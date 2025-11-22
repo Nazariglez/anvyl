@@ -1,0 +1,6 @@
+// @expect: success
+// @match: whatever
+
+fn main() -> int {
+    
+}

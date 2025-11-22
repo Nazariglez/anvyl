@@ -1,0 +1,4 @@
+// @skip: I am thinking this is whatever\nbut I can be wrong
+fn main() -> int {
+    
+}

@@ -2,7 +2,7 @@ use crate::ExpectedResult;
 
 #[derive(Debug, Default, Clone)]
 pub struct Directives {
-    pub expect: Option<ExpectedResult>,
+    pub expect: ExpectedResult,
     pub match_exact: Option<String>,
     pub contains: Vec<String>,
     pub skip: Option<String>,
@@ -50,7 +50,7 @@ impl Directives {
                 directives.skip = Some(ln.trim().to_string());
             }
             if let Some(ln) = trimmed.strip_prefix("// @expect:") {
-                directives.expect = Some(ExpectedResult::from_str(ln.trim()));
+                directives.expect = ExpectedResult::from_str(ln.trim());
             }
             if let Some(ln) = trimmed.strip_prefix("// @match:") {
                 directives.match_exact = Some(ln.trim().to_string());
@@ -65,12 +65,5 @@ impl Directives {
         }
 
         directives
-    }
-
-    fn has_any(&self) -> bool {
-        self.expect.is_some()
-            || self.match_exact.is_some()
-            || !self.contains.is_empty()
-            || self.skip.is_some()
     }
 }

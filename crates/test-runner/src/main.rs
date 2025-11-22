@@ -1,9 +1,10 @@
 mod args;
 mod directives;
+mod run_test;
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use run_test::{ExpectedResult, TestResult, run_test_file};
 use std::{path::PathBuf, time::Instant};
-use walkdir::WalkDir;
 
 const EXT: &str = "anv";
 const GREEN: &str = "\x1b[32m";
@@ -20,24 +21,16 @@ fn main() {
     let files = if let Some(file) = args.file {
         vec![file]
     } else {
-        WalkDir::new(&args.root)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_type().is_file()
-                    && entry.path().extension().and_then(|s| s.to_str()) == Some(EXT)
-            })
-            .map(|entry| entry.path().to_path_buf())
-            .collect()
+        list_all_anv_files(&args.root)
     };
 
     println!("");
-    println!("--- Testing {} files ---", files.len());
+    println!("{CYAN}--- Testing {} files ---{RESET}", files.len());
     println!("");
 
     let results = files
         .par_iter()
-        .filter_map(|file| match test_file(file) {
+        .filter_map(|file| match run_test_file(file) {
             Ok(res) => Some((file.clone(), res)),
             Err(e) => Some((
                 file.clone(),
@@ -54,51 +47,6 @@ fn main() {
     }
     summary.print_summary(start_time, files.len());
     println!("");
-}
-
-fn test_file(file: &PathBuf) -> Result<TestResult, String> {
-    let src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-    let directives = directives::Directives::new(&src);
-    if directives.skip.is_some() {
-        return Ok(TestResult::Skip {
-            message: directives.skip.unwrap(),
-        });
-    }
-    // TODO: parse the file and test it
-    // Ok(TestResult::Pass)
-    Err("Not implemented".to_string())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExpectedResult {
-    Success,
-    Error,
-    Timeout,
-}
-
-impl ExpectedResult {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "success" => Self::Success,
-            "error" => Self::Error,
-            "timeout" => Self::Timeout,
-            _ => panic!("Invalid expected result: {}", s),
-        }
-    }
-}
-
-impl std::fmt::Display for ExpectedResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-#[derive(Debug)]
-enum TestResult {
-    Pass,
-    Fail { message: String },
-    Timeout,
-    Skip { message: String },
 }
 
 #[derive(Debug, Default)]
@@ -140,36 +88,36 @@ impl Summary {
 
     fn print_summary(&self, start_time: Instant, total: usize) {
         println!("");
-        println!("--- Test Results ---");
+        println!("{CYAN}--- Test Results ---{RESET}");
         println!("");
 
         if self.skipped > 0 {
-            println!("{}Skipped:{} {}", YELLOW, RESET, self.skipped);
+            println!("* {}Skipped:{} {}", YELLOW, RESET, self.skipped);
             self.skips.iter().for_each(|(f, m)| {
                 println!("{YELLOW}  - {}:{RESET}", f.display());
-                println!("    * {m}");
+                tab_print(4, m, false);
             });
             println!("");
         }
 
         if self.timed_out > 0 {
-            println!("{}Timed out:{} {}", BLUE, RESET, self.timed_out);
+            eprintln!("* {}Timed out:{} {}", BLUE, RESET, self.timed_out);
             self.timeouts
                 .iter()
-                .for_each(|f| println!("{BLUE}  - {}{RESET}", f.display()));
+                .for_each(|f| eprintln!("{BLUE}  - {}{RESET}", f.display()));
             println!("");
         }
 
         if self.failed > 0 {
-            println!("{}Failed:{} {}", RED, RESET, self.failed);
+            eprintln!("* {}Failed:{} {}", RED, RESET, self.failed);
             self.failures.iter().for_each(|(f, m)| {
-                println!("{RED}  - {}:{RESET}", f.display());
-                println!("    * {m}");
+                eprintln!("{RED}  - {}:{RESET}", f.display());
+                tab_print(4, m, true);
             });
             println!("");
         }
 
-        println!("{GREEN}Passed:{RESET} {} of {total}", self.passed);
+        println!("* {GREEN}Passed:{RESET} {} of {total}", self.passed);
         println!("");
         println!(
             "{CYAN}Total time:{RESET} {:.2}s",
@@ -189,14 +137,14 @@ fn fail_msg(file: &PathBuf, quiet: bool) {
     if quiet {
         return;
     }
-    println!("{RED}[FAIL]{RESET} {}", file.display());
+    eprintln!("{RED}[FAIL]{RESET} {}", file.display());
 }
 
 fn timeout_msg(file: &PathBuf, quiet: bool) {
     if quiet {
         return;
     }
-    println!("{BLUE}[TIMEOUT]{RESET} {}", file.display());
+    eprintln!("{BLUE}[TIMEOUT]{RESET} {}", file.display());
 }
 
 fn skip_msg(file: &PathBuf, quiet: bool) {
@@ -204,4 +152,27 @@ fn skip_msg(file: &PathBuf, quiet: bool) {
         return;
     }
     println!("{YELLOW}[SKIP]{RESET} {}", file.display());
+}
+
+fn list_all_anv_files(root: &PathBuf) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some(EXT)
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .collect()
+}
+
+fn tab_print(spaces: usize, message: &str, is_error: bool) {
+    let message = message.replace("\\n", "\n");
+    for line in message.lines() {
+        if is_error {
+            eprintln!("{:>spaces$}| {line}", "");
+        } else {
+            println!("{:>spaces$}| {line}", "");
+        }
+    }
 }

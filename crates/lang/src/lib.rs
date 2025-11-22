@@ -15,8 +15,10 @@ pub fn generate_ast(program: &str) -> Result<ast::Program, String> {
     }
 }
 
-pub fn run_program(program: &str) -> Result<(), String> {
-    let ast = generate_ast(program)?;
-    println!("AST: {:?}", ast);
-    Ok(())
+pub fn run_program(program: &str) -> Result<String, String> {
+    let ast = generate_ast(program).map_err(|e| {
+        println!("{e}");
+        e
+    })?;
+    Ok("output".to_string())
 }

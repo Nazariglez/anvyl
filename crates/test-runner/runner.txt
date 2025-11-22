@@ -1,0 +1,429 @@
+--
+src/args.rs
+--
+use std::path::PathBuf;
+
+#[derive(Debug)]
+pub struct RunnerArgs {
+    pub root: PathBuf,
+    pub timeout_ms: u64,
+    pub quiet: bool,
+    pub file: Option<PathBuf>,
+}
+
+impl RunnerArgs {
+    pub fn new() -> Result<Self, String> {
+        let args = std::env::args().collect::<Vec<String>>();
+        let (root, file) = parse_root_file(&args)?;
+        let quiet = parse_quiet(&args);
+        let timeout_ms = parse_timeout(&args);
+        Ok(Self {
+            root,
+            timeout_ms,
+            quiet,
+            file,
+        })
+    }
+}
+
+fn parse_quiet(args: &[String]) -> bool {
+    args.iter().find(|arg| arg.as_str() == "--quiet").is_some()
+}
+
+fn parse_timeout(args: &[String]) -> u64 {
+    args.iter()
+        .position(|arg| arg.as_str() == "--timeout")
+        .and_then(|i| args.get(i + 1))
+        .map(|arg| arg.parse::<u64>().unwrap())
+        .unwrap_or(2000)
+}
+
+fn parse_root_file(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), String> {
+    if args.len() == 1 || args[1].starts_with("--") {
+        return Err("Provide a directory or a file as first argument".to_string());
+    }
+
+    let dir = std::path::Path::new(&args[1]);
+    if dir.is_dir() {
+        return Ok((dir.to_path_buf(), None));
+    }
+
+    if dir.is_file() {
+        return Ok((dir.parent().unwrap().to_path_buf(), Some(dir.to_path_buf())));
+    }
+
+    Err("Provide a directory or a file as first argument".to_string())
+}
+--
+src/directives.rs
+--
+use crate::ExpectedResult;
+
+#[derive(Debug, Default, Clone)]
+pub struct Directives {
+    pub expect: ExpectedResult,
+    pub match_exact: Option<String>,
+    pub contains: Vec<String>,
+    pub skip: Option<String>,
+}
+
+impl Directives {
+    pub fn new(src: &str) -> Self {
+        let mut directives = Self::default();
+
+        let mut is_match_block = false;
+        let mut match_block_lines = vec![];
+
+        for line in src.lines() {
+            let trimmed = line.trim();
+
+            // maybe a bit fragile but I don't want to parse the whole file
+            // so we stop here on the first line that is not a directive
+            if !trimmed.starts_with("// @") && is_match_block {
+                break;
+            }
+
+            // let's manage the multiline block
+            match trimmed {
+                "// @match-begin" => {
+                    is_match_block = true;
+                    continue;
+                }
+                "// @match-end" => {
+                    is_match_block = false;
+                    continue;
+                }
+                _ => {}
+            }
+
+            if is_match_block {
+                let Some(ln) = trimmed.strip_prefix("// ") else {
+                    continue;
+                };
+                match_block_lines.push(ln);
+                continue;
+            }
+
+            // now let's manage single line directives
+            if let Some(ln) = trimmed.strip_prefix("// @skip:") {
+                directives.skip = Some(ln.trim().to_string());
+            }
+            if let Some(ln) = trimmed.strip_prefix("// @expect:") {
+                directives.expect = ExpectedResult::from_str(ln.trim());
+            }
+            if let Some(ln) = trimmed.strip_prefix("// @match:") {
+                directives.match_exact = Some(ln.trim().to_string());
+            }
+            if let Some(ln) = trimmed.strip_prefix("// @contains:") {
+                directives.contains.push(ln.trim().to_string());
+            }
+        }
+
+        if !match_block_lines.is_empty() {
+            directives.match_exact = Some(match_block_lines.join("\n"));
+        }
+
+        directives
+    }
+}
+--
+src/main.rs
+--
+mod args;
+mod directives;
+mod run_test;
+
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use run_test::{ExpectedResult, TestResult, run_test_file};
+use std::{path::PathBuf, time::Instant};
+
+const EXT: &str = "anv";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const YELLOW: &str = "\x1b[33m";
+const CYAN: &str = "\x1b[36m";
+const BLUE: &str = "\x1b[34m";
+const RESET: &str = "\x1b[0m";
+
+fn main() {
+    let args = args::RunnerArgs::new().unwrap();
+
+    let start_time = Instant::now();
+    let files = if let Some(file) = args.file {
+        vec![file]
+    } else {
+        list_all_anv_files(&args.root)
+    };
+
+    println!("");
+    println!("{CYAN}--- Testing {} files ---{RESET}", files.len());
+    println!("");
+
+    let results = files
+        .par_iter()
+        .filter_map(|file| match run_test_file(file) {
+            Ok(res) => Some((file.clone(), res)),
+            Err(e) => Some((
+                file.clone(),
+                TestResult::Fail {
+                    message: format!("Test runner error: {e}"),
+                },
+            )),
+        })
+        .collect::<Vec<_>>();
+
+    let mut summary = Summary::default();
+    for (file, result) in results {
+        summary.add(file, result, args.quiet);
+    }
+    summary.print_summary(start_time, files.len());
+    println!("");
+}
+
+#[derive(Debug, Default)]
+struct Summary {
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    timed_out: usize,
+
+    failures: Vec<(PathBuf, String)>,
+    timeouts: Vec<PathBuf>,
+    skips: Vec<(PathBuf, String)>,
+}
+
+impl Summary {
+    fn add(&mut self, file: PathBuf, result: TestResult, quiet: bool) {
+        match result {
+            TestResult::Pass => {
+                self.passed += 1;
+                pass_msg(&file, quiet);
+            }
+            TestResult::Fail { message } => {
+                self.failed += 1;
+                fail_msg(&file, quiet);
+                self.failures.push((file, message));
+            }
+            TestResult::Timeout => {
+                self.timed_out += 1;
+                timeout_msg(&file, quiet);
+                self.timeouts.push(file);
+            }
+            TestResult::Skip { message } => {
+                self.skipped += 1;
+                skip_msg(&file, quiet);
+                self.skips.push((file, message));
+            }
+        }
+    }
+
+    fn print_summary(&self, start_time: Instant, total: usize) {
+        println!("");
+        println!("{CYAN}--- Test Results ---{RESET}");
+        println!("");
+
+        if self.skipped > 0 {
+            println!("* {}Skipped:{} {}", YELLOW, RESET, self.skipped);
+            self.skips.iter().for_each(|(f, m)| {
+                println!("{YELLOW}  - {}:{RESET}", f.display());
+                tab_print(4, m, false);
+            });
+            println!("");
+        }
+
+        if self.timed_out > 0 {
+            eprintln!("* {}Timed out:{} {}", BLUE, RESET, self.timed_out);
+            self.timeouts
+                .iter()
+                .for_each(|f| eprintln!("{BLUE}  - {}{RESET}", f.display()));
+            println!("");
+        }
+
+        if self.failed > 0 {
+            eprintln!("* {}Failed:{} {}", RED, RESET, self.failed);
+            self.failures.iter().for_each(|(f, m)| {
+                eprintln!("{RED}  - {}:{RESET}", f.display());
+                tab_print(4, m, true);
+            });
+            println!("");
+        }
+
+        println!("* {GREEN}Passed:{RESET} {} of {total}", self.passed);
+        println!("");
+        println!(
+            "{CYAN}Total time:{RESET} {:.2}s",
+            start_time.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn pass_msg(file: &PathBuf, quiet: bool) {
+    if quiet {
+        return;
+    }
+    println!("{GREEN}[PASS]{RESET} {}", file.display());
+}
+
+fn fail_msg(file: &PathBuf, quiet: bool) {
+    if quiet {
+        return;
+    }
+    eprintln!("{RED}[FAIL]{RESET} {}", file.display());
+}
+
+fn timeout_msg(file: &PathBuf, quiet: bool) {
+    if quiet {
+        return;
+    }
+    eprintln!("{BLUE}[TIMEOUT]{RESET} {}", file.display());
+}
+
+fn skip_msg(file: &PathBuf, quiet: bool) {
+    if quiet {
+        return;
+    }
+    println!("{YELLOW}[SKIP]{RESET} {}", file.display());
+}
+
+fn list_all_anv_files(root: &PathBuf) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some(EXT)
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .collect()
+}
+
+fn tab_print(spaces: usize, message: &str, is_error: bool) {
+    let message = message.replace("\\n", "\n");
+    for line in message.lines() {
+        if is_error {
+            eprintln!("{:>spaces$}| {line}", "");
+        } else {
+            println!("{:>spaces$}| {line}", "");
+        }
+    }
+}
+--
+src/run_test.rs
+--
+use anvyl_lang::run_program;
+
+use crate::directives::Directives;
+use std::path::PathBuf;
+
+pub fn run_test_file(file: &PathBuf) -> Result<TestResult, String> {
+    let src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    let directives = Directives::new(&src);
+    if directives.skip.is_some() {
+        return Ok(TestResult::Skip {
+            message: directives.skip.unwrap(),
+        });
+    }
+
+    Ok(match run_program(&src) {
+        Ok(output) => match directives.expect {
+            ExpectedResult::Success => match_output(&output, &directives)?,
+            ExpectedResult::Error => TestResult::Fail {
+                message: "Expected error but got success".to_string(),
+            },
+            ExpectedResult::Timeout => TestResult::Fail {
+                message: "Expected timeout but got success".to_string(),
+            },
+        },
+        Err(err) => match directives.expect {
+            ExpectedResult::Error => match_output(&err, &directives)?,
+            ExpectedResult::Success => TestResult::Fail {
+                message: format!("Expected success but got error:\n{err}"),
+            },
+            ExpectedResult::Timeout => TestResult::Fail {
+                message: format!("Expected timeout but got error:\n{err}"),
+            },
+        },
+    })
+}
+
+fn match_output(output: &str, directives: &Directives) -> Result<TestResult, String> {
+    // exact match, multilnne or not
+    if let Some(expected) = &directives.match_exact {
+        let expected_lines = expected.lines();
+        let lns = output.lines();
+        let same_lines_num = lns.count() == expected_lines.count();
+        if !same_lines_num {
+            return Ok(TestResult::Fail {
+                message: format!("* Expected:\n{output}\n* Got:\n{}", expected),
+            });
+        }
+
+        let expected_lines = expected.lines();
+        let lns = output.lines();
+        let join_iter = lns.zip(expected_lines);
+        for (idx, (ln, expected_ln)) in join_iter.enumerate() {
+            if ln != expected_ln {
+                return Ok(TestResult::Fail {
+                    message: format!(
+                        "*Line {idx} failed\n* Expected:\n{expected}\n* Got:\n{output}",
+                    ),
+                });
+            }
+        }
+
+        return Ok(TestResult::Pass);
+    }
+
+    // contains match
+    let lns = output.lines().collect::<Vec<_>>();
+    for (idx, expected_ln) in directives.contains.iter().enumerate() {
+        if let Some(ln) = lns.get(idx) {
+            if !ln.contains(expected_ln) {
+                return Ok(TestResult::Fail {
+                    message: format!(
+                        "* Line {idx} failed\n* Expected to contain:\n{expected_ln}\n* Got:\n{ln}",
+                    ),
+                });
+            }
+        } else {
+            return Ok(TestResult::Fail {
+                message: format!("* Line {idx} not found\n* Expected to contain:\n{expected_ln}"),
+            });
+        }
+    }
+
+    Ok(TestResult::Pass)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpectedResult {
+    #[default]
+    Success,
+    Error,
+    Timeout,
+}
+
+impl ExpectedResult {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "success" => Self::Success,
+            "error" => Self::Error,
+            "timeout" => Self::Timeout,
+            _ => panic!("Invalid expected result: {}", s),
+        }
+    }
+}
+
+impl std::fmt::Display for ExpectedResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+#[derive(Debug)]
+pub enum TestResult {
+    Pass,
+    Fail { message: String },
+    Timeout,
+    Skip { message: String },
+}
