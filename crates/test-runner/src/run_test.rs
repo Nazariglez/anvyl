@@ -1,19 +1,43 @@
 use wait_timeout::ChildExt;
 
 use crate::directives::Directives;
-use std::{io::Read, path::PathBuf, time::Duration};
+use std::{
+    io::Read,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
-pub fn run_test_file(cmd: &str, file: &PathBuf, timeout: Duration) -> Result<TestResult, String> {
+const ORANGE: &str = "\x1b[93m";
+const RESET: &str = "\x1b[0m";
+
+pub struct RunTestResult {
+    pub result: TestResult,
+    pub mode: Mode,
+    pub duration: Duration,
+}
+
+pub fn run_test_file(
+    cmd: &str,
+    file: &PathBuf,
+    timeout: Duration,
+) -> Result<RunTestResult, String> {
     let src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
     let directives = Directives::new(&src);
     if directives.skip.is_some() {
-        return Ok(TestResult::Skip {
-            message: directives.skip.unwrap(),
+        return Ok(RunTestResult {
+            result: TestResult::Skip {
+                message: directives.skip.unwrap(),
+            },
+            mode: directives.mode,
+            duration: Duration::from_secs(0),
         });
     }
 
-    let outcome = spawn_test_process(cmd, file, timeout)?;
-    Ok(match (outcome, directives.expect) {
+    let start_time = Instant::now();
+    let outcome = spawn_test_process(cmd, file, timeout, directives.mode)?;
+    let elapsed = start_time.elapsed();
+
+    let res = match (outcome, directives.expect) {
         (ProcessOutcome::Pass { output }, ExpectedResult::Success) => {
             match_output(&output, &directives)?
         }
@@ -35,6 +59,12 @@ pub fn run_test_file(cmd: &str, file: &PathBuf, timeout: Duration) -> Result<Tes
         (ProcessOutcome::Timeout, ExpectedResult::Success) => TestResult::Timeout,
         (ProcessOutcome::Timeout, ExpectedResult::Error) => TestResult::Timeout,
         (ProcessOutcome::Timeout, ExpectedResult::Timeout) => TestResult::Pass,
+    };
+
+    Ok(RunTestResult {
+        result: res,
+        mode: directives.mode,
+        duration: elapsed,
     })
 }
 
@@ -87,6 +117,32 @@ fn match_output(output: &str, directives: &Directives) -> Result<TestResult, Str
     Ok(TestResult::Pass)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Mode {
+    #[default]
+    Run,
+    Check,
+}
+
+impl Mode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "check" => Self::Check,
+            "run" => Self::Run,
+            _ => panic!("Invalid mode: {}", s),
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run => write!(f, "run"),
+            Self::Check => write!(f, "check"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExpectedResult {
     #[default]
@@ -128,7 +184,10 @@ enum ProcessOutcome {
 
 pub fn compile_lang(release: bool) -> Result<String, String> {
     // TODO: release? backend?
-    println!("Compiling anvyl...");
+    println!(
+        "{ORANGE}Compiling anvyl{}{RESET}",
+        if release { " (release)..." } else { "..." }
+    );
     let mut child = std::process::Command::new("cargo")
         .arg("build")
         .arg("--package")
@@ -158,10 +217,14 @@ fn spawn_test_process(
     cmd: &str,
     file: &PathBuf,
     timeout: Duration,
+    mode: Mode,
 ) -> Result<ProcessOutcome, String> {
     // TODO: allows to set backend? debug or release?
     let mut child = std::process::Command::new(cmd)
-        .arg("run")
+        .arg(match mode {
+            Mode::Check => "check",
+            Mode::Run => "run",
+        })
         .arg(file.display().to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

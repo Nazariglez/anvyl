@@ -1,0 +1,5 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token
+
+1 + 1

@@ -1,7 +1,8 @@
-use crate::ExpectedResult;
+use crate::{ExpectedResult, run_test::Mode};
 
 #[derive(Debug, Default, Clone)]
 pub struct Directives {
+    pub mode: Mode,
     pub expect: ExpectedResult,
     pub match_exact: Option<String>,
     pub contains: Vec<String>,
@@ -57,6 +58,9 @@ impl Directives {
             }
             if let Some(ln) = trimmed.strip_prefix("// @contains:") {
                 directives.contains.push(ln.trim().to_string());
+            }
+            if let Some(ln) = trimmed.strip_prefix("// @mode:") {
+                directives.mode = Mode::from_str(ln.trim());
             }
         }
 

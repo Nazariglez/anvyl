@@ -1,0 +1,4 @@
+// @mode: check
+// @expect: success
+
+fn main() -> void {}

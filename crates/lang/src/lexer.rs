@@ -12,6 +12,8 @@ pub enum Token {
     Ident(ast::Ident),
     Literal(LitToken),
     Op(Op),
+    Colon,
+    Semicolon,
 }
 
 pub type SpannedToken = (Token, Span);
@@ -29,6 +31,8 @@ impl Display for Token {
             Token::Close(Delimiter::Brace) => write!(f, "}}"),
             Token::Close(Delimiter::Bracket) => write!(f, "]"),
             Token::Op(op) => write!(f, "{}", op),
+            Token::Colon => write!(f, ":"),
+            Token::Semicolon => write!(f, ";"),
         }
     }
 }
@@ -69,6 +73,16 @@ pub enum Keyword {
     False,
     Fn,
     Return,
+    Let,
+    Var,
+    If,
+    Else,
+    While,
+    For,
+    Break,
+    Continue,
+    Match,
+    Pub,
 }
 
 impl Display for Keyword {
@@ -84,6 +98,16 @@ impl Display for Keyword {
             Keyword::False => write!(f, "false"),
             Keyword::Fn => write!(f, "fn"),
             Keyword::Return => write!(f, "return"),
+            Keyword::Let => write!(f, "let"),
+            Keyword::Var => write!(f, "var"),
+            Keyword::If => write!(f, "if"),
+            Keyword::Else => write!(f, "else"),
+            Keyword::While => write!(f, "while"),
+            Keyword::For => write!(f, "for"),
+            Keyword::Break => write!(f, "break"),
+            Keyword::Continue => write!(f, "continue"),
+            Keyword::Match => write!(f, "match"),
+            Keyword::Pub => write!(f, "pub"),
         }
     }
 }
@@ -130,7 +154,7 @@ impl Display for Op {
             Op::And => write!(f, "&&"),
             Op::Or => write!(f, "||"),
             Op::Not => write!(f, "!"),
-            Op::Assign => todo!(),
+            Op::Assign => write!(f, "="),
             Op::AddAssign => write!(f, "+="),
             Op::SubAssign => write!(f, "-="),
             Op::MulAssign => write!(f, "*="),
@@ -157,7 +181,15 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<SpannedToken>, Extra<'src>>
 }
 
 fn token<'src>() -> impl Parser<'src, &'src str, SpannedToken, Extra<'src>> {
-    choice((keyword(), delimiter(), literal(), ident(), op())).map_with(|tok, e| {
+    choice((
+        keyword(),
+        delimiter(),
+        literal(),
+        ident(),
+        op(),
+        punctuation(),
+    ))
+    .map_with(|tok, e| {
         let span = e.span();
         (
             tok,
@@ -171,6 +203,16 @@ fn token<'src>() -> impl Parser<'src, &'src str, SpannedToken, Extra<'src>> {
 
 fn keyword<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
     choice((
+        just("pub").to(Keyword::Pub),
+        just("let").to(Keyword::Let),
+        just("var").to(Keyword::Var),
+        just("if").to(Keyword::If),
+        just("else").to(Keyword::Else),
+        just("while").to(Keyword::While),
+        just("for").to(Keyword::For),
+        just("break").to(Keyword::Break),
+        just("continue").to(Keyword::Continue),
+        just("match").to(Keyword::Match),
         just("fn").to(Keyword::Fn),
         just("return").to(Keyword::Return),
         just("int").to(Keyword::Int),
@@ -271,4 +313,8 @@ fn op<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
 
 fn line_comment<'src>() -> impl Parser<'src, &'src str, (), Extra<'src>> {
     just("//").ignore_then(none_of("\n").repeated()).ignored()
+}
+
+fn punctuation<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
+    choice((just(":").to(Token::Colon), just(";").to(Token::Semicolon)))
 }

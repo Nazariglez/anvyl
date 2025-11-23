@@ -88,5 +88,6 @@ fn describe_token(token: &Token) -> String {
         Token::Ident(_) => "identifier".to_string(),
         Token::Literal(lit) => format!("'{}' literal", lit),
         Token::Op(op) => format!("'{}' operator", op),
+        _ => format!("'{}' token", token),
     }
 }

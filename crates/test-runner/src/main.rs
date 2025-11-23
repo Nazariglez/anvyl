@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::run_test::{Mode, RunTestResult};
+
 const EXT: &str = "anv";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
@@ -16,11 +18,12 @@ const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 const BLUE: &str = "\x1b[34m";
 const RESET: &str = "\x1b[0m";
+const GREY: &str = "\x1b[90m";
 
 fn main() {
     let args = args::RunnerArgs::new().unwrap();
 
-    let exe = run_test::compile_lang(false).unwrap();
+    let exe = run_test::compile_lang(args.release).unwrap();
 
     let start_time = Instant::now();
     let files = if let Some(file) = args.file {
@@ -40,8 +43,12 @@ fn main() {
                 Ok(res) => Some((file.clone(), res)),
                 Err(e) => Some((
                     file.clone(),
-                    TestResult::Fail {
-                        message: format!("Test runner error: {e}"),
+                    run_test::RunTestResult {
+                        result: TestResult::Fail {
+                            message: format!("Test runner error: {e}"),
+                        },
+                        mode: run_test::Mode::Check,
+                        duration: Duration::from_secs(0),
                     },
                 )),
             }
@@ -69,25 +76,31 @@ struct Summary {
 }
 
 impl Summary {
-    fn add(&mut self, file: PathBuf, result: TestResult, quiet: bool) {
+    fn add(&mut self, file: PathBuf, result: RunTestResult, quiet: bool) {
+        let RunTestResult {
+            result,
+            mode,
+            duration,
+        } = result;
+
         match result {
             TestResult::Pass => {
                 self.passed += 1;
-                pass_msg(&file, quiet);
+                pass_msg(&file, quiet, mode, duration);
             }
             TestResult::Fail { message } => {
                 self.failed += 1;
-                fail_msg(&file, quiet);
+                fail_msg(&file, quiet, mode, duration);
                 self.failures.push((file, message));
             }
             TestResult::Timeout => {
                 self.timed_out += 1;
-                timeout_msg(&file, quiet);
+                timeout_msg(&file, quiet, mode, duration);
                 self.timeouts.push(file);
             }
             TestResult::Skip { message } => {
                 self.skipped += 1;
-                skip_msg(&file, quiet);
+                skip_msg(&file, quiet, mode, duration);
                 self.skips.push((file, message));
             }
         }
@@ -133,32 +146,48 @@ impl Summary {
     }
 }
 
-fn pass_msg(file: &PathBuf, quiet: bool) {
+fn pass_msg(file: &PathBuf, quiet: bool, mode: Mode, duration: Duration) {
     if quiet {
         return;
     }
-    println!("{GREEN}[PASS]{RESET} {}", file.display());
+    println!(
+        "{GREEN}[PASS]{RESET} {} {GREY}({mode} - {:.3}s){RESET}",
+        file.display(),
+        duration.as_secs_f32()
+    );
 }
 
-fn fail_msg(file: &PathBuf, quiet: bool) {
+fn fail_msg(file: &PathBuf, quiet: bool, mode: Mode, duration: Duration) {
     if quiet {
         return;
     }
-    eprintln!("{RED}[FAIL]{RESET} {}", file.display());
+    eprintln!(
+        "{RED}[FAIL]{RESET} {} {GREY}({mode} - {:.3}s){RESET}",
+        file.display(),
+        duration.as_secs_f32()
+    );
 }
 
-fn timeout_msg(file: &PathBuf, quiet: bool) {
+fn timeout_msg(file: &PathBuf, quiet: bool, mode: Mode, duration: Duration) {
     if quiet {
         return;
     }
-    eprintln!("{BLUE}[TIMEOUT]{RESET} {}", file.display());
+    eprintln!(
+        "{BLUE}[TIMEOUT]{RESET} {} {GREY}({mode} - {:.3}s){RESET}",
+        file.display(),
+        duration.as_secs_f32()
+    );
 }
 
-fn skip_msg(file: &PathBuf, quiet: bool) {
+fn skip_msg(file: &PathBuf, quiet: bool, mode: Mode, duration: Duration) {
     if quiet {
         return;
     }
-    println!("{YELLOW}[SKIP]{RESET} {}", file.display());
+    println!(
+        "{YELLOW}[SKIP]{RESET} {} {GREY}({mode} - {:.3}s){RESET}",
+        file.display(),
+        duration.as_secs_f32()
+    );
 }
 
 fn list_all_anv_files(root: &PathBuf) -> Vec<PathBuf> {

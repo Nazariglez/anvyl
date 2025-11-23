@@ -11,6 +11,7 @@ pub type ExprNode = Spanned<Expr>;
 pub type StmtNode = Spanned<Stmt>;
 pub type FuncNode = Spanned<Func>;
 pub type BlockNode = Spanned<Block>;
+pub type BindingNode = Spanned<Binding>;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Ident(pub Intern<String>);
@@ -23,6 +24,7 @@ impl Display for Ident {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
+    Infer,
     Int,
     Float,
     Bool,
@@ -51,6 +53,7 @@ impl Display for Type {
                     .join(", "),
                 ret
             ),
+            Type::Infer => write!(f, "<infer>"),
         }
     }
 }
@@ -59,12 +62,27 @@ impl Display for Type {
 pub enum Stmt {
     Func(FuncNode),
     Expr(ExprNode),
+    Binding(BindingNode),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Visibility {
     Public,
     Private,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Mutability {
+    Mutable,
+    Immutable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Binding {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub mutability: Mutability,
+    pub value: ExprNode,
 }
 
 #[derive(Debug, Clone, PartialEq)]

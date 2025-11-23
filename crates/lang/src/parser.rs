@@ -13,7 +13,12 @@ pub fn parse_ast(tokens: &[SpannedToken]) -> Result<ast::Program, Vec<Rich<'_, S
 }
 
 fn parser<'src>() -> impl Parser<'src, Input<'src>, ast::Program, Extra<'src>> + 'src {
-    statement()
+    let stmt = statement();
+    function(stmt)
+        .map(|func_node| {
+            let span = func_node.span;
+            Spanned::new(ast::Stmt::Func(func_node), span)
+        })
         .repeated()
         .collect::<Vec<_>>()
         .map(|stmts| ast::Program { stmts })
@@ -23,10 +28,17 @@ fn parser<'src>() -> impl Parser<'src, Input<'src>, ast::Program, Extra<'src>> +
 fn statement<'src>() -> impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>> + 'src {
     recursive(|stmt| {
         let expr = expression(stmt.clone());
+        let func = function(stmt.clone());
+        let bind = binding(stmt.clone());
+
         choice((
-            function(stmt.clone()).map(|func_node| {
+            func.map(|func_node| {
                 let span = func_node.span;
                 Spanned::new(ast::Stmt::Func(func_node), span)
+            }),
+            bind.map(|bind_node| {
+                let span = bind_node.span;
+                Spanned::new(ast::Stmt::Binding(bind_node), span)
             }),
             expr.map(|expr_node| {
                 let span = expr_node.span;
@@ -40,12 +52,12 @@ fn statement<'src>() -> impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src
 }
 
 fn function<'src>(
-    stmt: impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>> + Clone,
+    stmt: impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>>,
 ) -> impl Parser<'src, Input<'src>, ast::FuncNode, Extra<'src>> {
     select! {
         (Token::Keyword(Keyword::Fn), _) => (),
     }
-    .ignore_then(term_ident())
+    .ignore_then(identifier())
     .then(params())
     .then(return_type())
     .then(block_stmt(stmt))
@@ -67,7 +79,7 @@ fn function<'src>(
 }
 
 fn block_stmt<'src>(
-    stmt: impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>> + Clone,
+    stmt: impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>>,
 ) -> impl Parser<'src, Input<'src>, ast::BlockNode, Extra<'src>> {
     select! {
         (Token::Open(Delimiter::Brace), _) => (),
@@ -85,7 +97,7 @@ fn block_stmt<'src>(
 }
 
 fn expression<'src>(
-    stmt: impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>> + Clone,
+    stmt: impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>>,
 ) -> impl Parser<'src, Input<'src>, ast::ExprNode, Extra<'src>> {
     choice((
         literal().map_with(|lit, e| {
@@ -106,10 +118,6 @@ fn expression<'src>(
 }
 
 fn identifier<'src>() -> impl Parser<'src, Input<'src>, ast::Ident, Extra<'src>> {
-    term_ident().labelled("identifier").as_context()
-}
-
-fn term_ident<'src>() -> impl Parser<'src, Input<'src>, ast::Ident, Extra<'src>> {
     select! {
         (Token::Ident(ident), _) => ident,
     }
@@ -147,8 +155,8 @@ fn params<'src>() -> impl Parser<'src, Input<'src>, Vec<ast::Param>, Extra<'src>
 }
 
 fn param<'src>() -> impl Parser<'src, Input<'src>, ast::Param, Extra<'src>> {
-    term_ident()
-        .then(type_())
+    identifier()
+        .then(type_ident())
         .map(|(name, ty)| ast::Param { name, ty })
         .labelled("parameter")
         .as_context()
@@ -158,13 +166,13 @@ fn return_type<'src>() -> impl Parser<'src, Input<'src>, Option<ast::Type>, Extr
     select! {
         (Token::Op(Op::ThinArrow), _) => (),
     }
-    .ignore_then(type_())
+    .ignore_then(type_ident())
     .or_not()
     .labelled("return type")
     .as_context()
 }
 
-fn type_<'src>() -> impl Parser<'src, Input<'src>, ast::Type, Extra<'src>> {
+fn type_ident<'src>() -> impl Parser<'src, Input<'src>, ast::Type, Extra<'src>> {
     select! {
         (Token::Keyword(Keyword::Int), _) => ast::Type::Int,
         (Token::Keyword(Keyword::Float), _) => ast::Type::Float,
@@ -174,4 +182,42 @@ fn type_<'src>() -> impl Parser<'src, Input<'src>, ast::Type, Extra<'src>> {
     }
     .labelled("type")
     .as_context()
+}
+
+fn binding<'src>(
+    stmt: impl Parser<'src, Input<'src>, ast::StmtNode, Extra<'src>>,
+) -> impl Parser<'src, Input<'src>, ast::BindingNode, Extra<'src>> {
+    let mutability = select! {
+        (Token::Keyword(Keyword::Let), _) => ast::Mutability::Immutable,
+        (Token::Keyword(Keyword::Var), _) => ast::Mutability::Mutable,
+    };
+
+    mutability
+        .then(identifier())
+        .then(
+            select! {
+                (Token::Colon, _) => (),
+            }
+            .ignore_then(type_ident())
+            .or_not(),
+        )
+        .then_ignore(select! {
+            (Token::Op(Op::Assign), _) => (),
+        })
+        .then(expression(stmt))
+        .then_ignore(select! {
+            (Token::Semicolon, _) => (),
+        })
+        .map_with(|(((mutability, name), ty), value), e| {
+            let s = e.span();
+            Spanned::new(
+                ast::Binding {
+                    name,
+                    ty,
+                    mutability,
+                    value,
+                },
+                Span::new(s.start, s.end),
+            )
+        })
 }
