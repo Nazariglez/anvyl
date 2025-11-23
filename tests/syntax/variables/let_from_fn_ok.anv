@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+fn add(a: int, b: int) -> int {
+    a + b
+}
+
+fn main() {
+    let sum: int = add(10, 15);
+}

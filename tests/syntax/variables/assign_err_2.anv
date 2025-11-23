@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token
+
+fn main() {
+    var a: int = 10;
+    a: 10;
+}

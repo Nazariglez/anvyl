@@ -15,6 +15,7 @@ pub type BindingNode = Spanned<Binding>;
 pub type BinaryNode = Spanned<Binary>;
 pub type UnaryNode = Spanned<Unary>;
 pub type CallNode = Spanned<Call>;
+pub type AssignNode = Spanned<Assign>;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Ident(pub Intern<String>);
@@ -125,6 +126,7 @@ pub enum Expr {
     Call(CallNode),
     Binary(BinaryNode),
     Unary(UnaryNode),
+    Assign(AssignNode),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -199,4 +201,32 @@ pub struct Call {
     pub func: Box<ExprNode>,
     pub args: Vec<ExprNode>,
     pub type_args: Vec<Type>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assign {
+    pub target: Box<ExprNode>,
+    pub op: AssignOp,
+    pub value: Box<ExprNode>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum AssignOp {
+    Assign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+}
+
+impl Display for AssignOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AssignOp::Assign => write!(f, "="),
+            AssignOp::AddAssign => write!(f, "+="),
+            AssignOp::SubAssign => write!(f, "-="),
+            AssignOp::MulAssign => write!(f, "*="),
+            AssignOp::DivAssign => write!(f, "/="),
+        }
+    }
 }

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let a: int = 10;
+    let b: int = a;
+    var c: int = b;
+    c = 100;
+}

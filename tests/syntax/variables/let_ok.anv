@@ -7,4 +7,6 @@ fn main() {
     let c: bool = true;
     let d: bool = false;
     let f: float = 10.0;
+
+    let aa: int = 10 + 10;
 }

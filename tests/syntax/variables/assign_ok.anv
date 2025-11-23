@@ -3,10 +3,18 @@
 
 fn main() {
     var a: int = 10;
+    a = 10;
     var b: string = "str";
+    b = "hello";
     var c: bool = true;
+    c = false;
     var d: bool = false;
+    d = true;
     var f: float = 10.0;
+    f = 0.0;
 
-    var ff: float = 10.0 + 98.0;
+    var aa: int = 10;
+    aa = 10 + 20;
+    aa = 100 * 100;
+    aa = 100 * (100 * 100) + 10;
 }

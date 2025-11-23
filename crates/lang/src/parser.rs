@@ -7,9 +7,9 @@ use chumsky::{error::Rich, extra, prelude::*};
 
 type Input<'src> = &'src [SpannedToken];
 type Extra<'src> = extra::Full<Rich<'src, SpannedToken>, (), ()>;
-trait AnvParser<'src, T>: chumsky::Parser<'src, Input<'src>, T, Extra<'src>> + 'src {}
+trait AnvParser<'src, T>: chumsky::Parser<'src, Input<'src>, T, Extra<'src>> + Clone + 'src {}
 impl<'src, T, P> AnvParser<'src, T> for P where
-    P: chumsky::Parser<'src, Input<'src>, T, Extra<'src>> + 'src
+    P: chumsky::Parser<'src, Input<'src>, T, Extra<'src>> + Clone + 'src
 {
 }
 
@@ -50,7 +50,6 @@ fn statement<'src>() -> impl AnvParser<'src, ast::StmtNode> {
                 Spanned::new(ast::Stmt::Expr(expr_node), span)
             }),
         ))
-        .boxed()
     })
     .labelled("statement")
     .as_context()
@@ -103,6 +102,7 @@ fn block_stmt<'src>(
 
 fn atom_expr<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
+    expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
     choice((
         literal().map_with(|lit, e| {
@@ -117,8 +117,21 @@ fn atom_expr<'src>(
             let span = block_node.span;
             Spanned::new(ast::Expr::Block(block_node), span)
         }),
+        grouped_expr(expr),
     ))
     .labelled("atom")
+}
+
+fn grouped_expr<'src>(
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> impl AnvParser<'src, ast::ExprNode> {
+    select! {
+        (Token::Open(Delimiter::Parent), _) => (),
+    }
+    .ignore_then(expr.clone())
+    .then_ignore(select! {
+        (Token::Close(Delimiter::Parent), _) => (),
+    })
 }
 
 fn fn_call_args<'src>(
@@ -139,7 +152,6 @@ fn fn_call_args<'src>(
     .then_ignore(select! {
         (Token::Close(Delimiter::Parent), _) => (),
     })
-    .boxed()
     .labelled("function call arguments")
     .as_context()
 }
@@ -165,16 +177,45 @@ fn call_expr<'src>(
 
         Spanned::new(ast::Expr::Call(call_node), span)
     })
-    .boxed()
     .labelled("call expr")
+}
+
+fn unary_expr<'src>(
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> impl AnvParser<'src, ast::ExprNode> {
+    select! {
+        (Token::Op(Op::Sub), _) => ast::UnaryOp::Neg,
+        (Token::Op(Op::Not), _) => ast::UnaryOp::Not,
+    }
+    .repeated()
+    .collect::<Vec<_>>()
+    .then(expr)
+    .map_with(|(ops, expr), e| {
+        let s = e.span();
+        let span = Span::new(s.start, s.end);
+
+        ops.into_iter().rev().fold(expr, |acc, op| {
+            let unary_node = Spanned::new(
+                ast::Unary {
+                    op,
+                    expr: Box::new(acc),
+                },
+                span,
+            );
+
+            Spanned::new(ast::Expr::Unary(unary_node), span)
+        })
+    })
+    .labelled("unary")
+    .as_context()
 }
 
 fn binary_expr<'src>(
     term: impl AnvParser<'src, ast::ExprNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
-    let term = term.boxed();
-    let op_rhs = binary_op().then(term.clone());
+    // FIXME: precedence (sum, mul, etc...)
 
+    let op_rhs = binary_op().then(term.clone());
     term.foldl(op_rhs.repeated(), |left, (op, right)| {
         let span = Span::new(left.span.start, right.span.end);
         let bin_node = Spanned::new(
@@ -196,10 +237,12 @@ fn expression<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
     recursive(|expr| {
-        let atom = atom_expr(stmt).boxed();
-        let call = call_expr(atom, expr);
-        let binary = binary_expr(call);
-        binary.boxed()
+        let atom = atom_expr(stmt, expr.clone());
+        let call = call_expr(atom, expr.clone());
+        let unary = unary_expr(call);
+        let binary = binary_expr(unary);
+        let assign = assignment_expr(binary);
+        assign
     })
 }
 
@@ -337,4 +380,43 @@ fn binary_op<'src>() -> impl AnvParser<'src, ast::BinaryOp> {
     }
     .labelled("binary op")
     .as_context()
+}
+
+fn assign_op<'src>() -> impl AnvParser<'src, ast::AssignOp> {
+    select! {
+        (Token::Op(Op::Assign), _) => ast::AssignOp::Assign,
+        (Token::Op(Op::AddAssign), _) => ast::AssignOp::AddAssign,
+        (Token::Op(Op::SubAssign), _) => ast::AssignOp::SubAssign,
+        (Token::Op(Op::MulAssign), _) => ast::AssignOp::MulAssign,
+        (Token::Op(Op::DivAssign), _) => ast::AssignOp::DivAssign,
+    }
+    .labelled("assign op")
+    .as_context()
+}
+
+fn assignment_expr<'src>(
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> impl AnvParser<'src, ast::ExprNode> {
+    expr.clone()
+        .then(assign_op().then(expr.clone()))
+        .map_with(|(target, (op, value)), e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let assign_node = Spanned::new(
+                ast::Assign {
+                    target: Box::new(target),
+                    op,
+                    value: Box::new(value),
+                },
+                span,
+            );
+
+            Spanned::new(ast::Expr::Assign(assign_node), span)
+        })
+        .then_ignore(select! {
+            (Token::Semicolon, _) => (),
+        })
+        .or(expr)
+        .labelled("assignment")
+        .as_context()
 }
