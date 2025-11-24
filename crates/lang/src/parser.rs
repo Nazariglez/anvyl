@@ -35,6 +35,7 @@ fn statement<'src>() -> impl AnvParser<'src, ast::StmtNode> {
         let expr = expression(stmt.clone());
         let func = function(stmt.clone());
         let bind = binding(stmt.clone());
+        let ret = return_stmt(stmt.clone());
 
         choice((
             func.map(|func_node| {
@@ -45,6 +46,7 @@ fn statement<'src>() -> impl AnvParser<'src, ast::StmtNode> {
                 let span = bind_node.span;
                 Spanned::new(ast::Stmt::Binding(bind_node), span)
             }),
+            ret,
             expr.map(|expr_node| {
                 let span = expr_node.span;
                 Spanned::new(ast::Stmt::Expr(expr_node), span)
@@ -313,13 +315,27 @@ fn return_type<'src>() -> impl AnvParser<'src, Option<ast::Type>> {
 }
 
 fn type_ident<'src>() -> impl AnvParser<'src, ast::Type> {
-    select! {
+    let typ = select! {
         (Token::Keyword(Keyword::Int), _) => ast::Type::Int,
         (Token::Keyword(Keyword::Float), _) => ast::Type::Float,
         (Token::Keyword(Keyword::Bool), _) => ast::Type::Bool,
         (Token::Keyword(Keyword::String), _) => ast::Type::String,
         (Token::Keyword(Keyword::Void), _) => ast::Type::Void,
-    }
+    };
+
+    typ.then(
+        select! {
+            (Token::Question, _) => (),
+        }
+        .or_not(),
+    )
+    .map(|(ty, q)| {
+        if q.is_some() {
+            ast::Type::Optional(Box::new(ty))
+        } else {
+            ty
+        }
+    })
     .labelled("type")
     .as_context()
 }
@@ -377,6 +393,7 @@ fn binary_op<'src>() -> impl AnvParser<'src, ast::BinaryOp> {
         (Token::Op(Op::GreaterThanEq), _) => ast::BinaryOp::GreaterThanEq,
         (Token::Op(Op::And), _) => ast::BinaryOp::And,
         (Token::Op(Op::Or), _) => ast::BinaryOp::Or,
+        (Token::Op(Op::Coalesce), _) => ast::BinaryOp::Coalesce,
     }
     .labelled("binary op")
     .as_context()
@@ -419,4 +436,26 @@ fn assignment_expr<'src>(
         .or(expr)
         .labelled("assignment")
         .as_context()
+}
+
+fn return_stmt<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> impl AnvParser<'src, ast::StmtNode> {
+    select! {
+        (Token::Keyword(Keyword::Return), _) => (),
+    }
+    .ignore_then(expression(stmt).or_not())
+    .then_ignore(select! {
+        (Token::Semicolon, _) => (),
+    })
+    .map_with(|value_opt, e| {
+        let s = e.span();
+        let span = Span::new(s.start, s.end);
+        Spanned::new(
+            ast::Stmt::Return(Spanned::new(ast::Return { value: value_opt }, span)),
+            span,
+        )
+    })
+    .labelled("return")
+    .as_context()
 }

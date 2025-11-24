@@ -2,11 +2,6 @@ use crate::span::Spanned;
 use internment::Intern;
 use std::fmt::Display;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Program {
-    pub stmts: Vec<StmtNode>,
-}
-
 pub type ExprNode = Spanned<Expr>;
 pub type StmtNode = Spanned<Stmt>;
 pub type FuncNode = Spanned<Func>;
@@ -16,6 +11,31 @@ pub type BinaryNode = Spanned<Binary>;
 pub type UnaryNode = Spanned<Unary>;
 pub type CallNode = Spanned<Call>;
 pub type AssignNode = Spanned<Assign>;
+pub type ReturnNode = Spanned<Return>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    pub stmts: Vec<StmtNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Func(FuncNode),
+    Expr(ExprNode),
+    Binding(BindingNode),
+    Return(ReturnNode),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Ident(Ident),
+    Block(BlockNode),
+    Lit(Lit),
+    Call(CallNode),
+    Binary(BinaryNode),
+    Unary(UnaryNode),
+    Assign(AssignNode),
+}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Ident(pub Intern<String>);
@@ -60,13 +80,6 @@ impl Display for Type {
             Type::Infer => write!(f, "<infer>"),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
-    Func(FuncNode),
-    Expr(ExprNode),
-    Binding(BindingNode),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -118,17 +131,6 @@ pub enum Lit {
     Nil,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
-    Ident(Ident),
-    Block(BlockNode),
-    Lit(Lit),
-    Call(CallNode),
-    Binary(BinaryNode),
-    Unary(UnaryNode),
-    Assign(AssignNode),
-}
-
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum BinaryOp {
     Add,
@@ -145,6 +147,7 @@ pub enum BinaryOp {
     And,
     Or,
     Xor,
+    Coalesce,
 }
 
 impl Display for BinaryOp {
@@ -164,6 +167,7 @@ impl Display for BinaryOp {
             BinaryOp::And => write!(f, "&&"),
             BinaryOp::Or => write!(f, "||"),
             BinaryOp::Xor => write!(f, "^"),
+            BinaryOp::Coalesce => write!(f, "??"),
         }
     }
 }
@@ -229,4 +233,9 @@ impl Display for AssignOp {
             AssignOp::DivAssign => write!(f, "/="),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Return {
+    pub value: Option<ExprNode>,
 }

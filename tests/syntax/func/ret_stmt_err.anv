@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token
+
+fn whatever() -> void {
+    return
+}

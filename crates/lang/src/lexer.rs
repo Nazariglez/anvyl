@@ -15,6 +15,7 @@ pub enum Token {
     Colon,
     Semicolon,
     Comma,
+    Question,
 }
 
 pub type SpannedToken = (Token, Span);
@@ -35,6 +36,7 @@ impl Display for Token {
             Token::Colon => write!(f, ":"),
             Token::Semicolon => write!(f, ";"),
             Token::Comma => write!(f, ","),
+            Token::Question => write!(f, "?"),
         }
     }
 }
@@ -130,6 +132,7 @@ pub enum Op {
     And,
     Or,
     Not,
+    Coalesce,
     Assign,
     AddAssign,
     SubAssign,
@@ -156,6 +159,7 @@ impl Display for Op {
             Op::And => write!(f, "&&"),
             Op::Or => write!(f, "||"),
             Op::Not => write!(f, "!"),
+            Op::Coalesce => write!(f, "??"),
             Op::Assign => write!(f, "="),
             Op::AddAssign => write!(f, "+="),
             Op::SubAssign => write!(f, "-="),
@@ -287,6 +291,7 @@ fn ident<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
 fn op<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
     choice((
         // complex op
+        just("??").to(Op::Coalesce),
         just("==").to(Op::Eq),
         just("!=").to(Op::NotEq),
         just("<=").to(Op::LessThanEq),
@@ -322,5 +327,6 @@ fn punctuation<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
         just(":").to(Token::Colon),
         just(";").to(Token::Semicolon),
         just(",").to(Token::Comma),
+        just("?").to(Token::Question),
     ))
 }

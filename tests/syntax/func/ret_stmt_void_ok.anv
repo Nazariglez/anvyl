@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: success
+
+fn whatever() -> void {
+    return;
+}

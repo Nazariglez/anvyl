@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let a: int? = nil ?? 10;
+    let b: string? = "nice" ?? "other";
+}

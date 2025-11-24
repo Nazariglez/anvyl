@@ -12,6 +12,8 @@ fn main() {
     d = true;
     var f: float = 10.0;
     f = 0.0;
+    var e: int? = nil;
+    e = 10.0;
 
     var aa: int = 10;
     aa = 10 + 20;

@@ -7,6 +7,7 @@ fn main() {
     var c: bool = true;
     var d: bool = false;
     var f: float = 10.0;
+    var e: int? = nil;
 
     var ff: float = 10.0 + 98.0;
 }
