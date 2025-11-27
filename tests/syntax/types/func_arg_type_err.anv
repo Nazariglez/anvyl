@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn add(a: int, b: int) -> int {
+    a + b
+}
+
+fn main() {
+    let x: int = add(10, true);
+}

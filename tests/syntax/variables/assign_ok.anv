@@ -13,7 +13,7 @@ fn main() {
     var f: float = 10.0;
     f = 0.0;
     var e: int? = nil;
-    e = 10.0;
+    e = 10;
 
     var aa: int = 10;
     aa = 10 + 20;

@@ -2,6 +2,9 @@
 // @expect: success
 
 fn main() {
-    let a: int? = nil ?? 10;
-    let b: string? = "nice" ?? "other";
+    let a: int = nil ?? 10;
+    let b: string? = nil;
+    let c: string = b ?? "fallback";
+    let d: string? = "1st";
+    let e: string = d ?? "2nd";
 }

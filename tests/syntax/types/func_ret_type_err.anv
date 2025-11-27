@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn bad() -> int {
+    return "not an int";
+}
+
+fn main() {
+    let x: int = bad();
+}

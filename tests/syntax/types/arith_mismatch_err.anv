@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn main() {
+    let a: int = 10 + true;
+}

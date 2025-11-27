@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Could not infer type
+
+fn main() {
+    let a = nil;
+}

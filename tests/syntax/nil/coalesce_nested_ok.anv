@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let a: int? = nil;
+    let b: int? = nil;
+    let c: int = a ?? b ?? 10;
+}
