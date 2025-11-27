@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn bad() -> int? {
+    return true;
+}
+

@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+fn ok1() -> int? {
+    return nil;
+}
+
+fn ok2() -> int? {
+    return 1;
+}
+
+fn main() {
+    let x: int? = ok1();
+    let y: int? = ok2();
+}
+

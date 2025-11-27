@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn main() {
+    fn bad(a: int) -> int {
+        return "oops";
+    }
+
+    let x: int = bad(10);
+}
+

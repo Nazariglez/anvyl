@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Not a function
+
+fn main() {
+    let x: int = 10;
+    let y = x(1);
+}
+
