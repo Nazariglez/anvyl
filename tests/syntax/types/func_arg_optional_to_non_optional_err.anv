@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn main() {
+    fn takes_int(x: int) -> int { x }
+    
+    let a: int? = nil;
+    let _b: int = takes_int(a);
+}

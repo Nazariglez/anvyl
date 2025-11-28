@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    var a: int? = nil;
+    a = 42;
+    
+    var b: string? = nil;
+    b = "hello";
+    
+    var c: float? = nil;
+    c = 3.14;
+}
+

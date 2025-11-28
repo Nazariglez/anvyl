@@ -123,6 +123,8 @@ impl TypeChecker {
         }
     }
 
+    /// Constrains two types that must be the same
+    /// ie: let x:int = 10; x += 10; (int to int)
     fn constrain_equal(
         &mut self,
         span: Span,
@@ -137,6 +139,57 @@ impl TypeChecker {
         if !unified {
             self.add_constraint(span, left, right);
         }
+    }
+
+    /// Constraints 'value' to be assignable to 'target'
+    /// ie: let x:int? = 10; fn() -> int? { return 10; } (T to T?)
+    fn constrain_assignable(
+        &mut self,
+        span: Span,
+        from: TypeRef,
+        to: TypeRef,
+        errors: &mut Vec<TypeErr>,
+    ) {
+        let from_ty = self.get_type_ref(&from).unwrap_or(Type::Infer);
+        let to_ty = self.get_type_ref(&to).unwrap_or(Type::Infer);
+
+        // if both types are resolved, check assignability and set the types
+        let both_resolved = !(contains_infer(&from_ty) || contains_infer(&to_ty));
+        if both_resolved {
+            if !is_assignable(&from_ty, &to_ty) {
+                errors.push(TypeErr {
+                    span,
+                    kind: TypeErrKind::MismatchedTypes {
+                        expected: to_ty.clone(),
+                        found: from_ty.clone(),
+                    },
+                });
+            }
+            self.set_type_ref(&to, to_ty, span);
+            self.set_type_ref(&from, from_ty, span);
+            return;
+        }
+
+        // at this point at least one type is unresolved
+        // if both are optionals, constrain the inner types
+        if let (Type::Optional(inner_from), Type::Optional(inner_to)) = (&from_ty, &to_ty) {
+            let inner_from_ref = TypeRef::Concrete(*inner_from.clone());
+            let inner_to_ref = TypeRef::Concrete(*inner_to.clone());
+            self.constrain_equal(span, inner_from_ref, inner_to_ref, errors);
+            self.set_type_ref(&from, Type::Optional(inner_to.clone()), span);
+            return;
+        }
+
+        // if to is an optional and from has inference, constrain from to the inner type of to
+        if let Type::Optional(inner_to) = &to_ty
+            && contains_infer(&from_ty)
+        {
+            self.constrain_equal(span, from, TypeRef::Concrete(*inner_to.clone()), errors);
+            return;
+        }
+
+        // otherwise just constrain them to be the same as fallback
+        self.constrain_equal(span, from, to, errors);
     }
 }
 
@@ -492,7 +545,7 @@ fn check_call(call: &CallNode, type_checker: &mut TypeChecker, errors: &mut Vec<
                 check_expr(arg_expr, type_checker, errors);
                 let arg_ref = TypeRef::Expr(arg_expr.node.id);
                 let param_ref = TypeRef::Concrete(param_ty.clone());
-                type_checker.constrain_equal(arg_expr.span, arg_ref, param_ref, errors);
+                type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
             }
 
             *ret
@@ -713,51 +766,10 @@ fn check_assign_op(
     type_checker: &mut TypeChecker,
     errors: &mut Vec<TypeErr>,
 ) -> Type {
-    let get_ty = |tyr: &TypeRef, type_checker: &mut TypeChecker| {
-        type_checker.get_type_ref(tyr).unwrap_or(Type::Infer)
-    };
-
-    let target_ty = get_ty(&target_ref, type_checker);
-    let value_ty = get_ty(&value_ref, type_checker);
-
-    let can_assign = is_assignable(&value_ty, &target_ty);
-
-    // if both types are resolved then we can check if they are assignable and return the target type
-    let both_resolved = !(contains_infer(&target_ty) || contains_infer(&value_ty));
-    if both_resolved {
-        if !can_assign {
-            errors.push(TypeErr {
-                span: assign.span,
-                kind: TypeErrKind::MismatchedTypes {
-                    expected: target_ty.clone(),
-                    found: value_ty,
-                },
-            });
-        }
-
-        return target_ty;
-    }
-
-    // at this point one type is unresolved so we need to contstraint them
-    // let's check if there are optionals and check the inner types
-    if let (Type::Optional(inner_from), Type::Optional(inner_to)) = (&value_ty, &target_ty) {
-        if contains_infer(inner_from) {
-            let inner_from_ref = TypeRef::Concrete(*inner_from.clone());
-            let inner_to_ref = TypeRef::Concrete(*inner_to.clone());
-            type_checker.constrain_equal(assign.span, inner_from_ref, inner_to_ref, errors);
-            type_checker.set_type(
-                assign.node.value.node.id,
-                Type::Optional(inner_to.clone()),
-                assign.span,
-            );
-        }
-
-        return get_ty(&target_ref, type_checker);
-    }
-
-    // if there are no optionals then we just constrain them
-    type_checker.constrain_equal(assign.span, target_ref.clone(), value_ref, errors);
-    get_ty(&target_ref, type_checker)
+    type_checker.constrain_assignable(assign.span, value_ref, target_ref.clone(), errors);
+    type_checker
+        .get_type_ref(&target_ref)
+        .unwrap_or(Type::Infer)
 }
 
 fn check_compound_assign_op(
@@ -800,48 +812,10 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
         return;
     };
 
-    // if there is a type annotation then we need to check if the value is assignable to the annotation
-    let value_ty = type_checker.get_type_ref(&val_ref).unwrap_or(Type::Infer);
-    let can_assign = is_assignable(&value_ty, annot_ty);
-    let both_resolved = !(contains_infer(&value_ty) || contains_infer(annot_ty));
-
-    if both_resolved {
-        if !can_assign {
-            errors.push(TypeErr {
-                span: binding.span,
-                kind: TypeErrKind::MismatchedTypes {
-                    expected: annot_ty.clone(),
-                    found: value_ty,
-                },
-            });
-        }
-
-        type_checker.set_var(node.name, annot_ty.clone());
-        return;
-    }
-
-    // at this point one type is unresolved
+    // if there is a type annotation then we use constrain_assignable to check
+    // if the value is assignable to the annotation (handles T -> T?, inference, etc.)
     let annot_ref = TypeRef::Concrete(annot_ty.clone());
-
-    // if they are not both optionals then we just constrain them
-    let (Type::Optional(inner_from), Type::Optional(inner_to)) = (&value_ty, annot_ty) else {
-        type_checker.constrain_equal(binding.span, annot_ref, val_ref.clone(), errors);
-        type_checker.set_var(node.name, annot_ty.clone());
-        return;
-    };
-
-    // if the inner type is unresolved then we need to constrain it
-    if contains_infer(inner_from) {
-        let inner_from_ref = TypeRef::Concrete(*inner_from.clone());
-        let inner_to_ref = TypeRef::Concrete(*inner_to.clone());
-        type_checker.constrain_equal(binding.span, inner_from_ref, inner_to_ref, errors);
-        type_checker.set_type(
-            node.value.node.id,
-            Type::Optional(inner_to.clone()),
-            binding.span,
-        );
-    }
-
+    type_checker.constrain_assignable(binding.span, val_ref, annot_ref, errors);
     type_checker.set_var(node.name, annot_ty.clone());
 }
 
@@ -859,7 +833,7 @@ fn check_ret(ret: &ReturnNode, type_checker: &mut TypeChecker, errors: &mut Vec<
             check_expr(value_expr, type_checker, errors);
             let expr_ref = TypeRef::Expr(value_expr.node.id);
             let ret_ref = TypeRef::Concrete(expected_ty.clone());
-            type_checker.constrain_equal(ret.span, expr_ref, ret_ref, errors);
+            type_checker.constrain_assignable(ret.span, expr_ref, ret_ref, errors);
         }
 
         // returning nothing in a void fn is fine

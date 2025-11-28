@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn bad() -> int {
+    let x: int? = nil;
+    return x;
+}
+

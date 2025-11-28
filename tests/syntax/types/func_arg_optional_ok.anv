@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    fn takes_optional(x: int?) -> int { x ?? 0 }
+    
+    let _a: int = takes_optional(nil);
+    let _b: int = takes_optional(42);
+    
+    let c: int = 10;
+    let _d: int = takes_optional(c);
+    
+    let e: int? = nil;
+    let _f: int = takes_optional(e);
+}

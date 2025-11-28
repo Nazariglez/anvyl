@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn main() {
+    let a: int? = nil;
+    var b: int = 0;
+    b = a;
+}
+
