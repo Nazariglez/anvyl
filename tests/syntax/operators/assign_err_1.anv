@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error 
+
+fn main() {
+    let i: int = 10;
+    20 = i;
+}

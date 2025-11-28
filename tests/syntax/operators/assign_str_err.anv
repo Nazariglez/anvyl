@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: Invalid operand type
+
+fn main() {
+    let i: string = "hola";
+    i *= "adios";
+}

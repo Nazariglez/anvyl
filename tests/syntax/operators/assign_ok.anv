@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success 
+
+fn main() {
+    let i: int = 10;
+    i = 20;
+    i += 10;
+    i -= 10;
+    i /= 10;
+    i *= 10;
+    i += i;
+    i -= i + 10;
+    i /= i - 5;
+    i *= i + i;
+
+    let f: float = 10.0;
+    f = 20.0;
+    f += 10.0;
+    f -= 10.0;
+    f /= 10.0;
+    f *= 10.0;
+    f += f;
+    f -= f + 10.0;
+    f /= f - 5.0;
+    f *= f + f;
+}

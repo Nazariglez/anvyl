@@ -447,10 +447,23 @@ fn assign_op<'src>() -> impl AnvParser<'src, ast::AssignOp> {
     .as_context()
 }
 
+fn lvalue_expr<'src>() -> impl AnvParser<'src, ast::ExprNode> {
+    identifier()
+        .map_with(|ident, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let expr_id = e.state().new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
+            Spanned::new(expr, span)
+        })
+        .labelled("left value expr")
+        .as_context()
+}
+
 fn assignment_expr<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
-    expr.clone()
+    lvalue_expr()
         .then(assign_op().then(expr.clone()))
         .map_with(|(target, (op, value)), e| {
             let s = e.span();
