@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+fn classify(x: int) -> int {
+    x < 0 ? -1
+    : x == 0 ? 0
+    : 1
+}
+
+fn main() {
+    let s: int = classify(10);
+}
+

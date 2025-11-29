@@ -456,6 +456,59 @@ fn binary_expr<'src>(
     .as_context()
 }
 
+fn ternary_expr<'src>(
+    lower: impl AnvParser<'src, ast::ExprNode>,
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> impl AnvParser<'src, ast::ExprNode> {
+    let ternary_suffix = select! {
+        (Token::Question, _) => (),
+    }
+    .ignore_then(expr.clone())
+    .then_ignore(select! {
+        (Token::Colon, _) => (),
+    })
+    .then(expr);
+
+    lower
+        .foldl_with(
+            ternary_suffix.repeated(),
+            |cond, (then_expr, else_expr), e| {
+                let span = Span::new(cond.span.start, else_expr.span.end);
+
+                let then_stmt = Spanned::new(ast::Stmt::Expr(then_expr.clone()), then_expr.span);
+                let then_block = Spanned::new(
+                    ast::Block {
+                        stmts: vec![then_stmt],
+                    },
+                    then_expr.span,
+                );
+
+                let else_stmt = Spanned::new(ast::Stmt::Expr(else_expr.clone()), else_expr.span);
+                let else_block = Spanned::new(
+                    ast::Block {
+                        stmts: vec![else_stmt],
+                    },
+                    else_expr.span,
+                );
+
+                let if_node = Spanned::new(
+                    ast::If {
+                        cond: Box::new(cond),
+                        then_block,
+                        else_block: Some(else_block),
+                    },
+                    span,
+                );
+
+                let expr_id = e.state().new_expr_id();
+                let expr = ast::Expr::new(ast::ExprKind::If(if_node), expr_id);
+                Spanned::new(expr, span)
+            },
+        )
+        .labelled("ternary")
+        .as_context()
+}
+
 fn expression<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
@@ -464,7 +517,8 @@ fn expression<'src>(
         let call = call_expr(atom, expr.clone());
         let unary = unary_expr(call);
         let binary = binary_expr(unary);
-        let assign = assignment_expr(binary);
+        let ternary = ternary_expr(binary, expr.clone());
+        let assign = assignment_expr(ternary);
         assign
     })
 }

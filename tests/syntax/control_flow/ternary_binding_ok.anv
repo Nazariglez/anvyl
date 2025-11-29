@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let cond: bool = true;
+    let a: int = cond ? 1 : 2;
+    let b = cond ? a : a * 2;
+}
+

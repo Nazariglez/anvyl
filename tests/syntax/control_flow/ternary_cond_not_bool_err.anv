@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Condition of if expression must be bool
+
+fn main() {
+    let n: int = 1;
+    let x = n ? 1 : 2;
+}
+

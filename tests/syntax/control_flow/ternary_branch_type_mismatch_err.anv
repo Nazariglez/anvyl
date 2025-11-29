@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn main() {
+    let cond: bool = true;
+    let x = cond ? 1 : 2.0;
+}
+
