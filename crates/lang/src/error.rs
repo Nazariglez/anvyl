@@ -94,6 +94,14 @@ pub fn report_typecheck_errors(
                 "Could not infer type".to_string(),
                 "type inference could not resolve this expression".to_string(),
             ),
+            TypeErrKind::GenericArgNumMismatch { expected, found } => (
+                "Wrong number of type arguments".to_string(),
+                format!("expected {expected} type argument(s), found {found}"),
+            ),
+            TypeErrKind::NotGenericFunction => (
+                "Function is not generic".to_string(),
+                "type arguments cannot be provided for a non-generic function".to_string(),
+            ),
         };
 
         emit_report(src, file_path, byte_range, title, body);

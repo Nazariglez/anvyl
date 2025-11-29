@@ -1,5 +1,5 @@
 use crate::{
-    ast::{self, ExprId},
+    ast::{self, ExprId, TypeVarId},
     lexer::{Delimiter, Keyword, LitToken, Op, SpannedToken, Token},
     span::{Span, Spanned},
 };
@@ -8,16 +8,24 @@ use chumsky::{
     extra::{self, SimpleState},
     prelude::*,
 };
+use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 struct ParserState {
     next_expr_id: ExprId,
+    next_type_var_id: TypeVarId,
 }
 
 impl ParserState {
     fn new_expr_id(&mut self) -> ExprId {
         let id = ExprId(self.next_expr_id.0);
         self.next_expr_id = ExprId(id.0 + 1);
+        id
+    }
+
+    fn new_type_var_id(&mut self) -> TypeVarId {
+        let id = TypeVarId(self.next_type_var_id.0);
+        self.next_type_var_id = TypeVarId(id.0 + 1);
         id
     }
 }
@@ -75,6 +83,31 @@ fn statement<'src>() -> impl AnvParser<'src, ast::StmtNode> {
     .as_context()
 }
 
+fn type_params<'src>() -> impl AnvParser<'src, Vec<ast::TypeParam>> {
+    select! {
+        (Token::Op(Op::LessThan), _) => (),
+    }
+    .ignore_then(
+        identifier()
+            .map_with(|name, e| {
+                let id = e.state().new_type_var_id();
+                ast::TypeParam { name, id }
+            })
+            .separated_by(select! {
+                (Token::Comma, _) => (),
+            })
+            .allow_trailing()
+            .collect::<Vec<_>>(),
+    )
+    .then_ignore(select! {
+        (Token::Op(Op::GreaterThan), _) => (),
+    })
+    .or_not()
+    .map(|opt| opt.unwrap_or_default())
+    .labelled("type parameters")
+    .as_context()
+}
+
 fn function<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> impl AnvParser<'src, ast::FuncNode> {
@@ -82,24 +115,81 @@ fn function<'src>(
         (Token::Keyword(Keyword::Fn), _) => (),
     }
     .ignore_then(identifier())
+    .then(type_params())
     .then(params())
     .then(return_type())
     .then(block_stmt(stmt))
-    .map_with(|(((name, params), ret), body), e| {
+    .try_map_with(|((((name, type_params), params), ret), body), e| {
         let s = e.span();
-        Spanned::new(
+        // build type parameter map
+        let type_param_map = type_params
+            .iter()
+            .map(|tp| (tp.name, tp.id))
+            .collect::<HashMap<_, _>>();
+
+        // resolve type parameters variables in signature
+        let resolved_params = params
+            .into_iter()
+            .map(|p| {
+                resolve_type_params(&p.ty, &type_param_map)
+                    .map(|ty| ast::Param { name: p.name, ty })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|ident| Rich::custom(s.clone(), format!("unknown type '{}'", ident)))?;
+
+        // resolve type parameters in return type
+        let resolved_ret = match ret {
+            Some(ty) => resolve_type_params(&ty, &type_param_map)
+                .map_err(|ident| Rich::custom(s.clone(), format!("unknown type '{}'", ident)))?,
+            None => ast::Type::Void,
+        };
+
+        Ok(Spanned::new(
             ast::Func {
                 name,
                 visibility: ast::Visibility::Private,
-                params,
-                ret: ret.unwrap_or(ast::Type::Void),
+                type_params,
+                params: resolved_params,
+                ret: resolved_ret,
                 body,
             },
             Span::new(s.start, s.end),
-        )
+        ))
     })
     .labelled("function")
     .as_context()
+}
+
+fn resolve_type_params(
+    ty: &ast::Type,
+    type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+) -> Result<ast::Type, ast::Ident> {
+    use ast::Type::*;
+    match ty {
+        // resolve T to Var(id)
+        UnresolvedName(ident) => type_param_map
+            .get(ident)
+            .map(|id| Var(*id))
+            .ok_or_else(|| ident.clone()),
+
+        Optional(inner) => Ok(Optional(
+            resolve_type_params(inner, type_param_map)?.boxed(),
+        )),
+
+        Func { params, ret } => {
+            let resolved_params: Result<Vec<_>, _> = params
+                .iter()
+                .map(|p| resolve_type_params(p, type_param_map))
+                .collect();
+            Ok(Func {
+                params: resolved_params?,
+                ret: resolve_type_params(ret, type_param_map)?.boxed(),
+            })
+        }
+
+        // other types pass through unchanged
+        _ => Ok(ty.clone()),
+    }
 }
 
 fn block_stmt<'src>(
@@ -184,12 +274,60 @@ fn fn_call_args<'src>(
     .as_context()
 }
 
+fn call_type_args<'src>() -> impl AnvParser<'src, Vec<ast::Type>> {
+    // lookahead for optional generic type arguments (<int, ..>)
+    // and rewind to avoid consuming < when its a comparsion op (a < b)
+    let generic_lookahead = select! {
+        (Token::Op(Op::LessThan), _) => (),
+    }
+    .ignore_then(
+        type_ident()
+            .separated_by(select! {
+                (Token::Comma, _) => (),
+            })
+            .allow_trailing()
+            .collect::<Vec<_>>(),
+    )
+    .then_ignore(select! {
+        (Token::Op(Op::GreaterThan), _) => (),
+    })
+    .then_ignore(select! {
+        (Token::Open(Delimiter::Parent), _) => (),
+    })
+    .rewind();
+
+    let generic_list = select! {
+        (Token::Op(Op::LessThan), _) => (),
+    }
+    .ignore_then(
+        type_ident()
+            .separated_by(select! {
+                (Token::Comma, _) => (),
+            })
+            .allow_trailing()
+            .collect::<Vec<_>>(),
+    )
+    .then_ignore(select! {
+        (Token::Op(Op::GreaterThan), _) => (),
+    });
+
+    generic_lookahead
+        .ignore_then(generic_list)
+        .or_not()
+        .map(|opt| opt.unwrap_or_default())
+        .labelled("type arguments")
+        .as_context()
+}
+
 fn call_expr<'src>(
     atom: impl AnvParser<'src, ast::ExprNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
+    let type_args = call_type_args();
     let args = fn_call_args(expr);
-    atom.foldl_with(args.repeated(), |callee, args, e| {
+    // parse my_fn<T, U>(args) or my_fn(args)
+    let call_suffix = type_args.then(args);
+    atom.foldl_with(call_suffix.repeated(), |callee, (type_args, args), e| {
         let start = callee.span.start;
         let end = args.last().map(|a| a.span.end).unwrap_or(callee.span.end);
         let span = Span::new(start, end);
@@ -198,7 +336,7 @@ fn call_expr<'src>(
             ast::Call {
                 func: Box::new(callee),
                 args,
-                type_args: vec![],
+                type_args,
             },
             span,
         );
@@ -351,7 +489,7 @@ fn return_type<'src>() -> impl AnvParser<'src, Option<ast::Type>> {
 }
 
 fn type_ident<'src>() -> impl AnvParser<'src, ast::Type> {
-    let typ = select! {
+    let builtin_typ = select! {
         (Token::Keyword(Keyword::Int), _) => ast::Type::Int,
         (Token::Keyword(Keyword::Float), _) => ast::Type::Float,
         (Token::Keyword(Keyword::Bool), _) => ast::Type::Bool,
@@ -359,6 +497,11 @@ fn type_ident<'src>() -> impl AnvParser<'src, ast::Type> {
         (Token::Keyword(Keyword::Void), _) => ast::Type::Void,
     };
 
+    // parse type name as unresolved names (like T, U, ...)
+    let type_name_ref = identifier().map(ast::Type::UnresolvedName);
+
+    // try built-in types first and then type name references
+    let typ = builtin_typ.or(type_name_ref);
     typ.then(
         select! {
             (Token::Question, _) => (),
@@ -367,7 +510,7 @@ fn type_ident<'src>() -> impl AnvParser<'src, ast::Type> {
     )
     .map(|(ty, q)| {
         if q.is_some() {
-            ast::Type::Optional(Box::new(ty))
+            ast::Type::Optional(ty.boxed())
         } else {
             ty
         }

@@ -61,16 +61,45 @@ impl Display for Ident {
     }
 }
 
+/// Id for a generic type variable (T, U)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TypeVarId(pub u32);
+
+impl Display for TypeVarId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "${}", self.0)
+    }
+}
+
+/// A type parameter declared on a generic function (T in fn foo<T>(...))
 #[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: Ident,
+    pub id: TypeVarId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
+    /// Unknown type that needs to be inferred
     Infer,
+    /// Int 64 type
     Int,
+    /// Float 64 type
     Float,
+    /// Boolean type
     Bool,
+    /// String type
     String,
+    /// Void type
     Void,
+    /// Optional type (int? or T?)
     Optional(Box<Type>),
+    /// Function type
     Func { params: Vec<Type>, ret: Box<Type> },
+    /// Generic type variable (T, U)
+    Var(TypeVarId),
+    /// Unresolved type name reference (T before being resolved to Var)
+    UnresolvedName(Ident),
 }
 
 impl Type {
@@ -98,8 +127,16 @@ impl Type {
         matches!(self, Type::Func { .. })
     }
 
-    pub fn is_unresolved(&self) -> bool {
+    pub fn is_infer(&self) -> bool {
         matches!(self, Type::Infer)
+    }
+
+    pub fn is_type_var(&self) -> bool {
+        matches!(self, Type::Var(_))
+    }
+
+    pub fn boxed(&self) -> Box<Self> {
+        Box::new(self.clone())
     }
 }
 
@@ -123,6 +160,8 @@ impl Display for Type {
                 ret
             ),
             Type::Infer => write!(f, "<infer>"),
+            Type::Var(id) => write!(f, "{}", id),
+            Type::UnresolvedName(ident) => write!(f, "{}", ident),
         }
     }
 }
@@ -151,6 +190,7 @@ pub struct Binding {
 pub struct Func {
     pub name: Ident,
     pub visibility: Visibility,
+    pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub ret: Type,
     pub body: BlockNode,

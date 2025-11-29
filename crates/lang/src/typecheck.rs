@@ -2,11 +2,14 @@ use crate::{
     ast::{
         AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
         ExprKind, ExprNode, Func, FuncNode, Ident, Lit, Program, ReturnNode, Stmt, StmtNode, Type,
-        UnaryNode, UnaryOp,
+        TypeParam, TypeVarId, UnaryNode, UnaryOp,
     },
     span::Span,
 };
+use internment::Intern;
 use std::collections::HashMap;
+
+type InferenceSlots = HashMap<TypeVarId, Ident>;
 
 pub fn check_program(program: &Program) -> Result<TypeChecker, Vec<TypeErr>> {
     let mut type_checker = TypeChecker::default();
@@ -47,12 +50,45 @@ struct RetType {
     has_explicit: bool,
 }
 
+/// Key for caching scpecialized generic functions (instantiated with concrete types)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SpecializationKey {
+    func_name: Ident,
+    type_args: Vec<Type>,
+}
+
+#[derive(Debug, Clone)]
+struct SpecializationResult {
+    ret_ty: Type,
+    err_kind: Option<TypeErrKind>,
+}
+
 #[derive(Debug)]
 pub struct TypeChecker {
+    /// Resolved type for each expression
     types: HashMap<ExprId, (Span, Type)>,
+
+    /// Stack of scopes for variable lookup
     scopes: Vec<HashMap<Ident, Type>>,
+
+    /// Stack of return types for function calls
     return_types: Vec<RetType>,
+
+    /// Type constraints to be resolved by inference pass
     constraints: Vec<Constraint>,
+
+    /// Generic type params declared for function
+    func_type_params: HashMap<Ident, Vec<TypeParam>>,
+
+    /// Identify inference slots uniquely across multiple generic calls
+    next_infer_call_id: usize,
+
+    /// Stores the generic function templates for later instantiation at call sites
+    /// the bodies are checked when instantiated with concrete type arguments in a later pass
+    generic_func_templates: HashMap<Ident, FuncNode>,
+
+    /// Stores specialized functions avoiding re-checking for same type arguments
+    specialization_cache: HashMap<SpecializationKey, SpecializationResult>,
 }
 
 impl Default for TypeChecker {
@@ -62,7 +98,19 @@ impl Default for TypeChecker {
             scopes: vec![],
             return_types: vec![],
             constraints: vec![],
+            func_type_params: HashMap::new(),
+            next_infer_call_id: 0,
+            generic_func_templates: HashMap::new(),
+            specialization_cache: HashMap::new(),
         }
+    }
+}
+
+impl TypeChecker {
+    fn next_call_id(&mut self) -> usize {
+        let id = self.next_infer_call_id;
+        self.next_infer_call_id += 1;
+        id
     }
 }
 
@@ -227,6 +275,8 @@ pub enum TypeErrKind {
     UnknownFunction { name: Ident },
     UnresolvedInfer,
     NotAFunction { expr_type: Type },
+    GenericArgNumMismatch { expected: usize, found: usize },
+    NotGenericFunction,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +302,7 @@ fn contains_infer(ty: &Type) -> bool {
     }
 }
 
+/// Checks if 'from' is assignable to 'to'
 fn is_assignable(from: &Type, to: &Type) -> bool {
     use Type::*;
 
@@ -262,7 +313,7 @@ fn is_assignable(from: &Type, to: &Type) -> bool {
     }
 
     // if either side is Infer, we need to unify them
-    let needs_inference = matches!(from, Infer) || matches!(to, Infer);
+    let needs_inference = from.is_infer() || to.is_infer();
     if needs_inference {
         return true;
     }
@@ -303,6 +354,7 @@ fn is_assignable(from: &Type, to: &Type) -> bool {
     }
 }
 
+/// Unifies two types returning the unified type if successful
 fn unify_types(left: &Type, right: &Type, span: Span, errors: &mut Vec<TypeErr>) -> Option<Type> {
     use Type::*;
 
@@ -470,6 +522,20 @@ fn collect_scope_types(stmts: &[StmtNode], type_checker: &mut TypeChecker) {
             Stmt::Func(node) => {
                 let func = &node.node;
                 type_checker.set_var(func.name, type_from_fn(func));
+
+                // if the function is generic, store the type parameters and template
+                // because they are not fully typechecked at definition time until they are used
+                let is_generic = !func.type_params.is_empty();
+                if is_generic {
+                    type_checker
+                        .func_type_params
+                        .insert(func.name, func.type_params.clone());
+
+                    // store the function ast for later instantiation
+                    type_checker
+                        .generic_func_templates
+                        .insert(func.name, node.clone());
+                }
             }
 
             // TODO: consts, structs, type alias, anything that we need to collect first goes here
@@ -478,10 +544,113 @@ fn collect_scope_types(stmts: &[StmtNode], type_checker: &mut TypeChecker) {
     }
 }
 
+/// Builds a fucntion type from the AST node
 fn type_from_fn(func: &Func) -> Type {
     Type::Func {
         params: func.params.iter().map(|param| param.ty.clone()).collect(),
         ret: Box::new(func.ret.clone()),
+    }
+}
+
+/// Substitutes type variables in a type with concrete types from the substitution map
+/// fn(T) -> T where "T = int" then fn(int) -> int
+fn subst_type(ty: &Type, subst: &HashMap<TypeVarId, Type>) -> Type {
+    use Type::*;
+    match ty {
+        Var(id) => subst.get(id).cloned().unwrap_or_else(|| ty.clone()),
+        Optional(inner) => Optional(subst_type(inner, subst).boxed()),
+        Func { params, ret } => Func {
+            params: params.iter().map(|p| subst_type(p, subst)).collect(),
+            ret: subst_type(ret, subst).boxed(),
+        },
+
+        // anything else is passed through unchanged
+        _ => ty.clone(),
+    }
+}
+
+/// Instantiates a generic function type with explicit type arguments
+fn instantiate_func_type(
+    type_params: &[TypeParam],
+    template: &Type,
+    type_args: &[Type],
+    span: Span,
+    errors: &mut Vec<TypeErr>,
+) -> Option<Type> {
+    let same_param_count = type_params.len() == type_args.len();
+    if !same_param_count {
+        errors.push(TypeErr {
+            span,
+            kind: TypeErrKind::GenericArgNumMismatch {
+                expected: type_params.len(),
+                found: type_args.len(),
+            },
+        });
+        return None;
+    }
+
+    let subst = type_params
+        .iter()
+        .zip(type_args.iter())
+        .map(|(param, arg)| (param.id, arg.clone()))
+        .collect();
+
+    Some(subst_type(template, &subst))
+}
+
+/// Creates inference slots for a generic function call
+/// for each type parameter, this creates a synthetic variable
+/// in the type checker initialized to Type::Infer
+fn create_inference_slots(
+    type_params: &[TypeParam],
+    type_checker: &mut TypeChecker,
+    call_id: usize,
+) -> InferenceSlots {
+    type_params
+        .iter()
+        .map(|param| {
+            // lets use as name _infer_<name>_<id>_<call_id>
+            let name = format!("__infer_{}_{}_{}", param.name, param.id.0, call_id);
+            let infer_var_name = Ident(Intern::new(name));
+
+            // initialize the inference slot
+            type_checker.set_var(infer_var_name, Type::Infer);
+
+            // map the type variable id to its synthetic variable name
+            (param.id, infer_var_name)
+        })
+        .collect()
+}
+
+/// Converts 'Type::Var' references to 'TypeRef' for constraints
+fn type_to_ref_with_inference(ty: &Type, slots: &InferenceSlots) -> TypeRef {
+    match ty {
+        // use the synthetic variable ref for type variables
+        Type::Var(id) => slots
+            .get(id)
+            .cloned()
+            .map(TypeRef::Var)
+            .unwrap_or_else(|| TypeRef::Concrete(ty.clone())),
+
+        // anything else just use concrete
+        _ => TypeRef::Concrete(substitute_vars_with_infer(ty, slots)),
+    }
+}
+
+/// Substitutes 'Type::Var' with 'Type::Infer' for nested positions in compound types
+/// imagine infer T from fn my_fn(T?) -> T then my_fn(10) and we should infer int from T?
+fn substitute_vars_with_infer(ty: &Type, slots: &InferenceSlots) -> Type {
+    match ty {
+        Type::Var(id) if slots.contains_key(id) => Type::Infer,
+        Type::Optional(inner) => Type::Optional(substitute_vars_with_infer(inner, slots).boxed()),
+        Type::Func { params, ret } => Type::Func {
+            params: params
+                .iter()
+                .map(|p| substitute_vars_with_infer(p, slots))
+                .collect(),
+            ret: substitute_vars_with_infer(ret, slots).boxed(),
+        },
+        _ => ty.clone(),
     }
 }
 
@@ -506,8 +675,66 @@ fn check_stmt(stmt: &Stmt, type_checker: &mut TypeChecker, errors: &mut Vec<Type
     }
 }
 
+fn check_fn_body(
+    func: &Func,
+    param_types: &[Type],
+    ret_ty: Type,
+    error_span: Span,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) {
+    type_checker.push_scope();
+    type_checker.push_return_type(ret_ty.clone());
+
+    // bind parameters into scope with the provided types
+    for (param, ty) in func.params.iter().zip(param_types.iter()) {
+        type_checker.set_var(param.name, ty.clone());
+    }
+
+    // treat the block as an expression for implicit returns
+    let (body_ty, last_expr_id) = check_block_expr(&func.body, type_checker, errors);
+
+    // void fn cannot have trailing expressions (at least they are void too)
+    let is_void_fn = ret_ty.is_void();
+    if is_void_fn {
+        if !body_ty.is_void() {
+            errors.push(TypeErr {
+                span: error_span,
+                kind: TypeErrKind::MismatchedTypes {
+                    expected: Type::Void,
+                    found: body_ty,
+                },
+            });
+        }
+    } else if let Some(last_id) = last_expr_id {
+        // if there is a last expression, it must be assignable to return type
+        let expr_ref = TypeRef::Expr(last_id);
+        let ret_ref = TypeRef::Concrete(ret_ty.clone());
+        type_checker.constrain_assignable(error_span, expr_ref, ret_ref, errors);
+    } else if !type_checker.has_explicit_return() {
+        // no implicit or explicit return, fn with non-void return is invalid
+        errors.push(TypeErr {
+            span: error_span,
+            kind: TypeErrKind::MismatchedTypes {
+                expected: ret_ty,
+                found: Type::Void,
+            },
+        });
+    }
+
+    type_checker.pop_return_type();
+    type_checker.pop_scope();
+}
+
 fn check_func(fn_node: &FuncNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
     let func = &fn_node.node;
+
+    // if the function is generic we skip checking here
+    // it will be done at instantiation time with concrete types
+    let is_generic = !func.type_params.is_empty();
+    if is_generic {
+        return;
+    }
 
     let Some(ty) = type_checker.get_var(func.name) else {
         errors.push(TypeErr {
@@ -530,63 +757,17 @@ fn check_func(fn_node: &FuncNode, type_checker: &mut TypeChecker, errors: &mut V
         return;
     }
 
-    // new scope so we can add the parameters to the scope
-    // internally for the body a new scope will be pushed but I guess it's fine
-    type_checker.push_scope();
-    type_checker.push_return_type(func.ret.clone());
+    // build param types from the functions declared parameters
+    let param_types: Vec<Type> = func.params.iter().map(|p| p.ty.clone()).collect();
 
-    let pop_scope = |type_checker: &mut TypeChecker| {
-        type_checker.pop_return_type();
-        type_checker.pop_scope();
-    };
-
-    for param in &func.params {
-        type_checker.set_var(param.name, param.ty.clone());
-    }
-
-    // treat the block as an expression for implicit returns
-    let (body_ty, last_expr_id) = check_block_expr(&func.body, type_checker, errors);
-
-    // void fn cannot have trailing expressions (at least they are void too)
-    let is_void_fn = func.ret.is_void();
-    if is_void_fn {
-        let mismatch = !body_ty.is_void();
-        if mismatch {
-            errors.push(TypeErr {
-                span: fn_node.span,
-                kind: TypeErrKind::MismatchedTypes {
-                    expected: Type::Void,
-                    found: body_ty,
-                },
-            });
-        }
-        pop_scope(type_checker);
-        return;
-    }
-
-    let expected_ret = func.ret.clone();
-
-    // if there is a last expression, it must be assignable to return type
-    if let Some(last_id) = last_expr_id {
-        let expr_ref = TypeRef::Expr(last_id);
-        let ret_ref = TypeRef::Concrete(expected_ret);
-        type_checker.constrain_assignable(fn_node.span, expr_ref, ret_ref, errors);
-        pop_scope(type_checker);
-        return;
-    }
-
-    // no implicit or explicit return, fn with non-void return is invaliud
-    if !type_checker.has_explicit_return() {
-        errors.push(TypeErr {
-            span: fn_node.span,
-            kind: TypeErrKind::MismatchedTypes {
-                expected: expected_ret,
-                found: Type::Void,
-            },
-        });
-    }
-
-    pop_scope(type_checker);
+    check_fn_body(
+        func,
+        &param_types,
+        func.ret.clone(),
+        fn_node.span,
+        type_checker,
+        errors,
+    );
 }
 
 fn check_expr(
@@ -624,6 +805,226 @@ fn check_expr(
 fn check_call(call: &CallNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) -> Type {
     let node = &call.node;
     let func_ty = check_expr(&node.func, type_checker, errors);
+
+    // try to get the function name to look up type parameters
+    let func_name = match &node.func.node.kind {
+        ExprKind::Ident(ident) => Some(*ident),
+        _ => None,
+    };
+
+    // lookup type params for generic functions
+    let type_params = func_name
+        .and_then(|name| type_checker.func_type_params.get(&name))
+        .cloned()
+        .unwrap_or_default();
+
+    let is_generic = !type_params.is_empty();
+    let has_type_args = !node.type_args.is_empty();
+
+    // handle generic function calls with template instantiation
+    match (is_generic, has_type_args) {
+        // non generic functions with type params are invalid
+        (false, true) => {
+            errors.push(TypeErr {
+                span: call.span,
+                kind: TypeErrKind::NotGenericFunction,
+            });
+            return Type::Infer;
+        }
+
+        // generic function without type args -> infer type args, then instantiate
+        (true, false) => {
+            let Some(name) = func_name else {
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::NotAFunction {
+                        expr_type: func_ty.clone(),
+                    },
+                });
+                return Type::Infer;
+            };
+
+            // create inference slots for each type param
+            let call_id = type_checker.next_call_id();
+            let slots = create_inference_slots(&type_params, type_checker, call_id);
+
+            // check arguments and generate constraints to infer type args
+            let Type::Func { params, ret: _ } = &func_ty else {
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::NotAFunction {
+                        expr_type: func_ty.clone(),
+                    },
+                });
+                return Type::Infer;
+            };
+
+            // check argument count
+            let same_param_count = params.len() == node.args.len();
+            if !same_param_count {
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::MismatchedTypes {
+                        expected: func_ty.clone(),
+                        found: Type::Func {
+                            params: vec![Type::Infer; node.args.len()],
+                            ret: Box::new(Type::Infer),
+                        },
+                    },
+                });
+                return Type::Infer;
+            }
+
+            // check each argument and add constraints for type inference
+            for (arg_expr, param_ty) in node.args.iter().zip(params.iter()) {
+                check_expr(arg_expr, type_checker, errors);
+                let arg_ref = TypeRef::Expr(arg_expr.node.id);
+                let param_ref = type_to_ref_with_inference(param_ty, &slots);
+                type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
+            }
+
+            // resolve constraints to get inferred types
+            resolve_constraints(type_checker, errors); // FIXME: isn't resolving all the ast here too much? maybe we can do this in a more efficient way?
+
+            // read back the inferred types from the slots
+            let mut inferred_type_args = Vec::with_capacity(type_params.len());
+            let mut inference_failed = false;
+
+            for param in &type_params {
+                let slot_var = slots
+                    .get(&param.id)
+                    .and_then(|slot_ident| type_checker.get_var(*slot_ident));
+
+                let ty = slot_var
+                    .filter(|ty| !contains_infer(ty))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        inference_failed = true;
+                        Type::Infer
+                    });
+
+                inferred_type_args.push(ty);
+            }
+
+            if inference_failed {
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::UnresolvedInfer,
+                });
+                return Type::Infer;
+            }
+
+            // now instantiate and check the function body with the inferred types
+            return instantiate_and_check_fn(
+                name,
+                &inferred_type_args,
+                call.span,
+                type_checker,
+                errors,
+            );
+        }
+
+        // generic function with type args -> explicit instantiation
+        (true, true) => {
+            // error if not a function
+            let Some(name) = func_name else {
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::NotAFunction {
+                        expr_type: func_ty.clone(),
+                    },
+                });
+                return Type::Infer;
+            };
+
+            let same_param_count = type_params.len() == node.type_args.len();
+            if !same_param_count {
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::GenericArgNumMismatch {
+                        expected: type_params.len(),
+                        found: node.type_args.len(),
+                    },
+                });
+                return Type::Infer;
+            }
+
+            // check arguments against the instantiated parameter types
+            let Type::Func { params, ret: _ } = &func_ty else {
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::NotAFunction {
+                        expr_type: func_ty.clone(),
+                    },
+                });
+                return Type::Infer;
+            };
+
+            // build map substitution for parameter type checking
+            let subst = type_params
+                .iter()
+                .zip(node.type_args.iter())
+                .map(|(param, arg)| (param.id, arg.clone()))
+                .collect::<HashMap<TypeVarId, _>>();
+
+            let params_count = params.len() == node.args.len();
+            if !params_count {
+                let instantiated_ty = instantiate_func_type(
+                    &type_params,
+                    &func_ty,
+                    &node.type_args,
+                    call.span,
+                    errors,
+                );
+                errors.push(TypeErr {
+                    span: call.span,
+                    kind: TypeErrKind::MismatchedTypes {
+                        expected: instantiated_ty.unwrap_or(func_ty.clone()),
+                        found: Type::Func {
+                            params: vec![Type::Infer; node.args.len()],
+                            ret: Box::new(Type::Infer),
+                        },
+                    },
+                });
+                return Type::Infer;
+            }
+
+            // check each argument against the substituted parameter type
+            for (arg_expr, param_ty) in node.args.iter().zip(params.iter()) {
+                check_expr(arg_expr, type_checker, errors);
+                let instantiated_param_ty = subst_type(param_ty, &subst);
+                let arg_ref = TypeRef::Expr(arg_expr.node.id);
+                let param_ref = TypeRef::Concrete(instantiated_param_ty);
+                type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
+            }
+
+            // now instantiate and check the function body with the explicit types
+            return instantiate_and_check_fn(
+                name,
+                &node.type_args,
+                call.span,
+                type_checker,
+                errors,
+            );
+        }
+
+        // non generic function without type args then must be a normal call
+        (false, false) => {}
+    }
+
+    // fallback to normal call
+    check_call_with_type(call, func_ty, type_checker, errors)
+}
+
+/// Check a function call given the function type
+fn check_call_with_type(
+    call: &CallNode,
+    func_ty: Type,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let node = &call.node;
+
     match func_ty.clone() {
         Type::Func { params, ret } => {
             let same_params_len = params.len() == node.args.len();
@@ -658,6 +1059,111 @@ fn check_call(call: &CallNode, type_checker: &mut TypeChecker, errors: &mut Vec<
             Type::Infer
         }
     }
+}
+
+/// Instantiates a generic function with concrete type arguments and typechecks the specialized body
+fn instantiate_and_check_fn(
+    func_name: Ident,
+    type_args: &[Type],
+    call_span: Span,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let cache_key = SpecializationKey {
+        func_name,
+        type_args: type_args.to_vec(),
+    };
+
+    // check cache first
+    if let Some(cached) = type_checker.specialization_cache.get(&cache_key) {
+        // if there was an error we report it with the current call site span
+        if let Some(err_kind) = &cached.err_kind {
+            errors.push(TypeErr {
+                span: call_span,
+                kind: err_kind.clone(),
+            });
+        }
+        return cached.ret_ty.clone();
+    }
+
+    // look up the generic function template
+    let Some(fn_template) = type_checker.generic_func_templates.get(&func_name).cloned() else {
+        errors.push(TypeErr {
+            span: call_span,
+            kind: TypeErrKind::UnknownFunction { name: func_name },
+        });
+        return Type::Infer;
+    };
+
+    // look up type parameters
+    let Some(type_params) = type_checker.func_type_params.get(&func_name).cloned() else {
+        errors.push(TypeErr {
+            span: call_span,
+            kind: TypeErrKind::UnknownFunction { name: func_name },
+        });
+        return Type::Infer;
+    };
+
+    // verify arity
+    let same_param_count = type_params.len() == type_args.len();
+    if !same_param_count {
+        errors.push(TypeErr {
+            span: call_span,
+            kind: TypeErrKind::GenericArgNumMismatch {
+                expected: type_params.len(),
+                found: type_args.len(),
+            },
+        });
+        return Type::Infer;
+    }
+
+    // build substitution map to convert TypeVarId -> concrete Type
+    let subst: HashMap<TypeVarId, Type> = type_params
+        .iter()
+        .zip(type_args.iter())
+        .map(|(param, arg)| (param.id, arg.clone()))
+        .collect();
+
+    let func = &fn_template.node;
+
+    // compute the specialized parameter and return types
+    let specialized_param_types: Vec<Type> = func
+        .params
+        .iter()
+        .map(|p| subst_type(&p.ty, &subst))
+        .collect();
+    let specialized_ret = subst_type(&func.ret, &subst);
+
+    // typecheck the body with specialized types
+    let mut body_errors = vec![];
+    check_fn_body(
+        func,
+        &specialized_param_types,
+        specialized_ret.clone(),
+        call_span,
+        type_checker,
+        &mut body_errors,
+    );
+
+    // cache the result
+    let err_kind = body_errors.first().map(|err| err.kind.clone());
+    type_checker.specialization_cache.insert(
+        cache_key,
+        SpecializationResult {
+            ret_ty: specialized_ret.clone(),
+            err_kind,
+        },
+    );
+
+    // report any errors from the body with the call site span
+    for err in body_errors {
+        errors.push(TypeErr {
+            span: call_span,
+            kind: err.kind,
+        });
+    }
+
+    specialized_ret
 }
 
 fn check_binary(
@@ -883,7 +1389,7 @@ fn check_compound_assign_op(
         .get_type_ref(&target_ref)
         .unwrap_or(Type::Infer);
 
-    let is_numeric = target_ty.is_num() || target_ty.is_unresolved();
+    let is_numeric = target_ty.is_num() || target_ty.is_infer();
     if !is_numeric {
         errors.push(TypeErr {
             span: assign.span,
@@ -962,11 +1468,13 @@ fn check_ret(ret: &ReturnNode, type_checker: &mut TypeChecker, errors: &mut Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{
-        Assign, Binary, Binding, Block, BlockNode, Call, Expr, Func, Mutability, Param, Return,
-        Unary, Visibility,
+    use crate::{
+        ast::{
+            Assign, Binary, Binding, Block, BlockNode, Call, Expr, Func, Mutability, Param, Return,
+            TypeParam, TypeVarId, Unary, Visibility,
+        },
+        span::Span,
     };
-    use crate::span::Span;
     use internment::Intern;
     use std::cell::Cell;
 
@@ -1141,6 +1649,7 @@ mod tests {
                 node: Func {
                     name: dummy_ident(name),
                     visibility: Visibility::Private,
+                    type_params: vec![],
                     params: params
                         .into_iter()
                         .map(|(n, t)| Param {
@@ -2577,5 +3086,873 @@ mod tests {
 
         let tcx = run_ok(prog);
         assert_expr_type(&tcx, call_id, Type::Int);
+    }
+
+    fn type_var(id: u32) -> Type {
+        Type::Var(TypeVarId(id))
+    }
+
+    // ---- unification tests for type variables ----
+
+    #[test]
+    fn test_unify_same_type_var() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // T unifies with T (same variable)
+        let t = type_var(0);
+        let result = unify_types(&t, &t, span, &mut errors);
+        assert_eq!(result, Some(t.clone()));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_unify_different_type_vars_error() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // T and U are different type variables
+        let t = type_var(0);
+        let u = type_var(1);
+        let result = unify_types(&t, &u, span, &mut errors);
+        assert_eq!(result, None);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0].kind,
+            TypeErrKind::MismatchedTypes { expected, found }
+            if *expected == t && *found == u
+        ));
+    }
+
+    #[test]
+    fn test_unify_type_var_with_concrete_error() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // T and int are different types
+        let t = type_var(0);
+        let result = unify_types(&t, &Type::Int, span, &mut errors);
+        assert_eq!(result, None);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0].kind,
+            TypeErrKind::MismatchedTypes { expected, found }
+            if *expected == t && *found == Type::Int
+        ));
+
+        // int and T are different types
+        errors.clear();
+        let result = unify_types(&Type::Int, &t, span, &mut errors);
+        assert_eq!(result, None);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0].kind,
+            TypeErrKind::MismatchedTypes { expected, found }
+            if *expected == Type::Int && *found == t
+        ));
+    }
+
+    #[test]
+    fn test_unify_func_with_same_type_vars() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // fn(T) -> T unifies with itself
+        let t = type_var(0);
+        let func_type = Type::Func {
+            params: vec![t.clone()],
+            ret: Box::new(t.clone()),
+        };
+        let result = unify_types(&func_type, &func_type, span, &mut errors);
+        assert_eq!(result, Some(func_type.clone()));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_unify_func_with_different_type_vars_error() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // fn(T) -> T and fn(U) -> U are different functions
+        let t = type_var(0);
+        let u = type_var(1);
+        let func_t = Type::Func {
+            params: vec![t.clone()],
+            ret: Box::new(t.clone()),
+        };
+        let func_u = Type::Func {
+            params: vec![u.clone()],
+            ret: Box::new(u.clone()),
+        };
+        let result = unify_types(&func_t, &func_u, span, &mut errors);
+        assert_eq!(result, None);
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn test_unify_optional_with_same_type_var() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // T? unifies with T?
+        let t = type_var(0);
+        let opt_t = Type::Optional(Box::new(t.clone()));
+        let result = unify_types(&opt_t, &opt_t, span, &mut errors);
+        assert_eq!(result, Some(opt_t.clone()));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_unify_optional_with_different_type_vars_error() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // T? and U? are different optional types
+        let t = type_var(0);
+        let u = type_var(1);
+        let opt_t = Type::Optional(Box::new(t.clone()));
+        let opt_u = Type::Optional(Box::new(u.clone()));
+        let result = unify_types(&opt_t, &opt_u, span, &mut errors);
+        assert_eq!(result, None);
+        assert!(!errors.is_empty());
+    }
+
+    // ---- assignability tests for type variables ----
+
+    #[test]
+    fn test_assignable_same_type_var() {
+        // T is assignable to T
+        let t = type_var(0);
+        assert!(is_assignable(&t, &t));
+    }
+
+    #[test]
+    fn test_assignable_different_type_vars() {
+        // T is NOT assignable to U
+        let t = type_var(0);
+        let u = type_var(1);
+        assert!(!is_assignable(&t, &u));
+    }
+
+    #[test]
+    fn test_assignable_type_var_to_concrete() {
+        // T is NOT assignable to int
+        let t = type_var(0);
+        assert!(!is_assignable(&t, &Type::Int));
+    }
+
+    #[test]
+    fn test_assignable_concrete_to_type_var() {
+        // int is NOT assignable to T
+        let t = type_var(0);
+        assert!(!is_assignable(&Type::Int, &t));
+    }
+
+    #[test]
+    fn test_assignable_func_with_same_type_vars() {
+        // fn(T) -> U is assignable to fn(T) -> U
+        let t = type_var(0);
+        let u = type_var(1);
+        let func_type = Type::Func {
+            params: vec![t.clone()],
+            ret: Box::new(u.clone()),
+        };
+        assert!(is_assignable(&func_type, &func_type));
+    }
+
+    #[test]
+    fn test_assignable_func_with_different_type_vars() {
+        // fn(T) -> T is NOT assignable to fn(U) -> U
+        let t = type_var(0);
+        let u = type_var(1);
+        let func_t = Type::Func {
+            params: vec![t.clone()],
+            ret: Box::new(t.clone()),
+        };
+        let func_u = Type::Func {
+            params: vec![u.clone()],
+            ret: Box::new(u.clone()),
+        };
+        assert!(!is_assignable(&func_t, &func_u));
+    }
+
+    #[test]
+    fn test_assignable_optional_same_type_var() {
+        // T? is assignable to T?
+        let t = type_var(0);
+        let opt_t = Type::Optional(Box::new(t.clone()));
+        assert!(is_assignable(&opt_t, &opt_t));
+    }
+
+    #[test]
+    fn test_assignable_optional_different_type_vars() {
+        // T? is NOT assignable to U?
+        let t = type_var(0);
+        let u = type_var(1);
+        let opt_t = Type::Optional(Box::new(t.clone()));
+        let opt_u = Type::Optional(Box::new(u.clone()));
+        assert!(!is_assignable(&opt_t, &opt_u));
+    }
+
+    // ---- contains_infer tests for type variables ----
+
+    #[test]
+    fn test_contains_infer_type_var_is_false() {
+        // type variables are not considered as containing inference
+        let t = type_var(0);
+        assert!(!contains_infer(&t));
+    }
+
+    #[test]
+    fn test_contains_infer_optional_type_var_is_false() {
+        // T? does not contain infer
+        let t = type_var(0);
+        let opt_t = Type::Optional(Box::new(t));
+        assert!(!contains_infer(&opt_t));
+    }
+
+    #[test]
+    fn test_contains_infer_func_with_type_var_is_false() {
+        // fn(T) -> U does not contain infer
+        let t = type_var(0);
+        let u = type_var(1);
+        let func_type = Type::Func {
+            params: vec![t],
+            ret: Box::new(u),
+        };
+        assert!(!contains_infer(&func_type));
+    }
+
+    #[test]
+    fn test_contains_infer_optional_infer() {
+        // infer? returns true
+        let opt_infer = Type::Optional(Box::new(Type::Infer));
+        assert!(contains_infer(&opt_infer));
+    }
+
+    #[test]
+    fn test_contains_infer_func_with_infer() {
+        // fn(Infer) -> int returns true
+        let func_type = Type::Func {
+            params: vec![Type::Infer],
+            ret: Box::new(Type::Int),
+        };
+        assert!(contains_infer(&func_type));
+    }
+
+    // ---- type variable display tests ----
+
+    #[test]
+    fn test_type_var_display() {
+        let t = type_var(0);
+        assert_eq!(format!("{}", t), "$0");
+
+        let u = type_var(42);
+        assert_eq!(format!("{}", u), "$42");
+    }
+
+    #[test]
+    fn test_optional_type_var_display() {
+        let t = type_var(0);
+        let opt_t = Type::Optional(t.boxed());
+        assert_eq!(format!("{}", opt_t), "$0?");
+    }
+
+    #[test]
+    fn test_func_type_var_display() {
+        let t = type_var(0);
+        let u = type_var(1);
+        let func_type = Type::Func {
+            params: vec![t],
+            ret: u.boxed(),
+        };
+        assert_eq!(format!("{}", func_type), "fn($0) -> $1");
+    }
+
+    // ---- type variable predicates tests ----
+
+    #[test]
+    fn test_is_type_var() {
+        let t = type_var(0);
+        assert!(t.is_type_var());
+        assert!(!Type::Int.is_type_var());
+        assert!(!Type::Infer.is_type_var());
+    }
+
+    #[test]
+    fn test_type_var_is_not_inferred() {
+        // type variables are not considered infer
+        let t = type_var(0);
+        assert!(!t.is_infer());
+        assert!(Type::Infer.is_infer());
+    }
+
+    #[test]
+    fn test_type_var_is_not_num_bool_etc() {
+        let t = type_var(0);
+        assert!(!t.is_num());
+        assert!(!t.is_bool());
+        assert!(!t.is_str());
+        assert!(!t.is_void());
+        assert!(!t.is_optional());
+        assert!(!t.is_func());
+    }
+
+    fn type_param(name: &str, id: u32) -> TypeParam {
+        TypeParam {
+            name: dummy_ident(name),
+            id: TypeVarId(id),
+        }
+    }
+
+    // ---- subst_type tests ----
+
+    #[test]
+    fn test_subst_type_simple() {
+        // substitute T -> int in T
+        let t_var = type_var(0);
+        let mut subst = std::collections::HashMap::new();
+        subst.insert(TypeVarId(0), Type::Int);
+
+        let result = subst_type(&t_var, &subst);
+        assert_eq!(result, Type::Int);
+    }
+
+    #[test]
+    fn test_subst_type_optional() {
+        // substitute T -> int in T?
+        let t_var = type_var(0);
+        let opt_t = Type::Optional(Box::new(t_var));
+        let mut subst = std::collections::HashMap::new();
+        subst.insert(TypeVarId(0), Type::Int);
+
+        let result = subst_type(&opt_t, &subst);
+        assert_eq!(result, Type::Optional(Box::new(Type::Int)));
+    }
+
+    #[test]
+    fn test_subst_type_func() {
+        // substitute T -> int, U -> bool in fn(T) -> U
+        let t_var = type_var(0);
+        let u_var = type_var(1);
+        let func_ty = Type::Func {
+            params: vec![t_var],
+            ret: Box::new(u_var),
+        };
+        let mut subst = std::collections::HashMap::new();
+        subst.insert(TypeVarId(0), Type::Int);
+        subst.insert(TypeVarId(1), Type::Bool);
+
+        let result = subst_type(&func_ty, &subst);
+        assert_eq!(
+            result,
+            Type::Func {
+                params: vec![Type::Int],
+                ret: Box::new(Type::Bool),
+            }
+        );
+    }
+
+    #[test]
+    fn test_subst_type_repeated_var() {
+        // substitute T -> int in fn(T, T) -> T
+        let t_var = type_var(0);
+        let func_ty = Type::Func {
+            params: vec![t_var.clone(), t_var.clone()],
+            ret: Box::new(t_var),
+        };
+        let mut subst = std::collections::HashMap::new();
+        subst.insert(TypeVarId(0), Type::Int);
+
+        let result = subst_type(&func_ty, &subst);
+        assert_eq!(
+            result,
+            Type::Func {
+                params: vec![Type::Int, Type::Int],
+                ret: Box::new(Type::Int),
+            }
+        );
+    }
+
+    #[test]
+    fn test_subst_type_no_change_for_concrete() {
+        // substitute T -> int in int (no change)
+        let mut subst = std::collections::HashMap::new();
+        subst.insert(TypeVarId(0), Type::Int);
+
+        let result = subst_type(&Type::Bool, &subst);
+        assert_eq!(result, Type::Bool);
+    }
+
+    // ---- instantiate_func_type tests ----
+
+    #[test]
+    fn test_instantiate_identity() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // fn identity<T>(x: T) -> T instantiated with <int> yields fn(int) -> int
+        let type_params = vec![type_param("T", 0)];
+        let t_var = type_var(0);
+        let template = Type::Func {
+            params: vec![t_var.clone()],
+            ret: Box::new(t_var),
+        };
+        let type_args = vec![Type::Int];
+
+        let result = instantiate_func_type(&type_params, &template, &type_args, span, &mut errors);
+        assert!(errors.is_empty());
+        assert_eq!(
+            result,
+            Some(Type::Func {
+                params: vec![Type::Int],
+                ret: Box::new(Type::Int),
+            })
+        );
+    }
+
+    #[test]
+    fn test_instantiate_two_params() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // fn pair<T, U>(a: T, b: U) -> T? instantiated with <int, bool> yields fn(int, bool) -> int?
+        let type_params = vec![type_param("T", 0), type_param("U", 1)];
+        let t_var = type_var(0);
+        let u_var = type_var(1);
+        let template = Type::Func {
+            params: vec![t_var.clone(), u_var],
+            ret: Box::new(Type::Optional(Box::new(t_var))),
+        };
+        let type_args = vec![Type::Int, Type::Bool];
+
+        let result = instantiate_func_type(&type_params, &template, &type_args, span, &mut errors);
+        assert!(errors.is_empty());
+        assert_eq!(
+            result,
+            Some(Type::Func {
+                params: vec![Type::Int, Type::Bool],
+                ret: Box::new(Type::Optional(Box::new(Type::Int))),
+            })
+        );
+    }
+
+    #[test]
+    fn test_instantiate_arity_mismatch_too_few() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // fn<T, U> instantiated with <int> (too few)
+        let type_params = vec![type_param("T", 0), type_param("U", 1)];
+        let template = Type::Func {
+            params: vec![type_var(0), type_var(1)],
+            ret: Box::new(Type::Void),
+        };
+        let type_args = vec![Type::Int];
+
+        let result = instantiate_func_type(&type_params, &template, &type_args, span, &mut errors);
+        assert_eq!(result, None);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0].kind,
+            TypeErrKind::GenericArgNumMismatch {
+                expected: 2,
+                found: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn test_instantiate_arity_mismatch_too_many() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        // fn<T> instantiated with <int, bool, string> (too many)
+        let type_params = vec![type_param("T", 0)];
+        let template = Type::Func {
+            params: vec![type_var(0)],
+            ret: Box::new(Type::Void),
+        };
+        let type_args = vec![Type::Int, Type::Bool, Type::String];
+
+        let result = instantiate_func_type(&type_params, &template, &type_args, span, &mut errors);
+        assert_eq!(result, None);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0].kind,
+            TypeErrKind::GenericArgNumMismatch {
+                expected: 1,
+                found: 3
+            }
+        ));
+    }
+
+    /// helper to create a generic function declaration
+    fn generic_fn_decl(
+        name: &str,
+        type_params: Vec<TypeParam>,
+        params: Vec<(&str, Type)>,
+        ret: Type,
+        body: Vec<StmtNode>,
+    ) -> StmtNode {
+        StmtNode {
+            node: Stmt::Func(FuncNode {
+                node: Func {
+                    name: dummy_ident(name),
+                    visibility: Visibility::Private,
+                    type_params,
+                    params: params
+                        .into_iter()
+                        .map(|(n, t)| Param {
+                            name: dummy_ident(n),
+                            ty: t,
+                        })
+                        .collect(),
+                    ret,
+                    body: BlockNode {
+                        node: Block { stmts: body },
+                        span: dummy_span(),
+                    },
+                },
+                span: dummy_span(),
+            }),
+            span: dummy_span(),
+        }
+    }
+
+    /// helper to create a call expression with explicit type arguments
+    fn call_expr_with_type_args(
+        func: ExprNode,
+        args: Vec<ExprNode>,
+        type_args: Vec<Type>,
+    ) -> ExprNode {
+        ExprNode {
+            node: Expr::new(
+                ExprKind::Call(CallNode {
+                    node: Call {
+                        func: Box::new(func),
+                        args,
+                        type_args,
+                    },
+                    span: dummy_span(),
+                }),
+                next_expr_id(),
+            ),
+            span: dummy_span(),
+        }
+    }
+
+    #[test]
+    fn test_template_generic_add_with_int_ok() {
+        reset_expr_ids();
+
+        // fn add<T>(a: T, b: T) -> T { a + b }
+        // let x = add(1, 2);
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let add_fn = generic_fn_decl(
+            "add",
+            type_params,
+            vec![("a", t_type.clone()), ("b", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(binary_expr(
+                ident_expr("a"),
+                BinaryOp::Add,
+                ident_expr("b"),
+            ))],
+        );
+
+        let call = call_expr(ident_expr("add"), vec![lit_int(1), lit_int(2)]);
+        let call_id = get_expr_id(&call);
+        let binding = let_binding("x", None, call);
+
+        let prog = program(vec![add_fn, binding]);
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, call_id, Type::Int);
+    }
+
+    #[test]
+    fn test_template_generic_add_with_float_ok() {
+        reset_expr_ids();
+
+        // fn add<T>(a: T, b: T) -> T { a + b }
+        // let x = add(1.0, 2.0);
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let add_fn = generic_fn_decl(
+            "add",
+            type_params,
+            vec![("a", t_type.clone()), ("b", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(binary_expr(
+                ident_expr("a"),
+                BinaryOp::Add,
+                ident_expr("b"),
+            ))],
+        );
+
+        let call = call_expr(ident_expr("add"), vec![lit_float(1.0), lit_float(2.0)]);
+        let call_id = get_expr_id(&call);
+        let binding = let_binding("x", None, call);
+
+        let prog = program(vec![add_fn, binding]);
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, call_id, Type::Float);
+    }
+
+    #[test]
+    fn test_template_generic_add_with_bool_err() {
+        reset_expr_ids();
+
+        // fn add<T>(a: T, b: T) -> T { a + b }
+        // let x = add(true, false); // Error: bool + bool is invalid
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let add_fn = generic_fn_decl(
+            "add",
+            type_params,
+            vec![("a", t_type.clone()), ("b", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(binary_expr(
+                ident_expr("a"),
+                BinaryOp::Add,
+                ident_expr("b"),
+            ))],
+        );
+
+        let call = call_expr(ident_expr("add"), vec![lit_bool(true), lit_bool(false)]);
+        let binding = let_binding("x", None, call);
+
+        let prog = program(vec![add_fn, binding]);
+        let errors = run_err(prog);
+
+        assert!(!errors.is_empty());
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(&e.kind, TypeErrKind::MismatchedTypes { .. })),
+            "Expected MismatchedTypes error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_template_generic_explicit_type_args_ok() {
+        reset_expr_ids();
+
+        // fn add<T>(a: T, b: T) -> T { a + b }
+        // let x = add<int>(1, 2);
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let add_fn = generic_fn_decl(
+            "add",
+            type_params,
+            vec![("a", t_type.clone()), ("b", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(binary_expr(
+                ident_expr("a"),
+                BinaryOp::Add,
+                ident_expr("b"),
+            ))],
+        );
+
+        let call = call_expr_with_type_args(
+            ident_expr("add"),
+            vec![lit_int(1), lit_int(2)],
+            vec![Type::Int],
+        );
+        let call_id = get_expr_id(&call);
+        let binding = let_binding("x", None, call);
+
+        let prog = program(vec![add_fn, binding]);
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, call_id, Type::Int);
+    }
+
+    #[test]
+    fn test_template_generic_explicit_type_args_bool_err() {
+        reset_expr_ids();
+
+        // fn add<T>(a: T, b: T) -> T { a + b }
+        // let x = add<bool>(true, false); // Error: bool + bool is invalid
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let add_fn = generic_fn_decl(
+            "add",
+            type_params,
+            vec![("a", t_type.clone()), ("b", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(binary_expr(
+                ident_expr("a"),
+                BinaryOp::Add,
+                ident_expr("b"),
+            ))],
+        );
+
+        let call = call_expr_with_type_args(
+            ident_expr("add"),
+            vec![lit_bool(true), lit_bool(false)],
+            vec![Type::Bool],
+        );
+        let binding = let_binding("x", None, call);
+
+        let prog = program(vec![add_fn, binding]);
+        let errors = run_err(prog);
+        assert!(!errors.is_empty());
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(&e.kind, TypeErrKind::MismatchedTypes { .. })),
+            "Expected MismatchedTypes error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_template_generic_specialization_cache() {
+        reset_expr_ids();
+
+        // fn add<T>(a: T, b: T) -> T { a + b }
+        // let x = add(1, 2);
+        // let y = add(10, 20); // same instantiation shoudl use cache
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let add_fn = generic_fn_decl(
+            "add",
+            type_params,
+            vec![("a", t_type.clone()), ("b", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(binary_expr(
+                ident_expr("a"),
+                BinaryOp::Add,
+                ident_expr("b"),
+            ))],
+        );
+
+        let call1 = call_expr(ident_expr("add"), vec![lit_int(1), lit_int(2)]);
+        let call1_id = get_expr_id(&call1);
+        let binding1 = let_binding("x", None, call1);
+
+        let call2 = call_expr(ident_expr("add"), vec![lit_int(10), lit_int(20)]);
+        let call2_id = get_expr_id(&call2);
+        let binding2 = let_binding("y", None, call2);
+
+        let prog = program(vec![add_fn, binding1, binding2]);
+        let tcx = run_ok(prog);
+
+        assert_expr_type(&tcx, call1_id, Type::Int);
+        assert_expr_type(&tcx, call2_id, Type::Int);
+    }
+
+    #[test]
+    fn test_template_generic_multiple_instantiations() {
+        reset_expr_ids();
+
+        // fn add<T>(a: T, b: T) -> T { a + b }
+        // let x = add(1, 2);       // T = int
+        // let y = add(1.0, 2.0);   // T = float
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let add_fn = generic_fn_decl(
+            "add",
+            type_params,
+            vec![("a", t_type.clone()), ("b", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(binary_expr(
+                ident_expr("a"),
+                BinaryOp::Add,
+                ident_expr("b"),
+            ))],
+        );
+
+        let call1 = call_expr(ident_expr("add"), vec![lit_int(1), lit_int(2)]);
+        let call1_id = get_expr_id(&call1);
+        let binding1 = let_binding("x", None, call1);
+
+        let call2 = call_expr(ident_expr("add"), vec![lit_float(1.0), lit_float(2.0)]);
+        let call2_id = get_expr_id(&call2);
+        let binding2 = let_binding("y", None, call2);
+
+        let prog = program(vec![add_fn, binding1, binding2]);
+        let tcx = run_ok(prog);
+
+        // first call should have type int
+        assert_expr_type(&tcx, call1_id, Type::Int);
+        // second call should have type float
+        assert_expr_type(&tcx, call2_id, Type::Float);
+    }
+
+    #[test]
+    fn test_template_generic_identity_ok() {
+        reset_expr_ids();
+
+        // fn identity<T>(x: T) -> T { x }
+        // let a = identity(42);
+        // let b = identity(true);
+        let t_id = TypeVarId(0);
+        let t_type = Type::Var(t_id);
+        let type_params = vec![TypeParam {
+            name: dummy_ident("T"),
+            id: t_id,
+        }];
+
+        let identity_fn = generic_fn_decl(
+            "identity",
+            type_params,
+            vec![("x", t_type.clone())],
+            t_type.clone(),
+            vec![expr_stmt(ident_expr("x"))],
+        );
+
+        let call1 = call_expr(ident_expr("identity"), vec![lit_int(42)]);
+        let call1_id = get_expr_id(&call1);
+        let binding1 = let_binding("a", None, call1);
+
+        let call2 = call_expr(ident_expr("identity"), vec![lit_bool(true)]);
+        let call2_id = get_expr_id(&call2);
+        let binding2 = let_binding("b", None, call2);
+
+        let prog = program(vec![identity_fn, binding1, binding2]);
+        let tcx = run_ok(prog);
+
+        // first call should have type int
+        assert_expr_type(&tcx, call1_id, Type::Int);
+        // second call should have type bool
+        assert_expr_type(&tcx, call2_id, Type::Bool);
     }
 }
