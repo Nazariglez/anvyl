@@ -1,8 +1,8 @@
 use crate::{
     ast::{
         AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
-        ExprKind, ExprNode, Func, FuncNode, Ident, Lit, Program, ReturnNode, Stmt, StmtNode, Type,
-        TypeParam, TypeVarId, UnaryNode, UnaryOp,
+        ExprKind, ExprNode, Func, FuncNode, Ident, IfNode, Lit, Program, ReturnNode, Stmt,
+        StmtNode, Type, TypeParam, TypeVarId, UnaryNode, UnaryOp,
     },
     span::Span,
 };
@@ -277,6 +277,8 @@ pub enum TypeErrKind {
     NotAFunction { expr_type: Type },
     GenericArgNumMismatch { expected: usize, found: usize },
     NotGenericFunction,
+    IfConditionNotBool { found: Type },
+    IfMissingElse,
 }
 
 #[derive(Debug, Clone)]
@@ -796,6 +798,7 @@ fn check_expr(
         ExprKind::Binary(bin) => check_binary(bin, type_checker, errors),
         ExprKind::Unary(unary) => check_unary(unary, type_checker, errors),
         ExprKind::Assign(assign) => check_assign(assign, type_checker, errors),
+        ExprKind::If(if_node) => check_if(if_node, type_checker, errors),
     };
 
     type_checker.set_type(expr_node.node.id, ty.clone(), expr_node.span);
@@ -1403,9 +1406,57 @@ fn check_compound_assign_op(
     Type::Void
 }
 
+fn check_if(if_node: &IfNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) -> Type {
+    let node = &if_node.node;
+
+    let cond_ty = check_expr(&node.cond, type_checker, errors);
+    let maybe_bool = cond_ty.is_bool() || cond_ty.is_infer();
+    if !maybe_bool {
+        errors.push(TypeErr {
+            span: node.cond.span,
+            kind: TypeErrKind::IfConditionNotBool { found: cond_ty },
+        });
+    }
+
+    let (then_ty, _) = check_block_expr(&node.then_block, type_checker, errors);
+
+    // if there is no else block then the type is void and this must be a statment
+    let Some(else_block) = &node.else_block else {
+        return Type::Void;
+    };
+
+    let (else_ty, _) = check_block_expr(else_block, type_checker, errors);
+
+    // unify branch types
+    let same_branch_ty = then_ty == else_ty;
+    if !same_branch_ty {
+        let is_unifiable = then_ty.is_infer() || else_ty.is_infer();
+        if !is_unifiable {
+            errors.push(TypeErr {
+                span: if_node.span,
+                kind: TypeErrKind::MismatchedTypes {
+                    expected: then_ty.clone(),
+                    found: else_ty.clone(),
+                },
+            });
+            return Type::Infer;
+        }
+    }
+
+    // return the type of the branch that is not inferred
+    if then_ty.is_infer() { else_ty } else { then_ty }
+}
+
 fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
     let node = &binding.node;
     check_expr(&node.value, type_checker, errors);
+
+    if is_if_without_else(&node.value) {
+        errors.push(TypeErr {
+            span: node.value.span,
+            kind: TypeErrKind::IfMissingElse,
+        });
+    }
 
     let val_ref = TypeRef::Expr(node.value.node.id);
 
@@ -1428,6 +1479,13 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
     let annot_ref = TypeRef::Concrete(annot_ty.clone());
     type_checker.constrain_assignable(binding.span, val_ref, annot_ref, errors);
     type_checker.set_var(node.name, annot_ty.clone());
+}
+
+fn is_if_without_else(expr: &ExprNode) -> bool {
+    match &expr.node.kind {
+        ExprKind::If(if_node) => if_node.node.else_block.is_none(),
+        _ => false,
+    }
 }
 
 fn check_ret(ret: &ReturnNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {

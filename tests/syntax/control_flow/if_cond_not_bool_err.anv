@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Condition of if expression must be bool
+
+fn main() {
+    let x: int = 1;
+    let y = if x { 1 } else { 2 };
+}
+

@@ -102,6 +102,14 @@ pub fn report_typecheck_errors(
                 "Function is not generic".to_string(),
                 "type arguments cannot be provided for a non-generic function".to_string(),
             ),
+            TypeErrKind::IfConditionNotBool { found } => (
+                "Condition of if expression must be bool".to_string(),
+                format!("found '{found}'"),
+            ),
+            TypeErrKind::IfMissingElse => (
+                "if expression used as value must have an else branch".to_string(),
+                "add an else branch to use this if expression as a value".to_string(),
+            ),
         };
 
         emit_report(src, file_path, byte_range, title, body);

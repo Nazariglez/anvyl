@@ -12,6 +12,7 @@ pub type UnaryNode = Spanned<Unary>;
 pub type CallNode = Spanned<Call>;
 pub type AssignNode = Spanned<Assign>;
 pub type ReturnNode = Spanned<Return>;
+pub type IfNode = Spanned<If>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -50,6 +51,7 @@ pub enum ExprKind {
     Binary(BinaryNode),
     Unary(UnaryNode),
     Assign(AssignNode),
+    If(IfNode),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Eq)]
@@ -323,4 +325,11 @@ impl Display for AssignOp {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Return {
     pub value: Option<ExprNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct If {
+    pub cond: Box<ExprNode>,
+    pub then_block: BlockNode,
+    pub else_block: Option<BlockNode>,
 }

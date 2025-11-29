@@ -210,6 +210,52 @@ fn block_stmt<'src>(
     .as_context()
 }
 
+fn if_expr<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> impl AnvParser<'src, ast::ExprNode> {
+    recursive(|if_parser| {
+        let else_branch = select! {
+            (Token::Keyword(Keyword::Else), _) => (),
+        }
+        .ignore_then(choice((
+            // else-if wraps the nested if in a block
+            if_parser.map_with(|if_expr: ast::ExprNode, _| {
+                let span = if_expr.span;
+                let stmt = Spanned::new(ast::Stmt::Expr(if_expr), span);
+                Spanned::new(ast::Block { stmts: vec![stmt] }, span)
+            }),
+            // else { ... }
+            block_stmt(stmt.clone()),
+        )))
+        .or_not();
+
+        select! {
+            (Token::Keyword(Keyword::If), _) => (),
+        }
+        .ignore_then(expr.clone())
+        .then(block_stmt(stmt.clone()))
+        .then(else_branch)
+        .map_with(|((cond, then_block), else_block), e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let if_node = Spanned::new(
+                ast::If {
+                    cond: Box::new(cond),
+                    then_block,
+                    else_block,
+                },
+                span,
+            );
+            let expr_id = e.state().new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::If(if_node), expr_id);
+            Spanned::new(expr, span)
+        })
+    })
+    .labelled("if expression")
+    .as_context()
+}
+
 fn atom_expr<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
@@ -229,6 +275,7 @@ fn atom_expr<'src>(
             let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
             Spanned::new(expr, span)
         }),
+        if_expr(stmt.clone(), expr.clone()),
         block_stmt(stmt).map_with(|block_node, e| {
             let span = block_node.span;
             let id = e.state().new_expr_id();

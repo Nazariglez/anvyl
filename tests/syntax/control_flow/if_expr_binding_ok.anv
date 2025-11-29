@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let a: bool = if true { false } else { true };
+    let b = if a { a } else { !a };
+}
+

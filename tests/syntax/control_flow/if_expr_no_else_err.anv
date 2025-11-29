@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: if expression used as value must have an else branch
+
+fn main() {
+    let x = if true {
+        1
+    };
+}
+

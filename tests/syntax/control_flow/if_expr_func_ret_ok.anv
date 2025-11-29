@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn scale(a: int, nice: bool) -> int {
+    if nice { a } else { a * 10 }
+}
+
+fn main() {
+    let x: int = scale(2, true);
+}
+

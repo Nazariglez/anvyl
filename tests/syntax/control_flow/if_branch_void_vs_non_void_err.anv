@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn main() {
+    var x: int = 0;
+
+    let y = if true {
+        x = 1;
+    } else {
+        2
+    };
+}
+
