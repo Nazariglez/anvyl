@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Wrong number of type arguments
+
+fn pair<T, U>(a: T, b: U) -> T {
+    a
+}
+
+fn main() {
+    let x = pair<int>(10, true);
+}

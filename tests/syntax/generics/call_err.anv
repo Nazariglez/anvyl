@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Function is not generic
+
+fn foo(x: int) -> int {
+    x
+}
+
+fn main() {
+    let y = foo<int>(10);
+}

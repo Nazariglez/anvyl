@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+fn add<T>(a: T, b: T) -> T {
+    a + b
+}
+
+fn main() {
+    let x = add(1, 2);
+    let y = add(1.5, 2.5);
+    let z = add(x, 20);
+}
+

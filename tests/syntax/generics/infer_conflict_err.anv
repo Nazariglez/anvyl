@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn eq<T>(a: T, b: T) -> bool {
+    true
+}
+
+fn main() {
+    let x = eq(1, true);
+}
+

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn pair<T, U>(a: T, b: U) -> U {
+    b
+}
+
+fn main() {
+    let x = pair(10, true);
+}
+

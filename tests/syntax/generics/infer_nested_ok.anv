@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn identity<T>(x: T) -> T {
+    x
+}
+
+fn main() {
+    let x = identity(identity(42));
+}
+

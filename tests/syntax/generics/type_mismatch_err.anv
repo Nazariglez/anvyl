@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn identity<T>(x: T) -> T {
+    x
+}
+
+fn main() {
+    let a = identity<int>(true);
+}
+

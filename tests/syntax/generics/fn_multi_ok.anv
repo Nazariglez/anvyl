@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn first<T, U>(a: T, b: U) -> T {
+    a
+}
+
+fn main() {
+    let x = first<int, bool>(10, true);
+}
+

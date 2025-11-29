@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+fn equals<T>(a: T, b: T) -> bool {
+    a == b
+}
+
+fn main() {
+    let x = equals(10, 20);
+    let y = equals(true, false);
+    let z = equals(1.5, 2.5);
+}
+

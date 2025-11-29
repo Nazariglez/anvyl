@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn add<T>(a: T, b: T) -> T {
+    a + b
+}
+
+fn main() {
+    let x = add<bool>(true, false);
+}
+
