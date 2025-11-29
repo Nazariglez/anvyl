@@ -1,8 +1,8 @@
 use crate::{
     ast::{
-        AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, CallNode, ExprId, ExprKind,
-        ExprNode, Func, FuncNode, Ident, Lit, Program, ReturnNode, Stmt, StmtNode, Type, UnaryNode,
-        UnaryOp,
+        AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
+        ExprKind, ExprNode, Func, FuncNode, Ident, Lit, Program, ReturnNode, Stmt, StmtNode, Type,
+        UnaryNode, UnaryOp,
     },
     span::Span,
 };
@@ -13,7 +13,8 @@ pub fn check_program(program: &Program) -> Result<TypeChecker, Vec<TypeErr>> {
     let mut errors = vec![];
 
     // first pass we collect the types from the ast
-    check_block_stmts(&program.stmts, &mut type_checker, &mut errors);
+    // we don't need the type of the file scope blocks
+    let _ = check_block_stmts(&program.stmts, &mut type_checker, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
@@ -40,11 +41,17 @@ pub fn check_program(program: &Program) -> Result<TypeChecker, Vec<TypeErr>> {
     Ok(type_checker)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct RetType {
+    ty: Type,
+    has_explicit: bool,
+}
+
 #[derive(Debug)]
 pub struct TypeChecker {
     types: HashMap<ExprId, (Span, Type)>,
     scopes: Vec<HashMap<Ident, Type>>,
-    return_types: Vec<Type>,
+    return_types: Vec<RetType>,
     constraints: Vec<Constraint>,
 }
 
@@ -92,7 +99,10 @@ impl TypeChecker {
     }
 
     fn push_return_type(&mut self, ty: Type) {
-        self.return_types.push(ty);
+        self.return_types.push(RetType {
+            ty,
+            has_explicit: false,
+        });
     }
 
     fn pop_return_type(&mut self) {
@@ -100,7 +110,17 @@ impl TypeChecker {
     }
 
     fn current_return_type(&self) -> Option<&Type> {
-        self.return_types.last()
+        self.return_types.last().map(|r| &r.ty)
+    }
+
+    fn mark_explicit_return(&mut self) {
+        if let Some(ret_ty) = self.return_types.last_mut() {
+            ret_ty.has_explicit = true;
+        }
+    }
+
+    fn has_explicit_return(&self) -> bool {
+        self.return_types.last().map_or(false, |r| r.has_explicit)
     }
 
     fn add_constraint(&mut self, span: Span, left: TypeRef, right: TypeRef) {
@@ -398,14 +418,50 @@ fn check_block_stmts(
     stmts: &[StmtNode],
     type_checker: &mut TypeChecker,
     errors: &mut Vec<TypeErr>,
-) {
+) -> Option<ExprId> {
     type_checker.push_scope();
     collect_scope_types(stmts, type_checker);
 
-    for stmt in stmts {
-        check_stmt(&stmt.node, type_checker, errors);
-    }
+    let last_expr_id = stmts.split_last().and_then(|(last, rest)| {
+        // check all the statements except the last one
+        rest.iter().for_each(|stmt| {
+            check_stmt(&stmt.node, type_checker, errors);
+        });
+
+        // process the last statement as expression if needed
+        match &last.node {
+            Stmt::Expr(expr_node) => {
+                let _ = check_expr(expr_node, type_checker, errors);
+                Some(expr_node.node.id)
+            }
+            _ => {
+                check_stmt(&last.node, type_checker, errors);
+                None
+            }
+        }
+    });
+
     type_checker.pop_scope();
+    last_expr_id
+}
+
+fn check_block_expr(
+    block: &BlockNode,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> (Type, Option<ExprId>) {
+    let last_expr_id = check_block_stmts(&block.node.stmts, type_checker, errors);
+    let Some(id) = last_expr_id else {
+        return (Type::Void, None);
+    };
+
+    let ty = type_checker
+        .get_type(id)
+        .cloned()
+        .map(|(_, ty)| ty)
+        .unwrap_or(Type::Void);
+
+    (ty, Some(id))
 }
 
 fn collect_scope_types(stmts: &[StmtNode], type_checker: &mut TypeChecker) {
@@ -479,13 +535,58 @@ fn check_func(fn_node: &FuncNode, type_checker: &mut TypeChecker, errors: &mut V
     type_checker.push_scope();
     type_checker.push_return_type(func.ret.clone());
 
+    let pop_scope = |type_checker: &mut TypeChecker| {
+        type_checker.pop_return_type();
+        type_checker.pop_scope();
+    };
+
     for param in &func.params {
         type_checker.set_var(param.name, param.ty.clone());
     }
-    check_block_stmts(&func.body.node.stmts, type_checker, errors);
 
-    type_checker.pop_return_type();
-    type_checker.pop_scope();
+    // treat the block as an expression for implicit returns
+    let (body_ty, last_expr_id) = check_block_expr(&func.body, type_checker, errors);
+
+    // void fn cannot have trailing expressions (at least they are void too)
+    let is_void_fn = func.ret.is_void();
+    if is_void_fn {
+        let mismatch = !body_ty.is_void();
+        if mismatch {
+            errors.push(TypeErr {
+                span: fn_node.span,
+                kind: TypeErrKind::MismatchedTypes {
+                    expected: Type::Void,
+                    found: body_ty,
+                },
+            });
+        }
+        pop_scope(type_checker);
+        return;
+    }
+
+    let expected_ret = func.ret.clone();
+
+    // if there is a last expression, it must be assignable to return type
+    if let Some(last_id) = last_expr_id {
+        let expr_ref = TypeRef::Expr(last_id);
+        let ret_ref = TypeRef::Concrete(expected_ret);
+        type_checker.constrain_assignable(fn_node.span, expr_ref, ret_ref, errors);
+        pop_scope(type_checker);
+        return;
+    }
+
+    // no implicit or explicit return, fn with non-void return is invaliud
+    if !type_checker.has_explicit_return() {
+        errors.push(TypeErr {
+            span: fn_node.span,
+            kind: TypeErrKind::MismatchedTypes {
+                expected: expected_ret,
+                found: Type::Void,
+            },
+        });
+    }
+
+    pop_scope(type_checker);
 }
 
 fn check_expr(
@@ -506,9 +607,8 @@ fn check_expr(
             }
         },
         ExprKind::Block(spanned) => {
-            // FIXME: we need to return type for if, blocks, etc...
-            check_block_stmts(&spanned.node.stmts, type_checker, errors);
-            Type::Void
+            let (block_ty, _) = check_block_expr(spanned, type_checker, errors);
+            block_ty
         }
         ExprKind::Lit(lit) => type_from_lit(lit),
         ExprKind::Call(call) => check_call(call, type_checker, errors),
@@ -767,9 +867,7 @@ fn check_assign_op(
     errors: &mut Vec<TypeErr>,
 ) -> Type {
     type_checker.constrain_assignable(assign.span, value_ref, target_ref.clone(), errors);
-    type_checker
-        .get_type_ref(&target_ref)
-        .unwrap_or(Type::Infer)
+    Type::Void
 }
 
 fn check_compound_assign_op(
@@ -796,7 +894,7 @@ fn check_compound_assign_op(
         });
     }
 
-    target_ty
+    Type::Void
 }
 
 fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
@@ -807,6 +905,13 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
 
     // if there is no type annotation then we just constrain the variable to the value
     let Some(annot_ty) = &node.ty else {
+        // get the inferred type from the value expression
+        let inferred_ty = type_checker
+            .get_type(node.value.node.id)
+            .map(|(_, ty)| ty.clone())
+            .unwrap_or(Type::Infer);
+        type_checker.set_var(node.name, inferred_ty);
+
         let var_ref = TypeRef::Var(node.name);
         type_checker.constrain_equal(binding.span, val_ref, var_ref, errors);
         return;
@@ -826,6 +931,8 @@ fn check_ret(ret: &ReturnNode, type_checker: &mut TypeChecker, errors: &mut Vec<
     let Some(expected_ret) = type_checker.current_return_type().cloned() else {
         return;
     };
+
+    type_checker.mark_explicit_return();
 
     match (&node.value, &expected_ret) {
         // returning a value in a non-void fn needs constraining
@@ -1075,6 +1182,7 @@ mod tests {
     }
 
     // ---- runner helpers ----
+    #[track_caller]
     fn run_ok(prog: Program) -> TypeChecker {
         match check_program(&prog) {
             Ok(tcx) => tcx,
@@ -1084,6 +1192,7 @@ mod tests {
         }
     }
 
+    #[track_caller]
     fn run_err(prog: Program) -> Vec<TypeErr> {
         match check_program(&prog) {
             Ok(_) => panic!("Expected Err, got Ok"),
@@ -1092,6 +1201,7 @@ mod tests {
     }
 
     // ---- assertion helpers ----
+    #[track_caller]
     fn assert_expr_type(tcx: &TypeChecker, id: ExprId, expected: Type) {
         match tcx.get_type(id) {
             Some((_, ty)) => assert_eq!(
@@ -1595,7 +1705,7 @@ mod tests {
         ]);
 
         let tcx = run_ok(prog);
-        assert_expr_type(&tcx, assign_id, Type::Int);
+        assert_expr_type(&tcx, assign_id, Type::Void);
     }
 
     #[test]
@@ -1631,7 +1741,7 @@ mod tests {
         ]);
 
         let tcx = run_ok(prog);
-        assert_expr_type(&tcx, assign_id, Type::Int);
+        assert_expr_type(&tcx, assign_id, Type::Void);
     }
 
     #[test]
@@ -2201,5 +2311,271 @@ mod tests {
 
         let tcx = run_ok(prog);
         assert_expr_type(&tcx, ten_id, Type::Int);
+    }
+
+    // ---- block expression helper ----
+    fn block_expr(stmts: Vec<StmtNode>) -> ExprNode {
+        ExprNode {
+            node: Expr::new(
+                ExprKind::Block(BlockNode {
+                    node: Block { stmts },
+                    span: dummy_span(),
+                }),
+                next_expr_id(),
+            ),
+            span: dummy_span(),
+        }
+    }
+
+    // ---- block expression type tests ----
+    #[test]
+    fn test_block_expr_empty_is_void() {
+        reset_expr_ids();
+        // { }
+        let block = block_expr(vec![]);
+        let block_id = get_expr_id(&block);
+        let prog = program(vec![fn_decl(
+            "main",
+            vec![],
+            Type::Void,
+            vec![expr_stmt(block)],
+        )]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, block_id, Type::Void);
+    }
+
+    #[test]
+    fn test_block_expr_trailing_int() {
+        reset_expr_ids();
+        // { 1 }
+        let one = lit_int(1);
+        let block = block_expr(vec![expr_stmt(one)]);
+        let block_id = get_expr_id(&block);
+        let prog = program(vec![fn_decl(
+            "main",
+            vec![],
+            Type::Int,
+            vec![expr_stmt(block)],
+        )]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, block_id, Type::Int);
+    }
+
+    #[test]
+    fn test_block_expr_let_then_ident() {
+        reset_expr_ids();
+        // { let x: int = 1; x }
+        let x_val = lit_int(1);
+        let x_binding = let_binding("x", Some(Type::Int), x_val);
+        let x_ref = ident_expr("x");
+        let x_ref_id = get_expr_id(&x_ref);
+        let block = block_expr(vec![x_binding, expr_stmt(x_ref)]);
+        let block_id = get_expr_id(&block);
+        let prog = program(vec![fn_decl(
+            "main",
+            vec![],
+            Type::Int,
+            vec![expr_stmt(block)],
+        )]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, block_id, Type::Int);
+        assert_expr_type(&tcx, x_ref_id, Type::Int);
+    }
+
+    // ---- let-binding with block tests ----
+    #[test]
+    fn test_let_binding_block_infers_int() {
+        reset_expr_ids();
+        // let x = { 1 };
+        let one = lit_int(1);
+        let one_id = get_expr_id(&one);
+        let block = block_expr(vec![expr_stmt(one)]);
+        let block_id = get_expr_id(&block);
+        let prog = program(vec![fn_decl(
+            "main",
+            vec![],
+            Type::Void,
+            vec![let_binding("x", None, block)],
+        )]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, one_id, Type::Int);
+        assert_expr_type(&tcx, block_id, Type::Int);
+    }
+
+    #[test]
+    fn test_let_binding_block_annotated_int_ok() {
+        reset_expr_ids();
+        // let x: int = { 1 };
+        let one = lit_int(1);
+        let block = block_expr(vec![expr_stmt(one)]);
+        let block_id = get_expr_id(&block);
+        let prog = program(vec![fn_decl(
+            "main",
+            vec![],
+            Type::Void,
+            vec![let_binding("x", Some(Type::Int), block)],
+        )]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, block_id, Type::Int);
+    }
+
+    #[test]
+    fn test_let_binding_block_type_mismatch() {
+        reset_expr_ids();
+        // let x: string = { 1 };
+        let one = lit_int(1);
+        let block = block_expr(vec![expr_stmt(one)]);
+        let prog = program(vec![fn_decl(
+            "main",
+            vec![],
+            Type::Void,
+            vec![let_binding("x", Some(Type::String), block)],
+        )]);
+
+        let errors = run_err(prog);
+        assert!(errors.iter().any(|e| matches!(
+            &e.kind,
+            TypeErrKind::MismatchedTypes { expected, found }
+            if *expected == Type::String && *found == Type::Int
+        )));
+    }
+
+    // ---- implicit return function tests ----
+    #[test]
+    fn test_implicit_return_simple_int() {
+        reset_expr_ids();
+        // fn f() -> int { 1 }
+        let one = lit_int(1);
+        let one_id = get_expr_id(&one);
+        let prog = program(vec![fn_decl("f", vec![], Type::Int, vec![expr_stmt(one)])]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, one_id, Type::Int);
+    }
+
+    #[test]
+    fn test_implicit_return_let_then_ident() {
+        reset_expr_ids();
+        // fn f() -> int { let x: int = 1; x }
+        let x_val = lit_int(1);
+        let x_binding = let_binding("x", Some(Type::Int), x_val);
+        let x_ref = ident_expr("x");
+        let x_ref_id = get_expr_id(&x_ref);
+        let prog = program(vec![fn_decl(
+            "f",
+            vec![],
+            Type::Int,
+            vec![x_binding, expr_stmt(x_ref)],
+        )]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, x_ref_id, Type::Int);
+    }
+
+    #[test]
+    fn test_explicit_return_still_works() {
+        reset_expr_ids();
+        // fn f() -> int { return 1; }
+        let one = lit_int(1);
+        let one_id = get_expr_id(&one);
+        let prog = program(vec![fn_decl(
+            "f",
+            vec![],
+            Type::Int,
+            vec![return_stmt(Some(one))],
+        )]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, one_id, Type::Int);
+    }
+
+    #[test]
+    fn test_implicit_return_empty_body_non_void_error() {
+        reset_expr_ids();
+        // fn f() -> int { }
+        let prog = program(vec![fn_decl("f", vec![], Type::Int, vec![])]);
+
+        let errors = run_err(prog);
+        assert!(errors.iter().any(|e| matches!(
+            &e.kind,
+            TypeErrKind::MismatchedTypes { expected, found }
+            if *expected == Type::Int && *found == Type::Void
+        )));
+    }
+
+    #[test]
+    fn test_implicit_return_wrong_type_error() {
+        reset_expr_ids();
+        // fn f() -> int { true }
+        let prog = program(vec![fn_decl(
+            "f",
+            vec![],
+            Type::Int,
+            vec![expr_stmt(lit_bool(true))],
+        )]);
+
+        let errors = run_err(prog);
+        assert!(errors.iter().any(|e| matches!(
+            &e.kind,
+            TypeErrKind::MismatchedTypes { expected, found }
+            if *expected == Type::Int && *found == Type::Bool
+        )));
+    }
+
+    #[test]
+    fn test_void_fn_trailing_value_error() {
+        reset_expr_ids();
+        // fn f() { 1 }
+        // void functions should error on trailing non-void expressions
+        let prog = program(vec![fn_decl(
+            "f",
+            vec![],
+            Type::Void,
+            vec![expr_stmt(lit_int(1))],
+        )]);
+
+        let errors = run_err(prog);
+        assert!(errors.iter().any(|e| matches!(
+            &e.kind,
+            TypeErrKind::MismatchedTypes { expected, found }
+            if *expected == Type::Void && *found == Type::Int
+        )));
+    }
+
+    #[test]
+    fn test_void_fn_empty_body_ok() {
+        reset_expr_ids();
+        // fn f() { }
+        let prog = program(vec![fn_decl("f", vec![], Type::Void, vec![])]);
+
+        let _tcx = run_ok(prog);
+    }
+
+    // ---- nested function / scope tests ----
+    #[test]
+    fn test_nested_fn_implicit_return() {
+        reset_expr_ids();
+        // fn outer() -> int {
+        //   fn inner() -> int { 1 }
+        //   inner()
+        // }
+        let inner_fn = fn_decl("inner", vec![], Type::Int, vec![expr_stmt(lit_int(1))]);
+        let call_inner = call_expr(ident_expr("inner"), vec![]);
+        let call_id = get_expr_id(&call_inner);
+        let outer_fn = fn_decl(
+            "outer",
+            vec![],
+            Type::Int,
+            vec![inner_fn, expr_stmt(call_inner)],
+        );
+        let prog = program(vec![outer_fn]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, call_id, Type::Int);
     }
 }

@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn add() -> int {}
+

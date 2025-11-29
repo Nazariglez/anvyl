@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+fn add() -> int {
+    1
+}
+

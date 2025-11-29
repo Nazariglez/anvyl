@@ -128,9 +128,7 @@ fn emit_report(src: &str, file_path: &str, range: Range<usize>, title: String, b
                 .with_color(Color::Red)
                 .with_message(body),
         );
-    let _ = report
-        .finish()
-        .print((file_path, Source::from(src)));
+    let _ = report.finish().print((file_path, Source::from(src)));
 }
 
 fn describe_token(token: &Token) -> String {
