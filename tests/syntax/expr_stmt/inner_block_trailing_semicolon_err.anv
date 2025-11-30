@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'int'
+
+fn f() -> int {
+    let x = 1;
+    let y = 2;
+}

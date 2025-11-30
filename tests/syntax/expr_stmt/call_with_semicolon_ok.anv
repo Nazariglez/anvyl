@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+fn foo() { }
+
+fn bar() {
+    foo();
+}
+
+fn main() {
+    foo();
+    foo();
+}

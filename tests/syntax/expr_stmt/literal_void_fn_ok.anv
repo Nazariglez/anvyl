@@ -1,7 +1,8 @@
 // @mode: check
 // @expect: success
 
+fn noop() {}
+
 fn main() {
-    var a: int = 10;
-    a = 10
+    noop();
 }

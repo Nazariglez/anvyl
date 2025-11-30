@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'void'
+
+fn main() {
+    1 + 2
+}

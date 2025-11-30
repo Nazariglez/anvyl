@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token
+
+fn foo() {}
+
+fn main() {
+    foo() foo();
+}

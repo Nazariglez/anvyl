@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+fn f() -> int {
+    { 1; 2 }
+}
+
+fn main() {
+    let x: int = f();
+}
