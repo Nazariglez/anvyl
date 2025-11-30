@@ -45,11 +45,11 @@ pub fn parse_ast(tokens: &[SpannedToken]) -> Result<ast::Program, Vec<Rich<'_, S
 
 fn parser<'src>() -> impl AnvParser<'src, ast::Program> {
     let stmt = statement();
-    let func_decl = function(stmt).map(|func_node| {
+    let func_decl = function(stmt.clone()).map(|func_node| {
         let span = func_node.span;
         Spanned::new(ast::Stmt::Func(func_node), span)
     });
-    let struct_decl = struct_declaration().map(|struct_node| {
+    let struct_decl = struct_declaration(stmt).map(|struct_node| {
         let span = struct_node.span;
         Spanned::new(ast::Stmt::Struct(struct_node), span)
     });
@@ -68,6 +68,29 @@ fn statement<'src>() -> impl AnvParser<'src, ast::StmtNode> {
         let bind = binding(stmt.clone());
         let ret = return_stmt(stmt.clone());
 
+        let at_block_end = select! { (Token::Close(Delimiter::Brace), _) => () }.rewind();
+
+        let at_stmt_start = select! {
+            (Token::Keyword(Keyword::Let), _) => (),
+            (Token::Keyword(Keyword::Var), _) => (),
+            (Token::Keyword(Keyword::Return), _) => (),
+            (Token::Keyword(Keyword::Fn), _) => (),
+            (Token::Keyword(Keyword::If), _) => (),
+            (Token::Keyword(Keyword::Struct), _) => (),
+        }
+        .rewind();
+
+        let expr_stmt = expr
+            .then_ignore(
+                select! { (Token::Semicolon, _) => () }
+                    .or(at_block_end)
+                    .or(at_stmt_start),
+            )
+            .map(|expr_node| {
+                let span = expr_node.span;
+                Spanned::new(ast::Stmt::Expr(expr_node), span)
+            });
+
         choice((
             func.map(|func_node| {
                 let span = func_node.span;
@@ -78,10 +101,7 @@ fn statement<'src>() -> impl AnvParser<'src, ast::StmtNode> {
                 Spanned::new(ast::Stmt::Binding(bind_node), span)
             }),
             ret,
-            expr.map(|expr_node| {
-                let span = expr_node.span;
-                Spanned::new(ast::Stmt::Expr(expr_node), span)
-            }),
+            expr_stmt,
         ))
     })
     .labelled("statement")
@@ -169,7 +189,120 @@ fn struct_field<'src>() -> impl AnvParser<'src, ast::StructField> {
         .as_context()
 }
 
-fn struct_declaration<'src>() -> impl AnvParser<'src, ast::StructDeclNode> {
+enum StructMember {
+    Field(ast::StructField),
+    Method(ast::Method),
+}
+
+fn struct_method<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> impl AnvParser<'src, ast::Method> {
+    select! {
+        (Token::Keyword(Keyword::Fn), _) => (),
+    }
+    .ignore_then(identifier())
+    .then(type_params())
+    .then(method_params())
+    .then(return_type())
+    .then(block_stmt(stmt))
+    .map_with(
+        |((((name, method_type_params), (receiver, params)), ret), body), e| {
+            let s = e.span();
+
+            let type_param_map = method_type_params
+                .iter()
+                .map(|tp| (tp.name, tp.id))
+                .collect();
+
+            let resolved_params = params
+                .into_iter()
+                .map(|p| {
+                    let ty = resolve_type_params(&p.ty, &type_param_map);
+                    ast::Param { name: p.name, ty }
+                })
+                .collect();
+
+            let resolved_ret = match ret {
+                Some(ty) => resolve_type_params(&ty, &type_param_map),
+                None => ast::Type::Void,
+            };
+
+            ast::Method {
+                name,
+                visibility: ast::Visibility::Private,
+                type_params: method_type_params,
+                receiver,
+                params: resolved_params,
+                ret: resolved_ret,
+                body: Spanned::new(body.node, Span::new(s.start, s.end)),
+            }
+        },
+    )
+    .labelled("method")
+    .as_context()
+}
+
+fn method_params<'src>() -> impl AnvParser<'src, (Option<ast::MethodReceiver>, Vec<ast::Param>)> {
+    select! {
+        (Token::Open(Delimiter::Parent), _) => (),
+    }
+    .ignore_then(
+        method_param_list()
+            .or_not()
+            .map(|opt| opt.unwrap_or_default()),
+    )
+    .then_ignore(select! {
+        (Token::Close(Delimiter::Parent), _) => (),
+    })
+}
+
+fn self_param<'src>() -> impl AnvParser<'src, ()> {
+    identifier()
+        .try_map(|ident, span| {
+            if ident.0.as_ref() == "self" {
+                Ok(())
+            } else {
+                Err(Rich::custom(span, "expected 'self'"))
+            }
+        })
+        .then_ignore(
+            select! { (Token::Colon, _) => () }
+                .ignore_then(type_ident())
+                .or_not(),
+        )
+}
+
+fn method_param_list<'src>() -> impl AnvParser<'src, (Option<ast::MethodReceiver>, Vec<ast::Param>)>
+{
+    let regular_params = param()
+        .separated_by(select! { (Token::Comma, _) => () })
+        .collect::<Vec<_>>();
+
+    choice((
+        self_param()
+            .then(
+                select! { (Token::Comma, _) => () }
+                    .ignore_then(regular_params.clone())
+                    .or_not()
+                    .map(|opt| opt.unwrap_or_default()),
+            )
+            .map(|(_, params)| (Some(ast::MethodReceiver::Value), params)),
+        regular_params.map(|params| (None, params)),
+    ))
+}
+
+fn struct_member<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> impl AnvParser<'src, StructMember> {
+    choice((
+        struct_method(stmt).map(StructMember::Method),
+        struct_field().map(StructMember::Field),
+    ))
+}
+
+fn struct_declaration<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> impl AnvParser<'src, ast::StructDeclNode> {
     select! {
         (Token::Keyword(Keyword::Struct), _) => (),
     }
@@ -180,10 +313,8 @@ fn struct_declaration<'src>() -> impl AnvParser<'src, ast::StructDeclNode> {
             (Token::Open(Delimiter::Brace), _) => (),
         }
         .ignore_then(
-            struct_field()
-                .separated_by(select! {
-                    (Token::Comma, _) => (),
-                })
+            struct_member(stmt)
+                .separated_by(select! { (Token::Comma, _) => () })
                 .allow_trailing()
                 .collect::<Vec<_>>(),
         )
@@ -191,25 +322,73 @@ fn struct_declaration<'src>() -> impl AnvParser<'src, ast::StructDeclNode> {
             (Token::Close(Delimiter::Brace), _) => (),
         }),
     )
-    .map_with(|((name, type_params), fields), e| {
+    .map_with(|((name, type_params), members), e| {
         let s = e.span();
 
-        let type_param_map: HashMap<ast::Ident, ast::TypeVarId> =
+        let struct_type_param_map: HashMap<ast::Ident, ast::TypeVarId> =
             type_params.iter().map(|tp| (tp.name, tp.id)).collect();
 
-        let resolved_fields = fields
-            .into_iter()
-            .map(|f| {
-                let ty = resolve_type_params(&f.ty, &type_param_map);
-                ast::StructField { name: f.name, ty }
-            })
-            .collect();
+        let self_type = ast::Type::Struct {
+            name,
+            type_args: type_params.iter().map(|tp| ast::Type::Var(tp.id)).collect(),
+        };
+
+        let mut fields = vec![];
+        let mut methods = vec![];
+
+        for member in members {
+            match member {
+                StructMember::Field(f) => {
+                    let ty = resolve_type_params_with_self(
+                        &f.ty,
+                        &struct_type_param_map,
+                        Some(&self_type),
+                    );
+                    fields.push(ast::StructField { name: f.name, ty });
+                }
+                StructMember::Method(m) => {
+                    let mut combined_type_param_map = struct_type_param_map.clone();
+                    for tp in &m.type_params {
+                        combined_type_param_map.insert(tp.name, tp.id);
+                    }
+
+                    let resolved_params = m
+                        .params
+                        .iter()
+                        .map(|p| ast::Param {
+                            name: p.name,
+                            ty: resolve_type_params_with_self(
+                                &p.ty,
+                                &combined_type_param_map,
+                                Some(&self_type),
+                            ),
+                        })
+                        .collect();
+
+                    let resolved_ret = resolve_type_params_with_self(
+                        &m.ret,
+                        &combined_type_param_map,
+                        Some(&self_type),
+                    );
+                    methods.push(ast::Method {
+                        name: m.name,
+                        visibility: m.visibility,
+                        type_params: m.type_params,
+                        receiver: m.receiver,
+                        params: resolved_params,
+                        ret: resolved_ret,
+                        body: m.body,
+                    });
+                }
+            }
+        }
 
         Spanned::new(
             ast::StructDecl {
                 name,
                 type_params,
-                fields: resolved_fields,
+                fields,
+                methods,
             },
             Span::new(s.start, s.end),
         )
@@ -218,34 +397,44 @@ fn struct_declaration<'src>() -> impl AnvParser<'src, ast::StructDeclNode> {
     .as_context()
 }
 
-fn resolve_type_params(
+fn resolve_type_params_with_self(
     ty: &ast::Type,
     type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+    self_type: Option<&ast::Type>,
 ) -> ast::Type {
     use ast::Type::*;
     match ty {
-        UnresolvedName(ident) => type_param_map
-            .get(ident)
-            .map(|id| Var(*id))
-            .unwrap_or_else(|| ty.clone()),
+        UnresolvedName(ident) => {
+            if let Some(id) = type_param_map.get(ident) {
+                return Var(*id);
+            }
+            if let Some(st) = self_type {
+                if ident.0.as_ref() == "Self" {
+                    return st.clone();
+                }
+            }
+            ty.clone()
+        }
 
-        Optional(inner) => Optional(resolve_type_params(inner, type_param_map).boxed()),
+        Optional(inner) => {
+            Optional(resolve_type_params_with_self(inner, type_param_map, self_type).boxed())
+        }
 
         Func { params, ret } => {
             let resolved_params = params
                 .iter()
-                .map(|p| resolve_type_params(p, type_param_map))
+                .map(|p| resolve_type_params_with_self(p, type_param_map, self_type))
                 .collect::<Vec<_>>();
             Func {
                 params: resolved_params,
-                ret: resolve_type_params(ret, type_param_map).boxed(),
+                ret: resolve_type_params_with_self(ret, type_param_map, self_type).boxed(),
             }
         }
 
         Tuple(elements) => {
             let resolved_elements = elements
                 .iter()
-                .map(|el| resolve_type_params(el, type_param_map))
+                .map(|el| resolve_type_params_with_self(el, type_param_map, self_type))
                 .collect::<Vec<_>>();
             Tuple(resolved_elements)
         }
@@ -253,7 +442,12 @@ fn resolve_type_params(
         NamedTuple(fields) => {
             let resolved_fields: Vec<_> = fields
                 .iter()
-                .map(|(name, ty)| (*name, resolve_type_params(ty, type_param_map)))
+                .map(|(name, ty)| {
+                    (
+                        *name,
+                        resolve_type_params_with_self(ty, type_param_map, self_type),
+                    )
+                })
                 .collect();
             NamedTuple(resolved_fields)
         }
@@ -261,7 +455,7 @@ fn resolve_type_params(
         Struct { name, type_args } => {
             let resolved_args = type_args
                 .iter()
-                .map(|arg| resolve_type_params(arg, type_param_map))
+                .map(|arg| resolve_type_params_with_self(arg, type_param_map, self_type))
                 .collect::<Vec<_>>();
             Struct {
                 name: *name,
@@ -271,6 +465,13 @@ fn resolve_type_params(
 
         _ => ty.clone(),
     }
+}
+
+fn resolve_type_params(
+    ty: &ast::Type,
+    type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+) -> ast::Type {
+    resolve_type_params_with_self(ty, type_param_map, None)
 }
 
 fn block_stmt<'src>(
@@ -592,33 +793,112 @@ fn call_type_args<'src>() -> impl AnvParser<'src, Vec<ast::Type>> {
         .as_context()
 }
 
-fn call_expr<'src>(
+enum PostfixOp {
+    Call {
+        type_args: Vec<ast::Type>,
+        args: Vec<ast::ExprNode>,
+    },
+    Field(ast::Ident),
+    TupleIndices(Vec<u32>),
+}
+
+fn postfix_expr<'src>(
     atom: impl AnvParser<'src, ast::ExprNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
-    let type_args = call_type_args();
-    let args = fn_call_args(expr);
-    // parse my_fn<T, U>(args) or my_fn(args)
-    let call_suffix = type_args.then(args);
-    atom.foldl_with(call_suffix.repeated(), |callee, (type_args, args), e| {
-        let start = callee.span.start;
-        let end = args.last().map(|a| a.span.end).unwrap_or(callee.span.end);
-        let span = Span::new(start, end);
+    let call_suffix = call_type_args()
+        .then(fn_call_args(expr))
+        .map(|(type_args, args)| PostfixOp::Call { type_args, args });
 
-        let call_node = Spanned::new(
-            ast::Call {
-                func: Box::new(callee),
-                args,
-                type_args,
-            },
-            span,
-        );
+    let single_index = select! {
+        (Token::Dot, _) => (),
+    }
+    .ignore_then(select! {
+        (Token::Literal(LitToken::Number(n)), _) => PostfixOp::TupleIndices(vec![n as u32]),
+    });
 
-        let expr_id = e.state().new_expr_id();
-        let expr = ast::Expr::new(ast::ExprKind::Call(call_node), expr_id);
-        Spanned::new(expr, span)
+    let chained_index = select! {
+        (Token::Dot, _) => (),
+    }
+    .ignore_then(select! {
+        (Token::Literal(LitToken::Float(s)), _) => s,
     })
-    .labelled("call expr")
+    .try_map(|s, span| {
+        let parts = s.as_ref().split('.').collect::<Vec<_>>();
+        let indices = parts
+            .iter()
+            .map(|p| p.parse::<u32>())
+            .collect::<Result<Vec<_>, _>>();
+        indices
+            .map(PostfixOp::TupleIndices)
+            .map_err(|_| Rich::custom(span, "invalid tuple index"))
+    });
+
+    let field_access = select! {
+        (Token::Dot, _) => (),
+    }
+    .ignore_then(identifier())
+    .map(PostfixOp::Field);
+
+    let postfix_op = choice((call_suffix, chained_index, single_index, field_access));
+
+    atom.foldl_with(postfix_op.repeated(), |target, op, e| {
+        let s = e.span();
+        let span = Span::new(s.start, s.end);
+
+        match op {
+            PostfixOp::Call { type_args, args } => {
+                let start = target.span.start;
+                let end = args.last().map(|a| a.span.end).unwrap_or(target.span.end);
+                let call_span = Span::new(start, end);
+
+                let call_node = Spanned::new(
+                    ast::Call {
+                        func: Box::new(target),
+                        args,
+                        type_args,
+                    },
+                    call_span,
+                );
+
+                let expr_id = e.state().new_expr_id();
+                let expr = ast::Expr::new(ast::ExprKind::Call(call_node), expr_id);
+                Spanned::new(expr, call_span)
+            }
+            PostfixOp::TupleIndices(indices) => {
+                let mut current = target;
+                for index in indices {
+                    let index_node = Spanned::new(
+                        ast::TupleIndex {
+                            target: Box::new(current),
+                            index,
+                        },
+                        span,
+                    );
+
+                    let expr_id = e.state().new_expr_id();
+                    let expr = ast::Expr::new(ast::ExprKind::TupleIndex(index_node), expr_id);
+                    current = Spanned::new(expr, span);
+                }
+                current
+            }
+            PostfixOp::Field(field) => {
+                let field_node = Spanned::new(
+                    ast::FieldAccess {
+                        target: Box::new(target),
+                        field,
+                    },
+                    span,
+                );
+
+                let expr_id = e.state().new_expr_id();
+                let expr = ast::Expr::new(ast::ExprKind::Field(field_node), expr_id);
+                Spanned::new(expr, span)
+            }
+        }
+    })
+    .labelled("postfix expression")
+    .as_context()
 }
 
 fn unary_expr<'src>(
@@ -740,95 +1020,13 @@ fn expression<'src>(
 ) -> impl AnvParser<'src, ast::ExprNode> {
     recursive(|expr| {
         let atom = atom_expr(stmt, expr.clone());
-        let call = call_expr(atom, expr.clone());
-        let accessed = postfix_access_expr(call);
-        let unary = unary_expr(accessed);
+        let postfix = postfix_expr(atom, expr.clone());
+        let unary = unary_expr(postfix);
         let binary = binary_expr(unary);
         let ternary = ternary_expr(binary, expr.clone());
         let assign = assignment_expr(ternary);
         assign
     })
-}
-
-enum PostfixAccess {
-    TupleIndices(Vec<u32>),
-    Field(ast::Ident),
-}
-
-fn postfix_access_expr<'src>(
-    base: impl AnvParser<'src, ast::ExprNode>,
-) -> impl AnvParser<'src, ast::ExprNode> {
-    let single_index = select! {
-        (Token::Dot, _) => (),
-    }
-    .ignore_then(select! {
-        (Token::Literal(LitToken::Number(n)), _) => PostfixAccess::TupleIndices(vec![n as u32]),
-    });
-
-    let chained_index = select! {
-        (Token::Dot, _) => (),
-    }
-    .ignore_then(select! {
-        (Token::Literal(LitToken::Float(s)), _) => s,
-    })
-    .try_map(|s, span| {
-        let parts = s.as_ref().split('.').collect::<Vec<_>>();
-        let indices = parts
-            .iter()
-            .map(|p| p.parse::<u32>())
-            .collect::<Result<Vec<_>, _>>();
-        indices
-            .map(PostfixAccess::TupleIndices)
-            .map_err(|_| Rich::custom(span, "invalid tuple index"))
-    });
-
-    let field_access = select! {
-        (Token::Dot, _) => (),
-    }
-    .ignore_then(identifier())
-    .map(PostfixAccess::Field);
-
-    let access_suffix = choice((chained_index, single_index, field_access));
-
-    base.foldl_with(access_suffix.repeated(), |target, access, e| {
-        let s = e.span();
-        let span = Span::new(s.start, s.end);
-
-        match access {
-            PostfixAccess::TupleIndices(indices) => {
-                let mut current = target;
-                for index in indices {
-                    let index_node = Spanned::new(
-                        ast::TupleIndex {
-                            target: Box::new(current),
-                            index,
-                        },
-                        span,
-                    );
-
-                    let expr_id = e.state().new_expr_id();
-                    let expr = ast::Expr::new(ast::ExprKind::TupleIndex(index_node), expr_id);
-                    current = Spanned::new(expr, span);
-                }
-                current
-            }
-            PostfixAccess::Field(field) => {
-                let field_node = Spanned::new(
-                    ast::FieldAccess {
-                        target: Box::new(target),
-                        field,
-                    },
-                    span,
-                );
-
-                let expr_id = e.state().new_expr_id();
-                let expr = ast::Expr::new(ast::ExprKind::Field(field_node), expr_id);
-                Spanned::new(expr, span)
-            }
-        }
-    })
-    .labelled("field or tuple index access")
-    .as_context()
 }
 
 fn identifier<'src>() -> impl AnvParser<'src, ast::Ident> {
@@ -1272,9 +1470,6 @@ fn assignment_expr<'src>(
             let expr_id = e.state().new_expr_id();
             let expr = ast::Expr::new(ast::ExprKind::Assign(assign_node), expr_id);
             Spanned::new(expr, span)
-        })
-        .then_ignore(select! {
-            (Token::Semicolon, _) => (),
         })
         .or(expr)
         .labelled("assignment")

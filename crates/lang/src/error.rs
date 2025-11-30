@@ -168,10 +168,6 @@ pub fn report_typecheck_errors(
                 format!("Unknown struct '{name}'"),
                 "This struct is not defined in this scope".to_string(),
             ),
-            TypeErrKind::UnknownType { name } => (
-                format!("Unknown type '{name}'"),
-                "This type is not defined".to_string(),
-            ),
             TypeErrKind::StructMissingField { struct_name, field } => (
                 format!("Missing field '{field}' in struct literal"),
                 format!("struct '{struct_name}' requires field '{field}'"),
@@ -184,9 +180,32 @@ pub fn report_typecheck_errors(
                 format!("Duplicate field '{field}' in struct literal"),
                 format!("field '{field}' is specified more than once in '{struct_name}'"),
             ),
-            TypeErrKind::FieldAccessOnNonStruct { field, found } => (
-                format!("Cannot access field '{field}' on non-struct type"),
-                format!("type '{found}' is not a struct"),
+            TypeErrKind::UnknownMethod {
+                struct_name,
+                method,
+            } => (
+                format!("Unknown method '{method}' for struct '{struct_name}'"),
+                format!("struct '{struct_name}' has no method named '{method}'"),
+            ),
+            TypeErrKind::StaticMethodOnValue {
+                struct_name,
+                method,
+            } => (
+                format!("Cannot call static method '{method}' on a value"),
+                format!("'{method}' is a static method; call it as '{struct_name}.{method}(...)'"),
+            ),
+            TypeErrKind::InstanceMethodOnType {
+                struct_name,
+                method,
+            } => (
+                format!("Cannot call instance method '{method}' on a type"),
+                format!("'{method}' requires an instance of '{struct_name}'; create one first"),
+            ),
+            TypeErrKind::ReadonlySelfMutation { struct_name, field } => (
+                format!("Cannot assign to field '{field}' in readonly method"),
+                format!(
+                    "'self' is readonly in this method of '{struct_name}'; use '&self' for mutating methods"
+                ),
             ),
         };
 

@@ -438,6 +438,23 @@ pub struct StructDecl {
     pub name: Ident,
     pub type_params: Vec<TypeParam>,
     pub fields: Vec<StructField>,
+    pub methods: Vec<Method>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum MethodReceiver {
+    Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Method {
+    pub name: Ident,
+    pub visibility: Visibility,
+    pub type_params: Vec<TypeParam>,
+    pub receiver: Option<MethodReceiver>,
+    pub params: Vec<Param>,
+    pub ret: Type,
+    pub body: BlockNode,
 }
 
 #[derive(Debug, Clone, PartialEq)]

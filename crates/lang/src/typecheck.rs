@@ -1,9 +1,10 @@
 use crate::{
     ast::{
         AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
-        ExprKind, ExprNode, FieldAccessNode, Func, FuncNode, Ident, IfNode, Lit, Pattern,
-        PatternNode, Program, ReturnNode, Stmt, StmtNode, StructField, StructLiteralNode,
-        TupleIndexNode, Type, TypeParam, TypeVarId, UnaryNode, UnaryOp,
+        ExprKind, ExprNode, FieldAccessNode, Func, FuncNode, Ident, IfNode, Lit, MethodReceiver,
+        Param, Pattern, PatternNode, Program, ReturnNode, Stmt, StmtNode, StructDeclNode,
+        StructField, StructLiteralNode, TupleIndexNode, Type, TypeParam, TypeVarId, UnaryNode,
+        UnaryOp,
     },
     span::Span,
 };
@@ -11,9 +12,19 @@ use internment::Intern;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
+struct MethodDef {
+    type_params: Vec<TypeParam>,
+    receiver: Option<MethodReceiver>,
+    params: Vec<Param>,
+    ret: Type,
+    body: BlockNode,
+}
+
+#[derive(Debug, Clone)]
 struct StructDef {
     type_params: Vec<TypeParam>,
     fields: Vec<StructField>,
+    methods: HashMap<Ident, MethodDef>,
 }
 
 type InferenceSlots = HashMap<TypeVarId, Ident>;
@@ -57,6 +68,12 @@ struct RetType {
     has_explicit: bool,
 }
 
+#[derive(Debug, Clone)]
+struct MethodContext {
+    struct_name: Ident,
+    receiver: Option<MethodReceiver>,
+}
+
 /// Key for caching scpecialized generic functions (instantiated with concrete types)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SpecializationKey {
@@ -80,6 +97,9 @@ pub struct TypeChecker {
 
     /// Stack of return types for function calls
     return_types: Vec<RetType>,
+
+    /// Stack tracking the current method context (if any)
+    method_contexts: Vec<MethodContext>,
 
     /// Type constraints to be resolved by inference pass
     constraints: Vec<Constraint>,
@@ -107,6 +127,7 @@ impl Default for TypeChecker {
             types: HashMap::new(),
             scopes: vec![],
             return_types: vec![],
+            method_contexts: vec![],
             constraints: vec![],
             func_type_params: HashMap::new(),
             next_infer_call_id: 0,
@@ -122,6 +143,18 @@ impl TypeChecker {
         let id = self.next_infer_call_id;
         self.next_infer_call_id += 1;
         id
+    }
+
+    fn push_method_context(&mut self, ctx: MethodContext) {
+        self.method_contexts.push(ctx);
+    }
+
+    fn pop_method_context(&mut self) {
+        self.method_contexts.pop();
+    }
+
+    fn current_method(&self) -> Option<&MethodContext> {
+        self.method_contexts.last()
     }
 }
 
@@ -375,9 +408,6 @@ pub enum TypeErrKind {
     UnknownStruct {
         name: Ident,
     },
-    UnknownType {
-        name: Ident,
-    },
     StructMissingField {
         struct_name: Ident,
         field: Ident,
@@ -390,9 +420,21 @@ pub enum TypeErrKind {
         struct_name: Ident,
         field: Ident,
     },
-    FieldAccessOnNonStruct {
+    UnknownMethod {
+        struct_name: Ident,
+        method: Ident,
+    },
+    StaticMethodOnValue {
+        struct_name: Ident,
+        method: Ident,
+    },
+    InstanceMethodOnType {
+        struct_name: Ident,
+        method: Ident,
+    },
+    ReadonlySelfMutation {
+        struct_name: Ident,
         field: Ident,
-        found: Type,
     },
 }
 
@@ -657,11 +699,30 @@ fn collect_scope_types(stmts: &[StmtNode], type_checker: &mut TypeChecker) {
 
             Stmt::Struct(node) => {
                 let decl = &node.node;
+
+                let methods = decl
+                    .methods
+                    .iter()
+                    .map(|method| {
+                        (
+                            method.name,
+                            MethodDef {
+                                type_params: method.type_params.clone(),
+                                receiver: method.receiver,
+                                params: method.params.clone(),
+                                ret: method.ret.clone(),
+                                body: method.body.clone(),
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+
                 type_checker.struct_defs.insert(
                     decl.name,
                     StructDef {
                         type_params: decl.type_params.clone(),
                         fields: decl.fields.clone(),
+                        methods,
                     },
                 );
             }
@@ -822,7 +883,7 @@ fn type_from_lit(lit: &Lit) -> Type {
 fn check_stmt(stmt: &Stmt, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
     match stmt {
         Stmt::Func(node) => check_func(node, type_checker, errors),
-        Stmt::Struct(_) => {}
+        Stmt::Struct(node) => check_struct(node, type_checker, errors),
         Stmt::Expr(node) => {
             let _ = check_expr(node, type_checker, errors);
         }
@@ -882,6 +943,76 @@ fn check_fn_body(
     type_checker.pop_scope();
 }
 
+fn check_method_body(
+    struct_name: Ident,
+    struct_def: &StructDef,
+    method: &MethodDef,
+    error_span: Span,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) {
+    if !method.type_params.is_empty() {
+        // FIXME: method generics are not supported yet
+        return;
+    }
+
+    let self_type = Type::Struct {
+        name: struct_name,
+        type_args: struct_def
+            .type_params
+            .iter()
+            .map(|tp| Type::Var(tp.id))
+            .collect(),
+    };
+
+    type_checker.push_scope();
+    type_checker.push_return_type(method.ret.clone());
+    type_checker.push_method_context(MethodContext {
+        struct_name,
+        receiver: method.receiver,
+    });
+
+    if method.receiver.is_some() {
+        let self_ident = Ident(Intern::new("self".to_string()));
+        type_checker.set_var(self_ident, self_type);
+    }
+
+    for param in &method.params {
+        type_checker.set_var(param.name, param.ty.clone());
+    }
+
+    let (body_ty, last_expr_id) = check_block_expr(&method.body, type_checker, errors);
+    let had_explicit_return = type_checker.has_explicit_return();
+
+    if method.ret.is_void() {
+        if !body_ty.is_void() {
+            errors.push(TypeErr {
+                span: error_span,
+                kind: TypeErrKind::MismatchedTypes {
+                    expected: Type::Void,
+                    found: body_ty,
+                },
+            });
+        }
+    } else if let Some(last_id) = last_expr_id {
+        let expr_ref = TypeRef::Expr(last_id);
+        let ret_ref = TypeRef::Concrete(method.ret.clone());
+        type_checker.constrain_assignable(error_span, expr_ref, ret_ref, errors);
+    } else if !had_explicit_return {
+        errors.push(TypeErr {
+            span: error_span,
+            kind: TypeErrKind::MismatchedTypes {
+                expected: method.ret.clone(),
+                found: Type::Void,
+            },
+        });
+    }
+
+    type_checker.pop_method_context();
+    type_checker.pop_return_type();
+    type_checker.pop_scope();
+}
+
 fn check_func(fn_node: &FuncNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
     let func = &fn_node.node;
 
@@ -926,6 +1057,32 @@ fn check_func(fn_node: &FuncNode, type_checker: &mut TypeChecker, errors: &mut V
     );
 }
 
+fn check_struct(
+    struct_node: &StructDeclNode,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) {
+    let decl = &struct_node.node;
+    let struct_name = decl.name;
+
+    let Some(struct_def) = type_checker.get_struct(struct_name).cloned() else {
+        return;
+    };
+
+    for method in &decl.methods {
+        if let Some(method_def) = struct_def.methods.get(&method.name) {
+            check_method_body(
+                struct_name,
+                &struct_def,
+                method_def,
+                method.body.span,
+                type_checker,
+                errors,
+            );
+        }
+    }
+}
+
 fn check_expr(
     expr_node: &ExprNode,
     type_checker: &mut TypeChecker,
@@ -968,6 +1125,13 @@ fn check_expr(
 
 fn check_call(call: &CallNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) -> Type {
     let node = &call.node;
+
+    if let ExprKind::Field(field_access) = &node.func.node.kind {
+        if let Some(result) = try_check_method_call(call, field_access, type_checker, errors) {
+            return result;
+        }
+    }
+
     let func_ty = check_expr(&node.func, type_checker, errors);
 
     // try to get the function name to look up type parameters
@@ -1008,11 +1172,6 @@ fn check_call(call: &CallNode, type_checker: &mut TypeChecker, errors: &mut Vec<
                 return Type::Infer;
             };
 
-            // create inference slots for each type param
-            let call_id = type_checker.next_call_id();
-            let slots = create_inference_slots(&type_params, type_checker, call_id);
-
-            // check arguments and generate constraints to infer type args
             let Type::Func { params, ret: _ } = &func_ty else {
                 errors.push(TypeErr {
                     span: call.span,
@@ -1023,60 +1182,17 @@ fn check_call(call: &CallNode, type_checker: &mut TypeChecker, errors: &mut Vec<
                 return Type::Infer;
             };
 
-            // check argument count
-            let same_param_count = params.len() == node.args.len();
-            if !same_param_count {
-                errors.push(TypeErr {
-                    span: call.span,
-                    kind: TypeErrKind::MismatchedTypes {
-                        expected: func_ty.clone(),
-                        found: Type::Func {
-                            params: vec![Type::Infer; node.args.len()],
-                            ret: Box::new(Type::Infer),
-                        },
-                    },
-                });
+            let Some(inferred_type_args) = infer_type_args_from_call(
+                call.span,
+                &type_params,
+                params,
+                &node.args,
+                func_ty.clone(),
+                type_checker,
+                errors,
+            ) else {
                 return Type::Infer;
-            }
-
-            // check each argument and add constraints for type inference
-            for (arg_expr, param_ty) in node.args.iter().zip(params.iter()) {
-                check_expr(arg_expr, type_checker, errors);
-                let arg_ref = TypeRef::Expr(arg_expr.node.id);
-                let param_ref = type_to_ref_with_inference(param_ty, &slots);
-                type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
-            }
-
-            // resolve constraints to get inferred types
-            resolve_constraints(type_checker, errors); // FIXME: isn't resolving all the ast here too much? maybe we can do this in a more efficient way?
-
-            // read back the inferred types from the slots
-            let mut inferred_type_args = Vec::with_capacity(type_params.len());
-            let mut inference_failed = false;
-
-            for param in &type_params {
-                let slot_var = slots
-                    .get(&param.id)
-                    .and_then(|slot_ident| type_checker.get_var(*slot_ident));
-
-                let ty = slot_var
-                    .filter(|ty| !contains_infer(ty))
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        inference_failed = true;
-                        Type::Infer
-                    });
-
-                inferred_type_args.push(ty);
-            }
-
-            if inference_failed {
-                errors.push(TypeErr {
-                    span: call.span,
-                    kind: TypeErrKind::UnresolvedInfer,
-                });
-                return Type::Infer;
-            }
+            };
 
             // now instantiate and check the function body with the inferred types
             return instantiate_and_check_fn(
@@ -1180,6 +1296,105 @@ fn check_call(call: &CallNode, type_checker: &mut TypeChecker, errors: &mut Vec<
     check_call_with_type(call, func_ty, type_checker, errors)
 }
 
+fn check_call_signature(
+    call_span: Span,
+    param_types: &[Type],
+    ret_type: &Type,
+    args: &[ExprNode],
+    mismatch_found_type: Option<Type>,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    if args.len() != param_types.len() {
+        let expected = Type::Func {
+            params: param_types.to_vec(),
+            ret: Box::new(ret_type.clone()),
+        };
+        let found = mismatch_found_type.unwrap_or_else(|| Type::Func {
+            params: vec![Type::Infer; args.len()],
+            ret: Box::new(Type::Infer),
+        });
+        errors.push(TypeErr {
+            span: call_span,
+            kind: TypeErrKind::MismatchedTypes { expected, found },
+        });
+        return Type::Infer;
+    }
+
+    for (arg_expr, param_ty) in args.iter().zip(param_types.iter()) {
+        check_expr(arg_expr, type_checker, errors);
+        let arg_ref = TypeRef::Expr(arg_expr.node.id);
+        let param_ref = TypeRef::Concrete(param_ty.clone());
+        type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
+    }
+
+    ret_type.clone()
+}
+
+fn infer_type_args_from_call(
+    call_span: Span,
+    type_params: &[TypeParam],
+    param_template_types: &[Type],
+    args: &[ExprNode],
+    expected_on_mismatch: Type,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Option<Vec<Type>> {
+    let call_id = type_checker.next_call_id();
+    let slots = create_inference_slots(type_params, type_checker, call_id);
+
+    if args.len() != param_template_types.len() {
+        errors.push(TypeErr {
+            span: call_span,
+            kind: TypeErrKind::MismatchedTypes {
+                expected: expected_on_mismatch,
+                found: Type::Func {
+                    params: vec![Type::Infer; args.len()],
+                    ret: Box::new(Type::Infer),
+                },
+            },
+        });
+        return None;
+    }
+
+    for (arg_expr, param_ty) in args.iter().zip(param_template_types.iter()) {
+        check_expr(arg_expr, type_checker, errors);
+        let arg_ref = TypeRef::Expr(arg_expr.node.id);
+        let param_ref = type_to_ref_with_inference(param_ty, &slots);
+        type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
+    }
+
+    resolve_constraints(type_checker, errors);
+
+    let mut inferred_type_args = Vec::with_capacity(type_params.len());
+    let mut inference_failed = false;
+    for param in type_params {
+        let slot_var = slots
+            .get(&param.id)
+            .and_then(|slot_ident| type_checker.get_var(*slot_ident));
+
+        let ty = slot_var
+            .filter(|ty| !contains_infer(ty))
+            .cloned()
+            .unwrap_or_else(|| {
+                inference_failed = true;
+                Type::Infer
+            });
+
+        inferred_type_args.push(ty);
+    }
+
+    if inference_failed {
+        errors.push(TypeErr {
+            span: call_span,
+            kind: TypeErrKind::UnresolvedInfer,
+        });
+        return None;
+    }
+
+    Some(inferred_type_args)
+}
+
 /// Check a function call given the function type
 fn check_call_with_type(
     call: &CallNode,
@@ -1191,29 +1406,19 @@ fn check_call_with_type(
 
     match func_ty.clone() {
         Type::Func { params, ret } => {
-            let same_params_len = params.len() == node.args.len();
-            if !same_params_len {
-                errors.push(TypeErr {
-                    span: call.span,
-                    kind: TypeErrKind::MismatchedTypes {
-                        expected: Type::Func {
-                            params: params.clone(),
-                            ret: ret.clone(),
-                        },
-                        found: func_ty,
-                    },
-                });
-                return Type::Infer;
-            }
-
-            for (arg_expr, param_ty) in node.args.iter().zip(params.iter()) {
-                check_expr(arg_expr, type_checker, errors);
-                let arg_ref = TypeRef::Expr(arg_expr.node.id);
-                let param_ref = TypeRef::Concrete(param_ty.clone());
-                type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
-            }
-
-            *ret
+            let ret = *ret;
+            check_call_signature(
+                call.span,
+                &params,
+                &ret,
+                &node.args,
+                Some(Type::Func {
+                    params: params.clone(),
+                    ret: Box::new(ret.clone()),
+                }),
+                type_checker,
+                errors,
+            )
         }
         _ => {
             errors.push(TypeErr {
@@ -1223,6 +1428,182 @@ fn check_call_with_type(
             Type::Infer
         }
     }
+}
+
+fn try_check_method_call(
+    call: &CallNode,
+    field_access: &FieldAccessNode,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Option<Type> {
+    let method_name = field_access.node.field;
+    let target = &field_access.node.target;
+
+    if let ExprKind::Ident(type_name) = &target.node.kind {
+        if let Some(struct_def) = type_checker.get_struct(*type_name).cloned() {
+            return Some(check_static_method_call(
+                call,
+                *type_name,
+                method_name,
+                &struct_def,
+                type_checker,
+                errors,
+            ));
+        }
+    }
+
+    let target_ty = check_expr(target, type_checker, errors);
+    if let Type::Struct { name, type_args } = &target_ty {
+        if let Some(struct_def) = type_checker.get_struct(*name).cloned() {
+            return Some(check_instance_method_call(
+                call,
+                *name,
+                method_name,
+                type_args,
+                &struct_def,
+                type_checker,
+                errors,
+            ));
+        }
+    }
+
+    None
+}
+
+fn check_static_method_call(
+    call: &CallNode,
+    struct_name: Ident,
+    method_name: Ident,
+    struct_def: &StructDef,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let Some(method) = struct_def.methods.get(&method_name) else {
+        errors.push(TypeErr {
+            span: call.span,
+            kind: TypeErrKind::UnknownMethod {
+                struct_name,
+                method: method_name,
+            },
+        });
+        return Type::Infer;
+    };
+
+    if method.receiver.is_some() {
+        errors.push(TypeErr {
+            span: call.span,
+            kind: TypeErrKind::InstanceMethodOnType {
+                struct_name,
+                method: method_name,
+            },
+        });
+        return Type::Infer;
+    }
+
+    let node = &call.node;
+    let is_generic = !struct_def.type_params.is_empty();
+    if is_generic {
+        let param_templates: Vec<Type> = method.params.iter().map(|p| p.ty.clone()).collect();
+        let expected_ty = Type::Func {
+            params: param_templates.clone(),
+            ret: Box::new(method.ret.clone()),
+        };
+        let Some(inferred_type_args) = infer_type_args_from_call(
+            call.span,
+            &struct_def.type_params,
+            &param_templates,
+            &node.args,
+            expected_ty,
+            type_checker,
+            errors,
+        ) else {
+            return Type::Infer;
+        };
+
+        let subst: HashMap<TypeVarId, Type> = struct_def
+            .type_params
+            .iter()
+            .zip(inferred_type_args.iter())
+            .map(|(param, arg)| (param.id, arg.clone()))
+            .collect();
+
+        let ret_ty = subst_type(&method.ret, &subst);
+        return ret_ty;
+    }
+
+    let param_types = method
+        .params
+        .iter()
+        .map(|p| p.ty.clone())
+        .collect::<Vec<_>>();
+    let ret_type = method.ret.clone();
+    check_call_signature(
+        call.span,
+        &param_types,
+        &ret_type,
+        &node.args,
+        None,
+        type_checker,
+        errors,
+    )
+}
+
+fn check_instance_method_call(
+    call: &CallNode,
+    struct_name: Ident,
+    method_name: Ident,
+    type_args: &[Type],
+    struct_def: &StructDef,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let Some(method) = struct_def.methods.get(&method_name) else {
+        errors.push(TypeErr {
+            span: call.span,
+            kind: TypeErrKind::UnknownMethod {
+                struct_name,
+                method: method_name,
+            },
+        });
+        return Type::Infer;
+    };
+
+    if method.receiver.is_none() {
+        errors.push(TypeErr {
+            span: call.span,
+            kind: TypeErrKind::StaticMethodOnValue {
+                struct_name,
+                method: method_name,
+            },
+        });
+        return Type::Infer;
+    }
+
+    let node = &call.node;
+
+    let subst: HashMap<TypeVarId, Type> = struct_def
+        .type_params
+        .iter()
+        .zip(type_args.iter())
+        .map(|(param, arg)| (param.id, arg.clone()))
+        .collect();
+
+    let param_types: Vec<Type> = method
+        .params
+        .iter()
+        .map(|p| subst_type(&p.ty, &subst))
+        .collect();
+    let ret_type = subst_type(&method.ret, &subst);
+
+    check_call_signature(
+        call.span,
+        &param_types,
+        &ret_type,
+        &node.args,
+        None,
+        type_checker,
+        errors,
+    )
 }
 
 /// Instantiates a generic function with concrete type arguments and typechecks the specialized body
@@ -1509,11 +1890,48 @@ fn check_unary(
     }
 }
 
+fn readonly_self_mutation_error(
+    assign: &AssignNode,
+    type_checker: &TypeChecker,
+) -> Option<TypeErr> {
+    let method_ctx = type_checker.current_method()?;
+
+    if !matches!(method_ctx.receiver, Some(MethodReceiver::Value)) {
+        return None;
+    }
+
+    let ExprKind::Field(field_node) = &assign.node.target.node.kind else {
+        return None;
+    };
+
+    let ExprKind::Ident(ident) = &field_node.node.target.node.kind else {
+        return None;
+    };
+
+    if ident.0.as_ref() != "self" {
+        return None;
+    }
+
+    Some(TypeErr {
+        span: assign.span,
+        kind: TypeErrKind::ReadonlySelfMutation {
+            struct_name: method_ctx.struct_name,
+            field: field_node.node.field,
+        },
+    })
+}
+
 fn check_assign(
     assign: &AssignNode,
     type_checker: &mut TypeChecker,
     errors: &mut Vec<TypeErr>,
 ) -> Type {
+    let maybe_error = readonly_self_mutation_error(assign, type_checker);
+    if let Some(error) = maybe_error {
+        errors.push(error);
+        return Type::Infer;
+    }
+
     let node = &assign.node;
     check_expr(&node.target, type_checker, errors);
     check_expr(&node.value, type_checker, errors);
