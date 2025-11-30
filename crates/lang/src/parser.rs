@@ -187,6 +187,14 @@ fn resolve_type_params(
             })
         }
 
+        Tuple(elements) => {
+            let resolved_elements: Result<Vec<_>, _> = elements
+                .iter()
+                .map(|el| resolve_type_params(el, type_param_map))
+                .collect();
+            Ok(Tuple(resolved_elements?))
+        }
+
         // other types pass through unchanged
         _ => Ok(ty.clone()),
     }
@@ -282,21 +290,84 @@ fn atom_expr<'src>(
             let expr = ast::Expr::new(ast::ExprKind::Block(block_node), id);
             Spanned::new(expr, span)
         }),
-        grouped_expr(expr),
+        grouped_or_tuple_expr(expr),
     ))
     .labelled("atom")
 }
 
-fn grouped_expr<'src>(
+fn validate_tuple_shape<T>(
+    first: Option<T>,
+    mut rest: Vec<T>,
+    trailing_comma: bool,
+    span: chumsky::span::SimpleSpan,
+    emitter: &mut chumsky::input::Emitter<Rich<'_, SpannedToken>>,
+    make_tuple: impl FnOnce(Vec<T>) -> T,
+    make_error_dummy: impl FnOnce() -> T,
+) -> T {
+    match (first, rest.len(), trailing_comma) {
+        // empty ()
+        (None, 0, _) => {
+            emitter.emit(Rich::custom(span, "empty tuples are not supported"));
+            make_error_dummy()
+        }
+        // 1-tuple (T,)
+        (Some(single), 0, true) => {
+            emitter.emit(Rich::custom(span, "1-tuples are not supported"));
+            single
+        }
+        // grouped (T) = T
+        (Some(single), 0, false) => single,
+        // tuple (T, U, ...)
+        (Some(first), _, _) => {
+            rest.insert(0, first);
+            make_tuple(rest)
+        }
+        // unexpected comma
+        (None, _, _) => {
+            emitter.emit(Rich::custom(span, "unexpected comma"));
+            make_error_dummy()
+        }
+    }
+}
+
+fn grouped_or_tuple_expr<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
-    select! {
-        (Token::Open(Delimiter::Parent), _) => (),
-    }
-    .ignore_then(expr.clone())
-    .then_ignore(select! {
-        (Token::Close(Delimiter::Parent), _) => (),
-    })
+    let comma = select! { (Token::Comma, _) => () };
+    let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
+    let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+
+    let first_expr = expr.clone();
+    let rest_exprs = comma.ignore_then(expr).repeated().collect::<Vec<_>>();
+
+    open_paren
+        .ignore_then(first_expr.or_not())
+        .then(rest_exprs)
+        .then(comma.or_not())
+        .then_ignore(close_paren)
+        .validate(|((first, rest), trailing_comma), e, emitter| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let expr_id = e.state().new_expr_id();
+
+            validate_tuple_shape(
+                first,
+                rest,
+                trailing_comma.is_some(),
+                s,
+                emitter,
+                |exprs| {
+                    let tuple_expr = ast::Expr::new(ast::ExprKind::Tuple(exprs), expr_id);
+                    Spanned::new(tuple_expr, span)
+                },
+                || {
+                    let dummy = ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
+                    Spanned::new(dummy, span)
+                },
+            )
+        })
+        .labelled("tuple or grouped expression")
+        .as_context()
 }
 
 fn fn_call_args<'src>(
@@ -515,12 +586,64 @@ fn expression<'src>(
     recursive(|expr| {
         let atom = atom_expr(stmt, expr.clone());
         let call = call_expr(atom, expr.clone());
-        let unary = unary_expr(call);
+        let indexed = tuple_index_expr(call);
+        let unary = unary_expr(indexed);
         let binary = binary_expr(unary);
         let ternary = ternary_expr(binary, expr.clone());
         let assign = assignment_expr(ternary);
         assign
     })
+}
+
+fn tuple_index_expr<'src>(
+    base: impl AnvParser<'src, ast::ExprNode>,
+) -> impl AnvParser<'src, ast::ExprNode> {
+    let single_index = select! {
+        (Token::Dot, _) => (),
+    }
+    .ignore_then(select! {
+        (Token::Literal(LitToken::Number(n)), _) => vec![n as u32],
+    });
+
+    let chained_index = select! {
+        (Token::Dot, _) => (),
+    }
+    .ignore_then(select! {
+        (Token::Literal(LitToken::Float(s)), _) => s,
+    })
+    .try_map(|s, span| {
+        let parts = s.as_ref().split('.').collect::<Vec<_>>();
+        let indices = parts
+            .iter()
+            .map(|p| p.parse::<u32>())
+            .collect::<Result<Vec<_>, _>>();
+        indices.map_err(|_| Rich::custom(span, "invalid tuple index"))
+    });
+
+    let index_suffix = choice((chained_index, single_index));
+
+    base.foldl_with(index_suffix.repeated(), |target, indices, e| {
+        let s = e.span();
+        let span = Span::new(s.start, s.end);
+
+        let mut current = target;
+        for index in indices {
+            let index_node = Spanned::new(
+                ast::TupleIndex {
+                    target: Box::new(current),
+                    index,
+                },
+                span,
+            );
+
+            let expr_id = e.state().new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::TupleIndex(index_node), expr_id);
+            current = Spanned::new(expr, span);
+        }
+        current
+    })
+    .labelled("tuple index")
+    .as_context()
 }
 
 fn identifier<'src>() -> impl AnvParser<'src, ast::Ident> {
@@ -590,34 +713,74 @@ fn return_type<'src>() -> impl AnvParser<'src, Option<ast::Type>> {
 }
 
 fn type_ident<'src>() -> impl AnvParser<'src, ast::Type> {
-    let builtin_typ = select! {
-        (Token::Keyword(Keyword::Int), _) => ast::Type::Int,
-        (Token::Keyword(Keyword::Float), _) => ast::Type::Float,
-        (Token::Keyword(Keyword::Bool), _) => ast::Type::Bool,
-        (Token::Keyword(Keyword::String), _) => ast::Type::String,
-        (Token::Keyword(Keyword::Void), _) => ast::Type::Void,
-    };
+    recursive(|type_parser| {
+        let builtin_typ = select! {
+            (Token::Keyword(Keyword::Int), _) => ast::Type::Int,
+            (Token::Keyword(Keyword::Float), _) => ast::Type::Float,
+            (Token::Keyword(Keyword::Bool), _) => ast::Type::Bool,
+            (Token::Keyword(Keyword::String), _) => ast::Type::String,
+            (Token::Keyword(Keyword::Void), _) => ast::Type::Void,
+        };
 
-    // parse type name as unresolved names (like T, U, ...)
-    let type_name_ref = identifier().map(ast::Type::UnresolvedName);
+        // parse type name as unresolved names (like T, U, ...)
+        let type_name_ref = identifier().map(ast::Type::UnresolvedName);
 
-    // try built-in types first and then type name references
-    let typ = builtin_typ.or(type_name_ref);
-    typ.then(
-        select! {
-            (Token::Question, _) => (),
-        }
-        .or_not(),
-    )
-    .map(|(ty, q)| {
-        if q.is_some() {
-            ast::Type::Optional(ty.boxed())
-        } else {
-            ty
-        }
+        // (T) is grouping, (T, T, ...) is tuple
+        let paren_type = paren_or_tuple_type(type_parser.clone());
+
+        // try built-in types first, then type name references, then parenthesized/tuple types
+        let typ = choice((builtin_typ, type_name_ref, paren_type));
+        typ.then(
+            select! {
+                (Token::Question, _) => (),
+            }
+            .or_not(),
+        )
+        .map(|(ty, q)| {
+            if q.is_some() {
+                ast::Type::Optional(ty.boxed())
+            } else {
+                ty
+            }
+        })
     })
     .labelled("type")
     .as_context()
+}
+
+fn paren_or_tuple_type<'src>(
+    type_parser: impl AnvParser<'src, ast::Type>,
+) -> impl AnvParser<'src, ast::Type> {
+    let comma = select! { (Token::Comma, _) => () };
+    let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
+    let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+
+    let first_type = type_parser.clone();
+    let rest_types = comma
+        .ignore_then(type_parser)
+        .repeated()
+        .collect::<Vec<_>>();
+
+    open_paren
+        .ignore_then(first_type.or_not())
+        .then(rest_types)
+        .then(comma.or_not())
+        .then_ignore(close_paren)
+        .validate(|((first, rest), trailing_comma), e, emitter| {
+            let s = e.span();
+
+            validate_tuple_shape(
+                first,
+                rest,
+                trailing_comma.is_some(),
+                s,
+                emitter,
+                ast::Type::Tuple,
+                || ast::Type::Void,
+            )
+        })
+        .labelled("tuple or grouped type")
+        .as_context()
 }
 
 fn binding<'src>(

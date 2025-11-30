@@ -5,7 +5,7 @@ use crate::{
     typecheck::{TypeErr, TypeErrKind},
 };
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use chumsky::error::{Rich, RichPattern};
+use chumsky::error::{Rich, RichPattern, RichReason};
 
 pub fn report_lexer_errors(src: &str, file_path: &str, errors: Vec<Rich<'_, char>>) {
     for e in errors {
@@ -42,10 +42,18 @@ pub fn report_parse_errors(
 
         let byte_range = token_span_to_byte_range(tokens, token_span.start..token_span.end);
 
+        let custom_msg = match e.reason() {
+            RichReason::Custom(msg) => Some(msg.to_string()),
+            _ => None,
+        };
+
         let last_context = last_ctx(&e)
             .map(|s| format!("while parsing a {}", s))
             .unwrap_or_default();
-        let (msg_title, msg_body) = if let Some((found_token, _)) = e.found() {
+
+        let (msg_title, msg_body) = if let Some(msg) = custom_msg {
+            (msg, String::new())
+        } else if let Some((found_token, _)) = e.found() {
             let token_desc = describe_token(found_token);
             (format!("Unexpected token {}", last_context), token_desc)
         } else {
@@ -109,6 +117,21 @@ pub fn report_typecheck_errors(
             TypeErrKind::IfMissingElse => (
                 "if expression used as value must have an else branch".to_string(),
                 "add an else branch to use this if expression as a value".to_string(),
+            ),
+            TypeErrKind::TupleIndexOnNonTuple { found, index } => (
+                format!("cannot index non-tuple type with .{index}"),
+                format!("expression has type '{found}', which is not a tuple"),
+            ),
+            TypeErrKind::TupleIndexOutOfBounds {
+                tuple_type,
+                index,
+                len,
+            } => (
+                format!("tuple index {index} is out of bounds"),
+                format!(
+                    "tuple type '{tuple_type}' has {len} elements (indices 0..{})",
+                    len - 1
+                ),
             ),
         };
 

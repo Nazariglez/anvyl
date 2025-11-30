@@ -2,7 +2,7 @@ use crate::{
     ast::{
         AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
         ExprKind, ExprNode, Func, FuncNode, Ident, IfNode, Lit, Program, ReturnNode, Stmt,
-        StmtNode, Type, TypeParam, TypeVarId, UnaryNode, UnaryOp,
+        StmtNode, TupleIndexNode, Type, TypeParam, TypeVarId, UnaryNode, UnaryOp,
     },
     span::Span,
 };
@@ -269,16 +269,42 @@ pub struct TypeErr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeErrKind {
-    UnknownVariable { name: Ident },
-    MismatchedTypes { expected: Type, found: Type },
-    InvalidOperand { op: String, operand_type: Type },
-    UnknownFunction { name: Ident },
+    UnknownVariable {
+        name: Ident,
+    },
+    MismatchedTypes {
+        expected: Type,
+        found: Type,
+    },
+    InvalidOperand {
+        op: String,
+        operand_type: Type,
+    },
+    UnknownFunction {
+        name: Ident,
+    },
     UnresolvedInfer,
-    NotAFunction { expr_type: Type },
-    GenericArgNumMismatch { expected: usize, found: usize },
+    NotAFunction {
+        expr_type: Type,
+    },
+    GenericArgNumMismatch {
+        expected: usize,
+        found: usize,
+    },
     NotGenericFunction,
-    IfConditionNotBool { found: Type },
+    IfConditionNotBool {
+        found: Type,
+    },
     IfMissingElse,
+    TupleIndexOnNonTuple {
+        found: Type,
+        index: u32,
+    },
+    TupleIndexOutOfBounds {
+        tuple_type: Type,
+        index: u32,
+        len: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -799,6 +825,8 @@ fn check_expr(
         ExprKind::Unary(unary) => check_unary(unary, type_checker, errors),
         ExprKind::Assign(assign) => check_assign(assign, type_checker, errors),
         ExprKind::If(if_node) => check_if(if_node, type_checker, errors),
+        ExprKind::Tuple(elements) => check_tuple(elements, type_checker, errors),
+        ExprKind::TupleIndex(index_node) => check_tuple_index(index_node, type_checker, errors),
     };
 
     type_checker.set_type(expr_node.node.id, ty.clone(), expr_node.span);
@@ -1445,6 +1473,59 @@ fn check_if(if_node: &IfNode, type_checker: &mut TypeChecker, errors: &mut Vec<T
 
     // return the type of the branch that is not inferred
     if then_ty.is_infer() { else_ty } else { then_ty }
+}
+
+fn check_tuple(
+    elements: &[ExprNode],
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let element_types: Vec<Type> = elements
+        .iter()
+        .map(|el| check_expr(el, type_checker, errors))
+        .collect();
+    Type::Tuple(element_types)
+}
+
+fn check_tuple_index(
+    index_node: &TupleIndexNode,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let node = &index_node.node;
+    let target_ty = check_expr(&node.target, type_checker, errors);
+    let index = node.index;
+
+    match &target_ty {
+        Type::Tuple(elements) => {
+            let len = elements.len();
+            let is_in_bounds = (index as usize) < len;
+            if is_in_bounds {
+                elements[index as usize].clone()
+            } else {
+                errors.push(TypeErr {
+                    span: index_node.span,
+                    kind: TypeErrKind::TupleIndexOutOfBounds {
+                        tuple_type: target_ty.clone(),
+                        index,
+                        len,
+                    },
+                });
+                Type::Infer
+            }
+        }
+        Type::Infer => Type::Infer,
+        _ => {
+            errors.push(TypeErr {
+                span: index_node.span,
+                kind: TypeErrKind::TupleIndexOnNonTuple {
+                    found: target_ty.clone(),
+                    index,
+                },
+            });
+            Type::Infer
+        }
+    }
 }
 
 fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {

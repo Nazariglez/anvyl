@@ -16,6 +16,7 @@ pub enum Token {
     Semicolon,
     Comma,
     Question,
+    Dot,
 }
 
 pub type SpannedToken = (Token, Span);
@@ -37,6 +38,7 @@ impl Display for Token {
             Token::Semicolon => write!(f, ";"),
             Token::Comma => write!(f, ","),
             Token::Question => write!(f, "?"),
+            Token::Dot => write!(f, "."),
         }
     }
 }
@@ -328,5 +330,6 @@ fn punctuation<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
         just(";").to(Token::Semicolon),
         just(",").to(Token::Comma),
         just("?").to(Token::Question),
+        just(".").to(Token::Dot),
     ))
 }

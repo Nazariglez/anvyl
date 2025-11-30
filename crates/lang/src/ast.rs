@@ -13,6 +13,7 @@ pub type CallNode = Spanned<Call>;
 pub type AssignNode = Spanned<Assign>;
 pub type ReturnNode = Spanned<Return>;
 pub type IfNode = Spanned<If>;
+pub type TupleIndexNode = Spanned<TupleIndex>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -52,6 +53,8 @@ pub enum ExprKind {
     Unary(UnaryNode),
     Assign(AssignNode),
     If(IfNode),
+    Tuple(Vec<ExprNode>),
+    TupleIndex(TupleIndexNode),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Eq)]
@@ -102,6 +105,8 @@ pub enum Type {
     Var(TypeVarId),
     /// Unresolved type name reference (T before being resolved to Var)
     UnresolvedName(Ident),
+    /// Tuple type (int, string, bool)
+    Tuple(Vec<Type>),
 }
 
 impl Type {
@@ -137,6 +142,10 @@ impl Type {
         matches!(self, Type::Var(_))
     }
 
+    pub fn is_tuple(&self) -> bool {
+        matches!(self, Type::Tuple(_))
+    }
+
     pub fn boxed(&self) -> Box<Self> {
         Box::new(self.clone())
     }
@@ -164,6 +173,10 @@ impl Display for Type {
             Type::Infer => write!(f, "<infer>"),
             Type::Var(id) => write!(f, "{}", id),
             Type::UnresolvedName(ident) => write!(f, "{}", ident),
+            Type::Tuple(elements) => {
+                let parts: Vec<String> = elements.iter().map(|t| t.to_string()).collect();
+                write!(f, "({})", parts.join(", "))
+            }
         }
     }
 }
@@ -332,4 +345,10 @@ pub struct If {
     pub cond: Box<ExprNode>,
     pub then_block: BlockNode,
     pub else_block: Option<BlockNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TupleIndex {
+    pub target: Box<ExprNode>,
+    pub index: u32,
 }
