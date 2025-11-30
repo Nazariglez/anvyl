@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+struct Player {
+    hp: int,
+    name: string,
+}
+
+fn main() {}

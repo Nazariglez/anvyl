@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown field 'level'
+
+struct Player {
+    hp: int,
+    name: string,
+}
+
+fn main() {
+    let p = Player { hp: 100, name: "Naza" };
+    let x = p.level;
+}

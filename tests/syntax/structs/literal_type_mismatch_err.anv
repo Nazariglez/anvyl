@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+struct Player {
+    hp: int,
+    name: string,
+}
+
+fn main() {
+    let p = Player { hp: "oops", name: "Naza" };
+}

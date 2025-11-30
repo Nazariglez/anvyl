@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+struct Config {
+    name: string,
+    value: int?,
+}
+
+fn main() {
+    let c1 = Config { name: "test", value: 42 };
+    let c2 = Config { name: "other", value: nil };
+    let v: int? = c1.value;
+}

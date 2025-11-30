@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+struct Player {
+    hp: int,
+    name: string,
+}
+
+fn main() {
+    let p = Player { hp: 100, name: "Naza" };
+    let h: int = p.hp;
+    let n: string = p.name;
+}

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown struct 'Player'
+
+fn main() {
+    let p = Player { hp: 100, name: "Naza" };
+}

@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: success
+
+struct Vec2 {
+    x: int,
+    y: int,
+}
+
+struct Player {
+    pos: Vec2,
+    name: string,
+}
+
+fn main() {
+    let p = Player {
+        pos: Vec2 { x: 10, y: 20 },
+        name: "Hero",
+    };
+    let px: int = p.pos.x;
+    let py: int = p.pos.y;
+}

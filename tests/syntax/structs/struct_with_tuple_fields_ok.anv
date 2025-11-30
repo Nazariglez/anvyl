@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+struct Position {
+    coords: (int, int),
+    label: string,
+}
+
+fn main() {
+    let pos = Position { coords: (10, 20), label: "origin" };
+    let x = pos.coords.0;
+    let y = pos.coords.1;
+    let name: string = pos.label;
+}

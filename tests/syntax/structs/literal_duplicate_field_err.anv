@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Duplicate field 'hp'
+
+struct Player {
+    hp: int,
+    name: string,
+}
+
+fn main() {
+    let p = Player { hp: 100, hp: 200, name: "Naza" };
+}

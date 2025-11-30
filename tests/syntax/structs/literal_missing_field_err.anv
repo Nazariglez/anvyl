@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Missing field 'name'
+
+struct Player {
+    hp: int,
+    name: string,
+}
+
+fn main() {
+    let p = Player { hp: 100 };
+}

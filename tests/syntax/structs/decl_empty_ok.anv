@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: success
+
+struct Marker {}
+
+fn main() {}
