@@ -33,7 +33,7 @@ fn main() {
     };
 
     println!("");
-    println!("{CYAN}--- Testing {} files ---{RESET}", files.len());
+    println!("{CYAN}Running {} tests...{RESET}", files.len());
     println!("");
 
     let results = files
@@ -108,7 +108,7 @@ impl Summary {
 
     fn print_summary(&self, start_time: Instant, total: usize) {
         println!("");
-        println!("{CYAN}--- Test Results ---{RESET}");
+        println!("{CYAN}Summary: {RESET}");
         println!("");
 
         if self.skipped > 0 {
@@ -138,12 +138,21 @@ impl Summary {
             println!("");
         }
 
-        println!("* {GREEN}Passed:{RESET} {} of {total}", self.passed);
+        println!("* {GREEN}Passed:{RESET} {}", self.passed);
         println!("");
-        println!(
-            "{CYAN}Total time:{RESET} {:.2}s",
+        let result = format!(
+            "{GREEN}{}{RESET} passed; {RED}{}{RESET} failed; {BLUE}{}{RESET} timed out; {YELLOW}{}{RESET} skipped; finished in: {CYAN}{:.2}s{RESET}",
+            self.passed,
+            self.failed,
+            self.timed_out,
+            self.skipped,
             start_time.elapsed().as_secs_f64()
         );
+        if self.failed > 0 || self.timed_out > 0 {
+            eprintln!("Test Result: {RED}FAILED{RESET}. -- {result}");
+        } else {
+            eprintln!("Test Result: {GREEN}OK{RESET}. -- {result}");
+        }
     }
 }
 
