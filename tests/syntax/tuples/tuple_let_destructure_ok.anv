@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let p = (10, 20);
+    let (x, y) = p;
+    let a: int = x;
+    let b: int = y;
+
+    let t = ((1, 2), 3);
+    let ((m, n), o) = t;
+    let c: int = m;
+    let d: int = n;
+    let e: int = o;
+
+    let (_, second) = p;
+    let f: int = second;
+
+    let (first, _) = p;
+    let g: int = first;
+
+    let ((_, j), _) = t;
+    let h: int = j;
+}
+

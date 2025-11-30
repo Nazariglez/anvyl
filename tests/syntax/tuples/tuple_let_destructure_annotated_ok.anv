@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let (x, y): (int, int) = (1, 2);
+    let a: int = x;
+    let b: int = y;
+
+    let (m, n): (int, string) = (10, "hello");
+    let c: int = m;
+    let d: string = n;
+}
+

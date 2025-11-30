@@ -783,6 +783,70 @@ fn paren_or_tuple_type<'src>(
         .as_context()
 }
 
+fn pattern<'src>() -> impl AnvParser<'src, ast::PatternNode> {
+    recursive(|pat| {
+        let ident_or_wildcard = identifier().map_with(|ident, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            if ident.0.as_ref() == "_" {
+                Spanned::new(ast::Pattern::Wildcard, span)
+            } else {
+                Spanned::new(ast::Pattern::Ident(ident), span)
+            }
+        });
+
+        let tuple_pat = tuple_pattern(pat);
+
+        choice((tuple_pat, ident_or_wildcard))
+    })
+    .labelled("pattern")
+    .as_context()
+}
+
+fn tuple_pattern<'src>(
+    pat: impl AnvParser<'src, ast::PatternNode>,
+) -> impl AnvParser<'src, ast::PatternNode> {
+    let comma = select! { (Token::Comma, _) => () };
+    let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
+    let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+
+    let first_pat = pat.clone();
+    let rest_pats = comma.ignore_then(pat).repeated().collect::<Vec<_>>();
+
+    open_paren
+        .ignore_then(first_pat.or_not())
+        .then(rest_pats)
+        .then(comma.or_not())
+        .then_ignore(close_paren)
+        .validate(|((first, rest), trailing_comma), e, emitter| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+
+            match (first, rest.len(), trailing_comma.is_some()) {
+                (None, 0, _) => {
+                    emitter.emit(Rich::custom(s, "empty tuple patterns are not supported"));
+                    Spanned::new(ast::Pattern::Wildcard, span)
+                }
+                (Some(single), 0, true) => {
+                    emitter.emit(Rich::custom(s, "1-tuple patterns are not supported"));
+                    single
+                }
+                (Some(single), 0, false) => single,
+                (Some(first), _, _) => {
+                    let mut pats = vec![first];
+                    pats.extend(rest);
+                    Spanned::new(ast::Pattern::Tuple(pats), span)
+                }
+                (None, _, _) => {
+                    emitter.emit(Rich::custom(s, "unexpected comma in pattern"));
+                    Spanned::new(ast::Pattern::Wildcard, span)
+                }
+            }
+        })
+        .labelled("tuple pattern")
+        .as_context()
+}
+
 fn binding<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> impl AnvParser<'src, ast::BindingNode> {
@@ -792,7 +856,7 @@ fn binding<'src>(
     };
 
     mutability
-        .then(identifier())
+        .then(pattern())
         .then(
             select! {
                 (Token::Colon, _) => (),
@@ -807,11 +871,11 @@ fn binding<'src>(
         .then_ignore(select! {
             (Token::Semicolon, _) => (),
         })
-        .map_with(|(((mutability, name), ty), value), e| {
+        .map_with(|(((mutability, pat), ty), value), e| {
             let s = e.span();
             Spanned::new(
                 ast::Binding {
-                    name,
+                    pattern: pat,
                     ty,
                     mutability,
                     value,

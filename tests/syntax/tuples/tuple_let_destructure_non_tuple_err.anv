@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: cannot destructure non-tuple type
+
+fn main() {
+    let x = 1;
+    let (a, b) = x;
+}
+

@@ -1,8 +1,8 @@
 use crate::{
     ast::{
         AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
-        ExprKind, ExprNode, Func, FuncNode, Ident, IfNode, Lit, Program, ReturnNode, Stmt,
-        StmtNode, TupleIndexNode, Type, TypeParam, TypeVarId, UnaryNode, UnaryOp,
+        ExprKind, ExprNode, Func, FuncNode, Ident, IfNode, Lit, Pattern, PatternNode, Program,
+        ReturnNode, Stmt, StmtNode, TupleIndexNode, Type, TypeParam, TypeVarId, UnaryNode, UnaryOp,
     },
     span::Span,
 };
@@ -304,6 +304,14 @@ pub enum TypeErrKind {
         tuple_type: Type,
         index: u32,
         len: usize,
+    },
+    TuplePatternArityMismatch {
+        expected: usize,
+        found: usize,
+    },
+    NonTupleInTuplePattern {
+        found: Type,
+        pattern_arity: usize,
     },
 }
 
@@ -1541,25 +1549,63 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
 
     let val_ref = TypeRef::Expr(node.value.node.id);
 
-    // if there is no type annotation then we just constrain the variable to the value
-    let Some(annot_ty) = &node.ty else {
-        // get the inferred type from the value expression
-        let inferred_ty = type_checker
-            .get_type(node.value.node.id)
-            .map(|(_, ty)| ty.clone())
-            .unwrap_or(Type::Infer);
-        type_checker.set_var(node.name, inferred_ty);
+    let value_ty = type_checker
+        .get_type(node.value.node.id)
+        .map(|(_, ty)| ty.clone())
+        .unwrap_or(Type::Infer);
 
-        let var_ref = TypeRef::Var(node.name);
-        type_checker.constrain_equal(binding.span, val_ref, var_ref, errors);
-        return;
+    let binding_ty = match &node.ty {
+        Some(annot_ty) => {
+            let annot_ref = TypeRef::Concrete(annot_ty.clone());
+            type_checker.constrain_assignable(binding.span, val_ref, annot_ref, errors);
+            annot_ty.clone()
+        }
+        None => value_ty,
     };
 
-    // if there is a type annotation then we use constrain_assignable to check
-    // if the value is assignable to the annotation (handles T -> T?, inference, etc.)
-    let annot_ref = TypeRef::Concrete(annot_ty.clone());
-    type_checker.constrain_assignable(binding.span, val_ref, annot_ref, errors);
-    type_checker.set_var(node.name, annot_ty.clone());
+    check_pattern(&node.pattern, &binding_ty, type_checker, errors);
+}
+
+fn check_pattern(
+    pattern: &PatternNode,
+    value_ty: &Type,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) {
+    match &pattern.node {
+        Pattern::Ident(name) => {
+            type_checker.set_var(*name, value_ty.clone());
+        }
+        Pattern::Wildcard => {}
+        Pattern::Tuple(subpatterns) => {
+            let Type::Tuple(elem_types) = value_ty else {
+                errors.push(TypeErr {
+                    span: pattern.span,
+                    kind: TypeErrKind::NonTupleInTuplePattern {
+                        found: value_ty.clone(),
+                        pattern_arity: subpatterns.len(),
+                    },
+                });
+                return;
+            };
+
+            let same_arity = subpatterns.len() == elem_types.len();
+            if !same_arity {
+                errors.push(TypeErr {
+                    span: pattern.span,
+                    kind: TypeErrKind::TuplePatternArityMismatch {
+                        expected: elem_types.len(),
+                        found: subpatterns.len(),
+                    },
+                });
+                return;
+            }
+
+            for (subpat, elem_ty) in subpatterns.iter().zip(elem_types.iter()) {
+                check_pattern(subpat, elem_ty, type_checker, errors);
+            }
+        }
+    }
 }
 
 fn is_if_without_else(expr: &ExprNode) -> bool {
@@ -1609,8 +1655,8 @@ mod tests {
     use super::*;
     use crate::{
         ast::{
-            Assign, Binary, Binding, Block, BlockNode, Call, Expr, Func, Mutability, Param, Return,
-            TypeParam, TypeVarId, Unary, Visibility,
+            Assign, Binary, Binding, Block, BlockNode, Call, Expr, Func, Mutability, Param,
+            Pattern, PatternNode, Return, TypeParam, TypeVarId, Unary, Visibility,
         },
         span::Span,
     };
@@ -1752,11 +1798,18 @@ mod tests {
         }
     }
 
+    fn dummy_pattern(name: &str) -> PatternNode {
+        PatternNode {
+            node: Pattern::Ident(dummy_ident(name)),
+            span: dummy_span(),
+        }
+    }
+
     fn let_binding(name: &str, ty: Option<Type>, value: ExprNode) -> StmtNode {
         StmtNode {
             node: Stmt::Binding(BindingNode {
                 node: Binding {
-                    name: dummy_ident(name),
+                    pattern: dummy_pattern(name),
                     ty,
                     mutability: Mutability::Immutable,
                     value,
@@ -1771,7 +1824,7 @@ mod tests {
         StmtNode {
             node: Stmt::Binding(BindingNode {
                 node: Binding {
-                    name: dummy_ident(name),
+                    pattern: dummy_pattern(name),
                     ty,
                     mutability: Mutability::Mutable,
                     value,

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: tuple pattern arity mismatch
+
+fn main() {
+    let p = (1, 2, 3);
+    let (x, y) = p;
+}
+

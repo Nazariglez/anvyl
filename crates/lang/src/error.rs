@@ -133,6 +133,17 @@ pub fn report_typecheck_errors(
                     len - 1
                 ),
             ),
+            TypeErrKind::TuplePatternArityMismatch { expected, found } => (
+                "tuple pattern arity mismatch".to_string(),
+                format!("expected {expected} elements, found {found}"),
+            ),
+            TypeErrKind::NonTupleInTuplePattern {
+                found,
+                pattern_arity,
+            } => (
+                format!("cannot destructure non-tuple type with {pattern_arity}-element pattern"),
+                format!("expression has type '{found}', which is not a tuple"),
+            ),
         };
 
         emit_report(src, file_path, byte_range, title, body);

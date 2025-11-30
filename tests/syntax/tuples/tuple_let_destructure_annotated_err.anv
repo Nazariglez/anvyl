@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn main() {
+    let (x, y): (int, string) = (1, 2);
+}
+

@@ -14,6 +14,7 @@ pub type AssignNode = Spanned<Assign>;
 pub type ReturnNode = Spanned<Return>;
 pub type IfNode = Spanned<If>;
 pub type TupleIndexNode = Spanned<TupleIndex>;
+pub type PatternNode = Spanned<Pattern>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -195,10 +196,17 @@ pub enum Mutability {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
-    pub name: Ident,
+    pub pattern: PatternNode,
     pub ty: Option<Type>,
     pub mutability: Mutability,
     pub value: ExprNode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Ident(Ident),
+    Tuple(Vec<PatternNode>),
+    Wildcard,
 }
 
 #[derive(Debug, Clone, PartialEq)]
