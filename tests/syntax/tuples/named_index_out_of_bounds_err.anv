@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: tuple index 2 is out of bounds
+
+fn main() {
+    let p = (x: 10, y: 20);
+    let x = p.2;
+}
+

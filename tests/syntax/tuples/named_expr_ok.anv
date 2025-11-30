@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let p: (x: int, y: int) = (x: 10, y: 20);
+    let q = (x: 10, y: 20);
+    let a = q.x;
+    let b = q.y;
+    let i0 = q.0;
+    let i1 = q.1;
+
+    let c: int = a;
+    let d: int = b;
+    let e: int = i0;
+    let f: int = i1;
+}
+

@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: cannot mix labeled and unlabeled elements in tuple type
+
+fn main() {
+    let bad: (x: int, int) = (x: 10, 20);
+}
+

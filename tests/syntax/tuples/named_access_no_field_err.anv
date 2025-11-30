@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: has no field 'z'
+
+fn main() {
+    let p = (x: 10, y: 20);
+    let z = p.z;
+}
+
