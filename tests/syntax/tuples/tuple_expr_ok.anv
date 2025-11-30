@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+fn id_int(x: int) -> int { x }
+
+fn main() {
+    let x = 10;
+    let y = (10);
+    let p = (10, 20);
+    let t = (1, "hi", true);
+    let n = ((1, 2), "ok");
+
+    let a = id_int(10);
+    let b = id_int((10));
+}
+

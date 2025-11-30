@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: cannot index non-tuple type with .0
+
+fn main() {
+    let x: int = 10;
+    let y = x.0;
+}
+
