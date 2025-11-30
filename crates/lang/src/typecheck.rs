@@ -1,13 +1,14 @@
 use crate::{
     ast::{
         AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
-        ExprKind, ExprNode, Func, FuncNode, Ident, IfNode, Lit, Pattern, PatternNode, Program,
-        ReturnNode, Stmt, StmtNode, TupleIndexNode, Type, TypeParam, TypeVarId, UnaryNode, UnaryOp,
+        ExprKind, ExprNode, FieldAccessNode, Func, FuncNode, Ident, IfNode, Lit, Pattern,
+        PatternNode, Program, ReturnNode, Stmt, StmtNode, TupleIndexNode, Type, TypeParam,
+        TypeVarId, UnaryNode, UnaryOp,
     },
     span::Span,
 };
 use internment::Intern;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 type InferenceSlots = HashMap<TypeVarId, Ident>;
 
@@ -312,6 +313,17 @@ pub enum TypeErrKind {
     NonTupleInTuplePattern {
         found: Type,
         pattern_arity: usize,
+    },
+    DuplicateTupleLabel {
+        label: Ident,
+    },
+    NoSuchFieldOnTuple {
+        field: Ident,
+        tuple_type: Type,
+    },
+    FieldAccessOnNonNamedTuple {
+        field: Ident,
+        found: Type,
     },
 }
 
@@ -834,7 +846,11 @@ fn check_expr(
         ExprKind::Assign(assign) => check_assign(assign, type_checker, errors),
         ExprKind::If(if_node) => check_if(if_node, type_checker, errors),
         ExprKind::Tuple(elements) => check_tuple(elements, type_checker, errors),
+        ExprKind::NamedTuple(elements) => {
+            check_named_tuple(elements, expr_node.span, type_checker, errors)
+        }
         ExprKind::TupleIndex(index_node) => check_tuple_index(index_node, type_checker, errors),
+        ExprKind::Field(field_node) => check_field_access(field_node, type_checker, errors),
     };
 
     type_checker.set_type(expr_node.node.id, ty.clone(), expr_node.span);
@@ -1495,6 +1511,32 @@ fn check_tuple(
     Type::Tuple(element_types)
 }
 
+fn check_named_tuple(
+    elements: &[(Ident, ExprNode)],
+    span: Span,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let mut seen_labels = HashSet::new();
+    let mut fields = Vec::with_capacity(elements.len());
+
+    for (label, expr) in elements {
+        let ty = check_expr(expr, type_checker, errors);
+
+        let inserted = seen_labels.insert(*label);
+        if !inserted {
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::DuplicateTupleLabel { label: *label },
+            });
+        }
+
+        fields.push((*label, ty));
+    }
+
+    Type::NamedTuple(fields)
+}
+
 fn check_tuple_index(
     index_node: &TupleIndexNode,
     type_checker: &mut TypeChecker,
@@ -1504,31 +1546,70 @@ fn check_tuple_index(
     let target_ty = check_expr(&node.target, type_checker, errors);
     let index = node.index;
 
+    let Some(element_types) = target_ty.tuple_element_types() else {
+        if matches!(target_ty, Type::Infer) {
+            return Type::Infer;
+        }
+
+        errors.push(TypeErr {
+            span: index_node.span,
+            kind: TypeErrKind::TupleIndexOnNonTuple {
+                found: target_ty.clone(),
+                index,
+            },
+        });
+        return Type::Infer;
+    };
+
+    let len = element_types.len();
+    let is_in_bounds = (index as usize) < len;
+    if is_in_bounds {
+        element_types[index as usize].clone()
+    } else {
+        errors.push(TypeErr {
+            span: index_node.span,
+            kind: TypeErrKind::TupleIndexOutOfBounds {
+                tuple_type: target_ty.clone(),
+                index,
+                len,
+            },
+        });
+        Type::Infer
+    }
+}
+
+fn check_field_access(
+    field_node: &FieldAccessNode,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let node = &field_node.node;
+    let target_ty = check_expr(&node.target, type_checker, errors);
+    let field = node.field;
+
     match &target_ty {
-        Type::Tuple(elements) => {
-            let len = elements.len();
-            let is_in_bounds = (index as usize) < len;
-            if is_in_bounds {
-                elements[index as usize].clone()
-            } else {
-                errors.push(TypeErr {
-                    span: index_node.span,
-                    kind: TypeErrKind::TupleIndexOutOfBounds {
-                        tuple_type: target_ty.clone(),
-                        index,
-                        len,
-                    },
-                });
-                Type::Infer
+        Type::NamedTuple(fields) => {
+            for (label, ty) in fields {
+                if *label == field {
+                    return ty.clone();
+                }
             }
+            errors.push(TypeErr {
+                span: field_node.span,
+                kind: TypeErrKind::NoSuchFieldOnTuple {
+                    field,
+                    tuple_type: target_ty.clone(),
+                },
+            });
+            Type::Infer
         }
         Type::Infer => Type::Infer,
         _ => {
             errors.push(TypeErr {
-                span: index_node.span,
-                kind: TypeErrKind::TupleIndexOnNonTuple {
+                span: field_node.span,
+                kind: TypeErrKind::FieldAccessOnNonNamedTuple {
+                    field,
                     found: target_ty.clone(),
-                    index,
                 },
             });
             Type::Infer
@@ -1578,7 +1659,7 @@ fn check_pattern(
         }
         Pattern::Wildcard => {}
         Pattern::Tuple(subpatterns) => {
-            let Type::Tuple(elem_types) = value_ty else {
+            let Some(elem_types) = value_ty.tuple_element_types() else {
                 errors.push(TypeErr {
                     span: pattern.span,
                     kind: TypeErrKind::NonTupleInTuplePattern {

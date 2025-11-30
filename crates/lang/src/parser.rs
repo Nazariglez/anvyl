@@ -295,39 +295,34 @@ fn atom_expr<'src>(
     .labelled("atom")
 }
 
-fn validate_tuple_shape<T>(
+enum TupleShapeResult<T> {
+    Empty,
+    OneTupleError(T),
+    Grouped(T),
+    Tuple(Vec<T>),
+    UnexpectedComma,
+}
+
+fn validate_tuple_shape_raw<T>(
     first: Option<T>,
     mut rest: Vec<T>,
     trailing_comma: bool,
-    span: chumsky::span::SimpleSpan,
-    emitter: &mut chumsky::input::Emitter<Rich<'_, SpannedToken>>,
-    make_tuple: impl FnOnce(Vec<T>) -> T,
-    make_error_dummy: impl FnOnce() -> T,
-) -> T {
+) -> TupleShapeResult<T> {
     match (first, rest.len(), trailing_comma) {
-        // empty ()
-        (None, 0, _) => {
-            emitter.emit(Rich::custom(span, "empty tuples are not supported"));
-            make_error_dummy()
-        }
-        // 1-tuple (T,)
-        (Some(single), 0, true) => {
-            emitter.emit(Rich::custom(span, "1-tuples are not supported"));
-            single
-        }
-        // grouped (T) = T
-        (Some(single), 0, false) => single,
-        // tuple (T, U, ...)
+        (None, 0, _) => TupleShapeResult::Empty,
+        (Some(single), 0, true) => TupleShapeResult::OneTupleError(single),
+        (Some(single), 0, false) => TupleShapeResult::Grouped(single),
         (Some(first), _, _) => {
             rest.insert(0, first);
-            make_tuple(rest)
+            TupleShapeResult::Tuple(rest)
         }
-        // unexpected comma
-        (None, _, _) => {
-            emitter.emit(Rich::custom(span, "unexpected comma"));
-            make_error_dummy()
-        }
+        (None, _, _) => TupleShapeResult::UnexpectedComma,
     }
+}
+
+enum TupleExprElem {
+    Pos(ast::ExprNode),
+    Labeled(ast::Ident, ast::ExprNode),
 }
 
 fn grouped_or_tuple_expr<'src>(
@@ -336,13 +331,22 @@ fn grouped_or_tuple_expr<'src>(
     let comma = select! { (Token::Comma, _) => () };
     let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
     let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+    let colon = select! { (Token::Colon, _) => () };
 
-    let first_expr = expr.clone();
-    let rest_exprs = comma.ignore_then(expr).repeated().collect::<Vec<_>>();
+    let labeled_elem = identifier()
+        .then_ignore(colon.clone())
+        .then(expr.clone())
+        .map(|(name, e)| TupleExprElem::Labeled(name, e));
+
+    let pos_elem = expr.map(TupleExprElem::Pos);
+    let elem = choice((labeled_elem, pos_elem));
+
+    let first_elem = elem.clone();
+    let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
 
     open_paren
-        .ignore_then(first_expr.or_not())
-        .then(rest_exprs)
+        .ignore_then(first_elem.or_not())
+        .then(rest_elems)
         .then(comma.or_not())
         .then_ignore(close_paren)
         .validate(|((first, rest), trailing_comma), e, emitter| {
@@ -350,21 +354,67 @@ fn grouped_or_tuple_expr<'src>(
             let span = Span::new(s.start, s.end);
             let expr_id = e.state().new_expr_id();
 
-            validate_tuple_shape(
-                first,
-                rest,
-                trailing_comma.is_some(),
-                s,
-                emitter,
-                |exprs| {
-                    let tuple_expr = ast::Expr::new(ast::ExprKind::Tuple(exprs), expr_id);
-                    Spanned::new(tuple_expr, span)
-                },
-                || {
+            match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
+                TupleShapeResult::Empty => {
+                    emitter.emit(Rich::custom(s, "empty tuples are not supported"));
                     let dummy = ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
                     Spanned::new(dummy, span)
+                }
+                TupleShapeResult::OneTupleError(elem) => {
+                    emitter.emit(Rich::custom(s, "1-tuples are not supported"));
+                    match elem {
+                        TupleExprElem::Pos(e) => e,
+                        TupleExprElem::Labeled(_, e) => e,
+                    }
+                }
+                TupleShapeResult::Grouped(elem) => match elem {
+                    TupleExprElem::Pos(e) => e,
+                    TupleExprElem::Labeled(_, e) => e,
                 },
-            )
+                TupleShapeResult::Tuple(elems) => {
+                    let all_pos = elems.iter().all(|e| matches!(e, TupleExprElem::Pos(_)));
+                    let all_labeled = elems
+                        .iter()
+                        .all(|e| matches!(e, TupleExprElem::Labeled(_, _)));
+
+                    if all_pos {
+                        let exprs: Vec<ast::ExprNode> = elems
+                            .into_iter()
+                            .map(|e| match e {
+                                TupleExprElem::Pos(expr) => expr,
+                                TupleExprElem::Labeled(_, expr) => expr,
+                            })
+                            .collect();
+                        let tuple_expr = ast::Expr::new(ast::ExprKind::Tuple(exprs), expr_id);
+                        return Spanned::new(tuple_expr, span);
+                    }
+
+                    if all_labeled {
+                        let fields: Vec<(ast::Ident, ast::ExprNode)> = elems
+                            .into_iter()
+                            .map(|e| match e {
+                                TupleExprElem::Labeled(name, expr) => (name, expr),
+                                TupleExprElem::Pos(_) => unreachable!(),
+                            })
+                            .collect();
+                        let named_tuple_expr =
+                            ast::Expr::new(ast::ExprKind::NamedTuple(fields), expr_id);
+                        return Spanned::new(named_tuple_expr, span);
+                    }
+
+                    emitter.emit(Rich::custom(
+                        s,
+                        "cannot mix labeled and unlabeled elements in tuple literal",
+                    ));
+                    let dummy = ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
+                    return Spanned::new(dummy, span);
+                }
+                TupleShapeResult::UnexpectedComma => {
+                    emitter.emit(Rich::custom(s, "unexpected comma"));
+                    let dummy = ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
+                    Spanned::new(dummy, span)
+                }
+            }
         })
         .labelled("tuple or grouped expression")
         .as_context()
@@ -586,8 +636,8 @@ fn expression<'src>(
     recursive(|expr| {
         let atom = atom_expr(stmt, expr.clone());
         let call = call_expr(atom, expr.clone());
-        let indexed = tuple_index_expr(call);
-        let unary = unary_expr(indexed);
+        let accessed = postfix_access_expr(call);
+        let unary = unary_expr(accessed);
         let binary = binary_expr(unary);
         let ternary = ternary_expr(binary, expr.clone());
         let assign = assignment_expr(ternary);
@@ -595,14 +645,19 @@ fn expression<'src>(
     })
 }
 
-fn tuple_index_expr<'src>(
+enum PostfixAccess {
+    TupleIndices(Vec<u32>),
+    Field(ast::Ident),
+}
+
+fn postfix_access_expr<'src>(
     base: impl AnvParser<'src, ast::ExprNode>,
 ) -> impl AnvParser<'src, ast::ExprNode> {
     let single_index = select! {
         (Token::Dot, _) => (),
     }
     .ignore_then(select! {
-        (Token::Literal(LitToken::Number(n)), _) => vec![n as u32],
+        (Token::Literal(LitToken::Number(n)), _) => PostfixAccess::TupleIndices(vec![n as u32]),
     });
 
     let chained_index = select! {
@@ -617,32 +672,57 @@ fn tuple_index_expr<'src>(
             .iter()
             .map(|p| p.parse::<u32>())
             .collect::<Result<Vec<_>, _>>();
-        indices.map_err(|_| Rich::custom(span, "invalid tuple index"))
+        indices
+            .map(PostfixAccess::TupleIndices)
+            .map_err(|_| Rich::custom(span, "invalid tuple index"))
     });
 
-    let index_suffix = choice((chained_index, single_index));
+    let field_access = select! {
+        (Token::Dot, _) => (),
+    }
+    .ignore_then(identifier())
+    .map(PostfixAccess::Field);
 
-    base.foldl_with(index_suffix.repeated(), |target, indices, e| {
+    let access_suffix = choice((chained_index, single_index, field_access));
+
+    base.foldl_with(access_suffix.repeated(), |target, access, e| {
         let s = e.span();
         let span = Span::new(s.start, s.end);
 
-        let mut current = target;
-        for index in indices {
-            let index_node = Spanned::new(
-                ast::TupleIndex {
-                    target: Box::new(current),
-                    index,
-                },
-                span,
-            );
+        match access {
+            PostfixAccess::TupleIndices(indices) => {
+                let mut current = target;
+                for index in indices {
+                    let index_node = Spanned::new(
+                        ast::TupleIndex {
+                            target: Box::new(current),
+                            index,
+                        },
+                        span,
+                    );
 
-            let expr_id = e.state().new_expr_id();
-            let expr = ast::Expr::new(ast::ExprKind::TupleIndex(index_node), expr_id);
-            current = Spanned::new(expr, span);
+                    let expr_id = e.state().new_expr_id();
+                    let expr = ast::Expr::new(ast::ExprKind::TupleIndex(index_node), expr_id);
+                    current = Spanned::new(expr, span);
+                }
+                current
+            }
+            PostfixAccess::Field(field) => {
+                let field_node = Spanned::new(
+                    ast::FieldAccess {
+                        target: Box::new(target),
+                        field,
+                    },
+                    span,
+                );
+
+                let expr_id = e.state().new_expr_id();
+                let expr = ast::Expr::new(ast::ExprKind::Field(field_node), expr_id);
+                Spanned::new(expr, span)
+            }
         }
-        current
     })
-    .labelled("tuple index")
+    .labelled("field or tuple index access")
     .as_context()
 }
 
@@ -748,36 +828,93 @@ fn type_ident<'src>() -> impl AnvParser<'src, ast::Type> {
     .as_context()
 }
 
+enum TupleTypeElem {
+    Pos(ast::Type),
+    Labeled(ast::Ident, ast::Type),
+}
+
 fn paren_or_tuple_type<'src>(
     type_parser: impl AnvParser<'src, ast::Type>,
 ) -> impl AnvParser<'src, ast::Type> {
     let comma = select! { (Token::Comma, _) => () };
     let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
     let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+    let colon = select! { (Token::Colon, _) => () };
 
-    let first_type = type_parser.clone();
-    let rest_types = comma
-        .ignore_then(type_parser)
-        .repeated()
-        .collect::<Vec<_>>();
+    let labeled_elem = identifier()
+        .then_ignore(colon.clone())
+        .then(type_parser.clone())
+        .map(|(name, ty)| TupleTypeElem::Labeled(name, ty));
+
+    let pos_elem = type_parser.map(TupleTypeElem::Pos);
+    let elem = choice((labeled_elem, pos_elem));
+
+    let first_elem = elem.clone();
+    let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
 
     open_paren
-        .ignore_then(first_type.or_not())
-        .then(rest_types)
+        .ignore_then(first_elem.or_not())
+        .then(rest_elems)
         .then(comma.or_not())
         .then_ignore(close_paren)
         .validate(|((first, rest), trailing_comma), e, emitter| {
             let s = e.span();
 
-            validate_tuple_shape(
-                first,
-                rest,
-                trailing_comma.is_some(),
-                s,
-                emitter,
-                ast::Type::Tuple,
-                || ast::Type::Void,
-            )
+            match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
+                TupleShapeResult::Empty => {
+                    emitter.emit(Rich::custom(s, "empty tuples are not supported"));
+                    ast::Type::Void
+                }
+                TupleShapeResult::OneTupleError(elem) => {
+                    emitter.emit(Rich::custom(s, "1-tuples are not supported"));
+                    match elem {
+                        TupleTypeElem::Pos(ty) => ty,
+                        TupleTypeElem::Labeled(_, ty) => ty,
+                    }
+                }
+                TupleShapeResult::Grouped(elem) => match elem {
+                    TupleTypeElem::Pos(ty) => ty,
+                    TupleTypeElem::Labeled(_, ty) => ty,
+                },
+                TupleShapeResult::Tuple(elems) => {
+                    let all_pos = elems.iter().all(|e| matches!(e, TupleTypeElem::Pos(_)));
+                    let all_labeled = elems
+                        .iter()
+                        .all(|e| matches!(e, TupleTypeElem::Labeled(_, _)));
+
+                    if all_pos {
+                        let types: Vec<ast::Type> = elems
+                            .into_iter()
+                            .map(|e| match e {
+                                TupleTypeElem::Pos(ty) => ty,
+                                TupleTypeElem::Labeled(_, ty) => ty,
+                            })
+                            .collect();
+                        return ast::Type::Tuple(types);
+                    }
+
+                    if all_labeled {
+                        let fields: Vec<(ast::Ident, ast::Type)> = elems
+                            .into_iter()
+                            .map(|e| match e {
+                                TupleTypeElem::Labeled(name, ty) => (name, ty),
+                                TupleTypeElem::Pos(_) => unreachable!(),
+                            })
+                            .collect();
+                        return ast::Type::NamedTuple(fields);
+                    }
+
+                    emitter.emit(Rich::custom(
+                        s,
+                        "cannot mix labeled and unlabeled elements in tuple type",
+                    ));
+                    return ast::Type::Void;
+                }
+                TupleShapeResult::UnexpectedComma => {
+                    emitter.emit(Rich::custom(s, "unexpected comma"));
+                    ast::Type::Void
+                }
+            }
         })
         .labelled("tuple or grouped type")
         .as_context()

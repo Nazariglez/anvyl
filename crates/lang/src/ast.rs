@@ -15,6 +15,7 @@ pub type ReturnNode = Spanned<Return>;
 pub type IfNode = Spanned<If>;
 pub type TupleIndexNode = Spanned<TupleIndex>;
 pub type PatternNode = Spanned<Pattern>;
+pub type FieldAccessNode = Spanned<FieldAccess>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -55,7 +56,9 @@ pub enum ExprKind {
     Assign(AssignNode),
     If(IfNode),
     Tuple(Vec<ExprNode>),
+    NamedTuple(Vec<(Ident, ExprNode)>),
     TupleIndex(TupleIndexNode),
+    Field(FieldAccessNode),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Eq)]
@@ -108,6 +111,8 @@ pub enum Type {
     UnresolvedName(Ident),
     /// Tuple type (int, string, bool)
     Tuple(Vec<Type>),
+    /// Named tuple type (x: int, y: string)
+    NamedTuple(Vec<(Ident, Type)>),
 }
 
 impl Type {
@@ -147,6 +152,26 @@ impl Type {
         matches!(self, Type::Tuple(_))
     }
 
+    pub fn is_named_tuple(&self) -> bool {
+        matches!(self, Type::NamedTuple(_))
+    }
+
+    pub fn tuple_arity(&self) -> Option<usize> {
+        match self {
+            Type::Tuple(elems) => Some(elems.len()),
+            Type::NamedTuple(fields) => Some(fields.len()),
+            _ => None,
+        }
+    }
+
+    pub fn tuple_element_types(&self) -> Option<Vec<Type>> {
+        match self {
+            Type::Tuple(elems) => Some(elems.clone()),
+            Type::NamedTuple(fields) => Some(fields.iter().map(|(_, ty)| ty.clone()).collect()),
+            _ => None,
+        }
+    }
+
     pub fn boxed(&self) -> Box<Self> {
         Box::new(self.clone())
     }
@@ -176,6 +201,13 @@ impl Display for Type {
             Type::UnresolvedName(ident) => write!(f, "{}", ident),
             Type::Tuple(elements) => {
                 let parts: Vec<String> = elements.iter().map(|t| t.to_string()).collect();
+                write!(f, "({})", parts.join(", "))
+            }
+            Type::NamedTuple(fields) => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|(name, ty)| format!("{}: {}", name, ty))
+                    .collect();
                 write!(f, "({})", parts.join(", "))
             }
         }
@@ -359,4 +391,10 @@ pub struct If {
 pub struct TupleIndex {
     pub target: Box<ExprNode>,
     pub index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldAccess {
+    pub target: Box<ExprNode>,
+    pub field: Ident,
 }

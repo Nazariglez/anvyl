@@ -144,6 +144,18 @@ pub fn report_typecheck_errors(
                 format!("cannot destructure non-tuple type with {pattern_arity}-element pattern"),
                 format!("expression has type '{found}', which is not a tuple"),
             ),
+            TypeErrKind::DuplicateTupleLabel { label } => (
+                format!("duplicate field '{label}' in named tuple"),
+                "each field label must be unique".to_string(),
+            ),
+            TypeErrKind::NoSuchFieldOnTuple { field, tuple_type } => (
+                format!("tuple has no field '{field}'"),
+                format!("type '{tuple_type}' does not contain a field named '{field}'"),
+            ),
+            TypeErrKind::FieldAccessOnNonNamedTuple { field, found } => (
+                format!("cannot access field '{field}' on non-named tuple"),
+                format!("type '{found}' has no named fields; use '.0', '.1', ... instead"),
+            ),
         };
 
         emit_report(src, file_path, byte_range, title, body);
