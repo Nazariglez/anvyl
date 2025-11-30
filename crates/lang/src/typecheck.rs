@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 struct StructDef {
+    type_params: Vec<TypeParam>,
     fields: Vec<StructField>,
 }
 
@@ -131,9 +132,14 @@ impl TypeChecker {
 
     fn resolve_type(&self, ty: &Type) -> Type {
         match ty {
-            Type::UnresolvedName(name) if self.struct_defs.contains_key(name) => {
-                Type::Struct(*name)
-            }
+            Type::UnresolvedName(name) if self.struct_defs.contains_key(name) => Type::Struct {
+                name: *name,
+                type_args: vec![],
+            },
+            Type::Struct { name, type_args } => Type::Struct {
+                name: *name,
+                type_args: type_args.iter().map(|t| self.resolve_type(t)).collect(),
+            },
             Type::Optional(inner) => Type::Optional(Box::new(self.resolve_type(inner))),
             Type::Tuple(elems) => Type::Tuple(elems.iter().map(|t| self.resolve_type(t)).collect()),
             Type::NamedTuple(fields) => Type::NamedTuple(
@@ -654,6 +660,7 @@ fn collect_scope_types(stmts: &[StmtNode], type_checker: &mut TypeChecker) {
                 type_checker.struct_defs.insert(
                     decl.name,
                     StructDef {
+                        type_params: decl.type_params.clone(),
                         fields: decl.fields.clone(),
                     },
                 );
@@ -683,8 +690,17 @@ fn subst_type(ty: &Type, subst: &HashMap<TypeVarId, Type>) -> Type {
             params: params.iter().map(|p| subst_type(p, subst)).collect(),
             ret: subst_type(ret, subst).boxed(),
         },
-
-        // anything else is passed through unchanged
+        Tuple(elems) => Tuple(elems.iter().map(|e| subst_type(e, subst)).collect()),
+        NamedTuple(fields) => NamedTuple(
+            fields
+                .iter()
+                .map(|(n, t)| (*n, subst_type(t, subst)))
+                .collect(),
+        ),
+        Struct { name, type_args } => Struct {
+            name: *name,
+            type_args: type_args.iter().map(|a| subst_type(a, subst)).collect(),
+        },
         _ => ty.clone(),
     }
 }
@@ -769,6 +785,25 @@ fn substitute_vars_with_infer(ty: &Type, slots: &InferenceSlots) -> Type {
                 .map(|p| substitute_vars_with_infer(p, slots))
                 .collect(),
             ret: substitute_vars_with_infer(ret, slots).boxed(),
+        },
+        Type::Tuple(elems) => Type::Tuple(
+            elems
+                .iter()
+                .map(|e| substitute_vars_with_infer(e, slots))
+                .collect(),
+        ),
+        Type::NamedTuple(fields) => Type::NamedTuple(
+            fields
+                .iter()
+                .map(|(n, t)| (*n, substitute_vars_with_infer(t, slots)))
+                .collect(),
+        ),
+        Type::Struct { name, type_args } => Type::Struct {
+            name: *name,
+            type_args: type_args
+                .iter()
+                .map(|a| substitute_vars_with_infer(a, slots))
+                .collect(),
         },
         _ => ty.clone(),
     }
@@ -1627,6 +1662,14 @@ fn check_struct_lit(
         return Type::Infer;
     };
 
+    let is_generic = !struct_def.type_params.is_empty();
+    let slots = is_generic
+        .then(|| {
+            let call_id = type_checker.next_call_id();
+            create_inference_slots(&struct_def.type_params, type_checker, call_id)
+        })
+        .unwrap_or_default();
+
     let mut seen_fields = HashSet::new();
     let mut provided_fields = HashMap::new();
 
@@ -1657,9 +1700,13 @@ fn check_struct_lit(
             continue;
         };
 
-        let resolved_expected_ty = type_checker.resolve_type(&expected.ty);
         let field_ref = TypeRef::Expr(field_expr.node.id);
-        let expected_ref = TypeRef::Concrete(resolved_expected_ty);
+        let expected_ref = if is_generic {
+            type_to_ref_with_inference(&expected.ty, &slots)
+        } else {
+            let resolved = type_checker.resolve_type(&expected.ty);
+            TypeRef::Concrete(resolved)
+        };
         type_checker.constrain_assignable(field_expr.span, field_ref, expected_ref, errors);
 
         provided_fields.insert(*field_name, field_ty);
@@ -1678,7 +1725,26 @@ fn check_struct_lit(
         }
     }
 
-    Type::Struct(struct_name)
+    let type_args = is_generic
+        .then(|| {
+            struct_def
+                .type_params
+                .iter()
+                .map(|param| {
+                    let slot_name = slots.get(&param.id).expect("slot exists");
+                    type_checker
+                        .get_var(*slot_name)
+                        .cloned()
+                        .unwrap_or(Type::Infer)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Type::Struct {
+        name: struct_name,
+        type_args,
+    }
 }
 
 fn check_tuple_index(
@@ -1747,7 +1813,10 @@ fn check_field_access(
             });
             Type::Infer
         }
-        Type::Struct(struct_name) => {
+        Type::Struct {
+            name: struct_name,
+            type_args,
+        } => {
             let Some(struct_def) = type_checker.get_struct(*struct_name).cloned() else {
                 errors.push(TypeErr {
                     span: field_node.span,
@@ -1756,9 +1825,17 @@ fn check_field_access(
                 return Type::Infer;
             };
 
+            let subst = struct_def
+                .type_params
+                .iter()
+                .zip(type_args.iter())
+                .map(|(param, arg)| (param.id, arg.clone()))
+                .collect::<HashMap<_, _>>();
+
             for struct_field in &struct_def.fields {
                 if struct_field.name == field {
-                    return type_checker.resolve_type(&struct_field.ty);
+                    let field_ty = subst_type(&struct_field.ty, &subst);
+                    return type_checker.resolve_type(&field_ty);
                 }
             }
 

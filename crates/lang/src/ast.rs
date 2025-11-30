@@ -118,7 +118,7 @@ pub enum Type {
     /// Named tuple type (x: int, y: string)
     NamedTuple(Vec<(Ident, Type)>),
     /// Struct type
-    Struct(Ident),
+    Struct { name: Ident, type_args: Vec<Type> },
 }
 
 impl Type {
@@ -163,7 +163,7 @@ impl Type {
     }
 
     pub fn is_struct(&self) -> bool {
-        matches!(self, Type::Struct(_))
+        matches!(self, Type::Struct { .. })
     }
 
     pub fn tuple_arity(&self) -> Option<usize> {
@@ -210,17 +210,33 @@ impl Display for Type {
             Type::Var(id) => write!(f, "{}", id),
             Type::UnresolvedName(ident) => write!(f, "{}", ident),
             Type::Tuple(elements) => {
-                let parts: Vec<String> = elements.iter().map(|t| t.to_string()).collect();
-                write!(f, "({})", parts.join(", "))
+                let parts = elements
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "({parts})")
             }
             Type::NamedTuple(fields) => {
-                let parts: Vec<String> = fields
+                let parts = fields
                     .iter()
                     .map(|(name, ty)| format!("{}: {}", name, ty))
-                    .collect();
-                write!(f, "({})", parts.join(", "))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "({parts})")
             }
-            Type::Struct(name) => write!(f, "{}", name),
+            Type::Struct { name, type_args } => {
+                if type_args.is_empty() {
+                    write!(f, "{name}")
+                } else {
+                    let args = type_args
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, "{name}<{args}>")
+                }
+            }
         }
     }
 }
@@ -420,6 +436,7 @@ pub struct StructField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     pub name: Ident,
+    pub type_params: Vec<TypeParam>,
     pub fields: Vec<StructField>,
 }
 

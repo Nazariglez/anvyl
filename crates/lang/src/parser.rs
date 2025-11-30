@@ -124,32 +124,25 @@ fn function<'src>(
     .then(params())
     .then(return_type())
     .then(block_stmt(stmt))
-    .try_map_with(|((((name, type_params), params), ret), body), e| {
+    .map_with(|((((name, type_params), params), ret), body), e| {
         let s = e.span();
-        // build type parameter map
-        let type_param_map = type_params
-            .iter()
-            .map(|tp| (tp.name, tp.id))
-            .collect::<HashMap<_, _>>();
+        let type_param_map: HashMap<ast::Ident, ast::TypeVarId> =
+            type_params.iter().map(|tp| (tp.name, tp.id)).collect();
 
-        // resolve type parameters variables in signature
         let resolved_params = params
             .into_iter()
             .map(|p| {
-                resolve_type_params(&p.ty, &type_param_map)
-                    .map(|ty| ast::Param { name: p.name, ty })
+                let ty = resolve_type_params(&p.ty, &type_param_map);
+                ast::Param { name: p.name, ty }
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|ident| Rich::custom(s.clone(), format!("unknown type '{}'", ident)))?;
+            .collect();
 
-        // resolve type parameters in return type
         let resolved_ret = match ret {
-            Some(ty) => resolve_type_params(&ty, &type_param_map)
-                .map_err(|ident| Rich::custom(s.clone(), format!("unknown type '{}'", ident)))?,
+            Some(ty) => resolve_type_params(&ty, &type_param_map),
             None => ast::Type::Void,
         };
 
-        Ok(Spanned::new(
+        Spanned::new(
             ast::Func {
                 name,
                 visibility: ast::Visibility::Private,
@@ -159,7 +152,7 @@ fn function<'src>(
                 body,
             },
             Span::new(s.start, s.end),
-        ))
+        )
     })
     .labelled("function")
     .as_context()
@@ -181,6 +174,7 @@ fn struct_declaration<'src>() -> impl AnvParser<'src, ast::StructDeclNode> {
         (Token::Keyword(Keyword::Struct), _) => (),
     }
     .ignore_then(identifier())
+    .then(type_params())
     .then(
         select! {
             (Token::Open(Delimiter::Brace), _) => (),
@@ -197,9 +191,28 @@ fn struct_declaration<'src>() -> impl AnvParser<'src, ast::StructDeclNode> {
             (Token::Close(Delimiter::Brace), _) => (),
         }),
     )
-    .map_with(|(name, fields), e| {
+    .map_with(|((name, type_params), fields), e| {
         let s = e.span();
-        Spanned::new(ast::StructDecl { name, fields }, Span::new(s.start, s.end))
+
+        let type_param_map: HashMap<ast::Ident, ast::TypeVarId> =
+            type_params.iter().map(|tp| (tp.name, tp.id)).collect();
+
+        let resolved_fields = fields
+            .into_iter()
+            .map(|f| {
+                let ty = resolve_type_params(&f.ty, &type_param_map);
+                ast::StructField { name: f.name, ty }
+            })
+            .collect();
+
+        Spanned::new(
+            ast::StructDecl {
+                name,
+                type_params,
+                fields: resolved_fields,
+            },
+            Span::new(s.start, s.end),
+        )
     })
     .labelled("struct declaration")
     .as_context()
@@ -208,40 +221,55 @@ fn struct_declaration<'src>() -> impl AnvParser<'src, ast::StructDeclNode> {
 fn resolve_type_params(
     ty: &ast::Type,
     type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
-) -> Result<ast::Type, ast::Ident> {
+) -> ast::Type {
     use ast::Type::*;
     match ty {
-        // resolve T to Var(id)
         UnresolvedName(ident) => type_param_map
             .get(ident)
             .map(|id| Var(*id))
-            .ok_or_else(|| ident.clone()),
+            .unwrap_or_else(|| ty.clone()),
 
-        Optional(inner) => Ok(Optional(
-            resolve_type_params(inner, type_param_map)?.boxed(),
-        )),
+        Optional(inner) => Optional(resolve_type_params(inner, type_param_map).boxed()),
 
         Func { params, ret } => {
-            let resolved_params: Result<Vec<_>, _> = params
+            let resolved_params = params
                 .iter()
                 .map(|p| resolve_type_params(p, type_param_map))
-                .collect();
-            Ok(Func {
-                params: resolved_params?,
-                ret: resolve_type_params(ret, type_param_map)?.boxed(),
-            })
+                .collect::<Vec<_>>();
+            Func {
+                params: resolved_params,
+                ret: resolve_type_params(ret, type_param_map).boxed(),
+            }
         }
 
         Tuple(elements) => {
-            let resolved_elements: Result<Vec<_>, _> = elements
+            let resolved_elements = elements
                 .iter()
                 .map(|el| resolve_type_params(el, type_param_map))
-                .collect();
-            Ok(Tuple(resolved_elements?))
+                .collect::<Vec<_>>();
+            Tuple(resolved_elements)
         }
 
-        // other types pass through unchanged
-        _ => Ok(ty.clone()),
+        NamedTuple(fields) => {
+            let resolved_fields: Vec<_> = fields
+                .iter()
+                .map(|(name, ty)| (*name, resolve_type_params(ty, type_param_map)))
+                .collect();
+            NamedTuple(resolved_fields)
+        }
+
+        Struct { name, type_args } => {
+            let resolved_args = type_args
+                .iter()
+                .map(|arg| resolve_type_params(arg, type_param_map))
+                .collect::<Vec<_>>();
+            Struct {
+                name: *name,
+                type_args: resolved_args,
+            }
+        }
+
+        _ => ty.clone(),
     }
 }
 
@@ -879,8 +907,22 @@ fn type_ident<'src>() -> impl AnvParser<'src, ast::Type> {
             (Token::Keyword(Keyword::Void), _) => ast::Type::Void,
         };
 
-        // parse type name as unresolved names (like T, U, ...)
-        let type_name_ref = identifier().map(ast::Type::UnresolvedName);
+        let type_args = select! { (Token::Op(Op::LessThan), _) => () }
+            .ignore_then(
+                type_parser
+                    .clone()
+                    .separated_by(select! { (Token::Comma, _) => () })
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(select! { (Token::Op(Op::GreaterThan), _) => () });
+
+        let type_name_ref = identifier()
+            .then(type_args.or_not())
+            .map(|(name, args)| match args {
+                Some(type_args) => ast::Type::Struct { name, type_args },
+                None => ast::Type::UnresolvedName(name),
+            });
 
         // (T) is grouping, (T, T, ...) is tuple
         let paren_type = paren_or_tuple_type(type_parser.clone());
