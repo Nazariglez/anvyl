@@ -314,6 +314,11 @@ pub enum TypeErrKind {
         found: Type,
         pattern_arity: usize,
     },
+    TuplePatternLabelMismatch {
+        expected: Ident,
+        found: Ident,
+    },
+    NamedPatternOnPositionalTuple,
     DuplicateTupleLabel {
         label: Ident,
     },
@@ -1683,6 +1688,59 @@ fn check_pattern(
             }
 
             for (subpat, elem_ty) in subpatterns.iter().zip(elem_types.iter()) {
+                check_pattern(subpat, elem_ty, type_checker, errors);
+            }
+        }
+        Pattern::NamedTuple(elems) => {
+            let Some(elem_types) = value_ty.tuple_element_types() else {
+                errors.push(TypeErr {
+                    span: pattern.span,
+                    kind: TypeErrKind::NonTupleInTuplePattern {
+                        found: value_ty.clone(),
+                        pattern_arity: elems.len(),
+                    },
+                });
+                return;
+            };
+
+            let value_labels: Option<Vec<Ident>> = match value_ty {
+                Type::NamedTuple(fields) => Some(fields.iter().map(|(name, _)| *name).collect()),
+                _ => None,
+            };
+
+            let same_arity = elems.len() == elem_types.len();
+            if !same_arity {
+                errors.push(TypeErr {
+                    span: pattern.span,
+                    kind: TypeErrKind::TuplePatternArityMismatch {
+                        expected: elem_types.len(),
+                        found: elems.len(),
+                    },
+                });
+                return;
+            }
+
+            let Some(labels) = value_labels else {
+                errors.push(TypeErr {
+                    span: pattern.span,
+                    kind: TypeErrKind::NamedPatternOnPositionalTuple,
+                });
+                return;
+            };
+
+            for ((pat_label, _), ty_label) in elems.iter().zip(labels.iter()) {
+                if *pat_label != *ty_label {
+                    errors.push(TypeErr {
+                        span: pattern.span,
+                        kind: TypeErrKind::TuplePatternLabelMismatch {
+                            expected: *ty_label,
+                            found: *pat_label,
+                        },
+                    });
+                }
+            }
+
+            for ((_, subpat), elem_ty) in elems.iter().zip(elem_types.iter()) {
                 check_pattern(subpat, elem_ty, type_checker, errors);
             }
         }

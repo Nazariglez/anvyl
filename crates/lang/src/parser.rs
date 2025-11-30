@@ -940,41 +940,90 @@ fn pattern<'src>() -> impl AnvParser<'src, ast::PatternNode> {
     .as_context()
 }
 
+enum TuplePatternElem {
+    Pos(ast::PatternNode),
+    Labeled(ast::Ident, ast::PatternNode),
+}
+
 fn tuple_pattern<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> impl AnvParser<'src, ast::PatternNode> {
     let comma = select! { (Token::Comma, _) => () };
     let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
     let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+    let colon = select! { (Token::Colon, _) => () };
 
-    let first_pat = pat.clone();
-    let rest_pats = comma.ignore_then(pat).repeated().collect::<Vec<_>>();
+    let labeled_elem = identifier()
+        .then_ignore(colon.clone())
+        .then(pat.clone())
+        .map(|(name, p)| TuplePatternElem::Labeled(name, p));
+
+    let pos_elem = pat.map(TuplePatternElem::Pos);
+    let elem = choice((labeled_elem, pos_elem));
+
+    let first_elem = elem.clone();
+    let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
 
     open_paren
-        .ignore_then(first_pat.or_not())
-        .then(rest_pats)
+        .ignore_then(first_elem.or_not())
+        .then(rest_elems)
         .then(comma.or_not())
         .then_ignore(close_paren)
         .validate(|((first, rest), trailing_comma), e, emitter| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
 
-            match (first, rest.len(), trailing_comma.is_some()) {
-                (None, 0, _) => {
+            match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
+                TupleShapeResult::Empty => {
                     emitter.emit(Rich::custom(s, "empty tuple patterns are not supported"));
                     Spanned::new(ast::Pattern::Wildcard, span)
                 }
-                (Some(single), 0, true) => {
+                TupleShapeResult::OneTupleError(elem) => {
                     emitter.emit(Rich::custom(s, "1-tuple patterns are not supported"));
-                    single
+                    match elem {
+                        TuplePatternElem::Pos(p) => p,
+                        TuplePatternElem::Labeled(_, p) => p,
+                    }
                 }
-                (Some(single), 0, false) => single,
-                (Some(first), _, _) => {
-                    let mut pats = vec![first];
-                    pats.extend(rest);
-                    Spanned::new(ast::Pattern::Tuple(pats), span)
+                TupleShapeResult::Grouped(elem) => match elem {
+                    TuplePatternElem::Pos(p) => p,
+                    TuplePatternElem::Labeled(_, p) => p,
+                },
+                TupleShapeResult::Tuple(elems) => {
+                    let all_pos = elems.iter().all(|e| matches!(e, TuplePatternElem::Pos(_)));
+                    let all_labeled = elems
+                        .iter()
+                        .all(|e| matches!(e, TuplePatternElem::Labeled(_, _)));
+
+                    if all_pos {
+                        let pats: Vec<ast::PatternNode> = elems
+                            .into_iter()
+                            .map(|e| match e {
+                                TuplePatternElem::Pos(p) => p,
+                                TuplePatternElem::Labeled(_, p) => p,
+                            })
+                            .collect();
+                        return Spanned::new(ast::Pattern::Tuple(pats), span);
+                    }
+
+                    if all_labeled {
+                        let fields: Vec<(ast::Ident, ast::PatternNode)> = elems
+                            .into_iter()
+                            .map(|e| match e {
+                                TuplePatternElem::Labeled(name, p) => (name, p),
+                                TuplePatternElem::Pos(_) => unreachable!(),
+                            })
+                            .collect();
+                        return Spanned::new(ast::Pattern::NamedTuple(fields), span);
+                    }
+
+                    emitter.emit(Rich::custom(
+                        s,
+                        "cannot mix labeled and unlabeled elements in tuple pattern",
+                    ));
+                    Spanned::new(ast::Pattern::Wildcard, span)
                 }
-                (None, _, _) => {
+                TupleShapeResult::UnexpectedComma => {
                     emitter.emit(Rich::custom(s, "unexpected comma in pattern"));
                     Spanned::new(ast::Pattern::Wildcard, span)
                 }

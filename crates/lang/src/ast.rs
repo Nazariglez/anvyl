@@ -238,6 +238,7 @@ pub struct Binding {
 pub enum Pattern {
     Ident(Ident),
     Tuple(Vec<PatternNode>),
+    NamedTuple(Vec<(Ident, PatternNode)>),
     Wildcard,
 }
 

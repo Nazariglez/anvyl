@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: cannot use named tuple pattern on positional tuple
+
+fn main() {
+    let p: (int, int) = (10, 20);
+    let (x: a, y: b) = p;
+}
+

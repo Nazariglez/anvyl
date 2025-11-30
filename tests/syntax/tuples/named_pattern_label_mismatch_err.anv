@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: tuple pattern label mismatch
+
+fn main() {
+    let p: (x: int, y: int) = (x: 10, y: 20);
+    let (y: a, x: b) = p;
+}
+

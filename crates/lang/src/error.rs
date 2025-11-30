@@ -144,6 +144,14 @@ pub fn report_typecheck_errors(
                 format!("cannot destructure non-tuple type with {pattern_arity}-element pattern"),
                 format!("expression has type '{found}', which is not a tuple"),
             ),
+            TypeErrKind::TuplePatternLabelMismatch { expected, found } => (
+                "tuple pattern label mismatch".to_string(),
+                format!("expected label '{expected}', found '{found}'"),
+            ),
+            TypeErrKind::NamedPatternOnPositionalTuple => (
+                "cannot use named tuple pattern on positional tuple".to_string(),
+                "use positional pattern '(a, b, ...)' instead".to_string(),
+            ),
             TypeErrKind::DuplicateTupleLabel { label } => (
                 format!("duplicate field '{label}' in named tuple"),
                 "each field label must be unique".to_string(),
