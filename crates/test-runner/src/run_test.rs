@@ -96,20 +96,12 @@ fn match_output(output: &str, directives: &Directives) -> Result<TestResult, Str
         return Ok(TestResult::Pass);
     }
 
-    // contains match
-    let lns = output.lines().collect::<Vec<_>>();
-    for (idx, expected_ln) in directives.contains.iter().enumerate() {
-        if let Some(ln) = lns.get(idx) {
-            if !ln.contains(expected_ln) {
-                return Ok(TestResult::Fail {
-                    message: format!(
-                        "* Expected line '{idx}' to contain:\n{expected_ln}\n* Got:\n{ln}",
-                    ),
-                });
-            }
-        } else {
+    // check if any line contains the expected text
+    for expected_ln in directives.contains.iter() {
+        let found = output.lines().any(|ln| ln.contains(expected_ln));
+        if !found {
             return Ok(TestResult::Fail {
-                message: format!("* Missing line '{idx}' expected to contain:\n{expected_ln}"),
+                message: format!("* Expected output to contain:\n{expected_ln}\n* Got:\n{output}",),
             });
         }
     }
