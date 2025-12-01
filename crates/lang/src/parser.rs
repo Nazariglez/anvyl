@@ -75,6 +75,7 @@ fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let bind = binding(stmt.clone());
         let ret = return_stmt(stmt.clone());
         let while_s = while_stmt(stmt.clone());
+        let for_s = for_stmt(stmt.clone());
         let break_s = break_stmt();
         let continue_s = continue_stmt();
 
@@ -88,6 +89,7 @@ fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             (Token::Keyword(Keyword::If), _) => (),
             (Token::Keyword(Keyword::Struct), _) => (),
             (Token::Keyword(Keyword::While), _) => (),
+            (Token::Keyword(Keyword::For), _) => (),
             (Token::Keyword(Keyword::Break), _) => (),
             (Token::Keyword(Keyword::Continue), _) => (),
         }
@@ -127,6 +129,7 @@ fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             }),
             ret,
             while_s,
+            for_s,
             break_s,
             continue_s,
             expr_stmt,
@@ -1533,6 +1536,60 @@ fn while_stmt<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'s
     .boxed()
 }
 
+// rev key is only valid on for loops
+fn contextual_rev<'src>() -> BoxedParser<'src, bool> {
+    select! {
+        (Token::Ident(ident), _) if ident.0.as_ref() == "rev" => true,
+    }
+    .or_not()
+    .map(|o| o.unwrap_or(false))
+    .boxed()
+}
+
+// step key is only valid on for loops
+fn contextual_step<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, Option<ast::ExprNode>> {
+    select! {
+        (Token::Ident(ident), _) if ident.0.as_ref() == "step" => (),
+    }
+    .ignore_then(expression(stmt))
+    .or_not()
+    .boxed()
+}
+
+fn for_stmt<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src, ast::StmtNode> {
+    select! {
+        (Token::Keyword(Keyword::For), _) => (),
+    }
+    .ignore_then(pattern())
+    .then_ignore(select! {
+        (Token::Keyword(Keyword::In), _) => (),
+    })
+    .then(contextual_rev())
+    .then(expression(stmt.clone()))
+    .then(contextual_step(stmt.clone()))
+    .then(block_stmt(stmt))
+    .map_with(|((((pat, reversed), iterable), step), body), e| {
+        let s = e.span();
+        let span = Span::new(s.start, s.end);
+        let for_node = Spanned::new(
+            ast::For {
+                pattern: pat,
+                iterable,
+                step,
+                reversed,
+                body,
+            },
+            span,
+        );
+        Spanned::new(ast::Stmt::For(for_node), span)
+    })
+    .labelled("for statement")
+    .as_context()
+    .boxed()
+}
+
 fn break_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
     select! {
         (Token::Keyword(Keyword::Break), _) => (),
@@ -2099,5 +2156,79 @@ mod tests {
             &assign_expr_node.node.kind,
             ast::ExprKind::Assign(_)
         ));
+    }
+
+    #[test]
+    fn for_parses_basic_range() {
+        let prog = parse_program("fn main() { for n in 0..10 {} }");
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let body_stmts = &func_node.node.body.node.stmts;
+        assert_eq!(body_stmts.len(), 1);
+
+        let ast::Stmt::For(for_node) = &body_stmts[0].node else {
+            panic!("expected For stmt");
+        };
+        let for_inner = &for_node.node;
+
+        let ast::Pattern::Ident(ident) = &for_inner.pattern.node else {
+            panic!("expected Ident pattern");
+        };
+        assert_eq!(ident.0.as_ref(), "n");
+
+        assert!(!for_inner.reversed);
+        assert!(for_inner.step.is_none());
+
+        let ast::ExprKind::Range(range_node) = &for_inner.iterable.node.kind else {
+            panic!("expected Range iterable");
+        };
+        assert!(!range_node.node.inclusive);
+    }
+
+    #[test]
+    fn for_parses_rev_and_step() {
+        let prog = parse_program("fn main() { for n in rev 0..10 step 2 {} }");
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let body_stmts = &func_node.node.body.node.stmts;
+        assert_eq!(body_stmts.len(), 1);
+
+        let ast::Stmt::For(for_node) = &body_stmts[0].node else {
+            panic!("expected For stmt");
+        };
+        let for_inner = &for_node.node;
+
+        assert!(for_inner.reversed);
+        assert!(for_inner.step.is_some());
+
+        let step_expr = for_inner.step.as_ref().unwrap();
+        let ast::ExprKind::Lit(ast::Lit::Int(2)) = &step_expr.node.kind else {
+            panic!("expected Int(2) step");
+        };
+    }
+
+    #[test]
+    fn for_parses_inclusive_range() {
+        let prog = parse_program("fn main() { for n in 0..=10 {} }");
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let body_stmts = &func_node.node.body.node.stmts;
+        assert_eq!(body_stmts.len(), 1);
+
+        let ast::Stmt::For(for_node) = &body_stmts[0].node else {
+            panic!("expected For stmt");
+        };
+        let for_inner = &for_node.node;
+
+        let ast::ExprKind::Range(range_node) = &for_inner.iterable.node.kind else {
+            panic!("expected Range iterable");
+        };
+        assert!(range_node.node.inclusive);
     }
 }

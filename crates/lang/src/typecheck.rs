@@ -1,10 +1,10 @@
 use crate::{
     ast::{
         AssignNode, AssignOp, BinaryNode, BinaryOp, BindingNode, BlockNode, CallNode, ExprId,
-        ExprKind, ExprNode, FieldAccessNode, Func, FuncNode, Ident, IfNode, Lit, MethodReceiver,
-        Param, Pattern, PatternNode, Program, RangeNode, ReturnNode, Stmt, StmtNode,
-        StructDeclNode, StructField, StructLiteralNode, TupleIndexNode, Type, TypeParam, TypeVarId,
-        UnaryNode, UnaryOp, WhileNode,
+        ExprKind, ExprNode, FieldAccessNode, ForNode, Func, FuncNode, Ident, IfNode, Lit,
+        MethodReceiver, Param, Pattern, PatternNode, Program, RangeNode, ReturnNode, Stmt,
+        StmtNode, StructDeclNode, StructField, StructLiteralNode, TupleIndexNode, Type, TypeParam,
+        TypeVarId, UnaryNode, UnaryOp, WhileNode,
     },
     span::Span,
 };
@@ -456,6 +456,13 @@ pub enum TypeErrKind {
     ReadonlySelfMutation {
         struct_name: Ident,
         field: Ident,
+    },
+    ForIterableNotRange {
+        found: Type,
+    },
+    ForStepNotInt {
+        item_ty: Type,
+        step_ty: Type,
     },
 }
 
@@ -947,6 +954,7 @@ fn check_stmt(stmt: &StmtNode, type_checker: &mut TypeChecker, errors: &mut Vec<
         Stmt::Binding(node) => check_binding(node, type_checker, errors),
         Stmt::Return(node) => check_ret(node, type_checker, errors),
         Stmt::While(node) => check_while(node, type_checker, errors),
+        Stmt::For(node) => check_for(node, type_checker, errors),
         Stmt::Break => check_break(stmt.span, type_checker, errors),
         Stmt::Continue => check_continue(stmt.span, type_checker, errors),
     }
@@ -2092,6 +2100,63 @@ fn check_while(while_node: &WhileNode, type_checker: &mut TypeChecker, errors: &
     type_checker.exit_loop();
 }
 
+fn check_for(for_node: &ForNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
+    let node = &for_node.node;
+
+    let iterable_ty = check_expr(&node.iterable, type_checker, errors);
+    let item_ty = extract_range_item_type(&iterable_ty, for_node.span, errors);
+
+    if let Some(ref step_expr) = node.step {
+        let step_ty = check_expr(step_expr, type_checker, errors);
+        let item_is_int = matches!(item_ty, Type::Int | Type::Infer);
+        let step_is_int = matches!(step_ty, Type::Int | Type::Infer);
+        if !item_is_int || !step_is_int {
+            errors.push(TypeErr {
+                span: step_expr.span,
+                kind: TypeErrKind::ForStepNotInt {
+                    item_ty: item_ty.clone(),
+                    step_ty,
+                },
+            });
+        }
+    }
+
+    type_checker.push_scope();
+    type_checker.enter_loop();
+
+    check_pattern(&node.pattern, &item_ty, type_checker, errors);
+
+    let _ = check_block_stmts(&node.body.node.stmts, type_checker, errors);
+
+    type_checker.exit_loop();
+    type_checker.pop_scope();
+}
+
+fn extract_range_item_type(ty: &Type, span: Span, errors: &mut Vec<TypeErr>) -> Type {
+    match ty {
+        Type::Struct { name, type_args } => {
+            let name_str = name.0.as_ref();
+            let is_range = name_str == "Range" || name_str == "RangeInclusive";
+            if is_range && type_args.len() == 1 {
+                return type_args[0].clone();
+            }
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::ForIterableNotRange { found: ty.clone() },
+            });
+            Type::Infer
+        }
+        Type::Infer => Type::Infer,
+        _ => {
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::ForIterableNotRange { found: ty.clone() },
+            });
+            Type::Infer
+        }
+    }
+}
+
 fn check_break(span: Span, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
     if !type_checker.in_loop() {
         errors.push(TypeErr {
@@ -2587,6 +2652,7 @@ fn range_inclusive_type(elem_ty: Type) -> Type {
 }
 
 fn range_ident() -> Ident {
+    // TODO: define a const for Range and RangeInclusive to be reused across the code
     Ident(Intern::new("Range".to_string()))
 }
 

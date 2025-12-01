@@ -219,6 +219,14 @@ pub fn report_typecheck_errors(
                     "'self' is readonly in this method of '{struct_name}'; use '&self' for mutating methods"
                 ),
             ),
+            TypeErrKind::ForIterableNotRange { found } => (
+                "for can currently only iterate over ranges".to_string(),
+                format!("found '{found}', expected Range<T> or RangeInclusive<T>"),
+            ),
+            TypeErrKind::ForStepNotInt { item_ty, step_ty } => (
+                "step is only supported for integer ranges".to_string(),
+                format!("item type is '{item_ty}', step type is '{step_ty}'; both must be 'int'"),
+            ),
         };
 
         emit_report(src, file_path, byte_range, title, body);
