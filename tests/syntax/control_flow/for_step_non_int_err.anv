@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: step is only supported for integer ranges
+
+fn main() {
+    for n in 0..10 step 1.5 {
+        let x = n;
+    }
+}
+

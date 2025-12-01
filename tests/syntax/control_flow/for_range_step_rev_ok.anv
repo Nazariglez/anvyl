@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    for n in rev 0..10 step 2 {
+        let x: int = n;
+    }
+
+    for n in rev 0..=10 step 1 {
+        let y: int = n;
+    }
+
+    let step_val = 3;
+    for n in rev 0..100 step step_val {
+        let z: int = n;
+    }
+}
+

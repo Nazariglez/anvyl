@@ -1,0 +1,23 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    for n in 0..10 {
+        let x: int = n;
+    }
+
+    for n in 0..=10 {
+        let y: int = n;
+    }
+
+    let start = 5;
+    let end = 15;
+    for n in start..end {
+        let z: int = n;
+    }
+
+    for n in start..=end {
+        let w: int = n;
+    }
+}
+

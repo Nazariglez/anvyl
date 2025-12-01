@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: for can currently only iterate over ranges
+
+fn main() {
+    for n in 123 {
+        let x = n;
+    }
+}
+
