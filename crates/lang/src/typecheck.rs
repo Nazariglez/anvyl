@@ -29,11 +29,6 @@ struct StructDef {
 
 type InferenceSlots = HashMap<TypeVarId, Ident>;
 
-// Use fixed ids for builtin Range<T> type params so they never collide
-// with user declared generic type variables created by the parser
-const RANGE_TYPE_PARAM_ID: TypeVarId = TypeVarId(u32::MAX - 1);
-const RANGE_INCLUSIVE_TYPE_PARAM_ID: TypeVarId = TypeVarId(u32::MAX);
-
 pub fn check_program(program: &Program) -> Result<TypeChecker, Vec<TypeErr>> {
     let mut type_checker = TypeChecker::default();
     let mut errors = vec![];
@@ -141,7 +136,7 @@ impl Default for TypeChecker {
             next_infer_call_id: 0,
             generic_func_templates: HashMap::new(),
             specialization_cache: HashMap::new(),
-            struct_defs: builtin_structs(),
+            struct_defs: HashMap::new(),
             loop_depth: 0,
         }
     }
@@ -2577,16 +2572,6 @@ fn check_ret(ret: &ReturnNode, type_checker: &mut TypeChecker, errors: &mut Vec<
     }
 }
 
-fn builtin_structs() -> HashMap<Ident, StructDef> {
-    let mut defs = HashMap::new();
-    defs.insert(range_ident(), make_range_struct(RANGE_TYPE_PARAM_ID));
-    defs.insert(
-        range_inclusive_ident(),
-        make_range_struct(RANGE_INCLUSIVE_TYPE_PARAM_ID),
-    );
-    defs
-}
-
 fn range_type(elem_ty: Type) -> Type {
     Type::Struct {
         name: range_ident(),
@@ -2601,45 +2586,12 @@ fn range_inclusive_type(elem_ty: Type) -> Type {
     }
 }
 
-fn make_range_struct(type_param_id: TypeVarId) -> StructDef {
-    let type_param = TypeParam {
-        name: builtin_type_param_name(),
-        id: type_param_id,
-    };
-    let elem_ty = Type::Var(type_param.id);
-    let start_field = StructField {
-        name: builtin_field_name("start"),
-        ty: elem_ty.clone(),
-    };
-    let end_field = StructField {
-        name: builtin_field_name("end"),
-        ty: elem_ty,
-    };
-    StructDef {
-        type_params: vec![type_param],
-        fields: vec![start_field, end_field],
-        methods: HashMap::new(),
-    }
-}
-
-fn builtin_type_param_name() -> Ident {
-    builtin_ident("T")
-}
-
 fn range_ident() -> Ident {
-    builtin_ident("Range")
+    Ident(Intern::new("Range".to_string()))
 }
 
 fn range_inclusive_ident() -> Ident {
-    builtin_ident("RangeInclusive")
-}
-
-fn builtin_field_name(name: &str) -> Ident {
-    builtin_ident(name)
-}
-
-fn builtin_ident(name: &str) -> Ident {
-    Ident(Intern::new(name.to_string()))
+    Ident(Intern::new("RangeInclusive".to_string()))
 }
 
 #[cfg(test)]

@@ -1,0 +1,11 @@
+struct Range<T> {
+    start: T,
+    end: T,
+}
+
+struct RangeInclusive<T> {
+    start: T,
+    end: T,
+}
+
+
