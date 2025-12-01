@@ -4,7 +4,7 @@ use crate::{
         ExprKind, ExprNode, FieldAccessNode, Func, FuncNode, Ident, IfNode, Lit, MethodReceiver,
         Param, Pattern, PatternNode, Program, ReturnNode, Stmt, StmtNode, StructDeclNode,
         StructField, StructLiteralNode, TupleIndexNode, Type, TypeParam, TypeVarId, UnaryNode,
-        UnaryOp,
+        UnaryOp, WhileNode,
     },
     span::Span,
 };
@@ -119,6 +119,9 @@ pub struct TypeChecker {
 
     /// Stores struct definitions (name -> fields)
     struct_defs: HashMap<Ident, StructDef>,
+
+    /// Tracks depth of nested loops to validate break/continue usage
+    loop_depth: usize,
 }
 
 impl Default for TypeChecker {
@@ -134,6 +137,7 @@ impl Default for TypeChecker {
             generic_func_templates: HashMap::new(),
             specialization_cache: HashMap::new(),
             struct_defs: HashMap::new(),
+            loop_depth: 0,
         }
     }
 }
@@ -211,6 +215,18 @@ impl TypeChecker {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, ty);
         }
+    }
+
+    fn enter_loop(&mut self) {
+        self.loop_depth += 1;
+    }
+
+    fn exit_loop(&mut self) {
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+    }
+
+    fn in_loop(&self) -> bool {
+        self.loop_depth > 0
     }
 
     pub fn get_var(&self, name: Ident) -> Option<&Type> {
@@ -372,6 +388,11 @@ pub enum TypeErrKind {
         found: Type,
     },
     IfMissingElse,
+    WhileConditionNotBool {
+        found: Type,
+    },
+    BreakOutsideLoop,
+    ContinueOutsideLoop,
     TupleIndexOnNonTuple {
         found: Type,
         index: u32,
@@ -636,7 +657,7 @@ fn check_block_stmts(
     let last_expr_id = stmts.split_last().and_then(|(last, rest)| {
         // check all the statements except the last one
         rest.iter().for_each(|stmt| {
-            check_stmt(&stmt.node, type_checker, errors);
+            check_stmt(stmt, type_checker, errors);
         });
 
         // process the last statement as expression if needed
@@ -646,7 +667,7 @@ fn check_block_stmts(
                 Some(expr_node.node.id)
             }
             _ => {
-                check_stmt(&last.node, type_checker, errors);
+                check_stmt(last, type_checker, errors);
                 None
             }
         }
@@ -880,8 +901,8 @@ fn type_from_lit(lit: &Lit) -> Type {
     }
 }
 
-fn check_stmt(stmt: &Stmt, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
-    match stmt {
+fn check_stmt(stmt: &StmtNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
+    match &stmt.node {
         Stmt::Func(node) => check_func(node, type_checker, errors),
         Stmt::Struct(node) => check_struct(node, type_checker, errors),
         Stmt::Expr(node) => {
@@ -889,6 +910,9 @@ fn check_stmt(stmt: &Stmt, type_checker: &mut TypeChecker, errors: &mut Vec<Type
         }
         Stmt::Binding(node) => check_binding(node, type_checker, errors),
         Stmt::Return(node) => check_ret(node, type_checker, errors),
+        Stmt::While(node) => check_while(node, type_checker, errors),
+        Stmt::Break => check_break(stmt.span, type_checker, errors),
+        Stmt::Continue => check_continue(stmt.span, type_checker, errors),
     }
 }
 
@@ -1983,6 +2007,43 @@ fn check_compound_assign_op(
     }
 
     Type::Void
+}
+
+fn check_while(while_node: &WhileNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
+    let node = &while_node.node;
+    let cond_ty = check_expr(&node.cond, type_checker, errors);
+    let maybe_bool = cond_ty.is_bool() || cond_ty.is_infer();
+    if !maybe_bool {
+        errors.push(TypeErr {
+            span: node.cond.span,
+            kind: TypeErrKind::WhileConditionNotBool {
+                found: cond_ty.clone(),
+            },
+        });
+        return;
+    }
+
+    type_checker.enter_loop();
+    let _ = check_block_stmts(&node.body.node.stmts, type_checker, errors);
+    type_checker.exit_loop();
+}
+
+fn check_break(span: Span, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
+    if !type_checker.in_loop() {
+        errors.push(TypeErr {
+            span,
+            kind: TypeErrKind::BreakOutsideLoop,
+        });
+    }
+}
+
+fn check_continue(span: Span, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) {
+    if !type_checker.in_loop() {
+        errors.push(TypeErr {
+            span,
+            kind: TypeErrKind::ContinueOutsideLoop,
+        });
+    }
 }
 
 fn check_if(if_node: &IfNode, type_checker: &mut TypeChecker, errors: &mut Vec<TypeErr>) -> Type {

@@ -7,6 +7,7 @@ pub type StmtNode = Spanned<Stmt>;
 pub type FuncNode = Spanned<Func>;
 pub type BlockNode = Spanned<Block>;
 pub type BindingNode = Spanned<Binding>;
+pub type WhileNode = Spanned<While>;
 pub type BinaryNode = Spanned<Binary>;
 pub type UnaryNode = Spanned<Unary>;
 pub type CallNode = Spanned<Call>;
@@ -31,6 +32,9 @@ pub enum Stmt {
     Expr(ExprNode),
     Binding(BindingNode),
     Return(ReturnNode),
+    While(WhileNode),
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Hash, Eq, Default)]
@@ -406,6 +410,12 @@ impl Display for AssignOp {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Return {
     pub value: Option<ExprNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct While {
+    pub cond: ExprNode,
+    pub body: BlockNode,
 }
 
 #[derive(Debug, Clone, PartialEq)]

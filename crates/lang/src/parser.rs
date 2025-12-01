@@ -74,6 +74,9 @@ fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let func = function(stmt.clone());
         let bind = binding(stmt.clone());
         let ret = return_stmt(stmt.clone());
+        let while_s = while_stmt(stmt.clone());
+        let break_s = break_stmt();
+        let continue_s = continue_stmt();
 
         let at_block_end = select! { (Token::Close(Delimiter::Brace), _) => () }.rewind();
 
@@ -84,14 +87,29 @@ fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             (Token::Keyword(Keyword::Fn), _) => (),
             (Token::Keyword(Keyword::If), _) => (),
             (Token::Keyword(Keyword::Struct), _) => (),
+            (Token::Keyword(Keyword::While), _) => (),
+            (Token::Keyword(Keyword::Break), _) => (),
+            (Token::Keyword(Keyword::Continue), _) => (),
         }
         .rewind();
+
+        let at_assign_start = select! { (Token::Ident(_), _) => () }
+            .then(select! {
+                (Token::Op(Op::Assign), _) => (),
+                (Token::Op(Op::AddAssign), _) => (),
+                (Token::Op(Op::SubAssign), _) => (),
+                (Token::Op(Op::MulAssign), _) => (),
+                (Token::Op(Op::DivAssign), _) => (),
+            })
+            .to(())
+            .rewind();
 
         let expr_stmt = expr
             .then_ignore(
                 select! { (Token::Semicolon, _) => () }
                     .or(at_block_end)
-                    .or(at_stmt_start),
+                    .or(at_stmt_start)
+                    .or(at_assign_start),
             )
             .map(|expr_node| {
                 let span = expr_node.span;
@@ -108,6 +126,9 @@ fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
                 Spanned::new(ast::Stmt::Binding(bind_node), span)
             }),
             ret,
+            while_s,
+            break_s,
+            continue_s,
             expr_stmt,
         ))
     })
@@ -507,11 +528,10 @@ fn block_stmt<'src>(
     .boxed()
 }
 
-fn if_expr<'src>(
-    stmt: impl AnvParser<'src, ast::StmtNode>,
-    expr: impl AnvParser<'src, ast::ExprNode>,
-) -> BoxedParser<'src, ast::ExprNode> {
+fn if_expr<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src, ast::ExprNode> {
     recursive(|if_parser| {
+        let cond_expr = cond_expression();
+
         let else_branch = select! {
             (Token::Keyword(Keyword::Else), _) => (),
         }
@@ -530,7 +550,7 @@ fn if_expr<'src>(
         select! {
             (Token::Keyword(Keyword::If), _) => (),
         }
-        .ignore_then(expr.clone())
+        .ignore_then(cond_expr)
         .then(block_stmt(stmt.clone()))
         .then(else_branch)
         .map_with(|((cond, then_block), else_block), e| {
@@ -606,7 +626,7 @@ fn atom_expr<'src>(
             let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
             Spanned::new(expr, span)
         }),
-        if_expr(stmt.clone(), expr.clone()),
+        if_expr(stmt.clone()),
         block_stmt(stmt).map_with(|block_node, e| {
             let span = block_node.span;
             let id = e.state().new_expr_id();
@@ -616,6 +636,43 @@ fn atom_expr<'src>(
         grouped_or_tuple_expr(expr),
     ))
     .labelled("atom")
+    .boxed()
+}
+
+fn cond_atom_expr<'src>(
+    cond_expr: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, ast::ExprNode> {
+    choice((
+        literal().map_with(|lit, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let id = e.state().new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::Lit(lit), id);
+            Spanned::new(expr, span)
+        }),
+        identifier().map_with(|ident, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let expr_id = e.state().new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
+            Spanned::new(expr, span)
+        }),
+        grouped_or_tuple_expr(cond_expr),
+    ))
+    .labelled("condition atom")
+    .boxed()
+}
+
+fn cond_expression<'src>() -> BoxedParser<'src, ast::ExprNode> {
+    recursive(|cond_expr| {
+        let atom = cond_atom_expr(cond_expr.clone());
+        let postfix = postfix_expr(atom, cond_expr.clone());
+        let unary = unary_expr(postfix);
+        let binary = binary_expr(unary);
+        let ternary = ternary_expr(binary, cond_expr.clone());
+        let assign = assignment_expr(ternary);
+        assign
+    })
     .boxed()
 }
 
@@ -1429,6 +1486,59 @@ fn binding<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src,
         .boxed()
 }
 
+fn while_stmt<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src, ast::StmtNode> {
+    let cond_expr = cond_expression();
+
+    select! {
+        (Token::Keyword(Keyword::While), _) => (),
+    }
+    .ignore_then(cond_expr)
+    .then(block_stmt(stmt))
+    .map_with(|(cond, body), e| {
+        let s = e.span();
+        let span = Span::new(s.start, s.end);
+        let while_node = Spanned::new(ast::While { cond, body }, span);
+        Spanned::new(ast::Stmt::While(while_node), span)
+    })
+    .labelled("while statement")
+    .as_context()
+    .boxed()
+}
+
+fn break_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
+    select! {
+        (Token::Keyword(Keyword::Break), _) => (),
+    }
+    .then_ignore(select! {
+        (Token::Semicolon, _) => (),
+    })
+    .map_with(|(), e| {
+        let s: chumsky::span::SimpleSpan<usize> = e.span();
+        let span = Span::new(s.start, s.end);
+        Spanned::new(ast::Stmt::Break, span)
+    })
+    .labelled("break statement")
+    .as_context()
+    .boxed()
+}
+
+fn continue_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
+    select! {
+        (Token::Keyword(Keyword::Continue), _) => (),
+    }
+    .then_ignore(select! {
+        (Token::Semicolon, _) => (),
+    })
+    .map_with(|(), e| {
+        let s: chumsky::span::SimpleSpan<usize> = e.span();
+        let span = Span::new(s.start, s.end);
+        Spanned::new(ast::Stmt::Continue, span)
+    })
+    .labelled("continue statement")
+    .as_context()
+    .boxed()
+}
+
 fn mul_div_op<'src>() -> BoxedParser<'src, ast::BinaryOp> {
     select! {
         (Token::Op(Op::Mul), _) => ast::BinaryOp::Mul,
@@ -1772,5 +1882,126 @@ mod tests {
         expect_ident(mul_left, "c");
         expect_ident(mul_right, "d");
         expect_ident(and_right, "e");
+    }
+
+    fn parse_program(src: &str) -> ast::Program {
+        let tokens = lexer::tokenize(src)
+            .unwrap_or_else(|errs| panic!("failed to tokenize '{src}': {errs:?}"));
+        let mut state = SimpleState(ParserState::default());
+        parser()
+            .parse_with_state(&tokens, &mut state)
+            .into_result()
+            .unwrap_or_else(|errs| panic!("failed to parse '{src}': {errs:?}"))
+    }
+
+    #[test]
+    fn while_with_binary_cond_parses() {
+        let prog = parse_program("fn main() { while x < 3 {} }");
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let body_stmts = &func_node.node.body.node.stmts;
+        assert_eq!(body_stmts.len(), 1);
+        let ast::Stmt::While(while_node) = &body_stmts[0].node else {
+            panic!("expected While");
+        };
+        let cond = &while_node.node.cond;
+        match &cond.node.kind {
+            ast::ExprKind::Binary(bin) => {
+                assert_eq!(bin.node.op, ast::BinaryOp::LessThan);
+            }
+            other => panic!("expected Binary cond, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn while_with_ident_cond_parses() {
+        let prog = parse_program("fn main() { while x {} }");
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let body_stmts = &func_node.node.body.node.stmts;
+        assert_eq!(body_stmts.len(), 1);
+        let ast::Stmt::While(while_node) = &body_stmts[0].node else {
+            panic!("expected While");
+        };
+        let cond = &while_node.node.cond;
+        match &cond.node.kind {
+            ast::ExprKind::Ident(ident) => {
+                assert_eq!(ident.0.as_ref(), "x");
+            }
+            other => panic!("expected Ident cond, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_with_ident_cond_parses() {
+        let prog = parse_program("fn main() { if x {} }");
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let body_stmts = &func_node.node.body.node.stmts;
+        assert_eq!(body_stmts.len(), 1);
+        let ast::Stmt::Expr(expr_node) = &body_stmts[0].node else {
+            panic!("expected Expr stmt");
+        };
+        let ast::ExprKind::If(if_node) = &expr_node.node.kind else {
+            panic!("expected If expr");
+        };
+        let cond = &if_node.node.cond;
+        match &cond.node.kind {
+            ast::ExprKind::Ident(ident) => {
+                assert_eq!(ident.0.as_ref(), "x");
+            }
+            other => panic!("expected Ident cond, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn while_with_inner_break_and_assign_parses() {
+        let src = r#"
+            fn main() {
+                var i: int = 0;
+                while true {
+                    if i == 3 {
+                        break;
+                    }
+                    i = i + 1;
+                }
+            }
+        "#;
+        let prog = parse_program(src);
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let body_stmts = &func_node.node.body.node.stmts;
+        assert_eq!(body_stmts.len(), 2);
+
+        let ast::Stmt::Binding(_) = &body_stmts[0].node else {
+            panic!("expected Binding stmt");
+        };
+
+        let ast::Stmt::While(while_node) = &body_stmts[1].node else {
+            panic!("expected While stmt");
+        };
+        let while_body = &while_node.node.body.node.stmts;
+        assert_eq!(while_body.len(), 2);
+
+        let ast::Stmt::Expr(if_expr_node) = &while_body[0].node else {
+            panic!("expected Expr stmt for if");
+        };
+        assert!(matches!(&if_expr_node.node.kind, ast::ExprKind::If(_)));
+
+        let ast::Stmt::Expr(assign_expr_node) = &while_body[1].node else {
+            panic!("expected Expr stmt for assignment");
+        };
+        assert!(matches!(
+            &assign_expr_node.node.kind,
+            ast::ExprKind::Assign(_)
+        ));
     }
 }

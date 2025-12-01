@@ -118,6 +118,18 @@ pub fn report_typecheck_errors(
                 "if expression used as value must have an else branch".to_string(),
                 "add an else branch to use this if expression as a value".to_string(),
             ),
+            TypeErrKind::WhileConditionNotBool { found } => (
+                "Condition of while must be bool".to_string(),
+                format!("found '{found}'"),
+            ),
+            TypeErrKind::BreakOutsideLoop => (
+                "break outside of loop".to_string(),
+                "break can only be used inside a loop".to_string(),
+            ),
+            TypeErrKind::ContinueOutsideLoop => (
+                "continue outside of loop".to_string(),
+                "continue can only be used inside a loop".to_string(),
+            ),
             TypeErrKind::TupleIndexOnNonTuple { found, index } => (
                 format!("cannot index non-tuple type with .{index}"),
                 format!("expression has type '{found}', which is not a tuple"),
