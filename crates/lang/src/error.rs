@@ -227,10 +227,6 @@ pub fn report_typecheck_errors(
                 "step is only supported for integer ranges".to_string(),
                 format!("item type is '{item_ty}', step type is '{step_ty}'; both must be 'int'"),
             ),
-            TypeErrKind::ArrayLengthMismatch { expected, found } => (
-                "array length mismatch".to_string(),
-                format!("expected {expected} elements, found {found}"),
-            ),
             TypeErrKind::ArrayAllNilAmbiguous => (
                 "cannot infer element type for all-nil array literal".to_string(),
                 "try adding a type annotation, e.g. `var a: int?[_] = [nil, nil];`".to_string(),

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    var c: int?[] = [nil, nil];
+}
+

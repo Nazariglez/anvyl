@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'int[2]', found 'int[]'
+
+fn main() {
+    let lst: int[] = [1, 2];
+    let y: int[2] = lst;
+}
+
