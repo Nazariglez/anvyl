@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: index must be an integer
+
+fn main() {
+    let nums = [1, 2, 3];
+    let i = 1.5;
+    let value = nums[i];
+}
+

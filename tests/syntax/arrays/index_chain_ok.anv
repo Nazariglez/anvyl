@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+
+fn last_col(rows: int[3][2]) -> int {
+    rows[1][2]
+}
+
+fn main() {
+    let matrix: int[3][2] = [[1, 2, 3], [4, 5, 6]];
+    let diagonal = matrix[0][0] + matrix[1][1];
+
+    let grids = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]];
+    let chained = grids[1][0][1];
+
+    let total = diagonal + last_col(matrix) + chained;
+}
+

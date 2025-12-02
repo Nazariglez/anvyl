@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: cannot index non-array type
+
+fn main() {
+    let value = 10;
+    let bad = value[0];
+}
+

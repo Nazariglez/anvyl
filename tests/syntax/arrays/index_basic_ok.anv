@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let fixed: int[3] = [1, 2, 3];
+    let first = fixed[0];
+    let third = fixed[2];
+
+    let list: float[] = [1.0, 2.5, 3.5];
+    let middle = list[1];
+
+    let nested = [[1, 2], [3, 4]];
+    let row = nested[1];
+    let value = nested[0][0];
+
+    let _ = first + third + value;
+    let _ = middle;
+    let _ = row;
+}
+

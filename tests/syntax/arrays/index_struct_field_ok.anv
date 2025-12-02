@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+
+struct Board {
+    rows: int[3][2],
+}
+
+struct Bag {
+    slots: int[4],
+}
+
+fn main() {
+    let board = Board {
+        rows: [[1, 2, 3], [4, 5, 6]],
+    };
+
+    let row = board.rows[1];
+    let corner = board.rows[0][2];
+
+    let bag = Bag { slots: [5, 6, 7, 8] };
+    let last = bag.slots[3];
+
+    let _ = row[0] + corner + last;
+}
+
