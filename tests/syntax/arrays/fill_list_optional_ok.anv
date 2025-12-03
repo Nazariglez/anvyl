@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    var xs: [int?] = [nil; 2];
+}
+

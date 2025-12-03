@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let ints: [int] = [0; 3];
+    let floats: [float] = [1; 2];
+}
+

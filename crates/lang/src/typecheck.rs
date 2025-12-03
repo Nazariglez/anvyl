@@ -6113,6 +6113,63 @@ mod tests {
     }
 
     #[test]
+    fn test_array_fill_list_annotated_ok() {
+        reset_expr_ids();
+
+        // let xs: [int] = [0; 3];
+        let arr = array_fill(lit_int(0), lit_int(3));
+        let arr_id = get_expr_id(&arr);
+        let annot = Type::List {
+            elem: Type::Int.boxed(),
+        };
+        let prog = program(vec![let_binding("xs", Some(annot.clone()), arr)]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, arr_id, annot);
+    }
+
+    #[test]
+    fn test_array_fill_optional_list_ok() {
+        reset_expr_ids();
+
+        // var xs: [int?] = [nil; 3];
+        let arr = array_fill(lit_nil(), lit_int(3));
+        let arr_id = get_expr_id(&arr);
+        let annot = Type::List {
+            elem: Type::Optional(Type::Int.boxed()).boxed(),
+        };
+        let prog = program(vec![var_binding("xs", Some(annot.clone()), arr)]);
+
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, arr_id, annot);
+    }
+
+    #[test]
+    fn test_array_fill_list_len_not_literal_err() {
+        reset_expr_ids();
+
+        // let n = 3;
+        // let xs: [int] = [0; n];
+        let n_binding = let_binding("n", None, lit_int(3));
+        let arr = array_fill(lit_int(0), ident_expr("n"));
+        let annot = Type::List {
+            elem: Type::Int.boxed(),
+        };
+        let xs_binding = let_binding("xs", Some(annot), arr);
+        let prog = program(vec![n_binding, xs_binding]);
+
+        let errors = run_err(prog);
+        assert!(
+            errors.iter().any(|e| matches!(
+                &e.kind,
+                TypeErrKind::ArrayFillLengthNotLiteral
+            )),
+            "Expected ArrayFillLengthNotLiteral error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
     fn test_fixed_array_not_assignable_to_list() {
         reset_expr_ids();
 
