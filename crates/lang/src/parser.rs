@@ -1294,7 +1294,7 @@ fn param<'src>() -> BoxedParser<'src, ast::Param> {
         .then_ignore(select! {
             (Token::Colon, _) => (),
         })
-        .then(type_ident())
+        .then(param_type_ident())
         .map(|(name, ty)| ast::Param { name, ty })
         .labelled("parameter")
         .as_context()
@@ -1318,7 +1318,15 @@ enum TypeSuffix {
 }
 
 fn type_ident<'src>() -> BoxedParser<'src, ast::Type> {
-    recursive(|type_parser| {
+    type_ident_inner(false)
+}
+
+fn param_type_ident<'src>() -> BoxedParser<'src, ast::Type> {
+    type_ident_inner(true)
+}
+
+fn type_ident_inner<'src>(allow_view: bool) -> BoxedParser<'src, ast::Type> {
+    recursive(move |type_parser| {
         let builtin_typ = select! {
             (Token::Keyword(Keyword::Int), _) => ast::Type::Int,
             (Token::Keyword(Keyword::Float), _) => ast::Type::Float,
@@ -1362,27 +1370,6 @@ fn type_ident<'src>() -> BoxedParser<'src, ast::Type> {
         });
         let array_len = choice((array_len_fixed, array_len_infer));
 
-        let view_marker = select! { (Token::Range, _) => () };
-
-        let array_or_view_type = open_bracket
-            .clone()
-            .ignore_then(type_parser.clone())
-            .then_ignore(semicolon)
-            .then(
-                choice((
-                    view_marker.to(None),
-                    array_len.map(Some),
-                )),
-            )
-            .then_ignore(close_bracket.clone())
-            .map(|(elem, len)| match len {
-                Some(len) => ast::Type::Array {
-                    elem: elem.boxed(),
-                    len,
-                },
-                None => ast::Type::ArrayView { elem: elem.boxed() },
-            });
-
         let map_type = open_bracket
             .clone()
             .ignore_then(type_parser.clone())
@@ -1399,7 +1386,36 @@ fn type_ident<'src>() -> BoxedParser<'src, ast::Type> {
             .then_ignore(close_bracket)
             .map(|elem| ast::Type::List { elem: elem.boxed() });
 
-        let bracketed_type = choice((array_or_view_type, map_type, list_type));
+        let array_type = open_bracket
+            .clone()
+            .ignore_then(type_parser.clone())
+            .then_ignore(semicolon.clone())
+            .then(array_len)
+            .then_ignore(close_bracket.clone())
+            .map(|(elem, len)| ast::Type::Array {
+                elem: elem.boxed(),
+                len,
+            });
+
+        let view_type = open_bracket
+            .clone()
+            .ignore_then(type_parser.clone())
+            .then_ignore(semicolon.clone())
+            .then_ignore(select! { (Token::Range, _) => () })
+            .then_ignore(close_bracket.clone())
+            .try_map(move |elem, span| {
+                if allow_view {
+                    Ok(ast::Type::ArrayView { elem: elem.boxed() })
+                } else {
+                    Err(Rich::custom(
+                        span,
+                        "view types are only allowed in function parameters",
+                    ))
+                }
+            });
+
+        let bracketed_type = choice((view_type, choice((array_type, choice((map_type, list_type))))));
+
         let primary_type = choice((builtin_typ, type_name_ref, paren_type, bracketed_type));
         let optional_suffix = select! { (Token::Question, _) => TypeSuffix::Optional };
         let type_suffix = optional_suffix;
@@ -2388,6 +2404,17 @@ mod tests {
             .unwrap_or_else(|errs| panic!("failed to parse type '{src}': {errs:?}"))
     }
 
+    fn parse_param_type(src: &str) -> ast::Type {
+        let tokens = lexer::tokenize(src)
+            .unwrap_or_else(|errs| panic!("failed to tokenize type '{src}': {errs:?}"));
+        let mut state = SimpleState(ParserState::default());
+        param_type_ident()
+            .then_ignore(end())
+            .parse_with_state(&tokens, &mut state)
+            .into_result()
+            .unwrap_or_else(|errs| panic!("failed to parse param type '{src}': {errs:?}"))
+    }
+
     #[test]
     fn array_type_fixed_len_parses() {
         let ty = parse_type("[int; 3]");
@@ -2644,7 +2671,7 @@ mod tests {
 
     #[test]
     fn view_type_int_parses() {
-        let ty = parse_type("[int; ..]");
+        let ty = parse_param_type("[int; ..]");
         match ty {
             ast::Type::ArrayView { elem } => {
                 assert_eq!(*elem, ast::Type::Int);
@@ -2655,7 +2682,7 @@ mod tests {
 
     #[test]
     fn view_type_float_parses() {
-        let ty = parse_type("[float; ..]");
+        let ty = parse_param_type("[float; ..]");
         match ty {
             ast::Type::ArrayView { elem } => {
                 assert_eq!(*elem, ast::Type::Float);
@@ -2666,7 +2693,7 @@ mod tests {
 
     #[test]
     fn view_type_array_parses() {
-        let ty = parse_type("[[int; 3]; ..]");
+        let ty = parse_param_type("[[int; 3]; ..]");
         match ty {
             ast::Type::ArrayView { elem } => match *elem {
                 ast::Type::Array { elem: inner, len } => {
@@ -2681,7 +2708,7 @@ mod tests {
 
     #[test]
     fn view_type_list_parses() {
-        let ty = parse_type("[[string]; ..]");
+        let ty = parse_param_type("[[string]; ..]");
         match ty {
             ast::Type::ArrayView { elem } => match *elem {
                 ast::Type::List { elem: inner } => {
@@ -2695,7 +2722,7 @@ mod tests {
 
     #[test]
     fn view_type_optional_parses() {
-        let ty = parse_type("[int; ..]?");
+        let ty = parse_param_type("[int; ..]?");
         match ty {
             ast::Type::Optional(inner) => match *inner {
                 ast::Type::ArrayView { elem } => {

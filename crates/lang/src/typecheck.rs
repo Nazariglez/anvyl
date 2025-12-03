@@ -542,9 +542,6 @@ pub enum TypeErrKind {
     IndexNotInt {
         found: Type,
     },
-    ViewTypeNotAllowed {
-        found: Type,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -571,21 +568,6 @@ fn contains_infer(ty: &Type) -> bool {
         Type::Struct { type_args, .. } => type_args.iter().any(contains_infer),
         Type::Array { elem, .. } => contains_infer(elem),
         Type::ArrayView { elem } => contains_infer(elem),
-        _ => false,
-    }
-}
-
-fn contains_view(ty: &Type) -> bool {
-    match ty {
-        Type::ArrayView { .. } => true,
-        Type::Optional(inner) => contains_view(inner),
-        Type::Func { params, ret } => params.iter().any(contains_view) || contains_view(ret),
-        Type::Tuple(elems) => elems.iter().any(contains_view),
-        Type::NamedTuple(fields) => fields.iter().any(|(_, t)| contains_view(t)),
-        Type::Struct { type_args, .. } => type_args.iter().any(contains_view),
-        Type::Array { elem, .. } => contains_view(elem),
-        Type::List { elem } => contains_view(elem),
-        Type::Map { key, value } => contains_view(key) || contains_view(value),
         _ => false,
     }
 }
@@ -1325,15 +1307,6 @@ fn check_func(fn_node: &FuncNode, type_checker: &mut TypeChecker, errors: &mut V
     // build param types from the functions declared parameters
     let param_types: Vec<Type> = func.params.iter().map(|p| p.ty.clone()).collect();
 
-    if contains_view(&func.ret) {
-        errors.push(TypeErr {
-            span: fn_node.span,
-            kind: TypeErrKind::ViewTypeNotAllowed {
-                found: func.ret.clone(),
-            },
-        });
-    }
-
     check_fn_body(
         func,
         &param_types,
@@ -1355,17 +1328,6 @@ fn check_struct(
     let Some(struct_def) = type_checker.get_struct(struct_name).cloned() else {
         return;
     };
-
-    for field in &decl.fields {
-        if contains_view(&field.ty) {
-            errors.push(TypeErr {
-                span: struct_node.span,
-                kind: TypeErrKind::ViewTypeNotAllowed {
-                    found: field.ty.clone(),
-                },
-            });
-        }
-    }
 
     for method in &decl.methods {
         if let Some(method_def) = struct_def.methods.get(&method.name) {
@@ -2839,15 +2801,6 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
 
     let binding_ty = match &node.ty {
         Some(annot_ty) => {
-            if contains_view(annot_ty) {
-                errors.push(TypeErr {
-                    span: binding.span,
-                    kind: TypeErrKind::ViewTypeNotAllowed {
-                        found: annot_ty.clone(),
-                    },
-                });
-            }
-
             let resolved_annot = resolve_array_infer_annotation(annot_ty, &value_ty);
 
             let should_retag_literal = is_array_literal_with_infer_elem(&node.value, &value_ty)
@@ -6590,53 +6543,6 @@ mod tests {
             }),
             span: dummy_span(),
         }
-    }
-
-    #[test]
-    fn test_view_type_in_binding_err() {
-        reset_expr_ids();
-
-        // let xs: [int; ..] = [1, 2, 3];
-        let arr = array_literal(vec![lit_int(1), lit_int(2), lit_int(3)]);
-        let view_annot = Type::ArrayView {
-            elem: Type::Int.boxed(),
-        };
-        let xs_binding = let_binding("xs", Some(view_annot.clone()), arr);
-        let prog = program(vec![xs_binding]);
-
-        let errors = run_err(prog);
-        assert!(
-            errors.iter().any(|e| matches!(
-                &e.kind,
-                TypeErrKind::ViewTypeNotAllowed { found }
-                if *found == view_annot
-            )),
-            "Expected ViewTypeNotAllowed error, got: {:?}",
-            errors
-        );
-    }
-
-    #[test]
-    fn test_view_type_in_func_return_err() {
-        reset_expr_ids();
-
-        // fn f() -> [int; ..] { [1, 2, 3] }
-        let view_ret = Type::ArrayView {
-            elem: Type::Int.boxed(),
-        };
-        let func = func_decl("f", vec![], view_ret.clone(), vec![], Type::Void);
-        let prog = program(vec![func]);
-
-        let errors = run_err(prog);
-        assert!(
-            errors.iter().any(|e| matches!(
-                &e.kind,
-                TypeErrKind::ViewTypeNotAllowed { found }
-                if *found == view_ret
-            )),
-            "Expected ViewTypeNotAllowed error for return type, got: {:?}",
-            errors
-        );
     }
 
     fn view_type(elem: Type) -> Type {

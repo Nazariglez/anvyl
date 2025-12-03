@@ -1,11 +1,10 @@
 // @mode: check
 // @expect: error
-// @contains: view types are only allowed in function parameters
+// @contains: '..' token
 
 struct Bad {
     xs: [int; ..]
 }
 
-fn main() {
-}
+fn main() {}
 

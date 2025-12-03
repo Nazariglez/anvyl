@@ -243,10 +243,6 @@ pub fn report_typecheck_errors(
                 "index must be an integer".to_string(),
                 format!("expected 'int', found '{found}'"),
             ),
-            TypeErrKind::ViewTypeNotAllowed { found } => (
-                "view types are only allowed in function parameters".to_string(),
-                format!("'{found}' cannot be used here; use it as a function parameter type"),
-            ),
         };
 
         emit_report(src, file_path, byte_range, title, body);
