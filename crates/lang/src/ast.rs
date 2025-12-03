@@ -145,6 +145,8 @@ pub enum Type {
     Array { elem: Box<Type>, len: ArrayLen },
     /// Map type (key-value pairs)
     Map { key: Box<Type>, value: Box<Type> },
+    /// View/slice type for function parameters ([T; ..])
+    ArrayView { elem: Box<Type> },
 }
 
 impl Type {
@@ -202,6 +204,10 @@ impl Type {
 
     pub fn is_map(&self) -> bool {
         matches!(self, Type::Map { .. })
+    }
+
+    pub fn is_array_view(&self) -> bool {
+        matches!(self, Type::ArrayView { .. })
     }
 
     pub fn tuple_arity(&self) -> Option<usize> {
@@ -281,6 +287,7 @@ impl Display for Type {
                 ArrayLen::Infer => write!(f, "[{elem}; _]"),
             },
             Type::Map { key, value } => write!(f, "[{key}: {value}]"),
+            Type::ArrayView { elem } => write!(f, "[{elem}; ..]"),
         }
     }
 }

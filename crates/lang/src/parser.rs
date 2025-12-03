@@ -506,6 +506,10 @@ fn resolve_type_params_with_self(
             len: *len,
         },
 
+        ArrayView { elem } => ArrayView {
+            elem: resolve_type_params_with_self(elem, type_param_map, self_type).boxed(),
+        },
+
         _ => ty.clone(),
     }
 }
@@ -1358,15 +1362,25 @@ fn type_ident<'src>() -> BoxedParser<'src, ast::Type> {
         });
         let array_len = choice((array_len_fixed, array_len_infer));
 
-        let array_type = open_bracket
+        let view_marker = select! { (Token::Range, _) => () };
+
+        let array_or_view_type = open_bracket
             .clone()
             .ignore_then(type_parser.clone())
             .then_ignore(semicolon)
-            .then(array_len)
+            .then(
+                choice((
+                    view_marker.to(None),
+                    array_len.map(Some),
+                )),
+            )
             .then_ignore(close_bracket.clone())
-            .map(|(elem, len)| ast::Type::Array {
-                elem: elem.boxed(),
-                len,
+            .map(|(elem, len)| match len {
+                Some(len) => ast::Type::Array {
+                    elem: elem.boxed(),
+                    len,
+                },
+                None => ast::Type::ArrayView { elem: elem.boxed() },
             });
 
         let map_type = open_bracket
@@ -1385,12 +1399,13 @@ fn type_ident<'src>() -> BoxedParser<'src, ast::Type> {
             .then_ignore(close_bracket)
             .map(|elem| ast::Type::List { elem: elem.boxed() });
 
-        let bracketed_type = choice((array_type, map_type, list_type));
+        let bracketed_type = choice((array_or_view_type, map_type, list_type));
         let primary_type = choice((builtin_typ, type_name_ref, paren_type, bracketed_type));
         let optional_suffix = select! { (Token::Question, _) => TypeSuffix::Optional };
+        let type_suffix = optional_suffix;
 
         primary_type
-            .then(optional_suffix.repeated().collect::<Vec<_>>())
+            .then(type_suffix.repeated().collect::<Vec<_>>())
             .map(|(base, suffixes)| {
                 suffixes.into_iter().fold(base, |ty, sfx| match sfx {
                     TypeSuffix::Optional => ast::Type::Optional(ty.boxed()),
@@ -2624,6 +2639,71 @@ mod tests {
                 }
             }
             other => panic!("expected Array(Optional(Int), Fixed(3)), found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_type_int_parses() {
+        let ty = parse_type("[int; ..]");
+        match ty {
+            ast::Type::ArrayView { elem } => {
+                assert_eq!(*elem, ast::Type::Int);
+            }
+            other => panic!("expected View(Int), found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_type_float_parses() {
+        let ty = parse_type("[float; ..]");
+        match ty {
+            ast::Type::ArrayView { elem } => {
+                assert_eq!(*elem, ast::Type::Float);
+            }
+            other => panic!("expected View(Float), found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_type_array_parses() {
+        let ty = parse_type("[[int; 3]; ..]");
+        match ty {
+            ast::Type::ArrayView { elem } => match *elem {
+                ast::Type::Array { elem: inner, len } => {
+                    assert_eq!(*inner, ast::Type::Int);
+                    assert_eq!(len, ast::ArrayLen::Fixed(3));
+                }
+                other => panic!("expected Array(Int, Fixed(3)), found {other:?}"),
+            },
+            other => panic!("expected View(Array(...)), found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_type_list_parses() {
+        let ty = parse_type("[[string]; ..]");
+        match ty {
+            ast::Type::ArrayView { elem } => match *elem {
+                ast::Type::List { elem: inner } => {
+                    assert_eq!(*inner, ast::Type::String);
+                }
+                other => panic!("expected List(String), found {other:?}"),
+            },
+            other => panic!("expected View(List(...)), found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_type_optional_parses() {
+        let ty = parse_type("[int; ..]?");
+        match ty {
+            ast::Type::Optional(inner) => match *inner {
+                ast::Type::ArrayView { elem } => {
+                    assert_eq!(*elem, ast::Type::Int);
+                }
+                other => panic!("expected View(Int), found {other:?}"),
+            },
+            other => panic!("expected Optional(View(Int)), found {other:?}"),
         }
     }
 }

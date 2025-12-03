@@ -194,6 +194,9 @@ impl TypeChecker {
                 elem: self.resolve_type(elem).boxed(),
                 len: *len,
             },
+            Type::ArrayView { elem } => Type::ArrayView {
+                elem: self.resolve_type(elem).boxed(),
+            },
             _ => ty.clone(),
         }
     }
@@ -381,6 +384,40 @@ impl TypeChecker {
             return;
         }
 
+        // if both are views, constrain element types
+        if let (Type::ArrayView { elem: elem_from }, Type::ArrayView { elem: elem_to }) =
+            (&from_ty, &to_ty)
+        {
+            let elem_from_ref = TypeRef::Concrete(*elem_from.clone());
+            let elem_to_ref = TypeRef::Concrete(*elem_to.clone());
+            self.constrain_assignable(span, elem_from_ref, elem_to_ref, errors);
+            return;
+        }
+
+        // if assigning array to view, constrain element types
+        if let (
+            Type::Array {
+                elem: elem_from, ..
+            },
+            Type::ArrayView { elem: elem_to },
+        ) = (&from_ty, &to_ty)
+        {
+            let elem_from_ref = TypeRef::Concrete(*elem_from.clone());
+            let elem_to_ref = TypeRef::Concrete(*elem_to.clone());
+            self.constrain_assignable(span, elem_from_ref, elem_to_ref, errors);
+            return;
+        }
+
+        // if assigning list to view, constrain element types
+        if let (Type::List { elem: elem_from }, Type::ArrayView { elem: elem_to }) =
+            (&from_ty, &to_ty)
+        {
+            let elem_from_ref = TypeRef::Concrete(*elem_from.clone());
+            let elem_to_ref = TypeRef::Concrete(*elem_to.clone());
+            self.constrain_assignable(span, elem_from_ref, elem_to_ref, errors);
+            return;
+        }
+
         // otherwise just constrain them to be the same as fallback
         self.constrain_equal(span, from, to, errors);
     }
@@ -505,6 +542,9 @@ pub enum TypeErrKind {
     IndexNotInt {
         found: Type,
     },
+    ViewTypeNotAllowed {
+        found: Type,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +570,22 @@ fn contains_infer(ty: &Type) -> bool {
         Type::NamedTuple(fields) => fields.iter().any(|(_, t)| contains_infer(t)),
         Type::Struct { type_args, .. } => type_args.iter().any(contains_infer),
         Type::Array { elem, .. } => contains_infer(elem),
+        Type::ArrayView { elem } => contains_infer(elem),
+        _ => false,
+    }
+}
+
+fn contains_view(ty: &Type) -> bool {
+    match ty {
+        Type::ArrayView { .. } => true,
+        Type::Optional(inner) => contains_view(inner),
+        Type::Func { params, ret } => params.iter().any(contains_view) || contains_view(ret),
+        Type::Tuple(elems) => elems.iter().any(contains_view),
+        Type::NamedTuple(fields) => fields.iter().any(|(_, t)| contains_view(t)),
+        Type::Struct { type_args, .. } => type_args.iter().any(contains_view),
+        Type::Array { elem, .. } => contains_view(elem),
+        Type::List { elem } => contains_view(elem),
+        Type::Map { key, value } => contains_view(key) || contains_view(value),
         _ => false,
     }
 }
@@ -581,7 +637,7 @@ fn is_assignable(from: &Type, to: &Type) -> bool {
         // T? to T is not assignable, the value must be unwrapped first
         (Optional(_), non_opt) if !matches!(non_opt, Optional(_)) => false,
 
-        // Array T[N] to T[M] requires the len and the element type to be assignable
+        // array T[N] to T[M] requires the len and the element type to be assignable
         (
             Array {
                 elem: elem_from,
@@ -611,6 +667,24 @@ fn is_assignable(from: &Type, to: &Type) -> bool {
                 value: value_to,
             },
         ) => is_assignable(key_from, key_to) && is_assignable(value_from, value_to),
+
+        // view [T; ..] to [U; ..] if T is assignable to U
+        (ArrayView { elem: elem_from }, ArrayView { elem: elem_to }) => {
+            is_assignable(elem_from, elem_to)
+        }
+
+        // array [T; N] to View [U; ..] if T is assignable to U
+        (
+            Array {
+                elem: elem_from, ..
+            },
+            ArrayView { elem: elem_to },
+        ) => is_assignable(elem_from, elem_to),
+
+        // list [T] to View [U; ..] if T is assignable to U
+        (List { elem: elem_from }, ArrayView { elem: elem_to }) => {
+            is_assignable(elem_from, elem_to)
+        }
 
         // anything else is just not assignable
         _ => false,
@@ -749,6 +823,11 @@ fn unify_types(left: &Type, right: &Type, span: Span, errors: &mut Vec<TypeErr>)
                 key: unified_key.boxed(),
                 value: unified_value.boxed(),
             })
+        }
+
+        // views unify if element types can unify
+        (ArrayView { elem: le }, ArrayView { elem: re }) => {
+            unify_types(le, re, span, errors).map(|elem| ArrayView { elem: elem.boxed() })
         }
 
         // mismatched types report an error
@@ -1246,6 +1325,15 @@ fn check_func(fn_node: &FuncNode, type_checker: &mut TypeChecker, errors: &mut V
     // build param types from the functions declared parameters
     let param_types: Vec<Type> = func.params.iter().map(|p| p.ty.clone()).collect();
 
+    if contains_view(&func.ret) {
+        errors.push(TypeErr {
+            span: fn_node.span,
+            kind: TypeErrKind::ViewTypeNotAllowed {
+                found: func.ret.clone(),
+            },
+        });
+    }
+
     check_fn_body(
         func,
         &param_types,
@@ -1267,6 +1355,17 @@ fn check_struct(
     let Some(struct_def) = type_checker.get_struct(struct_name).cloned() else {
         return;
     };
+
+    for field in &decl.fields {
+        if contains_view(&field.ty) {
+            errors.push(TypeErr {
+                span: struct_node.span,
+                kind: TypeErrKind::ViewTypeNotAllowed {
+                    found: field.ty.clone(),
+                },
+            });
+        }
+    }
 
     for method in &decl.methods {
         if let Some(method_def) = struct_def.methods.get(&method.name) {
@@ -1435,6 +1534,7 @@ fn indexable_element_type(ty: &Type) -> Option<Type> {
     match ty {
         Type::Array { elem, .. } => Some((**elem).clone()),
         Type::List { elem } => Some((**elem).clone()),
+        Type::ArrayView { elem } => Some((**elem).clone()),
         _ => None,
     }
 }
@@ -2739,6 +2839,15 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
 
     let binding_ty = match &node.ty {
         Some(annot_ty) => {
+            if contains_view(annot_ty) {
+                errors.push(TypeErr {
+                    span: binding.span,
+                    kind: TypeErrKind::ViewTypeNotAllowed {
+                        found: annot_ty.clone(),
+                    },
+                });
+            }
+
             let resolved_annot = resolve_array_infer_annotation(annot_ty, &value_ty);
 
             let should_retag_literal = is_array_literal_with_infer_elem(&node.value, &value_ty)
@@ -6160,10 +6269,9 @@ mod tests {
 
         let errors = run_err(prog);
         assert!(
-            errors.iter().any(|e| matches!(
-                &e.kind,
-                TypeErrKind::ArrayFillLengthNotLiteral
-            )),
+            errors
+                .iter()
+                .any(|e| matches!(&e.kind, TypeErrKind::ArrayFillLengthNotLiteral)),
             "Expected ArrayFillLengthNotLiteral error, got: {:?}",
             errors
         );
@@ -6438,5 +6546,232 @@ mod tests {
 
         let prog = program(vec![arr_binding, assign_stmt]);
         let _ = run_ok(prog);
+    }
+
+    fn ident(s: &str) -> Ident {
+        Ident(Intern::new(s.to_string()))
+    }
+
+    fn func_decl(
+        name: &str,
+        params: Vec<(&str, Type)>,
+        ret: Type,
+        body: Vec<StmtNode>,
+        _implicit_ret_ty: Type,
+    ) -> StmtNode {
+        let body_stmts = if body.is_empty() && !ret.is_void() {
+            vec![expr_stmt(lit_int(0))]
+        } else if body.is_empty() {
+            vec![]
+        } else {
+            body
+        };
+
+        StmtNode {
+            node: Stmt::Func(FuncNode {
+                node: Func {
+                    name: ident(name),
+                    visibility: Visibility::Private,
+                    type_params: vec![],
+                    params: params
+                        .into_iter()
+                        .map(|(n, t)| Param {
+                            name: ident(n),
+                            ty: t,
+                        })
+                        .collect(),
+                    ret,
+                    body: BlockNode {
+                        node: Block { stmts: body_stmts },
+                        span: dummy_span(),
+                    },
+                },
+                span: dummy_span(),
+            }),
+            span: dummy_span(),
+        }
+    }
+
+    #[test]
+    fn test_view_type_in_binding_err() {
+        reset_expr_ids();
+
+        // let xs: [int; ..] = [1, 2, 3];
+        let arr = array_literal(vec![lit_int(1), lit_int(2), lit_int(3)]);
+        let view_annot = Type::ArrayView {
+            elem: Type::Int.boxed(),
+        };
+        let xs_binding = let_binding("xs", Some(view_annot.clone()), arr);
+        let prog = program(vec![xs_binding]);
+
+        let errors = run_err(prog);
+        assert!(
+            errors.iter().any(|e| matches!(
+                &e.kind,
+                TypeErrKind::ViewTypeNotAllowed { found }
+                if *found == view_annot
+            )),
+            "Expected ViewTypeNotAllowed error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_view_type_in_func_return_err() {
+        reset_expr_ids();
+
+        // fn f() -> [int; ..] { [1, 2, 3] }
+        let view_ret = Type::ArrayView {
+            elem: Type::Int.boxed(),
+        };
+        let func = func_decl("f", vec![], view_ret.clone(), vec![], Type::Void);
+        let prog = program(vec![func]);
+
+        let errors = run_err(prog);
+        assert!(
+            errors.iter().any(|e| matches!(
+                &e.kind,
+                TypeErrKind::ViewTypeNotAllowed { found }
+                if *found == view_ret
+            )),
+            "Expected ViewTypeNotAllowed error for return type, got: {:?}",
+            errors
+        );
+    }
+
+    fn view_type(elem: Type) -> Type {
+        Type::ArrayView { elem: elem.boxed() }
+    }
+
+    #[test]
+    fn test_view_param_accepts_fixed_array() {
+        reset_expr_ids();
+
+        // fn sum(xs: [int; ..]) -> int { xs[0] }
+        // sum([1, 2, 3])
+        let view_param = view_type(Type::Int);
+        let func = func_decl(
+            "sum",
+            vec![("xs", view_param)],
+            Type::Int,
+            vec![],
+            Type::Int,
+        );
+
+        let arr = array_literal(vec![lit_int(1), lit_int(2), lit_int(3)]);
+        let call = call_expr(ident_expr("sum"), vec![arr]);
+        let call_stmt = StmtNode {
+            node: Stmt::Expr(call),
+            span: dummy_span(),
+        };
+
+        let prog = program(vec![func, call_stmt]);
+        let _ = run_ok(prog);
+    }
+
+    #[test]
+    fn test_view_param_accepts_list() {
+        reset_expr_ids();
+
+        // fn sum(xs: [int; ..]) -> int { xs[0] }
+        // let lst: [int] = [1, 2, 3];
+        // sum(lst)
+        let view_param = view_type(Type::Int);
+        let func = func_decl(
+            "sum",
+            vec![("xs", view_param)],
+            Type::Int,
+            vec![],
+            Type::Int,
+        );
+
+        let lst = array_literal(vec![lit_int(1), lit_int(2), lit_int(3)]);
+        let lst_annot = Type::List {
+            elem: Type::Int.boxed(),
+        };
+        let lst_binding = let_binding("lst", Some(lst_annot), lst);
+
+        let call = call_expr(ident_expr("sum"), vec![ident_expr("lst")]);
+        let call_stmt = StmtNode {
+            node: Stmt::Expr(call),
+            span: dummy_span(),
+        };
+
+        let prog = program(vec![func, lst_binding, call_stmt]);
+        let _ = run_ok(prog);
+    }
+
+    #[test]
+    fn test_view_indexing_ok() {
+        reset_expr_ids();
+
+        // fn head(xs: [int; ..]) -> int { xs[0] }
+        let view_param = view_type(Type::Int);
+        let idx = index_expr(ident_expr("xs"), lit_int(0));
+        let idx_id = get_expr_id(&idx);
+        let body_stmt = StmtNode {
+            node: Stmt::Expr(idx),
+            span: dummy_span(),
+        };
+        let func = FuncNode {
+            node: Func {
+                name: ident("head"),
+                visibility: Visibility::Private,
+                type_params: vec![],
+                params: vec![Param {
+                    name: ident("xs"),
+                    ty: view_param,
+                }],
+                ret: Type::Int,
+                body: BlockNode {
+                    node: Block {
+                        stmts: vec![body_stmt],
+                    },
+                    span: dummy_span(),
+                },
+            },
+            span: dummy_span(),
+        };
+        let func_stmt = StmtNode {
+            node: Stmt::Func(func),
+            span: dummy_span(),
+        };
+
+        let prog = program(vec![func_stmt]);
+        let tcx = run_ok(prog);
+        assert_expr_type(&tcx, idx_id, Type::Int);
+    }
+
+    #[test]
+    fn test_view_mismatched_element_type_err() {
+        reset_expr_ids();
+
+        // fn f(xs: [int; ..]) {}
+        // f(["a", "b"])
+        let view_param = view_type(Type::Int);
+        let func = func_decl(
+            "f",
+            vec![("xs", view_param)],
+            Type::Void,
+            vec![],
+            Type::Void,
+        );
+
+        let arr = array_literal(vec![lit_string("a"), lit_string("b")]);
+        let call = call_expr(ident_expr("f"), vec![arr]);
+        let call_stmt = StmtNode {
+            node: Stmt::Expr(call),
+            span: dummy_span(),
+        };
+
+        let prog = program(vec![func, call_stmt]);
+        let errors = run_err(prog);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(&e.kind, TypeErrKind::MismatchedTypes { .. })),
+            "Expected MismatchedTypes error, got: {:?}",
+            errors
+        );
     }
 }
