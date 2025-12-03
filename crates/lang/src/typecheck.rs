@@ -353,6 +353,20 @@ impl TypeChecker {
             return;
         }
 
+        // optional values cannot be assigned to non-optional targets once the target is resolved
+        let from_is_optional = from_ty.is_optional();
+        let to_is_optional = to_ty.is_optional();
+        if from_is_optional && !to_is_optional && !contains_infer(&to_ty) {
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::MismatchedTypes {
+                    expected: to_ty.clone(),
+                    found: from_ty.clone(),
+                },
+            });
+            return;
+        }
+
         // if both are arrays, constrain element types
         if let (
             Type::Array {
@@ -619,6 +633,15 @@ fn unify_types(left: &Type, right: &Type, span: Span, errors: &mut Vec<TypeErr>)
         // optional types needs to unify the inner types
         (Optional(l), Optional(r)) => {
             unify_types(l, r, span, errors).map(|inner| Optional(Box::new(inner)))
+        }
+
+        (Optional(inner), other) if !other.is_optional() => {
+            unify_types(inner.as_ref(), other, span, errors)
+                .map(|inner_ty| Optional(Box::new(inner_ty)))
+        }
+        (other, Optional(inner)) if !other.is_optional() => {
+            unify_types(other, inner.as_ref(), span, errors)
+                .map(|inner_ty| Optional(Box::new(inner_ty)))
         }
 
         // function types needs to unify the params and return type
@@ -2722,7 +2745,7 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
                 || is_array_lit_with_list_annotation(&node.value, &resolved_annot);
 
             if should_retag_literal {
-                update_array_literal_type(&node.value, &resolved_annot, type_checker);
+                update_array_literal_typ(&node.value, &resolved_annot, type_checker);
             }
 
             let annot_ref = TypeRef::Concrete(resolved_annot.clone());
@@ -2749,7 +2772,10 @@ fn is_array_literal_with_infer_elem(expr: &ExprNode, value_ty: &Type) -> bool {
         &expr.node.kind,
         ExprKind::ArrayLiteral(_) | ExprKind::ArrayFill(_)
     );
-    let has_infer_elem = matches!(value_ty, Type::Array { elem, .. } if contains_infer(elem));
+    let has_infer_elem = match unwrap_opt_typ(value_ty) {
+        Type::Array { elem, .. } => contains_infer(elem),
+        _ => false,
+    };
     is_array_literal && has_infer_elem
 }
 
@@ -2758,13 +2784,22 @@ fn is_array_lit_with_list_annotation(expr: &ExprNode, annot_ty: &Type) -> bool {
         &expr.node.kind,
         ExprKind::ArrayLiteral(_) | ExprKind::ArrayFill(_)
     );
-    let is_list = matches!(annot_ty, Type::List { .. });
+    let is_list = unwrap_opt_typ(annot_ty).is_list();
     is_array_literal && is_list
 }
 
-fn update_array_literal_type(expr: &ExprNode, annot_ty: &Type, type_checker: &mut TypeChecker) {
+fn unwrap_opt_typ<'a>(ty: &'a Type) -> &'a Type {
+    match ty {
+        Type::Optional(inner) => inner.as_ref(),
+        _ => ty,
+    }
+}
+
+fn update_array_literal_typ(expr: &ExprNode, annot_ty: &Type, type_checker: &mut TypeChecker) {
+    let base_annot = unwrap_opt_typ(annot_ty);
+
     match &expr.node.kind {
-        ExprKind::ArrayLiteral(lit) => match annot_ty {
+        ExprKind::ArrayLiteral(lit) => match base_annot {
             Type::Array { elem, len } => {
                 let new_ty = Type::Array {
                     elem: elem.clone(),
@@ -2784,7 +2819,7 @@ fn update_array_literal_type(expr: &ExprNode, annot_ty: &Type, type_checker: &mu
             }
             _ => {}
         },
-        ExprKind::ArrayFill(fill) => match annot_ty {
+        ExprKind::ArrayFill(fill) => match base_annot {
             Type::Array { elem, len } => {
                 let new_ty = Type::Array {
                     elem: elem.clone(),
@@ -3449,6 +3484,45 @@ mod tests {
     }
 
     #[test]
+    fn test_unify_non_optional_with_optional() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        let result = unify_types(
+            &Type::Int,
+            &Type::Optional(Box::new(Type::Infer)),
+            span,
+            &mut errors,
+        );
+        assert_eq!(result, Some(Type::Optional(Box::new(Type::Int))));
+        assert!(errors.is_empty());
+
+        let result = unify_types(
+            &Type::Optional(Box::new(Type::String)),
+            &Type::String,
+            span,
+            &mut errors,
+        );
+        assert_eq!(result, Some(Type::Optional(Box::new(Type::String))));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_unify_non_optional_with_optional_mismatch() {
+        let span = dummy_span();
+        let mut errors = vec![];
+
+        let result = unify_types(
+            &Type::Int,
+            &Type::Optional(Box::new(Type::String)),
+            span,
+            &mut errors,
+        );
+        assert_eq!(result, None);
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
     fn test_unify_function_types() {
         let span = dummy_span();
         let mut errors = vec![];
@@ -3495,7 +3569,7 @@ mod tests {
             if *expected == Type::Int && *found == Type::Bool
         ));
 
-        // optional vs non-optional produces error
+        // optional vs non-optional now unifies to optional
         errors.clear();
         let result = unify_types(
             &Type::Optional(Box::new(Type::Int)),
@@ -3503,8 +3577,8 @@ mod tests {
             span,
             &mut errors,
         );
-        assert_eq!(result, None);
-        assert_eq!(errors.len(), 1);
+        assert_eq!(result, Some(Type::Optional(Box::new(Type::Int))));
+        assert!(errors.is_empty());
     }
 
     #[test]
@@ -5822,6 +5896,101 @@ mod tests {
                 elem: Type::Optional(Type::Int.boxed()).boxed(),
                 len: ArrayLen::Fixed(2),
             },
+        );
+    }
+
+    #[test]
+    fn test_array_literal_optional_elements_mixed_order() {
+        reset_expr_ids();
+
+        // let a: [int?; _] = [1, nil];
+        let arr_tail_nil = array_literal(vec![lit_int(1), lit_nil()]);
+        let arr_tail_id = get_expr_id(&arr_tail_nil);
+        let annot = Type::Array {
+            elem: Type::Optional(Type::Int.boxed()).boxed(),
+            len: ArrayLen::Infer,
+        };
+        let prog = program(vec![let_binding("a", Some(annot.clone()), arr_tail_nil)]);
+        let tcx_tail = run_ok(prog);
+        assert_expr_type(
+            &tcx_tail,
+            arr_tail_id,
+            Type::Array {
+                elem: Type::Optional(Type::Int.boxed()).boxed(),
+                len: ArrayLen::Fixed(2),
+            },
+        );
+
+        // let b: [int?; _] = [nil, 1];
+        let arr_head_nil = array_literal(vec![lit_nil(), lit_int(1)]);
+        let arr_head_id = get_expr_id(&arr_head_nil);
+        let prog = program(vec![let_binding("b", Some(annot), arr_head_nil)]);
+        let tcx_head = run_ok(prog);
+        assert_expr_type(
+            &tcx_head,
+            arr_head_id,
+            Type::Array {
+                elem: Type::Optional(Type::Int.boxed()).boxed(),
+                len: ArrayLen::Fixed(2),
+            },
+        );
+    }
+
+    #[test]
+    fn test_array_literal_optional_string_elements() {
+        reset_expr_ids();
+
+        // let c: [string?; _] = [nil, "hola", nil];
+        let arr = array_literal(vec![lit_nil(), lit_string("hola"), lit_nil()]);
+        let arr_id = get_expr_id(&arr);
+        let annot = Type::Array {
+            elem: Type::Optional(Type::String.boxed()).boxed(),
+            len: ArrayLen::Infer,
+        };
+        let prog = program(vec![let_binding("c", Some(annot.clone()), arr)]);
+        let tcx_annot = run_ok(prog);
+        assert_expr_type(
+            &tcx_annot,
+            arr_id,
+            Type::Array {
+                elem: Type::Optional(Type::String.boxed()).boxed(),
+                len: ArrayLen::Fixed(3),
+            },
+        );
+
+        // let d = [nil, "hola", nil];
+        let arr_inferred = array_literal(vec![lit_nil(), lit_string("hola"), lit_nil()]);
+        let arr_inferred_id = get_expr_id(&arr_inferred);
+        let prog = program(vec![let_binding("d", None, arr_inferred)]);
+        let tcx_inferred = run_ok(prog);
+        assert_expr_type(
+            &tcx_inferred,
+            arr_inferred_id,
+            Type::Array {
+                elem: Type::Optional(Type::String.boxed()).boxed(),
+                len: ArrayLen::Fixed(3),
+            },
+        );
+    }
+
+    #[test]
+    fn test_array_literal_optional_mixed_error() {
+        reset_expr_ids();
+
+        // let e: [string?; _] = [nil, "hola", 1];
+        let arr = array_literal(vec![lit_nil(), lit_string("hola"), lit_int(1)]);
+        let annot = Type::Array {
+            elem: Type::Optional(Type::String.boxed()).boxed(),
+            len: ArrayLen::Infer,
+        };
+        let prog = program(vec![let_binding("e", Some(annot), arr)]);
+
+        let errors = run_err(prog);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(&e.kind, TypeErrKind::MismatchedTypes { .. })),
+            "expected mismatched types error for incompatible element"
         );
     }
 

@@ -1,4 +1,3 @@
-// @skip: needs fix
 // @mode: check
 // @expect: success
 
@@ -7,14 +6,24 @@ fn main() {
     let maybe_fixed: [int; 3]? = nil;
 
     let inferred_opt: [int?; _] = [1, nil];
+    let inferred_opt_head: [int?; _] = [nil, 1];
     let some_opt: int? = 1;
     let dynamic_opt: [int?] = [nil, some_opt];
     let optional_dynamic: [int]? = [1, 2];
     let nested_chain: [int?]? = dynamic_opt;
+    let optional_from_inferred: [int?; _]? = inferred_opt_head;
+
+    let optional_string_arr: [string?; _] = [nil, "hola", nil];
+    let optional_string_chain: [string?]? = [nil, "hola", nil];
+    let optional_string_alias: [string?; _]? = optional_string_arr;
 
     let alias_fixed: [int; 3]? = fixed_opt;
     let alias_inferred: [int?; _] = inferred_opt;
+    let alias_inferred_head: [int?; _] = inferred_opt_head;
     let alias_dynamic: [int?] = dynamic_opt;
     let alias_optional_dynamic: [int]? = optional_dynamic;
     let alias_nested: [int?]? = nested_chain;
+    let alias_optional_from_inferred: [int?; _]? = optional_from_inferred;
+    let alias_optional_string_chain: [string?]? = optional_string_chain;
+    let alias_optional_string_arr: [string?; _]? = optional_string_arr;
 }

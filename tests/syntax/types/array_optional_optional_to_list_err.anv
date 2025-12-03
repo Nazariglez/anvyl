@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: expected '[int]?', found '[int; 2]?'
+
+fn main() {
+    let optional_array: [int; 2]? = [1, 2];
+    let _bad_optional_list: [int]? = optional_array;
+}
+
