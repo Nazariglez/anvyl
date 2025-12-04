@@ -424,6 +424,7 @@ pub struct Call {
     pub func: Box<ExprNode>,
     pub args: Vec<ExprNode>,
     pub type_args: Vec<Type>,
+    pub safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -491,12 +492,14 @@ pub struct TupleIndex {
 pub struct Index {
     pub target: Box<ExprNode>,
     pub index: Box<ExprNode>,
+    pub safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldAccess {
     pub target: Box<ExprNode>,
     pub field: Ident,
+    pub safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

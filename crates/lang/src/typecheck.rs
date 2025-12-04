@@ -163,6 +163,499 @@ impl TypeChecker {
     }
 }
 
+#[derive(Copy, Clone)]
+enum PostfixNodeRef<'a> {
+    Field {
+        expr_id: ExprId,
+        node: &'a FieldAccessNode,
+    },
+    Index {
+        expr_id: ExprId,
+        node: &'a IndexNode,
+    },
+    Call {
+        expr_id: ExprId,
+        node: &'a CallNode,
+    },
+}
+
+impl<'a> PostfixNodeRef<'a> {
+    fn safe(&self) -> bool {
+        match self {
+            PostfixNodeRef::Field { node, .. } => node.node.safe,
+            PostfixNodeRef::Index { node, .. } => node.node.safe,
+            PostfixNodeRef::Call { node, .. } => node.node.safe,
+        }
+    }
+
+    fn span(&self) -> Span {
+        match self {
+            PostfixNodeRef::Field { node, .. } => node.span,
+            PostfixNodeRef::Index { node, .. } => node.span,
+            PostfixNodeRef::Call { node, .. } => node.span,
+        }
+    }
+
+    fn expr_id(&self) -> ExprId {
+        match self {
+            PostfixNodeRef::Field { expr_id, .. } => *expr_id,
+            PostfixNodeRef::Index { expr_id, .. } => *expr_id,
+            PostfixNodeRef::Call { expr_id, .. } => *expr_id,
+        }
+    }
+}
+
+fn collect_postfix_chain<'a>(expr: &'a ExprNode) -> (&'a ExprNode, Vec<PostfixNodeRef<'a>>) {
+    let mut chain = vec![];
+    let mut current = expr;
+
+    loop {
+        match &current.node.kind {
+            ExprKind::Field(field_node) => {
+                chain.push(PostfixNodeRef::Field {
+                    expr_id: current.node.id,
+                    node: field_node,
+                });
+                current = field_node.node.target.as_ref();
+            }
+            ExprKind::Index(index_node) => {
+                chain.push(PostfixNodeRef::Index {
+                    expr_id: current.node.id,
+                    node: index_node,
+                });
+                current = index_node.node.target.as_ref();
+            }
+            ExprKind::Call(call_node) => {
+                chain.push(PostfixNodeRef::Call {
+                    expr_id: current.node.id,
+                    node: call_node,
+                });
+                current = call_node.node.func.as_ref();
+            }
+            _ => break,
+        }
+    }
+
+    chain.reverse();
+    (current, chain)
+}
+
+fn chain_has_safe_op(chain: &[PostfixNodeRef<'_>]) -> bool {
+    chain.iter().any(|op| op.safe())
+}
+
+fn type_field_on_base(
+    base_ty: &Type,
+    field: Ident,
+    span: Span,
+    type_checker: &TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    match base_ty {
+        Type::NamedTuple(fields) => {
+            for (label, ty) in fields {
+                if *label == field {
+                    return ty.clone();
+                }
+            }
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::NoSuchFieldOnTuple {
+                    field,
+                    tuple_type: base_ty.clone(),
+                },
+            });
+            Type::Infer
+        }
+        Type::Struct {
+            name: struct_name,
+            type_args,
+        } => {
+            let Some(struct_def) = type_checker.get_struct(*struct_name).cloned() else {
+                errors.push(TypeErr {
+                    span,
+                    kind: TypeErrKind::UnknownStruct { name: *struct_name },
+                });
+                return Type::Infer;
+            };
+
+            let subst = struct_def
+                .type_params
+                .iter()
+                .zip(type_args.iter())
+                .map(|(param, arg)| (param.id, arg.clone()))
+                .collect::<HashMap<_, _>>();
+
+            for struct_field in &struct_def.fields {
+                if struct_field.name == field {
+                    let field_ty = subst_type(&struct_field.ty, &subst);
+                    return type_checker.resolve_type(&field_ty);
+                }
+            }
+
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::StructUnknownField {
+                    struct_name: *struct_name,
+                    field,
+                },
+            });
+            Type::Infer
+        }
+        Type::Infer => Type::Infer,
+        _ => {
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::FieldAccessOnNonNamedTuple {
+                    field,
+                    found: base_ty.clone(),
+                },
+            });
+            Type::Infer
+        }
+    }
+}
+
+fn type_index_on_base(
+    base_ty: &Type,
+    index_ty: &Type,
+    span: Span,
+    index_span: Span,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let maybe_int = matches!(index_ty, Type::Int | Type::Infer);
+    if !maybe_int {
+        errors.push(TypeErr {
+            span: index_span,
+            kind: TypeErrKind::IndexNotInt {
+                found: index_ty.clone(),
+            },
+        });
+        return Type::Infer;
+    }
+
+    match indexable_element_type(base_ty) {
+        Some(elem_ty) => elem_ty,
+        None => {
+            errors.push(TypeErr {
+                span,
+                kind: TypeErrKind::IndexOnNonArray {
+                    found: base_ty.clone(),
+                },
+            });
+            Type::Infer
+        }
+    }
+}
+
+fn check_postfix_chain(
+    expr_node: &ExprNode,
+    base: &ExprNode,
+    chain: &[PostfixNodeRef<'_>],
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    let mut current_ty = check_expr(base, type_checker, errors);
+    let mut chain_is_optional = false;
+    let mut i = 0;
+
+    while i < chain.len() {
+        if let Some(method_result) = handle_method_call_if_applicable(
+            chain,
+            i,
+            &current_ty,
+            chain_is_optional,
+            type_checker,
+            errors,
+        ) {
+            match method_result {
+                MethodCallOutcome::Handled {
+                    ty,
+                    chain_optional,
+                    next_index,
+                    call_expr,
+                    call_span,
+                } => {
+                    current_ty = ty;
+                    chain_is_optional = chain_optional;
+                    type_checker.set_type(call_expr, current_ty.clone(), call_span);
+                    i = next_index;
+                    continue;
+                }
+                MethodCallOutcome::Abort => {
+                    type_checker.set_type(expr_node.node.id, Type::Infer, expr_node.span);
+                    return Type::Infer;
+                }
+                MethodCallOutcome::NotMethod => {
+                    // fallthrough normal handling
+                }
+            }
+        }
+
+        let op = &chain[i];
+        let op_safe = op.safe();
+        let mut base_ty = if chain_is_optional {
+            unwrap_opt_typ(&current_ty).clone()
+        } else {
+            current_ty.clone()
+        };
+
+        if op_safe {
+            match &current_ty {
+                Type::Optional(inner) => {
+                    base_ty = (**inner).clone();
+                }
+                _ => {
+                    errors.push(TypeErr {
+                        span: op.span(),
+                        kind: TypeErrKind::OptionalChainingOnNonOpt {
+                            found: current_ty.clone(),
+                        },
+                    });
+                    mark_remaining_ops_infer(chain, i, type_checker);
+                    type_checker.set_type(expr_node.node.id, Type::Infer, expr_node.span);
+                    return Type::Infer;
+                }
+            }
+        }
+
+        let op_result_inner = apply_postfix_op(op, &base_ty, type_checker, errors);
+        if op_safe || chain_is_optional {
+            current_ty = Type::Optional(Box::new(op_result_inner.clone()));
+            chain_is_optional = true;
+        } else {
+            current_ty = op_result_inner.clone();
+        }
+
+        set_op_type(op, current_ty.clone(), type_checker);
+        i += 1;
+    }
+
+    type_checker.set_type(expr_node.node.id, current_ty.clone(), expr_node.span);
+    current_ty
+}
+
+enum MethodCallOutcome {
+    NotMethod,
+    Handled {
+        ty: Type,
+        chain_optional: bool,
+        next_index: usize,
+        call_expr: ExprId,
+        call_span: Span,
+    },
+    Abort,
+}
+
+fn handle_method_call_if_applicable(
+    chain: &[PostfixNodeRef<'_>],
+    index: usize,
+    current_ty: &Type,
+    chain_is_optional: bool,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Option<MethodCallOutcome> {
+    if index + 1 >= chain.len() {
+        return None;
+    }
+
+    let field_op = match chain[index] {
+        PostfixNodeRef::Field { .. } => chain[index],
+        _ => return None,
+    };
+    let call_op = match chain[index + 1] {
+        PostfixNodeRef::Call { .. } => chain[index + 1],
+        _ => return None,
+    };
+
+    let call_node = match call_op {
+        PostfixNodeRef::Call { node, .. } => node,
+        _ => unreachable!(),
+    };
+    let field_node = match field_op {
+        PostfixNodeRef::Field { node, .. } => node,
+        _ => unreachable!(),
+    };
+
+    if call_node.node.func.node.id != field_op.expr_id() {
+        return Some(MethodCallOutcome::NotMethod);
+    }
+
+    let detection_ty = unwrap_opt_typ(current_ty);
+    let struct_info = match &detection_ty {
+        Type::Struct { name, type_args } => Some((*name, type_args.clone())),
+        _ => None,
+    };
+
+    let Some((struct_name, struct_type_args)) = struct_info else {
+        return Some(MethodCallOutcome::NotMethod);
+    };
+
+    let op_safe = field_op.safe() || call_op.safe();
+    if op_safe {
+        let error_span = if field_op.safe() {
+            field_node.span
+        } else {
+            call_op.span()
+        };
+
+        match current_ty {
+            Type::Optional(inner) => {
+                let _ = inner;
+            }
+            _ => {
+                errors.push(TypeErr {
+                    span: error_span,
+                    kind: TypeErrKind::OptionalChainingOnNonOpt {
+                        found: current_ty.clone(),
+                    },
+                });
+                mark_remaining_ops_infer(chain, index, type_checker);
+                return Some(MethodCallOutcome::Abort);
+            }
+        }
+    }
+
+    let Some(struct_def) = type_checker.get_struct(struct_name).cloned() else {
+        errors.push(TypeErr {
+            span: field_node.span,
+            kind: TypeErrKind::UnknownStruct { name: struct_name },
+        });
+        return Some(MethodCallOutcome::Handled {
+            ty: Type::Infer,
+            chain_optional: chain_is_optional || op_safe,
+            next_index: index + 2,
+            call_expr: call_op.expr_id(),
+            call_span: call_op.span(),
+        });
+    };
+
+    let method_ret = check_instance_method_call(
+        call_node,
+        struct_name,
+        field_node.node.field,
+        &struct_type_args,
+        &struct_def,
+        type_checker,
+        errors,
+    );
+
+    let mut result_ty = method_ret;
+    let mut chain_optional = chain_is_optional;
+    if op_safe || chain_is_optional {
+        chain_optional = true;
+        result_ty = Type::Optional(result_ty.boxed());
+    }
+
+    Some(MethodCallOutcome::Handled {
+        ty: result_ty,
+        chain_optional,
+        next_index: index + 2,
+        call_expr: call_op.expr_id(),
+        call_span: call_op.span(),
+    })
+}
+
+fn mark_remaining_ops_infer(
+    chain: &[PostfixNodeRef<'_>],
+    start_idx: usize,
+    type_checker: &mut TypeChecker,
+) {
+    for op in &chain[start_idx..] {
+        set_op_type(op, Type::Infer, type_checker);
+    }
+}
+
+fn set_op_type(op: &PostfixNodeRef<'_>, ty: Type, type_checker: &mut TypeChecker) {
+    type_checker.set_type(op.expr_id(), ty, op.span());
+}
+
+fn apply_postfix_op(
+    op: &PostfixNodeRef<'_>,
+    base_ty: &Type,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    match op {
+        PostfixNodeRef::Field {
+            node: field_node, ..
+        } => type_field_on_base(
+            base_ty,
+            field_node.node.field,
+            field_node.span,
+            type_checker,
+            errors,
+        ),
+        PostfixNodeRef::Index {
+            node: index_node, ..
+        } => {
+            let index_ty = check_expr(&index_node.node.index, type_checker, errors);
+            type_index_on_base(
+                base_ty,
+                &index_ty,
+                index_node.span,
+                index_node.node.index.span,
+                errors,
+            )
+        }
+        PostfixNodeRef::Call {
+            node: call_node, ..
+        } => {
+            // ror calls we need to check arguments and compute return type
+            type_call_on_base(base_ty, call_node, type_checker, errors)
+        }
+    }
+}
+
+fn type_call_on_base(
+    base_ty: &Type,
+    call_node: &CallNode,
+    type_checker: &mut TypeChecker,
+    errors: &mut Vec<TypeErr>,
+) -> Type {
+    // check each argument
+    for arg in &call_node.node.args {
+        check_expr(arg, type_checker, errors);
+    }
+
+    let Type::Func { params, ret } = base_ty else {
+        if matches!(base_ty, Type::Infer) {
+            return Type::Infer;
+        }
+        errors.push(TypeErr {
+            span: call_node.span,
+            kind: TypeErrKind::NotAFunction {
+                expr_type: base_ty.clone(),
+            },
+        });
+        return Type::Infer;
+    };
+
+    // check argument count
+    if call_node.node.args.len() != params.len() {
+        errors.push(TypeErr {
+            span: call_node.span,
+            kind: TypeErrKind::MismatchedTypes {
+                expected: base_ty.clone(),
+                found: Type::Func {
+                    params: vec![Type::Infer; call_node.node.args.len()],
+                    ret: Box::new(Type::Infer),
+                },
+            },
+        });
+        return Type::Infer;
+    }
+
+    // constrain argument types
+    for (arg_expr, param_ty) in call_node.node.args.iter().zip(params.iter()) {
+        let arg_ref = TypeRef::Expr(arg_expr.node.id);
+        let param_ref = TypeRef::Concrete(param_ty.clone());
+        type_checker.constrain_assignable(arg_expr.span, arg_ref, param_ref, errors);
+    }
+
+    (**ret).clone()
+}
+
 impl TypeChecker {
     fn get_struct(&self, name: Ident) -> Option<&StructDef> {
         self.struct_defs.get(&name)
@@ -540,6 +1033,9 @@ pub enum TypeErrKind {
         found: Type,
     },
     IndexNotInt {
+        found: Type,
+    },
+    OptionalChainingOnNonOpt {
         found: Type,
     },
 }
@@ -1348,6 +1844,17 @@ fn check_expr(
     type_checker: &mut TypeChecker,
     errors: &mut Vec<TypeErr>,
 ) -> Type {
+    // for postfix expressions (field, index, call) check if there is optional chaining
+    if matches!(
+        expr_node.node.kind,
+        ExprKind::Field(_) | ExprKind::Index(_) | ExprKind::Call(_)
+    ) {
+        let (base, chain) = collect_postfix_chain(expr_node);
+        if chain_has_safe_op(&chain) {
+            return check_postfix_chain(expr_node, base, &chain, type_checker, errors);
+        }
+    }
+
     let expr = &expr_node.node;
     let ty = match &expr.kind {
         ExprKind::Ident(ident) => match type_checker.get_var(*ident) {
@@ -2498,33 +3005,64 @@ fn check_if(if_node: &IfNode, type_checker: &mut TypeChecker, errors: &mut Vec<T
         });
     }
 
-    let (then_ty, _) = check_block_expr(&node.then_block, type_checker, errors);
+    let (then_ty, then_expr_id) = check_block_expr(&node.then_block, type_checker, errors);
 
     // if there is no else block then the type is void and this must be a statment
     let Some(else_block) = &node.else_block else {
         return Type::Void;
     };
 
-    let (else_ty, _) = check_block_expr(else_block, type_checker, errors);
+    let (else_ty, else_expr_id) = check_block_expr(else_block, type_checker, errors);
 
     // unify branch types
-    let same_branch_ty = then_ty == else_ty;
-    if !same_branch_ty {
-        let is_unifiable = then_ty.is_infer() || else_ty.is_infer();
-        if !is_unifiable {
-            errors.push(TypeErr {
-                span: if_node.span,
-                kind: TypeErrKind::MismatchedTypes {
-                    expected: then_ty.clone(),
-                    found: else_ty.clone(),
-                },
-            });
-            return Type::Infer;
-        }
+    let same_ty = then_ty == else_ty;
+    if same_ty {
+        return then_ty;
     }
 
-    // return the type of the branch that is not inferred
-    if then_ty.is_infer() { else_ty } else { then_ty }
+    // handle T vs Infer? case where one branch is nil
+    let then_is_nil = is_optional_with_infer(&then_ty);
+    let else_is_nil = is_optional_with_infer(&else_ty);
+
+    if !then_ty.is_optional() && else_is_nil {
+        let result_ty = Type::Optional(then_ty.boxed());
+        if let Some(id) = else_expr_id {
+            type_checker.set_type(id, result_ty.clone(), else_block.span);
+        }
+        return result_ty;
+    }
+
+    if !else_ty.is_optional() && then_is_nil {
+        let result_ty = Type::Optional(else_ty.boxed());
+        if let Some(id) = then_expr_id {
+            type_checker.set_type(id, result_ty.clone(), node.then_block.span);
+        }
+        return result_ty;
+    }
+
+    // check if unifiable
+    let is_unifiable = contains_infer(&then_ty) || contains_infer(&else_ty);
+    if !is_unifiable {
+        errors.push(TypeErr {
+            span: if_node.span,
+            kind: TypeErrKind::MismatchedTypes {
+                expected: then_ty.clone(),
+                found: else_ty.clone(),
+            },
+        });
+        return Type::Infer;
+    }
+
+    // return the type of the branch that doesn't contain infer
+    if contains_infer(&then_ty) {
+        else_ty
+    } else {
+        then_ty
+    }
+}
+
+fn is_optional_with_infer(ty: &Type) -> bool {
+    matches!(ty, Type::Optional(inner) if inner.as_ref().is_infer())
 }
 
 fn check_tuple(
@@ -2802,6 +3340,7 @@ fn check_binding(binding: &BindingNode, type_checker: &mut TypeChecker, errors: 
     let binding_ty = match &node.ty {
         Some(annot_ty) => {
             let resolved_annot = resolve_array_infer_annotation(annot_ty, &value_ty);
+            let resolved_annot = type_checker.resolve_type(&resolved_annot);
 
             let should_retag_literal = is_array_literal_with_infer_elem(&node.value, &value_ty)
                 || is_array_lit_with_list_annotation(&node.value, &resolved_annot);
@@ -3232,6 +3771,7 @@ mod tests {
                         func: Box::new(func),
                         args,
                         type_args: vec![],
+                        safe: false,
                     },
                     span: dummy_span(),
                 }),
@@ -5409,6 +5949,7 @@ mod tests {
                         func: Box::new(func),
                         args,
                         type_args,
+                        safe: false,
                     },
                     span: dummy_span(),
                 }),
@@ -5769,6 +6310,7 @@ mod tests {
                     node: Index {
                         target: Box::new(target),
                         index: Box::new(index),
+                        safe: false,
                     },
                     span: dummy_span(),
                 }),

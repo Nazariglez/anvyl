@@ -940,10 +940,17 @@ enum PostfixOp {
     Call {
         type_args: Vec<ast::Type>,
         args: Vec<ast::ExprNode>,
+        safe: bool,
     },
-    Field(ast::Ident),
+    Field {
+        ident: ast::Ident,
+        safe: bool,
+    },
     TupleIndices(Vec<u32>),
-    Index(ast::ExprNode),
+    Index {
+        expr: ast::ExprNode,
+        safe: bool,
+    },
 }
 
 fn postfix_expr<'src>(
@@ -952,7 +959,20 @@ fn postfix_expr<'src>(
 ) -> BoxedParser<'src, ast::ExprNode> {
     let call_suffix = call_type_args()
         .then(fn_call_args(expr.clone()))
-        .map(|(type_args, args)| PostfixOp::Call { type_args, args });
+        .map(|(type_args, args)| PostfixOp::Call {
+            type_args,
+            args,
+            safe: false,
+        });
+
+    let safe_call_suffix = select! { (Token::Question, _) => () }
+        .ignore_then(call_type_args())
+        .then(fn_call_args(expr.clone()))
+        .map(|(type_args, args)| PostfixOp::Call {
+            type_args,
+            args,
+            safe: true,
+        });
 
     let single_index = select! {
         (Token::Dot, _) => (),
@@ -978,22 +998,42 @@ fn postfix_expr<'src>(
             .map_err(|_| Rich::custom(span, "invalid tuple index"))
     });
 
+    let safe_field_access = select! { (Token::Question, _) => () }
+        .ignore_then(select! { (Token::Dot, _) => () })
+        .ignore_then(identifier())
+        .map(|ident| PostfixOp::Field { ident, safe: true });
+
     let field_access = select! {
         (Token::Dot, _) => (),
     }
     .ignore_then(identifier())
-    .map(PostfixOp::Field);
+    .map(|ident| PostfixOp::Field { ident, safe: false });
+
+    let safe_index_suffix = select! { (Token::Question, _) => () }
+        .ignore_then(select! { (Token::Open(Delimiter::Bracket), _) => () })
+        .ignore_then(expr.clone())
+        .then_ignore(select! { (Token::Close(Delimiter::Bracket), _) => () })
+        .map(|index_expr| PostfixOp::Index {
+            expr: index_expr,
+            safe: true,
+        });
 
     let index_suffix = select! { (Token::Open(Delimiter::Bracket), _) => () }
         .ignore_then(expr)
         .then_ignore(select! { (Token::Close(Delimiter::Bracket), _) => () })
-        .map(PostfixOp::Index);
+        .map(|index_expr| PostfixOp::Index {
+            expr: index_expr,
+            safe: false,
+        });
 
     let postfix_op = choice((
+        safe_call_suffix,
         call_suffix,
+        safe_index_suffix,
         index_suffix,
         chained_index,
         single_index,
+        safe_field_access,
         field_access,
     ));
 
@@ -1002,7 +1042,11 @@ fn postfix_expr<'src>(
         let span = Span::new(s.start, s.end);
 
         match op {
-            PostfixOp::Call { type_args, args } => {
+            PostfixOp::Call {
+                type_args,
+                args,
+                safe,
+            } => {
                 let start = target.span.start;
                 let end = args.last().map(|a| a.span.end).unwrap_or(target.span.end);
                 let call_span = Span::new(start, end);
@@ -1012,6 +1056,7 @@ fn postfix_expr<'src>(
                         func: Box::new(target),
                         args,
                         type_args,
+                        safe,
                     },
                     call_span,
                 );
@@ -1037,11 +1082,12 @@ fn postfix_expr<'src>(
                 }
                 current
             }
-            PostfixOp::Field(field) => {
+            PostfixOp::Field { ident: field, safe } => {
                 let field_node = Spanned::new(
                     ast::FieldAccess {
                         target: Box::new(target),
                         field,
+                        safe,
                     },
                     span,
                 );
@@ -1050,7 +1096,10 @@ fn postfix_expr<'src>(
                 let expr = ast::Expr::new(ast::ExprKind::Field(field_node), expr_id);
                 Spanned::new(expr, span)
             }
-            PostfixOp::Index(index_expr) => {
+            PostfixOp::Index {
+                expr: index_expr,
+                safe,
+            } => {
                 let start = target.span.start;
                 let end = span.end;
                 let index_span = Span::new(start, end);
@@ -1059,6 +1108,7 @@ fn postfix_expr<'src>(
                     ast::Index {
                         target: Box::new(target),
                         index: Box::new(index_expr),
+                        safe,
                     },
                     index_span,
                 );
@@ -1354,10 +1404,20 @@ fn type_ident_inner<'src>(allow_view: bool) -> BoxedParser<'src, ast::Type> {
 
         let paren_type = paren_or_tuple_type(type_parser.clone());
 
+        let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
+        let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+        let comma = select! { (Token::Comma, _) => () };
+        let arrow = select! { (Token::Op(Op::ThinArrow), _) => () };
         let open_bracket = select! { (Token::Open(Delimiter::Bracket), _) => () };
         let close_bracket = select! { (Token::Close(Delimiter::Bracket), _) => () };
         let semicolon = select! { (Token::Semicolon, _) => () };
         let colon = select! { (Token::Colon, _) => () };
+
+        let param_type_parser: BoxedParser<'src, ast::Type> = if allow_view {
+            type_parser.clone().boxed()
+        } else {
+            param_type_ident()
+        };
 
         let array_len_fixed =
             select! { (Token::Literal(LitToken::Number(n)), _) => ast::ArrayLen::Fixed(n as usize) };
@@ -1416,7 +1476,28 @@ fn type_ident_inner<'src>(allow_view: bool) -> BoxedParser<'src, ast::Type> {
 
         let bracketed_type = choice((view_type, choice((array_type, choice((map_type, list_type))))));
 
-        let primary_type = choice((builtin_typ, type_name_ref, paren_type, bracketed_type));
+        let fn_type = select! { (Token::Keyword(Keyword::Fn), _) => () }
+            .ignore_then(
+                open_paren
+                    .clone()
+                    .ignore_then(
+                        param_type_parser
+                            .separated_by(comma.clone())
+                            .allow_trailing()
+                            .collect::<Vec<_>>()
+                            .or_not()
+                            .map(|opt| opt.unwrap_or_default()),
+                    )
+                    .then_ignore(close_paren.clone()),
+            )
+            .then_ignore(arrow.clone())
+            .then(type_parser.clone())
+            .map(|(params, ret)| ast::Type::Func {
+                params,
+                ret: ret.boxed(),
+            });
+
+        let primary_type = choice((builtin_typ, type_name_ref, paren_type, bracketed_type, fn_type));
         let optional_suffix = select! { (Token::Question, _) => TypeSuffix::Optional };
         let type_suffix = optional_suffix;
 
@@ -1886,6 +1967,7 @@ fn lvalue_expr<'src>() -> BoxedParser<'src, ast::ExprNode> {
             ast::FieldAccess {
                 target: Box::new(target),
                 field,
+                safe: false,
             },
             span,
         );
@@ -2015,6 +2097,58 @@ mod tests {
                 assert_eq!(v, &value, "expected int literal {value}");
             }
             other => panic!("expected int literal {value}, found {other:?}"),
+        }
+    }
+
+    fn expect_field<'a>(expr: &'a ast::ExprNode, name: &str, safe: bool) -> &'a ast::ExprNode {
+        match &expr.node.kind {
+            ast::ExprKind::Field(field_node) => {
+                let node = field_node.node();
+                assert_eq!(node.field.0.as_ref(), name, "expected field '{name}'");
+                assert_eq!(
+                    node.safe, safe,
+                    "expected field '{name}' safe={safe}, found {}",
+                    node.safe
+                );
+                node.target.as_ref()
+            }
+            other => panic!("expected field access '{name}', found {other:?}"),
+        }
+    }
+
+    fn expect_index<'a>(
+        expr: &'a ast::ExprNode,
+        safe: bool,
+    ) -> (&'a ast::ExprNode, &'a ast::ExprNode) {
+        match &expr.node.kind {
+            ast::ExprKind::Index(index_node) => {
+                let node = index_node.node();
+                assert_eq!(
+                    node.safe, safe,
+                    "expected index safe={safe}, found {}",
+                    node.safe
+                );
+                (node.target.as_ref(), node.index.as_ref())
+            }
+            other => panic!("expected index expr, found {other:?}"),
+        }
+    }
+
+    fn expect_call<'a>(
+        expr: &'a ast::ExprNode,
+        safe: bool,
+    ) -> (&'a ast::ExprNode, &'a [ast::ExprNode]) {
+        match &expr.node.kind {
+            ast::ExprKind::Call(call_node) => {
+                let node = call_node.node();
+                assert_eq!(
+                    node.safe, safe,
+                    "expected call safe={safe}, found {}",
+                    node.safe
+                );
+                (node.func.as_ref(), node.args.as_slice())
+            }
+            other => panic!("expected call expr, found {other:?}"),
         }
     }
 
@@ -2196,6 +2330,75 @@ mod tests {
         expect_ident(add_left, "a");
         expect_ident(add_right, "b");
         expect_ident(range_end, "c");
+    }
+
+    #[test]
+    fn optional_field_flags() {
+        let expr = parse_expr("foo?.bar");
+        let target = expect_field(&expr, "bar", true);
+        expect_ident(target, "foo");
+    }
+
+    #[test]
+    fn optional_field_chain_mixed() {
+        let expr = parse_expr("foo?.bar.baz");
+        let first = expect_field(&expr, "baz", false);
+        let base = expect_field(first, "bar", true);
+        expect_ident(base, "foo");
+
+        let expr = parse_expr("foo.bar?.baz");
+        let first = expect_field(&expr, "baz", true);
+        let base = expect_field(first, "bar", false);
+        expect_ident(base, "foo");
+    }
+
+    #[test]
+    fn optional_index_and_field_mix() {
+        let expr = parse_expr("arr?[0]");
+        let (target, index_expr) = expect_index(&expr, true);
+        expect_ident(target, "arr");
+        expect_int(index_expr, 0);
+
+        let expr = parse_expr("arr?[i].field");
+        let field_target = expect_field(&expr, "field", false);
+        let (target, index_expr) = expect_index(field_target, true);
+        expect_ident(target, "arr");
+        expect_ident(index_expr, "i");
+    }
+
+    #[test]
+    fn optional_map_index() {
+        let expr = parse_expr(r#"map?["key"]"#);
+        let (target, index_expr) = expect_index(&expr, true);
+        expect_ident(target, "map");
+        match &index_expr.node.kind {
+            ast::ExprKind::Lit(ast::Lit::String(s)) => assert_eq!(s, "key"),
+            other => panic!("expected string literal key, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_call_suffix() {
+        let expr = parse_expr("foo?()");
+        let (target, args) = expect_call(&expr, true);
+        expect_ident(target, "foo");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn optional_chain_precedence_with_coalesce() {
+        let expr = parse_expr("foo?.bar ?? default");
+        let (left, right) = expect_binary(&expr, ast::BinaryOp::Coalesce);
+        expect_ident(right, "default");
+        let field_target = expect_field(left, "bar", true);
+        expect_ident(field_target, "foo");
+
+        let expr = parse_expr("foo?.bar?.baz ?? y");
+        let (left, right) = expect_binary(&expr, ast::BinaryOp::Coalesce);
+        expect_ident(right, "y");
+        let baz_target = expect_field(left, "baz", true);
+        let bar_target = expect_field(baz_target, "bar", true);
+        expect_ident(bar_target, "foo");
     }
 
     fn parse_program(src: &str) -> ast::Program {
@@ -2491,6 +2694,33 @@ mod tests {
                 assert_eq!(*value, ast::Type::Int);
             }
             other => panic!("expected map type, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_type_parses() {
+        let ty = parse_type("fn(int, string) -> bool");
+        match ty {
+            ast::Type::Func { params, ret } => {
+                assert_eq!(params, vec![ast::Type::Int, ast::Type::String]);
+                assert_eq!(*ret, ast::Type::Bool);
+            }
+            other => panic!("expected function type, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_function_type_parses() {
+        let ty = parse_type("(fn(float) -> int)?");
+        match ty {
+            ast::Type::Optional(inner) => match *inner {
+                ast::Type::Func { params, ret } => {
+                    assert_eq!(params, vec![ast::Type::Float]);
+                    assert_eq!(*ret, ast::Type::Int);
+                }
+                other => panic!("expected function type inside optional, found {other:?}"),
+            },
+            other => panic!("expected optional function type, found {other:?}"),
         }
     }
 

@@ -243,6 +243,12 @@ pub fn report_typecheck_errors(
                 "index must be an integer".to_string(),
                 format!("expected 'int', found '{found}'"),
             ),
+            TypeErrKind::OptionalChainingOnNonOpt { found } => (
+                "optional chaining requires an optional base type".to_string(),
+                format!(
+                    "found '{found}', which is not optional; remove the '?' or make the base type optional"
+                ),
+            ),
         };
 
         emit_report(src, file_path, byte_range, title, body);
