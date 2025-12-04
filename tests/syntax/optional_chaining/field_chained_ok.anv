@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+struct Stats {
+    hp: int,
+}
+
+struct Player {
+    stats: Stats,
+}
+
+fn main() {
+    let p: Player? = Player { stats: Stats { hp: 100 } };
+    let hp: int? = p?.stats.hp;
+}
+

@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+
+fn inc(x: int) -> int { x + 1 }
+fn dec(x: int) -> int { x - 1 }
+
+fn main() {
+    let pick_high = true;
+    let maybe_fn:(fn(int) -> int)? = if pick_high { inc } else { nil };
+    let value: int = maybe_fn?(10) ?? 0;
+
+    let pick_low = false;
+    let other_fn:(fn(int) -> int)? = if pick_low { dec } else { nil };
+    let fallback: int = other_fn?(5) ?? 99;
+}

@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+
+struct Counter {
+    value: int,
+
+    fn inc(self) -> int {
+        self.value + 1
+    }
+}
+
+fn main() {
+    let counter: Counter? = Counter { value: 10 };
+    let bumped: int? = counter?.inc();
+    let ensured: int = counter?.inc() ?? 0;
+
+    let missing: Counter? = nil;
+    let defaulted: int = missing?.inc() ?? 5;
+}

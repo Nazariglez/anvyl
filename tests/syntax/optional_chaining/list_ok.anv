@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let list: [string]? = ["a", "b", "c"];
+    let v: string? = list?[1];
+    let w: string = list?[2] ?? "default";
+}
+

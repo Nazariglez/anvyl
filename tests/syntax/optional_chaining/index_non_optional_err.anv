@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: optional chaining requires an optional base type
+
+fn main() {
+    let arr: [int; 3] = [1, 2, 3];
+    let v: int? = arr?[0];
+}
+

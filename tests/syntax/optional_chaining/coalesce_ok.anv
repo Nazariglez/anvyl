@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+
+struct Player {
+    score: int,
+}
+
+fn main() {
+    let p: Player? = Player { score: 100 };
+    let s: int = p?.score ?? 0;
+}
+

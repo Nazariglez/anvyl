@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+
+struct Data {
+    items: [int; 3],
+}
+
+fn main() {
+    let d: Data? = Data { items: [10, 20, 30] };
+    let v: int? = d?.items[1];
+}
+
