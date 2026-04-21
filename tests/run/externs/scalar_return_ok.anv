@@ -1,0 +1,9 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> extern_runtime
+
+extern fn answer() -> int;
+
+fn main() -> int {
+    answer()
+}

@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> dataref_var_param
+// @match: 1
+
+dataref Box {
+    value: int,
+}
+
+fn retarget(var b: Box) {
+    b = Box { value: 10 };
+    b.value = 1;
+}
+
+fn main() {
+    var b = Box { value: 5 };
+    retarget(b);
+    println(b.value);
+}

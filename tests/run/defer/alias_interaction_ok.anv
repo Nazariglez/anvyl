@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> defer_alias
+// @match: 42
+
+fn main() {
+    var opt: int? = 10;
+    if let Option.Some(var n) = opt {
+        defer { n = 42; }
+    }
+
+    if let Option.Some(v) = opt {
+        println(v);
+    }
+}

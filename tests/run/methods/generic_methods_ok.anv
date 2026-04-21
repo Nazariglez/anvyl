@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> generic_methods
+// @match-begin
+// 42
+// hi
+// ok
+// 7
+// @match-end
+
+struct Foo {
+    fn make<T>(x: T) -> T {
+        x
+    }
+
+    fn pair<A, B>(self, a: A, b: B) -> B {
+        b
+    }
+}
+
+fn main() {
+    let f = Foo {};
+    println(Foo.make<int>(42));
+    println(Foo.make("hi"));
+    println(f.pair<int, string>(1, "ok"));
+    println(f.pair("x", 7));
+}

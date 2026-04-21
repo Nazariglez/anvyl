@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> dataref_var_param
+// @match-begin
+// 0
+// 5
+// @match-end
+
+dataref Player {
+    hp: int,
+    mp: int,
+}
+
+fn zero(var x: int) {
+    x = 0;
+}
+
+fn tune(var p: Player) {
+    zero(p.hp);
+    p.mp = p.hp + 5;
+}
+
+fn main() {
+    var p = Player { hp: 8, mp: 1 };
+    tune(p);
+    println(p.hp);
+    println(p.mp);
+}

@@ -1,0 +1,11 @@
+[package]
+name = "anvyx-backend"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anvyx-frontend = { path = "../frontend" }
+anvyx-runtime = { path = "../runtime" }
+
+[lints]
+workspace = true

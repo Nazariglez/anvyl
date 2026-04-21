@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @skip: todo -> trailing_comma_params
+
+struct Counter {
+    value: int,
+
+    fn set(var self, next: int,) {
+        self.value = next;
+    }
+}
+
+fn main() {
+    var counter = Counter { value: 0 };
+    counter.set(1);
+}

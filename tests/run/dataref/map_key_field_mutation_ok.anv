@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> dataref_map_alias
+// @match-begin
+// .Some(10)
+// .Some(10)
+// .None<int>
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn main() {
+    var a = Node { value: 1 };
+    var alias = a;
+    var m: [Node: int] = [:];
+    m[a] = 10;
+    alias.value = 99;
+    println(m[a]);
+    println(m[alias]);
+    let c = Node { value: 99 };
+    println(m[c]);
+}

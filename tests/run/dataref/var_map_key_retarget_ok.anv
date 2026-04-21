@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> dataref_var_param
+// @match: 99
+
+dataref Registry {
+    counts: [string: int],
+}
+
+fn retarget(var r: Registry) {
+    r.counts = ["hp": 10];
+    r.counts["hp"] = 99;
+}
+
+fn main() {
+    var r = Registry { counts: ["hp": 1] };
+    retarget(r);
+    if let Option.Some(hp) = r.counts["hp"] {
+        println(hp);
+    }
+}

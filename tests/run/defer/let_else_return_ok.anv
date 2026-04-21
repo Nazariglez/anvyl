@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> defer_let_else
+// @match-begin
+// cleanup
+// 0
+// cleanup
+// 5
+// @match-end
+
+fn read(opt: int?) -> int {
+    defer println("cleanup");
+    let value? = opt else { return 0; }
+    value
+}
+
+fn main() {
+    println(read(nil));
+    println(read(5));
+}

@@ -1,0 +1,31 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> var_param_rotate
+// @match-begin
+// 2
+// 3
+// 4
+// 5
+// 1
+// @match-end
+
+struct Five { a: int, b: int, c: int, d: int, e: int }
+
+fn rotate5(var a: int, var b: int, var c: int, var d: int, var e: int) {
+    let tmp = a;
+    a = b;
+    b = c;
+    c = d;
+    d = e;
+    e = tmp;
+}
+
+fn main() {
+    var five = Five { a: 1, b: 2, c: 3, d: 4, e: 5 };
+    rotate5(five.a, five.b, five.c, five.d, five.e);
+    println(five.a);
+    println(five.b);
+    println(five.c);
+    println(five.d);
+    println(five.e);
+}

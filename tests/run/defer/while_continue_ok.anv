@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> defer_while_continue
+// @match-begin
+// 1
+// iter-done
+// iter-done
+// 3
+// iter-done
+// iter-done
+// @match-end
+
+fn main() {
+    var i = 0;
+    while i < 4 {
+        defer println("iter-done");
+        i += 1;
+        if i % 2 == 0 { continue; }
+        println(i);
+    }
+}

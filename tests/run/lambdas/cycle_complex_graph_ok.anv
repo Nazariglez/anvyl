@@ -1,0 +1,82 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> lambda_cycle_complex
+// @match: ok
+
+enum Wrapper {
+    Empty,
+    Holds(Node),
+}
+
+dataref Node {
+    callback: fn() -> void,
+    callbacks: [fn() -> void],
+    links: [string: Node?],
+    next: Node?,
+    child: Wrapper,
+}
+
+fn noop() {}
+
+fn make_complex_cycles() {
+    var init_callbacks: [fn() -> void] = [noop];
+    var a = Node {
+        callback: noop,
+        callbacks: init_callbacks,
+        links: [:],
+        next: nil,
+        child: Wrapper.Empty,
+    };
+    var init_callbacks: [fn() -> void] = [noop];
+    var b = Node {
+        callback: noop,
+        callbacks: init_callbacks,
+        links: [:],
+        next: nil,
+        child: Wrapper.Empty,
+    };
+    var init_callbacks: [fn() -> void] = [noop];
+    var c = Node {
+        callback: noop,
+        callbacks: init_callbacks,
+        links: [:],
+        next: nil,
+        child: Wrapper.Empty,
+    };
+
+    a.callback = || { b.callback(); };
+    b.callback = || { c.callback(); };
+    c.callback = || { a.callback(); };
+
+    var a_callbacks: [fn() -> void] = [];
+    a_callbacks.push(|| { b.callback(); });
+    var b_callbacks: [fn() -> void] = [];
+    b_callbacks.push(|| { c.callbacks[0](); });
+    var c_callbacks: [fn() -> void] = [];
+    c_callbacks.push(|| { a.callback(); });
+
+    a.callbacks = a_callbacks;
+    b.callbacks = b_callbacks;
+    c.callbacks = c_callbacks;
+
+    a.links["peer"] = b;
+    b.links["peer"] = c;
+    c.links["peer"] = a;
+
+    a.next = b;
+    b.next = c;
+    c.next = a;
+
+    a.child = Wrapper.Holds(c);
+    b.child = Wrapper.Holds(a);
+    c.child = Wrapper.Holds(b);
+}
+
+fn main() {
+    var i = 0;
+    while i < 1000 {
+        make_complex_cycles();
+        i = i + 1;
+    }
+    println("ok");
+}

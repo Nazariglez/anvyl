@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> module_generic_import
+// @match-begin
+// 8
+// 10
+// @match-end
+
+import tools;
+import tools { duplicate as dup };
+
+fn main() {
+    println(dup(4));
+    println(tools.duplicate(5));
+}

@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> extern_runtime
+
+extern type Counter {
+    init;
+    value: int;
+}
+
+struct Holder {
+    counter: Counter,
+}
+
+fn main() -> int {
+    var holder = Holder { counter: Counter { value: 1 } };
+    holder.counter.value = 7;
+    holder.counter.value
+}

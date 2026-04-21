@@ -1,0 +1,29 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> var_param_rotate
+// @match-begin
+// 2
+// 3
+// 1
+// @match-end
+
+struct Pair { x: int, y: int }
+struct Root { a: Pair, b: Pair }
+
+fn shift(var x: int, var y: int, var z: int) {
+    let old = x;
+    x = y;
+    y = z;
+    z = old;
+}
+
+fn main() {
+    var root = Root {
+        a: Pair { x: 1, y: 2 },
+        b: Pair { x: 3, y: 4 },
+    };
+    shift(root.a.x, root.a.y, root.b.x);
+    println(root.a.x);
+    println(root.a.y);
+    println(root.b.x);
+}

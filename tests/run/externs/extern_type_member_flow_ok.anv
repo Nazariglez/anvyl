@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> extern_runtime
+
+extern type Counter {
+    init;
+    value: int;
+    fn plus(self, delta: int) -> int;
+}
+
+fn main() -> int {
+    let counter = Counter { value: 1 };
+    counter.plus(2)
+}

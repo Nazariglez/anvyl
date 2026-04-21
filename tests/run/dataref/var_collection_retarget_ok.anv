@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> dataref_var_param
+// @match: [1]
+
+dataref State {
+    items: [int],
+}
+
+fn replace_and_push(var s: State) {
+    var next: [int] = [];
+    s.items = next;
+    s.items.push(1);
+}
+
+fn main() {
+    var initial: [int] = [7];
+    var s = State { items: initial };
+    replace_and_push(s);
+    println(s.items);
+}

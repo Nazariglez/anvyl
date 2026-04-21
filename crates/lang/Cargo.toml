@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anvyx-frontend = { path = "../frontend" }
+anvyx-backend = { path = "../backend" }
+anvyx-runtime = { path = "../runtime" }
 fd-lock = "4.0"
 chumsky = "0.11.2"
 ariadne = "0.6.0"
@@ -12,7 +15,6 @@ internment = "0.8.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anvyx-macros = { path = "../macros" }
-anvyx-runtime = { path = "../runtime" }
 
 [lints]
 workspace = true

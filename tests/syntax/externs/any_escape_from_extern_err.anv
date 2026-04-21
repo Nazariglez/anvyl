@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @skip: todo -> any_type_escape
+// @contains: cannot escape into ordinary user values
+
+extern fn identity(v: any) -> any;
+
+fn main() {
+    let x = identity(42);
+}

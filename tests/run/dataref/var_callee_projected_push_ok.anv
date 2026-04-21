@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> dataref_var_param
+// @match: [1, 5]
+
+dataref Player {
+    hp: int,
+    items: [int],
+}
+
+fn bump(var p: Player) {
+    p.items.push(p.hp);
+}
+
+fn main() {
+    var items: [int] = [1];
+    var p = Player { hp: 5, items: items };
+    bump(p);
+    println(p.items);
+}

@@ -1,0 +1,7 @@
+// @helper
+
+pub fn add(a: int, b: int = 10) -> int { a + b }
+
+pub fn greet(name: string, prefix: string = "hi ") -> string {
+    f"{prefix}{name}"
+}

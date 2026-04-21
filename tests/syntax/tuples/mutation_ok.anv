@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @skip: todo -> tuple_mutation
+
+fn bump(var x: int) {
+    x += 10;
+}
+
+fn main() {
+    var pair = (1, 2);
+    bump(pair.0);
+    pair.1 += 20;
+}

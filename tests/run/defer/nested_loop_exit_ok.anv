@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> defer_nested_loop
+// @match-begin
+// inner 0:1
+// inner 0:1
+// between
+// outer 0
+// @match-end
+
+fn main() {
+    var i = 0;
+    while i < 2 {
+        defer println(f"outer {i}");
+        var j = 0;
+        while j < 2 {
+            defer println(f"inner {i}:{j}");
+            if j == 0 {
+                j = j + 1;
+                continue;
+            }
+            break;
+        }
+        println("between");
+        break;
+    }
+}

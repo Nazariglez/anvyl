@@ -1,0 +1,34 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> dataref_var_param
+// @match: 7
+
+struct L4 { value: int }
+struct L3 { l4: L4 }
+struct L2 { l3: L3 }
+struct L1 { l2: L2 }
+struct L0 { l1: L1 }
+
+dataref Root {
+    l0: L0,
+}
+
+fn set_to_seven(var x: int) {
+    x = 7;
+}
+
+fn main() {
+    var root = Root {
+        l0: L0 {
+            l1: L1 {
+                l2: L2 {
+                    l3: L3 {
+                        l4: L4 { value: 1 },
+                    },
+                },
+            },
+        },
+    };
+    set_to_seven(root.l0.l1.l2.l3.l4.value);
+    println(root.l0.l1.l2.l3.l4.value);
+}

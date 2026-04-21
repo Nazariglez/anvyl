@@ -1,0 +1,35 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> let_else_forms
+// @match-begin
+// 42
+// 0
+// 42
+// 42
+// 2
+// @match-end
+
+fn process(opt: int?) -> int {
+    let Option.Some(x) = opt else { return 0; }
+    x
+}
+
+fn main() {
+    println(process(42));
+    println(process(nil));
+
+    let opt: int? = 42;
+    while true {
+        let Option.Some(x) = opt else { break; }
+        println(x);
+        break;
+    }
+
+    let n = 42;
+    let 42 = n else { return; }
+    println(n);
+
+    let t = (1, 2);
+    let (1, y) = t else { return; }
+    println(y);
+}

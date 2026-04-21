@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> extern_runtime
+
+struct Point { x: int, y: int }
+
+extern fn sum_points(a: Point, b: Point) -> int;
+extern fn transform_point(p: Point, cb: fn(Point) -> int) -> int;
+
+fn main() -> int {
+    let origin = Point { x: 3, y: 4 };
+    let other = Point { x: 1, y: 2 };
+    let s = sum_points(origin, other);
+    let t = transform_point(origin, |p| p.x * p.x + p.y * p.y);
+    s + t
+}

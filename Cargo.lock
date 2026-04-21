@@ -86,6 +86,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvyx-backend"
+version = "0.1.0"
+dependencies = [
+ "anvyx-frontend",
+ "anvyx-runtime",
+]
+
+[[package]]
 name = "anvyx-core"
 version = "0.1.0"
 dependencies = [
@@ -102,9 +110,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvyx-frontend"
+version = "0.1.0"
+
+[[package]]
 name = "anvyx-lang"
 version = "0.1.0"
 dependencies = [
+ "anvyx-backend",
+ "anvyx-frontend",
  "anvyx-macros",
  "anvyx-runtime",
  "ariadne",
