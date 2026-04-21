@@ -1226,6 +1226,7 @@ fn cast_from_decl<'src>(
 pub(super) fn extend_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::ExtendDeclNode> {
+    #[allow(clippy::large_enum_variant)]
     enum ExtendMember {
         Method(ast::ExtendMethodNode),
         CastFrom(ast::CastFromNode),

@@ -1510,10 +1510,8 @@ pub(super) fn extend_base_key(ty: &Type) -> Option<Ident> {
 
 fn collect_undeclared_type_param_names(ty: &Type, declared: &[TypeParam], out: &mut Vec<Ident>) {
     match ty {
-        Type::UnresolvedName(name) => {
-            if !declared.iter().any(|tp| tp.name == *name) {
-                out.push(*name);
-            }
+        Type::UnresolvedName(name) if !declared.iter().any(|tp| tp.name == *name) => {
+            out.push(*name);
         }
         Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
             collect_undeclared_type_param_names(elem, declared, out);

@@ -24,7 +24,7 @@ fn test_call_happy_path() {
     let prog = program(vec![fn_def, expr_stmt(call_expr_node)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::String);
+    assert_expr_type(&tcx, call_id, &Type::String);
 }
 
 #[test]
@@ -106,8 +106,7 @@ fn test_call_argument_type_mismatch() {
             if (*expected == Type::Int && *found == Type::String) ||
                (*expected == Type::String && *found == Type::Int)
         )),
-        "Expected MismatchedTypes error (int/string mismatch), got: {:?}",
-        errors
+        "Expected MismatchedTypes error (int/string mismatch), got: {errors:?}"
     );
 }
 
@@ -133,7 +132,7 @@ fn test_function_call_through_variable() {
     let prog = program(vec![fn_def, g_binding, expr_stmt(call_expr_node)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }
 
 // ---- generic function tests ----
@@ -169,7 +168,7 @@ fn test_template_generic_add_with_int_ok() {
 
     let prog = program(vec![add_fn, binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }
 
 #[test]
@@ -203,7 +202,7 @@ fn test_template_generic_add_with_float_ok() {
 
     let prog = program(vec![add_fn, binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Float);
+    assert_expr_type(&tcx, call_id, &Type::Float);
 }
 
 #[test]
@@ -244,8 +243,7 @@ fn test_template_generic_add_with_bool_err() {
             DiagnosticKind::InvalidOperand { op, operand_type }
             if op == "+" && *operand_type == Type::Bool
         )),
-        "Expected InvalidOperand error, got: {:?}",
-        errors
+        "Expected InvalidOperand error, got: {errors:?}"
     );
 }
 
@@ -284,7 +282,7 @@ fn test_template_generic_explicit_type_args_ok() {
 
     let prog = program(vec![add_fn, binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }
 
 #[test]
@@ -328,8 +326,7 @@ fn test_template_generic_explicit_type_args_bool_err() {
             DiagnosticKind::InvalidOperand { op, operand_type }
             if op == "+" && *operand_type == Type::Bool
         )),
-        "Expected InvalidOperand error, got: {:?}",
-        errors
+        "Expected InvalidOperand error, got: {errors:?}"
     );
 }
 
@@ -370,8 +367,8 @@ fn test_template_generic_specialization_cache() {
     let prog = program(vec![add_fn, binding1, binding2]);
     let tcx = run_ok(prog);
 
-    assert_expr_type(&tcx, call1_id, Type::Int);
-    assert_expr_type(&tcx, call2_id, Type::Int);
+    assert_expr_type(&tcx, call1_id, &Type::Int);
+    assert_expr_type(&tcx, call2_id, &Type::Int);
 }
 
 #[test]
@@ -412,9 +409,9 @@ fn test_template_generic_multiple_instantiations() {
     let tcx = run_ok(prog);
 
     // first call should have type int
-    assert_expr_type(&tcx, call1_id, Type::Int);
+    assert_expr_type(&tcx, call1_id, &Type::Int);
     // second call should have type float
-    assert_expr_type(&tcx, call2_id, Type::Float);
+    assert_expr_type(&tcx, call2_id, &Type::Float);
 }
 
 #[test]
@@ -451,9 +448,9 @@ fn test_template_generic_identity_ok() {
     let tcx = run_ok(prog);
 
     // first call should have type int
-    assert_expr_type(&tcx, call1_id, Type::Int);
+    assert_expr_type(&tcx, call1_id, &Type::Int);
     // second call should have type bool
-    assert_expr_type(&tcx, call2_id, Type::Bool);
+    assert_expr_type(&tcx, call2_id, &Type::Bool);
 }
 
 #[test]
@@ -464,7 +461,7 @@ fn test_println_builtin_ok() {
     let call_id = get_expr_id(&call);
     let prog = program(vec![expr_stmt(call)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Void);
+    assert_expr_type(&tcx, call_id, &Type::Void);
 }
 
 #[test]
@@ -474,7 +471,7 @@ fn test_println_builtin_int_ok() {
     let call_id = get_expr_id(&call);
     let prog = program(vec![expr_stmt(call)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Void);
+    assert_expr_type(&tcx, call_id, &Type::Void);
 }
 
 #[test]
@@ -484,5 +481,5 @@ fn test_println_builtin_bool_ok() {
     let call_id = get_expr_id(&call);
     let prog = program(vec![expr_stmt(call)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Void);
+    assert_expr_type(&tcx, call_id, &Type::Void);
 }

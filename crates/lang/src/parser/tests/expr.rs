@@ -393,11 +393,11 @@ fn string_interp_single_var_parses() {
     assert_eq!(parts.len(), 2);
     match &parts[0] {
         ast::StringPart::Text(s) => assert_eq!(s, "HP: "),
-        other => panic!("expected Text, found {other:?}"),
+        other @ ast::StringPart::Expr(..) => panic!("expected Text, found {other:?}"),
     }
     match &parts[1] {
         ast::StringPart::Expr(e, _) => expect_ident(e, "hp"),
-        other => panic!("expected Expr, found {other:?}"),
+        other @ ast::StringPart::Text(_) => panic!("expected Expr, found {other:?}"),
     }
 }
 
@@ -408,7 +408,7 @@ fn string_interp_expression_parses() {
     assert_eq!(parts.len(), 3);
     match &parts[0] {
         ast::StringPart::Text(s) => assert_eq!(s, "a "),
-        other => panic!("expected Text, found {other:?}"),
+        other @ ast::StringPart::Expr(..) => panic!("expected Text, found {other:?}"),
     }
     match &parts[1] {
         ast::StringPart::Expr(e, _) => {
@@ -416,11 +416,11 @@ fn string_interp_expression_parses() {
             expect_ident(left, "x");
             expect_ident(right, "y");
         }
-        other => panic!("expected Expr, found {other:?}"),
+        other @ ast::StringPart::Text(_) => panic!("expected Expr, found {other:?}"),
     }
     match &parts[2] {
         ast::StringPart::Text(s) => assert_eq!(s, " b"),
-        other => panic!("expected Text, found {other:?}"),
+        other @ ast::StringPart::Expr(..) => panic!("expected Text, found {other:?}"),
     }
 }
 
@@ -431,15 +431,15 @@ fn string_interp_multiple_exprs_parses() {
     assert_eq!(parts.len(), 3);
     match &parts[0] {
         ast::StringPart::Expr(e, _) => expect_ident(e, "a"),
-        other => panic!("expected Expr, found {other:?}"),
+        other @ ast::StringPart::Text(_) => panic!("expected Expr, found {other:?}"),
     }
     match &parts[1] {
         ast::StringPart::Text(s) => assert_eq!(s, " and "),
-        other => panic!("expected Text, found {other:?}"),
+        other @ ast::StringPart::Expr(..) => panic!("expected Text, found {other:?}"),
     }
     match &parts[2] {
         ast::StringPart::Expr(e, _) => expect_ident(e, "b"),
-        other => panic!("expected Expr, found {other:?}"),
+        other @ ast::StringPart::Text(_) => panic!("expected Expr, found {other:?}"),
     }
 }
 
@@ -450,7 +450,7 @@ fn string_interp_only_expr_parses() {
     assert_eq!(parts.len(), 1);
     match &parts[0] {
         ast::StringPart::Expr(e, _) => expect_ident(e, "x"),
-        other => panic!("expected Expr, found {other:?}"),
+        other @ ast::StringPart::Text(_) => panic!("expected Expr, found {other:?}"),
     }
 }
 
@@ -603,9 +603,9 @@ fn cast_int_to_float_parses() {
 
 #[test]
 fn cast_float_to_int_parses() {
-    let expr = parse_expr("3.14 as int");
+    let expr = parse_expr("1.5 as int");
     let (inner, target) = expect_cast(&expr);
-    expect_float(inner, 3.14);
+    expect_float(inner, 1.5);
     assert_eq!(*target, ast::Type::Int);
 }
 

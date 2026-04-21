@@ -604,8 +604,14 @@ mod tests {
 
     #[test]
     fn expr_float() {
-        let expr = Expr::new(Type::Float, dummy_span(), ExprKind::Float(3.14_f32));
-        assert!(matches!(expr.kind, ExprKind::Float(v) if (v - 3.14_f32).abs() < f32::EPSILON));
+        let expr = Expr::new(
+            Type::Float,
+            dummy_span(),
+            ExprKind::Float(std::f32::consts::PI),
+        );
+        assert!(
+            matches!(expr.kind, ExprKind::Float(v) if (v - std::f32::consts::PI).abs() < f32::EPSILON)
+        );
     }
 
     #[test]

@@ -1224,7 +1224,7 @@ mod tests {
         let compiled = compile(&prog(func), Profile::default()).unwrap();
         let chunk = &compiled.chunks[0];
         assert!(
-            chunk.code.iter().any(|op| *op == Op::UnwrapOptional),
+            chunk.code.contains(&Op::UnwrapOptional),
             "expected UnwrapOptional opcode"
         );
     }
@@ -1380,8 +1380,8 @@ mod tests {
         let chunk = &compiled.chunks[0];
         // After SetLocal(0) for scrutinee_init:
         // GetLocal(1), GetEnumVariant, Constant(idx), Eq, JumpIfFalse, Jump(end), [else], Return
-        let has_get_enum_variant = chunk.code.iter().any(|op| *op == Op::GetEnumVariant);
-        let has_eq = chunk.code.iter().any(|op| *op == Op::Eq);
+        let has_get_enum_variant = chunk.code.contains(&Op::GetEnumVariant);
+        let has_eq = chunk.code.contains(&Op::Eq);
         assert!(has_get_enum_variant, "expected GetEnumVariant opcode");
         assert!(has_eq, "expected Eq opcode");
     }
@@ -1536,8 +1536,8 @@ mod tests {
         };
         let compiled = compile(&prog(func), Profile::default()).unwrap();
         let chunk = &compiled.chunks[0];
-        let has_get_local = chunk.code.iter().any(|op| *op == Op::CloneLocal(0));
-        let has_index_get = chunk.code.iter().any(|op| *op == Op::IndexGet);
+        let has_get_local = chunk.code.contains(&Op::CloneLocal(0));
+        let has_index_get = chunk.code.contains(&Op::IndexGet);
         assert!(has_get_local, "expected CloneLocal(0)");
         assert!(has_index_get, "expected IndexGet");
     }
@@ -1565,9 +1565,9 @@ mod tests {
         };
         let compiled = compile(&prog(func), Profile::default()).unwrap();
         let chunk = &compiled.chunks[0];
-        let has_get_local = chunk.code.iter().any(|op| *op == Op::GetLocal(0));
-        let has_index_set = chunk.code.iter().any(|op| *op == Op::IndexSet);
-        let has_set_local = chunk.code.iter().any(|op| *op == Op::SetLocal(0));
+        let has_get_local = chunk.code.contains(&Op::GetLocal(0));
+        let has_index_set = chunk.code.contains(&Op::IndexSet);
+        let has_set_local = chunk.code.contains(&Op::SetLocal(0));
         assert!(has_get_local, "expected GetLocal(0)");
         assert!(has_index_set, "expected IndexSet");
         assert!(has_set_local, "expected SetLocal(0)");

@@ -294,16 +294,19 @@ pub enum Type {
 
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
-        use Type::*;
+        use Type::{
+            Any, Array, Bool, DataRef, Double, Enum, Extern, Float, Func, Infer, Int, List, Map,
+            NamedTuple, Slice, String, Struct, Tuple, UnresolvedName, Var, Void,
+        };
         match (self, other) {
-            (Infer, Infer) => true,
-            (Any, Any) => true,
-            (Int, Int) => true,
-            (Float, Float) => true,
-            (Double, Double) => true,
-            (Bool, Bool) => true,
-            (String, String) => true,
-            (Void, Void) => true,
+            (Infer, Infer)
+            | (Any, Any)
+            | (Int, Int)
+            | (Float, Float)
+            | (Double, Double)
+            | (Bool, Bool)
+            | (String, String)
+            | (Void, Void) => true,
             (
                 Func {
                     params: p1,
@@ -354,10 +357,9 @@ impl PartialEq for Type {
                     ..
                 },
             ) => n1 == n2 && t1 == t2,
-            (List { elem: a }, List { elem: b }) => a == b,
+            (List { elem: a }, List { elem: b }) | (Slice { elem: a }, Slice { elem: b }) => a == b,
             (Array { elem: e1, len: l1 }, Array { elem: e2, len: l2 }) => e1 == e2 && l1 == l2,
             (Map { key: k1, value: v1 }, Map { key: k2, value: v2 }) => k1 == k2 && v1 == v2,
-            (Slice { elem: a }, Slice { elem: b }) => a == b,
             (Extern { name: n1, .. }, Extern { name: n2, .. }) => n1 == n2,
             _ => false,
         }
@@ -589,7 +591,10 @@ impl Type {
 
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use Type::*;
+        use Type::{
+            Any, Array, Bool, DataRef, Double, Enum, Extern, Float, Func, Infer, Int, List, Map,
+            NamedTuple, Slice, String, Struct, Tuple, UnresolvedName, Var, Void,
+        };
         match self {
             Int => write!(f, "int"),
             Float => write!(f, "float"),

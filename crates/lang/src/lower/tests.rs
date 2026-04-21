@@ -612,7 +612,7 @@ fn lowers_map_literal() {
 
 #[test]
 fn lowers_empty_map_literal() {
-    let prog = lower_ok(r#"fn main() { let x: [string: int] = [:]; }"#);
+    let prog = lower_ok(r"fn main() { let x: [string: int] = [:]; }");
     let main = find_main(&prog);
     let init = &main.body.stmts[0];
     match &init.kind {

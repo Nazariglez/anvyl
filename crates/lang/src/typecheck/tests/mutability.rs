@@ -25,8 +25,7 @@ fn test_let_assign_ident_err() {
             &e.kind,
             DiagnosticKind::ImmutableAssignment { name } if name == &dummy_ident("x")
         )),
-        "expected ImmutableAssignment for x, got: {:?}",
-        errors
+        "expected ImmutableAssignment for x, got: {errors:?}"
     );
 }
 
@@ -61,8 +60,7 @@ fn test_let_compound_assign_err() {
             &e.kind,
             DiagnosticKind::ImmutableAssignment { name } if name == &dummy_ident("x")
         )),
-        "expected ImmutableAssignment for x, got: {:?}",
-        errors
+        "expected ImmutableAssignment for x, got: {errors:?}"
     );
 }
 
@@ -105,8 +103,7 @@ fn test_let_field_assign_err() {
             &e.kind,
             DiagnosticKind::ImmutableAssignment { name } if name == &dummy_ident("p")
         )),
-        "expected ImmutableAssignment for p, got: {:?}",
-        errors
+        "expected ImmutableAssignment for p, got: {errors:?}"
     );
 }
 
@@ -154,8 +151,7 @@ fn test_readonly_param_assign_err() {
             &e.kind,
             DiagnosticKind::ImmutableAssignment { name } if name == &dummy_ident("x")
         )),
-        "expected ImmutableAssignment for x, got: {:?}",
-        errors
+        "expected ImmutableAssignment for x, got: {errors:?}"
     );
 }
 
@@ -212,8 +208,7 @@ fn test_var_param_let_arg_err() {
             DiagnosticKind::VarParamImmutableBinding { param, binding }
                 if param == &dummy_ident("x") && binding == &dummy_ident("n")
         )),
-        "expected VarParamImmutableBinding for x/n, got: {:?}",
-        errors
+        "expected VarParamImmutableBinding for x/n, got: {errors:?}"
     );
 }
 
@@ -233,17 +228,16 @@ fn test_var_param_literal_err() {
             &e.kind,
             DiagnosticKind::VarParamNotLvalue { param } if param == &dummy_ident("x")
         )),
-        "expected VarParamNotLvalue for x, got: {:?}",
-        errors
+        "expected VarParamNotLvalue for x, got: {errors:?}"
     );
 }
 
 #[test]
 fn test_var_param_expr_err() {
-    reset_expr_ids();
-    // fn f(var x: int) {} var a = 1; f(a + 1);
     use super::helpers::binary_expr;
     use crate::ast::BinaryOp;
+    reset_expr_ids();
+    // fn f(var x: int) {} var a = 1; f(a + 1);
 
     let fn_def = fn_decl_var_params("f", vec![("x", Type::Int, true)], Type::Void, vec![]);
     let add_expr = binary_expr(ident_expr("a"), BinaryOp::Add, lit_int(1));
@@ -259,8 +253,7 @@ fn test_var_param_expr_err() {
             &e.kind,
             DiagnosticKind::VarParamNotLvalue { param } if param == &dummy_ident("x")
         )),
-        "expected VarParamNotLvalue for x, got: {:?}",
-        errors
+        "expected VarParamNotLvalue for x, got: {errors:?}"
     );
 }
 
@@ -268,13 +261,13 @@ fn test_var_param_expr_err() {
 
 #[test]
 fn test_readonly_self_mutation_err() {
+    use super::helpers::return_stmt;
     reset_expr_ids();
     // struct Counter { value: int
     //   fn get(self) -> int { self.value = 10; return self.value; }
     // }
     // let c = Counter { value: 0 };
     // c.get();
-    use super::helpers::return_stmt;
 
     let get_body = vec![
         expr_stmt(assign_expr(
@@ -308,21 +301,20 @@ fn test_readonly_self_mutation_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::ReadonlySelfMutation { .. })),
-        "expected ReadonlySelfMutation, got: {:?}",
-        errors
+        "expected ReadonlySelfMutation, got: {errors:?}"
     );
 }
 
 #[test]
 fn test_var_self_mutation_ok() {
+    use super::helpers::binary_expr;
+    use crate::ast::BinaryOp;
     reset_expr_ids();
     // struct Counter { value: int
     //   fn increment(var self) { self.value = self.value + 1; }
     // }
     // var c = Counter { value: 0 };
     // c.increment();
-    use super::helpers::binary_expr;
-    use crate::ast::BinaryOp;
 
     let increment_body = vec![expr_stmt(assign_expr(
         field_expr(ident_expr("self"), "value"),
@@ -357,14 +349,14 @@ fn test_var_self_mutation_ok() {
 
 #[test]
 fn test_var_self_on_let_binding_err() {
+    use super::helpers::binary_expr;
+    use crate::ast::BinaryOp;
     reset_expr_ids();
     // struct Counter { value: int
     //   fn increment(var self) { self.value = self.value + 1; }
     // }
     // let c = Counter { value: 0 };
     // c.increment();   -- should fail: c is immutable
-    use super::helpers::binary_expr;
-    use crate::ast::BinaryOp;
 
     let increment_body = vec![expr_stmt(assign_expr(
         field_expr(ident_expr("self"), "value"),
@@ -399,21 +391,20 @@ fn test_var_self_on_let_binding_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MutatingMethodOnImmutable { .. })),
-        "expected MutatingMethodOnImmutable, got: {:?}",
-        errors
+        "expected MutatingMethodOnImmutable, got: {errors:?}"
     );
 }
 
 #[test]
 fn test_var_self_on_var_binding_ok() {
+    use super::helpers::binary_expr;
+    use crate::ast::BinaryOp;
     reset_expr_ids();
     // struct Counter { value: int
     //   fn increment(var self) { self.value = self.value + 1; }
     // }
     // var c = Counter { value: 0 };
     // c.increment();   -- ok: c is mutable
-    use super::helpers::binary_expr;
-    use crate::ast::BinaryOp;
 
     let increment_body = vec![expr_stmt(assign_expr(
         field_expr(ident_expr("self"), "value"),

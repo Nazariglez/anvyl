@@ -353,7 +353,7 @@ impl fmt::Display for Value {
                     }
                 } else {
                     let mut entries: Vec<_> = m.iter().collect();
-                    entries.sort_by(|(a, _), (b, _)| a.to_string().cmp(&b.to_string()));
+                    entries.sort_by_key(|(a, _)| a.to_string());
                     for (i, (k, v)) in entries.iter().enumerate() {
                         if i > 0 {
                             write!(f, ", ")?;
@@ -716,13 +716,16 @@ mod tests {
 
     #[test]
     fn display_float() {
-        assert_eq!(Value::Float(3.14_f32).to_string(), "3.14");
+        assert_eq!(Value::Float(std::f32::consts::PI).to_string(), "3.1415927");
         assert_eq!(Value::Float(42.0_f32).to_string(), "42.0");
     }
 
     #[test]
     fn display_double() {
-        assert_eq!(Value::Double(3.14).to_string(), "3.14");
+        assert_eq!(
+            Value::Double(std::f64::consts::PI).to_string(),
+            "3.141592653589793"
+        );
         assert_eq!(Value::Double(42.0).to_string(), "42.0");
     }
 
@@ -1252,7 +1255,7 @@ mod tests {
     #[test]
     fn extern_handle_data_drop_calls_cleanup() {
         use std::cell::Cell;
-        thread_local! { static CLEANED: Cell<u64> = Cell::new(0); }
+        thread_local! { static CLEANED: Cell<u64> = const { Cell::new(0) }; }
         fn cleanup(id: u64) {
             CLEANED.with(|c| c.set(id));
         }
@@ -1270,7 +1273,7 @@ mod tests {
     #[test]
     fn extern_handle_data_shared_drop_once() {
         use std::cell::Cell;
-        thread_local! { static COUNT: Cell<u32> = Cell::new(0); }
+        thread_local! { static COUNT: Cell<u32> = const { Cell::new(0) }; }
         fn cleanup(_id: u64) {
             COUNT.with(|c| c.set(c.get() + 1));
         }
@@ -1291,7 +1294,7 @@ mod tests {
     #[test]
     fn extern_handle_in_list_cleanup_on_drop() {
         use std::cell::Cell;
-        thread_local! { static CLEANED: Cell<u32> = Cell::new(0); }
+        thread_local! { static CLEANED: Cell<u32> = const { Cell::new(0) }; }
         fn cleanup(_id: u64) {
             CLEANED.with(|c| c.set(c.get() + 1));
         }

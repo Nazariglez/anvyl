@@ -4,10 +4,10 @@ use crate::ast;
 #[test]
 fn doc_on_func() {
     let prog = parse_program(
-        r#"
+        r"
         /// A function.
         fn foo() {}
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
@@ -19,10 +19,10 @@ fn doc_on_func() {
 #[test]
 fn doc_on_struct() {
     let prog = parse_program(
-        r#"
+        r"
         /// A struct.
         struct S { x: int }
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Aggregate(struct_node) = &prog.stmts[0].node else {
@@ -59,10 +59,10 @@ fn doc_on_struct_method() {
 #[test]
 fn doc_on_enum() {
     let prog = parse_program(
-        r#"
+        r"
         /// An enum.
         enum E { V }
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Enum(enum_node) = &prog.stmts[0].node else {
@@ -116,10 +116,10 @@ fn doc_on_enum_variant_struct() {
 #[test]
 fn doc_on_const() {
     let prog = parse_program(
-        r#"
+        r"
         /// A constant.
         const N: int = 1;
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Const(const_node) = &prog.stmts[0].node else {
@@ -131,10 +131,10 @@ fn doc_on_const() {
 #[test]
 fn doc_on_extern_fn() {
     let prog = parse_program(
-        r#"
+        r"
         /// An extern function.
         extern fn f();
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::ExternFunc(extern_fn_node) = &prog.stmts[0].node else {
@@ -149,10 +149,10 @@ fn doc_on_extern_fn() {
 #[test]
 fn doc_on_extern_type() {
     let prog = parse_program(
-        r#"
+        r"
         /// An extern type.
         extern type T;
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::ExternType(extern_type_node) = &prog.stmts[0].node else {
@@ -227,11 +227,11 @@ fn doc_on_extend_method() {
 #[test]
 fn doc_multiline() {
     let prog = parse_program(
-        r#"
+        r"
         /// Line 1.
         /// Line 2.
         fn f() {}
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
@@ -243,12 +243,12 @@ fn doc_multiline() {
 #[test]
 fn doc_multiline_with_empty() {
     let prog = parse_program(
-        r#"
+        r"
         /// Line 1.
         ///
         /// Line 3.
         fn f() {}
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
@@ -270,10 +270,10 @@ fn doc_absent() {
 #[test]
 fn four_slashes_not_doc() {
     let prog = parse_program(
-        r#"
+        r"
         //// not a doc comment
         fn f() {}
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
@@ -285,11 +285,11 @@ fn four_slashes_not_doc() {
 #[test]
 fn blank_line_does_not_break_doc() {
     let prog = parse_program(
-        r#"
+        r"
         /// A doc.
 
         fn f() {}
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
@@ -302,11 +302,11 @@ fn blank_line_does_not_break_doc() {
 #[test]
 fn regular_comment_does_not_break_doc() {
     let prog = parse_program(
-        r#"
+        r"
         /// A doc.
         // regular comment
         fn f() {}
-        "#,
+        ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {

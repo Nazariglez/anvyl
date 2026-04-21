@@ -67,10 +67,10 @@ pub(super) fn parse_param_type(src: &str) -> ast::Type {
         .unwrap_or_else(|errs| panic!("failed to parse param type '{src}': {errs:?}"))
 }
 
-pub(super) fn expect_binary<'a>(
-    expr: &'a ast::ExprNode,
+pub(super) fn expect_binary(
+    expr: &ast::ExprNode,
     op: ast::BinaryOp,
-) -> (&'a ast::ExprNode, &'a ast::ExprNode) {
+) -> (&ast::ExprNode, &ast::ExprNode) {
     match &expr.node().kind {
         ast::ExprKind::Binary(bin_node) => {
             let binary = bin_node.node();
@@ -85,10 +85,10 @@ pub(super) fn expect_binary<'a>(
     }
 }
 
-pub(super) fn expect_range<'a>(
-    expr: &'a ast::ExprNode,
+pub(super) fn expect_range(
+    expr: &ast::ExprNode,
     inclusive: bool,
-) -> (&'a ast::ExprNode, &'a ast::ExprNode) {
+) -> (&ast::ExprNode, &ast::ExprNode) {
     match &expr.node().kind {
         ast::ExprKind::Range(range_node) => {
             let ast::Range::Bounded {
@@ -136,7 +136,7 @@ pub(super) fn expect_float(expr: &ast::ExprNode, value: f64) {
     }
 }
 
-pub(super) fn expect_unary<'a>(expr: &'a ast::ExprNode, op: ast::UnaryOp) -> &'a ast::ExprNode {
+pub(super) fn expect_unary(expr: &ast::ExprNode, op: ast::UnaryOp) -> &ast::ExprNode {
     match &expr.node.kind {
         ast::ExprKind::Unary(node) => {
             assert_eq!(node.node.op, op, "expected unary op {op:?}");
@@ -166,10 +166,7 @@ pub(super) fn expect_field<'a>(
     }
 }
 
-pub(super) fn expect_index<'a>(
-    expr: &'a ast::ExprNode,
-    safe: bool,
-) -> (&'a ast::ExprNode, &'a ast::ExprNode) {
+pub(super) fn expect_index(expr: &ast::ExprNode, safe: bool) -> (&ast::ExprNode, &ast::ExprNode) {
     match &expr.node.kind {
         ast::ExprKind::Index(index_node) => {
             let node = index_node.node();
@@ -184,10 +181,7 @@ pub(super) fn expect_index<'a>(
     }
 }
 
-pub(super) fn expect_call<'a>(
-    expr: &'a ast::ExprNode,
-    safe: bool,
-) -> (&'a ast::ExprNode, &'a [ast::ExprNode]) {
+pub(super) fn expect_call(expr: &ast::ExprNode, safe: bool) -> (&ast::ExprNode, &[ast::ExprNode]) {
     match &expr.node.kind {
         ast::ExprKind::Call(call_node) => {
             let node = call_node.node();
@@ -239,7 +233,7 @@ pub(super) fn expect_string_interp(expr: &ast::ExprNode) -> &[ast::StringPart] {
     }
 }
 
-pub(super) fn expect_cast<'a>(expr: &'a ast::ExprNode) -> (&'a ast::ExprNode, &'a ast::Type) {
+pub(super) fn expect_cast(expr: &ast::ExprNode) -> (&ast::ExprNode, &ast::Type) {
     match &expr.node.kind {
         ast::ExprKind::Cast(node) => (node.node.expr.as_ref(), &node.node.target),
         other => panic!("expected Cast, found {other:?}"),

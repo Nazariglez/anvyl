@@ -39,7 +39,7 @@ fn test_constrain_list_passthrough_ok() {
 
     let prog = program(vec![get_ints, a_binding, b_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, list_int);
+    assert_expr_type(&tcx, call_id, &list_int);
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn test_constrain_list_annotation_then_assign_ok() {
 
     let prog = program(vec![a_binding, b_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, b_id, list_int);
+    assert_expr_type(&tcx, b_id, &list_int);
 }
 
 #[test]
@@ -95,8 +95,7 @@ fn test_constrain_list_type_mismatch_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }
 
@@ -128,7 +127,7 @@ fn test_constrain_map_infer_flows_to_annotated() {
 
     let prog = program(vec![make_map, binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, map_ty);
+    assert_expr_type(&tcx, call_id, &map_ty);
 }
 
 #[test]
@@ -164,8 +163,7 @@ fn test_constrain_map_type_mismatch_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }
 
@@ -200,7 +198,7 @@ fn test_constrain_struct_passthrough_ok() {
 
     let prog = program(vec![point_decl, make_point, binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, point_ty);
+    assert_expr_type(&tcx, call_id, &point_ty);
 }
 
 #[test]
@@ -246,8 +244,7 @@ fn test_constrain_generic_struct_name_mismatch_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }
 
@@ -273,7 +270,7 @@ fn test_constrain_list_literal_annotated_binding() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::List {
+        &Type::List {
             elem: Type::String.boxed(),
         },
     );
@@ -300,7 +297,7 @@ fn test_constrain_map_literal_annotated_binding() {
     assert_expr_type(
         &tcx,
         map_id,
-        Type::Map {
+        &Type::Map {
             key: Type::Int.boxed(),
             value: Type::String.boxed(),
         },
@@ -336,8 +333,7 @@ fn test_generic_method_type_param_shadows_struct_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MethodTypeParamShadowsStruct { .. })),
-        "Expected MethodTypeParamShadowsStruct, got: {:?}",
-        errors
+        "Expected MethodTypeParamShadowsStruct, got: {errors:?}"
     );
     let _ = struct_t_id; // used indirectly via type_param
 }
@@ -414,7 +410,7 @@ fn test_generic_method_call_on_non_generic_struct() {
 
     let prog = program(vec![foo_decl, f_binding, result_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }
 
 #[test]
@@ -457,7 +453,7 @@ fn test_generic_method_call_on_generic_struct() {
 
     let prog = program(vec![wrapper_decl, w_binding, result_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::String);
+    assert_expr_type(&tcx, call_id, &Type::String);
 }
 
 #[test]
@@ -490,7 +486,7 @@ fn test_generic_method_call_explicit_type_args() {
 
     let prog = program(vec![foo_decl, f_binding, result_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }
 
 #[test]
@@ -526,8 +522,7 @@ fn test_generic_method_call_explicit_type_arg_arity_mismatch() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::GenericArgNumMismatch { .. })),
-        "Expected GenericArgNumMismatch, got: {:?}",
-        errors
+        "Expected GenericArgNumMismatch, got: {errors:?}"
     );
 }
 
@@ -555,7 +550,7 @@ fn test_static_generic_method_inferred() {
 
     let prog = program(vec![foo_decl, result_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }
 
 #[test]
@@ -595,7 +590,7 @@ fn test_static_generic_method_on_generic_struct_inferred() {
 
     let prog = program(vec![wrapper_decl, result_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::String);
+    assert_expr_type(&tcx, call_id, &Type::String);
 }
 
 #[test]
@@ -628,7 +623,7 @@ fn test_generic_method_multiple_type_params() {
 
     let prog = program(vec![foo_decl, f_binding, result_binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::String);
+    assert_expr_type(&tcx, call_id, &Type::String);
 }
 
 #[test]
@@ -683,7 +678,7 @@ fn test_generic_method_returns_struct_instantiation() {
         type_args: vec![Type::String],
         origin: None,
     };
-    assert_expr_type(&tcx, call_id, expected);
+    assert_expr_type(&tcx, call_id, &expected);
 }
 
 #[test]
@@ -741,7 +736,7 @@ fn test_constrain_list_inferred_elem_from_annotation() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::List {
+        &Type::List {
             elem: Type::Int.boxed(),
         },
     );
@@ -777,8 +772,7 @@ fn test_constrain_list_inferred_elem_mismatch_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }
 
@@ -803,7 +797,7 @@ fn test_constrain_map_inferred_key_value_from_annotation() {
     assert_expr_type(
         &tcx,
         map_id,
-        Type::Map {
+        &Type::Map {
             key: Type::String.boxed(),
             value: Type::Int.boxed(),
         },
@@ -845,8 +839,7 @@ fn test_constrain_map_inferred_value_mismatch_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }
 
@@ -886,7 +879,7 @@ fn test_constrain_generic_struct_type_arg_inferred_from_annotation() {
 
     let prog = program(vec![wrapper_decl, make_fn, binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, wrapper_int);
+    assert_expr_type(&tcx, call_id, &wrapper_int);
 }
 
 #[test]
@@ -935,8 +928,7 @@ fn test_constrain_generic_struct_type_arg_mismatch_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }
 
@@ -1044,7 +1036,6 @@ fn test_constrain_generic_enum_type_arg_mismatch_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }

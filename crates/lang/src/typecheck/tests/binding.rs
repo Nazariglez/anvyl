@@ -18,7 +18,7 @@ fn test_binding_annotated_success() {
     let prog = program(vec![let_binding("x", Some(Type::Int), value_expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, value_id, Type::Int);
+    assert_expr_type(&tcx, value_id, &Type::Int);
 }
 
 #[test]
@@ -38,8 +38,7 @@ fn test_binding_annotated_mismatch() {
             if (*expected == Type::Int && *found == Type::Bool) ||
                (*expected == Type::Bool && *found == Type::Int)
         )),
-        "Expected MismatchedTypes error (int/bool mismatch), got: {:?}",
-        errors
+        "Expected MismatchedTypes error (int/bool mismatch), got: {errors:?}"
     );
 }
 
@@ -53,7 +52,7 @@ fn test_binding_unannotated_simple_inference() {
     let prog = program(vec![let_binding("x", None, value_expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, value_id, Type::Int);
+    assert_expr_type(&tcx, value_id, &Type::Int);
 }
 
 #[test]
@@ -87,8 +86,8 @@ fn test_binding_chained_inference() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, x_val_id, Type::Int);
-    assert_expr_type(&tcx, y_val_id, Type::Int);
+    assert_expr_type(&tcx, x_val_id, &Type::Int);
+    assert_expr_type(&tcx, y_val_id, &Type::Int);
 }
 
 #[test]
@@ -105,8 +104,8 @@ fn test_constraint_chain_resolves() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, a_id, opt_type(Type::Int));
-    assert_expr_type(&tcx, b_id, opt_type(Type::Int));
+    assert_expr_type(&tcx, a_id, &opt_type(Type::Int));
+    assert_expr_type(&tcx, b_id, &opt_type(Type::Int));
 }
 
 #[test]
@@ -139,7 +138,7 @@ fn test_constraint_through_function_call() {
     let prog = program(vec![fn_def, let_binding("a", Some(Type::Int), a_val)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, a_val_id, Type::Int);
+    assert_expr_type(&tcx, a_val_id, &Type::Int);
 }
 
 #[test]
@@ -155,7 +154,7 @@ fn test_assignability_int_to_optional_int() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, value_id, Type::Int);
+    assert_expr_type(&tcx, value_id, &Type::Int);
 }
 
 #[test]
@@ -215,7 +214,7 @@ fn test_assignability_nil_to_optional_int() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, value_id, opt_type(Type::Int));
+    assert_expr_type(&tcx, value_id, &opt_type(Type::Int));
 }
 
 #[test]
@@ -251,5 +250,5 @@ fn test_multiple_optional_assignments() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, ten_id, Type::Int);
+    assert_expr_type(&tcx, ten_id, &Type::Int);
 }

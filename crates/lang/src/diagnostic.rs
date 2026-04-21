@@ -94,12 +94,6 @@ impl DiagnosticReport {
         self.diagnostics.extend(other.diagnostics);
     }
 
-    pub(crate) fn has_errors(&self) -> bool {
-        self.diagnostics
-            .iter()
-            .any(|d| d.severity == Severity::Error)
-    }
-
     pub fn print_ariadne(&self) {
         let mut cache = ariadne::sources(
             self.files

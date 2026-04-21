@@ -20,7 +20,7 @@ fn test_binary_arithmetic_int() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Int);
+    assert_expr_type(&tcx, expr_id, &Type::Int);
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn test_binary_arithmetic_float() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Float);
+    assert_expr_type(&tcx, expr_id, &Type::Float);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn test_binary_logical_ok() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn test_binary_comparison_ok() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn test_binary_string_comparison_ok() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 #[test]
@@ -153,10 +153,10 @@ fn test_binary_string_comparison_all_ops_ok() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, lt_id, Type::Bool);
-    assert_expr_type(&tcx, gt_id, Type::Bool);
-    assert_expr_type(&tcx, lte_id, Type::Bool);
-    assert_expr_type(&tcx, gte_id, Type::Bool);
+    assert_expr_type(&tcx, lt_id, &Type::Bool);
+    assert_expr_type(&tcx, gt_id, &Type::Bool);
+    assert_expr_type(&tcx, lte_id, &Type::Bool);
+    assert_expr_type(&tcx, gte_id, &Type::Bool);
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn test_unary_neg_int() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Int);
+    assert_expr_type(&tcx, expr_id, &Type::Int);
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn test_unary_neg_float() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Float);
+    assert_expr_type(&tcx, expr_id, &Type::Float);
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn test_unary_not_bool() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn test_assignment_plain_ok() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, assign_id, Type::Void);
+    assert_expr_type(&tcx, assign_id, &Type::Void);
 }
 
 #[test]
@@ -293,7 +293,7 @@ fn test_assignment_compound_ok() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, assign_id, Type::Void);
+    assert_expr_type(&tcx, assign_id, &Type::Void);
 }
 
 #[test]
@@ -308,7 +308,7 @@ fn test_assignment_string_add_assign_int_ok() {
     ]);
 
     let stmts = run_ok(prog);
-    assert_expr_type(&stmts, assign_id, Type::Void);
+    assert_expr_type(&stmts, assign_id, &Type::Void);
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn test_assignment_int_to_optional_var() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, ten_id, Type::Int);
+    assert_expr_type(&tcx, ten_id, &Type::Int);
 }
 
 #[test]
@@ -342,7 +342,7 @@ fn test_assignment_string_to_optional_string() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, str_id, Type::String);
+    assert_expr_type(&tcx, str_id, &Type::String);
 }
 
 #[test]
@@ -375,7 +375,7 @@ fn test_coalesce_optional_with_concrete_fallback() {
     let prog = program(vec![a_binding, x_binding]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, coalesce_id, Type::Int);
+    assert_expr_type(&tcx, coalesce_id, &Type::Int);
 }
 
 #[test]
@@ -423,8 +423,8 @@ fn test_coalesce_nil_with_int() {
     let prog = program(vec![let_binding("a", Some(Type::Int), coalesce)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, nil_id, opt_type(Type::Int));
-    assert_expr_type(&tcx, coalesce_id, Type::Int);
+    assert_expr_type(&tcx, nil_id, &opt_type(Type::Int));
+    assert_expr_type(&tcx, coalesce_id, &Type::Int);
 }
 
 #[test]
@@ -474,7 +474,7 @@ fn test_coalesce_optional_string_with_string() {
     let prog = program(vec![a_binding, b_binding]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, coalesce_id, Type::String);
+    assert_expr_type(&tcx, coalesce_id, &Type::String);
 }
 
 #[test]
@@ -506,7 +506,7 @@ fn test_binary_string_concat() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::String);
+    assert_expr_type(&tcx, expr_id, &Type::String);
 }
 
 #[test]
@@ -536,7 +536,7 @@ fn test_binary_string_add_int_ok() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let stmts = run_ok(prog);
-    assert_expr_type(&stmts, expr_id, Type::String);
+    assert_expr_type(&stmts, expr_id, &Type::String);
 }
 
 #[test]
@@ -551,7 +551,7 @@ fn test_assignment_string_add_assign_ok() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, assign_id, Type::Void);
+    assert_expr_type(&tcx, assign_id, &Type::Void);
 }
 
 #[test]
@@ -579,12 +579,16 @@ fn test_assignment_string_sub_assign_err() {
 fn test_binary_string_add_float_ok() {
     reset_expr_ids();
     // "val: " + 3.14
-    let expr = binary_expr(lit_string("val: "), BinaryOp::Add, lit_float(3.14));
+    let expr = binary_expr(
+        lit_string("val: "),
+        BinaryOp::Add,
+        lit_float(std::f64::consts::PI),
+    );
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![expr_stmt(expr)]);
 
     let stmts = run_ok(prog);
-    assert_expr_type(&stmts, expr_id, Type::String);
+    assert_expr_type(&stmts, expr_id, &Type::String);
 }
 
 #[test]
@@ -596,7 +600,7 @@ fn test_binary_string_add_bool_ok() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let stmts = run_ok(prog);
-    assert_expr_type(&stmts, expr_id, Type::String);
+    assert_expr_type(&stmts, expr_id, &Type::String);
 }
 
 #[test]
@@ -608,7 +612,7 @@ fn test_binary_int_add_string_ok() {
     let prog = program(vec![expr_stmt(expr)]);
 
     let stmts = run_ok(prog);
-    assert_expr_type(&stmts, expr_id, Type::String);
+    assert_expr_type(&stmts, expr_id, &Type::String);
 }
 
 #[test]
@@ -645,7 +649,7 @@ fn test_assignment_string_add_assign_int_ok_var() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, assign_id, Type::Void);
+    assert_expr_type(&tcx, assign_id, &Type::Void);
 }
 
 #[test]
@@ -660,7 +664,7 @@ fn test_assignment_string_add_assign_bool_ok() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, assign_id, Type::Void);
+    assert_expr_type(&tcx, assign_id, &Type::Void);
 }
 
 // ---- string interpolation tests ----
@@ -673,7 +677,7 @@ fn test_string_interp_text_only_ok() {
     let prog = program(vec![expr_stmt(interp)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, interp_id, Type::String);
+    assert_expr_type(&tcx, interp_id, &Type::String);
 }
 
 #[test]
@@ -687,7 +691,7 @@ fn test_string_interp_with_string_var_ok() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, interp_id, Type::String);
+    assert_expr_type(&tcx, interp_id, &Type::String);
 }
 
 #[test]
@@ -698,18 +702,21 @@ fn test_string_interp_with_int_ok() {
     let prog = program(vec![expr_stmt(interp)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, interp_id, Type::String);
+    assert_expr_type(&tcx, interp_id, &Type::String);
 }
 
 #[test]
 fn test_string_interp_with_float_ok() {
     reset_expr_ids();
-    let interp = string_interp_expr(vec![text_part("f="), expr_part(lit_float(3.14))]);
+    let interp = string_interp_expr(vec![
+        text_part("f="),
+        expr_part(lit_float(std::f64::consts::PI)),
+    ]);
     let interp_id = get_expr_id(&interp);
     let prog = program(vec![expr_stmt(interp)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, interp_id, Type::String);
+    assert_expr_type(&tcx, interp_id, &Type::String);
 }
 
 #[test]
@@ -720,7 +727,7 @@ fn test_string_interp_with_bool_ok() {
     let prog = program(vec![expr_stmt(interp)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, interp_id, Type::String);
+    assert_expr_type(&tcx, interp_id, &Type::String);
 }
 
 #[test]
@@ -739,7 +746,7 @@ fn test_string_interp_with_struct_ok() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, interp_id, Type::String);
+    assert_expr_type(&tcx, interp_id, &Type::String);
 }
 
 // ---- cast expression tests ----
@@ -751,17 +758,17 @@ fn test_cast_int_to_float_ok() {
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Float);
+    assert_expr_type(&tcx, expr_id, &Type::Float);
 }
 
 #[test]
 fn test_cast_float_to_int_ok() {
     reset_expr_ids();
-    let expr = cast_expr_node(lit_float(3.14), Type::Int);
+    let expr = cast_expr_node(lit_float(std::f64::consts::PI), Type::Int);
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Int);
+    assert_expr_type(&tcx, expr_id, &Type::Int);
 }
 
 #[test]
@@ -771,7 +778,7 @@ fn test_cast_same_type_int_ok() {
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Int);
+    assert_expr_type(&tcx, expr_id, &Type::Int);
 }
 
 #[test]
@@ -781,7 +788,7 @@ fn test_cast_same_type_float_ok() {
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Float);
+    assert_expr_type(&tcx, expr_id, &Type::Float);
 }
 
 #[test]

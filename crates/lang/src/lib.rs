@@ -264,7 +264,9 @@ fn analyze_with_extern_meta(
 
     // resolve intrinsics in module ast
     for ((_, stmts), loaded_file) in module_list.iter_mut().zip(module_loaded_files.iter()) {
-        let source_loc_info = loaded_file.as_ref().map(|lf| lf.to_source_location_info());
+        let source_loc_info = loaded_file
+            .as_ref()
+            .map(diagnostic::LoadedFile::to_source_location_info);
         let mut module_prog = ast::Program {
             stmts: std::mem::take(stmts),
         };

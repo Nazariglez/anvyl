@@ -9,7 +9,7 @@ use crate::{
 };
 
 thread_local! {
-    static EXPR_ID_COUNTER: Cell<u64> = Cell::new(0);
+    static EXPR_ID_COUNTER: Cell<u64> = const { Cell::new(0) };
 }
 
 // reset the expression id counter for deterministic test ids
@@ -430,7 +430,7 @@ pub(super) fn type_param(name: &str, id: u32) -> TypeParam {
     }
 }
 
-pub(super) fn slice_type(elem: Type) -> Type {
+pub(super) fn slice_type(elem: &Type) -> Type {
     Type::Slice { elem: elem.boxed() }
 }
 
@@ -628,7 +628,7 @@ pub(super) fn run_ok(prog: Program) -> TypecheckResult {
     match check_program_with_modules(&with_prelude(prog), &[], &[], &[], LintConfig::default()) {
         Ok(tcx) => tcx,
         Err(errors) => {
-            panic!("Expected Ok, got errors: {:?}", errors);
+            panic!("Expected Ok, got errors: {errors:?}");
         }
     }
 }
@@ -653,14 +653,13 @@ pub(super) fn check_src(src: &str) -> Result<TypecheckResult, Vec<Diagnostic>> {
 // ---- assertion helpers ----
 
 #[track_caller]
-pub(super) fn assert_expr_type(tcx: &TypecheckResult, id: ExprId, expected: Type) {
+pub(super) fn assert_expr_type(tcx: &TypecheckResult, id: ExprId, expected: &Type) {
     match tcx.get_type(id) {
         Some((_, ty)) => assert_eq!(
-            *ty, expected,
-            "Expression {:?} has wrong type. Expected {:?}, got {:?}",
-            id, expected, ty
+            *ty, *expected,
+            "Expression {id:?} has wrong type. Expected {expected:?}, got {ty:?}"
         ),
-        None => panic!("Expression {:?} not found in type map", id),
+        None => panic!("Expression {id:?} not found in type map"),
     }
 }
 

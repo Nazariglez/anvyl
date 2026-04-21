@@ -6,17 +6,17 @@ use crate::ast::{FuncParam, Type};
 #[test]
 fn test_type_var_display() {
     let t = type_var(0);
-    assert_eq!(format!("{}", t), "$0");
+    assert_eq!(format!("{t}"), "$0");
 
     let u = type_var(42);
-    assert_eq!(format!("{}", u), "$42");
+    assert_eq!(format!("{u}"), "$42");
 }
 
 #[test]
 fn test_optional_type_var_display() {
     let t = type_var(0);
     let opt_t = opt_type(t);
-    assert_eq!(format!("{}", opt_t), "$0?");
+    assert_eq!(format!("{opt_t}"), "$0?");
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn test_func_type_var_display() {
         params: vec![FuncParam::immut(t)],
         ret: u.boxed(),
     };
-    assert_eq!(format!("{}", func_type), "fn($0) -> $1");
+    assert_eq!(format!("{func_type}"), "fn($0) -> $1");
 }
 
 // ---- type variable predicates tests ----

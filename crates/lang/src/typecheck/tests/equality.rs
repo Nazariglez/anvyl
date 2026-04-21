@@ -18,7 +18,7 @@ fn test_eq_int_ok() {
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![super::helpers::expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 #[test]
@@ -28,7 +28,7 @@ fn test_eq_float_ok() {
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![super::helpers::expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_neq_bool_ok() {
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![super::helpers::expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn test_eq_string_ok() {
     let expr_id = get_expr_id(&expr);
     let prog = program(vec![super::helpers::expr_stmt(expr)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, expr_id, Type::Bool);
+    assert_expr_type(&tcx, expr_id, &Type::Bool);
 }
 
 // ---- equatable structs ----
@@ -81,7 +81,7 @@ fn test_eq_struct_with_int_fields_ok() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn test_eq_struct_with_float_fields_ok() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable: function types (identity equality) ----
@@ -151,7 +151,7 @@ fn test_eq_fn_type_errors() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable: lists ----
@@ -180,7 +180,7 @@ fn test_eq_list_ok() {
     let eq_id = get_expr_id(&eq);
     let prog = program(vec![a_binding, b_binding, super::helpers::expr_stmt(eq)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable: maps ----
@@ -210,7 +210,7 @@ fn test_eq_map_ok() {
     let eq_id = get_expr_id(&eq);
     let prog = program(vec![a_binding, b_binding, super::helpers::expr_stmt(eq)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable: struct with fn field (identity equality on fn fields) ----
@@ -253,7 +253,7 @@ fn test_eq_struct_with_fn_field_errors() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- enum equality ----
@@ -349,7 +349,7 @@ fn test_eq_enum_fn_payload_err() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 #[test]
@@ -385,7 +385,7 @@ fn test_eq_enum_list_payload_ok() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 #[test]
@@ -424,7 +424,7 @@ fn test_eq_struct_fn_field_reason_note() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 #[test]
@@ -462,7 +462,7 @@ fn test_eq_enum_fn_payload_reason_note() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable containers: fixed arrays ----
@@ -492,7 +492,7 @@ fn test_eq_array_fixed_ok() {
     let eq_id = get_expr_id(&eq);
     let prog = program(vec![a_binding, b_binding, super::helpers::expr_stmt(eq)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable containers: list of structs (gamedev: comparing position lists) ----
@@ -539,7 +539,7 @@ fn test_eq_list_of_structs_ok() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable containers: map with string key (gamedev: inventory-style maps) ----
@@ -569,7 +569,7 @@ fn test_eq_map_string_int_ok() {
     let eq_id = get_expr_id(&eq);
     let prog = program(vec![a_binding, b_binding, super::helpers::expr_stmt(eq)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable containers: enum with list payload now equatable ----
@@ -615,7 +615,7 @@ fn test_eq_enum_with_list_payload_ok() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- non-equatable containers: list of fn ----
@@ -650,7 +650,7 @@ fn test_eq_list_of_fn_errors() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- equatable containers: map with fn value (identity equality on fn values) ----
@@ -690,7 +690,7 @@ fn test_eq_map_fn_value_errors() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- non-equatable containers: slice stays non-equatable ----
@@ -722,8 +722,7 @@ fn test_eq_slice_errors() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::NotEquatable { .. })),
-        "Expected NotEquatable for Slice, got: {:?}",
-        errors
+        "Expected NotEquatable for Slice, got: {errors:?}"
     );
 }
 
@@ -757,7 +756,7 @@ fn test_eq_list_fn_elem_reason_note() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 #[test]
@@ -793,7 +792,7 @@ fn test_eq_map_fn_value_reason_note() {
         super::helpers::expr_stmt(eq),
     ]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 // ---- nil equality unification ----
@@ -809,8 +808,8 @@ fn test_eq_optional_int_vs_nil_ok() {
     let eq_id = get_expr_id(&eq);
     let prog = program(vec![v_binding, super::helpers::expr_stmt(eq)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
-    assert_expr_type(&tcx, nil_id, opt_type(Type::Int));
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
+    assert_expr_type(&tcx, nil_id, &opt_type(Type::Int));
 }
 
 #[test]
@@ -822,7 +821,7 @@ fn test_neq_optional_int_vs_nil_ok() {
     let eq_id = get_expr_id(&eq);
     let prog = program(vec![v_binding, super::helpers::expr_stmt(eq)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 #[test]
@@ -834,7 +833,7 @@ fn test_eq_nil_vs_optional_string_ok() {
     let eq_id = get_expr_id(&eq);
     let prog = program(vec![v_binding, super::helpers::expr_stmt(eq)]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, eq_id, Type::Bool);
+    assert_expr_type(&tcx, eq_id, &Type::Bool);
 }
 
 #[test]
@@ -848,7 +847,6 @@ fn test_eq_int_vs_nil_mismatch() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes, got: {:?}",
-        errors
+        "Expected MismatchedTypes, got: {errors:?}"
     );
 }

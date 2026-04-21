@@ -1224,7 +1224,7 @@ impl<'a> VM<'a> {
                 let mut entries: Vec<(Value, Value)> =
                     m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 if !m.is_ordered() {
-                    entries.sort_by(|(a, _), (b, _)| a.to_string().cmp(&b.to_string()));
+                    entries.sort_by_key(|(a, _)| a.to_string());
                 }
                 for (i, (k, v)) in entries.iter().enumerate() {
                     if i > 0 {

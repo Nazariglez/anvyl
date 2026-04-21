@@ -1,6 +1,7 @@
 // many items here are only used via generated macro,
 // so we can safely ignore dead_code warnings
 #![allow(dead_code)]
+#![allow(clippy::needless_pass_by_value)]
 
 use anvyx_lang::{
     AnvyxConvert, AnvyxExternType, AnvyxFn, ExternDecl, ExternHandle, ExternHandleData,
@@ -3839,7 +3840,7 @@ fn export_fn_anvyx_fn_double_decl() {
 
 #[export_fn]
 fn take_handle(h: ExternHandle<Color>) -> i64 {
-    h.with_borrow(|c| c.0 as i64).unwrap()
+    h.with_borrow(|c| i64::from(c.0)).unwrap()
 }
 
 #[test]
@@ -3875,9 +3876,8 @@ fn export_fn_extern_handle_roundtrip() {
 }
 
 #[export_fn]
-fn cb_with_handle(cb: AnvyxFn<(ExternHandle<Color>,), ()>) -> Result<(), RuntimeError> {
+fn cb_with_handle(cb: AnvyxFn<(ExternHandle<Color>,), ()>) {
     drop(cb);
-    Ok(())
 }
 
 #[test]
@@ -3901,9 +3901,8 @@ fn export_fn_callback_extern_handle_return_decl() {
 }
 
 #[export_fn(params(cb = "fn(Sprite) -> void"))]
-fn cb_override_handle(cb: AnvyxFn<(ExternHandle<SpriteData>,), ()>) -> Result<(), RuntimeError> {
+fn cb_override_handle(cb: AnvyxFn<(ExternHandle<SpriteData>,), ()>) {
     drop(cb);
-    Ok(())
 }
 
 #[test]

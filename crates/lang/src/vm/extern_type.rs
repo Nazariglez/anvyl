@@ -249,10 +249,10 @@ mod tests {
 
         fn to_display(id: u64) -> String {
             Self::with_store(|s| {
-                s.borrow()
-                    .borrow(id)
-                    .map(|p| format!("TestPoint({}, {})", p.x, p.y))
-                    .unwrap_or_else(|_| "<invalid>".to_string())
+                s.borrow().borrow(id).map_or_else(
+                    |_| "<invalid>".to_string(),
+                    |p| format!("TestPoint({}, {})", p.x, p.y),
+                )
             })
         }
     }

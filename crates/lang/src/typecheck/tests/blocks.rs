@@ -20,7 +20,7 @@ fn test_block_expr_empty_is_void() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, block_id, Type::Void);
+    assert_expr_type(&tcx, block_id, &Type::Void);
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_block_expr_trailing_int() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, block_id, Type::Int);
+    assert_expr_type(&tcx, block_id, &Type::Int);
 }
 
 #[test]
@@ -59,8 +59,8 @@ fn test_block_expr_let_then_ident() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, block_id, Type::Int);
-    assert_expr_type(&tcx, x_ref_id, Type::Int);
+    assert_expr_type(&tcx, block_id, &Type::Int);
+    assert_expr_type(&tcx, x_ref_id, &Type::Int);
 }
 
 // ---- let-binding with block tests ----
@@ -81,8 +81,8 @@ fn test_let_binding_block_infers_int() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, one_id, Type::Int);
-    assert_expr_type(&tcx, block_id, Type::Int);
+    assert_expr_type(&tcx, one_id, &Type::Int);
+    assert_expr_type(&tcx, block_id, &Type::Int);
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn test_let_binding_block_annotated_int_ok() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, block_id, Type::Int);
+    assert_expr_type(&tcx, block_id, &Type::Int);
 }
 
 #[test]

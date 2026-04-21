@@ -34,8 +34,7 @@ fn test_map_float_key_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MapKeyFloat)),
-        "Expected MapKeyFloat, got: {:?}",
-        errors
+        "Expected MapKeyFloat, got: {errors:?}"
     );
 }
 
@@ -58,8 +57,7 @@ fn test_map_annotation_float_key_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MapKeyFloat)),
-        "Expected MapKeyFloat, got: {:?}",
-        errors
+        "Expected MapKeyFloat, got: {errors:?}"
     );
 }
 
@@ -108,8 +106,7 @@ fn test_map_struct_float_field_key_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MapKeyNotKeyable { .. })),
-        "Expected MapKeyNotKeyable, got: {:?}",
-        errors
+        "Expected MapKeyNotKeyable, got: {errors:?}"
     );
 }
 
@@ -178,8 +175,7 @@ fn test_map_enum_non_keyable_payload_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MapKeyNotKeyable { .. })),
-        "Expected MapKeyNotKeyable, got: {:?}",
-        errors
+        "Expected MapKeyNotKeyable, got: {errors:?}"
     );
 }
 

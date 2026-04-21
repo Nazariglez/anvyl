@@ -111,12 +111,12 @@ fn build_compilation_ctx(
             }
             "arch" => {
                 ctx.arch = v.parse().map_err(|()| {
-                    format!("unknown arch value: '{v}'. Expected: x86_64, aarch64",)
+                    format!("unknown arch value: '{v}'. Expected: x86_64, aarch64")
                 })?;
             }
             "profile" => {
                 ctx.profile = v.parse().map_err(|()| {
-                    format!("unknown profile value: '{v}'. Expected: debug, release",)
+                    format!("unknown profile value: '{v}'. Expected: debug, release")
                 })?;
             }
             "feature" => {

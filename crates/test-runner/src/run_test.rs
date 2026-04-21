@@ -167,7 +167,7 @@ fn match_output(output: &str, directives: &Directives) -> TestResult {
         let found = output.lines().any(|ln| ln.contains(expected_ln));
         if !found {
             return TestResult::Fail {
-                message: format!("* Expected output to contain:\n{expected_ln}\n* Got:\n{output}",),
+                message: format!("* Expected output to contain:\n{expected_ln}\n* Got:\n{output}"),
             };
         }
     }

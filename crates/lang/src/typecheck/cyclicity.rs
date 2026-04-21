@@ -123,10 +123,10 @@ fn extract_dataref_refs(
 ) {
     type_any(ty, &mut |t| {
         match t {
-            Type::DataRef { name, .. } | Type::Struct { name, .. } | Type::UnresolvedName(name) => {
-                if struct_defs.get(name).is_some_and(|d| d.kind.is_dataref()) {
-                    out.push(*name);
-                }
+            Type::DataRef { name, .. } | Type::Struct { name, .. } | Type::UnresolvedName(name)
+                if struct_defs.get(name).is_some_and(|d| d.kind.is_dataref()) =>
+            {
+                out.push(*name);
             }
             Type::Enum {
                 name, type_args, ..
@@ -257,10 +257,10 @@ fn extract_value_type_refs(
     out: &mut Vec<Ident>,
 ) {
     match ty {
-        Type::Struct { name, .. } => {
-            if struct_defs.get(name).is_some_and(|d| !d.kind.is_dataref()) {
-                out.push(*name);
-            }
+        Type::Struct { name, .. }
+            if struct_defs.get(name).is_some_and(|d| !d.kind.is_dataref()) =>
+        {
+            out.push(*name);
         }
         Type::UnresolvedName(name) => {
             if struct_defs.get(name).is_some_and(|d| !d.kind.is_dataref()) {

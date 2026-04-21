@@ -17,7 +17,7 @@ fn range_expr_of_ints_has_range_int_type() {
     let range_id = get_expr_id(&range);
     let prog = program(vec![expr_stmt(range.clone())]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, range_id, range_type(Type::Int));
+    assert_expr_type(&tcx, range_id, &range_type(Type::Int));
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn inclusive_range_expr_of_floats_has_range_inclusive_float_type() {
     let range_id = get_expr_id(&range);
     let prog = program(vec![expr_stmt(range.clone())]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, range_id, range_inclusive_type(Type::Float));
+    assert_expr_type(&tcx, range_id, &range_inclusive_type(Type::Float));
 }
 
 #[test]
@@ -40,8 +40,7 @@ fn range_expr_bounds_must_unify() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "expected mismatched types error, got: {:?}",
-        errors
+        "expected mismatched types error, got: {errors:?}"
     );
 }
 
@@ -75,5 +74,5 @@ fn range_exprs_work_with_generics() {
 
     let prog = program(vec![wrap_fn, binding]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }

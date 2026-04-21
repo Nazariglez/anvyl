@@ -125,7 +125,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Parse(_) => {}
-            other => panic!("expected Parse error, got {:?}", other),
+            FormatError::Lex(other) => panic!("expected Parse error, got {other:?}"),
         }
     }
 
@@ -222,7 +222,7 @@ mod tests {
         assert!(formatted.contains("    x: float;"));
         assert!(formatted.contains("    y: float;"));
         assert!(formatted.contains("    fn distance(self, other: Point) -> float;"));
-        assert!(formatted.contains("}"));
+        assert!(formatted.contains('}'));
     }
 
     #[test]
@@ -1038,12 +1038,9 @@ mod tests {
                 continue;
             }
 
-            let first = match format_source(&source) {
-                Ok(f) => f,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
+            let Ok(first) = format_source(&source) else {
+                skipped += 1;
+                continue;
             };
 
             let second = format_source(&first).unwrap_or_else(|e| {
@@ -1080,14 +1077,12 @@ mod tests {
     }
 
     fn walk_anv_files_rec(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Ok(entry) = entry else {
+                continue;
             };
             let path = entry.path();
             if path.is_dir() {

@@ -128,10 +128,10 @@ mod tests {
         }
         fn to_display(id: u64) -> String {
             Self::with_store(|s| {
-                s.borrow()
-                    .borrow(id)
-                    .map(|c| format!("Counter({})", c.value))
-                    .unwrap_or_else(|_| "<invalid>".to_string())
+                s.borrow().borrow(id).map_or_else(
+                    |_| "<invalid>".to_string(),
+                    |c| format!("Counter({})", c.value),
+                )
             })
         }
     }
@@ -176,16 +176,16 @@ mod tests {
     ) -> (
         super::compiler::CompiledProgram,
         super::ExternRegistry,
-        std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+        std::rc::Rc<std::cell::RefCell<Option<Value>>>,
     ) {
-        use std::sync::{Arc, Mutex};
-        let stored: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        use std::{cell::RefCell, rc::Rc};
+        let stored: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
         let stored_clone = stored.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
             extern_name.to_string(),
             Box::new(move |args| {
-                *stored_clone.lock().unwrap() = Some(args[0].clone());
+                *stored_clone.borrow_mut() = Some(args[0].clone());
                 Ok(Value::Nil)
             }),
         );
@@ -323,10 +323,10 @@ mod tests {
     #[test]
     fn call_function_with_args() {
         let out = vm_ok(
-            r#"
+            r"
             fn add(a: int, b: int) -> int { a + b }
             fn main() { add(1, 2); }
-        "#,
+        ",
         );
         assert!(out.is_empty());
     }
@@ -520,14 +520,14 @@ mod tests {
 
     #[test]
     fn extern_fn_void_with_side_effect() {
-        use std::sync::{Arc, Mutex};
-        let counter = Arc::new(Mutex::new(0i64));
+        use std::{cell::RefCell, rc::Rc};
+        let counter = Rc::new(RefCell::new(0i64));
         let counter_clone = counter.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
             "increment".to_string(),
             Box::new(move |_args| {
-                *counter_clone.lock().unwrap() += 1;
+                *counter_clone.borrow_mut() += 1;
                 Ok(Value::Nil)
             }),
         );
@@ -541,16 +541,16 @@ mod tests {
         "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        assert_eq!(*counter.lock().unwrap(), 2);
+        assert_eq!(*counter.borrow(), 2);
     }
 
     #[test]
     fn extern_fn_missing_handler_errors() {
         let externs: HashMap<String, ExternHandler> = HashMap::new();
-        let src = r#"
+        let src = r"
             extern fn add(a: int, b: int) -> int;
             fn main() { let x = add(1, 2); }
-        "#;
+        ";
         let err = vm_err_with_externs(src, externs);
         assert!(
             err.contains("missing extern") && err.contains("add"),
@@ -665,8 +665,8 @@ fn main() {
 
     #[test]
     fn extern_type_field_set() {
-        use std::sync::{Arc, Mutex};
-        let captured = Arc::new(Mutex::new(0.0f64));
+        use std::{cell::RefCell, rc::Rc};
+        let captured = Rc::new(RefCell::new(0.0f64));
         let captured_clone = captured.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
@@ -684,7 +684,7 @@ fn main() {
                 let Value::Float(val) = args[1] else {
                     panic!("expected Float");
                 };
-                *captured_clone.lock().unwrap() = val as f64;
+                *captured_clone.borrow_mut() = f64::from(val);
                 Ok(Value::Nil)
             }),
         );
@@ -701,13 +701,13 @@ fn main() {
 "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        assert_eq!(*captured.lock().unwrap(), 42.0);
+        assert_eq!(*captured.borrow(), 42.0);
     }
 
     #[test]
     fn extern_type_instance_method() {
-        use std::sync::{Arc, Mutex};
-        let captured = Arc::new(Mutex::new((0u64, 0.0f64, 0.0f64)));
+        use std::{cell::RefCell, rc::Rc};
+        let captured = Rc::new(RefCell::new((0u64, 0.0f64, 0.0f64)));
         let captured_clone = captured.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
@@ -727,7 +727,7 @@ fn main() {
                 let Value::Float(dy) = args[2] else {
                     panic!("expected Float dy");
                 };
-                *captured_clone.lock().unwrap() = (id, dx as f64, dy as f64);
+                *captured_clone.borrow_mut() = (id, f64::from(dx), f64::from(dy));
                 Ok(Value::Nil)
             }),
         );
@@ -744,7 +744,7 @@ fn main() {
 "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        let vals = *captured.lock().unwrap();
+        let vals = *captured.borrow();
         assert_eq!(vals, (7, 5.0, -3.0));
     }
 
@@ -782,8 +782,8 @@ fn main() {
 
     #[test]
     fn extern_type_combined() {
-        use std::sync::{Arc, Mutex};
-        let set_val = Arc::new(Mutex::new(0.0f64));
+        use std::{cell::RefCell, rc::Rc};
+        let set_val = Rc::new(RefCell::new(0.0f64));
         let set_val_clone = set_val.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
@@ -808,7 +808,7 @@ fn main() {
                 let Value::Float(val) = args[1] else {
                     panic!("expected Float");
                 };
-                *set_val_clone.lock().unwrap() = val as f64;
+                *set_val_clone.borrow_mut() = f64::from(val);
                 Ok(Value::Nil)
             }),
         );
@@ -839,19 +839,19 @@ fn main() {
 "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        assert_eq!(*set_val.lock().unwrap(), 99.0);
+        assert_eq!(*set_val.borrow(), 99.0);
     }
 
     #[test]
     fn extern_type_static_method() {
-        use std::sync::{Arc, Mutex};
-        let called_args = Arc::new(Mutex::new(vec![]));
+        use std::{cell::RefCell, rc::Rc};
+        let called_args = Rc::new(RefCell::new(vec![]));
         let called_args_clone = called_args.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
             "Point::new".to_string(),
             Box::new(move |args| {
-                *called_args_clone.lock().unwrap() = args.to_vec();
+                *called_args_clone.borrow_mut() = args.clone();
                 Ok(extern_handle(42))
             }),
         );
@@ -866,7 +866,7 @@ fn main() {
 "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        let args = called_args.lock().unwrap();
+        let args = called_args.borrow();
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], Value::Float(1.0_f32));
         assert_eq!(args[1], Value::Float(2.0_f32));
@@ -874,8 +874,8 @@ fn main() {
 
     #[test]
     fn extern_type_static_with_instance() {
-        use std::sync::{Arc, Mutex};
-        let move_args = Arc::new(Mutex::new((0u64, 0.0f64, 0.0f64)));
+        use std::{cell::RefCell, rc::Rc};
+        let move_args = Rc::new(RefCell::new((0u64, 0.0f64, 0.0f64)));
         let move_args_clone = move_args.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
@@ -904,7 +904,7 @@ fn main() {
                 let Value::Float(dy) = args[2] else {
                     panic!("expected Float dy");
                 };
-                *move_args_clone.lock().unwrap() = (id, dx as f64, dy as f64);
+                *move_args_clone.borrow_mut() = (id, f64::from(dx), f64::from(dy));
                 Ok(Value::Nil)
             }),
         );
@@ -924,20 +924,20 @@ fn main() {
 "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        let vals = *move_args.lock().unwrap();
+        let vals = *move_args.borrow();
         assert_eq!(vals, (7, 5.0, -3.0));
     }
 
     #[test]
     fn extern_type_static_void() {
-        use std::sync::{Arc, Mutex};
-        let called = Arc::new(Mutex::new(false));
+        use std::{cell::RefCell, rc::Rc};
+        let called = Rc::new(RefCell::new(false));
         let called_clone = called.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
             "Logger::reset".to_string(),
             Box::new(move |_args| {
-                *called_clone.lock().unwrap() = true;
+                *called_clone.borrow_mut() = true;
                 Ok(Value::Nil)
             }),
         );
@@ -952,19 +952,19 @@ fn main() {
 "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        assert!(*called.lock().unwrap());
+        assert!(*called.borrow());
     }
 
     #[test]
     fn extern_type_struct_literal_init() {
-        use std::sync::{Arc, Mutex};
-        let init_args = Arc::new(Mutex::new(vec![]));
+        use std::{cell::RefCell, rc::Rc};
+        let init_args = Rc::new(RefCell::new(vec![]));
         let init_args_clone = init_args.clone();
         let mut externs: HashMap<String, ExternHandler> = HashMap::new();
         externs.insert(
             "Point::__init__".to_string(),
             Box::new(move |args| {
-                *init_args_clone.lock().unwrap() = args.to_vec();
+                *init_args_clone.borrow_mut() = args.clone();
                 Ok(extern_handle(10))
             }),
         );
@@ -997,7 +997,7 @@ fn main() {
 "#;
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "ok\n");
-        let args = init_args.lock().unwrap();
+        let args = init_args.borrow();
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], Value::Float(1.0_f32));
         assert_eq!(args[1], Value::Float(2.0_f32));
@@ -1042,8 +1042,8 @@ fn main() {
 
     #[test]
     fn extern_type_init_destructure_round_trip() {
-        use std::sync::{Arc, Mutex};
-        let state = Arc::new(Mutex::new((0.0f64, 0.0f64)));
+        use std::{cell::RefCell, rc::Rc};
+        let state = Rc::new(RefCell::new((0.0f64, 0.0f64)));
         let state_init = state.clone();
         let state_move = state.clone();
         let state_get_x = state.clone();
@@ -1058,7 +1058,7 @@ fn main() {
                 let Value::Float(y) = args[1] else {
                     panic!("expected Float")
                 };
-                *state_init.lock().unwrap() = (x as f64, y as f64);
+                *state_init.borrow_mut() = (f64::from(x), f64::from(y));
                 Ok(extern_handle(1))
             }),
         );
@@ -1074,19 +1074,19 @@ fn main() {
                 let Value::Float(dy) = args[2] else {
                     panic!("expected Float")
                 };
-                let mut s = state_move.lock().unwrap();
-                s.0 += dx as f64;
-                s.1 += dy as f64;
+                let mut s = state_move.borrow_mut();
+                s.0 += f64::from(dx);
+                s.1 += f64::from(dy);
                 Ok(Value::Nil)
             }),
         );
         externs.insert(
             "Point::__get_x".to_string(),
-            Box::new(move |_| Ok(Value::Float(state_get_x.lock().unwrap().0 as f32))),
+            Box::new(move |_| Ok(Value::Float(state_get_x.borrow().0 as f32))),
         );
         externs.insert(
             "Point::__get_y".to_string(),
-            Box::new(move |_| Ok(Value::Float(state_get_y.lock().unwrap().1 as f32))),
+            Box::new(move |_| Ok(Value::Float(state_get_y.borrow().1 as f32))),
         );
         let src = r#"
 extern type Point {
@@ -1125,13 +1125,13 @@ fn main() {
                 })))
             }),
         );
-        let src = r#"
+        let src = r"
 extern type Widget;
 extern fn make_widget() -> Widget;
 fn main() {
     let w = make_widget();
     println(w);
-}"#;
+}";
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "MyWidget\n");
     }
@@ -1153,13 +1153,13 @@ fn main() {
                 })))
             }),
         );
-        let src = r#"
+        let src = r"
 extern type Window;
 extern fn make_window() -> Window;
 fn main() {
     let w = make_window();
     println(w);
-}"#;
+}";
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "<Window>\n");
     }
@@ -1168,7 +1168,7 @@ fn main() {
     fn ownership_rc_reduction_benchmark() {
         use super::managed_rc::{rc_dec_count, rc_inc_count, reset_rc_counts};
 
-        let source = r#"
+        let source = r"
             struct Point { x: int, y: int }
 
             fn make_point(x: int, y: int) -> Point {
@@ -1196,7 +1196,7 @@ fn main() {
                 }
                 println(total);
             }
-        "#;
+        ";
 
         reset_rc_counts();
         let out = vm_ok(source);
@@ -1225,13 +1225,13 @@ fn main() {
                 })))
             }),
         );
-        let src = r#"
+        let src = r"
 extern type Item;
 extern fn make_item() -> Item;
 fn main() {
     let items = [make_item(), make_item()];
     println(items);
-}"#;
+}";
         let out = vm_ok_with_externs(src, externs);
         assert_eq!(out, "[Item, Item]\n");
     }
@@ -1290,16 +1290,16 @@ fn main() {
 
     #[test]
     fn host_driven_callback() {
-        let src = r#"
+        let src = r"
             extern fn store_callback(cb: fn(int) -> int);
             fn main() {
                 store_callback(|x| x * 3);
             }
-        "#;
+        ";
         let (compiled, registry, stored) = compile_with_store_callback(src, "store_callback");
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
-        let closure_val = stored.lock().unwrap().clone().expect("closure not stored");
+        let closure_val = stored.borrow().clone().expect("closure not stored");
         let result = vm
             .call_closure(&registry, &closure_val, vec![Value::Int(7)])
             .expect("callback failed");
@@ -1433,7 +1433,7 @@ fn main() {
                 Ok(result.into_anvyx())
             }),
         );
-        let src = r#"
+        let src = r"
             extern fn native_apply(value: int, cb: fn(int) -> int) -> int;
             fn fail_fn(x: int) -> int {
                 assert(false);
@@ -1442,7 +1442,7 @@ fn main() {
             fn main() {
                 native_apply(1, fail_fn);
             }
-        "#;
+        ";
         let err = vm_err_with_externs(src, externs);
         assert!(err.contains("assertion failed"), "got: {err}");
     }
@@ -1714,16 +1714,16 @@ fn main() {
 
     #[test]
     fn host_driven_multiple_calls() {
-        let src = r#"
+        let src = r"
             extern fn store_callback(cb: fn(int) -> int);
             fn main() {
                 store_callback(|x| x * x);
             }
-        "#;
+        ";
         let (compiled, registry, stored) = compile_with_store_callback(src, "store_callback");
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
-        let closure_val = stored.lock().unwrap().clone().expect("closure not stored");
+        let closure_val = stored.borrow().clone().expect("closure not stored");
         for i in 1..=5_i64 {
             let result = vm
                 .call_closure(&registry, &closure_val, vec![Value::Int(i)])
@@ -1734,10 +1734,10 @@ fn main() {
 
     #[test]
     fn host_driven_multiple_closures() {
-        use std::sync::{Arc, Mutex};
+        use std::{cell::RefCell, rc::Rc};
 
-        let stored_update: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
-        let stored_draw: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let stored_update: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
+        let stored_draw: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
         let update_clone = stored_update.clone();
         let draw_clone = stored_draw.clone();
 
@@ -1745,26 +1745,26 @@ fn main() {
         externs.insert(
             "register_update".to_string(),
             Box::new(move |args| {
-                *update_clone.lock().unwrap() = Some(args[0].clone());
+                *update_clone.borrow_mut() = Some(args[0].clone());
                 Ok(Value::Nil)
             }),
         );
         externs.insert(
             "register_draw".to_string(),
             Box::new(move |args| {
-                *draw_clone.lock().unwrap() = Some(args[0].clone());
+                *draw_clone.borrow_mut() = Some(args[0].clone());
                 Ok(Value::Nil)
             }),
         );
 
-        let src = r#"
+        let src = r"
             extern fn register_update(cb: fn(int) -> int);
             extern fn register_draw(cb: fn() -> int);
             fn main() {
                 register_update(|dt| dt * 2);
                 register_draw(|| 42);
             }
-        "#;
+        ";
 
         let hir = crate::test_helpers::generate_hir(src, "<test>").expect("generate_hir failed");
         let (compiled, registry) =
@@ -1773,16 +1773,8 @@ fn main() {
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
 
-        let update_val = stored_update
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("update not stored");
-        let draw_val = stored_draw
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("draw not stored");
+        let update_val = stored_update.borrow().clone().expect("update not stored");
+        let draw_val = stored_draw.borrow().clone().expect("draw not stored");
 
         let result = vm
             .call_closure(&registry, &update_val, vec![Value::Int(10)])
@@ -1797,17 +1789,17 @@ fn main() {
 
     #[test]
     fn host_driven_named_fn() {
-        let src = r#"
+        let src = r"
             extern fn store_callback(cb: fn(int) -> int);
             fn triple(x: int) -> int { x * 3 }
             fn main() {
                 store_callback(triple);
             }
-        "#;
+        ";
         let (compiled, registry, stored) = compile_with_store_callback(src, "store_callback");
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
-        let closure_val = stored.lock().unwrap().clone().expect("closure not stored");
+        let closure_val = stored.borrow().clone().expect("closure not stored");
         let result = vm
             .call_closure(&registry, &closure_val, vec![Value::Int(5)])
             .expect("callback failed");
@@ -1816,7 +1808,7 @@ fn main() {
 
     #[test]
     fn host_driven_callback_with_stdout() {
-        let src = r#"
+        let src = r"
             extern fn store_callback(cb: fn(int) -> int);
             fn process(x: int) -> int {
                 println(x);
@@ -1825,11 +1817,11 @@ fn main() {
             fn main() {
                 store_callback(process);
             }
-        "#;
+        ";
         let (compiled, registry, stored) = compile_with_store_callback(src, "store_callback");
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
-        let closure_val = stored.lock().unwrap().clone().expect("closure not stored");
+        let closure_val = stored.borrow().clone().expect("closure not stored");
 
         let result = vm
             .call_closure(&registry, &closure_val, vec![Value::Int(10)])
@@ -1846,7 +1838,7 @@ fn main() {
 
     #[test]
     fn host_driven_callback_error() {
-        let src = r#"
+        let src = r"
             extern fn store_callback(cb: fn(int) -> int);
             fn guarded(x: int) -> int {
                 assert(x > 0);
@@ -1855,11 +1847,11 @@ fn main() {
             fn main() {
                 store_callback(guarded);
             }
-        "#;
+        ";
         let (compiled, registry, stored) = compile_with_store_callback(src, "store_callback");
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
-        let closure_val = stored.lock().unwrap().clone().expect("closure not stored");
+        let closure_val = stored.borrow().clone().expect("closure not stored");
 
         let result = vm
             .call_closure(&registry, &closure_val, vec![Value::Int(5)])
@@ -1874,17 +1866,17 @@ fn main() {
 
     #[test]
     fn host_driven_closure_with_capture() {
-        let src = r#"
+        let src = r"
             extern fn store_callback(cb: fn(int) -> int);
             fn main() {
                 let factor = 7;
                 store_callback(|x| x * factor);
             }
-        "#;
+        ";
         let (compiled, registry, stored) = compile_with_store_callback(src, "store_callback");
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
-        let closure_val = stored.lock().unwrap().clone().expect("closure not stored");
+        let closure_val = stored.borrow().clone().expect("closure not stored");
         let result = vm
             .call_closure(&registry, &closure_val, vec![Value::Int(3)])
             .expect("callback failed");
@@ -1893,10 +1885,10 @@ fn main() {
 
     #[test]
     fn host_driven_simulate_game_loop() {
-        use std::sync::{Arc, Mutex};
+        use std::{cell::RefCell, rc::Rc};
 
-        let stored_update: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
-        let stored_draw: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let stored_update: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
+        let stored_draw: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
         let update_clone = stored_update.clone();
         let draw_clone = stored_draw.clone();
 
@@ -1904,18 +1896,18 @@ fn main() {
         externs.insert(
             "app_run".to_string(),
             Box::new(move |args| {
-                *update_clone.lock().unwrap() = Some(args[0].clone());
-                *draw_clone.lock().unwrap() = Some(args[1].clone());
+                *update_clone.borrow_mut() = Some(args[0].clone());
+                *draw_clone.borrow_mut() = Some(args[1].clone());
                 Ok(Value::Nil)
             }),
         );
 
-        let src = r#"
+        let src = r"
             extern fn app_run(update: fn(int) -> int, draw: fn() -> int);
             fn main() {
                 app_run(|dt| dt + 1, || 99);
             }
-        "#;
+        ";
 
         let hir = crate::test_helpers::generate_hir(src, "<test>").expect("generate_hir failed");
         let (compiled, registry) =
@@ -1924,16 +1916,8 @@ fn main() {
         let mut vm = super::runtime::VM::new(&compiled);
         vm.run(&registry).expect("vm run failed");
 
-        let update_val = stored_update
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("update not stored");
-        let draw_val = stored_draw
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("draw not stored");
+        let update_val = stored_update.borrow().clone().expect("update not stored");
+        let draw_val = stored_draw.borrow().clone().expect("draw not stored");
 
         for frame in 0..3_i64 {
             let dt = frame + 1;

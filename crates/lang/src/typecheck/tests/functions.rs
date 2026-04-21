@@ -7,10 +7,10 @@ use crate::{
     typecheck::error::{Diagnostic, DiagnosticKind},
 };
 
-fn assert_has_mismatch(errors: &[Diagnostic], a: Type, b: Type) {
+fn assert_has_mismatch(errors: &[Diagnostic], a: &Type, b: &Type) {
     let found = errors.iter().any(|e| {
         matches!(&e.kind, DiagnosticKind::MismatchedTypes { expected, found }
-            if (*expected == a && *found == b) || (*expected == b && *found == a))
+            if (*expected == *a && *found == *b) || (*expected == *b && *found == *a))
     });
     assert!(
         found,
@@ -47,7 +47,7 @@ fn test_return_void_function_returning_value() {
 
     let errors = run_err(prog);
     assert!(!errors.is_empty());
-    assert_has_mismatch(&errors, Type::Void, Type::Int);
+    assert_has_mismatch(&errors, &Type::Void, &Type::Int);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn test_return_non_void_function_correct() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, value_id, Type::Int);
+    assert_expr_type(&tcx, value_id, &Type::Int);
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn test_return_non_void_wrong_type() {
 
     let errors = run_err(prog);
     assert!(!errors.is_empty());
-    assert_has_mismatch(&errors, Type::Int, Type::Bool);
+    assert_has_mismatch(&errors, &Type::Int, &Type::Bool);
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn test_return_non_void_without_value() {
     )]);
 
     let errors = run_err(prog);
-    assert_has_mismatch(&errors, Type::Int, Type::Void);
+    assert_has_mismatch(&errors, &Type::Int, &Type::Void);
 }
 
 // ---- function as value tests ----
@@ -123,7 +123,7 @@ fn test_function_as_value() {
     ]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, g_val_id, expected_fn_type);
+    assert_expr_type(&tcx, g_val_id, &expected_fn_type);
 }
 
 // ---- nested function / scope tests ----
@@ -213,7 +213,7 @@ fn test_implicit_return_simple_int() {
     let prog = program(vec![fn_decl("f", vec![], Type::Int, vec![expr_stmt(one)])]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, one_id, Type::Int);
+    assert_expr_type(&tcx, one_id, &Type::Int);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn test_implicit_return_let_then_ident() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, x_ref_id, Type::Int);
+    assert_expr_type(&tcx, x_ref_id, &Type::Int);
 }
 
 #[test]
@@ -249,7 +249,7 @@ fn test_explicit_return_still_works() {
     )]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, one_id, Type::Int);
+    assert_expr_type(&tcx, one_id, &Type::Int);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn test_implicit_return_empty_body_non_void_error() {
     let prog = program(vec![fn_decl("f", vec![], Type::Int, vec![])]);
 
     let errors = run_err(prog);
-    assert_has_mismatch(&errors, Type::Int, Type::Void);
+    assert_has_mismatch(&errors, &Type::Int, &Type::Void);
 }
 
 #[test]
@@ -274,7 +274,7 @@ fn test_implicit_return_wrong_type_error() {
     )]);
 
     let errors = run_err(prog);
-    assert_has_mismatch(&errors, Type::Int, Type::Bool);
+    assert_has_mismatch(&errors, &Type::Int, &Type::Bool);
 }
 
 #[test]
@@ -290,7 +290,7 @@ fn test_void_fn_trailing_value_error() {
     )]);
 
     let errors = run_err(prog);
-    assert_has_mismatch(&errors, Type::Void, Type::Int);
+    assert_has_mismatch(&errors, &Type::Void, &Type::Int);
 }
 
 #[test]
@@ -321,7 +321,7 @@ fn test_nested_fn_implicit_return() {
     let prog = program(vec![outer_fn]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, call_id, Type::Int);
+    assert_expr_type(&tcx, call_id, &Type::Int);
 }
 
 // ---- extern fn typechecker tests ----

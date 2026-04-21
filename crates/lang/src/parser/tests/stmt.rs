@@ -99,7 +99,7 @@ fn if_with_ident_cond_parses() {
 
 #[test]
 fn while_with_inner_break_and_assign_parses() {
-    let src = r#"
+    let src = r"
         fn main() {
             var i: int = 0;
             while true {
@@ -109,7 +109,7 @@ fn while_with_inner_break_and_assign_parses() {
                 i = i + 1;
             }
         }
-    "#;
+    ";
     let prog = parse_program(src);
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
@@ -316,12 +316,12 @@ fn extern_type_parses() {
 #[test]
 fn extern_type_block_with_fields_parses() {
     let prog = parse_program(
-        r#"
+        r"
         extern type Point {
             x: float;
             y: float;
         }
-    "#,
+    ",
     );
     assert_eq!(prog.stmts.len(), 1);
     let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
@@ -344,11 +344,11 @@ fn extern_type_block_with_fields_parses() {
 #[test]
 fn extern_type_block_with_static_parses() {
     let prog = parse_program(
-        r#"
+        r"
         extern type Point {
             fn new(x: float, y: float) -> Point;
         }
-    "#,
+    ",
     );
     let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
         panic!("expected ExternType");
@@ -369,12 +369,12 @@ fn extern_type_block_with_static_parses() {
 #[test]
 fn extern_type_block_with_methods_parses() {
     let prog = parse_program(
-        r#"
+        r"
         extern type Point {
             fn get_x(self) -> float;
             fn move_by(var self, dx: float, dy: float);
         }
-    "#,
+    ",
     );
     let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
         panic!("expected ExternType");
@@ -406,11 +406,11 @@ fn extern_type_block_with_methods_parses() {
 #[test]
 fn extern_type_self_in_return_resolves() {
     let prog = parse_program(
-        r#"
+        r"
         extern type Point {
             fn new(x: float, y: float) -> Self;
         }
-    "#,
+    ",
     );
     let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
         panic!("expected ExternType");
@@ -430,7 +430,7 @@ fn extern_type_self_in_return_resolves() {
 #[test]
 fn extern_type_block_full_parses() {
     let prog = parse_program(
-        r#"
+        r"
         extern type Point {
             x: float;
             y: float;
@@ -438,7 +438,7 @@ fn extern_type_block_full_parses() {
             fn move_by(var self, dx: float, dy: float);
             fn distance_to(self, other: Point) -> float;
         }
-    "#,
+    ",
     );
     let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
         panic!("expected ExternType");

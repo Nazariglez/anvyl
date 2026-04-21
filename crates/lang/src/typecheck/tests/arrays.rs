@@ -33,7 +33,7 @@ fn test_array_literal_unannotated_int() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::Array {
+        &Type::Array {
             elem: Type::Int.boxed(),
             len: ArrayLen::Fixed(3),
         },
@@ -53,7 +53,7 @@ fn test_array_literal_unannotated_string() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::Array {
+        &Type::Array {
             elem: Type::String.boxed(),
             len: ArrayLen::Fixed(2),
         },
@@ -74,7 +74,7 @@ fn test_array_literal_empty() {
     let prog = program(vec![let_binding("c", Some(annot.clone()), arr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, arr_id, annot);
+    assert_expr_type(&tcx, arr_id, &annot);
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn test_array_literal_annotated_fixed_length_ok() {
     let prog = program(vec![let_binding("d", Some(annot.clone()), arr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, arr_id, annot);
+    assert_expr_type(&tcx, arr_id, &annot);
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn test_array_literal_annotated_infer_length() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::Array {
+        &Type::Array {
             elem: Type::Int.boxed(),
             len: ArrayLen::Fixed(4),
         },
@@ -156,7 +156,7 @@ fn test_array_literal_annotated_list() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::List {
+        &Type::List {
             elem: Type::Int.boxed(),
         },
     );
@@ -196,7 +196,7 @@ fn test_array_literal_all_nil_annotated_ok() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::Array {
+        &Type::Array {
             elem: opt_type(Type::Int).boxed(),
             len: ArrayLen::Fixed(2),
         },
@@ -219,7 +219,7 @@ fn test_array_literal_optional_elements_mixed_order() {
     assert_expr_type(
         &tcx_tail,
         arr_tail_id,
-        Type::Array {
+        &Type::Array {
             elem: opt_type(Type::Int).boxed(),
             len: ArrayLen::Fixed(2),
         },
@@ -233,7 +233,7 @@ fn test_array_literal_optional_elements_mixed_order() {
     assert_expr_type(
         &tcx_head,
         arr_head_id,
-        Type::Array {
+        &Type::Array {
             elem: opt_type(Type::Int).boxed(),
             len: ArrayLen::Fixed(2),
         },
@@ -256,7 +256,7 @@ fn test_array_literal_optional_string_elements() {
     assert_expr_type(
         &tcx_annot,
         arr_id,
-        Type::Array {
+        &Type::Array {
             elem: opt_type(Type::String).boxed(),
             len: ArrayLen::Fixed(3),
         },
@@ -270,7 +270,7 @@ fn test_array_literal_optional_string_elements() {
     assert_expr_type(
         &tcx_inferred,
         arr_inferred_id,
-        Type::Array {
+        &Type::Array {
             elem: opt_type(Type::String).boxed(),
             len: ArrayLen::Fixed(3),
         },
@@ -330,7 +330,7 @@ fn test_array_fill_unannotated() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::Array {
+        &Type::Array {
             elem: Type::Int.boxed(),
             len: ArrayLen::Fixed(5),
         },
@@ -351,7 +351,7 @@ fn test_array_fill_annotated_ok() {
     let prog = program(vec![let_binding("l", Some(annot.clone()), arr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, arr_id, annot);
+    assert_expr_type(&tcx, arr_id, &annot);
 }
 
 #[test]
@@ -392,7 +392,7 @@ fn test_array_fill_infer_length() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::Array {
+        &Type::Array {
             elem: Type::Int.boxed(),
             len: ArrayLen::Fixed(4),
         },
@@ -431,7 +431,7 @@ fn test_array_fill_list_annotated_ok() {
     let prog = program(vec![let_binding("xs", Some(annot.clone()), arr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, arr_id, annot);
+    assert_expr_type(&tcx, arr_id, &annot);
 }
 
 #[test]
@@ -447,7 +447,7 @@ fn test_array_fill_optional_list_ok() {
     let prog = program(vec![var_binding("xs", Some(annot.clone()), arr)]);
 
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, arr_id, annot);
+    assert_expr_type(&tcx, arr_id, &annot);
 }
 
 #[test]
@@ -469,8 +469,7 @@ fn test_array_fill_list_len_not_literal_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::ArrayFillLengthNotLiteral)),
-        "Expected ArrayFillLengthNotLiteral error, got: {:?}",
-        errors
+        "Expected ArrayFillLengthNotLiteral error, got: {errors:?}"
     );
 }
 
@@ -510,8 +509,7 @@ fn test_fixed_array_not_assignable_to_list() {
             if *expected == Type::List { elem: Type::Int.boxed() }
             && *found == Type::Array { elem: Type::Int.boxed(), len: ArrayLen::Fixed(2) }
         )),
-        "Expected MismatchedTypes error ([int; 2] not assignable to [int]), got: {:?}",
-        errors
+        "Expected MismatchedTypes error ([int; 2] not assignable to [int]), got: {errors:?}"
     );
 }
 
@@ -549,8 +547,7 @@ fn test_list_not_assignable_to_fixed_array() {
             if *expected == Type::Array { elem: Type::Int.boxed(), len: ArrayLen::Fixed(2) }
             && *found == Type::List { elem: Type::Int.boxed() }
         )),
-        "Expected MismatchedTypes error ([int] not assignable to [int; 2]), got: {:?}",
-        errors
+        "Expected MismatchedTypes error ([int] not assignable to [int; 2]), got: {errors:?}"
     );
 }
 
@@ -570,7 +567,7 @@ fn test_all_nil_annotated_list_ok() {
     assert_expr_type(
         &tcx,
         arr_id,
-        Type::List {
+        &Type::List {
             elem: opt_type(Type::Int).boxed(),
         },
     );
@@ -598,7 +595,7 @@ fn test_array_index_fixed_ok() {
     let prog = program(vec![arr_binding, x_binding]);
     let tcx = run_ok(prog);
 
-    assert_expr_type(&tcx, idx_id, Type::Int);
+    assert_expr_type(&tcx, idx_id, &Type::Int);
 }
 
 #[test]
@@ -620,7 +617,7 @@ fn test_list_index_ok() {
     let prog = program(vec![arr_binding, y_binding]);
     let tcx = run_ok(prog);
 
-    assert_expr_type(&tcx, idx_id, Type::Float);
+    assert_expr_type(&tcx, idx_id, &Type::Float);
 }
 
 #[test]
@@ -639,7 +636,7 @@ fn test_array_index_inferred_ok() {
     let prog = program(vec![arr_binding, x_binding]);
     let tcx = run_ok(prog);
 
-    assert_expr_type(&tcx, idx_id, Type::Int);
+    assert_expr_type(&tcx, idx_id, &Type::Int);
 }
 
 #[test]
@@ -663,8 +660,7 @@ fn test_array_index_non_int_index_error() {
         errors.iter().any(
             |e| matches!(&e.kind, DiagnosticKind::IndexNotInt { found } if *found == Type::Float)
         ),
-        "Expected IndexNotInt error with found=float, got: {:?}",
-        errors
+        "Expected IndexNotInt error with found=float, got: {errors:?}"
     );
 }
 
@@ -689,8 +685,7 @@ fn test_index_on_non_array_error() {
         errors.iter().any(
             |e| matches!(&e.kind, DiagnosticKind::IndexOnNonArray { found } if *found == Type::Int)
         ),
-        "Expected IndexOnNonArray error with found=int, got: {:?}",
-        errors
+        "Expected IndexOnNonArray error with found=int, got: {errors:?}"
     );
 }
 
@@ -722,7 +717,7 @@ fn test_nested_array_index_ok() {
     let prog = program(vec![arr_binding, x_binding]);
     let tcx = run_ok(prog);
 
-    assert_expr_type(&tcx, idx2_id, Type::Int);
+    assert_expr_type(&tcx, idx2_id, &Type::Int);
 }
 
 #[test]
@@ -757,7 +752,7 @@ fn test_view_param_accepts_fixed_array() {
 
     // fn sum(xs: [int; ..]) -> int { xs[0] }
     // sum([1, 2, 3])
-    let view_param = slice_type(Type::Int);
+    let view_param = slice_type(&Type::Int);
     let func = func_decl("sum", vec![("xs", view_param)], Type::Int, vec![]);
 
     let arr = array_literal(vec![lit_int(1), lit_int(2), lit_int(3)]);
@@ -778,7 +773,7 @@ fn test_view_param_accepts_list() {
     // fn sum(xs: [int; ..]) -> int { xs[0] }
     // let lst: [int] = [1, 2, 3];
     // sum(lst)
-    let view_param = slice_type(Type::Int);
+    let view_param = slice_type(&Type::Int);
     let func = func_decl("sum", vec![("xs", view_param)], Type::Int, vec![]);
 
     let lst = array_literal(vec![lit_int(1), lit_int(2), lit_int(3)]);
@@ -802,7 +797,7 @@ fn test_view_indexing_ok() {
     reset_expr_ids();
 
     // fn head(xs: [int; ..]) -> int { xs[0] }
-    let view_param = slice_type(Type::Int);
+    let view_param = slice_type(&Type::Int);
     let idx = index_expr(ident_expr("xs"), lit_int(0));
     let idx_id = get_expr_id(&idx);
     let func = FuncNode {
@@ -838,7 +833,7 @@ fn test_view_indexing_ok() {
 
     let prog = program(vec![func_stmt]);
     let tcx = run_ok(prog);
-    assert_expr_type(&tcx, idx_id, Type::Int);
+    assert_expr_type(&tcx, idx_id, &Type::Int);
 }
 
 #[test]
@@ -847,7 +842,7 @@ fn test_view_mismatched_element_type_err() {
 
     // fn f(xs: [int; ..]) {}
     // f(["a", "b"])
-    let view_param = slice_type(Type::Int);
+    let view_param = slice_type(&Type::Int);
     let func = func_decl("f", vec![("xs", view_param)], Type::Void, vec![]);
 
     let arr = array_literal(vec![lit_string("a"), lit_string("b")]);
@@ -863,8 +858,7 @@ fn test_view_mismatched_element_type_err() {
         errors
             .iter()
             .any(|e| matches!(&e.kind, DiagnosticKind::MismatchedTypes { .. })),
-        "Expected MismatchedTypes error, got: {:?}",
-        errors
+        "Expected MismatchedTypes error, got: {errors:?}"
     );
 }
 
@@ -891,7 +885,7 @@ fn test_safe_map_index_returns_optional_value() {
     let tcx = run_ok(prog);
 
     let expected = opt_type(Type::Int);
-    assert_expr_type(&tcx, idx_id, expected);
+    assert_expr_type(&tcx, idx_id, &expected);
 }
 
 #[test]
@@ -915,5 +909,5 @@ fn test_map_index_ok() {
     let tcx = run_ok(prog);
 
     let expected = opt_type(Type::Int);
-    assert_expr_type(&tcx, idx_id, expected);
+    assert_expr_type(&tcx, idx_id, &expected);
 }
