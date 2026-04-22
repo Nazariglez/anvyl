@@ -249,6 +249,32 @@ impl std::hash::Hash for Type {
 impl Type {
     pub const OPTION_ENUM_NAME: &'static str = "Option";
 
+    pub fn boxed(&self) -> Box<Self> {
+        Box::new(self.clone())
+    }
+
+    pub fn option_of(inner: Type) -> Type {
+        let name = Ident(Intern::new(Type::OPTION_ENUM_NAME.to_string()));
+        Type::Enum {
+            name,
+            type_args: vec![inner],
+            origin: None,
+        }
+    }
+
+    pub fn is_option(&self) -> bool {
+        self.option_inner().is_some()
+    }
+
+    pub fn option_inner(&self) -> Option<&Type> {
+        match self {
+            Type::Enum {
+                name, type_args, ..
+            } if name.0.as_ref() == Type::OPTION_ENUM_NAME => type_args.first(),
+            _ => None,
+        }
+    }
+
     pub fn as_aggregate(&self) -> Option<AggregateTypeRef<'_>> {
         match self {
             Type::Struct {
