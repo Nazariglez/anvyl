@@ -1,0 +1,30 @@
+macro_rules! define_id {
+    ($name:ident) => {
+        #[repr(transparent)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(pub u32);
+
+        impl $name {
+            pub const fn from_index(index: usize) -> Self {
+                Self(index as u32)
+            }
+
+            pub const fn index(self) -> usize {
+                self.0 as usize
+            }
+        }
+    };
+}
+
+define_id!(ModuleId);
+define_id!(FunctionId);
+define_id!(AggregateId);
+define_id!(EnumId);
+define_id!(ExternId);
+define_id!(ExternTypeId);
+define_id!(TypeId);
+define_id!(ConstId);
+define_id!(LocalId);
+define_id!(BlockId);
+define_id!(FieldId);
+define_id!(VariantId);

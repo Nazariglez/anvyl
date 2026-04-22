@@ -3,5 +3,9 @@ name = "anvyx-frontend"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+chumsky = "0.11.2"
+internment = "0.8.6"
+
 [lints]
 workspace = true

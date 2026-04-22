@@ -112,6 +112,10 @@ dependencies = [
 [[package]]
 name = "anvyx-frontend"
 version = "0.1.0"
+dependencies = [
+ "chumsky",
+ "internment",
+]
 
 [[package]]
 name = "anvyx-lang"
