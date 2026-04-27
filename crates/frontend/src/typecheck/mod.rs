@@ -237,14 +237,7 @@ struct VarInfo {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FuncTemplate {
-    pub span: Span,
-    pub params: Vec<Param>,
-    pub body: BlockNode,
-}
-
-#[derive(Debug, Clone)]
-struct MethodTemplate {
+struct CallableTemplate {
     span: Span,
     receiver: Option<MethodReceiver>,
     params: Vec<Param>,
@@ -264,9 +257,7 @@ struct TypeChecker {
     module_programs: HashMap<ModuleScope, Rc<Program>>,
     type_substs: Vec<TypeSubst>,
     const_substs: Vec<ConstSubst>,
-    func_templates: HashMap<(ModuleScope, Ident), FuncTemplate>,
-    method_templates: HashMap<MethodId, MethodTemplate>,
-    extend_templates: HashMap<(ExtendId, Ident), MethodTemplate>,
+    callable_templates: HashMap<CallableId, CallableTemplate>,
     specializations: HashMap<SpecializationKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
 }
@@ -369,9 +360,7 @@ impl TypeChecker {
             module_programs: HashMap::new(),
             type_substs: vec![],
             const_substs: vec![],
-            func_templates: HashMap::new(),
-            method_templates: HashMap::new(),
-            extend_templates: HashMap::new(),
+            callable_templates: HashMap::new(),
             specializations: HashMap::new(),
             consts: HashMap::new(),
         }
@@ -634,28 +623,12 @@ impl TypeChecker {
         self.const_substs.pop();
     }
 
-    fn store_func_template(&mut self, module: ModuleScope, name: Ident, template: FuncTemplate) {
-        self.func_templates.insert((module, name), template);
+    fn store_callable_template(&mut self, id: CallableId, template: CallableTemplate) {
+        self.callable_templates.insert(id, template);
     }
 
-    fn func_template(&self, module: &ModuleScope, name: Ident) -> Option<&FuncTemplate> {
-        self.func_templates.get(&(module.clone(), name))
-    }
-
-    fn store_method_template(&mut self, id: MethodId, template: MethodTemplate) {
-        self.method_templates.insert(id, template);
-    }
-
-    fn method_template(&self, id: &MethodId) -> Option<&MethodTemplate> {
-        self.method_templates.get(id)
-    }
-
-    fn store_extend_template(&mut self, id: ExtendId, name: Ident, template: MethodTemplate) {
-        self.extend_templates.insert((id, name), template);
-    }
-
-    fn extend_template(&self, id: &ExtendId, name: Ident) -> Option<&MethodTemplate> {
-        self.extend_templates.get(&(id.clone(), name))
+    fn callable_template(&self, id: &CallableId) -> Option<&CallableTemplate> {
+        self.callable_templates.get(id)
     }
 
     fn specialization(&self, key: &SpecializationKey) -> Option<&SpecializationState> {
@@ -1006,9 +979,7 @@ pub(crate) fn check_with_modules(
     let decls = DeclarationIndex::from_root_and_modules(program, resolved);
     let mut tc = TypeChecker::new(decls);
     tc.collect_const_decls(ModuleScope::Root, program);
-    collect_func_templates(ModuleScope::Root, program, &mut tc);
-    collect_method_templates(ModuleScope::Root, program, &mut tc);
-    collect_extend_templates(ModuleScope::Root, program, &mut tc);
+    collect_callable_templates(ModuleScope::Root, program, &mut tc);
 
     for group in &resolved.module_groups {
         for module in group {
@@ -1019,9 +990,7 @@ pub(crate) fn check_with_modules(
             tc.module_programs
                 .insert(scope.clone(), Rc::new(module.program.clone()));
             tc.collect_const_decls(scope.clone(), &module.program);
-            collect_func_templates(scope.clone(), &module.program, &mut tc);
-            collect_method_templates(scope.clone(), &module.program, &mut tc);
-            collect_extend_templates(scope, &module.program, &mut tc);
+            collect_callable_templates(scope, &module.program, &mut tc);
         }
     }
 
@@ -1037,9 +1006,7 @@ pub(crate) fn check(program: &Program) -> Result<TypecheckResult, Vec<TypeError>
     let decls = DeclarationIndex::from_root(program);
     let mut tc = TypeChecker::new(decls);
     tc.collect_const_decls(ModuleScope::Root, program);
-    collect_func_templates(ModuleScope::Root, program, &mut tc);
-    collect_method_templates(ModuleScope::Root, program, &mut tc);
-    collect_extend_templates(ModuleScope::Root, program, &mut tc);
+    collect_callable_templates(ModuleScope::Root, program, &mut tc);
     tc.push_scope();
     register_declarations(program, &mut tc);
     tc.eval_module_consts(&ModuleScope::Root);
@@ -1052,98 +1019,87 @@ fn is_generic(func: &Func) -> bool {
     !func.type_params.is_empty() || !func.const_params.is_empty()
 }
 
-fn collect_func_templates(module: ModuleScope, program: &Program, tc: &mut TypeChecker) {
+fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut TypeChecker) {
+    let mut extend_index = 0;
+
     for stmt in &program.stmts {
-        if let Stmt::Func(func_node) = &stmt.node {
-            let func = &func_node.node;
-            if is_generic(func) {
-                tc.store_func_template(
-                    module.clone(),
-                    func.name,
-                    FuncTemplate {
+        match &stmt.node {
+            Stmt::Func(func_node) => {
+                let func = &func_node.node;
+                if !is_generic(func) {
+                    continue;
+                }
+                tc.store_callable_template(
+                    CallableId::function(module.clone(), func.name),
+                    CallableTemplate {
                         span: func_node.span,
+                        receiver: None,
                         params: func.params.clone(),
                         body: func.body.clone(),
                     },
                 );
             }
-        }
-    }
-}
-
-fn collect_method_templates(module: ModuleScope, program: &Program, tc: &mut TypeChecker) {
-    for stmt in &program.stmts {
-        let Stmt::Aggregate(agg_node) = &stmt.node else {
-            continue;
-        };
-        let agg = &agg_node.node;
-        let kind = agg.kind.into();
-        let owner = NominalKey {
-            module: module.clone(),
-            kind,
-            name: agg.name,
-        };
-        let aggregate_is_generic = !agg.type_params.is_empty() || !agg.const_params.is_empty();
-        for method in &agg.methods {
-            let method_is_generic =
-                !method.type_params.is_empty() || !method.const_params.is_empty();
-            let needs_template = aggregate_is_generic || method_is_generic;
-            if !needs_template {
-                continue;
+            Stmt::Aggregate(agg_node) => {
+                let agg = &agg_node.node;
+                let owner = NominalKey {
+                    module: module.clone(),
+                    kind: agg.kind.into(),
+                    name: agg.name,
+                };
+                let aggregate_is_generic =
+                    !agg.type_params.is_empty() || !agg.const_params.is_empty();
+                for method in &agg.methods {
+                    let method_is_generic =
+                        !method.type_params.is_empty() || !method.const_params.is_empty();
+                    if !aggregate_is_generic && !method_is_generic {
+                        continue;
+                    }
+                    tc.store_callable_template(
+                        CallableId::aggregate_method(
+                            owner.clone(),
+                            method.name,
+                            method.receiver.is_some(),
+                        ),
+                        CallableTemplate {
+                            span: agg_node.span,
+                            receiver: method.receiver,
+                            params: method.params.clone(),
+                            body: method.body.clone(),
+                        },
+                    );
+                }
             }
-            tc.store_method_template(
-                MethodId {
-                    owner: owner.clone(),
-                    name: method.name,
-                },
-                MethodTemplate {
-                    span: agg_node.span,
-                    receiver: method.receiver,
-                    params: method.params.clone(),
-                    body: method.body.clone(),
-                },
-            );
-        }
-    }
-}
-
-fn collect_extend_templates(module: ModuleScope, program: &Program, tc: &mut TypeChecker) {
-    let mut extend_index = 0;
-
-    for stmt in &program.stmts {
-        let Stmt::Extend(extend_node) = &stmt.node else {
-            continue;
-        };
-        let extend = &extend_node.node;
-        let extend_id = ExtendId {
-            module: module.clone(),
-            index: extend_index,
-        };
-        extend_index += 1;
-        let extend_is_generic = !extend.type_params.is_empty() || !extend.const_params.is_empty();
-
-        for method_node in &extend.methods {
-            if !extend_is_generic {
-                continue;
+            Stmt::Extend(extend_node) => {
+                let extend = &extend_node.node;
+                let extend_id = ExtendId {
+                    module: module.clone(),
+                    index: extend_index,
+                };
+                extend_index += 1;
+                if extend.type_params.is_empty() && extend.const_params.is_empty() {
+                    continue;
+                }
+                for method_node in &extend.methods {
+                    let method = &method_node.node;
+                    let Some((self_param, params)) = method.params.split_first() else {
+                        continue;
+                    };
+                    let receiver = match self_param.mutability {
+                        Mutability::Mutable => MethodReceiver::Var,
+                        Mutability::Immutable => MethodReceiver::Value,
+                    };
+                    tc.store_callable_template(
+                        CallableId::extend_method(extend_id.clone(), method.name),
+                        CallableTemplate {
+                            span: extend_node.span,
+                            receiver: Some(receiver),
+                            params: params.to_vec(),
+                            body: method.body.clone(),
+                        },
+                    );
+                }
             }
-            let method = &method_node.node;
-            let Some((self_param, params)) = method.params.split_first() else {
-                continue;
-            };
-            let receiver = match self_param.mutability {
-                Mutability::Mutable => MethodReceiver::Var,
-                Mutability::Immutable => MethodReceiver::Value,
-            };
-            tc.store_extend_template(
-                extend_id.clone(),
-                method.name,
-                MethodTemplate {
-                    span: extend_node.span,
-                    receiver: Some(receiver),
-                    params: params.to_vec(),
-                    body: method.body.clone(),
-                },
-            );
+            _ => {}
         }
     }
 }
@@ -1361,62 +1317,8 @@ fn check_func_body(
     tc.pop_scope();
 }
 
-fn check_specialized_func_body(
-    module: &ModuleScope,
-    name: Ident,
-    sig: &FuncSig,
-    args: &GenericArgs,
-    type_subst: TypeSubst,
-    const_subst: ConstSubst,
-    tc: &mut TypeChecker,
-) {
-    let key = function_specialization_key(module, name, args);
-    if specialization_is_cached(&key, tc) {
-        return;
-    }
-
-    let Some(template) = tc.func_template(module, name).cloned() else {
-        return;
-    };
-    let Type::Func {
-        params: template_params,
-        ret: template_ret,
-    } = &sig.ty
-    else {
-        return;
-    };
-    let param_types: Vec<FuncParam> = template_params
-        .iter()
-        .map(|param| {
-            FuncParam::new(
-                tc.substitute_checked(&param.ty, &type_subst, &const_subst, template.span),
-                param.mutable,
-            )
-        })
-        .collect();
-    let ret_ty = tc.substitute_checked(template_ret, &type_subst, &const_subst, template.span);
-
-    let const_bindings = const_param_bindings(&sig.generics, args);
-    check_with_specialization(key, type_subst, const_subst, tc, |tc| {
-        with_source_module_scope(module, tc, |tc| {
-            check_func_body(
-                None,
-                &template.params,
-                &param_types,
-                ret_ty.clone(),
-                &template.body,
-                template.span,
-                &const_bindings,
-                tc,
-            );
-        });
-    });
-}
-
-fn check_specialized_method_body(
-    owner: &NominalKey,
-    name: Ident,
-    self_ty: Option<Type>,
+fn check_specialized_callable_body(
+    callee: &CallableRef,
     param_types: &[FuncParam],
     ret_ty: Type,
     args: &GenericArgs,
@@ -1425,62 +1327,29 @@ fn check_specialized_method_body(
     const_bindings: Vec<(Ident, ConstValue)>,
     tc: &mut TypeChecker,
 ) {
-    let key = method_specialization_key(owner, name, self_ty.is_some(), args);
+    if args.is_empty()
+        || matches!(
+            callee.def.id.kind,
+            CallableKind::ExternFunction | CallableKind::EnumVariant
+        )
+    {
+        return;
+    }
+
+    let key = specialization_key(callee.def.id.clone(), args);
     if specialization_is_cached(&key, tc) {
         return;
     }
 
-    let id = MethodId {
-        owner: owner.clone(),
-        name,
-    };
-    let Some(template) = tc.method_template(&id).cloned() else {
+    let Some(template) = tc.callable_template(&callee.def.id).cloned() else {
         return;
     };
+    let receiver = template.receiver.zip(callee.receiver_ty.clone());
 
     check_with_specialization(key, type_subst, const_subst, tc, |tc| {
-        with_source_module_scope(&owner.module, tc, |tc| {
+        with_source_module_scope(&callee.def.id.module, tc, |tc| {
             check_func_body(
-                template.receiver.zip(self_ty),
-                &template.params,
-                param_types,
-                ret_ty.clone(),
-                &template.body,
-                template.span,
-                &const_bindings,
-                tc,
-            );
-        });
-    });
-}
-
-fn check_specialized_extend_body(
-    extend: &ExtendId,
-    name: Ident,
-    receiver_ty: Type,
-    param_types: &[FuncParam],
-    ret_ty: Type,
-    args: &GenericArgs,
-    type_subst: TypeSubst,
-    const_subst: ConstSubst,
-    const_bindings: Vec<(Ident, ConstValue)>,
-    tc: &mut TypeChecker,
-) {
-    let key = extend_specialization_key(extend, name, args);
-    if specialization_is_cached(&key, tc) {
-        return;
-    }
-
-    let Some(template) = tc.extend_template(extend, name).cloned() else {
-        return;
-    };
-
-    check_with_specialization(key, type_subst, const_subst, tc, |tc| {
-        with_source_module_scope(&extend.module, tc, |tc| {
-            check_func_body(
-                template
-                    .receiver
-                    .map(|receiver| (receiver, receiver_ty.clone())),
+                receiver,
                 &template.params,
                 param_types,
                 ret_ty.clone(),
@@ -1540,14 +1409,14 @@ fn const_param_bindings(params: &GenericParams, args: &GenericArgs) -> Vec<(Iden
         .collect()
 }
 
-fn combined_const_param_bindings(
+fn callable_const_bindings(
     owner_params: &GenericParams,
     owner_args: &GenericArgs,
-    method_params: &GenericParams,
-    method_args: &GenericArgs,
+    callable_params: &GenericParams,
+    callable_args: &GenericArgs,
 ) -> Vec<(Ident, ConstValue)> {
     let mut bindings = const_param_bindings(owner_params, owner_args);
-    bindings.extend(const_param_bindings(method_params, method_args));
+    bindings.extend(const_param_bindings(callable_params, callable_args));
     bindings
 }
 
@@ -1564,59 +1433,9 @@ fn specialized_body_types(
         .collect()
 }
 
-fn function_specialization_key(
-    module: &ModuleScope,
-    name: Ident,
-    args: &GenericArgs,
-) -> SpecializationKey {
+fn specialization_key(id: CallableId, args: &GenericArgs) -> SpecializationKey {
     SpecializationKey {
-        target: CallableId {
-            module: module.clone(),
-            parent: None,
-            kind: CallableKind::Function,
-            name,
-        },
-        args: args.clone(),
-    }
-}
-
-fn method_specialization_key(
-    owner: &NominalKey,
-    name: Ident,
-    is_instance: bool,
-    args: &GenericArgs,
-) -> SpecializationKey {
-    SpecializationKey {
-        target: CallableId {
-            module: owner.module.clone(),
-            parent: Some(CallableParent::Nominal(owner.clone())),
-            kind: if is_instance {
-                CallableKind::InstanceMethod
-            } else {
-                CallableKind::StaticMethod
-            },
-            name,
-        },
-        args: args.clone(),
-    }
-}
-
-fn extend_callable_id(extend: &ExtendId, name: Ident) -> CallableId {
-    CallableId {
-        module: extend.module.clone(),
-        parent: Some(CallableParent::Extend(extend.clone())),
-        kind: CallableKind::ExtendMethod,
-        name,
-    }
-}
-
-fn extend_specialization_key(
-    extend: &ExtendId,
-    name: Ident,
-    args: &GenericArgs,
-) -> SpecializationKey {
-    SpecializationKey {
-        target: extend_callable_id(extend, name),
+        target: id,
         args: args.clone(),
     }
 }
@@ -2953,17 +2772,7 @@ pub(crate) fn type_contains_infer(ty: &Type) -> bool {
 
 pub(crate) fn call_target_contains_infer(target: &CallTarget) -> bool {
     match target {
-        CallTarget::GenericDirect { type_args, .. } | CallTarget::Method { type_args, .. } => {
-            type_args.iter().any(type_contains_infer)
-        }
-        CallTarget::Extend { receiver, args, .. } => {
-            let receiver_contains_infer = type_contains_infer(receiver);
-            let args_contain_infer = args.type_args.iter().any(type_contains_infer);
-            receiver_contains_infer || args_contain_infer
-        }
-        CallTarget::Direct { .. }
-        | CallTarget::ModuleFunction { .. }
-        | CallTarget::EnumVariant { .. } => false,
+        CallTarget::Callable { args, .. } => args.type_args.iter().any(type_contains_infer),
     }
 }
 

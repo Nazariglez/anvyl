@@ -5,7 +5,8 @@ use super::support::{
 use crate::{
     ast::{Ident, NominalKind, Type},
     typecheck::{
-        ArityError, CallTarget, ConstDiagnostic, ModuleScope, TypeError, const_term::ConstTerm,
+        ArityError, CallTarget, CallableId, ConstDiagnostic, GenericArgs, ModuleScope, TypeError,
+        const_term::ConstTerm,
     },
 };
 
@@ -54,11 +55,12 @@ fn generic_fn_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::GenericDirect {
-            module: ModuleScope::Root,
-            name: Ident::new("id"),
-            type_args: vec![Type::Int],
-            const_args: vec![],
+        &CallTarget::Callable {
+            id: CallableId::function(ModuleScope::Root, Ident::new("id")),
+            args: GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![],
+            },
         }
     );
 }
@@ -72,11 +74,12 @@ fn generic_fn_explicit_prefix_call_target_includes_inferred_suffix() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::GenericDirect {
-            module: ModuleScope::Root,
-            name: Ident::new("make"),
-            type_args: vec![Type::Int, Type::String],
-            const_args: vec![],
+        &CallTarget::Callable {
+            id: CallableId::function(ModuleScope::Root, Ident::new("make")),
+            args: GenericArgs {
+                type_args: vec![Type::Int, Type::String],
+                const_args: vec![],
+            },
         }
     );
 }
@@ -218,11 +221,12 @@ fn const_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::GenericDirect {
-            module: ModuleScope::Root,
-            name: Ident::new("len"),
-            type_args: vec![Type::Int],
-            const_args: vec![ConstTerm::from_usize(3)],
+        &CallTarget::Callable {
+            id: CallableId::function(ModuleScope::Root, Ident::new("len")),
+            args: GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![ConstTerm::from_usize(3)],
+            },
         }
     );
 }
@@ -261,17 +265,18 @@ fn generic_const_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::GenericDirect {
-            module: ModuleScope::Root,
-            name: Ident::new("len"),
-            type_args: vec![Type::Int],
-            const_args: vec![ConstTerm::from_usize(3)],
+        &CallTarget::Callable {
+            id: CallableId::function(ModuleScope::Root, Ident::new("len")),
+            args: GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![ConstTerm::from_usize(3)],
+            },
         }
     );
 }
 
 #[test]
-fn generic_const_named_call_target() {
+fn generic_const_named_target() {
     let result = typecheck(
         "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, CAP>(xs); }",
     )
@@ -279,11 +284,12 @@ fn generic_const_named_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::GenericDirect {
-            module: ModuleScope::Root,
-            name: Ident::new("len"),
-            type_args: vec![Type::Int],
-            const_args: vec![ConstTerm::from_usize(3)],
+        &CallTarget::Callable {
+            id: CallableId::function(ModuleScope::Root, Ident::new("len")),
+            args: GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![ConstTerm::from_usize(3)],
+            },
         }
     );
 }

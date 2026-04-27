@@ -1,60 +1,28 @@
 use super::{
     ConstSubst, GenericArgs, GenericParams, TypeChecker, TypeError, TypeSubst,
     call_map::CallTarget,
-    check_expr, check_expr_checked_with_hint, check_specialized_extend_body,
-    check_specialized_func_body, check_specialized_method_body,
-    const_term::ConstTerm,
+    check_expr, check_expr_checked_with_hint,
     decls::{
-        AggregateSchema, ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, FuncSig,
-        MethodSchema, ModuleScope, NominalKey, ValueDecl, VariantSchema, generic_template_type,
-        nominal_type, nominal_type_with_args,
+        AggregateSchema, CallableKind, CallableParent, CallableRef, DeclarationIndex,
+        ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, MethodSchema, ModuleScope, NominalKey,
+        ResolvedValue, ValueDecl, VariantSchema, nominal_type, owner_template,
     },
     generic_bind::bind_prefix_generic_seeds,
     infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
-    substitute,
 };
 use crate::{
-    ast::{
-        CallNode, ConstArg, ConstValue, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam,
-        Ident, Type,
-    },
+    ast::{CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, Ident, Type},
     span::Span,
 };
 
 pub(super) enum Subject {
     Value(Type),
+    NonAggregate(Type),
     Module(ModuleScope),
     Type(NominalKey),
-    NamedValue {
-        module: ModuleScope,
-        name: Ident,
-        ty: Type,
-        generic: Option<FuncSig>,
-    },
-    Method {
-        target: MethodTarget,
-        name: Ident,
-        owner_generics: GenericParams,
-        owner_args: GenericArgs,
-        generics: GenericParams,
-        params: Vec<FuncParam>,
-        ret: Type,
-    },
-    EnumVariant {
-        enum_key: NominalKey,
-        variant: Ident,
-        schema: VariantSchema,
-    },
-}
-
-pub(super) enum MethodTarget {
-    Aggregate {
-        owner: NominalKey,
-        receiver: Option<Type>,
-    },
-    Extend {
-        extend: super::ExtendId,
-        receiver: Type,
+    Callable {
+        callee: CallableRef,
+        surface_ty: Type,
     },
 }
 
@@ -112,7 +80,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
     match &expr.node.kind {
         ExprKind::Ident(name) => {
             if let Some((module, value_name, value)) = tc.lookup_named_value(*name) {
-                return Some(named_value_subject(module, value_name, &value));
+                return Some(named_value_subject(&tc.decls, module, value_name, &value));
             }
             if let Some(ty) = tc.lookup_type(*name) {
                 return Some(Subject::Value(ty));
@@ -191,11 +159,11 @@ fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> 
 
 fn subject_type(subject: &Subject) -> Type {
     match subject {
-        Subject::Value(ty) | Subject::NamedValue { ty, .. } => ty.clone(),
+        Subject::Value(ty)
+        | Subject::NonAggregate(ty)
+        | Subject::Callable { surface_ty: ty, .. } => ty.clone(),
         Subject::Module(_) => Type::Void,
         Subject::Type(key) => nominal_type(key),
-        Subject::EnumVariant { enum_key, .. } => nominal_type(enum_key),
-        Subject::Method { params, ret, .. } => func_type(params, ret),
     }
 }
 
@@ -206,12 +174,12 @@ fn apply_field(
     tc: &mut TypeChecker,
 ) -> Subject {
     match subject {
-        Subject::Value(ty) | Subject::NamedValue { ty, .. } => {
+        Subject::Value(ty) => {
             apply_value_field(ty.clone(), field.node.field, field.span, next_is_call, tc)
         }
         Subject::Module(scope) => apply_module_field(scope, field.node.field, field.span, tc),
         Subject::Type(key) => apply_type_field(key, field.node.field, field.span, tc),
-        Subject::EnumVariant { .. } | Subject::Method { .. } => {
+        Subject::NonAggregate(_) | Subject::Callable { .. } => {
             field_access_on_non_aggregate(subject, field.node.field, field.span, tc)
         }
     }
@@ -231,122 +199,68 @@ fn field_access_on_non_aggregate(
     Subject::Value(Type::Infer)
 }
 
-fn owner_member_type(receiver: &Type, generics: &GenericParams, ty: &Type) -> Type {
-    let Some(receiver) = receiver.as_aggregate() else {
-        return ty.clone();
-    };
-
-    let type_subst: TypeSubst = generics
-        .type_params
-        .iter()
-        .zip(receiver.type_args)
-        .map(|(param, arg)| (param.id, arg.clone()))
-        .collect();
-    let const_subst: ConstSubst = generics
-        .const_params
-        .iter()
-        .zip(receiver.const_args)
-        .map(|(param, arg)| (param.id, ConstTerm::from_arg(arg)))
-        .collect();
-    substitute(ty, &type_subst, &const_subst)
-}
-
 fn aggregate_method_subject(
+    decls: &DeclarationIndex,
     agg: &AggregateSchema,
     receiver: Option<Type>,
     name: Ident,
     method: &MethodSchema,
 ) -> Subject {
-    let owner_generics = agg.generics.clone();
-    let (params, ret) = match receiver.as_ref() {
-        Some(receiver) => (
-            method
-                .params
-                .iter()
-                .map(|param| {
-                    FuncParam::new(
-                        owner_member_type(receiver, &agg.generics, &param.ty),
-                        param.mutable,
-                    )
-                })
-                .collect(),
-            owner_member_type(receiver, &agg.generics, &method.ret),
-        ),
-        None => (method.params.clone(), method.ret.clone()),
-    };
-
-    Subject::Method {
-        target: MethodTarget::Aggregate {
-            owner: agg.key.clone(),
-            receiver,
-        },
-        name,
-        owner_generics,
-        owner_args: GenericArgs::empty(),
-        generics: method.generics.clone(),
-        params,
-        ret,
-    }
+    let callee = decls.callable_for_aggregate_method(agg, name, method, receiver);
+    func_callable_subject(callee)
 }
 
-fn generic_sig(value: &ValueDecl) -> Option<FuncSig> {
-    match value {
-        ValueDecl::Func(sig) if !sig.generics.is_empty() => Some(sig.clone()),
-        _ => None,
-    }
-}
-
-fn named_value_subject(module: ModuleScope, name: Ident, value: &ValueDecl) -> Subject {
-    Subject::NamedValue {
+fn named_value_subject(
+    decls: &DeclarationIndex,
+    module: ModuleScope,
+    name: Ident,
+    value: &ValueDecl,
+) -> Subject {
+    let resolved = ResolvedValue {
         module,
         name,
-        ty: value.ty().clone(),
-        generic: generic_sig(value),
+        decl: value.clone(),
+    };
+    match decls.callable_for_value(&resolved) {
+        Some(callee) => Subject::Callable {
+            callee,
+            surface_ty: value.ty().clone(),
+        },
+        None => Subject::Value(value.ty().clone()),
     }
 }
 
 fn extend_method_subject(
+    decls: &DeclarationIndex,
     receiver: Type,
     extend: &ExtendSchema,
     name: Ident,
     method: &ExtendMethodSchema,
     owner_args: GenericArgs,
-) -> Subject {
-    let (type_subst, const_subst) = extend.generics.substitutions(&owner_args);
-    let template_params = method
-        .params
-        .iter()
-        .map(|param| {
-            FuncParam::new(
-                generic_template_type(&param.ty, &extend.generics),
-                param.mutable,
-            )
-        })
-        .collect::<Vec<_>>();
-    let template_ret = generic_template_type(&method.ret, &extend.generics);
-    let params = substitute_params(&template_params, &type_subst, &const_subst);
-    let ret = substitute(&template_ret, &type_subst, &const_subst);
+) -> Option<Subject> {
+    decls
+        .callable_for_extend_method(receiver, extend, name, method, owner_args)
+        .map(func_callable_subject)
+}
 
-    Subject::Method {
-        target: MethodTarget::Extend {
-            extend: extend.id.clone(),
-            receiver,
+fn enum_variant_subject(
+    decls: &DeclarationIndex,
+    enum_key: &NominalKey,
+    variant: Ident,
+    schema: &VariantSchema,
+) -> Subject {
+    match decls.callable_for_variant(enum_key, variant, schema) {
+        Some(callee) => Subject::Callable {
+            callee,
+            surface_ty: nominal_type(enum_key),
         },
-        name,
-        owner_generics: extend.generics.clone(),
-        owner_args,
-        generics: method.generics.clone(),
-        params,
-        ret,
+        None => Subject::NonAggregate(nominal_type(enum_key)),
     }
 }
 
-fn enum_variant_subject(enum_key: &NominalKey, variant: Ident, schema: &VariantSchema) -> Subject {
-    Subject::EnumVariant {
-        enum_key: enum_key.clone(),
-        variant,
-        schema: schema.clone(),
-    }
+fn func_callable_subject(callee: CallableRef) -> Subject {
+    let surface_ty = func_type(&callee.def.sig.params, &callee.def.sig.ret);
+    Subject::Callable { callee, surface_ty }
 }
 
 fn unknown_enum_variant(
@@ -380,7 +294,7 @@ fn apply_value_field(
     }
 
     if let Some(matched) = tc.find_extend_method(&receiver, name) {
-        return match extend_method_match_subject(receiver, name, &matched) {
+        return match extend_method_match_subject(&tc.decls, receiver, name, &matched) {
             Ok(subject) => subject,
             Err(ExtendMethodError::Unbound(names)) => {
                 tc.push_unbound_generic_errors(names, span);
@@ -414,6 +328,7 @@ fn aggregate_field_subject(
     let method = agg.methods.get(&name);
     match (prefer_method, method, field_ty) {
         (true, Some(method), _) | (false, Some(method), None) => Some(aggregate_method_subject(
+            &tc.decls,
             agg,
             Some(receiver.clone()),
             name,
@@ -430,6 +345,7 @@ enum ExtendMethodError {
 }
 
 fn extend_method_match_subject(
+    decls: &DeclarationIndex,
     receiver: Type,
     name: Ident,
     matched: &ExtendMethodMatch<'_>,
@@ -439,13 +355,10 @@ fn extend_method_match_subject(
             extend,
             method,
             owner_args: Ok(owner_args),
-        } => Ok(extend_method_subject(
-            receiver,
-            extend,
-            name,
-            method,
-            owner_args.clone(),
-        )),
+        } => Ok(
+            extend_method_subject(decls, receiver, extend, name, method, owner_args.clone())
+                .unwrap_or(Subject::Value(Type::Infer)),
+        ),
         ExtendMethodMatch::Match {
             owner_args: Err(unbound),
             ..
@@ -464,7 +377,7 @@ fn apply_module_field(
         return Subject::Module(module);
     }
     if let Some((module, value_name, decl)) = tc.exported_value_in_module(scope, name) {
-        return named_value_subject(module, value_name, &decl);
+        return named_value_subject(&tc.decls, module, value_name, &decl);
     }
     if let Some(key) = tc.exported_type_in_module(scope, name) {
         return Subject::Type(key);
@@ -480,14 +393,14 @@ fn apply_module_field(
 fn apply_type_field(key: &NominalKey, name: Ident, span: Span, tc: &mut TypeChecker) -> Subject {
     if let Some(schema) = tc.decls.enum_schema(key) {
         if let Some(variant) = schema.variants.get(&name) {
-            return enum_variant_subject(&schema.key, name, variant);
+            return enum_variant_subject(&tc.decls, &schema.key, name, variant);
         }
 
         if let Some(agg) = tc.decls.aggregate(key)
             && let Some(method) = agg.methods.get(&name)
             && method.receiver.is_none()
         {
-            return aggregate_method_subject(agg, None, name, method);
+            return aggregate_method_subject(&tc.decls, agg, None, name, method);
         }
         return unknown_enum_variant(key, name, span, tc);
     }
@@ -500,7 +413,7 @@ fn apply_type_field(key: &NominalKey, name: Ident, span: Span, tc: &mut TypeChec
     if method.receiver.is_some() {
         return unknown_field(nominal_type(key), name, span, tc);
     }
-    aggregate_method_subject(agg, None, name, method)
+    aggregate_method_subject(&tc.decls, agg, None, name, method)
 }
 
 fn apply_call(
@@ -511,48 +424,13 @@ fn apply_call(
     tc: &mut TypeChecker,
 ) -> Type {
     match subject {
-        Subject::Value(ty) => call_value(ty.clone(), call, tc),
-        Subject::NamedValue {
-            module,
-            name,
-            ty,
-            generic,
-        } => call_named_value(
-            module,
-            *name,
-            ty.clone(),
-            generic.as_ref(),
-            call,
-            call_id,
-            expected,
-            tc,
-        ),
-        Subject::Method {
-            target,
-            name,
-            owner_generics,
-            owner_args,
-            generics,
-            params,
-            ret,
-        } => {
-            let method = MethodCall {
-                target,
-                name: *name,
-                owner_generics,
-                owner_args,
-                generics,
-                params,
-                ret,
-            };
-            call_method(method, call, call_id, expected, tc)
+        Subject::Callable { callee, .. } => {
+            check_callable_call(callee, call, call_id, expected, tc)
         }
-        Subject::EnumVariant {
-            enum_key,
-            variant,
-            schema,
-        } => call_enum_variant(enum_key, *variant, schema, call, call_id, expected, tc),
-        Subject::Module(_) | Subject::Type(_) => not_callable(subject_type(subject), call, tc),
+        Subject::Value(ty) => call_value(ty.clone(), call, tc),
+        Subject::NonAggregate(_) | Subject::Module(_) | Subject::Type(_) => {
+            not_callable(subject_type(subject), call, tc)
+        }
     }
 }
 
@@ -566,44 +444,12 @@ fn call_value(callee_ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
     }
 }
 
-fn call_named_value(
-    module: &ModuleScope,
-    name: Ident,
-    callee_ty: Type,
-    generic: Option<&FuncSig>,
-    call: &CallNode,
-    call_id: ExprId,
-    expected: Option<TypeHandle>,
-    tc: &mut TypeChecker,
-) -> Type {
-    if let Some(sig) = generic {
-        return call_generic(module, name, sig, call, call_id, expected, tc);
-    }
-    let is_func = matches!(&callee_ty, Type::Func { .. });
-    let ret = call_value(callee_ty, call, tc);
-    if is_func {
-        tc.record_call(call_id, named_call_target(module, name));
-    }
-    ret
-}
-
 struct GenericCallInstantiation {
     args: GenericArgs,
     type_subst: TypeSubst,
     const_subst: ConstSubst,
     concrete_params: Vec<FuncParam>,
     ret: Type,
-}
-
-#[derive(Clone, Copy)]
-struct MethodCall<'a> {
-    target: &'a MethodTarget,
-    name: Ident,
-    owner_generics: &'a GenericParams,
-    owner_args: &'a GenericArgs,
-    generics: &'a GenericParams,
-    params: &'a [FuncParam],
-    ret: &'a Type,
 }
 
 fn solve_generic_call_with(
@@ -704,22 +550,6 @@ fn constrain_expected_return(
     }
 }
 
-fn substitute_params(
-    params: &[FuncParam],
-    type_subst: &TypeSubst,
-    const_subst: &ConstSubst,
-) -> Vec<FuncParam> {
-    params
-        .iter()
-        .map(|param| {
-            FuncParam::new(
-                substitute(&param.ty, type_subst, const_subst),
-                param.mutable,
-            )
-        })
-        .collect()
-}
-
 fn substitute_params_checked(
     params: &[FuncParam],
     type_subst: &TypeSubst,
@@ -738,59 +568,114 @@ fn substitute_params_checked(
         .collect()
 }
 
-fn call_generic(
-    module: &ModuleScope,
-    name: Ident,
-    sig: &FuncSig,
+fn check_callable_call(
+    callee: &CallableRef,
     call: &CallNode,
     call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> Type {
-    let Type::Func {
-        params: template_params,
-        ret: template_ret,
-    } = &sig.ty
-    else {
-        return not_callable(sig.ty.clone(), call, tc);
-    };
-    let Some(seeds) =
-        bind_prefix_generic_seeds(tc, &sig.generics, &call.node.generic_args, call.span)
-    else {
+    let Some(mut seeds) = bind_prefix_generic_seeds(
+        tc,
+        syntactic_generics(callee),
+        &call.node.generic_args,
+        call.span,
+    ) else {
         return Type::Infer;
     };
+    seed_owner_args(
+        &mut seeds,
+        &callee.def.sig.owner_generics,
+        &callee.owner_args,
+    );
+
+    let all_generics =
+        combined_generic_params(&callee.def.sig.owner_generics, &callee.def.sig.generics);
     let Some(inst) = solve_generic_call_with(
-        &sig.generics,
+        &all_generics,
         &seeds,
-        template_params,
-        template_ret,
+        &callee.def.sig.params,
+        &callee.def.sig.ret,
         call,
         expected,
         tc,
-        |_, _| {},
+        |vars, tc| constrain_callable_owner(callee, vars, call.span, tc),
     ) else {
         return Type::Infer;
     };
 
-    check_specialized_func_body(
-        module,
-        name,
-        sig,
+    let (owner_args, callable_args) = split_generic_args(
         &inst.args,
-        inst.type_subst,
-        inst.const_subst,
+        &callee.def.sig.owner_generics,
+        &callee.def.sig.generics,
+    );
+    let args = combine_generic_args(&owner_args, &callable_args);
+    let const_bindings = super::callable_const_bindings(
+        &callee.def.sig.owner_generics,
+        &owner_args,
+        &callee.def.sig.generics,
+        &callable_args,
+    );
+    let GenericCallInstantiation {
+        type_subst,
+        const_subst,
+        concrete_params,
+        ret,
+        ..
+    } = inst;
+    let body_ret = ret.clone();
+
+    super::check_specialized_callable_body(
+        callee,
+        &concrete_params,
+        body_ret,
+        &args,
+        type_subst,
+        const_subst,
+        const_bindings,
         tc,
     );
     tc.record_call(
         call_id,
-        CallTarget::GenericDirect {
-            module: module.clone(),
-            name,
-            type_args: inst.args.type_args,
-            const_args: inst.args.const_args,
+        CallTarget::Callable {
+            id: callee.def.id.clone(),
+            args,
         },
     );
-    inst.ret
+    ret
+}
+
+fn syntactic_generics(callee: &CallableRef) -> &GenericParams {
+    match callee.def.id.kind {
+        CallableKind::EnumVariant => &callee.def.sig.owner_generics,
+        CallableKind::Function
+        | CallableKind::ExternFunction
+        | CallableKind::StaticMethod
+        | CallableKind::InstanceMethod
+        | CallableKind::ExtendMethod => &callee.def.sig.generics,
+    }
+}
+
+fn constrain_callable_owner(
+    callee: &CallableRef,
+    vars: &GenericSolverVars,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    let CallableKind::InstanceMethod = callee.def.id.kind else {
+        return;
+    };
+    let Some(receiver) = &callee.receiver_ty else {
+        return;
+    };
+    let Some(CallableParent::Nominal(owner)) = &callee.def.id.parent else {
+        return;
+    };
+
+    let template = owner_template(owner, &callee.def.sig.owner_generics);
+    let owner_handle = tc.solver.instantiate_generic_type(&template, vars);
+    let receiver_handle = tc.type_handle(receiver);
+    tc.expect_equal(span, owner_handle, receiver_handle);
 }
 
 fn combine_generic_args(owner_args: &GenericArgs, method_args: &GenericArgs) -> GenericArgs {
@@ -816,20 +701,6 @@ fn seed_owner_args(seeds: &mut GenericSolverSeeds, generics: &GenericParams, arg
     }
 }
 
-fn owner_template(owner: &NominalKey, generics: &GenericParams) -> Type {
-    let type_args = generics
-        .type_params
-        .iter()
-        .map(|param| Type::Var(param.id))
-        .collect::<Vec<_>>();
-    let const_args = generics
-        .const_params
-        .iter()
-        .map(|param| ConstArg::Param(param.id))
-        .collect::<Vec<_>>();
-    nominal_type_with_args(owner, &type_args, &const_args)
-}
-
 fn split_generic_args(
     args: &GenericArgs,
     owner_generics: &GenericParams,
@@ -848,170 +719,6 @@ fn split_generic_args(
         const_args: args.const_args[owner_const_len..owner_const_len + method_const_len].to_vec(),
     };
     (owner_args, method_args)
-}
-
-fn call_method(
-    method: MethodCall<'_>,
-    call: &CallNode,
-    call_id: ExprId,
-    expected: Option<TypeHandle>,
-    tc: &mut TypeChecker,
-) -> Type {
-    let Some(mut seeds) =
-        bind_prefix_generic_seeds(tc, method.generics, &call.node.generic_args, call.span)
-    else {
-        return Type::Infer;
-    };
-    seed_owner_args(&mut seeds, method.owner_generics, method.owner_args);
-
-    let all_generics = combined_generic_params(method.owner_generics, method.generics);
-    let Some(inst) = solve_generic_call_with(
-        &all_generics,
-        &seeds,
-        method.params,
-        method.ret,
-        call,
-        expected,
-        tc,
-        |vars, tc| constrain_aggregate_method_owner(method, vars, call.span, tc),
-    ) else {
-        return Type::Infer;
-    };
-
-    let (inferred_owner_args, method_args) =
-        split_generic_args(&inst.args, method.owner_generics, method.generics);
-    let all_args = combine_generic_args(&inferred_owner_args, &method_args);
-    let const_bindings = super::combined_const_param_bindings(
-        method.owner_generics,
-        &inferred_owner_args,
-        method.generics,
-        &method_args,
-    );
-
-    let ret = if all_args.is_empty() {
-        inst.ret
-    } else {
-        check_specialized_method_like_body(method, inst, &all_args, const_bindings, tc)
-    };
-
-    tc.record_call(
-        call_id,
-        method_call_target(method.target, method.name, &all_args),
-    );
-    ret
-}
-
-fn constrain_aggregate_method_owner(
-    method: MethodCall<'_>,
-    vars: &GenericSolverVars,
-    span: Span,
-    tc: &mut TypeChecker,
-) {
-    let MethodTarget::Aggregate {
-        owner,
-        receiver: Some(receiver),
-    } = method.target
-    else {
-        return;
-    };
-
-    let template = owner_template(owner, method.owner_generics);
-    let owner_handle = tc.solver.instantiate_generic_type(&template, vars);
-    let receiver_handle = tc.type_handle(receiver);
-    tc.expect_equal(span, owner_handle, receiver_handle);
-}
-
-fn check_specialized_method_like_body(
-    method: MethodCall<'_>,
-    inst: GenericCallInstantiation,
-    args: &GenericArgs,
-    const_bindings: Vec<(Ident, ConstValue)>,
-    tc: &mut TypeChecker,
-) -> Type {
-    let GenericCallInstantiation {
-        type_subst,
-        const_subst,
-        concrete_params,
-        ret,
-        ..
-    } = inst;
-    let body_ret = ret.clone();
-
-    match method.target {
-        MethodTarget::Aggregate { owner, receiver } => check_specialized_method_body(
-            owner,
-            method.name,
-            receiver.clone(),
-            &concrete_params,
-            body_ret,
-            args,
-            type_subst,
-            const_subst,
-            const_bindings,
-            tc,
-        ),
-        MethodTarget::Extend { extend, receiver } => check_specialized_extend_body(
-            extend,
-            method.name,
-            receiver.clone(),
-            &concrete_params,
-            body_ret,
-            args,
-            type_subst,
-            const_subst,
-            const_bindings,
-            tc,
-        ),
-    }
-    ret
-}
-
-fn call_enum_variant(
-    enum_key: &NominalKey,
-    variant: Ident,
-    schema: &VariantSchema,
-    call: &CallNode,
-    call_id: ExprId,
-    expected: Option<TypeHandle>,
-    tc: &mut TypeChecker,
-) -> Type {
-    let template_params = match schema {
-        VariantSchema::Unit => vec![],
-        VariantSchema::Tuple(tys) => tys.iter().cloned().map(FuncParam::immut).collect(),
-        VariantSchema::Struct(_) => {
-            return not_callable(nominal_type(enum_key), call, tc);
-        }
-    };
-    let Some(enum_schema) = tc.decls.enum_schema(enum_key) else {
-        return Type::Infer;
-    };
-    let generics = enum_schema.generics.clone();
-    let Some(seeds) = bind_prefix_generic_seeds(tc, &generics, &call.node.generic_args, call.span)
-    else {
-        return Type::Infer;
-    };
-    let ret_template = owner_template(enum_key, &generics);
-    let Some(inst) = solve_generic_call_with(
-        &generics,
-        &seeds,
-        &template_params,
-        &ret_template,
-        call,
-        expected,
-        tc,
-        |_, _| {},
-    ) else {
-        return Type::Infer;
-    };
-
-    tc.record_call(
-        call_id,
-        CallTarget::EnumVariant {
-            enum_key: enum_key.clone(),
-            variant,
-        },
-    );
-    inst.ret
 }
 
 fn not_callable(ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
@@ -1040,35 +747,6 @@ fn non_aggregate_field(ty: Type, field: Ident, span: Span, tc: &mut TypeChecker)
 fn unknown_field(ty: Type, field: Ident, span: Span, tc: &mut TypeChecker) -> Subject {
     tc.push_error(TypeError::UnknownField { ty, field, span });
     Subject::Value(Type::Infer)
-}
-
-fn method_call_target(target: &MethodTarget, name: Ident, args: &GenericArgs) -> CallTarget {
-    match target {
-        MethodTarget::Aggregate { owner, .. } => CallTarget::Method {
-            owner: owner.clone(),
-            name,
-            type_args: args.type_args.clone(),
-            const_args: args.const_args.clone(),
-        },
-        MethodTarget::Extend { extend, receiver } => CallTarget::Extend {
-            target: super::extend_callable_id(extend, name),
-            receiver: receiver.clone(),
-            args: args.clone(),
-        },
-    }
-}
-
-fn named_call_target(module: &ModuleScope, name: Ident) -> CallTarget {
-    match module {
-        ModuleScope::Root => CallTarget::Direct {
-            module: ModuleScope::Root,
-            name,
-        },
-        ModuleScope::Named(path) => CallTarget::ModuleFunction {
-            module: path.clone(),
-            name,
-        },
-    }
 }
 
 pub(super) fn check_args(

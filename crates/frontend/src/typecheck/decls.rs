@@ -48,6 +48,57 @@ pub(crate) struct CallableId {
     pub(crate) name: Ident,
 }
 
+impl CallableId {
+    pub(crate) fn function(module: ModuleScope, name: Ident) -> Self {
+        Self {
+            module,
+            parent: None,
+            kind: CallableKind::Function,
+            name,
+        }
+    }
+
+    pub(crate) fn extern_function(module: ModuleScope, name: Ident) -> Self {
+        Self {
+            module,
+            parent: None,
+            kind: CallableKind::ExternFunction,
+            name,
+        }
+    }
+
+    pub(crate) fn aggregate_method(owner: NominalKey, name: Ident, is_instance: bool) -> Self {
+        Self {
+            module: owner.module.clone(),
+            parent: Some(CallableParent::Nominal(owner)),
+            kind: if is_instance {
+                CallableKind::InstanceMethod
+            } else {
+                CallableKind::StaticMethod
+            },
+            name,
+        }
+    }
+
+    pub(crate) fn extend_method(extend: ExtendId, name: Ident) -> Self {
+        Self {
+            module: extend.module.clone(),
+            parent: Some(CallableParent::Extend(extend)),
+            kind: CallableKind::ExtendMethod,
+            name,
+        }
+    }
+
+    pub(crate) fn enum_variant(enum_key: NominalKey, variant: Ident) -> Self {
+        Self {
+            module: enum_key.module.clone(),
+            parent: Some(CallableParent::Nominal(enum_key)),
+            kind: CallableKind::EnumVariant,
+            name: variant,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum CallableParent {
     Nominal(NominalKey),
@@ -68,12 +119,6 @@ pub(crate) enum CallableKind {
 pub(crate) struct ExtendId {
     pub(crate) module: ModuleScope,
     pub(crate) index: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct MethodId {
-    pub(crate) owner: NominalKey,
-    pub(crate) name: Ident,
 }
 
 pub(crate) struct DeclarationIndex {
@@ -170,8 +215,31 @@ impl ValueDecl {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FuncSig {
+    pub(crate) kind: CallableKind,
     pub(crate) generics: GenericParams,
     pub(crate) ty: Type,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CallableSig {
+    pub(crate) owner_generics: GenericParams,
+    pub(crate) generics: GenericParams,
+    pub(crate) params: Vec<FuncParam>,
+    pub(crate) ret: Type,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CallableDef {
+    pub(crate) id: CallableId,
+    pub(crate) receiver: Option<MethodReceiver>,
+    pub(crate) sig: CallableSig,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CallableRef {
+    pub(crate) def: CallableDef,
+    pub(crate) receiver_ty: Option<Type>,
+    pub(crate) owner_args: GenericArgs,
 }
 
 #[derive(Clone)]
@@ -220,6 +288,7 @@ pub(crate) struct ExtendSchema {
 }
 
 pub(crate) struct ExtendMethodSchema {
+    pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) ret: Type,
@@ -394,6 +463,7 @@ impl DeclarationIndex {
                         module: scope.clone(),
                         name: func.name,
                         decl: ValueDecl::Func(FuncSig {
+                            kind: CallableKind::Function,
                             generics: generic_params(&func.type_params, &func.const_params),
                             ty,
                         }),
@@ -497,6 +567,7 @@ impl DeclarationIndex {
                         module: scope.clone(),
                         name: ext.name,
                         decl: ValueDecl::Func(FuncSig {
+                            kind: CallableKind::ExternFunction,
                             generics: GenericParams::default(),
                             ty,
                         }),
@@ -543,10 +614,20 @@ impl DeclarationIndex {
                     let mut methods = HashMap::new();
                     for method_node in &ext.methods {
                         let m = &method_node.node;
-                        let params = m.params.split_first().map_or(&[][..], |(_, params)| params);
+                        let (receiver, params) = m.params.split_first().map_or(
+                            (None, &[][..]),
+                            |(self_param, params)| {
+                                let receiver = match self_param.mutability {
+                                    Mutability::Mutable => MethodReceiver::Var,
+                                    Mutability::Immutable => MethodReceiver::Value,
+                                };
+                                (Some(receiver), params)
+                            },
+                        );
                         methods.insert(
                             m.name,
                             ExtendMethodSchema {
+                                receiver,
                                 generics: GenericParams::default(),
                                 params: resolve_func_params(params),
                                 ret: m.ret.clone(),
@@ -886,9 +967,161 @@ impl DeclarationIndex {
             _ => Some(most_specific_extend(candidates)),
         }
     }
+
+    pub(crate) fn callable_for_value(&self, value: &ResolvedValue) -> Option<CallableRef> {
+        let ValueDecl::Func(sig) = &value.decl else {
+            return None;
+        };
+        let Type::Func { params, ret } = &sig.ty else {
+            return None;
+        };
+        let id = match sig.kind {
+            CallableKind::Function => CallableId::function(value.module.clone(), value.name),
+            CallableKind::ExternFunction => {
+                CallableId::extern_function(value.module.clone(), value.name)
+            }
+            CallableKind::StaticMethod
+            | CallableKind::InstanceMethod
+            | CallableKind::ExtendMethod
+            | CallableKind::EnumVariant => return None,
+        };
+
+        Some(CallableRef {
+            def: CallableDef {
+                id,
+                receiver: None,
+                sig: CallableSig {
+                    owner_generics: GenericParams::default(),
+                    generics: sig.generics.clone(),
+                    params: params.clone(),
+                    ret: (**ret).clone(),
+                },
+            },
+            receiver_ty: None,
+            owner_args: GenericArgs::empty(),
+        })
+    }
+
+    pub(crate) fn callable_for_aggregate_method(
+        &self,
+        aggregate: &AggregateSchema,
+        name: Ident,
+        method: &MethodSchema,
+        receiver_ty: Option<Type>,
+    ) -> CallableRef {
+        let params = match receiver_ty.as_ref() {
+            Some(receiver) => method
+                .params
+                .iter()
+                .map(|param| {
+                    FuncParam::new(
+                        substitute_aggregate_member(receiver, &aggregate.generics, &param.ty),
+                        param.mutable,
+                    )
+                })
+                .collect(),
+            None => method.params.clone(),
+        };
+        let ret = receiver_ty.as_ref().map_or_else(
+            || method.ret.clone(),
+            |receiver| substitute_aggregate_member(receiver, &aggregate.generics, &method.ret),
+        );
+
+        CallableRef {
+            def: CallableDef {
+                id: CallableId::aggregate_method(
+                    aggregate.key.clone(),
+                    name,
+                    method.receiver.is_some(),
+                ),
+                receiver: method.receiver,
+                sig: CallableSig {
+                    owner_generics: aggregate.generics.clone(),
+                    generics: method.generics.clone(),
+                    params,
+                    ret,
+                },
+            },
+            receiver_ty,
+            owner_args: GenericArgs::empty(),
+        }
+    }
+
+    pub(crate) fn callable_for_extend_method(
+        &self,
+        receiver_ty: Type,
+        extend: &ExtendSchema,
+        name: Ident,
+        method: &ExtendMethodSchema,
+        owner_args: GenericArgs,
+    ) -> Option<CallableRef> {
+        let receiver = method.receiver?;
+        let (type_subst, const_subst) = extend.generics.substitutions(&owner_args);
+        let template_params = method
+            .params
+            .iter()
+            .map(|param| {
+                FuncParam::new(
+                    generic_template_type(&param.ty, &extend.generics),
+                    param.mutable,
+                )
+            })
+            .collect::<Vec<_>>();
+        let template_ret = generic_template_type(&method.ret, &extend.generics);
+
+        Some(CallableRef {
+            def: CallableDef {
+                id: CallableId::extend_method(extend.id.clone(), name),
+                receiver: Some(receiver),
+                sig: CallableSig {
+                    owner_generics: extend.generics.clone(),
+                    generics: method.generics.clone(),
+                    params: substitute_func_params(&template_params, &type_subst, &const_subst),
+                    ret: substitute(&template_ret, &type_subst, &const_subst),
+                },
+            },
+            receiver_ty: Some(receiver_ty),
+            owner_args,
+        })
+    }
+
+    pub(crate) fn callable_for_variant(
+        &self,
+        enum_key: &NominalKey,
+        variant: Ident,
+        schema: &VariantSchema,
+    ) -> Option<CallableRef> {
+        let params = match schema {
+            VariantSchema::Unit => vec![],
+            VariantSchema::Tuple(types) => types.iter().cloned().map(FuncParam::immut).collect(),
+            VariantSchema::Struct(_) => return None,
+        };
+        let enum_schema = self.enum_schema(enum_key)?;
+        let owner_generics = enum_schema.generics.clone();
+        let ret = owner_template(enum_key, &owner_generics);
+
+        Some(CallableRef {
+            def: CallableDef {
+                id: CallableId::enum_variant(enum_key.clone(), variant),
+                receiver: None,
+                sig: CallableSig {
+                    owner_generics,
+                    generics: GenericParams::default(),
+                    params,
+                    ret,
+                },
+            },
+            receiver_ty: None,
+            owner_args: GenericArgs::empty(),
+        })
+    }
 }
 
-fn substitute_aggregate_member(receiver: &Type, generics: &GenericParams, ty: &Type) -> Type {
+pub(crate) fn substitute_aggregate_member(
+    receiver: &Type,
+    generics: &GenericParams,
+    ty: &Type,
+) -> Type {
     let Some(receiver) = receiver.as_aggregate() else {
         return ty.clone();
     };
@@ -909,6 +1142,36 @@ fn substitute_aggregate_member(receiver: &Type, generics: &GenericParams, ty: &T
         return ty.clone();
     }
     substitute(ty, &type_subst, &const_subst)
+}
+
+fn substitute_func_params(
+    params: &[FuncParam],
+    type_subst: &TypeSubst,
+    const_subst: &ConstSubst,
+) -> Vec<FuncParam> {
+    params
+        .iter()
+        .map(|param| {
+            FuncParam::new(
+                substitute(&param.ty, type_subst, const_subst),
+                param.mutable,
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn owner_template(owner: &NominalKey, generics: &GenericParams) -> Type {
+    let type_args = generics
+        .type_params
+        .iter()
+        .map(|param| Type::Var(param.id))
+        .collect::<Vec<_>>();
+    let const_args = generics
+        .const_params
+        .iter()
+        .map(|param| ConstArg::Param(param.id))
+        .collect::<Vec<_>>();
+    nominal_type_with_args(owner, &type_args, &const_args)
 }
 
 struct ExtendCandidate<'a> {
@@ -1435,6 +1698,122 @@ mod tests {
             .expect("missing import");
 
         assert_eq!(value.module, scope("a"));
+    }
+
+    #[test]
+    fn callable_for_value_distinguishes_function_extern_and_const() {
+        let index = index(
+            "fn f<T>(x: T) -> T { x } extern fn e(x: int) -> int; const C = 1;",
+            &[],
+        );
+        let func = index.local_value(&ModuleScope::Root, ident("f")).unwrap();
+        let ext = index.local_value(&ModuleScope::Root, ident("e")).unwrap();
+        let konst = index.local_value(&ModuleScope::Root, ident("C")).unwrap();
+
+        let func = index.callable_for_value(&func).unwrap();
+        let ext = index.callable_for_value(&ext).unwrap();
+
+        assert_eq!(func.def.id.kind, CallableKind::Function);
+        assert_eq!(ext.def.id.kind, CallableKind::ExternFunction);
+        assert!(index.callable_for_value(&konst).is_none());
+    }
+
+    #[test]
+    fn callable_for_aggregate_methods_keeps_kind_receiver_and_member_types() {
+        let index = index(
+            "struct Box<T> { value: T, fn make(value: T) -> T { value } fn get(self, fallback: T) -> T { self.value } }",
+            &[],
+        );
+        let key = index.local_type(&ModuleScope::Root, ident("Box")).unwrap();
+        let aggregate = index.aggregate(&key).unwrap();
+        let receiver = Type::nominal(
+            NominalKind::Struct,
+            ident("Box"),
+            vec![Type::Int],
+            vec![],
+            None,
+        );
+        let static_method = aggregate.methods.get(&ident("make")).unwrap();
+        let instance_method = aggregate.methods.get(&ident("get")).unwrap();
+
+        let static_ref =
+            index.callable_for_aggregate_method(aggregate, ident("make"), static_method, None);
+        let instance_ref = index.callable_for_aggregate_method(
+            aggregate,
+            ident("get"),
+            instance_method,
+            Some(receiver.clone()),
+        );
+
+        assert_eq!(static_ref.def.id.kind, CallableKind::StaticMethod);
+        assert_eq!(instance_ref.def.id.kind, CallableKind::InstanceMethod);
+        assert_eq!(instance_ref.receiver_ty, Some(receiver));
+        assert_eq!(
+            instance_ref.def.sig.params,
+            vec![FuncParam::immut(Type::Int)]
+        );
+        assert_eq!(instance_ref.def.sig.ret, Type::Int);
+    }
+
+    #[test]
+    fn callable_for_extend_method_keeps_lookup_owner_args() {
+        let index = index("extend<T> T { fn id(self, x: T) -> T { x } }", &[]);
+        let ExtendMethodMatch::Match {
+            extend,
+            method,
+            owner_args: Ok(owner_args),
+        } = index
+            .find_extend_method(&Type::Int, ident("id"), |_| true)
+            .unwrap()
+        else {
+            panic!("expected extend match");
+        };
+        let callable = index
+            .callable_for_extend_method(Type::Int, extend, ident("id"), method, owner_args.clone())
+            .unwrap();
+
+        assert_eq!(callable.def.id.kind, CallableKind::ExtendMethod);
+        assert_eq!(callable.owner_args, owner_args);
+        assert_eq!(callable.receiver_ty, Some(Type::Int));
+        assert_eq!(callable.def.receiver, Some(MethodReceiver::Value));
+        assert_eq!(callable.def.sig.params, vec![FuncParam::immut(Type::Int)]);
+        assert_eq!(callable.def.sig.ret, Type::Int);
+    }
+
+    #[test]
+    fn callable_for_enum_variants_models_unit_tuple_and_rejects_struct() {
+        let index = index("enum E<T> { A, B(T), C { x: T } }", &[]);
+        let key = index.local_type(&ModuleScope::Root, ident("E")).unwrap();
+        let enm = index.enum_schema(&key).unwrap();
+
+        let unit = index
+            .callable_for_variant(&key, ident("A"), enm.variants.get(&ident("A")).unwrap())
+            .unwrap();
+        let tuple = index
+            .callable_for_variant(&key, ident("B"), enm.variants.get(&ident("B")).unwrap())
+            .unwrap();
+
+        assert_eq!(unit.def.id.kind, CallableKind::EnumVariant);
+        assert!(unit.def.sig.params.is_empty());
+        assert_eq!(
+            tuple.def.sig.params,
+            vec![FuncParam::immut(Type::Var(TypeVarId(0)))]
+        );
+        assert_eq!(
+            tuple.def.sig.ret,
+            Type::nominal(
+                NominalKind::Enum,
+                ident("E"),
+                vec![Type::Var(TypeVarId(0))],
+                vec![],
+                None
+            )
+        );
+        assert!(
+            index
+                .callable_for_variant(&key, ident("C"), enm.variants.get(&ident("C")).unwrap())
+                .is_none()
+        );
     }
 
     #[test]

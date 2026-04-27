@@ -1,15 +1,12 @@
 use super::support::{
     assert_calls, assert_err, assert_err_count, assert_no_infer_vars_in_result, assert_type,
-    assert_type_with_modules, errors, typecheck,
+    assert_type_with_modules, errors, typecheck, typecheck_with_named_modules,
 };
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
         CallTarget, GenericArgs, TypeError, TypecheckResult,
-        decls::{
-            CallableId, CallableKind, CallableParent, ExtendId, ModuleScope, NominalKey,
-            VariantSchema,
-        },
+        decls::{CallableId, ExtendId, ModuleScope, NominalKey, VariantSchema},
     },
 };
 
@@ -402,16 +399,22 @@ mod method_calls {
         result: &TypecheckResult,
         owner: &str,
         name: &str,
+        is_instance: bool,
         type_args: Vec<Type>,
     ) {
         let target = result.calls().values().next().expect("missing call target");
         assert_eq!(
             target,
-            &CallTarget::Method {
-                owner: root_key(NominalKind::Struct, owner),
-                name: Ident::new(name),
-                type_args,
-                const_args: vec![],
+            &CallTarget::Callable {
+                id: CallableId::aggregate_method(
+                    root_key(NominalKind::Struct, owner),
+                    Ident::new(name),
+                    is_instance,
+                ),
+                args: GenericArgs {
+                    type_args,
+                    const_args: vec![],
+                },
             }
         );
     }
@@ -454,7 +457,7 @@ mod method_calls {
             "struct Point { x: int, fn len(self) -> int { 0 } } fn main() { let p = Point { x: 1 }; p.len(); }",
         )
         .unwrap();
-        assert_method_target(&result, "Point", "len", vec![]);
+        assert_method_target(&result, "Point", "len", true, vec![]);
     }
 
     #[test]
@@ -541,7 +544,7 @@ mod method_calls {
             "struct Foo { fn make<T>(x: T) -> T { x } } fn main() { Foo.make<int>(42); }",
         )
         .unwrap();
-        assert_method_target(&result, "Foo", "make", vec![Type::Int]);
+        assert_method_target(&result, "Foo", "make", false, vec![Type::Int]);
     }
 
     #[test]
@@ -550,7 +553,7 @@ mod method_calls {
             "struct Wrapper<T> { value: T, fn new(value: T) -> Self { Wrapper { value: value } } } fn main() { Wrapper.new(42); }",
         )
         .unwrap();
-        assert_method_target(&result, "Wrapper", "new", vec![Type::Int]);
+        assert_method_target(&result, "Wrapper", "new", false, vec![Type::Int]);
     }
 
     #[test]
@@ -700,23 +703,19 @@ mod extend_calls {
         result: &TypecheckResult,
         index: usize,
         name: &str,
-        receiver: Type,
         type_args: Vec<Type>,
     ) {
         let target = result.calls().values().next().expect("missing call target");
         assert_eq!(
             target,
-            &CallTarget::Extend {
-                target: CallableId {
-                    module: ModuleScope::Root,
-                    parent: Some(CallableParent::Extend(ExtendId {
+            &CallTarget::Callable {
+                id: CallableId::extend_method(
+                    ExtendId {
                         module: ModuleScope::Root,
                         index,
-                    })),
-                    kind: CallableKind::ExtendMethod,
-                    name: Ident::new(name),
-                },
-                receiver,
+                    },
+                    Ident::new(name),
+                ),
                 args: GenericArgs {
                     type_args,
                     const_args: vec![],
@@ -775,7 +774,7 @@ mod extend_calls {
             "extend int { fn double(self) -> int { self * 2 } } fn main() { 5.double(); }",
         )
         .unwrap();
-        assert_extend_target(&result, 0, "double", Type::Int, vec![]);
+        assert_extend_target(&result, 0, "double", vec![]);
     }
 
     #[test]
@@ -856,7 +855,7 @@ mod extend_calls {
     fn generic_call_target() {
         let result =
             typecheck("extend<T> T { fn id(self) -> T { self } } fn main() { 1.id(); }").unwrap();
-        assert_extend_target(&result, 0, "id", Type::Int, vec![Type::Int]);
+        assert_extend_target(&result, 0, "id", vec![Type::Int]);
     }
 
     #[test]
@@ -897,6 +896,22 @@ mod extend_calls {
             "fn mul2(x: int) -> int { x * 2 } extend<T> T { fn duplicate(self) -> T { mul2(self) } } fn main() { true.duplicate(); }",
             2,
         );
+    }
+
+    #[test]
+    fn generic_public_extend_template_index_counts_private_extends() {
+        let result = typecheck_with_named_modules(
+            "import ext { * }; fn main() { 1.bad(); }",
+            &[(
+                "ext",
+                "extend bool { fn keep(self) -> bool { self } } pub extend string { fn keep(self) -> string { self } } pub extend<T> T { fn bad(self) -> T { true } }",
+            )],
+        );
+        let Err(errors) = result else {
+            panic!("expected generic extend body error");
+        };
+
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]

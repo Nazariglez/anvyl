@@ -4,7 +4,11 @@ use super::support::{
 use crate::{
     ast::{Ident, Type},
     resolve::ModulePath,
-    typecheck::{call_map::CallTarget, decls::ModuleScope},
+    typecheck::{
+        GenericArgs,
+        call_map::CallTarget,
+        decls::{CallableId, ModuleScope},
+    },
 };
 
 const FIXED_BUF_MOD: &str = "pub struct FixedBuf<T, N: int> { data: [T; N] }";
@@ -182,11 +186,15 @@ fn reexport_alias_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::GenericDirect {
-            module: ModuleScope::Named(ModulePath::new(vec!["tools".to_string()])),
-            name: Ident::new("id"),
-            type_args: vec![Type::Int],
-            const_args: vec![],
+        &CallTarget::Callable {
+            id: CallableId::function(
+                ModuleScope::Named(ModulePath::new(vec!["tools".to_string()])),
+                Ident::new("id"),
+            ),
+            args: GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![],
+            },
         }
     );
 }
@@ -384,11 +392,15 @@ fn qualified_reexport_alias_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::GenericDirect {
-            module: ModuleScope::Named(ModulePath::new(vec!["tools".to_string()])),
-            name: Ident::new("id"),
-            type_args: vec![Type::Int],
-            const_args: vec![],
+        &CallTarget::Callable {
+            id: CallableId::function(
+                ModuleScope::Named(ModulePath::new(vec!["tools".to_string()])),
+                Ident::new("id"),
+            ),
+            args: GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![],
+            },
         }
     );
 }
