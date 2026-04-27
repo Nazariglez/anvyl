@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::{
     GenericArgs,
+    const_term::ConstTerm,
     decls::{CallableId, ModuleScope, NominalKey},
 };
 use crate::ast::{ExprId, Ident, Type};
@@ -18,7 +19,7 @@ pub(crate) enum CallTarget {
         module: ModuleScope,
         name: Ident,
         type_args: Vec<Type>,
-        const_args: Vec<usize>,
+        const_args: Vec<ConstTerm>,
     },
     ModuleFunction {
         module: crate::resolve::ModulePath,
@@ -28,7 +29,7 @@ pub(crate) enum CallTarget {
         owner: NominalKey,
         name: Ident,
         type_args: Vec<Type>,
-        const_args: Vec<usize>,
+        const_args: Vec<ConstTerm>,
     },
     Extend {
         target: CallableId,

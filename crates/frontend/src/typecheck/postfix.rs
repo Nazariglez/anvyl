@@ -2,7 +2,8 @@ use super::{
     ArityError, ConstSubst, GenericArgs, GenericParams, TypeChecker, TypeError, TypeSubst,
     call_map::CallTarget,
     check_expr, check_expr_checked_with_hint, check_specialized_extend_body,
-    check_specialized_func_body, check_specialized_method_body, const_arg_usize,
+    check_specialized_func_body, check_specialized_method_body,
+    const_term::ConstTerm,
     decls::{
         AggregateSchema, ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, FuncSig,
         MethodSchema, ModuleScope, NominalKey, ValueDecl, VariantSchema, generic_template_type,
@@ -244,7 +245,7 @@ fn owner_member_type(receiver: &Type, generics: &GenericParams, ty: &Type) -> Ty
         .const_params
         .iter()
         .zip(receiver.const_args)
-        .filter_map(|(param, arg)| const_arg_usize(arg).map(|value| (param.id, value)))
+        .map(|(param, arg)| (param.id, ConstTerm::from_arg(arg)))
         .collect();
     substitute(ty, &type_subst, &const_subst)
 }
@@ -636,10 +637,10 @@ fn explicit_generic_seeds(
                 .insert(generics.type_params[index].id, tc.resolve_type_for_tc(ty));
         } else {
             let const_index = index - generics.type_params.len();
-            let value = tc.eval_generic_const_arg_usize(arg, span)?;
+            let term = tc.eval_generic_const_term(arg, span)?;
             seeds
                 .const_args
-                .insert(generics.const_params[const_index].id, value);
+                .insert(generics.const_params[const_index].id, term);
         }
     }
     Some(seeds)
@@ -678,6 +679,18 @@ fn solve_generic_call_with(
         return None;
     }
 
+    let error_count = tc.errors.len();
+    for param in template_params {
+        tc.substitute_checked(&param.ty, &seeds.type_args, &seeds.const_args, call.span);
+    }
+    tc.substitute_checked(template_ret, &seeds.type_args, &seeds.const_args, call.span);
+    if tc.errors.len() != error_count {
+        for arg in &call.node.args {
+            check_expr(arg, tc);
+        }
+        return None;
+    }
+
     let vars = tc.solver.generic_solver_vars(generics, seeds, call.span);
     add_constraints(&vars, tc);
     let mut failed = tc.solve_constraints();
@@ -701,8 +714,9 @@ fn solve_generic_call_with(
     };
 
     let (type_subst, const_subst) = generics.substitutions(&args);
-    let concrete_params = substitute_params(template_params, &type_subst, &const_subst);
-    let ret = substitute(template_ret, &type_subst, &const_subst);
+    let concrete_params =
+        substitute_params_checked(template_params, &type_subst, &const_subst, call.span, tc);
+    let ret = tc.substitute_checked(template_ret, &type_subst, &const_subst, call.span);
 
     Some(GenericCallInstantiation {
         args,
@@ -759,6 +773,24 @@ fn substitute_params(
         .map(|param| {
             FuncParam::new(
                 substitute(&param.ty, type_subst, const_subst),
+                param.mutable,
+            )
+        })
+        .collect()
+}
+
+fn substitute_params_checked(
+    params: &[FuncParam],
+    type_subst: &TypeSubst,
+    const_subst: &ConstSubst,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Vec<FuncParam> {
+    params
+        .iter()
+        .map(|param| {
+            FuncParam::new(
+                tc.substitute_checked(&param.ty, type_subst, const_subst, span),
                 param.mutable,
             )
         })
@@ -837,8 +869,8 @@ fn seed_owner_args(seeds: &mut GenericSolverSeeds, generics: &GenericParams, arg
     for (param, ty) in generics.type_params.iter().zip(&args.type_args) {
         seeds.type_args.insert(param.id, ty.clone());
     }
-    for (param, value) in generics.const_params.iter().zip(&args.const_args) {
-        seeds.const_args.insert(param.id, *value);
+    for (param, term) in generics.const_params.iter().zip(&args.const_args) {
+        seeds.const_args.insert(param.id, term.clone());
     }
 }
 

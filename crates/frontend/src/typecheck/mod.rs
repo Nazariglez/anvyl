@@ -2,6 +2,7 @@ use std::{collections::HashMap, rc::Rc};
 
 pub(crate) use self::{call_map::*, decls::*, generic::*, result::*};
 use self::{
+    const_term::ConstTerm,
     infer::{LocalTypeId, Solver, SolverFinalizeError, SolverRelationError, TypeHandle},
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor},
@@ -14,6 +15,7 @@ use crate::{
 
 mod call_map;
 mod const_eval;
+mod const_term;
 mod decls;
 mod generic;
 mod infer;
@@ -304,6 +306,46 @@ impl TypeFolder for ConstNormalizer<'_> {
 
     fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
         self.tc.normalize_array_len(len, self.span)
+    }
+}
+
+struct CheckedSubstituter<'a, 'tc> {
+    tc: &'tc mut TypeChecker,
+    span: Span,
+    types: &'a TypeSubst,
+    consts: &'a ConstSubst,
+}
+
+impl TypeFolder for CheckedSubstituter<'_, '_> {
+    fn fold_var(&mut self, id: TypeVarId) -> Type {
+        self.types.get(&id).cloned().unwrap_or(Type::Var(id))
+    }
+
+    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
+        match arg {
+            ConstArg::Param(id) => self
+                .consts
+                .get(id)
+                .and_then(ConstTerm::to_arg_no_infer)
+                .unwrap_or_else(|| arg.clone()),
+            ConstArg::Value(_) | ConstArg::Name(_) => arg.clone(),
+        }
+    }
+
+    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
+        match len {
+            ArrayLen::Param(id) => match self.consts.get(&id).cloned() {
+                Some(term) => self
+                    .tc
+                    .array_len_from_term(term, self.span)
+                    .unwrap_or(ArrayLen::Infer),
+                None => ArrayLen::Param(id),
+            },
+            other => self
+                .tc
+                .array_len_from_term(ConstTerm::from_array_len(other), self.span)
+                .unwrap_or(ArrayLen::Infer),
+        }
     }
 }
 
@@ -672,11 +714,10 @@ impl TypeChecker {
 
     fn resolve_type_for_tc(&mut self, ty: &Type) -> Type {
         let resolved = self.resolve_type_ref(ty);
-        let substituted = match self.type_substs.last() {
+        let substituted = match self.type_substs.last().cloned() {
             Some(ts) => {
-                let empty = ConstSubst::new();
-                let cs = self.const_substs.last().unwrap_or(&empty);
-                substitute(&resolved, ts, cs)
+                let cs = self.const_substs.last().cloned().unwrap_or_default();
+                self.substitute_checked(&resolved, &ts, &cs, Span::new(0, 0))
             }
             None => resolved,
         };
@@ -687,41 +728,125 @@ impl TypeChecker {
         ConstNormalizer { tc: self, span }.fold_type(ty)
     }
 
-    fn normalize_const_arg(&mut self, arg: &ConstArg, span: Span) -> ConstArg {
-        match arg {
-            ConstArg::Name(name) => match self.eval_visible_const(*name, span) {
-                Some(Ok(value)) => ConstArg::Value(value),
+    fn substitute_checked(
+        &mut self,
+        ty: &Type,
+        types: &TypeSubst,
+        consts: &ConstSubst,
+        span: Span,
+    ) -> Type {
+        CheckedSubstituter {
+            tc: self,
+            span,
+            types,
+            consts,
+        }
+        .fold_type(ty)
+    }
+
+    fn normalize_const_term(&mut self, term: ConstTerm, span: Span) -> ConstTerm {
+        match term {
+            ConstTerm::Name(name) => match self.eval_visible_const(name, span) {
+                Some(Ok(value)) => ConstTerm::Value(value),
                 Some(Err(err)) => {
                     self.push_error(err);
-                    arg.clone()
+                    ConstTerm::Name(name)
                 }
-                None => arg.clone(),
+                None => ConstTerm::Name(name),
             },
-            ConstArg::Value(_) | ConstArg::Param(_) => arg.clone(),
+            ConstTerm::Value(_)
+            | ConstTerm::Param(_)
+            | ConstTerm::ArrayInfer
+            | ConstTerm::Infer(_) => term,
         }
     }
 
-    fn normalize_array_len(&mut self, len: ArrayLen, span: Span) -> ArrayLen {
-        let ArrayLen::Named(name) = len else {
-            return len;
-        };
-        match self.eval_visible_const(name, span) {
-            Some(Ok(value)) => match const_eval::const_usize(&value, span) {
-                Ok(value) => ArrayLen::Fixed(value),
-                Err(err) => {
+    fn eval_const_term(&mut self, term: ConstTerm, span: Span) -> Option<ConstTerm> {
+        match term {
+            ConstTerm::Value(_) => Some(term),
+            ConstTerm::Name(name) => match self.eval_visible_const(name, span) {
+                Some(Ok(value)) => Some(ConstTerm::Value(value)),
+                Some(Err(err)) => {
                     self.push_error(err);
-                    ArrayLen::Infer
+                    None
+                }
+                None => {
+                    self.push_error(TypeError::UnknownConst { name, span });
+                    None
                 }
             },
-            Some(Err(err)) => {
-                self.push_error(err);
-                ArrayLen::Infer
-            }
-            None => {
-                self.push_error(TypeError::UnknownConst { name, span });
-                ArrayLen::Infer
-            }
+            ConstTerm::Param(id) => match self
+                .const_substs
+                .last()
+                .and_then(|subst| subst.get(&id).cloned())
+            {
+                Some(term) => self.eval_const_term(term, span),
+                None => Some(ConstTerm::Param(id)),
+            },
+            ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
         }
+    }
+
+    fn eval_generic_const_term(&mut self, arg: &GenericArg, span: Span) -> Option<ConstTerm> {
+        let term = match arg {
+            GenericArg::Const(arg) => ConstTerm::from_arg(arg),
+            GenericArg::Type(ty) => match bare_type_name(ty) {
+                Some(name) => ConstTerm::Name(name),
+                None => {
+                    self.push_error(TypeError::GenericArgKindMismatch {
+                        expected: "const",
+                        span,
+                    });
+                    return None;
+                }
+            },
+        };
+        self.eval_const_term(term, span)
+    }
+
+    fn require_usize_const(&mut self, term: ConstTerm, span: Span) -> Option<usize> {
+        match self.eval_const_term(term, span)? {
+            ConstTerm::Value(value) => match const_eval::const_usize(&value, span) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    self.push_error(err);
+                    None
+                }
+            },
+            ConstTerm::Name(name) => {
+                self.push_error(TypeError::UnknownConst { name, span });
+                None
+            }
+            ConstTerm::Param(_) | ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
+        }
+    }
+
+    fn array_len_from_term(&mut self, term: ConstTerm, span: Span) -> Option<ArrayLen> {
+        match term {
+            ConstTerm::ArrayInfer => Some(ArrayLen::Infer),
+            ConstTerm::Param(id) => match self
+                .const_substs
+                .last()
+                .and_then(|subst| subst.get(&id).cloned())
+            {
+                Some(term) => self.array_len_from_term(term, span),
+                None => Some(ArrayLen::Param(id)),
+            },
+            ConstTerm::Value(_) | ConstTerm::Name(_) => {
+                self.require_usize_const(term, span).map(ArrayLen::Fixed)
+            }
+            ConstTerm::Infer(_) => None,
+        }
+    }
+
+    fn normalize_const_arg(&mut self, arg: &ConstArg, span: Span) -> ConstArg {
+        let term = self.normalize_const_term(ConstTerm::from_arg(arg), span);
+        term.to_arg_no_infer().unwrap_or_else(|| arg.clone())
+    }
+
+    fn normalize_array_len(&mut self, len: ArrayLen, span: Span) -> ArrayLen {
+        self.array_len_from_term(ConstTerm::from_array_len(len), span)
+            .unwrap_or(ArrayLen::Infer)
     }
 
     fn imported_value(&self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
@@ -832,7 +957,61 @@ impl TypeChecker {
         else {
             return Type::Infer;
         };
+        self.validate_nominal_args(key, &generics, &type_args, &const_args, span);
         nominal_type_with_args(key, &type_args, &const_args)
+    }
+
+    fn validate_nominal_args(
+        &mut self,
+        key: &NominalKey,
+        generics: &GenericParams,
+        type_args: &[Type],
+        const_args: &[ConstArg],
+        span: Span,
+    ) {
+        let args = GenericArgs {
+            type_args: type_args.to_vec(),
+            const_args: ConstTerm::from_args(const_args),
+        };
+        let (type_subst, const_subst) = generics.substitutions(&args);
+        match key.kind {
+            NominalKind::Struct | NominalKind::DataRef => {
+                if let Some(schema) = self.decls.aggregate(key).cloned() {
+                    for field in schema.fields.values() {
+                        self.substitute_checked(&field.ty, &type_subst, &const_subst, span);
+                    }
+                }
+            }
+            NominalKind::Enum => {
+                if let Some(variants) = self
+                    .decls
+                    .enum_schema(key)
+                    .map(|schema| schema.variants.clone())
+                {
+                    for variant in variants.values() {
+                        match variant {
+                            VariantSchema::Unit => {}
+                            VariantSchema::Tuple(params) => {
+                                for param in params {
+                                    self.substitute_checked(param, &type_subst, &const_subst, span);
+                                }
+                            }
+                            VariantSchema::Struct(fields) => {
+                                for field in fields.values() {
+                                    self.substitute_checked(
+                                        &field.ty,
+                                        &type_subst,
+                                        &const_subst,
+                                        span,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            NominalKind::Extern => {}
+        }
     }
 
     fn bind_nominal_args(
@@ -871,71 +1050,7 @@ impl TypeChecker {
     }
 
     fn bind_nominal_const_arg(&mut self, arg: &GenericArg, span: Span) -> Option<ConstArg> {
-        match self.const_arg_from_generic(arg, span)? {
-            ConstArg::Value(value) => self
-                .const_value_usize(&value, span)
-                .map(const_arg_from_usize),
-            ConstArg::Name(name) => self
-                .eval_const_name_usize(name, span)
-                .map(const_arg_from_usize),
-            ConstArg::Param(id) => Some(ConstArg::Param(id)),
-        }
-    }
-
-    fn eval_generic_const_arg_usize(&mut self, arg: &GenericArg, span: Span) -> Option<usize> {
-        let arg = self.const_arg_from_generic(arg, span)?;
-        self.eval_const_arg_usize(arg, span)
-    }
-
-    fn const_arg_from_generic(&mut self, arg: &GenericArg, span: Span) -> Option<ConstArg> {
-        match arg {
-            GenericArg::Const(arg) => Some(arg.clone()),
-            GenericArg::Type(ty) => match bare_type_name(ty) {
-                Some(name) => Some(ConstArg::Name(name)),
-                None => {
-                    self.push_error(TypeError::GenericArgKindMismatch {
-                        expected: "const",
-                        span,
-                    });
-                    None
-                }
-            },
-        }
-    }
-
-    fn eval_const_arg_usize(&mut self, arg: ConstArg, span: Span) -> Option<usize> {
-        match arg {
-            ConstArg::Value(value) => self.const_value_usize(&value, span),
-            ConstArg::Name(name) => self.eval_const_name_usize(name, span),
-            ConstArg::Param(id) => self
-                .const_substs
-                .last()
-                .and_then(|subst| subst.get(&id).copied()),
-        }
-    }
-
-    fn eval_const_name_usize(&mut self, name: Ident, span: Span) -> Option<usize> {
-        match self.eval_visible_const(name, span) {
-            Some(Ok(value)) => self.const_value_usize(&value, span),
-            Some(Err(err)) => {
-                self.push_error(err);
-                None
-            }
-            None => {
-                self.push_error(TypeError::UnknownConst { name, span });
-                None
-            }
-        }
-    }
-
-    fn const_value_usize(&mut self, value: &ConstValue, span: Span) -> Option<usize> {
-        match const_eval::const_usize(value, span) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                self.push_error(err);
-                None
-            }
-        }
+        self.eval_generic_const_term(arg, span)?.to_arg_no_infer()
     }
 }
 
@@ -1329,12 +1444,12 @@ fn check_specialized_func_body(
         .iter()
         .map(|param| {
             FuncParam::new(
-                substitute(&param.ty, &type_subst, &const_subst),
+                tc.substitute_checked(&param.ty, &type_subst, &const_subst, template.span),
                 param.mutable,
             )
         })
         .collect();
-    let ret_ty = substitute(template_ret, &type_subst, &const_subst);
+    let ret_ty = tc.substitute_checked(template_ret, &type_subst, &const_subst, template.span);
 
     let const_bindings = const_param_bindings(&sig.generics, args);
     check_with_specialization(key, type_subst, const_subst, tc, |tc| {
@@ -1470,10 +1585,12 @@ fn const_param_bindings(params: &GenericParams, args: &GenericArgs) -> Vec<(Iden
         .const_params
         .iter()
         .zip(&args.const_args)
-        .filter_map(|(param, value)| {
-            i64::try_from(*value)
-                .ok()
-                .map(|value| (param.name, ConstValue::Int(value)))
+        .filter_map(|(param, term)| match term {
+            ConstTerm::Value(value) => Some((param.name, value.clone())),
+            ConstTerm::Name(_)
+            | ConstTerm::Param(_)
+            | ConstTerm::ArrayInfer
+            | ConstTerm::Infer(_) => None,
         })
         .collect()
 }
@@ -2253,10 +2370,7 @@ impl NominalLiteralInference {
             }
         }
         for (param, arg) in generics.const_params.iter().zip(const_args) {
-            let Some(value) = const_arg_usize(&arg) else {
-                return false;
-            };
-            if !self.inf.bind_const(param.id, value) {
+            if !self.inf.bind_const(param.id, ConstTerm::from_arg(&arg)) {
                 return false;
             }
         }
@@ -2289,8 +2403,8 @@ impl NominalLiteralInference {
         false
     }
 
-    fn current_hint(&self, ty: &Type) -> Type {
-        substitute(ty, self.inf.type_subst(), self.inf.const_subst())
+    fn current_hint(&self, ty: &Type, span: Span, tc: &mut TypeChecker) -> Type {
+        tc.substitute_checked(ty, self.inf.type_subst(), self.inf.const_subst(), span)
     }
 
     fn infer_field(&mut self, template: &Type, checked: &CheckedType) {
@@ -2348,7 +2462,8 @@ impl NominalLiteralInference {
                 self.inf
                     .const_subst()
                     .get(&param.id)
-                    .map_or(ConstArg::Param(param.id), |n| const_arg_from_usize(*n))
+                    .and_then(ConstTerm::to_arg_no_infer)
+                    .unwrap_or(ConstArg::Param(param.id))
             })
             .collect::<Vec<_>>();
         nominal_type_with_args(key, &type_args, &const_args)
@@ -2473,7 +2588,8 @@ fn check_inferred_enum_checked_with_hint(
                 return checked_from_type(expr, Type::Infer, tc);
             };
             for (arg, param) in args.iter().zip(params) {
-                let expected_ty = substitute(param, &result.type_subst, &result.const_subst);
+                let expected_ty =
+                    tc.substitute_checked(param, &result.type_subst, &result.const_subst, arg.span);
                 let hint = tc.type_handle(&expected_ty);
                 check_expected(arg, hint, tc);
             }
@@ -2550,7 +2666,7 @@ fn check_nominal_fields(
         }
         match schema.get(name) {
             Some(field) => {
-                let field_hint = inf.current_hint(&field.ty);
+                let field_hint = inf.current_hint(&field.ty, value.span, tc);
                 let checked = if generics.contains_param(&field_hint) {
                     check_expr_checked(value, tc)
                 } else {
@@ -2591,7 +2707,8 @@ fn constrain_provided_fields(
     tc: &mut TypeChecker,
 ) {
     for field in fields {
-        let expected_ty = substitute(&field.template_ty, type_subst, const_subst);
+        let expected_ty =
+            tc.substitute_checked(&field.template_ty, type_subst, const_subst, field.span);
         let expected = tc.type_handle(&expected_ty);
         tc.expect_assignable(field.span, field.handle, expected);
     }
@@ -2634,7 +2751,7 @@ fn nominal_literal_type(
         let const_args = args
             .const_args
             .iter()
-            .map(|n| const_arg_from_usize(*n))
+            .filter_map(ConstTerm::to_arg_no_infer)
             .collect::<Vec<_>>();
         return nominal_type_with_args(key, &args.type_args, &const_args);
     }

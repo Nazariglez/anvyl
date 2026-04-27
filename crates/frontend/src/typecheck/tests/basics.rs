@@ -458,6 +458,20 @@ mod nominals {
     }
 
     #[test]
+    fn bool_const_arg_ok_when_not_array_len() {
+        assert_type(
+            "struct Flag<N: int> {} fn main(x: Flag<true>) -> Flag<true> { x }",
+            Type::nominal(
+                NominalKind::Struct,
+                Ident::new("Flag"),
+                vec![],
+                vec![ConstArg::Value(ConstValue::Bool(true))],
+                None,
+            ),
+        );
+    }
+
+    #[test]
     fn dataref_arity_err() {
         assert_err(&ref_buf("fn f(x: FixedBuf<int>) {} fn main() {}"));
     }
@@ -753,6 +767,52 @@ mod arrays {
         assert_type(
             "const N = 3; fn main() { let xs: [int; N] = [1, 2, 3]; xs; }",
             array(Type::Int, 3),
+        );
+    }
+
+    #[test]
+    fn unknown_const_len_err() {
+        assert_single_error(
+            "fn main() { let xs: [int; N] = []; }",
+            |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("N")),
+        );
+    }
+
+    #[test]
+    fn bool_const_len_err() {
+        assert_single_error(
+            "const B = true; fn main() { let xs: [int; B] = []; }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::ExpectedIntConst {
+                        found: Type::Bool,
+                        ..
+                    }
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn negative_const_len_err() {
+        assert_single_error(
+            "const N = -1; fn main() { let xs: [int; N] = []; }",
+            |err| matches!(err, TypeError::NegativeArrayLength { value: -1, .. }),
+        );
+    }
+
+    #[test]
+    fn nominal_const_arg_name_normalizes() {
+        assert_type(
+            "const N = 3; struct Buf<N: int> {} fn main(x: Buf<N>) -> Buf<3> { x }",
+            Type::nominal(
+                NominalKind::Struct,
+                Ident::new("Buf"),
+                vec![],
+                vec![ConstArg::Value(ConstValue::Int(3))],
+                None,
+            ),
         );
     }
 

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, TypeSubst, const_arg_from_usize,
-    const_arg_usize,
+    ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, TypeSubst,
+    const_term::{ConstInferVarId, ConstTerm},
 };
 use crate::{
     ast::{
@@ -14,9 +14,6 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 struct InferVarId(u32);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-struct ConstInferVarId(u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TyFuncParam {
@@ -46,88 +43,23 @@ struct TyFuncParts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TyConstArg {
-    Value(ConstValue),
-    Name(Ident),
-    Param(ConstParamId),
-    Infer(ConstInferVarId),
-}
-
-impl TyConstArg {
-    fn from_const_arg(arg: &ConstArg) -> Self {
-        match arg {
-            ConstArg::Value(value) => Self::Value(value.clone()),
-            ConstArg::Name(name) => Self::Name(*name),
-            ConstArg::Param(id) => Self::Param(*id),
-        }
-    }
-
-    fn from_const_args(args: &[ConstArg]) -> Vec<Self> {
-        args.iter().map(Self::from_const_arg).collect()
-    }
-
-    fn try_to_const_arg_no_infer(&self) -> Option<ConstArg> {
-        match self {
-            Self::Value(value) => Some(ConstArg::Value(value.clone())),
-            Self::Name(name) => Some(ConstArg::Name(*name)),
-            Self::Param(id) => Some(ConstArg::Param(*id)),
-            Self::Infer(_) => None,
-        }
-    }
-
-    fn try_to_const_args_no_infer(args: &[Self]) -> Option<Vec<ConstArg>> {
-        args.iter().map(Self::try_to_const_arg_no_infer).collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TyGenericArg {
     Type(Ty),
-    Const(TyConstArg),
+    Const(ConstTerm),
 }
 
 impl TyGenericArg {
     fn from_recovery_generic_arg(arg: &GenericArg) -> Self {
         match arg {
             GenericArg::Type(ty) => Self::Type(Ty::from_recovery_type(ty)),
-            GenericArg::Const(arg) => Self::Const(TyConstArg::from_const_arg(arg)),
+            GenericArg::Const(arg) => Self::Const(ConstTerm::from_arg(arg)),
         }
     }
 
     fn try_to_generic_arg_no_infer(&self) -> Option<GenericArg> {
         match self {
             Self::Type(ty) => Some(GenericArg::Type(ty.try_to_type_no_infer()?)),
-            Self::Const(arg) => Some(GenericArg::Const(arg.try_to_const_arg_no_infer()?)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TyArrayLen {
-    Fixed(usize),
-    Named(Ident),
-    Param(ConstParamId),
-    LegacyInfer,
-    Infer(ConstInferVarId),
-}
-
-impl TyArrayLen {
-    fn from_array_len(len: &ArrayLen) -> Self {
-        match len {
-            ArrayLen::Fixed(len) => Self::Fixed(*len),
-            ArrayLen::Infer => Self::LegacyInfer,
-            ArrayLen::Named(name) => Self::Named(*name),
-            ArrayLen::Param(id) => Self::Param(*id),
-        }
-    }
-
-    fn try_to_array_len_no_infer(&self) -> Option<ArrayLen> {
-        match self {
-            Self::Fixed(len) => Some(ArrayLen::Fixed(*len)),
-            Self::Named(name) => Some(ArrayLen::Named(*name)),
-            Self::Param(id) => Some(ArrayLen::Param(*id)),
-            Self::LegacyInfer => Some(ArrayLen::Infer),
-            Self::Infer(_) => None,
+            Self::Const(arg) => Some(GenericArg::Const(arg.to_arg_no_infer()?)),
         }
     }
 }
@@ -137,7 +69,7 @@ struct TyNominal {
     kind: NominalKind,
     name: Ident,
     type_args: Vec<Ty>,
-    const_args: Vec<TyConstArg>,
+    const_args: Vec<ConstTerm>,
     origin: Option<ModulePath>,
 }
 
@@ -180,7 +112,7 @@ enum Ty {
     },
     Array {
         elem: Box<Ty>,
-        len: TyArrayLen,
+        len: ConstTerm,
     },
     Map {
         key: Box<Ty>,
@@ -199,10 +131,10 @@ impl Ty {
     fn from_recovery_nominal_args(
         type_args: &[Type],
         const_args: &[ConstArg],
-    ) -> (Vec<Self>, Vec<TyConstArg>) {
+    ) -> (Vec<Self>, Vec<ConstTerm>) {
         (
             Self::from_recovery_types(type_args),
-            TyConstArg::from_const_args(const_args),
+            ConstTerm::from_args(const_args),
         )
     }
 
@@ -212,11 +144,11 @@ impl Ty {
 
     fn try_nominal_args_to_no_infer(
         type_args: &[Self],
-        const_args: &[TyConstArg],
+        const_args: &[ConstTerm],
     ) -> Option<(Vec<Type>, Vec<ConstArg>)> {
         Some((
             Self::try_types_to_no_infer(type_args)?,
-            TyConstArg::try_to_const_args_no_infer(const_args)?,
+            ConstTerm::to_args_no_infer(const_args)?,
         ))
     }
 
@@ -224,7 +156,7 @@ impl Ty {
         kind: NominalKind,
         name: Ident,
         type_args: Vec<Self>,
-        const_args: Vec<TyConstArg>,
+        const_args: Vec<ConstTerm>,
         origin: Option<ModulePath>,
     ) -> Self {
         Self::Nominal(TyNominal {
@@ -330,7 +262,7 @@ impl Ty {
             },
             Type::Array { elem, len } => Self::Array {
                 elem: Box::new(Self::from_recovery_type(elem)),
-                len: TyArrayLen::from_array_len(len),
+                len: ConstTerm::from_array_len(*len),
             },
             Type::Map { key, value } => Self::Map {
                 key: Box::new(Self::from_recovery_type(key)),
@@ -391,7 +323,7 @@ impl Ty {
             }),
             Self::Array { elem, len } => Some(Type::Array {
                 elem: Box::new(elem.try_to_type_no_infer()?),
-                len: len.try_to_array_len_no_infer()?,
+                len: len.to_array_len_no_infer()?,
             }),
             Self::Map { key, value } => Some(Type::Map {
                 key: Box::new(key.try_to_type_no_infer()?),
@@ -430,7 +362,7 @@ pub(super) struct GenericSolverSeeds {
 #[derive(Debug, Clone)]
 pub(super) struct GenericSolverVars {
     types: HashMap<TypeVarId, Ty>,
-    consts: HashMap<ConstParamId, TyConstArg>,
+    consts: HashMap<ConstParamId, ConstTerm>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -510,8 +442,8 @@ enum SolveError {
         span: Span,
     },
     ConstMismatch {
-        expected: ConstBinding,
-        found: ConstBinding,
+        expected: ConstTerm,
+        found: ConstTerm,
         span: Span,
     },
     TypeAlreadyBound {
@@ -526,8 +458,8 @@ enum SolveError {
     },
     ConstAlreadyBound {
         var: ConstInferVarId,
-        existing: ConstBinding,
-        found: ConstBinding,
+        existing: ConstTerm,
+        found: ConstTerm,
         span: Span,
     },
     ConstOccurs {
@@ -545,7 +477,7 @@ impl SolveError {
         }
     }
 
-    fn const_mismatch(expected: ConstBinding, found: ConstBinding, span: Span) -> Self {
+    fn const_mismatch(expected: ConstTerm, found: ConstTerm, span: Span) -> Self {
         Self::ConstMismatch {
             expected,
             found,
@@ -588,21 +520,6 @@ struct FinalizeCx<'a> {
     seen_consts: &'a mut HashSet<ConstInferVarId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ConstBinding {
-    Arg(TyConstArg),
-    Len(TyArrayLen),
-}
-
-impl ConstBinding {
-    fn is_self_binding(&self, var: ConstInferVarId) -> bool {
-        matches!(
-            self,
-            Self::Arg(TyConstArg::Infer(id)) | Self::Len(TyArrayLen::Infer(id)) if *id == var
-        )
-    }
-}
-
 #[derive(Debug, Default)]
 pub(super) struct Solver {
     next_type_var: u32,
@@ -610,7 +527,7 @@ pub(super) struct Solver {
     type_spans: HashMap<InferVarId, Span>,
     const_spans: HashMap<ConstInferVarId, Span>,
     type_bindings: HashMap<InferVarId, Ty>,
-    const_bindings: HashMap<ConstInferVarId, ConstBinding>,
+    const_bindings: HashMap<ConstInferVarId, ConstTerm>,
     nil_vars: HashSet<InferVarId>,
     local_types: Vec<Ty>,
     temp_types: Vec<Ty>,
@@ -650,10 +567,11 @@ impl Solver {
             .const_params
             .iter()
             .map(|param| {
-                let arg = seeds.const_args.get(&param.id).map_or_else(
-                    || self.fresh_const(span),
-                    |value| TyConstArg::from_const_arg(&const_arg_from_usize(*value)),
-                );
+                let arg = seeds
+                    .const_args
+                    .get(&param.id)
+                    .cloned()
+                    .unwrap_or_else(|| self.fresh_const(span));
                 (param.id, arg)
             })
             .collect();
@@ -713,7 +631,7 @@ impl Solver {
         &self,
         id: ConstParamId,
         vars: &GenericSolverVars,
-    ) -> Option<usize> {
+    ) -> Option<ConstTerm> {
         let arg = vars.consts.get(&id)?;
         self.finalized_generic_const_arg(arg)
     }
@@ -737,7 +655,7 @@ impl Solver {
 
     pub(super) fn array_handle(&mut self, elem: TypeHandle, len: ArrayLen) -> TypeHandle {
         let elem = self.resolve_ref(&elem.0);
-        let len = TyArrayLen::from_array_len(&len);
+        let len = ConstTerm::from_array_len(len);
         self.temp_handle(Ty::Array {
             elem: Box::new(elem),
             len,
@@ -1002,14 +920,14 @@ impl Solver {
         &self,
         arg: &ConstArg,
         vars: &GenericSolverVars,
-    ) -> TyConstArg {
+    ) -> ConstTerm {
         match arg {
             ConstArg::Param(id) => vars
                 .consts
                 .get(id)
                 .cloned()
-                .unwrap_or(TyConstArg::Param(*id)),
-            ConstArg::Value(_) | ConstArg::Name(_) => TyConstArg::from_const_arg(arg),
+                .unwrap_or(ConstTerm::Param(*id)),
+            ConstArg::Value(_) | ConstArg::Name(_) => ConstTerm::from_arg(arg),
         }
     }
 
@@ -1017,35 +935,24 @@ impl Solver {
         &self,
         len: &ArrayLen,
         vars: &GenericSolverVars,
-    ) -> TyArrayLen {
+    ) -> ConstTerm {
         match len {
             ArrayLen::Param(id) => vars
                 .consts
                 .get(id)
-                .map(Self::const_slot_to_array_len)
-                .unwrap_or(TyArrayLen::Param(*id)),
+                .cloned()
+                .unwrap_or(ConstTerm::Param(*id)),
             ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Named(_) => {
-                TyArrayLen::from_array_len(len)
+                ConstTerm::from_array_len(*len)
             }
         }
     }
 
-    fn const_slot_to_array_len(arg: &TyConstArg) -> TyArrayLen {
-        match arg {
-            TyConstArg::Value(ConstValue::Int(value)) => {
-                usize::try_from(*value).map_or(TyArrayLen::LegacyInfer, TyArrayLen::Fixed)
-            }
-            TyConstArg::Value(_) => TyArrayLen::LegacyInfer,
-            TyConstArg::Name(name) => TyArrayLen::Named(*name),
-            TyConstArg::Param(id) => TyArrayLen::Param(*id),
-            TyConstArg::Infer(id) => TyArrayLen::Infer(*id),
-        }
-    }
-
-    fn finalized_generic_const_arg(&self, arg: &TyConstArg) -> Option<usize> {
-        match self.resolve_const_arg(arg) {
-            TyConstArg::Value(value) => const_arg_usize(&ConstArg::Value(value)),
-            TyConstArg::Infer(_) | TyConstArg::Name(_) | TyConstArg::Param(_) => None,
+    fn finalized_generic_const_arg(&self, arg: &ConstTerm) -> Option<ConstTerm> {
+        let resolved = self.resolve_const(arg);
+        match resolved {
+            ConstTerm::Value(_) | ConstTerm::Name(_) | ConstTerm::Param(_) => Some(resolved),
+            ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
         }
     }
 
@@ -1115,18 +1022,11 @@ impl Solver {
         Ty::Infer(id)
     }
 
-    fn fresh_const(&mut self, span: Span) -> TyConstArg {
+    fn fresh_const(&mut self, span: Span) -> ConstTerm {
         let id = ConstInferVarId(self.next_const_var);
         self.next_const_var += 1;
         self.const_spans.insert(id, span);
-        TyConstArg::Infer(id)
-    }
-
-    fn fresh_array_len(&mut self, span: Span) -> TyArrayLen {
-        match self.fresh_const(span) {
-            TyConstArg::Infer(id) => TyArrayLen::Infer(id),
-            TyConstArg::Value(_) | TyConstArg::Name(_) | TyConstArg::Param(_) => unreachable!(),
-        }
+        ConstTerm::Infer(id)
     }
 
     fn fresh_nil_type(&mut self, span: Span) -> Ty {
@@ -1376,7 +1276,7 @@ impl Solver {
                 },
             ) => Ok(Ty::Array {
                 elem: self.relate_boxed(span, *elem, *found_elem, TyRelation::Equal)?,
-                len: self.unify_array_len_equal(span, len, found_len)?,
+                len: self.unify_const_equal(span, len, found_len)?,
             }),
             (
                 Ty::Map { key, value },
@@ -1472,7 +1372,7 @@ impl Solver {
                 },
             ) => Ok(Ty::Array {
                 elem: self.relate_boxed(span, *to_elem, *elem, TyRelation::Assignable)?,
-                len: self.unify_array_len_equal(span, len, to_len)?,
+                len: self.unify_const_equal(span, len, to_len)?,
             }),
             (
                 Ty::Map { key, value },
@@ -1576,7 +1476,7 @@ impl Solver {
                     Ok(TyGenericArg::Type(self.unify_tys_equal(span, left, right)?))
                 }
                 (TyGenericArg::Const(left), TyGenericArg::Const(right)) => Ok(TyGenericArg::Const(
-                    self.unify_const_arg_equal(span, left, right)?,
+                    self.unify_const_equal(span, left, right)?,
                 )),
                 _ => Err(SolveError::type_mismatch(
                     expected.clone(),
@@ -1590,70 +1490,38 @@ impl Solver {
     fn relate_const_arg_lists(
         &mut self,
         span: Span,
-        expected: Vec<TyConstArg>,
-        found: Vec<TyConstArg>,
-    ) -> Result<Vec<TyConstArg>, SolveError> {
+        expected: Vec<ConstTerm>,
+        found: Vec<ConstTerm>,
+    ) -> Result<Vec<ConstTerm>, SolveError> {
         expected
             .into_iter()
             .zip(found)
-            .map(|(expected, found)| self.unify_const_arg_equal(span, expected, found))
+            .map(|(expected, found)| self.unify_const_equal(span, expected, found))
             .collect()
     }
 
-    fn unify_const_arg_equal(
+    fn unify_const_equal(
         &mut self,
         span: Span,
-        left: TyConstArg,
-        right: TyConstArg,
-    ) -> Result<TyConstArg, SolveError> {
-        let left = self.resolve_const_arg(&left);
-        let right = self.resolve_const_arg(&right);
+        left: ConstTerm,
+        right: ConstTerm,
+    ) -> Result<ConstTerm, SolveError> {
+        let left = self.resolve_const(&left);
+        let right = self.resolve_const(&right);
         if left == right {
             return Ok(left);
         }
         match (left, right) {
-            (TyConstArg::Infer(id), arg) => {
-                self.bind_const_arg(id, arg, span)?;
-                Ok(self.resolve_const_arg(&TyConstArg::Infer(id)))
+            (ConstTerm::ArrayInfer, term) | (term, ConstTerm::ArrayInfer) => Ok(term),
+            (ConstTerm::Infer(id), term) => {
+                self.bind_const(id, term, span)?;
+                Ok(self.resolve_const(&ConstTerm::Infer(id)))
             }
-            (arg, TyConstArg::Infer(id)) => {
-                self.bind_const_arg(id, arg, span)?;
-                Ok(self.resolve_const_arg(&TyConstArg::Infer(id)))
+            (term, ConstTerm::Infer(id)) => {
+                self.bind_const(id, term, span)?;
+                Ok(self.resolve_const(&ConstTerm::Infer(id)))
             }
-            (expected, found) => Err(SolveError::const_mismatch(
-                ConstBinding::Arg(expected),
-                ConstBinding::Arg(found),
-                span,
-            )),
-        }
-    }
-
-    fn unify_array_len_equal(
-        &mut self,
-        span: Span,
-        left: TyArrayLen,
-        right: TyArrayLen,
-    ) -> Result<TyArrayLen, SolveError> {
-        let left = self.resolve_array_len(&left);
-        let right = self.resolve_array_len(&right);
-        if left == right {
-            return Ok(left);
-        }
-        match (left, right) {
-            (TyArrayLen::LegacyInfer, len) | (len, TyArrayLen::LegacyInfer) => Ok(len),
-            (TyArrayLen::Infer(id), len) => {
-                self.bind_array_len(id, len, span)?;
-                Ok(self.resolve_array_len(&TyArrayLen::Infer(id)))
-            }
-            (len, TyArrayLen::Infer(id)) => {
-                self.bind_array_len(id, len, span)?;
-                Ok(self.resolve_array_len(&TyArrayLen::Infer(id)))
-            }
-            (expected, found) => Err(SolveError::const_mismatch(
-                ConstBinding::Len(expected),
-                ConstBinding::Len(found),
-                span,
-            )),
+            (expected, found) => Err(SolveError::const_mismatch(expected, found, span)),
         }
     }
 
@@ -1727,37 +1595,18 @@ impl Solver {
         }
     }
 
-    fn bind_const_arg(
-        &mut self,
-        var: ConstInferVarId,
-        arg: TyConstArg,
-        span: Span,
-    ) -> Result<(), SolveError> {
-        let found = ConstBinding::Arg(self.resolve_const_arg(&arg));
-        self.bind_const(var, found, span)
-    }
-
-    fn bind_array_len(
-        &mut self,
-        var: ConstInferVarId,
-        len: TyArrayLen,
-        span: Span,
-    ) -> Result<(), SolveError> {
-        let found = ConstBinding::Len(self.resolve_array_len(&len));
-        self.bind_const(var, found, span)
-    }
-
     fn bind_const(
         &mut self,
         var: ConstInferVarId,
-        found: ConstBinding,
+        found: ConstTerm,
         span: Span,
     ) -> Result<(), SolveError> {
+        let found = self.resolve_const(&found);
         if found.is_self_binding(var) {
             return Ok(());
         }
         if let Some(bound) = self.const_bindings.get(&var) {
-            let existing = self.resolve_const_binding(bound);
+            let existing = self.resolve_const(bound);
             if existing == found {
                 return Ok(());
             }
@@ -1768,7 +1617,7 @@ impl Solver {
                 span,
             });
         }
-        if self.const_occurs_in_binding(var, &found) {
+        if self.const_occurs_in_term(var, &found) {
             return Err(SolveError::ConstOccurs { var, span });
         }
         self.const_bindings.insert(var, found);
@@ -1793,19 +1642,16 @@ impl Solver {
         types.iter().map(|ty| self.resolve_ty(ty)).collect()
     }
 
-    fn resolve_const_args(&self, args: &[TyConstArg]) -> Vec<TyConstArg> {
-        args.iter().map(|arg| self.resolve_const_arg(arg)).collect()
+    fn resolve_consts(&self, args: &[ConstTerm]) -> Vec<ConstTerm> {
+        args.iter().map(|arg| self.resolve_const(arg)).collect()
     }
 
     fn resolve_nominal_args(
         &self,
         type_args: &[Ty],
-        const_args: &[TyConstArg],
-    ) -> (Vec<Ty>, Vec<TyConstArg>) {
-        (
-            self.resolve_tys(type_args),
-            self.resolve_const_args(const_args),
-        )
+        const_args: &[ConstTerm],
+    ) -> (Vec<Ty>, Vec<ConstTerm>) {
+        (self.resolve_tys(type_args), self.resolve_consts(const_args))
     }
 
     fn resolve_nominal(&self, nominal: &TyNominal) -> Ty {
@@ -1847,9 +1693,7 @@ impl Solver {
                     .iter()
                     .map(|arg| match arg {
                         TyGenericArg::Type(ty) => TyGenericArg::Type(self.resolve_ty(ty)),
-                        TyGenericArg::Const(arg) => {
-                            TyGenericArg::Const(self.resolve_const_arg(arg))
-                        }
+                        TyGenericArg::Const(arg) => TyGenericArg::Const(self.resolve_const(arg)),
                     })
                     .collect(),
             },
@@ -1866,7 +1710,7 @@ impl Solver {
             },
             Ty::Array { elem, len } => Ty::Array {
                 elem: Box::new(self.resolve_ty(elem)),
-                len: self.resolve_array_len(len),
+                len: self.resolve_const(len),
             },
             Ty::Map { key, value } => Ty::Map {
                 key: Box::new(self.resolve_ty(key)),
@@ -1887,47 +1731,16 @@ impl Solver {
         }
     }
 
-    fn resolve_const_binding(&self, binding: &ConstBinding) -> ConstBinding {
-        match binding {
-            ConstBinding::Arg(arg) => ConstBinding::Arg(self.resolve_const_arg(arg)),
-            ConstBinding::Len(len) => ConstBinding::Len(self.resolve_array_len(len)),
-        }
-    }
-
-    fn resolve_const_arg(&self, arg: &TyConstArg) -> TyConstArg {
-        match arg {
-            TyConstArg::Infer(id) => match self.const_bindings.get(id) {
-                Some(ConstBinding::Arg(arg)) => self.resolve_const_arg(arg),
-                Some(ConstBinding::Len(TyArrayLen::Fixed(len))) => {
-                    let len = i64::try_from(*len).expect("const len exceeds int range");
-                    TyConstArg::Value(ConstValue::Int(len))
-                }
-                Some(ConstBinding::Len(TyArrayLen::Named(name))) => TyConstArg::Name(*name),
-                Some(ConstBinding::Len(TyArrayLen::Param(id))) => TyConstArg::Param(*id),
-                Some(ConstBinding::Len(TyArrayLen::LegacyInfer)) => TyConstArg::Infer(*id),
-                Some(ConstBinding::Len(TyArrayLen::Infer(other))) => TyConstArg::Infer(*other),
-                None => TyConstArg::Infer(*id),
-            },
-            TyConstArg::Value(_) | TyConstArg::Name(_) | TyConstArg::Param(_) => arg.clone(),
-        }
-    }
-
-    fn resolve_array_len(&self, len: &TyArrayLen) -> TyArrayLen {
-        match len {
-            TyArrayLen::Infer(id) => match self.const_bindings.get(id) {
-                Some(ConstBinding::Len(len)) => self.resolve_array_len(len),
-                Some(ConstBinding::Arg(TyConstArg::Value(ConstValue::Int(value)))) => {
-                    usize::try_from(*value).map_or(TyArrayLen::Infer(*id), TyArrayLen::Fixed)
-                }
-                Some(ConstBinding::Arg(TyConstArg::Name(name))) => TyArrayLen::Named(*name),
-                Some(ConstBinding::Arg(TyConstArg::Param(id))) => TyArrayLen::Param(*id),
-                Some(ConstBinding::Arg(TyConstArg::Infer(other))) => TyArrayLen::Infer(*other),
-                Some(ConstBinding::Arg(TyConstArg::Value(_))) | None => TyArrayLen::Infer(*id),
-            },
-            TyArrayLen::Fixed(_)
-            | TyArrayLen::Named(_)
-            | TyArrayLen::Param(_)
-            | TyArrayLen::LegacyInfer => len.clone(),
+    fn resolve_const(&self, term: &ConstTerm) -> ConstTerm {
+        match term {
+            ConstTerm::Infer(id) => self
+                .const_bindings
+                .get(id)
+                .map_or(ConstTerm::Infer(*id), |term| self.resolve_const(term)),
+            ConstTerm::Value(_)
+            | ConstTerm::Name(_)
+            | ConstTerm::Param(_)
+            | ConstTerm::ArrayInfer => term.clone(),
         }
     }
 
@@ -1969,28 +1782,8 @@ impl Solver {
         }
     }
 
-    fn const_occurs_in_binding(&self, var: ConstInferVarId, binding: &ConstBinding) -> bool {
-        match binding {
-            ConstBinding::Arg(arg) => self.const_occurs_in_arg(var, arg),
-            ConstBinding::Len(len) => self.const_occurs_in_len(var, len),
-        }
-    }
-
-    fn const_occurs_in_arg(&self, var: ConstInferVarId, arg: &TyConstArg) -> bool {
-        match self.resolve_const_arg(arg) {
-            TyConstArg::Infer(id) => id == var,
-            TyConstArg::Value(_) | TyConstArg::Name(_) | TyConstArg::Param(_) => false,
-        }
-    }
-
-    fn const_occurs_in_len(&self, var: ConstInferVarId, len: &TyArrayLen) -> bool {
-        match self.resolve_array_len(len) {
-            TyArrayLen::Infer(id) => id == var,
-            TyArrayLen::Fixed(_)
-            | TyArrayLen::Named(_)
-            | TyArrayLen::Param(_)
-            | TyArrayLen::LegacyInfer => false,
-        }
+    fn const_occurs_in_term(&self, var: ConstInferVarId, term: &ConstTerm) -> bool {
+        matches!(self.resolve_const(term), ConstTerm::Infer(id) if id == var)
     }
 
     fn finalize_ty(&self, ty: &Ty) -> (Type, Vec<InferError>) {
@@ -2110,7 +1903,7 @@ impl Solver {
 
     fn finalize_const_args(
         &self,
-        args: Vec<TyConstArg>,
+        args: Vec<ConstTerm>,
         cx: &mut FinalizeCx<'_>,
     ) -> Option<Vec<ConstArg>> {
         args.into_iter()
@@ -2129,27 +1922,30 @@ impl Solver {
         }
     }
 
-    fn finalize_const_arg(&self, arg: TyConstArg, cx: &mut FinalizeCx<'_>) -> Option<ConstArg> {
-        match self.resolve_const_arg(&arg) {
-            TyConstArg::Value(value) => Some(ConstArg::Value(value)),
-            TyConstArg::Name(name) => Some(ConstArg::Name(name)),
-            TyConstArg::Param(id) => Some(ConstArg::Param(id)),
-            TyConstArg::Infer(id) => {
+    fn finalize_const_arg(&self, arg: ConstTerm, cx: &mut FinalizeCx<'_>) -> Option<ConstArg> {
+        match self.resolve_const(&arg) {
+            ConstTerm::Infer(id) => {
                 self.push_unresolved_const(id, cx);
                 None
             }
+            ConstTerm::ArrayInfer => None,
+            term => term.to_arg_no_infer(),
         }
     }
 
-    fn finalize_array_len(&self, len: TyArrayLen, cx: &mut FinalizeCx<'_>) -> Option<ArrayLen> {
-        match self.resolve_array_len(&len) {
-            TyArrayLen::Fixed(len) => Some(ArrayLen::Fixed(len)),
-            TyArrayLen::Named(name) => Some(ArrayLen::Named(name)),
-            TyArrayLen::Param(id) => Some(ArrayLen::Param(id)),
-            TyArrayLen::LegacyInfer => Some(ArrayLen::Infer),
-            TyArrayLen::Infer(id) => {
+    fn finalize_array_len(&self, len: ConstTerm, cx: &mut FinalizeCx<'_>) -> Option<ArrayLen> {
+        match self.resolve_const(&len) {
+            ConstTerm::Infer(id) => {
                 self.push_unresolved_const(id, cx);
                 None
+            }
+            term => {
+                let len = term.to_array_len_no_infer();
+                debug_assert!(
+                    len.is_some(),
+                    "invalid const value cannot finalize as array length"
+                );
+                len
             }
         }
     }
@@ -2208,8 +2004,8 @@ impl Solver {
 
     fn const_mismatch_error(
         &self,
-        expected: &ConstBinding,
-        found: &ConstBinding,
+        expected: &ConstTerm,
+        found: &ConstTerm,
         span: Span,
     ) -> SolverRelationError {
         SolverRelationError::ConstMismatch {
@@ -2219,20 +2015,8 @@ impl Solver {
         }
     }
 
-    fn const_diagnostic(&self, binding: &ConstBinding) -> ConstDiagnostic {
-        match self.resolve_const_binding(binding) {
-            ConstBinding::Arg(TyConstArg::Value(value)) => ConstDiagnostic::Value(value),
-            ConstBinding::Arg(TyConstArg::Name(name)) => ConstDiagnostic::Name(name),
-            ConstBinding::Len(TyArrayLen::Fixed(len)) => {
-                let value = i64::try_from(len).expect("array length exceeds int range");
-                ConstDiagnostic::Value(ConstValue::Int(value))
-            }
-            ConstBinding::Len(TyArrayLen::Named(name)) => ConstDiagnostic::Name(name),
-            ConstBinding::Arg(TyConstArg::Param(_) | TyConstArg::Infer(_))
-            | ConstBinding::Len(
-                TyArrayLen::Param(_) | TyArrayLen::LegacyInfer | TyArrayLen::Infer(_),
-            ) => ConstDiagnostic::Unknown,
-        }
+    fn const_diagnostic(&self, term: &ConstTerm) -> ConstDiagnostic {
+        self.resolve_const(term).diagnostic()
     }
 }
 
@@ -2297,7 +2081,7 @@ mod tests {
     fn fixed_array(elem: Ty, len: usize) -> Ty {
         Ty::Array {
             elem: Box::new(elem),
-            len: TyArrayLen::Fixed(len),
+            len: ConstTerm::from_usize(len),
         }
     }
 
@@ -2417,7 +2201,7 @@ mod tests {
             solver.finalize_generic_args(&generics, &vars),
             Ok(GenericArgs {
                 type_args: vec![],
-                const_args: vec![3],
+                const_args: vec![ConstTerm::from_usize(3)],
             }),
         );
     }
@@ -2474,6 +2258,10 @@ mod tests {
         assert_roundtrip(Type::Array {
             elem: Box::new(Type::Bool),
             len: ArrayLen::Param(const_param(2)),
+        });
+        assert_roundtrip(Type::Array {
+            elem: Box::new(Type::String),
+            len: ArrayLen::Infer,
         });
     }
 
@@ -2628,8 +2416,8 @@ mod tests {
         let ty1 = solver.fresh_type(span(3, 4));
         let c0 = solver.fresh_const(span(5, 6));
         let c1 = solver.fresh_const(span(7, 8));
-        let l0 = solver.fresh_array_len(span(9, 10));
-        let l1 = solver.fresh_array_len(span(11, 12));
+        let l0 = solver.fresh_const(span(9, 10));
+        let l1 = solver.fresh_const(span(11, 12));
         assert_ne!(ty0, ty1);
         assert_ne!(c0, c1);
         assert_ne!(l0, l1);
@@ -2681,7 +2469,7 @@ mod tests {
         };
         let recursive = Ty::Array {
             elem: Box::new(Ty::Infer(var)),
-            len: TyArrayLen::Fixed(1),
+            len: ConstTerm::from_usize(1),
         };
         assert_eq!(
             solver.bind_type(var, recursive, span(4, 8)),
@@ -2715,47 +2503,47 @@ mod tests {
     #[test]
     fn const_len_bindings() {
         let mut solver = Solver::default();
-        let TyConstArg::Infer(arg_var) = solver.fresh_const(span(1, 2)) else {
+        let ConstTerm::Infer(arg_var) = solver.fresh_const(span(1, 2)) else {
             panic!("expected fresh const var");
         };
-        let TyArrayLen::Infer(len_var) = solver.fresh_array_len(span(3, 4)) else {
+        let ConstTerm::Infer(len_var) = solver.fresh_const(span(3, 4)) else {
             panic!("expected fresh array len var");
         };
         solver
-            .bind_const_arg(arg_var, TyConstArg::Value(ConstValue::Int(8)), span(5, 6))
+            .bind_const(arg_var, ConstTerm::Value(ConstValue::Int(8)), span(5, 6))
             .expect("const arg bind should succeed");
         solver
-            .bind_array_len(len_var, TyArrayLen::Fixed(4), span(7, 8))
+            .bind_const(len_var, ConstTerm::from_usize(4), span(7, 8))
             .expect("array len bind should succeed");
         assert_eq!(
-            solver.resolve_const_arg(&TyConstArg::Infer(arg_var)),
-            TyConstArg::Value(ConstValue::Int(8))
+            solver.resolve_const(&ConstTerm::Infer(arg_var)),
+            ConstTerm::Value(ConstValue::Int(8))
         );
         assert_eq!(
-            solver.resolve_array_len(&TyArrayLen::Infer(arg_var)),
-            TyArrayLen::Fixed(8)
+            solver.resolve_const(&ConstTerm::Infer(arg_var)),
+            ConstTerm::from_usize(8)
         );
         assert_eq!(
-            solver.resolve_const_arg(&TyConstArg::Infer(len_var)),
-            TyConstArg::Value(ConstValue::Int(4))
+            solver.resolve_const(&ConstTerm::Infer(len_var)),
+            ConstTerm::Value(ConstValue::Int(4))
         );
     }
 
     #[test]
     fn const_rebind() {
         let mut solver = Solver::default();
-        let TyConstArg::Infer(var) = solver.fresh_const(span(1, 2)) else {
+        let ConstTerm::Infer(var) = solver.fresh_const(span(1, 2)) else {
             panic!("expected fresh const var");
         };
         solver
-            .bind_const_arg(var, TyConstArg::Value(ConstValue::Int(1)), span(3, 4))
+            .bind_const(var, ConstTerm::Value(ConstValue::Int(1)), span(3, 4))
             .expect("initial bind should succeed");
         assert_eq!(
-            solver.bind_array_len(var, TyArrayLen::Fixed(2), span(5, 6)),
+            solver.bind_const(var, ConstTerm::from_usize(2), span(5, 6)),
             Err(SolveError::ConstAlreadyBound {
                 var,
-                existing: ConstBinding::Arg(TyConstArg::Value(ConstValue::Int(1))),
-                found: ConstBinding::Len(TyArrayLen::Fixed(2)),
+                existing: ConstTerm::Value(ConstValue::Int(1)),
+                found: ConstTerm::from_usize(2),
                 span: span(5, 6),
             })
         );
@@ -2826,10 +2614,43 @@ mod tests {
                 ty_ref(fixed_array(Ty::Int, 4)),
             ),
             Err(SolveError::ConstMismatch {
-                expected: ConstBinding::Len(TyArrayLen::Fixed(3)),
-                found: ConstBinding::Len(TyArrayLen::Fixed(4)),
+                expected: ConstTerm::from_usize(3),
+                found: ConstTerm::from_usize(4),
                 span: span(5, 6),
             })
+        );
+    }
+
+    #[test]
+    fn array_infer_unifies_with_fixed_length() {
+        let mut solver = Solver::default();
+        let wildcard = Ty::Array {
+            elem: Box::new(Ty::Int),
+            len: ConstTerm::ArrayInfer,
+        };
+        let fixed = fixed_array(Ty::Int, 5);
+        let result = solver
+            .unify_equal(span(1, 2), ty_ref(wildcard), ty_ref(fixed.clone()))
+            .expect("array wildcard length should unify");
+        assert_eq!(result, fixed);
+    }
+
+    #[test]
+    fn unresolved_const_infer_finalizes_error() {
+        let mut solver = Solver::default();
+        let term = solver.fresh_const(span(3, 4));
+        let ty = Ty::nominal(
+            NominalKind::Struct,
+            ident("Buf"),
+            vec![],
+            vec![term],
+            Some(origin(&["pkg"])),
+        );
+        let (finalized, errors) = solver.finalize_ty(&ty);
+        assert_eq!(finalized, Type::Infer);
+        assert_eq!(
+            errors,
+            vec![InferError::UnresolvedConst { span: span(3, 4) }]
         );
     }
 
@@ -3084,29 +2905,29 @@ mod tests {
     #[test]
     fn equal_nominal_const_args() {
         let mut solver = Solver::default();
-        let TyConstArg::Infer(n) = solver.fresh_const(span(1, 2)) else {
+        let ConstTerm::Infer(n) = solver.fresh_const(span(1, 2)) else {
             panic!("expected const infer var");
         };
         let left = Ty::nominal(
             NominalKind::Struct,
             ident("Buf"),
             vec![Ty::Int],
-            vec![TyConstArg::Infer(n)],
+            vec![ConstTerm::Infer(n)],
             None,
         );
         let right = Ty::nominal(
             NominalKind::Struct,
             ident("Buf"),
             vec![Ty::Int],
-            vec![TyConstArg::Value(ConstValue::Int(8))],
+            vec![ConstTerm::Value(ConstValue::Int(8))],
             None,
         );
         solver
             .unify_equal(span(3, 4), ty_ref(left), ty_ref(right))
             .expect("nominal const arg should bind");
         assert_eq!(
-            solver.resolve_const_arg(&TyConstArg::Infer(n)),
-            TyConstArg::Value(ConstValue::Int(8))
+            solver.resolve_const(&ConstTerm::Infer(n)),
+            ConstTerm::Value(ConstValue::Int(8))
         );
     }
 

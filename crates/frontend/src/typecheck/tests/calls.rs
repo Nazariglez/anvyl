@@ -4,7 +4,7 @@ use super::support::{
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
-    typecheck::{CallTarget, ConstDiagnostic, ModuleScope, TypeError},
+    typecheck::{CallTarget, ConstDiagnostic, ModuleScope, TypeError, const_term::ConstTerm},
 };
 
 fn option_type(inner: Type) -> Type {
@@ -173,7 +173,7 @@ fn const_target() {
             module: ModuleScope::Root,
             name: Ident::new("len"),
             type_args: vec![Type::Int],
-            const_args: vec![3],
+            const_args: vec![ConstTerm::from_usize(3)],
         }
     );
 }
@@ -216,7 +216,7 @@ fn generic_const_call_target() {
             module: ModuleScope::Root,
             name: Ident::new("len"),
             type_args: vec![Type::Int],
-            const_args: vec![3],
+            const_args: vec![ConstTerm::from_usize(3)],
         }
     );
 }
@@ -227,6 +227,30 @@ fn generic_const_arg_kind_mismatch() {
         "fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<3, int>(xs); }",
     );
     assert!(result.is_err(), "expected generic arg kind mismatch");
+}
+
+#[test]
+fn explicit_generic_bool_used_as_array_len_err() {
+    assert_single_error(
+        "fn take<N: int>(xs: [int; N]) {} fn main() { take<true>([]); }",
+        |err| {
+            matches!(
+                err,
+                TypeError::ExpectedIntConst {
+                    found: Type::Bool,
+                    ..
+                }
+            )
+        },
+    );
+}
+
+#[test]
+fn explicit_generic_negative_used_as_array_len_err() {
+    assert_single_error(
+        "const NEG = -1; fn take<N: int>(xs: [int; N]) {} fn main() { take<NEG>([]); }",
+        |err| matches!(err, TypeError::NegativeArrayLength { value: -1, .. }),
+    );
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::{
+    const_term::ConstTerm,
     decls::CallableId,
     type_ops::{TypeFolder, TypeVisitor},
 };
@@ -13,19 +14,7 @@ use crate::{
 };
 
 pub(crate) type TypeSubst = HashMap<TypeVarId, Type>;
-pub(crate) type ConstSubst = HashMap<ConstParamId, usize>;
-
-pub(crate) fn const_arg_from_usize(n: usize) -> ConstArg {
-    let n = i64::try_from(n).expect("const arg exceeds int range");
-    ConstArg::Value(ConstValue::Int(n))
-}
-
-pub(crate) fn const_arg_usize(arg: &ConstArg) -> Option<usize> {
-    match arg {
-        ConstArg::Value(ConstValue::Int(value)) => usize::try_from(*value).ok(),
-        ConstArg::Value(_) | ConstArg::Name(_) | ConstArg::Param(_) => None,
-    }
-}
+pub(crate) type ConstSubst = HashMap<ConstParamId, ConstTerm>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ArityError {
@@ -56,7 +45,7 @@ impl GenericParams {
             .const_params
             .iter()
             .zip(&args.const_args)
-            .map(|(param, value)| (param.id, *value))
+            .map(|(param, term)| (param.id, term.clone()))
             .collect();
         (types, consts)
     }
@@ -129,7 +118,7 @@ impl TypeVisitor for ContainsGenericParam<'_> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct GenericArgs {
     pub(crate) type_args: Vec<Type>,
-    pub(crate) const_args: Vec<usize>,
+    pub(crate) const_args: Vec<ConstTerm>,
 }
 
 impl GenericArgs {
@@ -164,12 +153,12 @@ impl Inference {
         true
     }
 
-    pub(crate) fn bind_const(&mut self, id: ConstParamId, val: usize) -> bool {
+    pub(crate) fn bind_const(&mut self, id: ConstParamId, term: ConstTerm) -> bool {
         match self.consts.get(&id) {
-            Some(&existing) if existing != val => return false,
+            Some(existing) if existing != &term => return false,
             Some(_) => {}
             None => {
-                self.consts.insert(id, val);
+                self.consts.insert(id, term);
             }
         }
         true
@@ -219,7 +208,7 @@ impl Inference {
         let const_args = params
             .const_params
             .iter()
-            .map(|p| self.consts.get(&p.id).copied())
+            .map(|p| self.consts.get(&p.id).cloned())
             .collect::<Option<Vec<_>>>();
         match (type_args, const_args) {
             (Some(type_args), Some(const_args)) => Ok(GenericArgs {
@@ -255,15 +244,18 @@ fn infer_all<'a>(
 }
 
 fn infer_len(template: &ArrayLen, concrete: &ArrayLen, inf: &mut Inference) -> bool {
-    match (template, concrete) {
-        (ArrayLen::Param(id), ArrayLen::Fixed(n)) => inf.bind_const(*id, *n),
+    match template {
+        ArrayLen::Param(id) => match concrete {
+            ArrayLen::Infer => false,
+            _ => inf.bind_const(*id, ConstTerm::from_array_len(*concrete)),
+        },
         _ => template == concrete,
     }
 }
 
 fn infer_const_arg(template: &ConstArg, concrete: &ConstArg, inf: &mut Inference) -> bool {
     match template {
-        ConstArg::Param(id) => const_arg_usize(concrete).is_some_and(|n| inf.bind_const(*id, n)),
+        ConstArg::Param(id) => inf.bind_const(*id, ConstTerm::from_arg(concrete)),
         _ => template == concrete,
     }
 }
@@ -390,15 +382,6 @@ pub(crate) enum Specificity {
     LessSpecific,
     Equal,
     Incomparable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConstTerm {
-    Int(usize),
-    Infer,
-    Name(Ident),
-    Param(ConstParamId),
-    Value(ConstValue),
 }
 
 #[derive(Default)]
@@ -560,22 +543,11 @@ fn cover_const(id: ConstParamId, term: ConstTerm, cover: &mut Cover<'_>) -> bool
 }
 
 fn const_term_len(len: ArrayLen) -> ConstTerm {
-    match len {
-        ArrayLen::Fixed(n) => ConstTerm::Int(n),
-        ArrayLen::Infer => ConstTerm::Infer,
-        ArrayLen::Named(name) => ConstTerm::Name(name),
-        ArrayLen::Param(id) => ConstTerm::Param(id),
-    }
+    ConstTerm::from_array_len(len)
 }
 
 fn const_term_arg(arg: &ConstArg) -> ConstTerm {
-    match arg {
-        ConstArg::Value(ConstValue::Int(n)) => usize::try_from(*n)
-            .map_or_else(|_| ConstTerm::Value(ConstValue::Int(*n)), ConstTerm::Int),
-        ConstArg::Value(value) => ConstTerm::Value(value.clone()),
-        ConstArg::Name(name) => ConstTerm::Name(*name),
-        ConstArg::Param(id) => ConstTerm::Param(*id),
-    }
+    ConstTerm::from_arg(arg)
 }
 
 struct Substituter<'a> {
@@ -593,7 +565,8 @@ impl TypeFolder for Substituter<'_> {
             ConstArg::Param(id) => self
                 .consts
                 .get(id)
-                .map_or_else(|| arg.clone(), |value| const_arg_from_usize(*value)),
+                .and_then(ConstTerm::to_arg_no_infer)
+                .unwrap_or_else(|| arg.clone()),
             ConstArg::Value(_) | ConstArg::Name(_) => arg.clone(),
         }
     }
@@ -603,7 +576,8 @@ impl TypeFolder for Substituter<'_> {
             ArrayLen::Param(id) => self
                 .consts
                 .get(&id)
-                .map_or(ArrayLen::Param(id), |value| ArrayLen::Fixed(*value)),
+                .and_then(ConstTerm::to_array_len_no_infer)
+                .unwrap_or(ArrayLen::Param(id)),
             other => other,
         }
     }
@@ -641,6 +615,10 @@ mod tests {
         ConstArg::Value(ConstValue::Int(n))
     }
 
+    fn cterm(n: usize) -> ConstTerm {
+        ConstTerm::from_usize(n)
+    }
+
     fn nominal(
         kind: NominalKind,
         name: &str,
@@ -673,7 +651,7 @@ mod tests {
 
     #[test]
     fn array_const_param() {
-        let cs = HashMap::from([(cp(0), 4)]);
+        let cs = HashMap::from([(cp(0), cterm(4))]);
         let ty = array_ty(Type::Int, ArrayLen::Param(cp(0)));
         let result = substitute(&ty, &HashMap::new(), &cs);
         assert_eq!(result, array_ty(Type::Int, ArrayLen::Fixed(4)));
@@ -682,10 +660,42 @@ mod tests {
     #[test]
     fn type_and_const() {
         let ts = HashMap::from([(tv(0), Type::String)]);
-        let cs = HashMap::from([(cp(1), 3)]);
+        let cs = HashMap::from([(cp(1), cterm(3))]);
         let ty = array_ty(Type::Var(tv(0)), ArrayLen::Param(cp(1)));
         let result = substitute(&ty, &ts, &cs);
         assert_eq!(result, array_ty(Type::String, ArrayLen::Fixed(3)));
+    }
+
+    #[test]
+    fn substitute_nominal_const_param_to_bool() {
+        let cs = HashMap::from([(cp(0), ConstTerm::Value(ConstValue::Bool(true)))]);
+        let ty = struct_const("Flag", vec![], vec![ConstArg::Param(cp(0))]);
+        let result = substitute(&ty, &HashMap::new(), &cs);
+        assert_eq!(
+            result,
+            struct_const(
+                "Flag",
+                vec![],
+                vec![ConstArg::Value(ConstValue::Bool(true))],
+            ),
+        );
+    }
+
+    #[test]
+    fn substitute_array_const_param_to_name() {
+        let name = Ident::new("N");
+        let cs = HashMap::from([(cp(0), ConstTerm::Name(name))]);
+        let ty = array_ty(Type::Int, ArrayLen::Param(cp(0)));
+        let result = substitute(&ty, &HashMap::new(), &cs);
+        assert_eq!(result, array_ty(Type::Int, ArrayLen::Named(name)));
+    }
+
+    #[test]
+    fn substitute_array_const_param_rejects_non_int_term_without_infer() {
+        let cs = HashMap::from([(cp(0), ConstTerm::Value(ConstValue::Bool(true)))]);
+        let ty = array_ty(Type::Int, ArrayLen::Param(cp(0)));
+        let result = substitute(&ty, &HashMap::new(), &cs);
+        assert_eq!(result, array_ty(Type::Int, ArrayLen::Param(cp(0))));
     }
 
     #[test]
@@ -722,7 +732,7 @@ mod tests {
     #[test]
     fn substitute_unresolved_nominal_args() {
         let ts = HashMap::from([(tv(0), Type::Int)]);
-        let cs = HashMap::from([(cp(1), 4)]);
+        let cs = HashMap::from([(cp(1), cterm(4))]);
         let ty = Type::UnresolvedNominal {
             qualifier: None,
             name: Ident::new("Box"),
@@ -823,18 +833,18 @@ mod tests {
     #[test]
     fn bind_const_ok() {
         let mut inf = Inference::new();
-        assert!(inf.bind_const(cp(0), 4));
-        assert!(inf.bind_const(cp(0), 4));
-        assert!(inf.bind_const(cp(1), 8));
+        assert!(inf.bind_const(cp(0), cterm(4)));
+        assert!(inf.bind_const(cp(0), cterm(4)));
+        assert!(inf.bind_const(cp(1), cterm(8)));
         assert_eq!(inf.const_subst().len(), 2);
     }
 
     #[test]
     fn bind_const_conflict() {
         let mut inf = Inference::new();
-        assert!(inf.bind_const(cp(0), 4));
-        assert!(!inf.bind_const(cp(0), 8));
-        assert_eq!(inf.const_subst()[&cp(0)], 4);
+        assert!(inf.bind_const(cp(0), cterm(4)));
+        assert!(!inf.bind_const(cp(0), cterm(8)));
+        assert_eq!(inf.const_subst()[&cp(0)], cterm(4));
     }
 
     #[test]
@@ -847,7 +857,7 @@ mod tests {
         assert!(!inf.is_complete(&params));
         inf.bind_type(tv(0), Type::Int);
         assert!(!inf.is_complete(&params));
-        inf.bind_const(cp(1), 3);
+        inf.bind_const(cp(1), cterm(3));
         assert!(inf.is_complete(&params));
     }
 
@@ -871,13 +881,13 @@ mod tests {
         let mut inf = Inference::new();
         inf.bind_type(tv(0), Type::Int);
         inf.bind_type(tv(1), Type::String);
-        inf.bind_const(cp(2), 5);
+        inf.bind_const(cp(2), cterm(5));
         let args = inf.into_args(&params).unwrap();
         assert_eq!(
             args,
             GenericArgs {
                 type_args: vec![Type::Int, Type::String],
-                const_args: vec![5],
+                const_args: vec![cterm(5)],
             }
         );
     }
@@ -908,6 +918,51 @@ mod tests {
         let mut inf = Inference::new();
         assert!(infer(&Type::Var(tv(0)), &Type::Int, &mut inf));
         assert!(!infer(&Type::Var(tv(0)), &Type::String, &mut inf));
+    }
+
+    #[test]
+    fn infer_const_arg_terms() {
+        let mut inf = Inference::new();
+        assert!(infer_const_arg(
+            &ConstArg::Param(cp(0)),
+            &ConstArg::Value(ConstValue::Bool(true)),
+            &mut inf,
+        ));
+        assert_eq!(
+            inf.const_subst()[&cp(0)],
+            ConstTerm::Value(ConstValue::Bool(true)),
+        );
+
+        let mut inf = Inference::new();
+        let name = Ident::new("N");
+        assert!(infer_const_arg(
+            &ConstArg::Param(cp(0)),
+            &ConstArg::Name(name),
+            &mut inf,
+        ));
+        assert_eq!(inf.const_subst()[&cp(0)], ConstTerm::Name(name));
+    }
+
+    #[test]
+    fn infer_const_arg_conflicting_terms_fail() {
+        let mut inf = Inference::new();
+        assert!(infer_const_arg(&ConstArg::Param(cp(0)), &carg(1), &mut inf));
+        assert!(!infer_const_arg(
+            &ConstArg::Param(cp(0)),
+            &ConstArg::Value(ConstValue::Bool(true)),
+            &mut inf,
+        ));
+    }
+
+    #[test]
+    fn infer_array_len_infer_does_not_bind_const_param() {
+        let mut inf = Inference::new();
+        assert!(!infer_len(
+            &ArrayLen::Param(cp(0)),
+            &ArrayLen::Infer,
+            &mut inf,
+        ));
+        assert!(inf.const_subst().is_empty());
     }
 
     #[test]
@@ -952,7 +1007,7 @@ mod tests {
         let concrete = array_ty(Type::Int, ArrayLen::Fixed(3));
         assert!(infer(&tmpl, &concrete, &mut inf));
         assert_eq!(inf.type_subst()[&tv(0)], Type::Int);
-        assert_eq!(inf.const_subst()[&cp(1)], 3);
+        assert_eq!(inf.const_subst()[&cp(1)], cterm(3));
     }
 
     #[test]
@@ -1009,7 +1064,7 @@ mod tests {
         ]);
         assert!(infer(&tmpl, &concrete, &mut inf));
         assert_eq!(inf.type_subst()[&tv(0)], Type::Bool);
-        assert_eq!(inf.const_subst()[&cp(1)], 7);
+        assert_eq!(inf.const_subst()[&cp(1)], cterm(7));
         assert_eq!(inf.type_subst()[&tv(2)], Type::String);
     }
 
@@ -1207,7 +1262,7 @@ mod tests {
         ]);
         assert!(infer(&tmpl, &concrete, &mut inf));
         assert_eq!(inf.type_subst()[&tv(0)], Type::Bool);
-        assert_eq!(inf.const_subst()[&cp(1)], 5);
+        assert_eq!(inf.const_subst()[&cp(1)], cterm(5));
         assert_eq!(inf.type_subst()[&tv(2)], Type::String);
     }
 
@@ -1306,6 +1361,61 @@ mod tests {
     }
 
     #[test]
+    fn spec_bool_const_arg_exact() {
+        let a = struct_const(
+            "Flag",
+            vec![],
+            vec![ConstArg::Value(ConstValue::Bool(true))],
+        );
+        let b = struct_const(
+            "Flag",
+            vec![],
+            vec![ConstArg::Value(ConstValue::Bool(true))],
+        );
+        assert_eq!(compare_specificity(&a, &b), Specificity::Equal);
+    }
+
+    #[test]
+    fn spec_repeated_const_across_nominal_and_array_requires_equal_terms() {
+        let repeated = Type::Tuple(vec![
+            struct_const("Buf", vec![], vec![ConstArg::Param(cp(0))]),
+            array_ty(Type::Int, ArrayLen::Param(cp(0))),
+        ]);
+        let same = Type::Tuple(vec![
+            struct_const("Buf", vec![], vec![carg(3)]),
+            array_ty(Type::Int, ArrayLen::Fixed(3)),
+        ]);
+        let different = Type::Tuple(vec![
+            struct_const("Buf", vec![], vec![ConstArg::Value(ConstValue::Bool(true))]),
+            array_ty(Type::Int, ArrayLen::Fixed(1)),
+        ]);
+        assert_eq!(
+            compare_specificity(&same, &repeated),
+            Specificity::MoreSpecific
+        );
+        assert_eq!(
+            compare_specificity(&different, &repeated),
+            Specificity::Incomparable
+        );
+    }
+
+    #[test]
+    fn spec_negative_const_arg_not_array_len() {
+        let repeated = Type::Tuple(vec![
+            struct_const("Buf", vec![], vec![ConstArg::Param(cp(0))]),
+            array_ty(Type::Int, ArrayLen::Param(cp(0))),
+        ]);
+        let negative = Type::Tuple(vec![
+            struct_const("Buf", vec![], vec![carg(-1)]),
+            array_ty(Type::Int, ArrayLen::Fixed(0)),
+        ]);
+        assert_eq!(
+            compare_specificity(&negative, &repeated),
+            Specificity::Incomparable
+        );
+    }
+
+    #[test]
     fn spec_ambig() {
         let cap = struct_const("FixedBuf", vec![Type::Var(tv(0))], vec![carg(5)]);
         let ints = struct_const("FixedBuf", vec![Type::Int], vec![ConstArg::Param(cp(0))]);
@@ -1320,7 +1430,7 @@ mod tests {
         };
         let args = GenericArgs {
             type_args: vec![Type::Int],
-            const_args: vec![4],
+            const_args: vec![cterm(4)],
         };
         assert!(params.validate_explicit_args(&args).is_ok());
     }

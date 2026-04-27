@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     ConstSubst, GenericParams, Inference, Specificity, TypeSubst, bare_type_name,
-    compare_specificity, const_arg_usize, infer, substitute, type_ops::TypeFolder,
+    compare_specificity, const_term::ConstTerm, infer, substitute, type_ops::TypeFolder,
 };
 use crate::{
     ast::{
@@ -885,7 +885,7 @@ fn substitute_aggregate_member(receiver: &Type, generics: &GenericParams, ty: &T
         .const_params
         .iter()
         .zip(receiver.const_args)
-        .filter_map(|(param, arg)| const_arg_usize(arg).map(|value| (param.id, value)))
+        .map(|(param, arg)| (param.id, ConstTerm::from_arg(arg)))
         .collect();
     let has_substitutions = !type_subst.is_empty() || !const_subst.is_empty();
     if !has_substitutions {
