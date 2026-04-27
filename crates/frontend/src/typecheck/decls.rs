@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    ConstSubst, GenericParams, Inference, Specificity, TypeSubst, bare_type_name,
-    compare_specificity, const_term::ConstTerm, infer, substitute, type_ops::TypeFolder,
+    ConstSubst, GenericArgs, GenericParams, Specificity, TypeSubst, compare_specificity,
+    const_term::ConstTerm,
+    generic_bind::bind_exact_generic_args_no_diag,
+    infer::{GenericSolverSeeds, Solver},
+    substitute,
+    type_ops::TypeFolder,
 };
 use crate::{
     ast::{
@@ -11,6 +15,7 @@ use crate::{
         StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     resolve::{ModuleKey, ModulePath, ResolveResult},
+    span::Span,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -224,6 +229,7 @@ pub(crate) enum ExtendMethodMatch<'a> {
     Match {
         extend: &'a ExtendSchema,
         method: &'a ExtendMethodSchema,
+        owner_args: Result<GenericArgs, Vec<Ident>>,
     },
     Ambiguous,
 }
@@ -854,17 +860,28 @@ impl DeclarationIndex {
                 continue;
             };
             let target = generic_template_type(&ext.target, &ext.generics);
-            let mut inf = Inference::new();
-            if infer(&target, receiver, &mut inf) {
-                candidates.push((ext, method, target));
-            }
+            let Some(owner_args) =
+                match_generic_template_args(&ext.generics, &target, receiver, Span::new(0, 0))
+            else {
+                continue;
+            };
+            candidates.push(ExtendCandidate {
+                extend: ext,
+                method,
+                target,
+                owner_args,
+            });
         }
 
         match candidates.len() {
             0 => None,
             1 => {
-                let (extend, method, _) = candidates.remove(0);
-                Some(ExtendMethodMatch::Match { extend, method })
+                let candidate = candidates.remove(0);
+                Some(ExtendMethodMatch::Match {
+                    extend: candidate.extend,
+                    method: candidate.method,
+                    owner_args: candidate.owner_args,
+                })
             }
             _ => Some(most_specific_extend(candidates)),
         }
@@ -894,30 +911,62 @@ fn substitute_aggregate_member(receiver: &Type, generics: &GenericParams, ty: &T
     substitute(ty, &type_subst, &const_subst)
 }
 
-type ExtendCandidate<'a> = (&'a ExtendSchema, &'a ExtendMethodSchema, Type);
+struct ExtendCandidate<'a> {
+    extend: &'a ExtendSchema,
+    method: &'a ExtendMethodSchema,
+    target: Type,
+    owner_args: Result<GenericArgs, Vec<Ident>>,
+}
+
+type GenericTemplateMatch = Result<GenericArgs, Vec<Ident>>;
+
+fn match_generic_template_args(
+    generics: &GenericParams,
+    template: &Type,
+    concrete: &Type,
+    span: Span,
+) -> Option<GenericTemplateMatch> {
+    if generics.is_empty() {
+        return (template == concrete).then(|| Ok(GenericArgs::empty()));
+    }
+
+    let mut solver = Solver::default();
+    let seeds = GenericSolverSeeds::default();
+    let vars = solver.generic_solver_vars(generics, &seeds, span);
+    let template = solver.instantiate_generic_type(template, &vars);
+    let concrete = solver.concrete_type(concrete);
+    solver.add_handle_equal(span, template, concrete);
+    if !solver.solve_pending().is_empty() {
+        return None;
+    }
+
+    Some(solver.finalize_generic_args(generics, &vars))
+}
 
 fn most_specific_extend(mut candidates: Vec<ExtendCandidate<'_>>) -> ExtendMethodMatch<'_> {
     let winner = (1..candidates.len()).fold(0, |best, i| {
-        let target = &candidates[i].2;
-        let best_target = &candidates[best].2;
-        if more_specific(target, best_target) {
+        if more_specific(&candidates[i].target, &candidates[best].target) {
             i
         } else {
             best
         }
     });
 
-    let winner_target = &candidates[winner].2;
+    let winner_target = &candidates[winner].target;
     let dominates_all = candidates
         .iter()
         .enumerate()
-        .all(|(i, candidate)| i == winner || more_specific(winner_target, &candidate.2));
+        .all(|(i, candidate)| i == winner || more_specific(winner_target, &candidate.target));
     if !dominates_all {
         return ExtendMethodMatch::Ambiguous;
     }
 
-    let (extend, method, _) = candidates.swap_remove(winner);
-    ExtendMethodMatch::Match { extend, method }
+    let candidate = candidates.swap_remove(winner);
+    ExtendMethodMatch::Match {
+        extend: candidate.extend,
+        method: candidate.method,
+        owner_args: candidate.owner_args,
+    }
 }
 
 fn more_specific(a: &Type, b: &Type) -> bool {
@@ -1022,43 +1071,17 @@ impl TypeFolder for NominalResolver<'_> {
 }
 
 impl NominalResolver<'_> {
-    fn bind_nominal_args(
-        &mut self,
-        generics: &GenericParams,
-        args: &[GenericArg],
-    ) -> Option<(Vec<Type>, Vec<ConstArg>)> {
-        if args.len() != (generics.type_params.len() + generics.const_params.len()) {
-            return None;
-        }
-
-        let mut type_args = Vec::with_capacity(generics.type_params.len());
-        let mut const_args = Vec::with_capacity(generics.const_params.len());
-        for (index, arg) in args.iter().enumerate() {
-            if index < generics.type_params.len() {
-                let GenericArg::Type(ty) = arg else {
-                    return None;
-                };
-                type_args.push(self.fold_type(ty));
-            } else {
-                match arg {
-                    GenericArg::Const(arg) => const_args.push(arg.clone()),
-                    GenericArg::Type(ty) => const_args.push(ConstArg::Name(bare_type_name(ty)?)),
-                }
-            }
-        }
-        Some((type_args, const_args))
-    }
-
     fn merge_generic_args(
         &mut self,
         base: Type,
         generics: &GenericParams,
         args: &[GenericArg],
     ) -> Option<Type> {
-        let (type_args, const_args) = self.bind_nominal_args(generics, args)?;
+        let args = bind_exact_generic_args_no_diag(generics, args, |ty| self.fold_type(ty))?;
+        let const_args = ConstTerm::to_args_no_infer(&args.const_args)?;
         Some(match base {
             Type::Nominal(nominal) if nominal.kind == NominalKind::Extern => {
-                if !type_args.is_empty() || !const_args.is_empty() {
+                if !args.type_args.is_empty() || !const_args.is_empty() {
                     return None;
                 }
                 Type::nominal(nominal.kind, nominal.name, vec![], vec![], nominal.origin)
@@ -1066,7 +1089,7 @@ impl NominalResolver<'_> {
             Type::Nominal(nominal) => Type::nominal(
                 nominal.kind,
                 nominal.name,
-                type_args,
+                args.type_args,
                 const_args,
                 nominal.origin,
             ),

@@ -1,5 +1,5 @@
 use super::{
-    ArityError, ConstSubst, GenericArgs, GenericParams, TypeChecker, TypeError, TypeSubst,
+    ConstSubst, GenericArgs, GenericParams, TypeChecker, TypeError, TypeSubst,
     call_map::CallTarget,
     check_expr, check_expr_checked_with_hint, check_specialized_extend_body,
     check_specialized_func_body, check_specialized_method_body,
@@ -9,13 +9,14 @@ use super::{
         MethodSchema, ModuleScope, NominalKey, ValueDecl, VariantSchema, generic_template_type,
         nominal_type, nominal_type_with_args,
     },
-    infer::{GenericSolverSeeds, GenericSolverVars, Solver, TypeHandle},
+    generic_bind::bind_prefix_generic_seeds,
+    infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
     substitute,
 };
 use crate::{
     ast::{
         CallNode, ConstArg, ConstValue, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam,
-        GenericArg, Ident, Type,
+        Ident, Type,
     },
     span::Span,
 };
@@ -250,38 +251,6 @@ fn owner_member_type(receiver: &Type, generics: &GenericParams, ty: &Type) -> Ty
     substitute(ty, &type_subst, &const_subst)
 }
 
-fn infer_extend_args(
-    receiver: &Type,
-    target: &Type,
-    generics: &GenericParams,
-) -> Result<GenericArgs, Vec<Ident>> {
-    if generics.is_empty() {
-        return Ok(GenericArgs::empty());
-    }
-
-    let mut solver = Solver::default();
-    let seeds = GenericSolverSeeds::default();
-    let span = Span::new(0, 0);
-    let vars = solver.generic_solver_vars(generics, &seeds, span);
-    let template = generic_template_type(target, generics);
-    let template = solver.instantiate_generic_type(&template, &vars);
-    let receiver = solver.concrete_type(receiver);
-    solver.add_handle_equal(span, template, receiver);
-    if !solver.solve_pending().is_empty() {
-        return Err(generic_names(generics));
-    }
-    solver.finalize_generic_args(generics, &vars)
-}
-
-fn generic_names(generics: &GenericParams) -> Vec<Ident> {
-    generics
-        .type_params
-        .iter()
-        .map(|param| param.name)
-        .chain(generics.const_params.iter().map(|param| param.name))
-        .collect()
-}
-
 fn aggregate_method_subject(
     agg: &AggregateSchema,
     receiver: Option<Type>,
@@ -341,8 +310,8 @@ fn extend_method_subject(
     extend: &ExtendSchema,
     name: Ident,
     method: &ExtendMethodSchema,
-) -> Result<Subject, Vec<Ident>> {
-    let owner_args = infer_extend_args(&receiver, &extend.target, &extend.generics)?;
+    owner_args: GenericArgs,
+) -> Subject {
     let (type_subst, const_subst) = extend.generics.substitutions(&owner_args);
     let template_params = method
         .params
@@ -358,7 +327,7 @@ fn extend_method_subject(
     let params = substitute_params(&template_params, &type_subst, &const_subst);
     let ret = substitute(&template_ret, &type_subst, &const_subst);
 
-    Ok(Subject::Method {
+    Subject::Method {
         target: MethodTarget::Extend {
             extend: extend.id.clone(),
             receiver,
@@ -369,7 +338,7 @@ fn extend_method_subject(
         generics: method.generics.clone(),
         params,
         ret,
-    })
+    }
 }
 
 fn enum_variant_subject(enum_key: &NominalKey, variant: Ident, schema: &VariantSchema) -> Subject {
@@ -466,10 +435,21 @@ fn extend_method_match_subject(
     matched: &ExtendMethodMatch<'_>,
 ) -> Result<Subject, ExtendMethodError> {
     match matched {
-        ExtendMethodMatch::Match { extend, method } => {
-            extend_method_subject(receiver, extend, name, method)
-                .map_err(ExtendMethodError::Unbound)
-        }
+        ExtendMethodMatch::Match {
+            extend,
+            method,
+            owner_args: Ok(owner_args),
+        } => Ok(extend_method_subject(
+            receiver,
+            extend,
+            name,
+            method,
+            owner_args.clone(),
+        )),
+        ExtendMethodMatch::Match {
+            owner_args: Err(unbound),
+            ..
+        } => Err(ExtendMethodError::Unbound(unbound.clone())),
         ExtendMethodMatch::Ambiguous => Err(ExtendMethodError::Ambiguous { receiver, name }),
     }
 }
@@ -605,45 +585,6 @@ fn call_named_value(
         tc.record_call(call_id, named_call_target(module, name));
     }
     ret
-}
-
-fn explicit_generic_seeds(
-    generics: &GenericParams,
-    args: &[GenericArg],
-    span: Span,
-    tc: &mut TypeChecker,
-) -> Option<GenericSolverSeeds> {
-    let expected = generics.type_params.len() + generics.const_params.len();
-    if args.len() > expected {
-        tc.push_error(TypeError::GenericArity(ArityError::TypeArgs {
-            expected,
-            found: args.len(),
-        }));
-        return None;
-    }
-
-    let mut seeds = GenericSolverSeeds::default();
-    for (index, arg) in args.iter().enumerate() {
-        if index < generics.type_params.len() {
-            let GenericArg::Type(ty) = arg else {
-                tc.push_error(TypeError::GenericArgKindMismatch {
-                    expected: "type",
-                    span,
-                });
-                return None;
-            };
-            seeds
-                .type_args
-                .insert(generics.type_params[index].id, tc.resolve_type_for_tc(ty));
-        } else {
-            let const_index = index - generics.type_params.len();
-            let term = tc.eval_generic_const_term(arg, span)?;
-            seeds
-                .const_args
-                .insert(generics.const_params[const_index].id, term);
-        }
-    }
-    Some(seeds)
 }
 
 struct GenericCallInstantiation {
@@ -813,7 +754,8 @@ fn call_generic(
     else {
         return not_callable(sig.ty.clone(), call, tc);
     };
-    let Some(seeds) = explicit_generic_seeds(&sig.generics, &call.node.generic_args, call.span, tc)
+    let Some(seeds) =
+        bind_prefix_generic_seeds(tc, &sig.generics, &call.node.generic_args, call.span)
     else {
         return Type::Infer;
     };
@@ -916,7 +858,7 @@ fn call_method(
     tc: &mut TypeChecker,
 ) -> Type {
     let Some(mut seeds) =
-        explicit_generic_seeds(method.generics, &call.node.generic_args, call.span, tc)
+        bind_prefix_generic_seeds(tc, method.generics, &call.node.generic_args, call.span)
     else {
         return Type::Infer;
     };
@@ -1044,7 +986,7 @@ fn call_enum_variant(
         return Type::Infer;
     };
     let generics = enum_schema.generics.clone();
-    let Some(seeds) = explicit_generic_seeds(&generics, &call.node.generic_args, call.span, tc)
+    let Some(seeds) = bind_prefix_generic_seeds(tc, &generics, &call.node.generic_args, call.span)
     else {
         return Type::Infer;
     };

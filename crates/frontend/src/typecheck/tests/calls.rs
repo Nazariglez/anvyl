@@ -4,7 +4,9 @@ use super::support::{
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
-    typecheck::{CallTarget, ConstDiagnostic, ModuleScope, TypeError, const_term::ConstTerm},
+    typecheck::{
+        ArityError, CallTarget, ConstDiagnostic, ModuleScope, TypeError, const_term::ConstTerm,
+    },
 };
 
 fn option_type(inner: Type) -> Type {
@@ -62,6 +64,24 @@ fn generic_fn_call_target() {
 }
 
 #[test]
+fn generic_fn_explicit_prefix_call_target_includes_inferred_suffix() {
+    let result = typecheck(
+        "enum Option<T> { Some(T), None } fn make<T, U>(x: T) -> Option<U> { nil } fn main() -> Option<string> { make<int>(1) }",
+    )
+    .unwrap();
+    let target = result.calls().values().next().expect("missing call target");
+    assert_eq!(
+        target,
+        &CallTarget::GenericDirect {
+            module: ModuleScope::Root,
+            name: Ident::new("make"),
+            type_args: vec![Type::Int, Type::String],
+            const_args: vec![],
+        }
+    );
+}
+
+#[test]
 fn generic_fn_repeated_param_conflict() {
     let result = typecheck("fn same<T>(a: T, b: T) -> T { a } fn main() { same(1, true); }");
     assert!(result.is_err(), "expected repeated type param conflict");
@@ -73,6 +93,35 @@ fn generic_fn_body_err() {
         "fn mul2(x: int) -> int { x * 2 } fn duplicate<T>(x: T) -> T { mul2(x) } fn main() { duplicate<string>(\"x\"); }",
     );
     assert!(result.is_err(), "expected specialized body error");
+}
+
+#[test]
+fn generic_fn_too_many_explicit_args_err() {
+    assert_single_error(
+        "fn id<T>(x: T) -> T { x } fn main() { id<int, string>(1); }",
+        |err| {
+            matches!(
+                err,
+                TypeError::GenericArity(ArityError::TypeArgs {
+                    expected: 1,
+                    found: 2,
+                })
+            )
+        },
+    );
+}
+
+#[test]
+fn generic_fn_const_arg_in_type_slot_err() {
+    assert_single_error("fn id<T>(x: T) -> T { x } fn main() { id<3>(1); }", |err| {
+        matches!(
+            err,
+            TypeError::GenericArgKindMismatch {
+                expected: "type",
+                ..
+            }
+        )
+    });
 }
 
 #[test]
@@ -222,6 +271,48 @@ fn generic_const_call_target() {
 }
 
 #[test]
+fn generic_const_named_call_target() {
+    let result = typecheck(
+        "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, CAP>(xs); }",
+    )
+    .unwrap();
+    let target = result.calls().values().next().expect("missing call target");
+    assert_eq!(
+        target,
+        &CallTarget::GenericDirect {
+            module: ModuleScope::Root,
+            name: Ident::new("len"),
+            type_args: vec![Type::Int],
+            const_args: vec![ConstTerm::from_usize(3)],
+        }
+    );
+}
+
+#[test]
+fn generic_const_non_bare_type_arg_err() {
+    assert_single_error(
+        "fn take<T, N: int>(xs: [T; N]) {} fn main(xs: [int; 3]) { take<int, [int]>(xs); }",
+        |err| {
+            matches!(
+                err,
+                TypeError::GenericArgKindMismatch {
+                    expected: "const",
+                    ..
+                }
+            )
+        },
+    );
+}
+
+#[test]
+fn generic_const_unknown_name_arg_err() {
+    assert_single_error(
+        "fn take<T, N: int>(xs: [T; N]) {} fn main(xs: [int; 3]) { take<int, N>(xs); }",
+        |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("N")),
+    );
+}
+
+#[test]
 fn generic_const_arg_kind_mismatch() {
     let result = typecheck(
         "fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<3, int>(xs); }",
@@ -257,6 +348,22 @@ fn explicit_generic_negative_used_as_array_len_err() {
 fn generic_method_const_return() {
     assert_type(
         "struct Arrays { fn len<T, N: int>(xs: [T; N]) -> int { N } } fn main(xs: [int; 4]) -> int { Arrays.len<int, 4>(xs) }",
+        Type::Int,
+    );
+}
+
+#[test]
+fn generic_method_explicit_args_bind_method_generics_only() {
+    assert_type(
+        "struct Box<T> { value: T, fn keep<U>(self, x: U) -> U { x } } fn main(b: Box<int>) -> string { b.keep<string>(\"ok\") }",
+        Type::String,
+    );
+}
+
+#[test]
+fn generic_method_named_const_arg() {
+    assert_type(
+        "const CAP = 3; struct Arrays { fn len<T, N: int>(xs: [T; N]) -> int { N } } fn main(xs: [int; 3]) -> int { Arrays.len<int, CAP>(xs) }",
         Type::Int,
     );
 }

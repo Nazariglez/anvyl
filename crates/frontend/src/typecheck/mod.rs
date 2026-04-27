@@ -3,7 +3,11 @@ use std::{collections::HashMap, rc::Rc};
 pub(crate) use self::{call_map::*, decls::*, generic::*, result::*};
 use self::{
     const_term::ConstTerm,
-    infer::{LocalTypeId, Solver, SolverFinalizeError, SolverRelationError, TypeHandle},
+    generic_bind::bind_exact_generic_args,
+    infer::{
+        GenericSolverSeeds, GenericSolverVars, LocalTypeId, Solver, SolverFinalizeError,
+        SolverRelationError, TypeHandle,
+    },
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor},
 };
@@ -18,6 +22,7 @@ mod const_eval;
 mod const_term;
 mod decls;
 mod generic;
+mod generic_bind;
 mod infer;
 mod postfix;
 mod result;
@@ -787,23 +792,6 @@ impl TypeChecker {
         }
     }
 
-    fn eval_generic_const_term(&mut self, arg: &GenericArg, span: Span) -> Option<ConstTerm> {
-        let term = match arg {
-            GenericArg::Const(arg) => ConstTerm::from_arg(arg),
-            GenericArg::Type(ty) => match bare_type_name(ty) {
-                Some(name) => ConstTerm::Name(name),
-                None => {
-                    self.push_error(TypeError::GenericArgKindMismatch {
-                        expected: "const",
-                        span,
-                    });
-                    return None;
-                }
-            },
-        };
-        self.eval_const_term(term, span)
-    }
-
     fn require_usize_const(&mut self, term: ConstTerm, span: Span) -> Option<usize> {
         match self.eval_const_term(term, span)? {
             ConstTerm::Value(value) => match const_eval::const_usize(&value, span) {
@@ -953,27 +941,23 @@ impl TypeChecker {
         let Some(generics) = self.nominal_generics(key) else {
             return nominal_type(key);
         };
-        let Some((type_args, const_args)) = self.bind_nominal_args(&generics, generic_args, span)
-        else {
+        let Some(args) = bind_exact_generic_args(self, &generics, generic_args, span) else {
             return Type::Infer;
         };
-        self.validate_nominal_args(key, &generics, &type_args, &const_args, span);
-        nominal_type_with_args(key, &type_args, &const_args)
+        self.validate_nominal_args(key, &generics, &args, span);
+        let const_args = ConstTerm::to_args_no_infer(&args.const_args)
+            .expect("explicit nominal binder must not produce inference const terms");
+        nominal_type_with_args(key, &args.type_args, &const_args)
     }
 
     fn validate_nominal_args(
         &mut self,
         key: &NominalKey,
         generics: &GenericParams,
-        type_args: &[Type],
-        const_args: &[ConstArg],
+        args: &GenericArgs,
         span: Span,
     ) {
-        let args = GenericArgs {
-            type_args: type_args.to_vec(),
-            const_args: ConstTerm::from_args(const_args),
-        };
-        let (type_subst, const_subst) = generics.substitutions(&args);
+        let (type_subst, const_subst) = generics.substitutions(args);
         match key.kind {
             NominalKind::Struct | NominalKind::DataRef => {
                 if let Some(schema) = self.decls.aggregate(key).cloned() {
@@ -1012,45 +996,6 @@ impl TypeChecker {
             }
             NominalKind::Extern => {}
         }
-    }
-
-    fn bind_nominal_args(
-        &mut self,
-        generics: &GenericParams,
-        args: &[GenericArg],
-        span: Span,
-    ) -> Option<(Vec<Type>, Vec<ConstArg>)> {
-        let type_len = generics.type_params.len();
-        let expected = type_len + generics.const_params.len();
-        if args.len() != expected {
-            self.push_error(TypeError::GenericArity(ArityError::TypeArgs {
-                expected,
-                found: args.len(),
-            }));
-            return None;
-        }
-
-        let mut type_args = Vec::with_capacity(generics.type_params.len());
-        let mut const_args = Vec::with_capacity(generics.const_params.len());
-        for (index, arg) in args.iter().enumerate() {
-            if index < type_len {
-                let GenericArg::Type(ty) = arg else {
-                    self.push_error(TypeError::GenericArgKindMismatch {
-                        expected: "type",
-                        span,
-                    });
-                    return None;
-                };
-                type_args.push(self.resolve_type_for_tc(ty));
-            } else {
-                const_args.push(self.bind_nominal_const_arg(arg, span)?);
-            }
-        }
-        Some((type_args, const_args))
-    }
-
-    fn bind_nominal_const_arg(&mut self, arg: &GenericArg, span: Span) -> Option<ConstArg> {
-        self.eval_generic_const_term(arg, span)?.to_arg_no_infer()
     }
 }
 
@@ -2328,57 +2273,38 @@ fn check_named_tuple_checked_with_hint(
     solve_and_checked_from_handle(expr, tuple, tc)
 }
 
-struct ProvidedNominalField {
-    span: Span,
-    handle: TypeHandle,
-    template_ty: Type,
+struct NominalLiteralSolver {
+    vars: GenericSolverVars,
 }
 
-struct FinalNominalLiteral {
-    type_subst: TypeSubst,
-    const_subst: ConstSubst,
-    ty: Type,
-}
-
-struct NominalLiteralInference {
-    inf: Inference,
-}
-
-impl NominalLiteralInference {
-    fn new() -> Self {
-        Self {
-            inf: Inference::new(),
-        }
-    }
-
-    fn bind_explicit_args(
-        &mut self,
+impl NominalLiteralSolver {
+    fn new(
         generics: &GenericParams,
         args: &[GenericArg],
         span: Span,
         tc: &mut TypeChecker,
-    ) -> bool {
-        if args.is_empty() {
-            return true;
-        }
-        let Some((type_args, const_args)) = tc.bind_nominal_args(generics, args, span) else {
-            return false;
+    ) -> Option<Self> {
+        let seeds = if args.is_empty() {
+            GenericSolverSeeds::default()
+        } else {
+            let args = bind_exact_generic_args(tc, generics, args, span)?;
+            GenericSolverSeeds::from_args(generics, &args)
         };
-        for (param, ty) in generics.type_params.iter().zip(type_args) {
-            if !self.inf.bind_type(param.id, ty) {
-                return false;
-            }
+        Some(Self {
+            vars: tc.solver.generic_solver_vars(generics, &seeds, span),
+        })
+    }
+
+    fn empty(generics: &GenericParams, span: Span, tc: &mut TypeChecker) -> Self {
+        Self {
+            vars: tc
+                .solver
+                .generic_solver_vars(generics, &GenericSolverSeeds::default(), span),
         }
-        for (param, arg) in generics.const_params.iter().zip(const_args) {
-            if !self.inf.bind_const(param.id, ConstTerm::from_arg(&arg)) {
-                return false;
-            }
-        }
-        true
     }
 
     fn bind_expected(
-        &mut self,
+        &self,
         key: &NominalKey,
         generics: &GenericParams,
         expected: Option<&Type>,
@@ -2392,81 +2318,31 @@ impl NominalLiteralInference {
             return true;
         }
         let template = nominal_literal_type(key, generics, None);
-        if infer(&template, expected, &mut self.inf) {
-            return true;
-        }
-        tc.push_error(TypeError::TypeMismatch {
-            expected: expected.clone(),
-            found: self.current_nominal_type(key, generics),
-            span,
-        });
-        false
+        let template = tc.solver.instantiate_generic_type(&template, &self.vars);
+        let expected = tc.type_handle(expected);
+        tc.expect_equal(span, template, expected);
+        !tc.solve_constraints()
     }
 
-    fn current_hint(&self, ty: &Type, span: Span, tc: &mut TypeChecker) -> Type {
-        tc.substitute_checked(ty, self.inf.type_subst(), self.inf.const_subst(), span)
-    }
-
-    fn infer_field(&mut self, template: &Type, checked: &CheckedType) {
-        if checked.ty != Type::Infer {
-            infer(template, &checked.ty, &mut self.inf);
-        }
+    fn instantiate(&self, ty: &Type, tc: &mut TypeChecker) -> TypeHandle {
+        tc.solver.instantiate_generic_type(ty, &self.vars)
     }
 
     fn finalize(
-        self,
+        &self,
         key: &NominalKey,
         generics: &GenericParams,
         span: Span,
         tc: &mut TypeChecker,
-    ) -> Option<FinalNominalLiteral> {
-        if generics.is_empty() {
-            return Some(FinalNominalLiteral {
-                type_subst: TypeSubst::new(),
-                const_subst: ConstSubst::new(),
-                ty: nominal_type(key),
-            });
-        }
-        let args = match self.inf.into_args(generics) {
+    ) -> Option<Type> {
+        let args = match tc.solver.finalize_generic_args(generics, &self.vars) {
             Ok(args) => args,
             Err(unbound) => {
                 tc.push_unbound_generic_errors(unbound, span);
                 return None;
             }
         };
-        let (type_subst, const_subst) = generics.substitutions(&args);
-        let ty = nominal_literal_type(key, generics, Some(&args));
-        Some(FinalNominalLiteral {
-            type_subst,
-            const_subst,
-            ty,
-        })
-    }
-
-    fn current_nominal_type(&self, key: &NominalKey, generics: &GenericParams) -> Type {
-        let type_args = generics
-            .type_params
-            .iter()
-            .map(|param| {
-                self.inf
-                    .type_subst()
-                    .get(&param.id)
-                    .cloned()
-                    .unwrap_or(Type::Var(param.id))
-            })
-            .collect::<Vec<_>>();
-        let const_args = generics
-            .const_params
-            .iter()
-            .map(|param| {
-                self.inf
-                    .const_subst()
-                    .get(&param.id)
-                    .and_then(ConstTerm::to_arg_no_infer)
-                    .unwrap_or(ConstArg::Param(param.id))
-            })
-            .collect::<Vec<_>>();
-        nominal_type_with_args(key, &type_args, &const_args)
+        Some(nominal_literal_type(key, generics, Some(&args)))
     }
 }
 
@@ -2503,30 +2379,27 @@ fn check_struct_literal_checked_with_hint(
         .expect("aggregate exists for resolved key")
         .clone();
     let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
-    let mut inf = NominalLiteralInference::new();
-    if !inf.bind_explicit_args(&agg.generics, &lit.node.generic_args, lit.span, tc) {
+    let Some(inf) = NominalLiteralSolver::new(&agg.generics, &lit.node.generic_args, lit.span, tc)
+    else {
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return checked_from_type(expr, Type::Infer, tc);
-    }
+    };
     let expected_ok = inf.bind_expected(&key, &agg.generics, expected_ty.as_ref(), lit.span, tc);
-
-    let provided = check_nominal_fields(
+    let fields_failed = check_nominal_fields(
         &lit.node.fields,
         &agg.fields,
         nominal_type(&key),
         lit.span,
-        &agg.generics,
-        &mut inf,
+        &inf,
         tc,
     );
-    if !expected_ok {
+    if !expected_ok || fields_failed {
         return checked_from_type(expr, Type::Infer, tc);
     }
-    let Some(result) = inf.finalize(&key, &agg.generics, lit.span, tc) else {
+    let Some(ty) = inf.finalize(&key, &agg.generics, lit.span, tc) else {
         return checked_from_type(expr, Type::Infer, tc);
     };
-    constrain_provided_fields(provided, &result.type_subst, &result.const_subst, tc);
-    let handle = tc.type_handle(&result.ty);
+    let handle = tc.type_handle(&ty);
     solve_and_checked_from_handle(expr, handle, tc)
 }
 
@@ -2562,7 +2435,7 @@ fn check_inferred_enum_checked_with_hint(
         return checked_from_type(expr, Type::Infer, tc);
     };
 
-    let mut inf = NominalLiteralInference::new();
+    let inf = NominalLiteralSolver::empty(&generics, node.span, tc);
     if !inf.bind_expected(&key, &generics, Some(&expected_ty), node.span, tc) {
         check_inferred_enum_args_without_hint(&node.node.args, tc);
         return checked_from_type(expr, Type::Infer, tc);
@@ -2583,34 +2456,25 @@ fn check_inferred_enum_checked_with_hint(
                 check_exprs_without_hint(args, tc);
                 return checked_from_type(expr, Type::Infer, tc);
             }
-            let Some(result) = inf.finalize(&key, &generics, node.span, tc) else {
-                check_exprs_without_hint(args, tc);
-                return checked_from_type(expr, Type::Infer, tc);
-            };
+            let mut failed = false;
             for (arg, param) in args.iter().zip(params) {
-                let expected_ty =
-                    tc.substitute_checked(param, &result.type_subst, &result.const_subst, arg.span);
-                let hint = tc.type_handle(&expected_ty);
+                let hint = inf.instantiate(param, tc);
                 check_expected(arg, hint, tc);
+                failed |= tc.solve_constraints();
+            }
+            if failed || inf.finalize(&key, &generics, node.span, tc).is_none() {
+                return checked_from_type(expr, Type::Infer, tc);
             }
         }
         (VariantSchema::Tuple(params), args) => {
             return wrong_inferred_enum_args(expr, node, params.len(), args, tc);
         }
         (VariantSchema::Struct(fields), InferredEnumArgs::Struct(args)) => {
-            let provided = check_nominal_fields(
-                args,
-                fields,
-                expected_ty.clone(),
-                node.span,
-                &generics,
-                &mut inf,
-                tc,
-            );
-            let Some(result) = inf.finalize(&key, &generics, node.span, tc) else {
+            let fields_failed =
+                check_nominal_fields(args, fields, expected_ty.clone(), node.span, &inf, tc);
+            if fields_failed || inf.finalize(&key, &generics, node.span, tc).is_none() {
                 return checked_from_type(expr, Type::Infer, tc);
-            };
-            constrain_provided_fields(provided, &result.type_subst, &result.const_subst, tc);
+            }
         }
         (VariantSchema::Struct(fields), args) => {
             return wrong_inferred_enum_args(expr, node, fields.len(), args, tc);
@@ -2651,12 +2515,11 @@ fn check_nominal_fields(
     schema: &HashMap<Ident, FieldSchema>,
     owner_ty: Type,
     span: Span,
-    generics: &GenericParams,
-    inf: &mut NominalLiteralInference,
+    inf: &NominalLiteralSolver,
     tc: &mut TypeChecker,
-) -> Vec<ProvidedNominalField> {
+) -> bool {
     let mut seen = HashMap::new();
-    let mut provided = vec![];
+    let mut failed = false;
     for (name, value) in fields {
         if seen.insert(*name, value.span).is_some() {
             tc.push_error(TypeError::DuplicateField {
@@ -2666,19 +2529,10 @@ fn check_nominal_fields(
         }
         match schema.get(name) {
             Some(field) => {
-                let field_hint = inf.current_hint(&field.ty, value.span, tc);
-                let checked = if generics.contains_param(&field_hint) {
-                    check_expr_checked(value, tc)
-                } else {
-                    let hint = tc.type_handle(&field_hint);
-                    check_expr_checked_with_hint(value, Some(hint), tc)
-                };
-                inf.infer_field(&field.ty, &checked);
-                provided.push(ProvidedNominalField {
-                    span: value.span,
-                    handle: checked.handle,
-                    template_ty: field.ty.clone(),
-                });
+                let hint = inf.instantiate(&field.ty, tc);
+                let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
+                tc.expect_assignable(value.span, checked.handle, hint);
+                failed |= tc.solve_constraints();
             }
             None => {
                 tc.push_error(TypeError::UnknownField {
@@ -2697,21 +2551,7 @@ fn check_nominal_fields(
             tc.push_error(TypeError::MissingField { name: *name, span });
         }
     }
-    provided
-}
-
-fn constrain_provided_fields(
-    fields: Vec<ProvidedNominalField>,
-    type_subst: &TypeSubst,
-    const_subst: &ConstSubst,
-    tc: &mut TypeChecker,
-) {
-    for field in fields {
-        let expected_ty =
-            tc.substitute_checked(&field.template_ty, type_subst, const_subst, field.span);
-        let expected = tc.type_handle(&expected_ty);
-        tc.expect_assignable(field.span, field.handle, expected);
-    }
+    failed
 }
 
 fn check_unknown_nominal_fields(fields: &[(Ident, ExprNode)], tc: &mut TypeChecker) {
@@ -2748,11 +2588,8 @@ fn nominal_literal_type(
     args: Option<&GenericArgs>,
 ) -> Type {
     if let Some(args) = args {
-        let const_args = args
-            .const_args
-            .iter()
-            .filter_map(ConstTerm::to_arg_no_infer)
-            .collect::<Vec<_>>();
+        let const_args = ConstTerm::to_args_no_infer(&args.const_args)
+            .expect("nominal literal finalization must not produce inference const terms");
         return nominal_type_with_args(key, &args.type_args, &const_args);
     }
 

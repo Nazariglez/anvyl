@@ -1,11 +1,11 @@
 use super::support::{
     assert_calls, assert_err, assert_err_count, assert_no_infer_vars_in_result, assert_type,
-    assert_type_with_modules, typecheck,
+    assert_type_with_modules, errors, typecheck,
 };
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
-        CallTarget, GenericArgs, TypecheckResult,
+        CallTarget, GenericArgs, TypeError, TypecheckResult,
         decls::{
             CallableId, CallableKind, CallableParent, ExtendId, ModuleScope, NominalKey,
             VariantSchema,
@@ -807,6 +807,32 @@ mod extend_calls {
         assert_type(
             "extend<T> T { fn tag(self) -> int { 0 } } fn main() -> int { 1.tag() }",
             Type::Int,
+        );
+    }
+
+    #[test]
+    fn generic_unbound_owner_arg() {
+        let errors = errors("extend<T, U> T { fn bad(self) -> int { 0 } } fn main() { 1.bad(); }");
+        assert!(errors.iter().any(|err| matches!(
+            err,
+            TypeError::UnboundGenericParam { name, .. } if *name == Ident::new("U")
+        )));
+    }
+
+    #[test]
+    fn generic_receiver_mismatch_is_not_unbound() {
+        let errors = errors(
+            "struct Box<T> { value: T } extend<T> Box<T> { fn get(self) -> T { self.value } } fn main() { 1.get(); }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|err| matches!(err, TypeError::FieldAccessOnNonAggregate { .. }))
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|err| matches!(err, TypeError::UnboundGenericParam { .. }))
         );
     }
 

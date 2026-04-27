@@ -359,6 +359,27 @@ pub(super) struct GenericSolverSeeds {
     pub(super) const_args: ConstSubst,
 }
 
+impl GenericSolverSeeds {
+    pub(super) fn from_args(generics: &GenericParams, args: &GenericArgs) -> Self {
+        let type_args = generics
+            .type_params
+            .iter()
+            .zip(&args.type_args)
+            .map(|(param, ty)| (param.id, ty.clone()))
+            .collect();
+        let const_args = generics
+            .const_params
+            .iter()
+            .zip(&args.const_args)
+            .map(|(param, term)| (param.id, term.clone()))
+            .collect();
+        Self {
+            type_args,
+            const_args,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct GenericSolverVars {
     types: HashMap<TypeVarId, Ty>,

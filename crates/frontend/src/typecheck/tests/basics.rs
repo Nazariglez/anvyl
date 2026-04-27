@@ -426,7 +426,15 @@ mod nominals {
 
     #[test]
     fn order_err() {
-        assert_err(&buf("fn f(x: FixedBuf<3, int>) {} fn main() {}"));
+        assert_single_error(&buf("fn f(x: FixedBuf<3, int>) {} fn main() {}"), |err| {
+            matches!(
+                err,
+                TypeError::GenericArgKindMismatch {
+                    expected: "type",
+                    ..
+                }
+            )
+        });
     }
 
     #[test]
@@ -441,6 +449,46 @@ mod nominals {
                 found: 1,
             }))
         ));
+    }
+
+    #[test]
+    fn too_many_args_err() {
+        assert_single_error(
+            &buf("fn f(x: FixedBuf<int, 3, 4>) {} fn main() {}"),
+            |err| {
+                matches!(
+                    err,
+                    TypeError::GenericArity(ArityError::TypeArgs {
+                        expected: 2,
+                        found: 3,
+                    })
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn non_bare_type_const_arg_kind_err() {
+        assert_single_error(
+            &buf("fn f(x: FixedBuf<int, [int]>) {} fn main() {}"),
+            |err| {
+                matches!(
+                    err,
+                    TypeError::GenericArgKindMismatch {
+                        expected: "const",
+                        ..
+                    }
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn unknown_const_arg_err() {
+        assert_single_error(
+            &buf("fn f(x: FixedBuf<int, N>) {} fn main() {}"),
+            |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("N")),
+        );
     }
 
     #[test]
@@ -546,7 +594,7 @@ mod nominals {
     }
 
     #[test]
-    fn infer() {
+    fn literal_infers_args() {
         assert_type(
             &buf("fn main() { FixedBuf { data: [1, 2, 3] }; }"),
             fixed(3),
