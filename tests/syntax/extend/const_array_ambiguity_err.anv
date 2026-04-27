@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: ambiguous
+
+extend<T> [T; 5] {
+    fn tag(self) -> string { "len" }
+}
+
+extend<N: int> [int; N] {
+    fn tag(self) -> string { "int" }
+}
+
+fn main() {
+    [1, 2, 3, 4, 5].tag();
+}

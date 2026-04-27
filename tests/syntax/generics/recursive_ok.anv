@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+fn recur<T>(x: T) -> T {
+    recur(x)
+}
+
+fn main() {
+    recur(1);
+}

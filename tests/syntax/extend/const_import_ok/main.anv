@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @skip: todo -> frontend_nominal_const_generics
+
+import bufs { FixedBuf };
+import exts { keep };
+
+fn main() {
+    keep();
+    let n: int = FixedBuf { data: [1, 2] }.len();
+}

@@ -236,6 +236,19 @@ fn opt_call() {
 }
 
 #[test]
+fn call_const_arg() {
+    let expr = parse_expr("foo<int, 3>(1)");
+    let (_, _, generics) = expect_generic_call(&expr, false);
+    assert_eq!(
+        generics,
+        [
+            ast::GenericArg::Type(ast::Type::Int),
+            ast::GenericArg::Const(ast::ConstArg::Value(ast::ConstValue::Int(3))),
+        ]
+    );
+}
+
+#[test]
 fn opt_chain_coalesce() {
     let expr = parse_expr("foo?.bar ?? default");
     let (left, right) = expect_binary(&expr, ast::BinaryOp::Coalesce);
@@ -675,6 +688,24 @@ fn cast_chained() {
     let (inner_inner, inner_target) = expect_cast(outer_inner);
     expect_ident(inner_inner, "x");
     assert_eq!(*inner_target, ast::Type::Float);
+}
+
+#[test]
+fn struct_args() {
+    let expr = parse_expr("FixedBuf<int, 3> { data: xs }");
+    let ast::ExprKind::StructLiteral(lit) = &expr.node.kind else {
+        panic!("expected struct literal, found {:?}", expr.node.kind);
+    };
+    assert_eq!(lit.node.name.0.as_ref(), "FixedBuf");
+    assert_eq!(lit.node.generic_args.len(), 2);
+    assert_eq!(
+        lit.node.generic_args[0],
+        ast::GenericArg::Type(ast::Type::Int)
+    );
+    assert_eq!(
+        lit.node.generic_args[1],
+        ast::GenericArg::Const(ast::ConstArg::Value(ast::ConstValue::Int(3)))
+    );
 }
 
 #[test]

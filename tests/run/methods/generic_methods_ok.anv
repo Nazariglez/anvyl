@@ -1,6 +1,6 @@
 // @mode: run
 // @expect: success
-// @skip: todo -> generic_methods
+// @skip: blocked by lang HIR v1 method-call lowering; tracked in todo/clean_branch_plan.md
 // @match-begin
 // 42
 // hi

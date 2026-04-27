@@ -4,7 +4,7 @@ use super::{
     AnvParser, BoxedParser,
     common::{block_stmt, identifier},
     decl::function,
-    expr::{cond_expression, expression},
+    expr::{cond_expression, expression, for_header_expression},
     pattern::pattern,
     types::type_ident,
 };
@@ -273,7 +273,7 @@ fn contextual_step<'src>(
     select! {
         (Token::Ident(ident), _) if ident.0.as_ref() == "step" => (),
     }
-    .ignore_then(expression(stmt))
+    .ignore_then(for_header_expression(stmt))
     .or_not()
     .boxed()
 }
@@ -290,7 +290,7 @@ fn for_stmt<'src>(
         (Token::Keyword(Keyword::In), _) => (),
     })
     .then(contextual_rev())
-    .then(expression(stmt.clone()))
+    .then(for_header_expression(stmt.clone()))
     .then(contextual_step(stmt.clone()))
     .then(block_stmt(stmt, expr))
     .map_with(|((((pat, reversed), iterable), step), body), e| {

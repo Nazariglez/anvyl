@@ -1,0 +1,36 @@
+// @mode: run
+// @expect: success
+// @skip: todo -> frontend_nominal_const_generics
+// @match-begin
+// exact
+// 5
+// 2
+// 4
+// @match-end
+
+struct FixedBuf<T, N: int> {
+    data: [T; N],
+}
+
+extend FixedBuf<int, 3> {
+    fn tag(self) -> string { "exact" }
+}
+
+extend<T> FixedBuf<T, 5> {
+    fn cap(self) -> int { 5 }
+}
+
+extend<N: int> FixedBuf<float, N> {
+    fn len(self) -> int { N }
+}
+
+extend<T, N: int> FixedBuf<T, N> {
+    fn size(self) -> int { N }
+}
+
+fn main() {
+    println(FixedBuf { data: [1, 2, 3] }.tag());
+    println(FixedBuf { data: [1, 2, 3, 4, 5] }.cap());
+    println(FixedBuf { data: [1.0, 2.0] }.len());
+    println(FixedBuf { data: [true, false, true, false] }.size());
+}

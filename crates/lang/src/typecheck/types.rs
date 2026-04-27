@@ -32,7 +32,6 @@ pub(super) struct EnumVariantDef {
 pub(super) struct EnumDef {
     pub(super) defining_module: Option<ModulePath>,
     pub type_params: Vec<TypeParam>,
-    #[allow(dead_code)] // stored for future enum const param support
     pub const_params: Vec<ConstParam>,
     pub variants: Vec<EnumVariantDef>,
     pub annotations: AppliedAnnotations,
@@ -321,6 +320,12 @@ pub struct SpecializationResult {
     pub binding_types: HashMap<ExprId, Type>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum SpecializationState {
+    InProgress,
+    Done(SpecializationResult),
+}
+
 #[derive(Debug)]
 pub(super) struct InstantiationContext<'a> {
     pub(super) module_env: Option<&'a ModuleCheckContext>,
@@ -460,7 +465,7 @@ pub(super) struct TypeChecker {
     pub(super) generic_func_templates: HashMap<Ident, FuncNode>,
 
     /// Stores specialized functions avoiding re-checking for same type arguments
-    pub(super) specialization_cache: HashMap<SpecializationKey, SpecializationResult>,
+    pub(super) specialization_cache: HashMap<SpecializationKey, SpecializationState>,
 
     /// Stores specialized generic method bodies avoiding re-checking for same type arguments
     pub(super) method_spec_cache: HashMap<MethodSpecKey, SpecializationResult>,
@@ -594,7 +599,14 @@ impl TypeChecker {
             enum_defs: self.ctx.enum_defs,
             extern_type_defs: self.ctx.extern_type_defs,
             cycle_capable_types: self.cycle_capable_types,
-            specialization_cache: self.specialization_cache,
+            specialization_cache: self
+                .specialization_cache
+                .into_iter()
+                .filter_map(|(key, state)| match state {
+                    SpecializationState::InProgress => None,
+                    SpecializationState::Done(result) => Some((key, result)),
+                })
+                .collect(),
             method_spec_cache: self.method_spec_cache,
             extend_spec_cache: self.extend_spec_cache,
             resolved_call_type_args: self.resolved_call_type_args,

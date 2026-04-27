@@ -1,0 +1,9 @@
+// @helper
+
+import bufs { FixedBuf };
+
+pub fn keep() {}
+
+pub extend<T, N: int> FixedBuf<T, N> {
+    fn len(self) -> int { N }
+}

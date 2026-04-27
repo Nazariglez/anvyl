@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+enum Packet<T, N: int> {
+    Data([T; N]),
+    Empty,
+}
+
+fn main() {
+    let a = Packet.Data([1, 2, 3]);
+    let b = Packet.Data<int>([4, 5]);
+    let _: Packet<int> = a;
+    let _: Packet<int> = b;
+}

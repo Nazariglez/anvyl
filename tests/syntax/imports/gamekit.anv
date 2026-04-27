@@ -1,0 +1,9 @@
+// @helper
+
+pub fn init() -> GameKit {
+    GameKit { name: "test" }
+}
+
+pub struct GameKit {
+    name: string,
+}

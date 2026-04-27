@@ -1,4 +1,4 @@
-use super::helpers::parse_program;
+use super::helpers::{parse_program, parse_program_err};
 use crate::ast::{self, MethodReceiver, Mutability, Type};
 
 #[test]
@@ -223,6 +223,88 @@ fn for_range_inclusive() {
 }
 
 #[test]
+fn for_ident_empty_body() {
+    let prog = parse_program("fn main() { for x in xs {} }");
+    assert_eq!(prog.stmts.len(), 1);
+    let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    let body_stmts = &func_node.node.body.node.stmts;
+    assert_eq!(body_stmts.len(), 1);
+
+    let ast::Stmt::For(for_node) = &body_stmts[0].node else {
+        panic!("expected For stmt");
+    };
+    let for_inner = &for_node.node;
+
+    let ast::ExprKind::Ident(ident) = &for_inner.iterable.node.kind else {
+        panic!(
+            "expected Ident iterable, found {:?}",
+            for_inner.iterable.node.kind
+        );
+    };
+    assert_eq!(ident.0.as_ref(), "xs");
+    assert!(for_inner.body.node.stmts.is_empty());
+    assert!(for_inner.body.node.tail.is_none());
+}
+
+#[test]
+fn for_paren_struct_iter() {
+    let prog = parse_program("fn main() { for x in (Foo {}) {} }");
+    assert_eq!(prog.stmts.len(), 1);
+    let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    let body_stmts = &func_node.node.body.node.stmts;
+    assert_eq!(body_stmts.len(), 1);
+
+    let ast::Stmt::For(for_node) = &body_stmts[0].node else {
+        panic!("expected For stmt");
+    };
+    let for_inner = &for_node.node;
+
+    let ast::ExprKind::StructLiteral(_) = &for_inner.iterable.node.kind else {
+        panic!(
+            "expected StructLiteral iterable, found {:?}",
+            for_inner.iterable.node.kind
+        );
+    };
+    assert!(for_inner.body.node.stmts.is_empty());
+}
+
+#[test]
+fn for_unparen_struct_iter_err() {
+    parse_program_err("fn main() { for x in Foo { x: 1 } {} }");
+}
+
+#[test]
+fn for_paren_struct_step() {
+    let prog = parse_program("fn main() { for x in xs step (Foo {}) {} }");
+    assert_eq!(prog.stmts.len(), 1);
+    let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    let body_stmts = &func_node.node.body.node.stmts;
+    assert_eq!(body_stmts.len(), 1);
+
+    let ast::Stmt::For(for_node) = &body_stmts[0].node else {
+        panic!("expected For stmt");
+    };
+    let for_inner = &for_node.node;
+
+    let step = for_inner.step.as_ref().expect("expected step");
+    let ast::ExprKind::StructLiteral(_) = &step.node.kind else {
+        panic!("expected StructLiteral step, found {:?}", step.node.kind);
+    };
+    assert!(for_inner.body.node.stmts.is_empty());
+}
+
+#[test]
+fn for_unparen_struct_step_err() {
+    parse_program_err("fn main() { for x in xs step Foo { x: 1 } {} }");
+}
+
+#[test]
 fn var_param() {
     let prog = parse_program("fn f(var x: int) {}");
     assert_eq!(prog.stmts.len(), 1);
@@ -404,8 +486,16 @@ fn extern_type_static() {
     };
     assert_eq!(name.0.as_ref(), "new");
     assert_eq!(params.len(), 2);
-    // point is an UnresolvedName at parse time (resolved later by typechecker)
-    assert!(matches!(ret, Type::UnresolvedName(_)));
+    let Type::UnresolvedNominal {
+        qualifier: None,
+        name,
+        generic_args,
+    } = ret
+    else {
+        panic!("expected Point nominal, found {ret:?}");
+    };
+    let is_point = name.0.as_ref() == "Point" && generic_args.is_empty();
+    assert!(is_point);
 }
 
 #[test]

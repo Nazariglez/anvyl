@@ -22,6 +22,34 @@ pub(super) fn param_type_ident<'src>() -> BoxedParser<'src, Type> {
     type_ident_inner(true)
 }
 
+fn const_value_arg<'src>() -> BoxedParser<'src, ast::ConstArg> {
+    select! {
+        (Token::Literal(LitToken::Number(n)), _) => ast::ConstArg::Value(ast::ConstValue::Int(n)),
+        (Token::Literal(LitToken::Float(s)), _) => {
+            let value = s.as_ref().parse::<f64>().unwrap_or(0.0);
+            ast::ConstArg::Value(ast::ConstValue::Float(value))
+        },
+        (Token::Literal(LitToken::String(s)), _) => {
+            ast::ConstArg::Value(ast::ConstValue::String(s.to_string()))
+        },
+        (Token::Keyword(Keyword::True), _) => ast::ConstArg::Value(ast::ConstValue::Bool(true)),
+        (Token::Keyword(Keyword::False), _) => ast::ConstArg::Value(ast::ConstValue::Bool(false)),
+    }
+    .labelled("const argument")
+    .as_context()
+    .boxed()
+}
+
+pub(super) fn generic_arg<'src>(
+    ty: impl AnvParser<'src, Type>,
+) -> BoxedParser<'src, ast::GenericArg> {
+    choice((
+        const_value_arg().map(ast::GenericArg::Const),
+        ty.map(ast::GenericArg::Type),
+    ))
+    .boxed()
+}
+
 fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
     recursive(move |type_parser| {
         let builtin_typ = select! {
@@ -33,10 +61,9 @@ fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
             (Token::Keyword(Keyword::Any), _) => Type::Any,
         };
 
-        let type_args = select! { (Token::Op(Op::LessThan), _) => () }
+        let generic_args = select! { (Token::Op(Op::LessThan), _) => () }
             .ignore_then(
-                type_parser
-                    .clone()
+                generic_arg(type_parser.clone())
                     .separated_by(select! { (Token::Comma, _) => () })
                     .allow_trailing()
                     .collect::<Vec<_>>(),
@@ -44,10 +71,22 @@ fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
             .then_ignore(select! { (Token::Op(Op::GreaterThan), _) => () });
 
         let type_name_ref = identifier()
-            .then(type_args.or_not())
-            .map(|(name, args)| match args {
-                Some(type_args) => Type::Struct { name, type_args, origin: None },
-                None => Type::UnresolvedName(name),
+            .then(
+                select! { (Token::Dot, _) => () }
+                    .ignore_then(identifier())
+                    .or_not(),
+            )
+            .then(generic_args.or_not())
+            .map(|((qualifier_ident, name_ident), generic_args)| {
+                let (qualifier, name) = match name_ident {
+                    Some(name) => (Some(qualifier_ident), name),
+                    None => (None, qualifier_ident),
+                };
+                Type::UnresolvedNominal {
+                    qualifier,
+                    name,
+                    generic_args: generic_args.unwrap_or_default(),
+                }
             });
 
         let paren_type = paren_or_tuple_type(type_parser.clone());

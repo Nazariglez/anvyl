@@ -1,6 +1,5 @@
 // @mode: run
 // @expect: success
-// @skip: todo -> module_generic_import
 // @match-begin
 // 8
 // 10

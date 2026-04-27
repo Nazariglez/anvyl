@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+struct FixedBuf<T, N: int> {
+    data: [T; N],
+}
+
+fn main() {
+    let a = FixedBuf { data: [1, 2, 3] };
+    let b = FixedBuf { data: ["a", "b"] };
+    let _: FixedBuf<int> = a;
+    let _: FixedBuf<string> = b;
+}

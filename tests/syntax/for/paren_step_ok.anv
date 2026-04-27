@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+fn id(n: int) -> int { n }
+
+fn main() {
+    for x in 0..10 step (id(2)) {}
+}

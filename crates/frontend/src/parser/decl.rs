@@ -14,6 +14,9 @@ use crate::{
     span::{Span, Spanned},
 };
 
+pub const SELF_TYPE: &str = "Self";
+pub const SELF_ITEM: &str = "self";
+
 fn annotation_value<'src>() -> BoxedParser<'src, ast::Lit> {
     select! {
         (Token::Literal(LitToken::String(s)), _) => ast::Lit::String(s.to_string()),
@@ -180,9 +183,14 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
             rest
         });
 
-    let import_item = identifier()
+    let self_item = select! {
+        (Token::Ident(i), _) if i.0.as_ref() == SELF_ITEM => ast::ImportItemKind::SelfModule
+    };
+
+    let import_item = self_item
+        .or(identifier().map(ast::ImportItemKind::Name))
         .then(as_kw.ignore_then(identifier()).or_not())
-        .map(|(name, alias)| ast::ImportItem { name, alias });
+        .map(|(kind, alias)| ast::ImportItem { kind, alias });
 
     let selective_items = import_item
         .separated_by(comma)
@@ -479,7 +487,7 @@ fn extern_type_member<'src>(
 }
 
 fn is_self_type(ty: &ast::Type) -> bool {
-    matches!(ty, ast::Type::UnresolvedName(ident) if ident.0.as_ref() == "Self")
+    bare_type_name(ty).is_some_and(|name| name.0.as_ref() == SELF_TYPE)
 }
 
 fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
@@ -776,7 +784,7 @@ fn self_param<'src>() -> BoxedParser<'src, (ast::MethodReceiver, Option<ast::Typ
 
     var_kw
         .then(identifier().try_map(|ident, span| {
-            if ident.0.as_ref() == "self" {
+            if ident.0.as_ref() == SELF_ITEM {
                 Ok(())
             } else {
                 Err(Rich::custom(span, "expected 'self'"))
@@ -872,6 +880,10 @@ fn aggregate_declaration<'src>(
             let self_type = kind.make_type(
                 name,
                 type_params.iter().map(|tp| ast::Type::Var(tp.id)).collect(),
+                const_params
+                    .iter()
+                    .map(|cp| ast::ConstArg::Param(cp.id))
+                    .collect(),
                 None,
             );
 
@@ -1149,7 +1161,7 @@ fn extend_method<'src>(
                         ast::MethodReceiver::Var => ast::Mutability::Mutable,
                         ast::MethodReceiver::Value => ast::Mutability::Immutable,
                     },
-                    name: ast::Ident(internment::Intern::new("self".to_string())),
+                    name: ast::Ident(internment::Intern::new(SELF_ITEM.to_string())),
                     ty: ast::Type::Infer,
                     default: None,
                     cast_accept: false,
@@ -1252,16 +1264,13 @@ pub(super) fn extend_declaration<'src>(
                     ast::Type::DataRef {
                         name,
                         type_args: vec![],
+                        const_args: vec![],
                         origin: None,
                     },
                     gp,
                 )
             }),
-        // identifier with optional type params, handles named types (structs/enums) with generics
-        identifier()
-            .then(generic_params())
-            .map(|(name, gp)| (ast::Type::UnresolvedName(name), gp)),
-        // any other type expression, no type params possible (primitives, lists, options, etc.)
+        // target type expression without extend params
         type_ident().map(|ty| (ty, GenericParams::default())),
     ));
 
@@ -1350,6 +1359,80 @@ pub(super) fn const_decl<'src>(
         .boxed()
 }
 
+fn resolve_const_arg(
+    arg: &ast::ConstArg,
+    const_param_map: &HashMap<ast::Ident, ast::ConstParamId>,
+) -> ast::ConstArg {
+    match arg {
+        ast::ConstArg::Name(name) => const_param_map
+            .get(name)
+            .map_or_else(|| arg.clone(), |id| ast::ConstArg::Param(*id)),
+        ast::ConstArg::Value(_) | ast::ConstArg::Param(_) => arg.clone(),
+    }
+}
+
+fn bare_type_name(ty: &ast::Type) -> Option<ast::Ident> {
+    match ty {
+        ast::Type::UnresolvedName(name) => Some(*name),
+        ast::Type::UnresolvedNominal {
+            qualifier: None,
+            name,
+            generic_args,
+        } if generic_args.is_empty() => Some(*name),
+        _ => None,
+    }
+}
+
+fn resolve_generic_args(
+    args: &[ast::GenericArg],
+    type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+    const_param_map: &HashMap<ast::Ident, ast::ConstParamId>,
+    self_type: Option<&ast::Type>,
+) -> Vec<ast::GenericArg> {
+    args.iter()
+        .map(|arg| match arg {
+            ast::GenericArg::Type(ty) => {
+                match bare_type_name(ty).and_then(|name| const_param_map.get(&name).copied()) {
+                    Some(id) => ast::GenericArg::Const(ast::ConstArg::Param(id)),
+                    None => ast::GenericArg::Type(resolve_type_params_with_self(
+                        ty,
+                        type_param_map,
+                        const_param_map,
+                        self_type,
+                    )),
+                }
+            }
+            ast::GenericArg::Const(arg) => {
+                ast::GenericArg::Const(resolve_const_arg(arg, const_param_map))
+            }
+        })
+        .collect()
+}
+
+fn resolve_split_generic_args(
+    type_args: &[ast::Type],
+    const_args: &[ast::ConstArg],
+    type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+    const_param_map: &HashMap<ast::Ident, ast::ConstParamId>,
+    self_type: Option<&ast::Type>,
+) -> (Vec<ast::Type>, Vec<ast::ConstArg>) {
+    let generic_args = type_args
+        .iter()
+        .cloned()
+        .map(ast::GenericArg::Type)
+        .chain(const_args.iter().cloned().map(ast::GenericArg::Const))
+        .collect::<Vec<_>>();
+    let mut resolved_types = vec![];
+    let mut resolved_consts = vec![];
+    for arg in resolve_generic_args(&generic_args, type_param_map, const_param_map, self_type) {
+        match arg {
+            ast::GenericArg::Type(ty) => resolved_types.push(ty),
+            ast::GenericArg::Const(arg) => resolved_consts.push(arg),
+        }
+    }
+    (resolved_types, resolved_consts)
+}
+
 fn resolve_type_params_with_self(
     ty: &ast::Type,
     type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
@@ -1358,7 +1441,7 @@ fn resolve_type_params_with_self(
 ) -> ast::Type {
     use ast::Type::{
         Array, DataRef, Enum, Func, List, Map, NamedTuple, Slice, Struct, Tuple, UnresolvedName,
-        Var,
+        UnresolvedNominal, Var,
     };
     match ty {
         UnresolvedName(ident) => {
@@ -1366,25 +1449,60 @@ fn resolve_type_params_with_self(
                 return Var(*id);
             }
             if let Some(st) = self_type
-                && ident.0.as_ref() == "Self"
+                && ident.0.as_ref() == SELF_TYPE
             {
                 return st.clone();
             }
             ty.clone()
         }
+        UnresolvedNominal {
+            qualifier,
+            name,
+            generic_args,
+        } => {
+            let can_resolve_bare_name = qualifier.is_none() && generic_args.is_empty();
+            let type_param = can_resolve_bare_name
+                .then(|| type_param_map.get(name))
+                .flatten();
+            if let Some(id) = type_param {
+                return Var(*id);
+            }
+            let is_self_type = can_resolve_bare_name && name.0.as_ref() == SELF_TYPE;
+            if let (true, Some(st)) = (is_self_type, self_type) {
+                return st.clone();
+            }
+            UnresolvedNominal {
+                qualifier: *qualifier,
+                name: *name,
+                generic_args: resolve_generic_args(
+                    generic_args,
+                    type_param_map,
+                    const_param_map,
+                    self_type,
+                ),
+            }
+        }
 
         Enum {
-            name, type_args, ..
-        } => Enum {
-            name: *name,
-            type_args: type_args
-                .iter()
-                .map(|a| {
-                    resolve_type_params_with_self(a, type_param_map, const_param_map, self_type)
-                })
-                .collect(),
-            origin: None,
-        },
+            name,
+            type_args,
+            const_args,
+            ..
+        } => {
+            let (type_args, const_args) = resolve_split_generic_args(
+                type_args,
+                const_args,
+                type_param_map,
+                const_param_map,
+                self_type,
+            );
+            Enum {
+                name: *name,
+                type_args,
+                const_args,
+                origin: None,
+            }
+        }
 
         Func { params, ret } => {
             let resolved_params = params
@@ -1437,33 +1555,43 @@ fn resolve_type_params_with_self(
         }
 
         Struct {
-            name, type_args, ..
+            name,
+            type_args,
+            const_args,
+            ..
         } => {
-            let resolved_args = type_args
-                .iter()
-                .map(|arg| {
-                    resolve_type_params_with_self(arg, type_param_map, const_param_map, self_type)
-                })
-                .collect::<Vec<_>>();
+            let (type_args, const_args) = resolve_split_generic_args(
+                type_args,
+                const_args,
+                type_param_map,
+                const_param_map,
+                self_type,
+            );
             Struct {
                 name: *name,
-                type_args: resolved_args,
+                type_args,
+                const_args,
                 origin: None,
             }
         }
 
         DataRef {
-            name, type_args, ..
+            name,
+            type_args,
+            const_args,
+            ..
         } => {
-            let resolved_args = type_args
-                .iter()
-                .map(|arg| {
-                    resolve_type_params_with_self(arg, type_param_map, const_param_map, self_type)
-                })
-                .collect::<Vec<_>>();
+            let (type_args, const_args) = resolve_split_generic_args(
+                type_args,
+                const_args,
+                type_param_map,
+                const_param_map,
+                self_type,
+            );
             DataRef {
                 name: *name,
-                type_args: resolved_args,
+                type_args,
+                const_args,
                 origin: None,
             }
         }

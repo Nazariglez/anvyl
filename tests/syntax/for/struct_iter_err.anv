@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token while parsing a function
+
+struct Foo { x: int }
+
+fn main() {
+    for x in Foo { x: 1 } {}
+}

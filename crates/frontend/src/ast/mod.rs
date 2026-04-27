@@ -43,6 +43,83 @@ impl Display for ConstParamId {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ConstValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+}
+
+impl PartialEq for ConstValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConstValue {}
+
+impl std::hash::Hash for ConstValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Int(value) => value.hash(state),
+            Self::Float(value) => value.to_bits().hash(state),
+            Self::Bool(value) => value.hash(state),
+            Self::String(value) => value.hash(state),
+        }
+    }
+}
+
+impl Display for ConstValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(value) => write!(f, "{value}"),
+            Self::Float(value) => write!(f, "{value}"),
+            Self::Bool(value) => write!(f, "{value}"),
+            Self::String(value) => write!(f, "{value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConstArg {
+    Value(ConstValue),
+    Name(Ident),
+    Param(ConstParamId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GenericArg {
+    Type(Type),
+    Const(ConstArg),
+}
+
+impl Display for GenericArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Type(ty) => write!(f, "{ty}"),
+            Self::Const(arg) => write!(f, "{arg}"),
+        }
+    }
+}
+
+impl Display for ConstArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(value) => write!(f, "{value}"),
+            Self::Name(name) => write!(f, "{name}"),
+            Self::Param(id) => write!(f, "{id}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArrayLen {
     Fixed(usize),
@@ -98,21 +175,29 @@ pub enum Type {
     },
     Var(TypeVarId),
     UnresolvedName(Ident),
+    UnresolvedNominal {
+        qualifier: Option<Ident>,
+        name: Ident,
+        generic_args: Vec<GenericArg>,
+    },
     Tuple(Vec<Type>),
     NamedTuple(Vec<(Ident, Type)>),
     Struct {
         name: Ident,
         type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
         origin: Option<ModulePath>,
     },
     DataRef {
         name: Ident,
         type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
         origin: Option<ModulePath>,
     },
     Enum {
         name: Ident,
         type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
         origin: Option<ModulePath>,
     },
     List {
@@ -158,17 +243,31 @@ impl PartialEq for Type {
             ) => p1 == p2 && r1 == r2,
             (Var(a), Var(b)) => a == b,
             (UnresolvedName(a), UnresolvedName(b)) => a == b,
+            (
+                UnresolvedNominal {
+                    qualifier: q1,
+                    name: n1,
+                    generic_args: g1,
+                },
+                UnresolvedNominal {
+                    qualifier: q2,
+                    name: n2,
+                    generic_args: g2,
+                },
+            ) => q1 == q2 && n1 == n2 && g1 == g2,
             (Tuple(a), Tuple(b)) => a == b,
             (NamedTuple(a), NamedTuple(b)) => a == b,
             (
                 Struct {
                     name: n1,
                     type_args: t1,
+                    const_args: c1,
                     ..
                 },
                 Struct {
                     name: n2,
                     type_args: t2,
+                    const_args: c2,
                     ..
                 },
             )
@@ -176,11 +275,13 @@ impl PartialEq for Type {
                 DataRef {
                     name: n1,
                     type_args: t1,
+                    const_args: c1,
                     ..
                 },
                 DataRef {
                     name: n2,
                     type_args: t2,
+                    const_args: c2,
                     ..
                 },
             )
@@ -188,14 +289,16 @@ impl PartialEq for Type {
                 Enum {
                     name: n1,
                     type_args: t1,
+                    const_args: c1,
                     ..
                 },
                 Enum {
                     name: n2,
                     type_args: t2,
+                    const_args: c2,
                     ..
                 },
-            ) => n1 == n2 && t1 == t2,
+            ) => n1 == n2 && t1 == t2 && c1 == c2,
             (List { elem: a }, List { elem: b }) | (Slice { elem: a }, Slice { elem: b }) => a == b,
             (Array { elem: e1, len: l1 }, Array { elem: e2, len: l2 }) => e1 == e2 && l1 == l2,
             (Map { key: k1, value: v1 }, Map { key: k2, value: v2 }) => k1 == k2 && v1 == v2,
@@ -217,19 +320,38 @@ impl std::hash::Hash for Type {
             }
             Type::Var(id) => id.hash(state),
             Type::UnresolvedName(ident) => ident.hash(state),
+            Type::UnresolvedNominal {
+                qualifier,
+                name,
+                generic_args,
+            } => {
+                qualifier.hash(state);
+                name.hash(state);
+                generic_args.hash(state);
+            }
             Type::Tuple(elems) => elems.hash(state),
             Type::NamedTuple(fields) => fields.hash(state),
             Type::Struct {
-                name, type_args, ..
+                name,
+                type_args,
+                const_args,
+                ..
             }
             | Type::DataRef {
-                name, type_args, ..
+                name,
+                type_args,
+                const_args,
+                ..
             }
             | Type::Enum {
-                name, type_args, ..
+                name,
+                type_args,
+                const_args,
+                ..
             } => {
                 name.hash(state);
                 type_args.hash(state);
+                const_args.hash(state);
             }
             Type::List { elem } | Type::Slice { elem } => elem.hash(state),
             Type::Array { elem, len } => {
@@ -249,6 +371,7 @@ impl std::hash::Hash for Type {
 impl Type {
     pub const OPTION_ENUM_NAME: &'static str = "Option";
 
+    #[inline]
     pub fn boxed(&self) -> Box<Self> {
         Box::new(self.clone())
     }
@@ -258,14 +381,17 @@ impl Type {
         Type::Enum {
             name,
             type_args: vec![inner],
+            const_args: vec![],
             origin: None,
         }
     }
 
+    #[inline]
     pub fn is_option(&self) -> bool {
         self.option_inner().is_some()
     }
 
+    #[inline]
     pub fn option_inner(&self) -> Option<&Type> {
         match self {
             Type::Enum {
@@ -275,31 +401,116 @@ impl Type {
         }
     }
 
+    #[inline]
+    pub fn is_str(&self) -> bool {
+        matches!(self, Type::String)
+    }
+
+    #[inline]
+    pub fn is_stringable(&self) -> bool {
+        matches!(self, Type::Int | Type::Float | Type::Bool)
+    }
+
+    #[inline]
+    pub fn is_num(&self) -> bool {
+        matches!(self, Type::Int | Type::Float)
+    }
+
+    #[inline]
+    pub fn is_void(&self) -> bool {
+        matches!(self, Type::Void)
+    }
+
+    #[inline]
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Type::Bool)
+    }
+
+    #[inline]
+    pub fn is_int(&self) -> bool {
+        matches!(self, Type::Int)
+    }
+
+    #[inline]
+    pub fn is_float(&self) -> bool {
+        matches!(self, Type::Float)
+    }
+
+    #[inline]
+    pub fn is_any(&self) -> bool {
+        matches!(self, Type::Any)
+    }
+
     pub fn as_aggregate(&self) -> Option<AggregateTypeRef<'_>> {
         match self {
             Type::Struct {
                 name,
                 type_args,
+                const_args,
                 origin,
             } => Some(AggregateTypeRef {
                 kind: AggregateKind::Struct,
                 name: *name,
                 type_args,
+                const_args,
                 origin: origin.as_deref(),
             }),
             Type::DataRef {
                 name,
                 type_args,
+                const_args,
                 origin,
             } => Some(AggregateTypeRef {
                 kind: AggregateKind::DataRef,
                 name: *name,
                 type_args,
+                const_args,
                 origin: origin.as_deref(),
             }),
             _ => None,
         }
     }
+}
+
+fn fmt_ordered_generic_args(
+    f: &mut std::fmt::Formatter<'_>,
+    args: &[GenericArg],
+) -> std::fmt::Result {
+    if args.is_empty() {
+        return Ok(());
+    }
+
+    write!(f, "<")?;
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{arg}")?;
+    }
+    write!(f, ">")
+}
+
+fn fmt_generic_args(
+    f: &mut std::fmt::Formatter<'_>,
+    type_args: &[Type],
+    const_args: &[ConstArg],
+) -> std::fmt::Result {
+    let has_generic_args = !type_args.is_empty() || !const_args.is_empty();
+    if !has_generic_args {
+        return Ok(());
+    }
+
+    write!(f, "<")?;
+    let mut sep = "";
+    for ty in type_args {
+        write!(f, "{sep}{ty}")?;
+        sep = ", ";
+    }
+    for arg in const_args {
+        write!(f, "{sep}{arg}")?;
+        sep = ", ";
+    }
+    write!(f, ">")
 }
 
 impl Display for Type {
@@ -332,6 +543,17 @@ impl Display for Type {
             }
             Var(id) => write!(f, "{id}"),
             UnresolvedName(ident) => write!(f, "{ident}"),
+            UnresolvedNominal {
+                qualifier,
+                name,
+                generic_args,
+            } => {
+                if let Some(q) = qualifier {
+                    write!(f, "{q}.")?;
+                }
+                write!(f, "{name}")?;
+                fmt_ordered_generic_args(f, generic_args)
+            }
             Tuple(elems) => {
                 write!(f, "(")?;
                 for (i, e) in elems.iter().enumerate() {
@@ -353,52 +575,25 @@ impl Display for Type {
                 write!(f, "}}")
             }
             Struct {
-                name, type_args, ..
-            } => {
-                write!(f, "{name}")?;
-                if !type_args.is_empty() {
-                    write!(f, "<")?;
-                    for (i, a) in type_args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{a}")?;
-                    }
-                    write!(f, ">")?;
-                }
-                Ok(())
+                name,
+                type_args,
+                const_args,
+                ..
             }
-            DataRef {
-                name, type_args, ..
-            } => {
-                write!(f, "{name}")?;
-                if !type_args.is_empty() {
-                    write!(f, "<")?;
-                    for (i, a) in type_args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{a}")?;
-                    }
-                    write!(f, ">")?;
-                }
-                Ok(())
+            | DataRef {
+                name,
+                type_args,
+                const_args,
+                ..
             }
-            Enum {
-                name, type_args, ..
+            | Enum {
+                name,
+                type_args,
+                const_args,
+                ..
             } => {
                 write!(f, "{name}")?;
-                if !type_args.is_empty() {
-                    write!(f, "<")?;
-                    for (i, a) in type_args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{a}")?;
-                    }
-                    write!(f, ">")?;
-                }
-                Ok(())
+                fmt_generic_args(f, type_args, const_args)
             }
             List { elem } => write!(f, "[{elem}]"),
             Array { elem, len } => write!(f, "[{elem}; {len}]"),
@@ -694,8 +889,14 @@ pub enum ImportKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ImportItemKind {
+    Name(Ident),
+    SelfModule,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImportItem {
-    pub name: Ident,
+    pub kind: ImportItemKind,
     pub alias: Option<Ident>,
 }
 
@@ -753,7 +954,7 @@ pub struct CastFrom {
 pub struct Call {
     pub func: Box<ExprNode>,
     pub args: Vec<ExprNode>,
-    pub type_args: Vec<Type>,
+    pub generic_args: Vec<GenericArg>,
     pub safe: bool,
 }
 
@@ -870,6 +1071,7 @@ pub struct Index {
 pub struct StructLiteral {
     pub qualifier: Option<Ident>,
     pub name: Ident,
+    pub generic_args: Vec<GenericArg>,
     pub fields: Vec<(Ident, ExprNode)>,
 }
 
@@ -1176,16 +1378,24 @@ impl AggregateKind {
         matches!(self, Self::DataRef)
     }
 
-    pub fn make_type(self, name: Ident, type_args: Vec<Type>, origin: Option<ModulePath>) -> Type {
+    pub fn make_type(
+        self,
+        name: Ident,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+        origin: Option<ModulePath>,
+    ) -> Type {
         match self {
             Self::Struct => Type::Struct {
                 name,
                 type_args,
+                const_args,
                 origin,
             },
             Self::DataRef => Type::DataRef {
                 name,
                 type_args,
+                const_args,
                 origin,
             },
         }
@@ -1196,6 +1406,7 @@ pub struct AggregateTypeRef<'a> {
     pub kind: AggregateKind,
     pub name: Ident,
     pub type_args: &'a [Type],
+    pub const_args: &'a [ConstArg],
     pub origin: Option<&'a [String]>,
 }
 
@@ -1290,3 +1501,67 @@ pub type IntrinsicCallNode = Spanned<IntrinsicCall>;
 pub type InferredEnumNode = Spanned<InferredEnum>;
 pub type CastNode = Spanned<Cast>;
 pub type ConstDeclNode = Spanned<ConstDecl>;
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    use super::{AggregateKind, ConstArg, ConstParamId, ConstValue, GenericArg, Ident, Type};
+
+    fn hash<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn buf(n: i64) -> Type {
+        Type::Struct {
+            name: Ident::new("Buf"),
+            type_args: vec![Type::Int],
+            const_args: vec![ConstArg::Value(ConstValue::Int(n))],
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn const_arg_fmt() {
+        assert_eq!(
+            ConstValue::String(String::from("cap")).to_string(),
+            "\"cap\""
+        );
+        assert_eq!(ConstArg::Value(ConstValue::Int(7)).to_string(), "7");
+        assert_eq!(ConstArg::Name(Ident::new("CAP")).to_string(), "CAP");
+        assert_eq!(ConstArg::Param(ConstParamId(2)).to_string(), "$c2");
+        assert_eq!(
+            GenericArg::Const(ConstArg::Value(ConstValue::Int(7))).to_string(),
+            "7"
+        );
+    }
+
+    #[test]
+    fn nominal_eq() {
+        assert_ne!(buf(3), buf(4));
+    }
+
+    #[test]
+    fn nominal_hash() {
+        assert_ne!(hash(&buf(3)), hash(&buf(4)));
+    }
+
+    #[test]
+    fn nominal_fmt() {
+        assert_eq!(buf(3).to_string(), "Buf<int, 3>");
+    }
+
+    #[test]
+    fn as_aggregate() {
+        let ty = buf(3);
+        let aggregate = ty.as_aggregate().expect("expected aggregate");
+        assert_eq!(aggregate.kind, AggregateKind::Struct);
+        assert_eq!(aggregate.type_args, [Type::Int]);
+        assert_eq!(aggregate.const_args, [ConstArg::Value(ConstValue::Int(3))]);
+    }
+}

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+// @contains: required by this expression
+// @contains: where T = string
+
+fn mul2(x: int) -> int { x * 2 }
+
+fn duplicate<T>(x: T) -> T { mul2(x) }
+
+fn main() {
+    duplicate<string>("x");
+}

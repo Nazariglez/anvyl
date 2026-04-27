@@ -248,19 +248,16 @@ pub fn compile_lang(release: bool) -> Result<String, String> {
         "{ORANGE}Compiling anvyx{}{RESET}",
         if release { " (release)..." } else { "..." }
     );
-    let mut child = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("--package")
-        .arg("anvyx")
-        .args(if release { vec!["--release"] } else { vec![] })
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-
-    let status = child.wait().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Build failed".to_string());
+    let mut command = std::process::Command::new("cargo");
+    command.arg("build").arg("--package").arg("anvyx");
+    if release {
+        command.arg("--release");
+    }
+    let output = command.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Build failed\n{stdout}{stderr}"));
     }
 
     let profile = if release { "release" } else { "debug" };

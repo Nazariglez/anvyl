@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+dataref Buffer<T, N: int> {
+    data: [T; N],
+}
+
+fn main() {
+    let a = Buffer { data: [true, false] };
+    let b = Buffer { data: [1, 2, 3] };
+    let _: Buffer<bool> = a;
+    let _: Buffer<int> = b;
+}

@@ -35,6 +35,57 @@ pub(super) fn expression<'src>(
     .boxed()
 }
 
+pub(super) fn for_header_expression<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, ast::ExprNode> {
+    let full_expr = expression(stmt.clone());
+    let atom = for_header_atom_expr(stmt, full_expr.clone());
+    let postfix = postfix_expr(atom, full_expr.clone());
+    let unary = unary_expr(postfix);
+    let cast = cast_expr(unary);
+    let binary = binary_expr(cast);
+    let ternary = ternary_expr(binary, full_expr);
+    assignment_expr(ternary)
+}
+
+fn for_header_atom_expr<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, ast::ExprNode> {
+    choice((
+        inferred_enum_expr(expr.clone()),
+        lambda_expr(stmt.clone(), expr.clone()),
+        intrinsic_call_expr(expr.clone()),
+        string_interp(expr.clone()),
+        literal().map_with(|lit, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let id = new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::Lit(lit), id);
+            Spanned::new(expr, span)
+        }),
+        array_literal(expr.clone()),
+        identifier().map_with(|ident, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let expr_id = new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
+            Spanned::new(expr, span)
+        }),
+        if_expr(stmt.clone(), expr.clone()),
+        match_expr(stmt.clone(), expr.clone()),
+        block_stmt(stmt, expr.clone()).map(|block_node| {
+            let span = block_node.span;
+            let id = new_expr_id();
+            let block_expr = ast::Expr::new(ast::ExprKind::Block(block_node), id);
+            Spanned::new(block_expr, span)
+        }),
+        grouped_or_tuple_expr(expr),
+    ))
+    .labelled("for header atom")
+    .boxed()
+}
+
 pub(super) fn cond_expression<'src>() -> BoxedParser<'src, ast::ExprNode> {
     recursive(|cond_expr| {
         let atom = cond_atom_expr(cond_expr.clone());

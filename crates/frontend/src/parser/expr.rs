@@ -12,7 +12,7 @@ use super::{
         infix_left, mul_div_op, or_op, shift_op, xor_op,
     },
     pattern::{or_pattern, pattern},
-    types::type_ident,
+    types::{generic_arg, type_ident},
 };
 use crate::{
     ast,
@@ -32,6 +32,57 @@ pub(super) fn expression<'src>(
         let ternary = ternary_expr(binary, expr.clone());
         assignment_expr(ternary)
     })
+    .boxed()
+}
+
+pub(super) fn for_header_expression<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, ast::ExprNode> {
+    let full_expr = expression(stmt.clone());
+    let atom = for_header_atom_expr(stmt, full_expr.clone());
+    let postfix = postfix_expr(atom, full_expr.clone());
+    let unary = unary_expr(postfix);
+    let cast = cast_expr(unary);
+    let binary = binary_expr(cast);
+    let ternary = ternary_expr(binary, full_expr);
+    assignment_expr(ternary)
+}
+
+fn for_header_atom_expr<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, ast::ExprNode> {
+    choice((
+        inferred_enum_expr(expr.clone()),
+        lambda_expr(stmt.clone(), expr.clone()),
+        intrinsic_call_expr(expr.clone()),
+        string_interp(expr.clone()),
+        literal().map_with(|lit, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let id = new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::Lit(lit), id);
+            Spanned::new(expr, span)
+        }),
+        array_literal(expr.clone()),
+        identifier().map_with(|ident, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let expr_id = new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
+            Spanned::new(expr, span)
+        }),
+        if_expr(stmt.clone(), expr.clone()),
+        match_expr(stmt.clone(), expr.clone()),
+        block_stmt(stmt, expr.clone()).map(|block_node| {
+            let span = block_node.span;
+            let id = new_expr_id();
+            let block_expr = ast::Expr::new(ast::ExprKind::Block(block_node), id);
+            Spanned::new(block_expr, span)
+        }),
+        grouped_or_tuple_expr(expr),
+    ))
+    .labelled("for header atom")
     .boxed()
 }
 
@@ -217,7 +268,20 @@ fn struct_literal<'src>(
             None => (None, first),             // struc
         });
 
+    let generic_args = select! { (Token::Op(Op::LessThan), _) => () }
+        .ignore_then(
+            generic_arg(type_ident())
+                .separated_by(select! { (Token::Comma, _) => () })
+                .allow_trailing()
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(select! { (Token::Op(Op::GreaterThan), _) => () })
+        .then_ignore(select! { (Token::Open(Delimiter::Brace), _) => () }.rewind())
+        .or_not()
+        .map(Option::unwrap_or_default);
+
     qualified_name
+        .then(generic_args)
         .then(
             select! { (Token::Open(Delimiter::Brace), _) => () }
                 .ignore_then(
@@ -228,13 +292,14 @@ fn struct_literal<'src>(
                 )
                 .then_ignore(select! { (Token::Close(Delimiter::Brace), _) => () }),
         )
-        .map_with(|((qualifier, name), fields), e| {
+        .map_with(|(((qualifier, name), generic_args), fields), e| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
             let lit_node = Spanned::new(
                 ast::StructLiteral {
                     qualifier,
                     name,
+                    generic_args,
                     fields,
                 },
                 span,
@@ -848,14 +913,14 @@ fn fn_call_args<'src>(
     .boxed()
 }
 
-fn call_type_args<'src>() -> BoxedParser<'src, Vec<ast::Type>> {
-    // lookahead for optional generic type arguments (<int, ..>)
+fn call_generic_args<'src>() -> BoxedParser<'src, Vec<ast::GenericArg>> {
+    // lookahead for optional generic arguments (<int, ..>)
     // and rewind to avoid consuming < when its a comparsion op (a < b)
     let generic_lookahead = select! {
         (Token::Op(Op::LessThan), _) => (),
     }
     .ignore_then(
-        type_ident()
+        generic_arg(type_ident())
             .separated_by(select! {
                 (Token::Comma, _) => (),
             })
@@ -874,7 +939,7 @@ fn call_type_args<'src>() -> BoxedParser<'src, Vec<ast::Type>> {
         (Token::Op(Op::LessThan), _) => (),
     }
     .ignore_then(
-        type_ident()
+        generic_arg(type_ident())
             .separated_by(select! {
                 (Token::Comma, _) => (),
             })
@@ -889,14 +954,14 @@ fn call_type_args<'src>() -> BoxedParser<'src, Vec<ast::Type>> {
         .ignore_then(generic_list)
         .or_not()
         .map(Option::unwrap_or_default)
-        .labelled("type arguments")
+        .labelled("generic arguments")
         .as_context()
         .boxed()
 }
 
 enum PostfixOp {
     Call {
-        type_args: Vec<ast::Type>,
+        generic_args: Vec<ast::GenericArg>,
         args: Vec<ast::ExprNode>,
         safe: bool,
     },
@@ -915,19 +980,20 @@ fn postfix_expr<'src>(
     atom: impl AnvParser<'src, ast::ExprNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::ExprNode> {
-    let call_suffix = call_type_args()
-        .then(fn_call_args(expr.clone()))
-        .map(|(type_args, args)| PostfixOp::Call {
-            type_args,
-            args,
-            safe: false,
-        });
+    let call_suffix =
+        call_generic_args()
+            .then(fn_call_args(expr.clone()))
+            .map(|(generic_args, args)| PostfixOp::Call {
+                generic_args,
+                args,
+                safe: false,
+            });
 
     let safe_call_suffix = select! { (Token::Question, _) => () }
-        .ignore_then(call_type_args())
+        .ignore_then(call_generic_args())
         .then(fn_call_args(expr.clone()))
-        .map(|(type_args, args)| PostfixOp::Call {
-            type_args,
+        .map(|(generic_args, args)| PostfixOp::Call {
+            generic_args,
             args,
             safe: true,
         });
@@ -1001,7 +1067,7 @@ fn postfix_expr<'src>(
 
         match op {
             PostfixOp::Call {
-                type_args,
+                generic_args,
                 args,
                 safe,
             } => {
@@ -1009,7 +1075,7 @@ fn postfix_expr<'src>(
                     ast::Call {
                         func: Box::new(target),
                         args,
-                        type_args,
+                        generic_args,
                         safe,
                     },
                     span,

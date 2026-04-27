@@ -1,4 +1,4 @@
-use super::helpers::{parse_param_type, parse_type};
+use super::helpers::{expect_nominal, parse_param_type, parse_program, parse_type};
 use crate::ast;
 
 #[test]
@@ -57,10 +57,16 @@ fn array_struct_elem() {
         ast::Type::Array { elem, len } => {
             assert_eq!(len, ast::ArrayLen::Fixed(5));
             match *elem {
-                ast::Type::UnresolvedName(name) => {
+                ast::Type::UnresolvedNominal {
+                    qualifier,
+                    name,
+                    generic_args,
+                } => {
+                    assert!(qualifier.is_none());
                     assert_eq!(name.0.as_ref(), "MyStruct");
+                    assert!(generic_args.is_empty());
                 }
-                other => panic!("expected unresolved name, found {other:?}"),
+                other => panic!("expected UnresolvedNominal, found {other:?}"),
             }
         }
         other => panic!("expected array type, found {other:?}"),
@@ -297,4 +303,115 @@ fn fn_type_mixed_var() {
         }
         other => panic!("expected function type with mixed params, found {other:?}"),
     }
+}
+
+#[test]
+fn qualified_nominal() {
+    let ty = parse_type("gk.GameKit");
+    match ty {
+        ast::Type::UnresolvedNominal {
+            qualifier,
+            name,
+            generic_args,
+        } => {
+            assert!(qualifier.is_some(), "expected qualifier Some(gk), got None");
+            assert_eq!(qualifier.as_ref().unwrap().0.as_ref(), "gk");
+            assert_eq!(name.0.as_ref(), "GameKit");
+            assert!(generic_args.is_empty());
+        }
+        other => panic!("expected UnresolvedNominal, found {other:?}"),
+    }
+}
+
+#[test]
+fn qualified_generic() {
+    let ty = parse_type("gk.GameKit<int>");
+    match ty {
+        ast::Type::UnresolvedNominal {
+            qualifier,
+            name,
+            generic_args,
+        } => {
+            assert!(qualifier.is_some());
+            assert_eq!(qualifier.as_ref().unwrap().0.as_ref(), "gk");
+            assert_eq!(name.0.as_ref(), "GameKit");
+            assert_eq!(generic_args, &[ast::GenericArg::Type(ast::Type::Int)]);
+        }
+        other => panic!("expected UnresolvedNominal, found {other:?}"),
+    }
+}
+
+#[test]
+fn bare_generic() {
+    let ty = parse_type("Foo<T>");
+    match ty {
+        ast::Type::UnresolvedNominal {
+            qualifier,
+            name,
+            generic_args,
+        } => {
+            assert!(qualifier.is_none());
+            assert_eq!(name.0.as_ref(), "Foo");
+            assert_eq!(generic_args.len(), 1);
+            let ast::GenericArg::Type(ast::Type::UnresolvedNominal {
+                qualifier: None,
+                name,
+                generic_args: inner_args,
+            }) = &generic_args[0]
+            else {
+                panic!("expected bare nominal T, found {:?}", generic_args[0]);
+            };
+            assert_eq!(name.0.as_ref(), "T");
+            assert!(inner_args.is_empty());
+        }
+        other => panic!("expected UnresolvedNominal, found {other:?}"),
+    }
+}
+
+#[test]
+fn mixed_params() {
+    let prog = parse_program("struct Use<T, N: int> { buf: FixedBuf<T, N> }");
+    let ast::Stmt::Aggregate(node) = &prog.stmts[0].node else {
+        panic!("expected aggregate");
+    };
+    let args = expect_nominal(&node.node.fields[0].ty, "FixedBuf");
+    assert_eq!(
+        args[0],
+        ast::GenericArg::Type(ast::Type::Var(node.node.type_params[0].id))
+    );
+    assert_eq!(
+        args[1],
+        ast::GenericArg::Const(ast::ConstArg::Param(node.node.const_params[0].id))
+    );
+}
+
+#[test]
+fn arg_order() {
+    let ty = parse_type("FixedBuf<3, int>");
+    let args = expect_nominal(&ty, "FixedBuf");
+    assert_eq!(
+        args[0],
+        ast::GenericArg::Const(ast::ConstArg::Value(ast::ConstValue::Int(3)))
+    );
+    assert_eq!(args[1], ast::GenericArg::Type(ast::Type::Int));
+}
+
+#[test]
+fn nested_args() {
+    let ty = parse_type("Outer<FixedBuf<int, 3>, 2>");
+    let args = expect_nominal(&ty, "Outer");
+    assert_eq!(args.len(), 2);
+    assert_eq!(
+        args[1],
+        ast::GenericArg::Const(ast::ConstArg::Value(ast::ConstValue::Int(2)))
+    );
+    let ast::GenericArg::Type(inner) = &args[0] else {
+        panic!("expected type arg");
+    };
+    let inner_args = expect_nominal(inner, "FixedBuf");
+    assert_eq!(inner_args[0], ast::GenericArg::Type(ast::Type::Int));
+    assert_eq!(
+        inner_args[1],
+        ast::GenericArg::Const(ast::ConstArg::Value(ast::ConstValue::Int(3)))
+    );
 }

@@ -1,7 +1,10 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use crate::{
     ast::{self, Ident, Program, Stmt},
@@ -26,6 +29,10 @@ impl ModulePath {
 
     pub fn first_segment(&self) -> Option<&str> {
         self.0.first().map(String::as_str)
+    }
+
+    pub fn to_ast_path(&self) -> ast::ModulePath {
+        Rc::from(self.0.clone())
     }
 }
 
@@ -138,6 +145,7 @@ impl<'a, L: ModuleLoader> Resolver<'a, L> {
             let ModuleKey::Named(path) = &import_key else {
                 continue;
             };
+
             match self.loader.load(path) {
                 Ok(Some(module_program)) => {
                     self.resolve_module(import_key.clone(), module_program);

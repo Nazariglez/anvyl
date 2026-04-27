@@ -16,8 +16,8 @@ use super::{
     postfix::resolve_builtin_or_extend,
     types::{
         DeepLookup, EnumDef, ExternMethodDef, ExternTypeDef, InstantiationContext, MethodContext,
-        MethodDef, MethodSpecKey, ModuleDef, SpecializationKey, SpecializationResult, StructDef,
-        TypeChecker, TypedBodyResult,
+        MethodDef, MethodSpecKey, ModuleDef, SpecializationKey, SpecializationResult,
+        SpecializationState, StructDef, TypeChecker, TypedBodyResult,
     },
     unify::{contains_infer, is_assignable},
 };
@@ -2297,18 +2297,6 @@ fn instantiate_and_check_fn(
         const_args: const_args.to_vec(),
     };
 
-    if let Some(cached) = type_checker.specialization_cache.get(&cache_key) {
-        report_cached_spec_error(
-            cached,
-            &func_name.to_string(),
-            &type_params,
-            type_args,
-            call_span,
-            errors,
-        );
-        return cached.ret_ty.clone();
-    }
-
     // look up the generic function template
     let Some(fn_template) = type_checker.generic_func_templates.get(&func_name).cloned() else {
         errors.push(Diagnostic::new(
@@ -2319,8 +2307,7 @@ fn instantiate_and_check_fn(
     };
 
     // verify arity
-    let same_param_count = type_params.len() == type_args.len();
-    if !same_param_count {
+    if type_params.len() != type_args.len() {
         errors.push(Diagnostic::new(
             call_span,
             DiagnosticKind::GenericArgNumMismatch {
@@ -2342,7 +2329,6 @@ fn instantiate_and_check_fn(
 
     let func = &fn_template.node;
 
-    // put const params in scope so named lengths can resolve first and then become concrete values
     type_checker.push_const_params(&fn_const_params);
     let mut params: Vec<(Ident, Type, bool)> = func
         .params
@@ -2357,6 +2343,24 @@ fn instantiate_and_check_fn(
         .collect();
     let ret_ty = subst_type(&type_checker.resolve_type(&func.ret), &subst, &const_subst);
     type_checker.pop_const_params(fn_const_params.len());
+
+    match type_checker.specialization_cache.get(&cache_key) {
+        Some(SpecializationState::Done(cached)) => {
+            report_cached_spec_error(
+                cached,
+                &func_name.to_string(),
+                &type_params,
+                type_args,
+                call_span,
+                errors,
+            );
+            return cached.ret_ty.clone();
+        }
+        Some(SpecializationState::InProgress) => {
+            return ret_ty;
+        }
+        None => {}
+    }
 
     // inject const params as immutable variables so the body can reference them by name
     for param in &fn_const_params {
@@ -2381,6 +2385,9 @@ fn instantiate_and_check_fn(
         method_ctx: None,
         type_subst,
     };
+    type_checker
+        .specialization_cache
+        .insert(cache_key.clone(), SpecializationState::InProgress);
     let mut body_errors = vec![];
     let result =
         check_instantiated_body(&ictx, &func.body, call_span, type_checker, &mut body_errors)
@@ -2396,7 +2403,9 @@ fn instantiate_and_check_fn(
     );
 
     let ret = result.ret_ty.clone();
-    type_checker.specialization_cache.insert(cache_key, result);
+    type_checker
+        .specialization_cache
+        .insert(cache_key, SpecializationState::Done(result));
     ret
 }
 

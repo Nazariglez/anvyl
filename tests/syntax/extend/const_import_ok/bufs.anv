@@ -1,0 +1,5 @@
+// @helper
+
+pub struct FixedBuf<T, N: int> {
+    data: [T; N],
+}

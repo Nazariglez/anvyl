@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: error
+// @skip: todo -> frontend_nominal_const_generics
+// @contains: ambiguous
+
+struct FixedBuf<T, N: int> {
+    data: [T; N],
+}
+
+extend<T> FixedBuf<T, 5> {
+    fn tag(self) -> string { "cap5" }
+}
+
+extend<N: int> FixedBuf<int, N> {
+    fn tag(self) -> string { "intN" }
+}
+
+fn main() {
+    FixedBuf { data: [1, 2, 3, 4, 5] }.tag();
+}

@@ -67,6 +67,18 @@ pub(super) fn parse_param_type(src: &str) -> ast::Type {
         .unwrap_or_else(|errs| panic!("failed to parse param type '{src}': {errs:?}"))
 }
 
+pub(super) fn expect_nominal<'a>(ty: &'a ast::Type, expected: &str) -> &'a [ast::GenericArg] {
+    match ty {
+        ast::Type::UnresolvedNominal {
+            name, generic_args, ..
+        } => {
+            assert_eq!(name.0.as_ref(), expected);
+            generic_args
+        }
+        other => panic!("expected nominal {expected}, found {other:?}"),
+    }
+}
+
 pub(super) fn expect_binary(
     expr: &ast::ExprNode,
     op: ast::BinaryOp,
@@ -196,6 +208,14 @@ pub(super) fn expect_tuple_index(expr: &ast::ExprNode, value: u32) -> &ast::Expr
 }
 
 pub(super) fn expect_call(expr: &ast::ExprNode, safe: bool) -> (&ast::ExprNode, &[ast::ExprNode]) {
+    let (func, args, _) = expect_generic_call(expr, safe);
+    (func, args)
+}
+
+pub(super) fn expect_generic_call(
+    expr: &ast::ExprNode,
+    safe: bool,
+) -> (&ast::ExprNode, &[ast::ExprNode], &[ast::GenericArg]) {
     match &expr.node.kind {
         ast::ExprKind::Call(call_node) => {
             let node = call_node.node();
@@ -204,7 +224,11 @@ pub(super) fn expect_call(expr: &ast::ExprNode, safe: bool) -> (&ast::ExprNode, 
                 "expected call safe={safe}, found {}",
                 node.safe
             );
-            (node.func.as_ref(), node.args.as_slice())
+            (
+                node.func.as_ref(),
+                node.args.as_slice(),
+                node.generic_args.as_slice(),
+            )
         }
         other => panic!("expected call expr, found {other:?}"),
     }
