@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
-use super::decls::CallableId;
+use super::{
+    decls::CallableId,
+    type_ops::{TypeFolder, TypeVisitor},
+};
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ExprId, FuncParam, GenericArg,
-        Ident, Type, TypeParam, TypeVarId,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ExprId, GenericArg, Ident, Type,
+        TypeParam, TypeVarId,
     },
     span::Span,
 };
@@ -59,56 +62,7 @@ impl GenericParams {
     }
 
     pub(crate) fn contains_param(&self, ty: &Type) -> bool {
-        match ty {
-            Type::Var(id) => self.type_params.iter().any(|param| param.id == *id),
-            Type::Array { elem, len } => {
-                self.contains_param(elem)
-                    || matches!(len, ArrayLen::Param(id) if self.const_params.iter().any(|param| param.id == *id))
-            }
-            Type::Func { params, ret } => {
-                params.iter().any(|param| self.contains_param(&param.ty))
-                    || self.contains_param(ret)
-            }
-            Type::Tuple(elems) => elems.iter().any(|ty| self.contains_param(ty)),
-            Type::NamedTuple(fields) => fields.iter().any(|(_, ty)| self.contains_param(ty)),
-            Type::Nominal(nominal) => {
-                nominal.type_args.iter().any(|ty| self.contains_param(ty))
-                    || nominal
-                        .const_args
-                        .iter()
-                        .any(|arg| self.contains_const_param(arg))
-            }
-            Type::UnresolvedNominal {
-                qualifier,
-                name,
-                generic_args,
-            } => {
-                let is_type_param =
-                    qualifier.is_none() && self.type_params.iter().any(|param| param.name == *name);
-                let has_param = generic_args.iter().any(|arg| match arg {
-                    GenericArg::Type(ty) => self.contains_param(ty),
-                    GenericArg::Const(arg) => self.contains_const_param(arg),
-                });
-                is_type_param || has_param
-            }
-            Type::List { elem } | Type::Slice { elem } => self.contains_param(elem),
-            Type::Map { key, value } => self.contains_param(key) || self.contains_param(value),
-            Type::Infer
-            | Type::Any
-            | Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Void => false,
-            Type::UnresolvedName(name) => self.type_params.iter().any(|param| param.name == *name),
-        }
-    }
-
-    fn contains_const_param(&self, arg: &ConstArg) -> bool {
-        let ConstArg::Param(id) = arg else {
-            return false;
-        };
-        self.const_params.iter().any(|param| param.id == *id)
+        ContainsGenericParam { generics: self }.visit_type(ty)
     }
 
     pub(crate) fn validate_explicit_args(&self, args: &GenericArgs) -> Result<(), ArityError> {
@@ -129,6 +83,46 @@ impl GenericParams {
             });
         }
         Ok(())
+    }
+}
+
+struct ContainsGenericParam<'a> {
+    generics: &'a GenericParams,
+}
+
+impl TypeVisitor for ContainsGenericParam<'_> {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        match ty {
+            Type::Var(id) => self
+                .generics
+                .type_params
+                .iter()
+                .any(|param| param.id == *id),
+            Type::UnresolvedName(name) => self
+                .generics
+                .type_params
+                .iter()
+                .any(|param| param.name == *name),
+            Type::UnresolvedNominal {
+                qualifier, name, ..
+            } => {
+                qualifier.is_none()
+                    && self
+                        .generics
+                        .type_params
+                        .iter()
+                        .any(|param| param.name == *name)
+            }
+            _ => false,
+        }
+    }
+
+    fn visit_const_arg(&mut self, arg: &ConstArg) -> bool {
+        matches!(arg, ConstArg::Param(id) if self.generics.const_params.iter().any(|param| param.id == *id))
+    }
+
+    fn visit_array_len(&mut self, len: ArrayLen) -> bool {
+        matches!(len, ArrayLen::Param(id) if self.generics.const_params.iter().any(|param| param.id == id))
     }
 }
 
@@ -584,109 +578,49 @@ fn const_term_arg(arg: &ConstArg) -> ConstTerm {
     }
 }
 
-fn substitute_const_arg(arg: &ConstArg, cs: &ConstSubst) -> ConstArg {
-    match arg {
-        ConstArg::Param(id) => cs
-            .get(id)
-            .map_or_else(|| arg.clone(), |value| const_arg_from_usize(*value)),
-        ConstArg::Value(_) | ConstArg::Name(_) => arg.clone(),
-    }
+struct Substituter<'a> {
+    types: &'a TypeSubst,
+    consts: &'a ConstSubst,
 }
 
-fn substitute_generic_arg(arg: &GenericArg, ts: &TypeSubst, cs: &ConstSubst) -> GenericArg {
-    match arg {
-        GenericArg::Type(ty) => GenericArg::Type(substitute(ty, ts, cs)),
-        GenericArg::Const(arg) => GenericArg::Const(substitute_const_arg(arg, cs)),
+impl TypeFolder for Substituter<'_> {
+    fn fold_var(&mut self, id: TypeVarId) -> Type {
+        self.types.get(&id).cloned().unwrap_or(Type::Var(id))
     }
-}
 
-fn substitute_args(
-    type_args: &[Type],
-    const_args: &[ConstArg],
-    ts: &TypeSubst,
-    cs: &ConstSubst,
-) -> (Vec<Type>, Vec<ConstArg>) {
-    let type_args = type_args.iter().map(|ty| substitute(ty, ts, cs)).collect();
-    let const_args = const_args
-        .iter()
-        .map(|arg| substitute_const_arg(arg, cs))
-        .collect();
-    (type_args, const_args)
+    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
+        match arg {
+            ConstArg::Param(id) => self
+                .consts
+                .get(id)
+                .map_or_else(|| arg.clone(), |value| const_arg_from_usize(*value)),
+            ConstArg::Value(_) | ConstArg::Name(_) => arg.clone(),
+        }
+    }
+
+    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
+        match len {
+            ArrayLen::Param(id) => self
+                .consts
+                .get(&id)
+                .map_or(ArrayLen::Param(id), |value| ArrayLen::Fixed(*value)),
+            other => other,
+        }
+    }
 }
 
 pub(crate) fn substitute(ty: &Type, ts: &TypeSubst, cs: &ConstSubst) -> Type {
-    match ty {
-        Type::Var(id) => ts.get(id).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Array { elem, len } => Type::Array {
-            elem: Box::new(substitute(elem, ts, cs)),
-            len: match len {
-                ArrayLen::Param(id) => cs.get(id).map_or(*len, |&n| ArrayLen::Fixed(n)),
-                other => *other,
-            },
-        },
-        Type::Func { params, ret } => Type::Func {
-            params: params
-                .iter()
-                .map(|p| FuncParam::new(substitute(&p.ty, ts, cs), p.mutable))
-                .collect(),
-            ret: Box::new(substitute(ret, ts, cs)),
-        },
-        Type::Tuple(elems) => Type::Tuple(elems.iter().map(|t| substitute(t, ts, cs)).collect()),
-        Type::NamedTuple(fields) => Type::NamedTuple(
-            fields
-                .iter()
-                .map(|(n, t)| (*n, substitute(t, ts, cs)))
-                .collect(),
-        ),
-        Type::Nominal(nominal) => {
-            let (type_args, const_args) =
-                substitute_args(&nominal.type_args, &nominal.const_args, ts, cs);
-            Type::nominal(
-                nominal.kind,
-                nominal.name,
-                type_args,
-                const_args,
-                nominal.origin.clone(),
-            )
-        }
-        Type::List { elem } => Type::List {
-            elem: Box::new(substitute(elem, ts, cs)),
-        },
-        Type::Map { key, value } => Type::Map {
-            key: Box::new(substitute(key, ts, cs)),
-            value: Box::new(substitute(value, ts, cs)),
-        },
-        Type::Slice { elem } => Type::Slice {
-            elem: Box::new(substitute(elem, ts, cs)),
-        },
-        Type::UnresolvedNominal {
-            qualifier,
-            name,
-            generic_args,
-        } => Type::UnresolvedNominal {
-            qualifier: *qualifier,
-            name: *name,
-            generic_args: generic_args
-                .iter()
-                .map(|arg| substitute_generic_arg(arg, ts, cs))
-                .collect(),
-        },
-
-        Type::Infer
-        | Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::UnresolvedName(_) => ty.clone(),
+    Substituter {
+        types: ts,
+        consts: cs,
     }
+    .fold_type(ty)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Ident, NominalKind};
+    use crate::ast::{FuncParam, Ident, NominalKind};
 
     fn tv(id: u32) -> TypeVarId {
         TypeVarId(id)
@@ -786,6 +720,30 @@ mod tests {
     }
 
     #[test]
+    fn substitute_unresolved_nominal_args() {
+        let ts = HashMap::from([(tv(0), Type::Int)]);
+        let cs = HashMap::from([(cp(1), 4)]);
+        let ty = Type::UnresolvedNominal {
+            qualifier: None,
+            name: Ident::new("Box"),
+            generic_args: vec![
+                GenericArg::Type(Type::Var(tv(0))),
+                GenericArg::Const(ConstArg::Param(cp(1))),
+            ],
+        };
+        let result = substitute(&ty, &ts, &cs);
+
+        assert_eq!(
+            result,
+            Type::UnresolvedNominal {
+                qualifier: None,
+                name: Ident::new("Box"),
+                generic_args: vec![GenericArg::Type(Type::Int), GenericArg::Const(carg(4)),],
+            }
+        );
+    }
+
+    #[test]
     fn primitives_unchanged() {
         for ty in [Type::Int, Type::Float, Type::Bool, Type::String, Type::Void] {
             assert_eq!(substitute(&ty, &HashMap::new(), &HashMap::new()), ty);
@@ -804,6 +762,45 @@ mod tests {
             name: Ident::new(name),
             id: cp(id),
         }
+    }
+
+    fn params() -> GenericParams {
+        GenericParams {
+            type_params: vec![tp(0, "T")],
+            const_params: vec![cparam(1, "N")],
+        }
+    }
+
+    #[test]
+    fn contains_param_in_unresolved_nominal_type_arg() {
+        let ty = Type::UnresolvedNominal {
+            qualifier: None,
+            name: Ident::new("Foo"),
+            generic_args: vec![GenericArg::Type(Type::UnresolvedName(Ident::new("T")))],
+        };
+        assert!(params().contains_param(&ty));
+    }
+
+    #[test]
+    fn contains_param_in_unresolved_nominal_const_arg() {
+        let ty = Type::UnresolvedNominal {
+            qualifier: None,
+            name: Ident::new("Foo"),
+            generic_args: vec![GenericArg::Const(ConstArg::Param(cp(1)))],
+        };
+        assert!(params().contains_param(&ty));
+    }
+
+    #[test]
+    fn contains_param_in_array_len() {
+        let ty = array_ty(Type::Int, ArrayLen::Param(cp(1)));
+        assert!(params().contains_param(&ty));
+    }
+
+    #[test]
+    fn contains_param_ignores_unrelated_types() {
+        assert!(!params().contains_param(&Type::Int));
+        assert!(!params().contains_param(&struct_ty("Foo", vec![Type::String])));
     }
 
     #[test]
@@ -1031,6 +1028,7 @@ mod tests {
         let mut inf = Inference::new();
         let tmpl = Type::Func {
             params: vec![FuncParam::new(Type::Var(tv(0)), false)],
+
             ret: Box::new(Type::Var(tv(0))),
         };
         let concrete = Type::Func {

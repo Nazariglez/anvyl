@@ -7,6 +7,7 @@ pub(crate) use self::{call_map::*, decls::*, generic::*, result::*};
 use self::{
     infer::{LocalTypeId, Solver, SolverFinalizeError, SolverRelationError, TypeHandle},
     postfix::{check_postfix_chain, collect_postfix_chain},
+    type_ops::{TypeFolder, TypeVisitor},
 };
 use crate::{
     ast::*,
@@ -21,6 +22,7 @@ mod generic;
 mod infer;
 mod postfix;
 mod result;
+mod type_ops;
 
 #[cfg(test)]
 mod tests;
@@ -332,6 +334,86 @@ struct TypeChecker {
     extend_templates: HashMap<(ExtendId, Ident), MethodTemplate>,
     specializations: HashMap<SpecializationKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
+}
+
+struct TypeRefResolver<'tc> {
+    tc: &'tc mut TypeChecker,
+}
+
+impl TypeFolder for TypeRefResolver<'_> {
+    fn fold_unresolved_nominal(
+        &mut self,
+        qualifier: Option<Ident>,
+        name: Ident,
+        generic_args: &[GenericArg],
+    ) -> Type {
+        match qualifier {
+            Some(module_name) => {
+                let exported = self
+                    .tc
+                    .current_import_scope()
+                    .and_then(|scope| scope.modules.get(&module_name))
+                    .cloned()
+                    .and_then(|mod_path| {
+                        self.tc
+                            .module_exports
+                            .as_ref()?
+                            .get(&mod_path)?
+                            .types
+                            .get(&name)
+                            .cloned()
+                    });
+
+                match exported {
+                    Some(exported) => self.tc.imported_type(
+                        exported.name,
+                        exported.kind,
+                        generic_args,
+                        &exported.origin,
+                    ),
+                    None => self.fold_unresolved_nominal_default(qualifier, name, generic_args),
+                }
+            }
+            None => {
+                if let Some(key) = self.tc.current_module_type(name) {
+                    return self
+                        .tc
+                        .nominal_type_with_args(&key, generic_args, Span::new(0, 0));
+                }
+
+                let imported = self
+                    .tc
+                    .current_import_scope()
+                    .and_then(|scope| scope.types.get(&name))
+                    .cloned();
+
+                match imported {
+                    Some(imported) => self.tc.imported_type(
+                        imported.name,
+                        imported.kind,
+                        generic_args,
+                        &imported.origin,
+                    ),
+                    None => self.fold_unresolved_nominal_default(None, name, generic_args),
+                }
+            }
+        }
+    }
+}
+
+struct ConstNormalizer<'tc> {
+    tc: &'tc mut TypeChecker,
+    span: Span,
+}
+
+impl TypeFolder for ConstNormalizer<'_> {
+    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
+        self.tc.normalize_const_arg(arg, self.span)
+    }
+
+    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
+        self.tc.normalize_array_len(len, self.span)
+    }
 }
 
 impl TypeChecker {
@@ -779,93 +861,8 @@ impl TypeChecker {
         }
     }
 
-    fn resolve_type_refs(&mut self, tys: &[Type]) -> Vec<Type> {
-        tys.iter().map(|ty| self.resolve_type_ref(ty)).collect()
-    }
-
-    fn resolve_func_params(&mut self, params: &[FuncParam]) -> Vec<FuncParam> {
-        params
-            .iter()
-            .map(|param| FuncParam::new(self.resolve_type_ref(&param.ty), param.mutable))
-            .collect()
-    }
-
-    fn resolve_named_type_refs(&mut self, fields: &[(Ident, Type)]) -> Vec<(Ident, Type)> {
-        fields
-            .iter()
-            .map(|(name, ty)| (*name, self.resolve_type_ref(ty)))
-            .collect()
-    }
-
     fn resolve_type_ref(&mut self, ty: &Type) -> Type {
-        match ty {
-            Type::Func { params, ret } => Type::Func {
-                params: self.resolve_func_params(params),
-                ret: Box::new(self.resolve_type_ref(ret)),
-            },
-            Type::Tuple(elems) => Type::Tuple(self.resolve_type_refs(elems)),
-            Type::NamedTuple(fields) => Type::NamedTuple(self.resolve_named_type_refs(fields)),
-            Type::List { elem } => Type::List {
-                elem: Box::new(self.resolve_type_ref(elem)),
-            },
-            Type::Array { elem, len } => Type::Array {
-                elem: Box::new(self.resolve_type_ref(elem)),
-                len: *len,
-            },
-            Type::Map { key, value } => Type::Map {
-                key: Box::new(self.resolve_type_ref(key)),
-                value: Box::new(self.resolve_type_ref(value)),
-            },
-            Type::Slice { elem } => Type::Slice {
-                elem: Box::new(self.resolve_type_ref(elem)),
-            },
-            Type::Nominal(nominal) => Type::nominal(
-                nominal.kind,
-                nominal.name,
-                self.resolve_type_refs(&nominal.type_args),
-                nominal.const_args.clone(),
-                nominal.origin.clone(),
-            ),
-            Type::UnresolvedNominal {
-                qualifier: Some(module_name),
-                name,
-                generic_args,
-            } => {
-                let Some(scope) = self.current_import_scope() else {
-                    return resolve_type(ty);
-                };
-                let Some(mod_path) = scope.modules.get(module_name) else {
-                    return resolve_type(ty);
-                };
-                let Some(exports) = self.module_exports.as_ref() else {
-                    return resolve_type(ty);
-                };
-                let Some(dep) = exports.get(mod_path) else {
-                    return resolve_type(ty);
-                };
-                let Some(exported) = dep.types.get(name).cloned() else {
-                    return resolve_type(ty);
-                };
-                self.imported_type(exported.name, exported.kind, generic_args, &exported.origin)
-            }
-            Type::UnresolvedNominal {
-                qualifier: None,
-                name,
-                generic_args,
-            } => {
-                if let Some(key) = self.current_module_type(*name) {
-                    return self.nominal_type_with_args(&key, generic_args, Span::new(0, 0));
-                }
-                let Some(scope) = self.current_import_scope() else {
-                    return resolve_type(ty);
-                };
-                let Some(imported) = scope.types.get(name).cloned() else {
-                    return resolve_type(ty);
-                };
-                self.imported_type(imported.name, imported.kind, generic_args, &imported.origin)
-            }
-            _ => resolve_type(ty),
-        }
+        TypeRefResolver { tc: self }.fold_type(ty)
     }
 
     fn resolve_type_for_tc(&mut self, ty: &Type) -> Type {
@@ -882,97 +879,7 @@ impl TypeChecker {
     }
 
     fn normalize_type_consts(&mut self, ty: &Type, span: Span) -> Type {
-        match ty {
-            Type::Func { params, ret } => Type::Func {
-                params: params
-                    .iter()
-                    .map(|p| FuncParam::new(self.normalize_type_consts(&p.ty, span), p.mutable))
-                    .collect(),
-                ret: Box::new(self.normalize_type_consts(ret, span)),
-            },
-            Type::Tuple(elems) => Type::Tuple(
-                elems
-                    .iter()
-                    .map(|ty| self.normalize_type_consts(ty, span))
-                    .collect(),
-            ),
-            Type::NamedTuple(fields) => Type::NamedTuple(
-                fields
-                    .iter()
-                    .map(|(name, ty)| (*name, self.normalize_type_consts(ty, span)))
-                    .collect(),
-            ),
-            Type::Nominal(nominal) => {
-                let (type_args, const_args) =
-                    self.normalize_nominal_args(&nominal.type_args, &nominal.const_args, span);
-                Type::nominal(
-                    nominal.kind,
-                    nominal.name,
-                    type_args,
-                    const_args,
-                    nominal.origin.clone(),
-                )
-            }
-            Type::List { elem } => Type::List {
-                elem: Box::new(self.normalize_type_consts(elem, span)),
-            },
-            Type::Array { elem, len } => Type::Array {
-                elem: Box::new(self.normalize_type_consts(elem, span)),
-                len: self.normalize_array_len(*len, span),
-            },
-            Type::Map { key, value } => Type::Map {
-                key: Box::new(self.normalize_type_consts(key, span)),
-                value: Box::new(self.normalize_type_consts(value, span)),
-            },
-            Type::Slice { elem } => Type::Slice {
-                elem: Box::new(self.normalize_type_consts(elem, span)),
-            },
-            Type::UnresolvedNominal {
-                qualifier,
-                name,
-                generic_args,
-            } => Type::UnresolvedNominal {
-                qualifier: *qualifier,
-                name: *name,
-                generic_args: generic_args
-                    .iter()
-                    .map(|arg| self.normalize_generic_arg(arg, span))
-                    .collect(),
-            },
-            Type::Infer
-            | Type::Any
-            | Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Void
-            | Type::Var(_)
-            | Type::UnresolvedName(_) => ty.clone(),
-        }
-    }
-
-    fn normalize_nominal_args(
-        &mut self,
-        type_args: &[Type],
-        const_args: &[ConstArg],
-        span: Span,
-    ) -> (Vec<Type>, Vec<ConstArg>) {
-        let type_args = type_args
-            .iter()
-            .map(|ty| self.normalize_type_consts(ty, span))
-            .collect();
-        let const_args = const_args
-            .iter()
-            .map(|arg| self.normalize_const_arg(arg, span))
-            .collect();
-        (type_args, const_args)
-    }
-
-    fn normalize_generic_arg(&mut self, arg: &GenericArg, span: Span) -> GenericArg {
-        match arg {
-            GenericArg::Type(ty) => GenericArg::Type(self.normalize_type_consts(ty, span)),
-            GenericArg::Const(arg) => GenericArg::Const(self.normalize_const_arg(arg, span)),
-        }
+        ConstNormalizer { tc: self, span }.fold_type(ty)
     }
 
     fn normalize_const_arg(&mut self, arg: &ConstArg, span: Span) -> ConstArg {
@@ -1328,7 +1235,7 @@ fn collect_module_members(
             Stmt::Const(c) => {
                 if is_visible(c.node.visibility) {
                     let ty = match &c.node.ty {
-                        Some(t) => resolve_type(t),
+                        Some(t) => t.clone(),
                         None => Type::Infer,
                     };
                     exports.values.insert(
@@ -1657,14 +1564,9 @@ fn is_generic(func: &Func) -> bool {
 fn func_type_from_signature(params: &[Param], ret: &Type) -> Type {
     let resolved_params: Vec<FuncParam> = params
         .iter()
-        .map(|p| {
-            FuncParam::new(
-                resolve_type(&p.ty),
-                matches!(p.mutability, Mutability::Mutable),
-            )
-        })
+        .map(|p| FuncParam::new(p.ty.clone(), matches!(p.mutability, Mutability::Mutable)))
         .collect();
-    let resolved_ret = Box::new(resolve_type(ret));
+    let resolved_ret = Box::new(ret.clone());
     Type::Func {
         params: resolved_params,
         ret: resolved_ret,
@@ -3665,97 +3567,20 @@ pub(super) fn bare_type_name(ty: &Type) -> Option<Ident> {
     }
 }
 
-fn resolve_type(ty: &Type) -> Type {
-    match ty {
-        Type::Infer => Type::Infer,
-        Type::Any => Type::Any,
-        Type::Int => Type::Int,
-        Type::Float => Type::Float,
-        Type::Bool => Type::Bool,
-        Type::String => Type::String,
-        Type::Void => Type::Void,
-        Type::Func { params, ret } => Type::Func {
-            params: params
-                .iter()
-                .map(|p| FuncParam::new(resolve_type(&p.ty), p.mutable))
-                .collect(),
-            ret: Box::new(resolve_type(ret)),
-        },
-        Type::Var(v) => Type::Var(*v),
-        Type::UnresolvedName(n) => Type::UnresolvedName(*n),
-        Type::Tuple(elems) => Type::Tuple(elems.iter().map(resolve_type).collect()),
-        Type::NamedTuple(fields) => {
-            Type::NamedTuple(fields.iter().map(|(n, t)| (*n, resolve_type(t))).collect())
-        }
-        Type::Nominal(nominal) => Type::nominal(
-            nominal.kind,
-            nominal.name,
-            nominal.type_args.iter().map(resolve_type).collect(),
-            nominal.const_args.clone(),
-            nominal.origin.clone(),
-        ),
-        Type::List { elem } => Type::List {
-            elem: Box::new(resolve_type(elem)),
-        },
-        Type::Array { elem, len } => Type::Array {
-            elem: Box::new(resolve_type(elem)),
-            len: *len,
-        },
-        Type::Map { key, value } => Type::Map {
-            key: Box::new(resolve_type(key)),
-            value: Box::new(resolve_type(value)),
-        },
-        Type::Slice { elem } => Type::Slice {
-            elem: Box::new(resolve_type(elem)),
-        },
-        Type::UnresolvedNominal {
-            qualifier,
-            name,
-            generic_args,
-        } => Type::UnresolvedNominal {
-            qualifier: *qualifier,
-            name: *name,
-            generic_args: generic_args
-                .iter()
-                .map(|arg| match arg {
-                    GenericArg::Type(ty) => GenericArg::Type(resolve_type(ty)),
-                    GenericArg::Const(arg) => GenericArg::Const(arg.clone()),
-                })
-                .collect(),
-        },
+struct ContainsInfer;
+
+impl TypeVisitor for ContainsInfer {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        matches!(ty, Type::Infer)
+    }
+
+    fn visit_array_len(&mut self, len: ArrayLen) -> bool {
+        matches!(len, ArrayLen::Infer)
     }
 }
 
 pub(crate) fn type_contains_infer(ty: &Type) -> bool {
-    match ty {
-        Type::Infer => true,
-        Type::Func { params, ret } => {
-            let params_contain_infer = params.iter().any(|param| type_contains_infer(&param.ty));
-            params_contain_infer || type_contains_infer(ret)
-        }
-        Type::Tuple(elems) => elems.iter().any(type_contains_infer),
-        Type::NamedTuple(fields) => fields.iter().any(|(_, ty)| type_contains_infer(ty)),
-        Type::Nominal(nominal) => nominal.type_args.iter().any(type_contains_infer),
-        Type::List { elem } | Type::Slice { elem } => type_contains_infer(elem),
-        Type::Array { elem, len } => type_contains_infer(elem) || array_len_contains_infer(*len),
-        Type::Map { key, value } => type_contains_infer(key) || type_contains_infer(value),
-        Type::UnresolvedNominal { generic_args, .. } => generic_args.iter().any(|arg| match arg {
-            GenericArg::Type(ty) => type_contains_infer(ty),
-            GenericArg::Const(_) => false,
-        }),
-        Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Var(_)
-        | Type::UnresolvedName(_) => false,
-    }
-}
-
-fn array_len_contains_infer(len: ArrayLen) -> bool {
-    matches!(len, ArrayLen::Infer)
+    ContainsInfer.visit_type(ty)
 }
 
 pub(crate) fn call_target_contains_infer(target: &CallTarget) -> bool {

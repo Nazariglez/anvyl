@@ -3,7 +3,7 @@ use super::support::{
     assert_type_with_modules, assert_type_with_named_modules, typecheck, typecheck_with_modules,
 };
 use crate::{
-    ast::{ArrayLen, ConstArg, ConstValue, Ident, NominalKind, Type},
+    ast::{ArrayLen, ConstArg, ConstValue, FuncParam, GenericArg, Ident, NominalKind, Type},
     typecheck::{ArityError, ModuleScope, TypeError, type_contains_infer},
 };
 
@@ -161,6 +161,37 @@ mod constraints {
             elem: Box::new(Type::Int),
             len: ArrayLen::Infer,
         };
+        assert!(type_contains_infer(&ty));
+    }
+
+    #[test]
+    fn nested_func_ret_infer_guard() {
+        let ty = Type::Func {
+            params: vec![FuncParam::new(Type::Int, false)],
+            ret: Box::new(Type::Tuple(vec![Type::Infer])),
+        };
+        assert!(type_contains_infer(&ty));
+    }
+
+    #[test]
+    fn unresolved_nominal_type_arg_infer_guard() {
+        let ty = Type::UnresolvedNominal {
+            qualifier: None,
+            name: Ident::new("Box"),
+            generic_args: vec![GenericArg::Type(Type::Infer)],
+        };
+        assert!(type_contains_infer(&ty));
+    }
+
+    #[test]
+    fn nominal_type_arg_infer_guard() {
+        let ty = Type::nominal(
+            NominalKind::Struct,
+            Ident::new("Box"),
+            vec![Type::Infer],
+            vec![],
+            None,
+        );
         assert!(type_contains_infer(&ty));
     }
 }

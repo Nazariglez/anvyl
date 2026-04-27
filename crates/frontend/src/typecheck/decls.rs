@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     ConstSubst, GenericParams, Inference, Specificity, TypeSubst, bare_type_name,
-    compare_specificity, const_arg_usize, infer, resolve_type, substitute,
+    compare_specificity, const_arg_usize, infer, substitute, type_ops::TypeFolder,
 };
 use crate::{
     ast::{
@@ -312,7 +312,7 @@ impl DeclarationIndex {
                             field.name,
                             FieldSchema {
                                 index: i,
-                                ty: resolve_type(&field.ty),
+                                ty: field.ty.clone(),
                                 has_default: field.default.is_some(),
                             },
                         );
@@ -325,7 +325,7 @@ impl DeclarationIndex {
                                 generics: generic_params(&method.type_params, &method.const_params),
                                 receiver: method.receiver,
                                 params: resolve_func_params(&method.params),
-                                ret: resolve_type(&method.ret),
+                                ret: method.ret.clone(),
                             },
                         );
                     }
@@ -354,9 +354,7 @@ impl DeclarationIndex {
                     for variant in &enm.variants {
                         let schema = match &variant.kind {
                             VariantKind::Unit => VariantSchema::Unit,
-                            VariantKind::Tuple(types) => {
-                                VariantSchema::Tuple(types.iter().map(resolve_type).collect())
-                            }
+                            VariantKind::Tuple(types) => VariantSchema::Tuple(types.clone()),
                             VariantKind::Struct(fields) => {
                                 let mut field_map = HashMap::new();
                                 for (i, f) in fields.iter().enumerate() {
@@ -364,7 +362,7 @@ impl DeclarationIndex {
                                         f.name,
                                         FieldSchema {
                                             index: i,
-                                            ty: resolve_type(&f.ty),
+                                            ty: f.ty.clone(),
                                             has_default: f.default.is_some(),
                                         },
                                     );
@@ -417,7 +415,7 @@ impl DeclarationIndex {
                     if !visible {
                         continue;
                     }
-                    let ty = c.ty.as_ref().map(resolve_type).unwrap_or(Type::Infer);
+                    let ty = c.ty.clone().unwrap_or(Type::Infer);
                     decls.values.insert(c.name, ValueDecl::Const(ty));
                 }
                 Stmt::Extend(extend_node) => {
@@ -430,7 +428,7 @@ impl DeclarationIndex {
                         continue;
                     }
                     let ext = &extend_node.node;
-                    let target = resolve_type(&ext.ty);
+                    let target = ext.ty.clone();
                     let mut methods = HashMap::new();
                     for method_node in &ext.methods {
                         let m = &method_node.node;
@@ -440,7 +438,7 @@ impl DeclarationIndex {
                             ExtendMethodSchema {
                                 generics: GenericParams::default(),
                                 params: resolve_func_params(params),
-                                ret: resolve_type(&m.ret),
+                                ret: m.ret.clone(),
                             },
                         );
                     }
@@ -625,141 +623,65 @@ fn more_specific(a: &Type, b: &Type) -> bool {
     compare_specificity(a, b) == Specificity::MoreSpecific
 }
 
-pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type {
-    match ty {
-        Type::Infer => Type::Infer,
-        Type::Any => Type::Any,
-        Type::Int => Type::Int,
-        Type::Float => Type::Float,
-        Type::Bool => Type::Bool,
-        Type::String => Type::String,
-        Type::Void => Type::Void,
-        Type::Func { params, ret } => Type::Func {
-            params: params
-                .iter()
-                .map(|param| {
-                    FuncParam::new(generic_template_type(&param.ty, generics), param.mutable)
-                })
-                .collect(),
-            ret: Box::new(generic_template_type(ret, generics)),
-        },
-        Type::Var(id) => Type::Var(*id),
-        Type::UnresolvedName(name) => generics
+struct GenericTemplate<'a> {
+    generics: &'a GenericParams,
+}
+
+impl TypeFolder for GenericTemplate<'_> {
+    fn fold_unresolved_name(&mut self, name: Ident) -> Type {
+        self.generics
             .type_params
             .iter()
-            .find(|param| param.name == *name)
-            .map_or(Type::UnresolvedName(*name), |param| Type::Var(param.id)),
-        Type::UnresolvedNominal {
-            qualifier,
-            name,
-            generic_args,
-        } => {
-            let type_param = if qualifier.is_none() && generic_args.is_empty() {
-                generics
-                    .type_params
-                    .iter()
-                    .find(|param| param.name == *name)
-            } else {
-                None
-            };
-
-            match type_param {
-                Some(param) => Type::Var(param.id),
-                None => Type::UnresolvedNominal {
-                    qualifier: *qualifier,
-                    name: *name,
-                    generic_args: generic_args
-                        .iter()
-                        .map(|arg| generic_template_arg(arg, generics))
-                        .collect(),
-                },
-            }
-        }
-        Type::Tuple(elems) => Type::Tuple(
-            elems
-                .iter()
-                .map(|ty| generic_template_type(ty, generics))
-                .collect(),
-        ),
-        Type::NamedTuple(fields) => Type::NamedTuple(
-            fields
-                .iter()
-                .map(|(name, ty)| (*name, generic_template_type(ty, generics)))
-                .collect(),
-        ),
-        Type::Nominal(nominal) => {
-            let (type_args, const_args) =
-                generic_template_args(&nominal.type_args, &nominal.const_args, generics);
-            Type::nominal(
-                nominal.kind,
-                nominal.name,
-                type_args,
-                const_args,
-                nominal.origin.clone(),
-            )
-        }
-        Type::List { elem } => Type::List {
-            elem: Box::new(generic_template_type(elem, generics)),
-        },
-        Type::Array { elem, len } => Type::Array {
-            elem: Box::new(generic_template_type(elem, generics)),
-            len: extend_target_len(*len, generics),
-        },
-        Type::Map { key, value } => Type::Map {
-            key: Box::new(generic_template_type(key, generics)),
-            value: Box::new(generic_template_type(value, generics)),
-        },
-        Type::Slice { elem } => Type::Slice {
-            elem: Box::new(generic_template_type(elem, generics)),
-        },
+            .find(|param| param.name == name)
+            .map_or(Type::UnresolvedName(name), |param| Type::Var(param.id))
     }
-}
 
-fn generic_template_args(
-    type_args: &[Type],
-    const_args: &[ConstArg],
-    generics: &GenericParams,
-) -> (Vec<Type>, Vec<ConstArg>) {
-    let type_args = type_args
-        .iter()
-        .map(|ty| generic_template_type(ty, generics))
-        .collect();
-    let const_args = const_args
-        .iter()
-        .map(|arg| generic_template_const_arg(arg, generics))
-        .collect();
-    (type_args, const_args)
-}
+    fn fold_unresolved_nominal(
+        &mut self,
+        qualifier: Option<Ident>,
+        name: Ident,
+        generic_args: &[GenericArg],
+    ) -> Type {
+        if qualifier.is_none()
+            && generic_args.is_empty()
+            && let Some(param) = self
+                .generics
+                .type_params
+                .iter()
+                .find(|param| param.name == name)
+        {
+            return Type::Var(param.id);
+        }
+        self.fold_unresolved_nominal_default(qualifier, name, generic_args)
+    }
 
-fn generic_template_const_arg(arg: &ConstArg, generics: &GenericParams) -> ConstArg {
-    match arg {
-        ConstArg::Name(name) => {
-            let const_param = generics
+    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
+        match arg {
+            ConstArg::Name(name) => self
+                .generics
                 .const_params
                 .iter()
-                .find(|param| param.name == *name);
-            const_param.map_or_else(|| arg.clone(), |param| ConstArg::Param(param.id))
+                .find(|param| param.name == *name)
+                .map_or_else(|| arg.clone(), |param| ConstArg::Param(param.id)),
+            ConstArg::Value(_) | ConstArg::Param(_) => arg.clone(),
         }
-        ConstArg::Value(_) | ConstArg::Param(_) => arg.clone(),
+    }
+
+    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
+        match len {
+            ArrayLen::Named(name) => self
+                .generics
+                .const_params
+                .iter()
+                .find(|param| param.name == name)
+                .map_or(ArrayLen::Named(name), |param| ArrayLen::Param(param.id)),
+            other => other,
+        }
     }
 }
 
-fn generic_template_arg(arg: &GenericArg, generics: &GenericParams) -> GenericArg {
-    match arg {
-        GenericArg::Type(ty) => GenericArg::Type(generic_template_type(ty, generics)),
-        GenericArg::Const(arg) => GenericArg::Const(generic_template_const_arg(arg, generics)),
-    }
-}
-
-fn extend_target_len(len: ArrayLen, generics: &GenericParams) -> ArrayLen {
-    match len {
-        ArrayLen::Named(name) => generics
-            .const_params
-            .iter()
-            .find(|param| param.name == name)
-            .map_or(ArrayLen::Named(name), |param| ArrayLen::Param(param.id)),
-        other => other,
-    }
+pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type {
+    GenericTemplate { generics }.fold_type(ty)
 }
 
 struct NominalResolver<'a> {
@@ -768,62 +690,16 @@ struct NominalResolver<'a> {
     fallback: &'a HashMap<Ident, (Type, GenericParams)>,
 }
 
-impl NominalResolver<'_> {
-    fn resolve_type(&self, ty: &Type) -> Type {
-        match ty {
-            Type::UnresolvedNominal {
-                qualifier,
-                name,
-                generic_args,
-            } => self.resolve_unresolved_nominal(*qualifier, *name, generic_args),
-            Type::UnresolvedName(name) => self
-                .scoped
-                .get(&(self.scope.clone(), *name))
-                .or_else(|| self.fallback.get(name))
-                .map_or_else(|| ty.clone(), |(ty, _)| ty.clone()),
-            Type::Func { params, ret } => Type::Func {
-                params: params
-                    .iter()
-                    .map(|p| FuncParam::new(self.resolve_type(&p.ty), p.mutable))
-                    .collect(),
-                ret: Box::new(self.resolve_type(ret)),
-            },
-            Type::Tuple(elems) => {
-                Type::Tuple(elems.iter().map(|ty| self.resolve_type(ty)).collect())
-            }
-            Type::NamedTuple(fields) => Type::NamedTuple(
-                fields
-                    .iter()
-                    .map(|(name, ty)| (*name, self.resolve_type(ty)))
-                    .collect(),
-            ),
-            Type::Nominal(nominal) => Type::nominal(
-                nominal.kind,
-                nominal.name,
-                self.resolve_type_args(&nominal.type_args),
-                nominal.const_args.clone(),
-                nominal.origin.clone(),
-            ),
-            Type::List { elem } => Type::List {
-                elem: Box::new(self.resolve_type(elem)),
-            },
-            Type::Array { elem, len } => Type::Array {
-                elem: Box::new(self.resolve_type(elem)),
-                len: *len,
-            },
-            Type::Map { key, value } => Type::Map {
-                key: Box::new(self.resolve_type(key)),
-                value: Box::new(self.resolve_type(value)),
-            },
-            Type::Slice { elem } => Type::Slice {
-                elem: Box::new(self.resolve_type(elem)),
-            },
-            _ => ty.clone(),
-        }
+impl TypeFolder for NominalResolver<'_> {
+    fn fold_unresolved_name(&mut self, name: Ident) -> Type {
+        self.scoped
+            .get(&(self.scope.clone(), name))
+            .or_else(|| self.fallback.get(&name))
+            .map_or(Type::UnresolvedName(name), |(ty, _)| ty.clone())
     }
 
-    fn resolve_unresolved_nominal(
-        &self,
+    fn fold_unresolved_nominal(
+        &mut self,
         qualifier: Option<Ident>,
         name: Ident,
         generic_args: &[GenericArg],
@@ -833,43 +709,20 @@ impl NominalResolver<'_> {
             .get(&(self.scope.clone(), name))
             .cloned()
             .or_else(|| self.fallback.get(&name).cloned());
-        match resolved {
-            Some((base, generics)) => self
-                .merge_generic_args(base, &generics, generic_args)
-                .unwrap_or_else(|| self.unresolved_nominal(qualifier, name, generic_args)),
-            None => self.unresolved_nominal(qualifier, name, generic_args),
+
+        if let Some((base, generics)) = resolved {
+            if let Some(ty) = self.merge_generic_args(base, &generics, generic_args) {
+                return ty;
+            }
         }
-    }
 
-    fn resolve_type_args(&self, type_args: &[Type]) -> Vec<Type> {
-        type_args.iter().map(|ty| self.resolve_type(ty)).collect()
+        self.fold_unresolved_nominal_default(qualifier, name, generic_args)
     }
+}
 
-    fn resolve_generic_arg(&self, arg: &GenericArg) -> GenericArg {
-        match arg {
-            GenericArg::Type(ty) => GenericArg::Type(self.resolve_type(ty)),
-            GenericArg::Const(arg) => GenericArg::Const(arg.clone()),
-        }
-    }
-
-    fn unresolved_nominal(
-        &self,
-        qualifier: Option<Ident>,
-        name: Ident,
-        generic_args: &[GenericArg],
-    ) -> Type {
-        Type::UnresolvedNominal {
-            qualifier,
-            name,
-            generic_args: generic_args
-                .iter()
-                .map(|arg| self.resolve_generic_arg(arg))
-                .collect(),
-        }
-    }
-
+impl NominalResolver<'_> {
     fn bind_nominal_args(
-        &self,
+        &mut self,
         generics: &GenericParams,
         args: &[GenericArg],
     ) -> Option<(Vec<Type>, Vec<ConstArg>)> {
@@ -884,7 +737,7 @@ impl NominalResolver<'_> {
                 let GenericArg::Type(ty) = arg else {
                     return None;
                 };
-                type_args.push(self.resolve_type(ty));
+                type_args.push(self.fold_type(ty));
             } else {
                 match arg {
                     GenericArg::Const(arg) => const_args.push(arg.clone()),
@@ -896,7 +749,7 @@ impl NominalResolver<'_> {
     }
 
     fn merge_generic_args(
-        &self,
+        &mut self,
         base: Type,
         generics: &GenericParams,
         args: &[GenericArg],
@@ -932,28 +785,18 @@ fn generic_params(type_params: &[TypeParam], const_params: &[ConstParam]) -> Gen
 fn func_type_from_params(params: &[Param], ret: &Type) -> Type {
     let resolved_params = params
         .iter()
-        .map(|p| {
-            FuncParam::new(
-                resolve_type(&p.ty),
-                matches!(p.mutability, Mutability::Mutable),
-            )
-        })
+        .map(|p| FuncParam::new(p.ty.clone(), matches!(p.mutability, Mutability::Mutable)))
         .collect();
     Type::Func {
         params: resolved_params,
-        ret: Box::new(resolve_type(ret)),
+        ret: Box::new(ret.clone()),
     }
 }
 
 fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
     params
         .iter()
-        .map(|p| {
-            FuncParam::new(
-                resolve_type(&p.ty),
-                matches!(p.mutability, Mutability::Mutable),
-            )
-        })
+        .map(|p| FuncParam::new(p.ty.clone(), matches!(p.mutability, Mutability::Mutable)))
         .collect()
 }
 
@@ -975,12 +818,12 @@ fn resolve_nominal(
     scoped: &HashMap<(ModuleScope, Ident), (Type, GenericParams)>,
     fallback: &HashMap<Ident, (Type, GenericParams)>,
 ) -> Type {
-    NominalResolver {
+    let mut resolver = NominalResolver {
         scope,
         scoped,
         fallback,
-    }
-    .resolve_type(ty)
+    };
+    resolver.fold_type(ty)
 }
 
 pub(crate) fn nominal_type(key: &NominalKey) -> Type {
@@ -1010,6 +853,32 @@ mod tests {
 
     fn ident(name: &str) -> Ident {
         Ident::new(name)
+    }
+
+    #[test]
+    fn generic_template_keeps_nominal_with_args() {
+        let generics = GenericParams {
+            type_params: vec![TypeParam {
+                name: ident("T"),
+                id: TypeVarId(0),
+            }],
+            const_params: vec![],
+        };
+        let ty = Type::UnresolvedNominal {
+            qualifier: None,
+            name: ident("Foo"),
+            generic_args: vec![GenericArg::Type(Type::UnresolvedName(ident("T")))],
+        };
+        let result = generic_template_type(&ty, &generics);
+
+        assert_eq!(
+            result,
+            Type::UnresolvedNominal {
+                qualifier: None,
+                name: ident("Foo"),
+                generic_args: vec![GenericArg::Type(Type::Var(TypeVarId(0)))],
+            }
+        );
     }
 
     #[test]
