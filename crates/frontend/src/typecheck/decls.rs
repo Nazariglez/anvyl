@@ -7,8 +7,8 @@ use super::{
 use crate::{
     ast::{
         AggregateKind, ArrayLen, ConstArg, ConstParam, FuncParam, GenericArg, Ident,
-        MethodReceiver, Mutability, NominalKind, Param, Program, Stmt, StmtNode, Type, TypeParam,
-        VariantKind, Visibility,
+        ImportItemKind, ImportKind, MethodReceiver, Mutability, NominalKind, Param, Program, Stmt,
+        StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     resolve::{ModuleKey, ModulePath, ResolveResult},
 };
@@ -78,17 +78,80 @@ pub(crate) struct DeclarationIndex {
     extends: Vec<ExtendSchema>,
 }
 
-#[derive(Default)]
-pub(crate) struct ModuleDecls {
-    pub(crate) values: HashMap<Ident, ValueDecl>,
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedValue {
+    pub(crate) module: ModuleScope,
+    pub(crate) name: Ident,
+    pub(crate) decl: ValueDecl,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Namespace {
+    pub(crate) values: HashMap<Ident, ResolvedValue>,
     pub(crate) types: HashMap<Ident, NominalKey>,
     pub(crate) modules: HashMap<Ident, ModuleScope>,
+}
+
+pub(crate) type ModuleExports = Namespace;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImportScope {
+    pub(crate) namespace: Namespace,
+    pub(crate) active_modules: HashSet<ModuleScope>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ModuleDecls {
+    locals: Namespace,
+    exports: ModuleExports,
+    imports: ImportScope,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum ValueDecl {
     Func(FuncSig),
     Const(Type),
+}
+
+impl Namespace {
+    fn value(&self, name: Ident) -> Option<&ResolvedValue> {
+        self.values.get(&name)
+    }
+
+    fn ty(&self, name: Ident) -> Option<&NominalKey> {
+        self.types.get(&name)
+    }
+
+    fn module(&self, name: Ident) -> Option<&ModuleScope> {
+        self.modules.get(&name)
+    }
+
+    fn insert_value(&mut self, visible: Ident, value: ResolvedValue) {
+        self.values.insert(visible, value);
+    }
+
+    fn insert_type(&mut self, visible: Ident, key: NominalKey) {
+        self.types.insert(visible, key);
+    }
+
+    fn insert_module(&mut self, visible: Ident, module: ModuleScope) {
+        self.modules.insert(visible, module);
+    }
+}
+
+impl ImportScope {
+    fn activate_imported_origins(&mut self) {
+        self.active_modules.extend(
+            self.namespace
+                .values
+                .values()
+                .map(|value| value.module.clone()),
+        );
+        self.active_modules
+            .extend(self.namespace.types.values().map(|key| key.module.clone()));
+        self.active_modules
+            .extend(self.namespace.modules.values().cloned());
+    }
 }
 
 impl ValueDecl {
@@ -168,27 +231,42 @@ pub(crate) enum ExtendMethodMatch<'a> {
 impl DeclarationIndex {
     pub(crate) fn from_root(program: &Program) -> Self {
         let mut index = Self::new();
-        index.collect_module(program, ModuleScope::Root, true);
+        let modules = [(ModuleScope::Root, program)];
+        for (scope, program) in &modules {
+            index.collect_module(program, scope.clone(), true);
+        }
+        index.apply_public_import_reexports(&modules);
+        index.build_import_scopes(&modules);
         index.resolve_nominals();
         index
     }
 
     pub(crate) fn from_root_and_modules(root: &Program, resolved: &ResolveResult) -> Self {
         let mut index = Self::new();
-        index.collect_module(root, ModuleScope::Root, true);
-
-        for group in &resolved.module_groups {
-            for module in group {
-                let ModuleKey::Named(ref path) = module.key else {
-                    continue;
-                };
-                let scope = ModuleScope::Named(path.clone());
-                index.collect_module(&module.program, scope, false);
-            }
+        let modules = Self::module_programs(root, resolved);
+        for (scope, program) in &modules {
+            index.collect_module(program, scope.clone(), matches!(scope, ModuleScope::Root));
         }
-
+        index.apply_public_import_reexports(&modules);
+        index.build_import_scopes(&modules);
         index.resolve_nominals();
         index
+    }
+
+    fn module_programs<'a>(
+        root: &'a Program,
+        resolved: &'a ResolveResult,
+    ) -> Vec<(ModuleScope, &'a Program)> {
+        let mut modules = vec![(ModuleScope::Root, root)];
+        for group in &resolved.module_groups {
+            for module in group {
+                let ModuleKey::Named(path) = &module.key else {
+                    continue;
+                };
+                modules.push((ModuleScope::Named(path.clone()), &module.program));
+            }
+        }
+        modules
     }
 
     fn new() -> Self {
@@ -263,47 +341,67 @@ impl DeclarationIndex {
                 }
             }
         }
-        for (scope, decls) in &mut self.modules {
-            for value in decls.values.values_mut() {
-                match value {
-                    ValueDecl::Func(sig) => {
-                        sig.ty = resolve_nominal(scope, &sig.ty, &scoped, &fallback);
-                    }
-                    ValueDecl::Const(ty) => {
-                        *ty = resolve_nominal(scope, ty, &scoped, &fallback);
-                    }
-                }
+        for decls in self.modules.values_mut() {
+            Self::resolve_namespace_values(&mut decls.locals, &scoped, &fallback);
+            Self::resolve_namespace_values(&mut decls.exports, &scoped, &fallback);
+            Self::resolve_namespace_values(&mut decls.imports.namespace, &scoped, &fallback);
+        }
+    }
+
+    fn resolve_namespace_values(
+        namespace: &mut Namespace,
+        scoped: &HashMap<(ModuleScope, Ident), (Type, GenericParams)>,
+        fallback: &HashMap<Ident, (Type, GenericParams)>,
+    ) {
+        for value in namespace.values.values_mut() {
+            Self::resolve_value_decl(&value.module, &mut value.decl, scoped, fallback);
+        }
+    }
+
+    fn resolve_value_decl(
+        scope: &ModuleScope,
+        decl: &mut ValueDecl,
+        scoped: &HashMap<(ModuleScope, Ident), (Type, GenericParams)>,
+        fallback: &HashMap<Ident, (Type, GenericParams)>,
+    ) {
+        match decl {
+            ValueDecl::Func(sig) => {
+                sig.ty = resolve_nominal(scope, &sig.ty, scoped, fallback);
+            }
+            ValueDecl::Const(ty) => {
+                *ty = resolve_nominal(scope, ty, scoped, fallback);
             }
         }
     }
 
-    fn collect_module(&mut self, program: &Program, scope: ModuleScope, include_private: bool) {
+    fn collect_module(&mut self, program: &Program, scope: ModuleScope, export_all: bool) {
         let mut decls = ModuleDecls::default();
         let mut extend_index = 0;
 
         for stmt in &program.stmts {
-            let visible = include_private || matches!(stmt_visibility(stmt), Visibility::Public);
+            let exported = export_all || matches!(stmt_visibility(stmt), Visibility::Public);
             match &stmt.node {
                 Stmt::Func(func_node) => {
                     let func = &func_node.node;
-                    if !visible {
-                        continue;
-                    }
                     let ty = func_type_from_params(&func.params, &func.ret);
-                    decls.values.insert(
-                        func.name,
-                        ValueDecl::Func(FuncSig {
+                    let value = ResolvedValue {
+                        module: scope.clone(),
+                        name: func.name,
+                        decl: ValueDecl::Func(FuncSig {
                             generics: generic_params(&func.type_params, &func.const_params),
                             ty,
                         }),
-                    );
+                    };
+                    decls.locals.insert_value(func.name, value.clone());
+                    if exported {
+                        decls.exports.insert_value(func.name, value);
+                    }
                 }
                 Stmt::Aggregate(agg_node) => {
                     let agg = &agg_node.node;
-                    let kind = agg.kind.into();
                     let key = NominalKey {
                         module: scope.clone(),
-                        kind,
+                        kind: agg.kind.into(),
                         name: agg.name,
                     };
                     let mut fields = HashMap::new();
@@ -329,8 +427,9 @@ impl DeclarationIndex {
                             },
                         );
                     }
-                    if visible {
-                        decls.types.insert(agg.name, key.clone());
+                    decls.locals.insert_type(agg.name, key.clone());
+                    if exported {
+                        decls.exports.insert_type(agg.name, key.clone());
                     }
                     self.aggregates.insert(
                         key.clone(),
@@ -372,8 +471,9 @@ impl DeclarationIndex {
                         };
                         variants.insert(variant.name, schema);
                     }
-                    if visible {
-                        decls.types.insert(enm.name, key.clone());
+                    decls.locals.insert_type(enm.name, key.clone());
+                    if exported {
+                        decls.exports.insert_type(enm.name, key.clone());
                     }
                     self.enums.insert(
                         key.clone(),
@@ -386,37 +486,43 @@ impl DeclarationIndex {
                 }
                 Stmt::ExternFunc(ext_node) => {
                     let ext = &ext_node.node;
-                    if !visible {
-                        continue;
-                    }
                     let ty = func_type_from_params(&ext.params, &ext.ret);
-                    decls.values.insert(
-                        ext.name,
-                        ValueDecl::Func(FuncSig {
+                    let value = ResolvedValue {
+                        module: scope.clone(),
+                        name: ext.name,
+                        decl: ValueDecl::Func(FuncSig {
                             generics: GenericParams::default(),
                             ty,
                         }),
-                    );
+                    };
+                    decls.locals.insert_value(ext.name, value.clone());
+                    if exported {
+                        decls.exports.insert_value(ext.name, value);
+                    }
                 }
                 Stmt::ExternType(ext_node) => {
                     let ext = &ext_node.node;
-                    if !visible {
-                        continue;
-                    }
                     let key = NominalKey {
                         module: scope.clone(),
                         kind: NominalKind::Extern,
                         name: ext.name,
                     };
-                    decls.types.insert(ext.name, key);
+                    decls.locals.insert_type(ext.name, key.clone());
+                    if exported {
+                        decls.exports.insert_type(ext.name, key);
+                    }
                 }
                 Stmt::Const(const_node) => {
                     let c = &const_node.node;
-                    if !visible {
-                        continue;
+                    let value = ResolvedValue {
+                        module: scope.clone(),
+                        name: c.name,
+                        decl: ValueDecl::Const(c.ty.clone().unwrap_or(Type::Infer)),
+                    };
+                    decls.locals.insert_value(c.name, value.clone());
+                    if exported {
+                        decls.exports.insert_value(c.name, value);
                     }
-                    let ty = c.ty.clone().unwrap_or(Type::Infer);
-                    decls.values.insert(c.name, ValueDecl::Const(ty));
                 }
                 Stmt::Extend(extend_node) => {
                     let id = ExtendId {
@@ -424,11 +530,10 @@ impl DeclarationIndex {
                         index: extend_index,
                     };
                     extend_index += 1;
-                    if !visible {
+                    if !exported {
                         continue;
                     }
                     let ext = &extend_node.node;
-                    let target = ext.ty.clone();
                     let mut methods = HashMap::new();
                     for method_node in &ext.methods {
                         let m = &method_node.node;
@@ -445,7 +550,7 @@ impl DeclarationIndex {
                     self.extends.push(ExtendSchema {
                         id,
                         origin: scope.clone(),
-                        target,
+                        target: ext.ty.clone(),
                         generics: generic_params(&ext.type_params, &ext.const_params),
                         methods,
                     });
@@ -457,23 +562,219 @@ impl DeclarationIndex {
         self.modules.insert(scope, decls);
     }
 
-    pub(crate) fn type_in_module(&self, scope: &ModuleScope, name: Ident) -> Option<&NominalKey> {
-        self.modules.get(scope)?.types.get(&name)
+    fn apply_public_import_reexports(&mut self, modules: &[(ModuleScope, &Program)]) {
+        for (scope, program) in modules {
+            let Some(mut exports) = self.modules.get(scope).map(|decls| decls.exports.clone())
+            else {
+                continue;
+            };
+
+            for stmt in &program.stmts {
+                let Stmt::Import(import) = &stmt.node else {
+                    continue;
+                };
+                if !matches!(import.node.visibility, Visibility::Public) {
+                    continue;
+                }
+                let path = ModulePath::from_idents(&import.node.path);
+                let dep_scope = ModuleScope::Named(path.clone());
+                let dep_exports = self.modules.get(&dep_scope).map(|decls| &decls.exports);
+                Self::apply_import(&import.node.kind, &path, dep_exports, &mut exports);
+            }
+
+            if let Some(decls) = self.modules.get_mut(scope) {
+                decls.exports = exports;
+            }
+        }
     }
 
-    pub(crate) fn value_in_module(&self, scope: &ModuleScope, name: Ident) -> Option<&ValueDecl> {
-        self.modules.get(scope)?.values.get(&name)
+    fn build_import_scopes(&mut self, modules: &[(ModuleScope, &Program)]) {
+        for (scope, program) in modules {
+            let mut imports = ImportScope::default();
+            for stmt in &program.stmts {
+                let Stmt::Import(import) = &stmt.node else {
+                    continue;
+                };
+                let path = ModulePath::from_idents(&import.node.path);
+                let dep_scope = ModuleScope::Named(path.clone());
+                imports.active_modules.insert(dep_scope.clone());
+                let dep_exports = self.modules.get(&dep_scope).map(|decls| &decls.exports);
+                Self::apply_import(
+                    &import.node.kind,
+                    &path,
+                    dep_exports,
+                    &mut imports.namespace,
+                );
+            }
+            imports.activate_imported_origins();
+            if let Some(decls) = self.modules.get_mut(scope) {
+                decls.imports = imports;
+            }
+        }
+    }
+
+    fn apply_import(
+        kind: &ImportKind,
+        path: &ModulePath,
+        dep_exports: Option<&Namespace>,
+        namespace: &mut Namespace,
+    ) {
+        let module = ModuleScope::Named(path.clone());
+        match kind {
+            ImportKind::Module => {
+                if let Some(alias) = path.segments().last() {
+                    namespace.insert_module(Ident::new(alias.as_str()), module);
+                }
+            }
+            ImportKind::ModuleAs(alias) => {
+                namespace.insert_module(*alias, module);
+            }
+            ImportKind::Selective(items) => {
+                for item in items {
+                    let target = item.alias.unwrap_or_else(|| match item.kind {
+                        ImportItemKind::Name(name) => name,
+                        ImportItemKind::SelfModule => path
+                            .segments()
+                            .last()
+                            .map_or_else(|| Ident::new(""), |segment| Ident::new(segment.as_str())),
+                    });
+                    match item.kind {
+                        ImportItemKind::SelfModule => {
+                            namespace.insert_module(target, module.clone());
+                        }
+                        ImportItemKind::Name(name) => {
+                            if let Some(dep_exports) = dep_exports {
+                                Self::copy_named_members(dep_exports, name, target, namespace);
+                            }
+                        }
+                    }
+                }
+            }
+            ImportKind::Wildcard => {
+                if let Some(dep_exports) = dep_exports {
+                    Self::copy_wildcard_members(dep_exports, namespace);
+                }
+            }
+        }
+    }
+
+    fn copy_named_members(
+        source: &Namespace,
+        source_name: Ident,
+        target_name: Ident,
+        dest: &mut Namespace,
+    ) {
+        if let Some(key) = source.ty(source_name).cloned() {
+            dest.insert_type(target_name, key);
+        }
+        if let Some(value) = source.value(source_name).cloned() {
+            dest.insert_value(target_name, value);
+        }
+        if let Some(module) = source.module(source_name).cloned() {
+            dest.insert_module(target_name, module);
+        }
+    }
+
+    fn copy_wildcard_members(source: &Namespace, dest: &mut Namespace) {
+        for (name, key) in &source.types {
+            dest.types.entry(*name).or_insert_with(|| key.clone());
+        }
+        for (name, value) in &source.values {
+            dest.values.entry(*name).or_insert_with(|| value.clone());
+        }
+        for (name, module) in &source.modules {
+            dest.modules.entry(*name).or_insert_with(|| module.clone());
+        }
+    }
+
+    pub(crate) fn local_value(&self, module: &ModuleScope, name: Ident) -> Option<ResolvedValue> {
+        self.modules.get(module)?.locals.value(name).cloned()
+    }
+
+    pub(crate) fn local_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+        self.modules.get(module)?.locals.ty(name).cloned()
+    }
+
+    pub(crate) fn exported_value(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<ResolvedValue> {
+        self.modules.get(module)?.exports.value(name).cloned()
+    }
+
+    pub(crate) fn exported_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+        self.modules.get(module)?.exports.ty(name).cloned()
+    }
+
+    pub(crate) fn exported_module(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope> {
+        self.modules.get(module)?.exports.module(name).cloned()
+    }
+
+    pub(crate) fn imported_value(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<ResolvedValue> {
+        self.modules
+            .get(module)?
+            .imports
+            .namespace
+            .value(name)
+            .cloned()
+    }
+
+    pub(crate) fn imported_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+        self.modules
+            .get(module)?
+            .imports
+            .namespace
+            .ty(name)
+            .cloned()
+    }
+
+    pub(crate) fn imported_module(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope> {
+        self.modules
+            .get(module)?
+            .imports
+            .namespace
+            .module(name)
+            .cloned()
+    }
+
+    pub(crate) fn visible_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+        self.local_type(module, name)
+            .or_else(|| self.imported_type(module, name))
+    }
+
+    pub(crate) fn imports_module(&self, module: &ModuleScope, imported: &ModuleScope) -> bool {
+        self.modules
+            .get(module)
+            .is_some_and(|decls| decls.imports.active_modules.contains(imported))
     }
 
     pub(crate) fn set_const_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
-        let Some(ValueDecl::Const(existing)) = self
-            .modules
-            .get_mut(scope)
-            .and_then(|decls| decls.values.get_mut(&name))
-        else {
-            return;
-        };
-        *existing = ty;
+        for decls in self.modules.values_mut() {
+            Self::set_namespace_const_type(&mut decls.locals, scope, name, &ty);
+            Self::set_namespace_const_type(&mut decls.exports, scope, name, &ty);
+            Self::set_namespace_const_type(&mut decls.imports.namespace, scope, name, &ty);
+        }
+    }
+
+    fn set_namespace_const_type(
+        namespace: &mut Namespace,
+        scope: &ModuleScope,
+        name: Ident,
+        ty: &Type,
+    ) {
+        for value in namespace.values.values_mut() {
+            if value.module == *scope
+                && value.name == name
+                && let ValueDecl::Const(existing) = &mut value.decl
+            {
+                *existing = ty.clone();
+            }
+        }
     }
 
     pub(crate) fn aggregate(&self, key: &NominalKey) -> Option<&AggregateSchema> {
@@ -493,18 +794,18 @@ impl DeclarationIndex {
 
         if let Some(origin) = origin {
             let scope = ModuleScope::Named(ModulePath::new(origin.iter().cloned().collect()));
-            if let Some(key) = self.type_in_module(&scope, name) {
-                return Some(key.clone());
+            if let Some(key) = self.local_type(&scope, name) {
+                return Some(key);
             }
         }
 
-        if let Some(key) = self.type_in_module(&ModuleScope::Root, name) {
-            return Some(key.clone());
+        if let Some(key) = self.local_type(&ModuleScope::Root, name) {
+            return Some(key);
         }
 
         let mut found = None;
         for decls in self.modules.values() {
-            let Some(key) = decls.types.get(&name) else {
+            let Some(key) = decls.exports.ty(name) else {
                 continue;
             };
             if found.is_some() {
@@ -849,10 +1150,35 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::ast::TypeVarId;
+    use crate::{ast::TypeVarId, lexer::tokenize, parser, resolve::ResolvedModule};
 
     fn ident(name: &str) -> Ident {
         Ident::new(name)
+    }
+
+    fn parse(source: &str) -> Program {
+        let tokens = tokenize(source).expect("lexer error");
+        parser::parse_ast(&tokens).expect("parse error")
+    }
+
+    fn scope(name: &str) -> ModuleScope {
+        ModuleScope::Named(ModulePath::new(vec![name.to_string()]))
+    }
+
+    fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
+        let root = parse(root);
+        let resolved = ResolveResult {
+            module_groups: modules
+                .iter()
+                .map(|(name, source)| {
+                    vec![ResolvedModule {
+                        key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()])),
+                        program: parse(source),
+                    }]
+                })
+                .collect(),
+        };
+        DeclarationIndex::from_root_and_modules(&root, &resolved)
     }
 
     #[test]
@@ -984,5 +1310,126 @@ mod tests {
         let result = resolve_nominal(&ModuleScope::Root, &ty, &HashMap::new(), &HashMap::new());
 
         assert_eq!(result, ty);
+    }
+
+    #[test]
+    fn module_locals_include_private_but_exports_do_not() {
+        let index = index("", &[("tools", "fn hidden() {} pub fn shown() {}")]);
+        let tools = scope("tools");
+
+        assert!(index.local_value(&tools, ident("hidden")).is_some());
+        assert!(index.exported_value(&tools, ident("hidden")).is_none());
+        assert!(index.exported_value(&tools, ident("shown")).is_some());
+    }
+
+    #[test]
+    fn value_reexport_preserves_origin() {
+        let index = index(
+            "",
+            &[
+                ("tools", "pub fn id<T>(x: T) -> T { x }"),
+                ("facade", "pub import tools { id as dup };"),
+            ],
+        );
+        let value = index
+            .exported_value(&scope("facade"), ident("dup"))
+            .expect("missing reexport");
+
+        assert_eq!(value.module, scope("tools"));
+        assert_eq!(value.name, ident("id"));
+    }
+
+    #[test]
+    fn type_reexport_preserves_nominal_origin() {
+        let index = index(
+            "",
+            &[
+                ("tools", "pub struct Point { x: int }"),
+                ("facade", "pub import tools { Point as P };"),
+            ],
+        );
+        let key = index
+            .exported_type(&scope("facade"), ident("P"))
+            .expect("missing reexport");
+
+        assert_eq!(key.module, scope("tools"));
+        assert_eq!(key.name, ident("Point"));
+        assert_eq!(key.kind, NominalKind::Struct);
+    }
+
+    #[test]
+    fn import_alias_populates_module_namespace() {
+        let index = index("import facade { self as f };", &[("facade", "")]);
+
+        assert_eq!(
+            index.imported_module(&ModuleScope::Root, ident("f")),
+            Some(scope("facade")),
+        );
+    }
+
+    #[test]
+    fn imported_reexported_value_preserves_origin() {
+        let index = index(
+            "import facade { dup };",
+            &[
+                ("tools", "pub fn id<T>(x: T) -> T { x }"),
+                ("facade", "pub import tools { id as dup };"),
+            ],
+        );
+        let value = index
+            .imported_value(&ModuleScope::Root, ident("dup"))
+            .expect("missing import");
+
+        assert_eq!(value.module, scope("tools"));
+        assert_eq!(value.name, ident("id"));
+    }
+
+    #[test]
+    fn imported_type_activates_direct_and_origin_modules() {
+        let index = index(
+            "import facade { P };",
+            &[
+                ("tools", "pub struct Point { x: int }"),
+                ("facade", "pub import tools { Point as P };"),
+            ],
+        );
+
+        assert!(index.imports_module(&ModuleScope::Root, &scope("facade")));
+        assert!(index.imports_module(&ModuleScope::Root, &scope("tools")));
+    }
+
+    #[test]
+    fn wildcard_import_keeps_first_value() {
+        let index = index(
+            "import a { * }; import b { * };",
+            &[
+                ("a", "pub fn dup() -> int { 1 }"),
+                ("b", "pub fn dup() -> int { 2 }"),
+            ],
+        );
+        let value = index
+            .imported_value(&ModuleScope::Root, ident("dup"))
+            .expect("missing import");
+
+        assert_eq!(value.module, scope("a"));
+    }
+
+    #[test]
+    fn set_const_type_updates_exported_and_imported_copies() {
+        let mut index = index(
+            "import tools { SIZE };",
+            &[("tools", "pub const SIZE = 1;")],
+        );
+        index.set_const_type(&scope("tools"), ident("SIZE"), Type::Int);
+
+        let exported = index
+            .exported_value(&scope("tools"), ident("SIZE"))
+            .expect("missing export");
+        let imported = index
+            .imported_value(&ModuleScope::Root, ident("SIZE"))
+            .expect("missing import");
+
+        assert!(matches!(exported.decl, ValueDecl::Const(Type::Int)));
+        assert!(matches!(imported.decl, ValueDecl::Const(Type::Int)));
     }
 }

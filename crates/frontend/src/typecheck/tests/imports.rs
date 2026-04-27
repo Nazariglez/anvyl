@@ -208,6 +208,45 @@ fn reexport_type_alias_origin() {
 }
 
 #[test]
+fn qualified_reexport_type_alias() {
+    let root = "
+        import facade;
+        fn use_it(x: facade.P) -> int { x.x }
+    ";
+    let modules = [
+        ("tools", "pub struct Point { x: int }"),
+        ("facade", "pub import tools { Point as P };"),
+    ];
+    assert_type_with_named_modules(root, &modules, Type::Int);
+}
+
+#[test]
+fn reexport_const_alias_origin() {
+    let root = "
+        import facade { N };
+        fn use_it() -> int { N }
+    ";
+    let modules = [
+        ("tools", "pub const SIZE = 4;"),
+        ("facade", "pub import tools { SIZE as N };"),
+    ];
+    assert_type_with_named_modules(root, &modules, Type::Int);
+}
+
+#[test]
+fn lexical_value_shadows_imported_value() {
+    let root = "
+        import tools { id };
+        fn use_it() -> int {
+            let id = 3;
+            id
+        }
+    ";
+    let modules = [("tools", "pub fn id(x: int) -> int { x }")];
+    assert_type_with_named_modules(root, &modules, Type::Int);
+}
+
+#[test]
 fn imported_generic_source_scope() {
     let dep = "
         fn mul2(x: int) -> int { x * 2 }
