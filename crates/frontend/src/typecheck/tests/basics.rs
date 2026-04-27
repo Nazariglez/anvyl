@@ -3,7 +3,7 @@ use super::support::{
     assert_type_with_modules, assert_type_with_named_modules, typecheck, typecheck_with_modules,
 };
 use crate::{
-    ast::{ArrayLen, ConstArg, ConstValue, Ident, Type},
+    ast::{ArrayLen, ConstArg, ConstValue, Ident, NominalKind, Type},
     typecheck::{ArityError, ModuleScope, TypeError, type_contains_infer},
 };
 
@@ -301,58 +301,47 @@ mod nominals {
         ConstArg::Value(ConstValue::Int(value))
     }
 
+    fn nominal(
+        kind: NominalKind,
+        name: &str,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+    ) -> Type {
+        Type::nominal(kind, Ident::new(name), type_args, const_args, None)
+    }
+
     fn fixed(len: i64) -> Type {
-        Type::Struct {
-            name: Ident::new("FixedBuf"),
-            type_args: vec![Type::Int],
-            const_args: vec![arg(len)],
-            origin: None,
-        }
+        nominal(
+            NominalKind::Struct,
+            "FixedBuf",
+            vec![Type::Int],
+            vec![arg(len)],
+        )
     }
 
     fn dataref(len: i64) -> Type {
-        Type::DataRef {
-            name: Ident::new("FixedBuf"),
-            type_args: vec![Type::Int],
-            const_args: vec![arg(len)],
-            origin: None,
-        }
+        nominal(
+            NominalKind::DataRef,
+            "FixedBuf",
+            vec![Type::Int],
+            vec![arg(len)],
+        )
     }
 
     fn packet(len: i64) -> Type {
-        Type::Enum {
-            name: Ident::new("Packet"),
-            type_args: vec![Type::Int],
-            const_args: vec![arg(len)],
-            origin: None,
-        }
+        nominal(NominalKind::Enum, "Packet", vec![Type::Int], vec![arg(len)])
     }
 
     fn maybe(inner: Type) -> Type {
-        Type::Enum {
-            name: Ident::new("Maybe"),
-            type_args: vec![inner],
-            const_args: vec![],
-            origin: None,
-        }
+        nominal(NominalKind::Enum, "Maybe", vec![inner], vec![])
     }
 
     fn struct_ty(name: &str, type_args: Vec<Type>, const_args: Vec<ConstArg>) -> Type {
-        Type::Struct {
-            name: Ident::new(name),
-            type_args,
-            const_args,
-            origin: None,
-        }
+        nominal(NominalKind::Struct, name, type_args, const_args)
     }
 
     fn dataref_ty(name: &str, type_args: Vec<Type>) -> Type {
-        Type::DataRef {
-            name: Ident::new(name),
-            type_args,
-            const_args: vec![],
-            origin: None,
-        }
+        nominal(NominalKind::DataRef, name, type_args, vec![])
     }
 
     fn box_struct(inner: Type) -> Type {

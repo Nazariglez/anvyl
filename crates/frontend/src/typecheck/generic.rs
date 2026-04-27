@@ -71,23 +71,12 @@ impl GenericParams {
             }
             Type::Tuple(elems) => elems.iter().any(|ty| self.contains_param(ty)),
             Type::NamedTuple(fields) => fields.iter().any(|(_, ty)| self.contains_param(ty)),
-            Type::Struct {
-                type_args,
-                const_args,
-                ..
-            }
-            | Type::DataRef {
-                type_args,
-                const_args,
-                ..
-            }
-            | Type::Enum {
-                type_args,
-                const_args,
-                ..
-            } => {
-                type_args.iter().any(|ty| self.contains_param(ty))
-                    || const_args.iter().any(|arg| self.contains_const_param(arg))
+            Type::Nominal(nominal) => {
+                nominal.type_args.iter().any(|ty| self.contains_param(ty))
+                    || nominal
+                        .const_args
+                        .iter()
+                        .any(|arg| self.contains_const_param(arg))
             }
             Type::UnresolvedNominal {
                 qualifier,
@@ -110,8 +99,7 @@ impl GenericParams {
             | Type::Float
             | Type::Bool
             | Type::String
-            | Type::Void
-            | Type::Extern { .. } => false,
+            | Type::Void => false,
             Type::UnresolvedName(name) => self.type_params.iter().any(|param| param.name == *name),
         }
     }
@@ -344,53 +332,13 @@ pub(crate) fn infer(template: &Type, concrete: &Type, inf: &mut Inference) -> bo
                     .zip(b)
                     .all(|((an, at), (bn, bt))| an == bn && infer(at, bt, inf))
         }
-        (
-            Type::Struct {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Type::Struct {
-                name: concrete_name,
-                type_args: concrete_args,
-                const_args: concrete_const_args,
-                origin: concrete_origin,
-            },
-        )
-        | (
-            Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Type::DataRef {
-                name: concrete_name,
-                type_args: concrete_args,
-                const_args: concrete_const_args,
-                origin: concrete_origin,
-            },
-        )
-        | (
-            Type::Enum {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Type::Enum {
-                name: concrete_name,
-                type_args: concrete_args,
-                const_args: concrete_const_args,
-                origin: concrete_origin,
-            },
-        ) => {
-            name == concrete_name
-                && origin == concrete_origin
-                && type_args.len() == concrete_args.len()
-                && infer_all(type_args.iter().zip(concrete_args), inf)
-                && infer_const_args(const_args, concrete_const_args, inf)
+        (Type::Nominal(a), Type::Nominal(b)) => {
+            a.kind == b.kind
+                && a.name == b.name
+                && a.origin == b.origin
+                && a.type_args.len() == b.type_args.len()
+                && infer_all(a.type_args.iter().zip(&b.type_args), inf)
+                && infer_const_args(&a.const_args, &b.const_args, inf)
         }
         (
             Type::UnresolvedNominal {
@@ -427,13 +375,6 @@ pub(crate) fn infer(template: &Type, concrete: &Type, inf: &mut Inference) -> bo
                 value: concrete_value,
             },
         ) => infer(key, concrete_key, inf) && infer(value, concrete_value, inf),
-        (
-            Type::Extern { name, origin },
-            Type::Extern {
-                name: concrete_name,
-                origin: concrete_origin,
-            },
-        ) => name == concrete_name && origin == concrete_origin,
         (
             Type::Infer
             | Type::Any
@@ -517,52 +458,12 @@ fn covers_type<'a>(general: &Type, specific: &'a Type, cover: &mut Cover<'a>) ->
                     .zip(b)
                     .all(|((an, at), (bn, bt))| an == bn && covers_type(at, bt, cover))
         }
-        (
-            Type::Struct {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Type::Struct {
-                name: specific_name,
-                type_args: specific_type_args,
-                const_args: specific_const_args,
-                origin: specific_origin,
-            },
-        )
-        | (
-            Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Type::DataRef {
-                name: specific_name,
-                type_args: specific_type_args,
-                const_args: specific_const_args,
-                origin: specific_origin,
-            },
-        )
-        | (
-            Type::Enum {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Type::Enum {
-                name: specific_name,
-                type_args: specific_type_args,
-                const_args: specific_const_args,
-                origin: specific_origin,
-            },
-        ) => {
-            name == specific_name
-                && origin == specific_origin
-                && covers_types(type_args, specific_type_args, cover)
-                && covers_const_args(const_args, specific_const_args, cover)
+        (Type::Nominal(a), Type::Nominal(b)) => {
+            a.kind == b.kind
+                && a.name == b.name
+                && a.origin == b.origin
+                && covers_types(&a.type_args, &b.type_args, cover)
+                && covers_const_args(&a.const_args, &b.const_args, cover)
         }
         (
             Type::UnresolvedNominal {
@@ -599,13 +500,6 @@ fn covers_type<'a>(general: &Type, specific: &'a Type, cover: &mut Cover<'a>) ->
                 value: specific_value,
             },
         ) => covers_type(key, specific_key, cover) && covers_type(value, specific_value, cover),
-        (
-            Type::Extern { name, origin },
-            Type::Extern {
-                name: specific_name,
-                origin: specific_origin,
-            },
-        ) => name == specific_name && origin == specific_origin,
         _ => general == specific,
     }
 }
@@ -744,47 +638,16 @@ pub(crate) fn substitute(ty: &Type, ts: &TypeSubst, cs: &ConstSubst) -> Type {
                 .map(|(n, t)| (*n, substitute(t, ts, cs)))
                 .collect(),
         ),
-        Type::Struct {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => {
-            let (type_args, const_args) = substitute_args(type_args, const_args, ts, cs);
-            Type::Struct {
-                name: *name,
+        Type::Nominal(nominal) => {
+            let (type_args, const_args) =
+                substitute_args(&nominal.type_args, &nominal.const_args, ts, cs);
+            Type::nominal(
+                nominal.kind,
+                nominal.name,
                 type_args,
                 const_args,
-                origin: origin.clone(),
-            }
-        }
-        Type::DataRef {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => {
-            let (type_args, const_args) = substitute_args(type_args, const_args, ts, cs);
-            Type::DataRef {
-                name: *name,
-                type_args,
-                const_args,
-                origin: origin.clone(),
-            }
-        }
-        Type::Enum {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => {
-            let (type_args, const_args) = substitute_args(type_args, const_args, ts, cs);
-            Type::Enum {
-                name: *name,
-                type_args,
-                const_args,
-                origin: origin.clone(),
-            }
+                nominal.origin.clone(),
+            )
         }
         Type::List { elem } => Type::List {
             elem: Box::new(substitute(elem, ts, cs)),
@@ -816,15 +679,14 @@ pub(crate) fn substitute(ty: &Type, ts: &TypeSubst, cs: &ConstSubst) -> Type {
         | Type::Bool
         | Type::String
         | Type::Void
-        | Type::UnresolvedName(_)
-        | Type::Extern { .. } => ty.clone(),
+        | Type::UnresolvedName(_) => ty.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::Ident;
+    use crate::ast::{Ident, NominalKind};
 
     fn tv(id: u32) -> TypeVarId {
         TypeVarId(id)
@@ -845,22 +707,21 @@ mod tests {
         ConstArg::Value(ConstValue::Int(n))
     }
 
+    fn nominal(
+        kind: NominalKind,
+        name: &str,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+    ) -> Type {
+        Type::nominal(kind, Ident::new(name), type_args, const_args, None)
+    }
+
     fn struct_ty(name: &str, type_args: Vec<Type>) -> Type {
-        Type::Struct {
-            name: Ident::new(name),
-            type_args,
-            const_args: vec![],
-            origin: None,
-        }
+        nominal(NominalKind::Struct, name, type_args, vec![])
     }
 
     fn struct_const(name: &str, type_args: Vec<Type>, const_args: Vec<ConstArg>) -> Type {
-        Type::Struct {
-            name: Ident::new(name),
-            type_args,
-            const_args,
-            origin: None,
-        }
+        nominal(NominalKind::Struct, name, type_args, const_args)
     }
 
     #[test]
@@ -1267,18 +1128,8 @@ mod tests {
     #[test]
     fn infer_enum() {
         let mut inf = Inference::new();
-        let tmpl = Type::Enum {
-            name: Ident::new("Option"),
-            type_args: vec![Type::Var(tv(0))],
-            const_args: vec![],
-            origin: None,
-        };
-        let concrete = Type::Enum {
-            name: Ident::new("Option"),
-            type_args: vec![Type::Int],
-            const_args: vec![],
-            origin: None,
-        };
+        let tmpl = nominal(NominalKind::Enum, "Option", vec![Type::Var(tv(0))], vec![]);
+        let concrete = nominal(NominalKind::Enum, "Option", vec![Type::Int], vec![]);
         assert!(infer(&tmpl, &concrete, &mut inf));
         assert_eq!(inf.type_subst()[&tv(0)], Type::Int);
     }
@@ -1286,18 +1137,18 @@ mod tests {
     #[test]
     fn infer_dataref() {
         let mut inf = Inference::new();
-        let tmpl = Type::DataRef {
-            name: Ident::new("Buf"),
-            type_args: vec![Type::Var(tv(0)), Type::Var(tv(1))],
-            const_args: vec![],
-            origin: None,
-        };
-        let concrete = Type::DataRef {
-            name: Ident::new("Buf"),
-            type_args: vec![Type::Float, Type::Bool],
-            const_args: vec![],
-            origin: None,
-        };
+        let tmpl = nominal(
+            NominalKind::DataRef,
+            "Buf",
+            vec![Type::Var(tv(0)), Type::Var(tv(1))],
+            vec![],
+        );
+        let concrete = nominal(
+            NominalKind::DataRef,
+            "Buf",
+            vec![Type::Float, Type::Bool],
+            vec![],
+        );
         assert!(infer(&tmpl, &concrete, &mut inf));
         assert_eq!(inf.type_subst()[&tv(0)], Type::Float);
         assert_eq!(inf.type_subst()[&tv(1)], Type::Bool);

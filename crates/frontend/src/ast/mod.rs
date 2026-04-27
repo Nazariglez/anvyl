@@ -160,6 +160,23 @@ impl Display for ArrayLen {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NominalKind {
+    Struct,
+    DataRef,
+    Enum,
+    Extern,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NominalType {
+    pub kind: NominalKind,
+    pub name: Ident,
+    pub type_args: Vec<Type>,
+    pub const_args: Vec<ConstArg>,
+    pub origin: Option<ModulePath>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Type {
     Infer,
@@ -182,24 +199,7 @@ pub enum Type {
     },
     Tuple(Vec<Type>),
     NamedTuple(Vec<(Ident, Type)>),
-    Struct {
-        name: Ident,
-        type_args: Vec<Type>,
-        const_args: Vec<ConstArg>,
-        origin: Option<ModulePath>,
-    },
-    DataRef {
-        name: Ident,
-        type_args: Vec<Type>,
-        const_args: Vec<ConstArg>,
-        origin: Option<ModulePath>,
-    },
-    Enum {
-        name: Ident,
-        type_args: Vec<Type>,
-        const_args: Vec<ConstArg>,
-        origin: Option<ModulePath>,
-    },
+    Nominal(NominalType),
     List {
         elem: Box<Type>,
     },
@@ -213,10 +213,6 @@ pub enum Type {
     },
     Slice {
         elem: Box<Type>,
-    },
-    Extern {
-        name: Ident,
-        origin: Option<ModulePath>,
     },
 }
 
@@ -257,52 +253,10 @@ impl PartialEq for Type {
             ) => q1 == q2 && n1 == n2 && g1 == g2,
             (Tuple(a), Tuple(b)) => a == b,
             (NamedTuple(a), NamedTuple(b)) => a == b,
-            (
-                Struct {
-                    name: n1,
-                    type_args: t1,
-                    const_args: c1,
-                    ..
-                },
-                Struct {
-                    name: n2,
-                    type_args: t2,
-                    const_args: c2,
-                    ..
-                },
-            )
-            | (
-                DataRef {
-                    name: n1,
-                    type_args: t1,
-                    const_args: c1,
-                    ..
-                },
-                DataRef {
-                    name: n2,
-                    type_args: t2,
-                    const_args: c2,
-                    ..
-                },
-            )
-            | (
-                Enum {
-                    name: n1,
-                    type_args: t1,
-                    const_args: c1,
-                    ..
-                },
-                Enum {
-                    name: n2,
-                    type_args: t2,
-                    const_args: c2,
-                    ..
-                },
-            ) => n1 == n2 && t1 == t2 && c1 == c2,
+            (Nominal(a), Nominal(b)) => a == b,
             (List { elem: a }, List { elem: b }) | (Slice { elem: a }, Slice { elem: b }) => a == b,
             (Array { elem: e1, len: l1 }, Array { elem: e2, len: l2 }) => e1 == e2 && l1 == l2,
             (Map { key: k1, value: v1 }, Map { key: k2, value: v2 }) => k1 == k2 && v1 == v2,
-            (Extern { name: n1, .. }, Extern { name: n2, .. }) => n1 == n2,
             _ => false,
         }
     }
@@ -331,28 +285,7 @@ impl std::hash::Hash for Type {
             }
             Type::Tuple(elems) => elems.hash(state),
             Type::NamedTuple(fields) => fields.hash(state),
-            Type::Struct {
-                name,
-                type_args,
-                const_args,
-                ..
-            }
-            | Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                ..
-            }
-            | Type::Enum {
-                name,
-                type_args,
-                const_args,
-                ..
-            } => {
-                name.hash(state);
-                type_args.hash(state);
-                const_args.hash(state);
-            }
+            Type::Nominal(nominal) => nominal.hash(state),
             Type::List { elem } | Type::Slice { elem } => elem.hash(state),
             Type::Array { elem, len } => {
                 elem.hash(state);
@@ -362,7 +295,6 @@ impl std::hash::Hash for Type {
                 key.hash(state);
                 value.hash(state);
             }
-            Type::Extern { name, .. } => name.hash(state),
             _ => {}
         }
     }
@@ -376,14 +308,41 @@ impl Type {
         Box::new(self.clone())
     }
 
-    pub fn option_of(inner: Type) -> Type {
-        let name = Ident(Intern::new(Type::OPTION_ENUM_NAME.to_string()));
-        Type::Enum {
-            name,
-            type_args: vec![inner],
-            const_args: vec![],
-            origin: None,
+    pub fn nominal(
+        kind: NominalKind,
+        name: Ident,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+        origin: Option<ModulePath>,
+    ) -> Type {
+        if kind == NominalKind::Extern {
+            debug_assert!(type_args.is_empty());
+            debug_assert!(const_args.is_empty());
         }
+        Type::Nominal(NominalType {
+            kind,
+            name,
+            type_args,
+            const_args,
+            origin,
+        })
+    }
+
+    pub fn as_nominal(&self) -> Option<&NominalType> {
+        match self {
+            Type::Nominal(nominal) => Some(nominal),
+            _ => None,
+        }
+    }
+
+    pub fn option_of(inner: Type) -> Type {
+        Type::nominal(
+            NominalKind::Enum,
+            Ident(Intern::new(Type::OPTION_ENUM_NAME.to_string())),
+            vec![inner],
+            vec![],
+            None,
+        )
     }
 
     #[inline]
@@ -394,9 +353,12 @@ impl Type {
     #[inline]
     pub fn option_inner(&self) -> Option<&Type> {
         match self {
-            Type::Enum {
-                name, type_args, ..
-            } if name.0.as_ref() == Type::OPTION_ENUM_NAME => type_args.first(),
+            Type::Nominal(nominal)
+                if nominal.kind == NominalKind::Enum
+                    && nominal.name.0.as_ref() == Type::OPTION_ENUM_NAME =>
+            {
+                nominal.type_args.first()
+            }
             _ => None,
         }
     }
@@ -442,33 +404,21 @@ impl Type {
     }
 
     pub fn as_aggregate(&self) -> Option<AggregateTypeRef<'_>> {
-        match self {
-            Type::Struct {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => Some(AggregateTypeRef {
-                kind: AggregateKind::Struct,
-                name: *name,
-                type_args,
-                const_args,
-                origin: origin.as_deref(),
-            }),
-            Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => Some(AggregateTypeRef {
-                kind: AggregateKind::DataRef,
-                name: *name,
-                type_args,
-                const_args,
-                origin: origin.as_deref(),
-            }),
-            _ => None,
-        }
+        let Type::Nominal(nominal) = self else {
+            return None;
+        };
+        let kind = match nominal.kind {
+            NominalKind::Struct => AggregateKind::Struct,
+            NominalKind::DataRef => AggregateKind::DataRef,
+            NominalKind::Enum | NominalKind::Extern => return None,
+        };
+        Some(AggregateTypeRef {
+            kind,
+            name: nominal.name,
+            type_args: &nominal.type_args,
+            const_args: &nominal.const_args,
+            origin: nominal.origin.as_deref(),
+        })
     }
 }
 
@@ -574,32 +524,14 @@ impl Display for Type {
                 }
                 write!(f, "}}")
             }
-            Struct {
-                name,
-                type_args,
-                const_args,
-                ..
-            }
-            | DataRef {
-                name,
-                type_args,
-                const_args,
-                ..
-            }
-            | Enum {
-                name,
-                type_args,
-                const_args,
-                ..
-            } => {
-                write!(f, "{name}")?;
-                fmt_generic_args(f, type_args, const_args)
+            Nominal(nominal) => {
+                write!(f, "{}", nominal.name)?;
+                fmt_generic_args(f, &nominal.type_args, &nominal.const_args)
             }
             List { elem } => write!(f, "[{elem}]"),
             Array { elem, len } => write!(f, "[{elem}; {len}]"),
             Map { key, value } => write!(f, "[{key}: {value}]"),
             Slice { elem } => write!(f, "[{elem}; _]"),
-            Extern { name, .. } => write!(f, "{name}"),
         }
     }
 }
@@ -1366,6 +1298,26 @@ pub enum AggregateKind {
     DataRef,
 }
 
+impl From<AggregateKind> for NominalKind {
+    fn from(value: AggregateKind) -> Self {
+        match value {
+            AggregateKind::Struct => Self::Struct,
+            AggregateKind::DataRef => Self::DataRef,
+        }
+    }
+}
+
+impl NominalKind {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Struct => "struct",
+            Self::DataRef => "dataref",
+            Self::Enum => "enum",
+            Self::Extern => "extern",
+        }
+    }
+}
+
 impl AggregateKind {
     pub fn keyword(self) -> &'static str {
         match self {
@@ -1385,20 +1337,7 @@ impl AggregateKind {
         const_args: Vec<ConstArg>,
         origin: Option<ModulePath>,
     ) -> Type {
-        match self {
-            Self::Struct => Type::Struct {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Self::DataRef => Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-        }
+        Type::nominal(self.into(), name, type_args, const_args, origin)
     }
 }
 
@@ -1507,9 +1446,13 @@ mod tests {
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
+        rc::Rc,
     };
 
-    use super::{AggregateKind, ConstArg, ConstParamId, ConstValue, GenericArg, Ident, Type};
+    use super::{
+        AggregateKind, ConstArg, ConstParamId, ConstValue, GenericArg, Ident, ModulePath,
+        NominalKind, NominalType, Type,
+    };
 
     fn hash<T: Hash>(value: &T) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -1517,13 +1460,36 @@ mod tests {
         hasher.finish()
     }
 
+    fn nominal(
+        kind: NominalKind,
+        name: &str,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+        origin: Option<ModulePath>,
+    ) -> Type {
+        Type::nominal(kind, Ident::new(name), type_args, const_args, origin)
+    }
+
     fn buf(n: i64) -> Type {
-        Type::Struct {
-            name: Ident::new("Buf"),
-            type_args: vec![Type::Int],
-            const_args: vec![ConstArg::Value(ConstValue::Int(n))],
-            origin: None,
-        }
+        nominal(
+            NominalKind::Struct,
+            "Buf",
+            vec![Type::Int],
+            vec![ConstArg::Value(ConstValue::Int(n))],
+            None,
+        )
+    }
+
+    fn origin(name: &str) -> ModulePath {
+        Rc::from(vec![name.to_string()].into_boxed_slice())
+    }
+
+    fn foo(kind: NominalKind, origin: Option<ModulePath>) -> Type {
+        let (type_args, const_args) = match kind {
+            NominalKind::Extern => (vec![], vec![]),
+            _ => (vec![Type::Int], vec![ConstArg::Value(ConstValue::Int(1))]),
+        };
+        nominal(kind, "Foo", type_args, const_args, origin)
     }
 
     #[test]
@@ -1552,6 +1518,70 @@ mod tests {
     }
 
     #[test]
+    fn nominal_origin_affects_eq() {
+        for kind in [
+            NominalKind::Struct,
+            NominalKind::DataRef,
+            NominalKind::Enum,
+            NominalKind::Extern,
+        ] {
+            assert_ne!(foo(kind, Some(origin("a"))), foo(kind, Some(origin("b"))));
+        }
+    }
+
+    #[test]
+    fn nominal_origin_affects_hash() {
+        for kind in [
+            NominalKind::Struct,
+            NominalKind::DataRef,
+            NominalKind::Enum,
+            NominalKind::Extern,
+        ] {
+            assert_ne!(
+                hash(&foo(kind, Some(origin("a")))),
+                hash(&foo(kind, Some(origin("b"))))
+            );
+        }
+    }
+
+    #[test]
+    fn nominal_origin_affects_eq_and_hash() {
+        let a = foo(NominalKind::Struct, Some(origin("a")));
+        let b = foo(NominalKind::Struct, Some(origin("b")));
+        assert_ne!(a, b);
+        assert_ne!(hash(&a), hash(&b));
+    }
+
+    #[test]
+    fn nominal_kind_affects_eq_and_hash() {
+        let aggregate = foo(NominalKind::Struct, Some(origin("a")));
+        let enum_ty = foo(NominalKind::Enum, Some(origin("a")));
+        assert_ne!(aggregate, enum_ty);
+        assert_ne!(hash(&aggregate), hash(&enum_ty));
+    }
+
+    #[test]
+    fn nominal_kind_fmt() {
+        assert_eq!(foo(NominalKind::Struct, None).to_string(), "Foo<int, 1>");
+    }
+
+    #[test]
+    fn as_nominal() {
+        let ty = foo(NominalKind::Struct, Some(origin("a")));
+        assert_eq!(
+            ty.as_nominal(),
+            Some(&NominalType {
+                kind: NominalKind::Struct,
+                name: Ident::new("Foo"),
+                type_args: vec![Type::Int],
+                const_args: vec![ConstArg::Value(ConstValue::Int(1))],
+                origin: Some(origin("a")),
+            })
+        );
+        assert!(Type::Int.as_nominal().is_none());
+    }
+
+    #[test]
     fn nominal_fmt() {
         assert_eq!(buf(3).to_string(), "Buf<int, 3>");
     }
@@ -1563,5 +1593,34 @@ mod tests {
         assert_eq!(aggregate.kind, AggregateKind::Struct);
         assert_eq!(aggregate.type_args, [Type::Int]);
         assert_eq!(aggregate.const_args, [ConstArg::Value(ConstValue::Int(3))]);
+
+        let dataref = nominal(NominalKind::DataRef, "Ref", vec![], vec![], None);
+        assert_eq!(
+            dataref.as_aggregate().expect("expected dataref").kind,
+            AggregateKind::DataRef
+        );
+        assert!(foo(NominalKind::Enum, None).as_aggregate().is_none());
+        assert!(foo(NominalKind::Extern, None).as_aggregate().is_none());
+    }
+
+    #[test]
+    fn option_is_enum_nominal_only() {
+        let option = Type::option_of(Type::Int);
+        assert!(option.is_option());
+        assert_eq!(option.option_inner(), Some(&Type::Int));
+
+        for kind in [
+            NominalKind::Struct,
+            NominalKind::DataRef,
+            NominalKind::Extern,
+        ] {
+            let type_args = match kind {
+                NominalKind::Extern => vec![],
+                _ => vec![Type::Int],
+            };
+            let ty = nominal(kind, Type::OPTION_ENUM_NAME, type_args, vec![], None);
+            assert!(!ty.is_option());
+            assert!(ty.option_inner().is_none());
+        }
     }
 }

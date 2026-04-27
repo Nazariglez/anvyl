@@ -797,19 +797,6 @@ impl TypeChecker {
             .collect()
     }
 
-    fn resolve_nominal_type_ref_parts<O: Clone>(
-        &mut self,
-        type_args: &[Type],
-        const_args: &[ConstArg],
-        origin: Option<&O>,
-    ) -> (Vec<Type>, Vec<ConstArg>, Option<O>) {
-        (
-            self.resolve_type_refs(type_args),
-            const_args.to_vec(),
-            origin.cloned(),
-        )
-    }
-
     fn resolve_type_ref(&mut self, ty: &Type) -> Type {
         match ty {
             Type::Func { params, ret } => Type::Func {
@@ -832,51 +819,13 @@ impl TypeChecker {
             Type::Slice { elem } => Type::Slice {
                 elem: Box::new(self.resolve_type_ref(elem)),
             },
-            Type::Struct {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => {
-                let (type_args, const_args, origin) =
-                    self.resolve_nominal_type_ref_parts(type_args, const_args, origin.as_ref());
-                Type::Struct {
-                    name: *name,
-                    type_args,
-                    const_args,
-                    origin,
-                }
-            }
-            Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => {
-                let (type_args, const_args, origin) =
-                    self.resolve_nominal_type_ref_parts(type_args, const_args, origin.as_ref());
-                Type::DataRef {
-                    name: *name,
-                    type_args,
-                    const_args,
-                    origin,
-                }
-            }
-            Type::Enum {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => {
-                let (type_args, const_args, origin) =
-                    self.resolve_nominal_type_ref_parts(type_args, const_args, origin.as_ref());
-                Type::Enum {
-                    name: *name,
-                    type_args,
-                    const_args,
-                    origin,
-                }
-            }
+            Type::Nominal(nominal) => Type::nominal(
+                nominal.kind,
+                nominal.name,
+                self.resolve_type_refs(&nominal.type_args),
+                nominal.const_args.clone(),
+                nominal.origin.clone(),
+            ),
             Type::UnresolvedNominal {
                 qualifier: Some(module_name),
                 name,
@@ -953,50 +902,16 @@ impl TypeChecker {
                     .map(|(name, ty)| (*name, self.normalize_type_consts(ty, span)))
                     .collect(),
             ),
-            Type::Struct {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => {
+            Type::Nominal(nominal) => {
                 let (type_args, const_args) =
-                    self.normalize_nominal_args(type_args, const_args, span);
-                Type::Struct {
-                    name: *name,
+                    self.normalize_nominal_args(&nominal.type_args, &nominal.const_args, span);
+                Type::nominal(
+                    nominal.kind,
+                    nominal.name,
                     type_args,
                     const_args,
-                    origin: origin.clone(),
-                }
-            }
-            Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => {
-                let (type_args, const_args) =
-                    self.normalize_nominal_args(type_args, const_args, span);
-                Type::DataRef {
-                    name: *name,
-                    type_args,
-                    const_args,
-                    origin: origin.clone(),
-                }
-            }
-            Type::Enum {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => {
-                let (type_args, const_args) =
-                    self.normalize_nominal_args(type_args, const_args, span);
-                Type::Enum {
-                    name: *name,
-                    type_args,
-                    const_args,
-                    origin: origin.clone(),
-                }
+                    nominal.origin.clone(),
+                )
             }
             Type::List { elem } => Type::List {
                 elem: Box::new(self.normalize_type_consts(elem, span)),
@@ -1032,8 +947,7 @@ impl TypeChecker {
             | Type::String
             | Type::Void
             | Type::Var(_)
-            | Type::UnresolvedName(_)
-            | Type::Extern { .. } => ty.clone(),
+            | Type::UnresolvedName(_) => ty.clone(),
         }
     }
 
@@ -1782,10 +1696,7 @@ fn collect_method_templates(module: ModuleScope, program: &Program, tc: &mut Typ
             continue;
         };
         let agg = &agg_node.node;
-        let kind = match agg.kind {
-            AggregateKind::Struct => NominalKind::Struct,
-            AggregateKind::DataRef => NominalKind::DataRef,
-        };
+        let kind = agg.kind.into();
         let owner = NominalKey {
             module: module.clone(),
             kind,
@@ -3776,39 +3687,13 @@ fn resolve_type(ty: &Type) -> Type {
         Type::NamedTuple(fields) => {
             Type::NamedTuple(fields.iter().map(|(n, t)| (*n, resolve_type(t))).collect())
         }
-        Type::Struct {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => Type::Struct {
-            name: *name,
-            type_args: type_args.iter().map(resolve_type).collect(),
-            const_args: const_args.clone(),
-            origin: origin.clone(),
-        },
-        Type::DataRef {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => Type::DataRef {
-            name: *name,
-            type_args: type_args.iter().map(resolve_type).collect(),
-            const_args: const_args.clone(),
-            origin: origin.clone(),
-        },
-        Type::Enum {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => Type::Enum {
-            name: *name,
-            type_args: type_args.iter().map(resolve_type).collect(),
-            const_args: const_args.clone(),
-            origin: origin.clone(),
-        },
+        Type::Nominal(nominal) => Type::nominal(
+            nominal.kind,
+            nominal.name,
+            nominal.type_args.iter().map(resolve_type).collect(),
+            nominal.const_args.clone(),
+            nominal.origin.clone(),
+        ),
         Type::List { elem } => Type::List {
             elem: Box::new(resolve_type(elem)),
         },
@@ -3822,10 +3707,6 @@ fn resolve_type(ty: &Type) -> Type {
         },
         Type::Slice { elem } => Type::Slice {
             elem: Box::new(resolve_type(elem)),
-        },
-        Type::Extern { name, origin } => Type::Extern {
-            name: *name,
-            origin: origin.clone(),
         },
         Type::UnresolvedNominal {
             qualifier,
@@ -3854,9 +3735,7 @@ pub(crate) fn type_contains_infer(ty: &Type) -> bool {
         }
         Type::Tuple(elems) => elems.iter().any(type_contains_infer),
         Type::NamedTuple(fields) => fields.iter().any(|(_, ty)| type_contains_infer(ty)),
-        Type::Struct { type_args, .. }
-        | Type::DataRef { type_args, .. }
-        | Type::Enum { type_args, .. } => type_args.iter().any(type_contains_infer),
+        Type::Nominal(nominal) => nominal.type_args.iter().any(type_contains_infer),
         Type::List { elem } | Type::Slice { elem } => type_contains_infer(elem),
         Type::Array { elem, len } => type_contains_infer(elem) || array_len_contains_infer(*len),
         Type::Map { key, value } => type_contains_infer(key) || type_contains_infer(value),
@@ -3871,8 +3750,7 @@ pub(crate) fn type_contains_infer(ty: &Type) -> bool {
         | Type::String
         | Type::Void
         | Type::Var(_)
-        | Type::UnresolvedName(_)
-        | Type::Extern { .. } => false,
+        | Type::UnresolvedName(_) => false,
     }
 }
 

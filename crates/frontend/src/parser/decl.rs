@@ -285,7 +285,8 @@ fn extern_type_declaration<'src>(
         .map_with(|(name, body), e| {
             let s = e.span();
             let (members, has_init) = body.unwrap_or((vec![], false));
-            let self_type = ast::Type::Extern { name, origin: None };
+            let self_type =
+                ast::Type::nominal(ast::NominalKind::Extern, name, vec![], vec![], None);
             let empty_map = HashMap::new();
             let empty_const_map = HashMap::new();
             let resolved_members =
@@ -1255,18 +1256,13 @@ pub(super) fn extend_declaration<'src>(
         required_generic_params()
             .then(type_ident())
             .map(|(gp, ty)| (ty, gp)),
-        // dataref keyword followed by identifier produces Type::DataRef directly
+        // dataref keyword followed by identifier targets that dataref type
         select! { (Token::Keyword(Keyword::DataRef), _) => () }
             .ignore_then(identifier())
             .then(generic_params())
             .map(|(name, gp)| {
                 (
-                    ast::Type::DataRef {
-                        name,
-                        type_args: vec![],
-                        const_args: vec![],
-                        origin: None,
-                    },
+                    ast::Type::nominal(ast::NominalKind::DataRef, name, vec![], vec![], None),
                     gp,
                 )
             }),
@@ -1440,7 +1436,7 @@ fn resolve_type_params_with_self(
     self_type: Option<&ast::Type>,
 ) -> ast::Type {
     use ast::Type::{
-        Array, DataRef, Enum, Func, List, Map, NamedTuple, Slice, Struct, Tuple, UnresolvedName,
+        Array, Func, List, Map, NamedTuple, Nominal, Slice, Tuple, UnresolvedName,
         UnresolvedNominal, Var,
     };
     match ty {
@@ -1483,25 +1479,25 @@ fn resolve_type_params_with_self(
             }
         }
 
-        Enum {
-            name,
-            type_args,
-            const_args,
-            ..
-        } => {
+        Nominal(nominal) => {
+            if nominal.kind == ast::NominalKind::Extern {
+                debug_assert!(nominal.type_args.is_empty());
+                debug_assert!(nominal.const_args.is_empty());
+            }
             let (type_args, const_args) = resolve_split_generic_args(
-                type_args,
-                const_args,
+                &nominal.type_args,
+                &nominal.const_args,
                 type_param_map,
                 const_param_map,
                 self_type,
             );
-            Enum {
-                name: *name,
+            ast::Type::nominal(
+                nominal.kind,
+                nominal.name,
                 type_args,
                 const_args,
-                origin: None,
-            }
+                nominal.origin.clone(),
+            )
         }
 
         Func { params, ret } => {
@@ -1553,49 +1549,6 @@ fn resolve_type_params_with_self(
                 .collect();
             NamedTuple(resolved_fields)
         }
-
-        Struct {
-            name,
-            type_args,
-            const_args,
-            ..
-        } => {
-            let (type_args, const_args) = resolve_split_generic_args(
-                type_args,
-                const_args,
-                type_param_map,
-                const_param_map,
-                self_type,
-            );
-            Struct {
-                name: *name,
-                type_args,
-                const_args,
-                origin: None,
-            }
-        }
-
-        DataRef {
-            name,
-            type_args,
-            const_args,
-            ..
-        } => {
-            let (type_args, const_args) = resolve_split_generic_args(
-                type_args,
-                const_args,
-                type_param_map,
-                const_param_map,
-                self_type,
-            );
-            DataRef {
-                name: *name,
-                type_args,
-                const_args,
-                origin: None,
-            }
-        }
-
         Array { elem, len } => {
             let resolved_len = match len {
                 ast::ArrayLen::Named(ident) => {

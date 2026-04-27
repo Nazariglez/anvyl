@@ -7,8 +7,8 @@ use super::{
 use crate::{
     ast::{
         AggregateKind, ArrayLen, ConstArg, ConstParam, FuncParam, GenericArg, Ident,
-        MethodReceiver, Mutability, Param, Program, Stmt, StmtNode, Type, TypeParam, VariantKind,
-        Visibility,
+        MethodReceiver, Mutability, NominalKind, Param, Program, Stmt, StmtNode, Type, TypeParam,
+        VariantKind, Visibility,
     },
     resolve::{ModuleKey, ModulePath, ResolveResult},
 };
@@ -26,14 +26,6 @@ impl ModuleScope {
             ModuleScope::Named(p) => Some(p.to_ast_path()),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum NominalKind {
-    Struct,
-    DataRef,
-    Enum,
-    Extern,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -308,10 +300,7 @@ impl DeclarationIndex {
                 }
                 Stmt::Aggregate(agg_node) => {
                     let agg = &agg_node.node;
-                    let kind = match agg.kind {
-                        AggregateKind::Struct => NominalKind::Struct,
-                        AggregateKind::DataRef => NominalKind::DataRef,
-                    };
+                    let kind = agg.kind.into();
                     let key = NominalKey {
                         module: scope.clone(),
                         kind,
@@ -498,28 +487,11 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn key_for_type(&self, ty: &Type) -> Option<NominalKey> {
-        let (name, origin) = match ty {
-            Type::Struct {
-                name,
-                type_args: _,
-                const_args: _,
-                origin,
-            }
-            | Type::DataRef {
-                name,
-                type_args: _,
-                const_args: _,
-                origin,
-            }
-            | Type::Enum {
-                name,
-                type_args: _,
-                const_args: _,
-                origin,
-            } => (*name, origin.clone()),
-            Type::Extern { name, origin } => (*name, origin.clone()),
-            _ => return None,
+        let Type::Nominal(nominal) = ty else {
+            return None;
         };
+        let name = nominal.name;
+        let origin = nominal.origin.clone();
 
         if let Some(origin) = origin {
             let scope = ModuleScope::Named(ModulePath::new(origin.iter().cloned().collect()));
@@ -715,47 +687,16 @@ pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type
                 .map(|(name, ty)| (*name, generic_template_type(ty, generics)))
                 .collect(),
         ),
-        Type::Struct {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => {
-            let (type_args, const_args) = generic_template_args(type_args, const_args, generics);
-            Type::Struct {
-                name: *name,
+        Type::Nominal(nominal) => {
+            let (type_args, const_args) =
+                generic_template_args(&nominal.type_args, &nominal.const_args, generics);
+            Type::nominal(
+                nominal.kind,
+                nominal.name,
                 type_args,
                 const_args,
-                origin: origin.clone(),
-            }
-        }
-        Type::DataRef {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => {
-            let (type_args, const_args) = generic_template_args(type_args, const_args, generics);
-            Type::DataRef {
-                name: *name,
-                type_args,
-                const_args,
-                origin: origin.clone(),
-            }
-        }
-        Type::Enum {
-            name,
-            type_args,
-            const_args,
-            origin,
-        } => {
-            let (type_args, const_args) = generic_template_args(type_args, const_args, generics);
-            Type::Enum {
-                name: *name,
-                type_args,
-                const_args,
-                origin: origin.clone(),
-            }
+                nominal.origin.clone(),
+            )
         }
         Type::List { elem } => Type::List {
             elem: Box::new(generic_template_type(elem, generics)),
@@ -770,10 +711,6 @@ pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type
         },
         Type::Slice { elem } => Type::Slice {
             elem: Box::new(generic_template_type(elem, generics)),
-        },
-        Type::Extern { name, origin } => Type::Extern {
-            name: *name,
-            origin: origin.clone(),
         },
     }
 }
@@ -860,39 +797,13 @@ impl NominalResolver<'_> {
                     .map(|(name, ty)| (*name, self.resolve_type(ty)))
                     .collect(),
             ),
-            Type::Struct {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => Type::Struct {
-                name: *name,
-                type_args: self.resolve_type_args(type_args),
-                const_args: const_args.clone(),
-                origin: origin.clone(),
-            },
-            Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => Type::DataRef {
-                name: *name,
-                type_args: self.resolve_type_args(type_args),
-                const_args: const_args.clone(),
-                origin: origin.clone(),
-            },
-            Type::Enum {
-                name,
-                type_args,
-                const_args,
-                origin,
-            } => Type::Enum {
-                name: *name,
-                type_args: self.resolve_type_args(type_args),
-                const_args: const_args.clone(),
-                origin: origin.clone(),
-            },
+            Type::Nominal(nominal) => Type::nominal(
+                nominal.kind,
+                nominal.name,
+                self.resolve_type_args(&nominal.type_args),
+                nominal.const_args.clone(),
+                nominal.origin.clone(),
+            ),
             Type::List { elem } => Type::List {
                 elem: Box::new(self.resolve_type(elem)),
             },
@@ -992,24 +903,19 @@ impl NominalResolver<'_> {
     ) -> Option<Type> {
         let (type_args, const_args) = self.bind_nominal_args(generics, args)?;
         Some(match base {
-            Type::Struct { name, origin, .. } => Type::Struct {
-                name,
+            Type::Nominal(nominal) if nominal.kind == NominalKind::Extern => {
+                if !type_args.is_empty() || !const_args.is_empty() {
+                    return None;
+                }
+                Type::nominal(nominal.kind, nominal.name, vec![], vec![], nominal.origin)
+            }
+            Type::Nominal(nominal) => Type::nominal(
+                nominal.kind,
+                nominal.name,
                 type_args,
                 const_args,
-                origin,
-            },
-            Type::DataRef { name, origin, .. } => Type::DataRef {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
-            Type::Enum { name, origin, .. } => Type::Enum {
-                name,
-                type_args,
-                const_args,
-                origin,
-            },
+                nominal.origin,
+            ),
             other if args.is_empty() => other,
             _ => return None,
         })
@@ -1086,30 +992,13 @@ pub(crate) fn nominal_type_with_args(
     type_args: &[Type],
     const_args: &[ConstArg],
 ) -> Type {
-    match key.kind {
-        NominalKind::Struct => Type::Struct {
-            name: key.name,
-            type_args: type_args.to_vec(),
-            const_args: const_args.to_vec(),
-            origin: key.module.named_path(),
-        },
-        NominalKind::DataRef => Type::DataRef {
-            name: key.name,
-            type_args: type_args.to_vec(),
-            const_args: const_args.to_vec(),
-            origin: key.module.named_path(),
-        },
-        NominalKind::Enum => Type::Enum {
-            name: key.name,
-            type_args: type_args.to_vec(),
-            const_args: const_args.to_vec(),
-            origin: key.module.named_path(),
-        },
-        NominalKind::Extern => Type::Extern {
-            name: key.name,
-            origin: key.module.named_path(),
-        },
-    }
+    Type::nominal(
+        key.kind,
+        key.name,
+        type_args.to_vec(),
+        const_args.to_vec(),
+        key.module.named_path(),
+    )
 }
 
 #[cfg(test)]
@@ -1149,12 +1038,13 @@ mod tests {
 
         assert_eq!(
             result,
-            Type::Struct {
+            Type::nominal(
+                NominalKind::Struct,
                 name,
-                type_args: vec![Type::Int],
-                const_args: vec![],
-                origin: Some(std::rc::Rc::new(["tools".into()])),
-            }
+                vec![Type::Int],
+                vec![],
+                Some(std::rc::Rc::new(["tools".into()])),
+            )
         );
     }
 
@@ -1199,17 +1089,19 @@ mod tests {
 
         assert_eq!(
             result,
-            Type::Struct {
-                name: wrapper,
-                type_args: vec![Type::Struct {
-                    name: inner,
-                    type_args: vec![],
-                    const_args: vec![],
-                    origin: None,
-                }],
-                const_args: vec![],
-                origin: None,
-            }
+            Type::nominal(
+                NominalKind::Struct,
+                wrapper,
+                vec![Type::nominal(
+                    NominalKind::Struct,
+                    inner,
+                    vec![],
+                    vec![],
+                    None
+                )],
+                vec![],
+                None,
+            )
         );
     }
 

@@ -3,12 +3,12 @@ use super::support::{
     assert_type_with_modules, typecheck,
 };
 use crate::{
-    ast::{ArrayLen, Ident, Type},
+    ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
         CallTarget, GenericArgs, TypecheckResult,
         decls::{
             CallableId, CallableKind, CallableParent, ExtendId, ModuleScope, NominalKey,
-            NominalKind, VariantSchema,
+            VariantSchema,
         },
     },
 };
@@ -19,6 +19,15 @@ fn root_key(kind: NominalKind, name: &str) -> NominalKey {
         kind,
         name: Ident::new(name),
     }
+}
+
+fn nominal(
+    kind: NominalKind,
+    name: &str,
+    type_args: Vec<Type>,
+    origin: Option<std::rc::Rc<[String]>>,
+) -> Type {
+    Type::nominal(kind, Ident::new(name), type_args, vec![], origin)
 }
 
 mod field_access {
@@ -130,12 +139,7 @@ mod struct_literal {
     fn local_struct_literal() {
         assert_type(
             "struct Point { x: int, y: int } fn main() { Point { x: 1, y: 2 }; }",
-            Type::Struct {
-                name: Ident::new("Point"),
-                type_args: vec![],
-                const_args: vec![],
-                origin: None,
-            },
+            nominal(NominalKind::Struct, "Point", vec![], None),
         );
     }
 
@@ -176,12 +180,14 @@ mod struct_literal {
         assert_type_with_modules(
             "import gamekit { Point }; fn main() { Point { x: 1, y: 2 }; }",
             "pub struct Point { x: int, y: int }",
-            Type::Struct {
-                name: Ident::new("Point"),
-                type_args: vec![],
-                const_args: vec![],
-                origin: None,
-            },
+            nominal(
+                NominalKind::Struct,
+                "Point",
+                vec![],
+                Some(std::rc::Rc::from(
+                    vec![String::from("gamekit")].into_boxed_slice(),
+                )),
+            ),
         );
     }
 
@@ -189,12 +195,7 @@ mod struct_literal {
     fn struct_infer() {
         assert_type(
             "struct Wrapper<T> { value: T } fn main() { Wrapper { value: 42 }; }",
-            Type::Struct {
-                name: Ident::new("Wrapper"),
-                type_args: vec![Type::Int],
-                const_args: vec![],
-                origin: None,
-            },
+            nominal(NominalKind::Struct, "Wrapper", vec![Type::Int], None),
         );
     }
 
@@ -202,12 +203,7 @@ mod struct_literal {
     fn dataref_infer() {
         assert_type(
             "dataref Box<T> { value: T } fn main() { Box { value: \"hi\" }; }",
-            Type::DataRef {
-                name: Ident::new("Box"),
-                type_args: vec![Type::String],
-                const_args: vec![],
-                origin: None,
-            },
+            nominal(NominalKind::DataRef, "Box", vec![Type::String], None),
         );
     }
 
@@ -215,12 +211,7 @@ mod struct_literal {
     fn annotation_unconstrained() {
         assert_type(
             "struct Token<T> {} fn main() { let value: Token<int> = Token {}; value; }",
-            Type::Struct {
-                name: Ident::new("Token"),
-                type_args: vec![Type::Int],
-                const_args: vec![],
-                origin: None,
-            },
+            nominal(NominalKind::Struct, "Token", vec![Type::Int], None),
         );
     }
 
@@ -233,12 +224,7 @@ mod struct_literal {
                 let w: Wrapper<int> = Wrapper { value: Token {} }; 
                 w.value; 
             }",
-            Type::Struct {
-                name: Ident::new("Token"),
-                type_args: vec![Type::Int],
-                const_args: vec![],
-                origin: None,
-            },
+            nominal(NominalKind::Struct, "Token", vec![Type::Int], None),
         );
     }
 
@@ -664,16 +650,16 @@ mod extend_schemas {
 
         assert_eq!(
             ext.target,
-            Type::Struct {
-                name: Ident::new("Box"),
-                type_args: vec![Type::UnresolvedNominal {
+            nominal(
+                NominalKind::Struct,
+                "Box",
+                vec![Type::UnresolvedNominal {
                     qualifier: None,
                     name: Ident::new("T"),
                     generic_args: vec![],
                 }],
-                const_args: vec![],
-                origin: None,
-            }
+                None,
+            )
         );
         assert_eq!(ext.generics.type_params.len(), 1);
         assert!(ext.generics.const_params.is_empty());
@@ -701,12 +687,7 @@ mod extend_schemas {
             "struct Point { x: int } extend Point { fn len(self) -> int { 0 } } fn main() {}",
         )
         .unwrap();
-        let ty = Type::Struct {
-            name: Ident::new("Point"),
-            type_args: vec![],
-            const_args: vec![],
-            origin: None,
-        };
+        let ty = nominal(NominalKind::Struct, "Point", vec![], None);
         let ext = result.decls().extends_for(&ty).next().expect("no extend");
         assert!(ext.methods.contains_key(&Ident::new("len")));
     }
@@ -1074,21 +1055,11 @@ mod enum_variants {
     use super::*;
 
     fn color_type() -> Type {
-        Type::Enum {
-            name: Ident::new("Color"),
-            type_args: vec![],
-            const_args: vec![],
-            origin: None,
-        }
+        nominal(NominalKind::Enum, "Color", vec![], None)
     }
 
     fn option_type(inner: Type) -> Type {
-        Type::Enum {
-            name: Ident::new("Option"),
-            type_args: vec![inner],
-            const_args: vec![],
-            origin: None,
-        }
+        nominal(NominalKind::Enum, "Option", vec![inner], None)
     }
 
     #[test]

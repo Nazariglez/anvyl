@@ -3,17 +3,18 @@ use super::support::{
     assert_single_error, assert_type, assert_type_with_modules, typecheck, typecheck_with_modules,
 };
 use crate::{
-    ast::{Ident, Type},
+    ast::{Ident, NominalKind, Type},
     typecheck::{CallTarget, ConstDiagnostic, ModuleScope, TypeError},
 };
 
 fn option_type(inner: Type) -> Type {
-    Type::Enum {
-        name: Ident::new("Option"),
-        type_args: vec![inner],
-        const_args: vec![],
-        origin: None,
-    }
+    Type::nominal(
+        NominalKind::Enum,
+        Ident::new("Option"),
+        vec![inner],
+        vec![],
+        None,
+    )
 }
 
 #[test]

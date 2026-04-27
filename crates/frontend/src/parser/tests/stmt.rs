@@ -1,5 +1,5 @@
 use super::helpers::{parse_program, parse_program_err};
-use crate::ast::{self, MethodReceiver, Mutability, Type};
+use crate::ast::{self, MethodReceiver, Mutability, NominalKind, Type};
 
 #[test]
 fn while_let() {
@@ -552,10 +552,13 @@ fn extern_type_self_return() {
     };
     assert_eq!(
         *ret,
-        Type::Extern {
-            name: ast::Ident(internment::Intern::new("Point".to_string())),
-            origin: None,
-        }
+        Type::nominal(
+            NominalKind::Extern,
+            ast::Ident(internment::Intern::new("Point".to_string())),
+            vec![],
+            vec![],
+            None,
+        )
     );
 }
 
