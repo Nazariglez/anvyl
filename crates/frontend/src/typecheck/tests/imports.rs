@@ -1,5 +1,6 @@
 use super::support::{
-    assert_type_with_modules, assert_type_with_named_modules, typecheck_with_named_modules,
+    assert_type_with_modules, assert_type_with_named_modules, typecheck_with_always_active_modules,
+    typecheck_with_named_modules,
 };
 use crate::{
     ast::{Ident, Type},
@@ -188,7 +189,7 @@ fn reexport_alias_call_target() {
         target,
         &CallTarget::Callable {
             id: CallableId::function(
-                ModuleScope::Named(ModulePath::new(vec!["tools".to_string()])),
+                ModuleScope::Named(ModulePath::new(vec!["tools".to_string()]).unwrap()),
                 Ident::new("id"),
             ),
             args: GenericArgs {
@@ -394,7 +395,7 @@ fn qualified_reexport_alias_call_target() {
         target,
         &CallTarget::Callable {
             id: CallableId::function(
-                ModuleScope::Named(ModulePath::new(vec!["tools".to_string()])),
+                ModuleScope::Named(ModulePath::new(vec!["tools".to_string()]).unwrap()),
                 Ident::new("id"),
             ),
             args: GenericArgs {
@@ -403,4 +404,45 @@ fn qualified_reexport_alias_call_target() {
             },
         }
     );
+}
+
+#[test]
+fn always_active_extend_is_visible_without_import() {
+    let root = "fn use_it() -> int { 1.plus_one() }";
+    let modules = [(
+        "core_int",
+        "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+    )];
+
+    typecheck_with_always_active_modules(root, &modules, &["core_int"]).unwrap();
+}
+
+#[test]
+fn ordinary_module_extend_is_not_visible_without_import() {
+    let root = "fn use_it() -> int { 1.plus_one() }";
+    let modules = [(
+        "core_int",
+        "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+    )];
+
+    assert!(typecheck_with_always_active_modules(root, &modules, &[]).is_err());
+}
+
+#[test]
+fn always_active_module_names_are_not_imported() {
+    let root = "fn use_it() -> int { hidden() }";
+    let modules = [("helpers", "pub fn hidden() -> int { 1 }")];
+
+    assert!(typecheck_with_always_active_modules(root, &modules, &["helpers"]).is_err());
+}
+
+#[test]
+fn explicit_import_keeps_extend_visible() {
+    let root = "import core_int; fn use_it() -> int { 1.plus_one() }";
+    let modules = [(
+        "core_int",
+        "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+    )];
+
+    typecheck_with_always_active_modules(root, &modules, &[]).unwrap();
 }

@@ -74,6 +74,7 @@ dependencies = [
  "anvyx-core",
  "anvyx-fmt",
  "anvyx-lang",
+ "anvyx-lang2",
  "anvyx-std",
  "clap",
  "console",
@@ -132,6 +133,13 @@ dependencies = [
  "internment",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "anvyx-lang2"
+version = "0.1.0"
+dependencies = [
+ "anvyx-frontend",
 ]
 
 [[package]]
@@ -752,7 +760,6 @@ dependencies = [
 name = "test-runner"
 version = "0.1.0"
 dependencies = [
- "anvyx-frontend",
  "rayon",
  "serde",
  "serde_json",

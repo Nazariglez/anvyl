@@ -1,0 +1,10 @@
+[package]
+name = "anvyx-lang2"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anvyx-frontend = { path = "../frontend" }
+
+[lints]
+workspace = true

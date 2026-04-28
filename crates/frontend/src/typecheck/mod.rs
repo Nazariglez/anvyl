@@ -1,4 +1,7 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 pub(crate) use self::{call_map::*, decls::*, generic::*, result::*};
 use self::{
@@ -649,7 +652,9 @@ impl TypeChecker {
     }
 
     fn extend_visible(&self, origin: &ModuleScope) -> bool {
-        origin == &self.current_module || self.imports_module(origin)
+        origin == &self.current_module
+            || self.decls.always_active_module(origin)
+            || self.imports_module(origin)
     }
 
     fn find_extend_method(&self, receiver: &Type, name: Ident) -> Option<ExtendMethodMatch<'_>> {
@@ -970,8 +975,9 @@ impl TypeChecker {
 pub(crate) fn check_with_modules(
     program: &Program,
     resolved: &ResolveResult,
+    always_active_modules: HashSet<ModuleScope>,
 ) -> Result<TypecheckResult, Vec<TypeError>> {
-    let decls = DeclarationIndex::from_root_and_modules(program, resolved);
+    let decls = DeclarationIndex::from_root_and_modules(program, resolved, always_active_modules);
     let mut tc = TypeChecker::new(decls);
     tc.collect_const_decls(ModuleScope::Root, program);
     collect_callable_templates(ModuleScope::Root, program, &mut tc);
@@ -989,7 +995,7 @@ pub(crate) fn check_with_modules(
         }
     }
 
-    tc.push_scope();
+    push_source_scope(&mut tc);
     register_declarations(program, &mut tc);
     tc.eval_module_consts(&ModuleScope::Root);
     check_stmts(&program.stmts, &mut tc);
@@ -1002,7 +1008,7 @@ pub(crate) fn check(program: &Program) -> Result<TypecheckResult, Vec<TypeError>
     let mut tc = TypeChecker::new(decls);
     tc.collect_const_decls(ModuleScope::Root, program);
     collect_callable_templates(ModuleScope::Root, program, &mut tc);
-    tc.push_scope();
+    push_source_scope(&mut tc);
     register_declarations(program, &mut tc);
     tc.eval_module_consts(&ModuleScope::Root);
     check_stmts(&program.stmts, &mut tc);
@@ -1096,6 +1102,34 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
             }
             _ => {}
         }
+    }
+}
+
+fn push_source_scope(tc: &mut TypeChecker) {
+    tc.push_scope();
+    register_builtins(tc);
+}
+
+fn register_builtins(tc: &mut TypeChecker) {
+    let builtins = [
+        ("println", vec![FuncParam::immut(Type::Any)], Type::Void),
+        ("assert", vec![FuncParam::immut(Type::Bool)], Type::Void),
+        (
+            "assert_msg",
+            vec![FuncParam::immut(Type::Bool), FuncParam::immut(Type::String)],
+            Type::Void,
+        ),
+    ];
+
+    for (name, params, ret) in builtins {
+        tc.define(
+            Ident::new(name),
+            Type::Func {
+                params,
+                ret: Box::new(ret),
+            },
+            false,
+        );
     }
 }
 
@@ -1453,7 +1487,8 @@ fn with_source_module_scope<R>(
         ModuleScope::Root => with_global_scope(tc, f),
         ModuleScope::Named(_) => {
             let scopes = std::mem::take(&mut tc.scopes);
-            tc.scopes = vec![HashMap::new()];
+            tc.scopes = vec![];
+            push_source_scope(tc);
             if let Some(program) = tc.module_programs.get(module).map(Rc::clone) {
                 register_declarations(program.as_ref(), tc);
                 tc.eval_module_consts(module);

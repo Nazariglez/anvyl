@@ -126,6 +126,7 @@ pub(crate) struct DeclarationIndex {
     aggregates: HashMap<NominalKey, AggregateSchema>,
     enums: HashMap<NominalKey, EnumSchema>,
     extends: Vec<ExtendSchema>,
+    always_active_modules: HashSet<ModuleScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,8 +317,13 @@ impl DeclarationIndex {
         index
     }
 
-    pub(crate) fn from_root_and_modules(root: &Program, resolved: &ResolveResult) -> Self {
+    pub(crate) fn from_root_and_modules(
+        root: &Program,
+        resolved: &ResolveResult,
+        always_active: HashSet<ModuleScope>,
+    ) -> Self {
         let mut index = Self::new();
+        index.always_active_modules = always_active;
         let modules = Self::module_programs(root, resolved);
         for (scope, program) in &modules {
             index.collect_module(program, scope.clone(), matches!(scope, ModuleScope::Root));
@@ -350,6 +356,7 @@ impl DeclarationIndex {
             aggregates: HashMap::new(),
             enums: HashMap::new(),
             extends: vec![],
+            always_active_modules: HashSet::new(),
         }
     }
 
@@ -840,6 +847,10 @@ impl DeclarationIndex {
             .is_some_and(|decls| decls.imports.active_modules.contains(imported))
     }
 
+    pub(crate) fn always_active_module(&self, module: &ModuleScope) -> bool {
+        self.always_active_modules.contains(module)
+    }
+
     pub(crate) fn set_const_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
         for decls in self.modules.values_mut() {
             Self::set_namespace_const_type(&mut decls.locals, scope, name, &ty);
@@ -880,7 +891,10 @@ impl DeclarationIndex {
         let origin = nominal.origin.clone();
 
         if let Some(origin) = origin {
-            let scope = ModuleScope::Named(ModulePath::new(origin.iter().cloned().collect()));
+            let scope = ModuleScope::Named(
+                ModulePath::new(origin.iter().cloned().collect())
+                    .expect("AST validates module paths"),
+            );
             if let Some(key) = self.local_type(&scope, name) {
                 return Some(key);
             }
@@ -1448,7 +1462,7 @@ mod tests {
     }
 
     fn scope(name: &str) -> ModuleScope {
-        ModuleScope::Named(ModulePath::new(vec![name.to_string()]))
+        ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
     }
 
     fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
@@ -1458,13 +1472,13 @@ mod tests {
                 .iter()
                 .map(|(name, source)| {
                     vec![ResolvedModule {
-                        key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()])),
+                        key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()]).unwrap()),
                         program: parse(source),
                     }]
                 })
                 .collect(),
         };
-        DeclarationIndex::from_root_and_modules(&root, &resolved)
+        DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new())
     }
 
     #[test]
@@ -1496,7 +1510,7 @@ mod tests {
     #[test]
     fn type_args_origin() {
         let name = ident("Box");
-        let scope = ModuleScope::Named(ModulePath::new(vec!["tools".into()]));
+        let scope = ModuleScope::Named(ModulePath::new(vec!["tools".into()]).unwrap());
         let key = NominalKey {
             module: scope.clone(),
             kind: NominalKind::Struct,

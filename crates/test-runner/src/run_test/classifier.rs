@@ -1,6 +1,6 @@
 use super::{
+    ProcessOutcome,
     assertions::{self, AssertionInput},
-    driver::ProcessOutcome,
 };
 use crate::{
     directives::{Assertions, TestContract},
@@ -53,16 +53,6 @@ fn classify_process_outcome(outcome: ProcessOutcome, contract: TestContract) -> 
             stdout,
             stderr,
         } => classify_exit(exit_code, stdout, stderr, contract),
-        ProcessOutcome::Pass { stdout, stderr } => ActualOutcome::Success { stdout, stderr },
-        ProcessOutcome::Fail {
-            phase,
-            stdout,
-            stderr,
-        } => ActualOutcome::Error {
-            phase,
-            stdout,
-            stderr,
-        },
         ProcessOutcome::Timeout { phase } => ActualOutcome::Timeout { phase },
     }
 }
@@ -203,7 +193,7 @@ mod tests {
     use crate::{
         directives::Directives,
         model::{FailurePhase, TestResult},
-        run_test::driver::ProcessOutcome,
+        run_test::ProcessOutcome,
     };
 
     const USER_EXIT_CODE: i32 = 121;
@@ -367,13 +357,7 @@ mod tests {
     #[test]
     fn expectation_mismatch_fails_without_text_assertions() {
         let directives = directives("// @expect: error\n");
-        let result = classify(
-            ProcessOutcome::Pass {
-                stdout: String::new(),
-                stderr: String::new(),
-            },
-            &directives,
-        );
+        let result = classify(completed(Some(0), "", ""), &directives);
 
         assert!(matches!(
             result,
@@ -388,11 +372,7 @@ mod tests {
     fn expected_error_run_mode_checks_stderr() {
         let directives = directives("// @expect: error\n// @contains: runtime failed\n");
         let result = classify(
-            ProcessOutcome::Fail {
-                phase: FailurePhase::Runtime,
-                stdout: String::new(),
-                stderr: "runtime failed\n".to_string(),
-            },
+            completed(Some(1), "", "Runtime error\nruntime failed\n"),
             &directives,
         );
 
@@ -403,14 +383,7 @@ mod tests {
     fn expected_error_check_mode_checks_merged_output() {
         let directives =
             directives("// @mode: check\n// @expect: error\n// @contains: type mismatch\n");
-        let result = classify(
-            ProcessOutcome::Fail {
-                phase: FailurePhase::Compile,
-                stdout: "type ".to_string(),
-                stderr: "mismatch\n".to_string(),
-            },
-            &directives,
-        );
+        let result = classify(completed(Some(1), "type ", "mismatch\n"), &directives);
 
         assert!(matches!(result, TestResult::Pass));
     }

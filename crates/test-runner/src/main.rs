@@ -9,14 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use args::{BackendArg, DriverArg, usage};
+use args::{BackendArg, usage};
 use model::{FailurePhase, Mode, RunTestResult, TestResult};
 use rayon::{
     ThreadPoolBuilder,
     iter::{IntoParallelRefIterator, ParallelIterator},
 };
 use report::Summary;
-use run_test::{CliDriver, FrontendDriver, TestDriver, run_test_file};
+use run_test::{Cli, run_test_file};
 
 const EXT: &str = "anv";
 
@@ -28,10 +28,10 @@ fn main() {
         std::process::exit(1);
     });
 
-    let driver: Box<dyn TestDriver> = match args.driver {
-        DriverArg::Cli => Box::new(CliDriver::build(args.release, !args.report_json).unwrap()),
-        DriverArg::Frontend => Box::new(FrontendDriver),
-    };
+    let cli = Cli::build(args.release, !args.report_json, args.new_frontend).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
 
     let start_time = Instant::now();
     let mut files: Vec<_> = args
@@ -58,22 +58,16 @@ fn main() {
     let run_work = || {
         work.par_iter()
             .map(|(file, backend)| {
-                let result = run_test_file(
-                    file,
-                    runtime_timeout,
-                    compile_timeout,
-                    *backend,
-                    driver.as_ref(),
-                )
-                .unwrap_or_else(|e| RunTestResult {
-                    result: TestResult::Fail {
-                        phase: FailurePhase::Compile,
-                        message: format!("Test runner error: {e}"),
-                    },
-                    mode: Mode::Check,
-                    backend: None,
-                    duration: Duration::ZERO,
-                });
+                let result = run_test_file(file, runtime_timeout, compile_timeout, *backend, &cli)
+                    .unwrap_or_else(|e| RunTestResult {
+                        result: TestResult::Fail {
+                            phase: FailurePhase::Compile,
+                            message: format!("Test runner error: {e}"),
+                        },
+                        mode: Mode::Check,
+                        backend: None,
+                        duration: Duration::ZERO,
+                    });
                 (file.clone(), *backend, result)
             })
             .collect::<Vec<_>>()

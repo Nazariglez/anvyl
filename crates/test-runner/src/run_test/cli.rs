@@ -1,29 +1,24 @@
 use std::{
     io::{ErrorKind, Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
 
 use wait_timeout::ChildExt;
 
-use super::{
-    classifier::phase_from_stderr_marker,
-    driver::{DriverCapabilities, ProcessOutcome, TestCase, TestDriver},
-};
-use crate::{
-    directives::DriverOptions,
-    model::{FailurePhase, Mode},
-};
+use super::{CliCase, ProcessOutcome, classifier::phase_from_stderr_marker};
+use crate::model::{FailurePhase, Mode};
 
 const ORANGE: &str = "\x1b[93m";
 const RESET: &str = "\x1b[0m";
 
-pub(crate) struct CliDriver {
+pub(crate) struct Cli {
     exe: String,
+    new_frontend: bool,
 }
 
-impl CliDriver {
-    pub(crate) fn build(release: bool, announce: bool) -> Result<Self, String> {
+impl Cli {
+    pub(crate) fn build(release: bool, announce: bool, new_frontend: bool) -> Result<Self, String> {
         if announce {
             println!(
                 "{ORANGE}Compiling anvyx{}{RESET}",
@@ -55,33 +50,23 @@ impl CliDriver {
             .join(exe_name)
             .display()
             .to_string();
-        Ok(Self { exe })
+        Ok(Self { exe, new_frontend })
+    }
+
+    pub(crate) fn new_frontend(&self) -> bool {
+        self.new_frontend
+    }
+
+    pub(crate) fn run(&self, case: &CliCase) -> Result<ProcessOutcome, String> {
+        spawn(&self.exe, case, self.new_frontend)
     }
 }
 
-impl TestDriver for CliDriver {
-    fn run(&self, case: &TestCase<'_>) -> Result<ProcessOutcome, String> {
-        spawn_test_process(&self.exe, case)
-    }
-
-    fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities {
-            supports_run: true,
-            supports_text_diagnostics: true,
-        }
-    }
-}
-
-fn spawn_test_process(cmd: &str, case: &TestCase<'_>) -> Result<ProcessOutcome, String> {
+fn spawn(cmd: &str, case: &CliCase, new_frontend: bool) -> Result<ProcessOutcome, String> {
     use std::process::Stdio;
 
     let mut command = std::process::Command::new(cmd);
-    command.args(test_process_args(
-        case.file,
-        case.mode,
-        case.backend,
-        case.driver_options,
-    ));
+    command.args(child_args(case, new_frontend));
 
     let mut child = command
         .stdin(Stdio::piped())
@@ -90,7 +75,7 @@ fn spawn_test_process(cmd: &str, case: &TestCase<'_>) -> Result<ProcessOutcome, 
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    if let Err(err) = write_child_stdin(child.stdin.take(), case.stdin_text) {
+    if let Err(err) = write_child_stdin(child.stdin.take(), &case.stdin) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);
@@ -100,11 +85,11 @@ fn spawn_test_process(cmd: &str, case: &TestCase<'_>) -> Result<ProcessOutcome, 
     let res = child.wait_timeout(timeout).map_err(|e| e.to_string())?;
     if let Some(status) = res {
         let (stdout, stderr) = read_child_output(&mut child);
-        return Ok(process_outcome_from_exit_code(
-            status.code(),
+        return Ok(ProcessOutcome::Completed {
+            exit_code: status.code(),
             stdout,
             stderr,
-        ));
+        });
     }
 
     let _ = child.kill();
@@ -113,18 +98,6 @@ fn spawn_test_process(cmd: &str, case: &TestCase<'_>) -> Result<ProcessOutcome, 
     Ok(ProcessOutcome::Timeout {
         phase: timeout_phase_for_output(case.mode, &stderr),
     })
-}
-
-fn process_outcome_from_exit_code(
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-) -> ProcessOutcome {
-    ProcessOutcome::Completed {
-        exit_code: code,
-        stdout,
-        stderr,
-    }
 }
 
 fn read_child_output(child: &mut std::process::Child) -> (String, String) {
@@ -141,20 +114,20 @@ fn read_child_output(child: &mut std::process::Child) -> (String, String) {
     (stdout, stderr)
 }
 
-fn test_process_args(
-    file: &Path,
-    mode: Mode,
-    backend: Option<&str>,
-    driver_options: &DriverOptions,
-) -> Vec<String> {
-    let mut args = vec![mode.as_str().to_string()];
-
-    if let Some(backend) = backend {
-        args.extend(["--backend".to_string(), backend.to_string()]);
+fn child_args(case: &CliCase, new_frontend: bool) -> Vec<String> {
+    let mut args = vec![case.mode.as_str().to_string()];
+    if new_frontend && case.mode == Mode::Check {
+        args.push("--new-frontend".to_string());
     }
-    driver_options.append_cli_args(&mut args);
 
-    args.push(file.display().to_string());
+    if case.mode == Mode::Run {
+        if let Some(backend) = case.backend {
+            args.extend(["--backend".to_string(), backend.to_string()]);
+        }
+    }
+    case.cli_options.append_args(&mut args);
+
+    args.push(case.file.display().to_string());
     args
 }
 
@@ -196,19 +169,33 @@ fn timeout_phase_for_output(mode: Mode, stderr: &str) -> FailurePhase {
 mod tests {
     use std::{
         io::{ErrorKind, Write},
-        path::Path,
+        path::PathBuf,
         time::Duration,
     };
 
     use super::{
-        process_outcome_from_exit_code, process_timeout_for_mode, test_process_args,
-        timeout_phase_for_output, write_child_stdin,
+        child_args, process_timeout_for_mode, timeout_phase_for_output, write_child_stdin,
     };
     use crate::{
-        directives::{DriverFlag, DriverOptions},
+        directives::{CliFlag, CliOptions},
         model::{FailurePhase, Mode},
-        run_test::driver::ProcessOutcome,
+        run_test::CliCase,
     };
+
+    fn case(mode: Mode) -> CliCase {
+        CliCase {
+            file: PathBuf::from(match mode {
+                Mode::Check => "tests/syntax/basic_ok.anv",
+                Mode::Run => "tests/run/basic_ok.anv",
+            }),
+            mode,
+            backend: None,
+            runtime_timeout: Duration::from_millis(2),
+            compile_timeout: Duration::from_millis(300),
+            cli_options: CliOptions::default(),
+            stdin: String::new(),
+        }
+    }
 
     fn has_arg_pair(args: &[String], flag: &str, value: &str) -> bool {
         args.windows(2)
@@ -228,17 +215,13 @@ mod tests {
     }
 
     #[test]
-    fn child_cli_args_do_not_include_unsupported_old_flags() {
-        let mut driver_options = DriverOptions::default();
-        driver_options.push(DriverFlag::Lint, "unused".to_string());
-        driver_options.push(DriverFlag::Feature, "gc".to_string());
-        driver_options.push(DriverFlag::Cfg, "debug".to_string());
-        let args = test_process_args(
-            Path::new("tests/run/stdin_ok.anv"),
-            Mode::Run,
-            Some("vm"),
-            &driver_options,
-        );
+    fn omits_runner_flags() {
+        let mut case = case(Mode::Run);
+        case.backend = Some("vm");
+        case.cli_options.push(CliFlag::Lint, "unused".to_string());
+        case.cli_options.push(CliFlag::Feature, "gc".to_string());
+        case.cli_options.push(CliFlag::Cfg, "debug".to_string());
+        let args = child_args(&case, false);
 
         assert_eq!(args[0], "run");
         assert!(has_arg_pair(&args, "--backend", "vm"));
@@ -252,6 +235,7 @@ mod tests {
                 | "--compile-timeout"
                 | "--jobs"
                 | "--report-json"
+                | "--release"
                 | "--driver"
                 | "--diagnostics"
                 | "--"
@@ -259,19 +243,56 @@ mod tests {
     }
 
     #[test]
-    fn check_mode_child_cli_args_have_no_backend_when_effective_backend_is_none() {
-        let args = test_process_args(
-            Path::new("tests/syntax/basic_ok.anv"),
-            Mode::Check,
-            None,
-            &DriverOptions::default(),
-        );
+    fn check_omits_backend() {
+        let mut case = case(Mode::Check);
+        case.backend = Some("vm");
 
-        assert_eq!(args, vec!["check", "tests/syntax/basic_ok.anv"]);
+        assert_eq!(
+            child_args(&case, false),
+            vec!["check", "tests/syntax/basic_ok.anv"]
+        );
     }
 
     #[test]
-    fn writes_fixture_stdin_to_child_stdin() {
+    fn adds_new_frontend() {
+        assert_eq!(
+            child_args(&case(Mode::Check), true),
+            vec!["check", "--new-frontend", "tests/syntax/basic_ok.anv"]
+        );
+    }
+
+    #[test]
+    fn keeps_forwarded_args() {
+        let mut case = case(Mode::Check);
+        case.file = PathBuf::from("tests/syntax/cfg/foo.anv");
+        case.backend = Some("vm");
+        case.cli_options.push(CliFlag::Cfg, "debug".to_string());
+
+        assert_eq!(
+            child_args(&case, true),
+            vec![
+                "check",
+                "--new-frontend",
+                "--cfg",
+                "debug",
+                "tests/syntax/cfg/foo.anv"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_omits_new_frontend() {
+        let mut case = case(Mode::Run);
+        case.backend = Some("vm");
+
+        assert_eq!(
+            child_args(&case, true),
+            vec!["run", "--backend", "vm", "tests/run/basic_ok.anv"]
+        );
+    }
+
+    #[test]
+    fn writes_stdin() {
         let mut written = Vec::new();
 
         write_child_stdin(Some(&mut written), "first\n\nthird\n").unwrap();
@@ -280,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_fixture_stdin_writes_empty_payload() {
+    fn writes_empty_stdin() {
         let mut written = Vec::new();
 
         write_child_stdin(Some(&mut written), "").unwrap();
@@ -289,26 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn broken_pipe_while_writing_stdin_is_not_a_runner_error() {
+    fn broken_pipe_is_ok() {
         assert!(write_child_stdin(Some(BrokenPipeWriter), "input\n").is_ok());
     }
 
     #[test]
-    fn process_exit_preserves_raw_code_and_streams() {
-        let outcome = process_outcome_from_exit_code(Some(7), "out".to_string(), "err".to_string());
-
-        assert!(matches!(
-            outcome,
-            ProcessOutcome::Completed {
-                exit_code: Some(7),
-                stdout,
-                stderr,
-            } if stdout == "out" && stderr == "err"
-        ));
-    }
-
-    #[test]
-    fn runner_timeout_uses_marker_then_timeout_mode_fallback() {
+    fn timeout_uses_marker() {
         assert_eq!(
             timeout_phase_for_output(Mode::Run, "Compile error: stuck\n"),
             FailurePhase::Compile,
@@ -320,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn check_mode_uses_compile_process_timeout() {
+    fn check_timeout() {
         let timeout = process_timeout_for_mode(
             Mode::Check,
             Duration::from_millis(2),
@@ -331,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn run_mode_uses_compile_plus_runtime_process_timeout() {
+    fn run_timeout() {
         let timeout = process_timeout_for_mode(
             Mode::Run,
             Duration::from_millis(2),

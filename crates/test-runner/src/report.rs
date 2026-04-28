@@ -10,7 +10,7 @@ use crate::{
     model::{FailurePhase, Mode, RunTestResult, TestResult},
 };
 
-const JSON_SCHEMA_VERSION: u32 = 1;
+const JSON_SCHEMA_VERSION: u32 = 2;
 
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
@@ -246,6 +246,7 @@ impl Summary {
         JsonReport {
             schema_version: JSON_SCHEMA_VERSION,
             backend: args.backend.as_str().to_string(),
+            new_frontend: args.new_frontend,
             input_paths: args
                 .paths
                 .iter()
@@ -394,6 +395,7 @@ impl IssueKind {
 struct JsonReport {
     schema_version: u32,
     backend: String,
+    new_frontend: bool,
     input_paths: Vec<String>,
     runtime_timeout_ms: u64,
     compile_timeout_ms: u64,
@@ -524,10 +526,7 @@ mod tests {
 
     use super::Summary;
     use crate::{
-        args::{
-            BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, DriverArg,
-            RunnerArgs,
-        },
+        args::{BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, RunnerArgs},
         model::{FailurePhase, Mode, RunTestResult, TestResult},
     };
 
@@ -541,7 +540,14 @@ mod tests {
             report_json: true,
             release: false,
             backend,
-            driver: DriverArg::Cli,
+            new_frontend: false,
+        }
+    }
+
+    fn new_frontend_args() -> RunnerArgs {
+        RunnerArgs {
+            new_frontend: true,
+            ..runner_args(BackendArg::Vm)
         }
     }
 
@@ -585,8 +591,9 @@ mod tests {
 
         let report = summary.json_report(&runner_args(BackendArg::Both), Instant::now());
 
-        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.schema_version, 2);
         assert_eq!(report.backend, "both");
+        assert!(!report.new_frontend);
         assert_eq!(report.issues.len(), 2);
         assert_eq!(report.issues[0].path, "a.anv");
         assert_eq!(report.issues[0].mode, "check");
@@ -743,5 +750,13 @@ mod tests {
         let json = serde_json::to_string(&report).expect("report serializes");
 
         assert!(json.contains("schema_version"));
+    }
+
+    #[test]
+    fn json_report_records_new_frontend_mode() {
+        let summary = Summary::default();
+        let report = summary.json_report(&new_frontend_args(), Instant::now());
+
+        assert!(report.new_frontend);
     }
 }

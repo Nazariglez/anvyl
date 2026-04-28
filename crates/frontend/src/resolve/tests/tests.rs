@@ -1,5 +1,8 @@
-use super::support::{InMemoryLoader, ignored_roots, module_path, resolve, resolve_with_ignored};
-use crate::resolve::{ModuleKey, ResolveError, ResolveResult};
+use super::support::{
+    InMemoryLoader, ignored_roots, module_path, preloaded, resolve, resolve_errors,
+    resolve_with_ignored, resolve_with_preloaded,
+};
+use crate::resolve::{ModuleKey, ModulePath, ResolveError, ResolveResult};
 
 fn group_keys(result: &ResolveResult) -> Vec<Vec<ModuleKey>> {
     result
@@ -9,10 +12,18 @@ fn group_keys(result: &ResolveResult) -> Vec<Vec<ModuleKey>> {
         .collect()
 }
 
+fn has_key(result: &ResolveResult, path: &[&str]) -> bool {
+    group_keys(result)
+        .into_iter()
+        .flatten()
+        .any(|key| matches!(key, ModuleKey::Named(p) if p.segments() == path))
+}
+
 fn has_error(errors: &[ResolveError], path: &[&str]) -> bool {
     errors.iter().any(|e| match e {
-        ResolveError::ModuleNotFound { path: p, .. } => p.segments() == path,
-        ResolveError::LoadFailed { path: p, .. } => p.segments() == path,
+        ResolveError::ModuleNotFound { path: p, .. }
+        | ResolveError::LoadFailed { path: p, .. }
+        | ResolveError::DuplicatePreloadedModule { path: p } => p.segments() == path,
     })
 }
 
@@ -23,6 +34,21 @@ fn assert_module_path(src: &str, dep_src: &str, path: &[&str]) {
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 2);
     assert!(matches!(&keys[0][0], ModuleKey::Named(p) if p.segments() == path));
+}
+
+#[test]
+fn module_path_rejects_empty_path() {
+    let error = ModulePath::new(vec![]).unwrap_err();
+    assert_eq!(error.message(), "module path must not be empty");
+}
+
+#[test]
+fn module_path_rejects_empty_segment() {
+    let error = ModulePath::new(vec!["foo".into(), "".into(), "bar".into()]).unwrap_err();
+    assert_eq!(
+        error.message(),
+        "module path must not contain empty segments: foo..bar"
+    );
 }
 
 #[test]
@@ -115,7 +141,7 @@ fn mixed_real_and_ignored() {
 fn missing_module() {
     let mut loader = InMemoryLoader::default();
     loader.add_missing(module_path(vec!["missing"]));
-    let errors = resolve("import missing;", &mut loader).unwrap_err();
+    let errors = resolve_errors(resolve("import missing;", &mut loader));
     assert!(has_error(&errors, &["missing"]));
 }
 
@@ -123,7 +149,7 @@ fn missing_module() {
 fn load_failure() {
     let mut loader = InMemoryLoader::default();
     loader.add_failure(module_path(vec!["bad"]), "disk error");
-    let errors = resolve("import bad;", &mut loader).unwrap_err();
+    let errors = resolve_errors(resolve("import bad;", &mut loader));
     assert!(has_error(&errors, &["bad"]));
 }
 
@@ -192,4 +218,104 @@ fn selective_self_alias() {
 #[test]
 fn selective_self_mixed() {
     assert_module_path("import foo { self, bar };", "pub fn bar() {}", &["foo"]);
+}
+
+#[test]
+fn preloaded_module_resolves_without_import() {
+    let mut loader = InMemoryLoader::default();
+    let result =
+        resolve_with_preloaded("", vec![preloaded(&["core_int"], "")], &mut loader).unwrap();
+
+    assert!(has_key(&result, &["core_int"]));
+}
+
+#[test]
+fn duplicate_preloaded_module_is_resolve_error() {
+    let path = module_path(vec!["core_int"]);
+    let mut loader = InMemoryLoader::default();
+    let errors = resolve_errors(resolve_with_preloaded(
+        "import core_int;",
+        vec![preloaded(&["core_int"], ""), preloaded(&["core_int"], "")],
+        &mut loader,
+    ));
+
+    assert!(matches!(
+        errors.as_slice(),
+        [ResolveError::DuplicatePreloadedModule { path: p }] if p == &path
+    ));
+    assert_eq!(loader.load_count(&path), 0);
+}
+
+#[test]
+fn preloaded_module_imports_are_resolved() {
+    let mut loader = InMemoryLoader::default();
+    loader.add_source(module_path(vec!["dep"]), "");
+    let result = resolve_with_preloaded(
+        "",
+        vec![preloaded(&["core_int"], "import dep;")],
+        &mut loader,
+    )
+    .unwrap();
+
+    assert!(has_key(&result, &["core_int"]));
+    assert!(has_key(&result, &["dep"]));
+}
+
+#[test]
+fn root_import_of_preloaded_module_dedupes() {
+    let path = module_path(vec!["core_int"]);
+    let mut loader = InMemoryLoader::default();
+    loader.add_source(path.clone(), "fn should_not_load() {}");
+    let result = resolve_with_preloaded(
+        "import core_int;",
+        vec![preloaded(&["core_int"], "")],
+        &mut loader,
+    )
+    .unwrap();
+
+    assert!(has_key(&result, &["core_int"]));
+    assert_eq!(loader.load_count(&path), 0);
+}
+
+#[test]
+fn duplicate_preloaded_and_loaded_imports_appear_once() {
+    let mut loader = InMemoryLoader::default();
+    let result = resolve_with_preloaded(
+        "import core_int; import core_int;",
+        vec![preloaded(&["core_int"], "")],
+        &mut loader,
+    )
+    .unwrap();
+    let count = group_keys(&result)
+        .into_iter()
+        .flatten()
+        .filter(|key| matches!(key, ModuleKey::Named(p) if p.segments() == ["core_int"]))
+        .count();
+
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn preloaded_cycle_is_one_scc() {
+    let mut loader = InMemoryLoader::default();
+    let result = resolve_with_preloaded(
+        "",
+        vec![
+            preloaded(&["a"], "import b;"),
+            preloaded(&["b"], "import a;"),
+        ],
+        &mut loader,
+    )
+    .unwrap();
+    let keys = group_keys(&result);
+
+    assert!(keys.iter().any(|group| {
+        group.len() == 2
+            && group
+                .iter()
+                .any(|key| matches!(key, ModuleKey::Named(p) if p.segments() == ["a"]))
+            && group
+                .iter()
+                .any(|key| matches!(key, ModuleKey::Named(p) if p.segments() == ["b"]))
+    }));
 }

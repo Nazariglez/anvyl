@@ -1,6 +1,6 @@
 # Test runner
 
-`test-runner` executes Anvyx fixture files from `tests/`. It parses `// @...` directives at the top of each `.anv` file, runs the selected driver, classifies the result, and prints a human or JSON report.
+`test-runner` executes Anvyx fixture files from `tests/`. It parses `// @...` directives at the top of each `.anv` file, runs the production CLI, classifies the result, and prints a human or JSON report.
 
 ## Usage
 
@@ -15,6 +15,7 @@ cargo run --package test-runner -- tests --quiet
 cargo run --package test-runner -- tests/syntax --backend vm
 cargo run --package test-runner -- tests/run --backend both --jobs 8
 cargo run --package test-runner -- tests --report-json
+cargo run --package test-runner -- tests/syntax --new-frontend --quiet
 ```
 
 Options:
@@ -22,7 +23,7 @@ Options:
 | Option | Meaning |
 | --- | --- |
 | `--backend <vm|rust|both>` | Backend to test. Defaults to `vm`. |
-| `--driver <cli|frontend>` | Driver to execute tests. Defaults to `cli`. |
+| `--new-frontend` | Route check-mode fixtures through `anvyx check --new-frontend`; run-mode fixtures are skipped. |
 | `--timeout <ms>` | Runtime timeout. Defaults to `2000`. |
 | `--compile-timeout <ms>` | Compile timeout. Defaults to `300000`. |
 | `--jobs <n>` | Maximum parallel tests. Defaults to Rayon. |
@@ -31,6 +32,8 @@ Options:
 | `--release` | Build Anvyx in release mode. |
 
 Options can appear before or after paths. Repeated value options use the last value.
+
+By default, fixtures run through the production CLI old frontend/backend path. `--new-frontend` uses the same compiled CLI binary and adds `--new-frontend` to check-mode child invocations. It is check-only, so run-mode fixtures are skipped before spawning `anvyx`.
 
 ## Fixture directives
 
@@ -68,9 +71,9 @@ Helper files are different. A helper file must contain only `// @helper` as its 
 | `// @warn-contains: text` | many | substring | Successful test stderr must contain this warning substring. Valid only with `@expect: success`. |
 | `// @skip: reason` | once | reason | Skips the test and reports the reason. |
 | `// @helper` | once | none | Marks a helper module. Cannot be combined with other directives. |
-| `// @lint: value` | many | lint override | Forwards `--lint <value>` to the CLI driver. |
-| `// @feature: value` | many | feature | Forwards `--feature <value>` to the CLI driver. |
-| `// @cfg: value` | many | cfg | Forwards `--cfg <value>` to the CLI driver. |
+| `// @lint: value` | many | lint override | Forwards `--lint <value>` to the child CLI. |
+| `// @feature: value` | many | feature | Forwards `--feature <value>` to the child CLI. |
+| `// @cfg: value` | many | cfg | Forwards `--cfg <value>` to the child CLI. |
 
 ### Selected output
 
@@ -120,13 +123,13 @@ Typical steps:
 6. Add parser and behavior tests.
 7. Update this README.
 
-For forwarded CLI flags, prefer `DriverFlag` plus one `DIRECTIVE_SPECS` row. Do not add a new `Directives` field or a custom loop in `run_test/cli_driver.rs` unless the directive has behavior beyond forwarding a CLI flag.
+For forwarded CLI flags, prefer `CliFlag` plus one `DIRECTIVE_SPECS` row. Do not add a new `Directives` field or a custom loop in `run_test/cli.rs` unless the directive has behavior beyond forwarding a CLI flag.
 
 Relevant files:
 
 - `src/directives.rs`: directive parsing, validation, and semantic grouping
 - `src/run_test/assertions.rs`: output assertion checks
 - `src/run_test/classifier.rs`: process outcome classification
-- `src/run_test/driver.rs`: driver interface and capabilities
+- `src/run_test/cli.rs`: child CLI process construction and timeout handling
 - `src/report.rs`: human and JSON report aggregation
 - `src/args.rs`: test-runner CLI arguments

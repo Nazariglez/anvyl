@@ -3,6 +3,7 @@ mod tests;
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     rc::Rc,
 };
 
@@ -15,12 +16,25 @@ use crate::{
 pub struct ModulePath(Vec<String>);
 
 impl ModulePath {
-    pub fn new(segments: Vec<String>) -> Self {
+    pub fn new(segments: Vec<String>) -> Result<Self, ModulePathError> {
+        if segments.is_empty() {
+            return Err(ModulePathError::new("module path must not be empty"));
+        }
+        if segments.iter().any(String::is_empty) {
+            return Err(ModulePathError::new(format!(
+                "module path must not contain empty segments: {}",
+                display_module_path(&segments)
+            )));
+        }
+        Ok(Self(segments))
+    }
+
+    fn from_valid_segments(segments: Vec<String>) -> Self {
         Self(segments)
     }
 
     pub fn from_idents(idents: &[Ident]) -> Self {
-        Self(idents.iter().map(|i| i.to_string()).collect())
+        Self::from_valid_segments(idents.iter().map(|i| i.to_string()).collect())
     }
 
     pub fn segments(&self) -> &[String] {
@@ -28,11 +42,44 @@ impl ModulePath {
     }
 
     pub fn first_segment(&self) -> Option<&str> {
-        self.0.first().map(String::as_str)
+        self.0.first().map(String::as_ref)
     }
 
     pub fn to_ast_path(&self) -> ast::ModulePath {
         Rc::from(self.0.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModulePathError {
+    message: String,
+}
+
+impl ModulePathError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ModulePathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModulePathError {}
+
+fn display_module_path(path: &[String]) -> String {
+    if path.is_empty() {
+        "<empty>".to_string()
+    } else {
+        path.join(".")
     }
 }
 
@@ -64,6 +111,12 @@ pub struct ResolveResult {
     pub module_groups: Vec<Vec<ResolvedModule>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreloadedModule {
+    pub path: ModulePath,
+    pub program: Program,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     ModuleNotFound {
@@ -75,26 +128,57 @@ pub enum ResolveError {
         span: Span,
         message: String,
     },
+    DuplicatePreloadedModule {
+        path: ModulePath,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleLoadError<E> {
+    LoadFailed(String),
+    Fatal(E),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveFailure<E> {
+    Resolve(Vec<ResolveError>),
+    Fatal(E),
 }
 
 pub trait ModuleLoader {
-    fn load(&mut self, path: &ModulePath) -> Result<Option<Program>, String>;
+    type FatalError;
+
+    fn load(
+        &mut self,
+        path: &ModulePath,
+    ) -> Result<Option<Program>, ModuleLoadError<Self::FatalError>>;
 }
 
-pub fn resolve_modules(
+pub fn resolve_modules<L: ModuleLoader>(
     root: Program,
-    loader: &mut impl ModuleLoader,
+    preloaded_modules: Vec<PreloadedModule>,
+    loader: &mut L,
     ignored_roots: &HashSet<String>,
-) -> Result<ResolveResult, Vec<ResolveError>> {
+) -> Result<ResolveResult, ResolveFailure<L::FatalError>> {
+    let preloaded_roots =
+        prepare_preloaded_modules(preloaded_modules).map_err(ResolveFailure::Resolve)?;
     let mut resolver = Resolver {
         loader,
         ignored_roots,
+        preloaded: preloaded_roots.iter().cloned().collect(),
         visiting: HashSet::new(),
         loaded: HashSet::new(),
         modules: Vec::new(),
         errors: Vec::new(),
+        fatal: None,
     };
+    for (path, program) in preloaded_roots {
+        resolver.resolve_module(ModuleKey::Named(path), program);
+    }
     resolver.resolve_root(root);
+    if let Some(error) = resolver.fatal {
+        return Err(ResolveFailure::Fatal(error));
+    }
     if resolver.errors.is_empty() {
         let modules = resolver.into_modules();
         let groups = build_dependency_groups(modules, ignored_roots);
@@ -103,24 +187,52 @@ pub fn resolve_modules(
         });
     }
 
-    Err(resolver.errors)
+    Err(ResolveFailure::Resolve(resolver.errors))
+}
+
+fn prepare_preloaded_modules(
+    modules: Vec<PreloadedModule>,
+) -> Result<Vec<(ModulePath, Program)>, Vec<ResolveError>> {
+    let mut seen = HashSet::new();
+    let mut roots = vec![];
+    let mut errors = vec![];
+
+    for module in modules {
+        if !seen.insert(module.path.clone()) {
+            errors.push(ResolveError::DuplicatePreloadedModule { path: module.path });
+            continue;
+        }
+        roots.push((module.path, module.program));
+    }
+
+    if errors.is_empty() {
+        Ok(roots)
+    } else {
+        Err(errors)
+    }
 }
 
 struct Resolver<'a, L: ModuleLoader> {
     loader: &'a mut L,
     ignored_roots: &'a HashSet<String>,
+    preloaded: HashMap<ModulePath, Program>,
     visiting: HashSet<ModuleKey>,
     loaded: HashSet<ModuleKey>,
     modules: Vec<ResolvedModule>,
     errors: Vec<ResolveError>,
+    fatal: Option<L::FatalError>,
 }
 
-impl<'a, L: ModuleLoader> Resolver<'a, L> {
+impl<L: ModuleLoader> Resolver<'_, L> {
     fn resolve_root(&mut self, root: Program) {
         self.resolve_module(ModuleKey::Root, root);
     }
 
     fn resolve_module(&mut self, key: ModuleKey, program: Program) {
+        if self.fatal.is_some() {
+            return;
+        }
+
         if self.loaded.contains(&key) {
             return;
         }
@@ -146,6 +258,11 @@ impl<'a, L: ModuleLoader> Resolver<'a, L> {
                 continue;
             };
 
+            if let Some(module_program) = self.preloaded.get(path).cloned() {
+                self.resolve_module(import_key.clone(), module_program);
+                continue;
+            }
+
             match self.loader.load(path) {
                 Ok(Some(module_program)) => {
                     self.resolve_module(import_key.clone(), module_program);
@@ -156,12 +273,16 @@ impl<'a, L: ModuleLoader> Resolver<'a, L> {
                         span: import.span,
                     });
                 }
-                Err(msg) => {
+                Err(ModuleLoadError::LoadFailed(message)) => {
                     self.errors.push(ResolveError::LoadFailed {
                         path: path.clone(),
                         span: import.span,
-                        message: msg,
+                        message,
                     });
+                }
+                Err(ModuleLoadError::Fatal(error)) => {
+                    self.fatal = Some(error);
+                    return;
                 }
             }
         }

@@ -29,6 +29,30 @@ fn direct_call_typechecks() {
 }
 
 #[test]
+fn builtin_calls_typecheck() {
+    typecheck(
+        r#"
+        fn main() {
+            println("ok");
+            println(1);
+            assert(true);
+            assert_msg(true, "ok");
+        }
+        "#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn builtin_calls_typecheck_in_named_modules() {
+    typecheck_with_modules(
+        "import gamekit { run }; fn main() { run(); }",
+        "pub fn run() { println(1); }",
+    )
+    .unwrap();
+}
+
+#[test]
 fn direct_call_target() {
     assert_calls("fn foo() -> int { 0 } fn main() { foo(); }", 1);
 }

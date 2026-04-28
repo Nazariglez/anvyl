@@ -5,7 +5,7 @@ pub(crate) struct Directives {
     pub(crate) contract: TestContract,
     pub(crate) assertions: Assertions,
     pub(crate) stdin: Stdin,
-    pub(crate) driver_options: DriverOptions,
+    pub(crate) cli_options: CliOptions,
     pub(crate) skip: Option<String>,
     pub(crate) helper: bool,
 }
@@ -37,12 +37,6 @@ pub(crate) struct Assertions {
     pub(crate) warnings: ContainsAssertions,
 }
 
-impl Assertions {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.selected.is_empty() && self.stderr.is_empty() && self.warnings.is_empty()
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub(crate) struct StreamAssertions {
     pub(crate) exact: Option<String>,
@@ -50,10 +44,6 @@ pub(crate) struct StreamAssertions {
 }
 
 impl StreamAssertions {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.exact.is_none() && self.contains.is_empty()
-    }
-
     fn has_conflict(&self) -> bool {
         self.exact.is_some() && !self.contains.is_empty()
     }
@@ -94,13 +84,13 @@ impl Stdin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DriverFlag {
+pub(crate) enum CliFlag {
     Lint,
     Feature,
     Cfg,
 }
 
-impl DriverFlag {
+impl CliFlag {
     pub(crate) fn cli_flag(self) -> &'static str {
         match self {
             Self::Lint => "--lint",
@@ -111,28 +101,28 @@ impl DriverFlag {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForwardedArg {
-    flag: DriverFlag,
+pub(crate) struct ForwardedCliArg {
+    flag: CliFlag,
     value: String,
 }
 
-impl ForwardedArg {
-    fn new(flag: DriverFlag, value: String) -> Self {
+impl ForwardedCliArg {
+    fn new(flag: CliFlag, value: String) -> Self {
         Self { flag, value }
     }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct DriverOptions {
-    forwarded: Vec<ForwardedArg>,
+pub(crate) struct CliOptions {
+    forwarded: Vec<ForwardedCliArg>,
 }
 
-impl DriverOptions {
-    pub(crate) fn push(&mut self, flag: DriverFlag, value: String) {
-        self.forwarded.push(ForwardedArg::new(flag, value));
+impl CliOptions {
+    pub(crate) fn push(&mut self, flag: CliFlag, value: String) {
+        self.forwarded.push(ForwardedCliArg::new(flag, value));
     }
 
-    pub(crate) fn append_cli_args(&self, args: &mut Vec<String>) {
+    pub(crate) fn append_args(&self, args: &mut Vec<String>) {
         for arg in &self.forwarded {
             args.extend([arg.flag.cli_flag().to_string(), arg.value.clone()]);
         }
@@ -155,7 +145,7 @@ enum DirectiveKind {
     WarnContains,
     Skip,
     Helper,
-    DriverOption(DriverFlag),
+    CliOption(CliFlag),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,19 +258,19 @@ const DIRECTIVE_SPECS: &[DirectiveSpec] = &[
     DirectiveSpec::flag("helper", DirectiveKind::Helper, Repeatability::Once),
     DirectiveSpec::value(
         "lint",
-        DirectiveKind::DriverOption(DriverFlag::Lint),
+        DirectiveKind::CliOption(CliFlag::Lint),
         "override",
         Repeatability::Many,
     ),
     DirectiveSpec::value(
         "feature",
-        DirectiveKind::DriverOption(DriverFlag::Feature),
+        DirectiveKind::CliOption(CliFlag::Feature),
         "feature",
         Repeatability::Many,
     ),
     DirectiveSpec::value(
         "cfg",
-        DirectiveKind::DriverOption(DriverFlag::Cfg),
+        DirectiveKind::CliOption(CliFlag::Cfg),
         "cfg",
         Repeatability::Many,
     ),
@@ -443,7 +433,7 @@ impl Directives {
             }
             DirectiveKind::Skip => self.skip = Some(value.to_string()),
             DirectiveKind::Helper => self.helper = true,
-            DirectiveKind::DriverOption(flag) => self.driver_options.push(flag, value.to_string()),
+            DirectiveKind::CliOption(flag) => self.cli_options.push(flag, value.to_string()),
             DirectiveKind::MatchBegin | DirectiveKind::MatchEnd => {
                 unreachable!("match block directives are handled earlier")
             }
@@ -481,7 +471,7 @@ fn validate_directive_value<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Directives, DriverFlag};
+    use super::{CliFlag, Directives};
 
     fn fixture(body: &str) -> String {
         format!("// @mode: run\n// @expect: success\n{body}")
@@ -679,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_driver_options_in_order() {
+    fn parses_cli_options_in_order() {
         let directives = directives(
             "// @lint: unused\n\
              // @feature: gc\n\
@@ -688,15 +678,15 @@ mod tests {
         );
 
         let mut args = vec![];
-        directives.driver_options.append_cli_args(&mut args);
+        directives.cli_options.append_args(&mut args);
         assert_eq!(
             args,
             vec![
-                DriverFlag::Lint.cli_flag(),
+                CliFlag::Lint.cli_flag(),
                 "unused",
-                DriverFlag::Feature.cli_flag(),
+                CliFlag::Feature.cli_flag(),
                 "gc",
-                DriverFlag::Cfg.cli_flag(),
+                CliFlag::Cfg.cli_flag(),
                 "debug",
             ]
         );

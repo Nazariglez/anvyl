@@ -3,31 +3,11 @@ use std::path::PathBuf;
 pub const DEFAULT_RUNTIME_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_COMPILE_TIMEOUT_MS: u64 = 300_000;
 
-// FIXME: probaby remove driver frontend once the frontend is wired to the cli
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendArg {
     Vm,
     Rust,
     Both,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverArg {
-    Cli,
-    Frontend,
-}
-
-impl DriverArg {
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "cli" => Ok(Self::Cli),
-            "frontend" => Ok(Self::Frontend),
-            _ => Err(format!(
-                "Unknown driver: '{s}'. Expected 'cli' or 'frontend'"
-            )),
-        }
-    }
 }
 
 impl BackendArg {
@@ -69,7 +49,7 @@ pub struct RunnerArgs {
     pub report_json: bool,
     pub release: bool,
     pub backend: BackendArg,
-    pub driver: DriverArg,
+    pub new_frontend: bool,
 }
 
 pub fn usage() -> String {
@@ -82,7 +62,7 @@ Arguments:
 
 Options:
   --backend <vm|rust|both>  Backend to test (default: vm)
-  --driver <cli|frontend>   Driver to execute tests (default: cli)
+  --new-frontend            Run check-mode fixtures through anvyx check --new-frontend
   --timeout <ms>            Runtime timeout in milliseconds (default: {DEFAULT_RUNTIME_TIMEOUT_MS})
   --compile-timeout <ms>    Compile timeout in milliseconds (default: {DEFAULT_COMPILE_TIMEOUT_MS})
   --jobs <n>                Maximum tests to run in parallel (default: rayon default)
@@ -107,6 +87,7 @@ impl RunnerArgs {
                 "--quiet" => parsed.quiet = true,
                 "--report-json" => parsed.report_json = true,
                 "--release" => parsed.release = true,
+                "--new-frontend" => parsed.new_frontend = true,
                 "--timeout" => {
                     let value = parse_value(&mut iter, "--timeout")?;
                     parsed.timeout_ms = parse_u64("--timeout", &value)?;
@@ -122,10 +103,6 @@ impl RunnerArgs {
                 "--backend" => {
                     let value = parse_value(&mut iter, "--backend")?;
                     parsed.backend = BackendArg::from_str(&value)?;
-                }
-                "--driver" => {
-                    let value = parse_value(&mut iter, "--driver")?;
-                    parsed.driver = DriverArg::from_str(&value)?;
                 }
                 flag if flag.starts_with("--") => return Err(format!("Unknown option: {flag}")),
                 path => parsed.paths.push(PathBuf::from(path)),
@@ -145,7 +122,7 @@ struct ParsedArgs {
     report_json: bool,
     release: bool,
     backend: BackendArg,
-    driver: DriverArg,
+    new_frontend: bool,
 }
 
 impl Default for ParsedArgs {
@@ -159,7 +136,7 @@ impl Default for ParsedArgs {
             report_json: false,
             release: false,
             backend: BackendArg::Vm,
-            driver: DriverArg::Cli,
+            new_frontend: false,
         }
     }
 }
@@ -185,7 +162,7 @@ impl ParsedArgs {
             report_json: self.report_json,
             release: self.release,
             backend: self.backend,
-            driver: self.driver,
+            new_frontend: self.new_frontend,
         })
     }
 }
@@ -227,8 +204,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, DriverArg, RunnerArgs,
-        usage,
+        BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, RunnerArgs, usage,
     };
 
     fn args(items: &[&str]) -> Vec<String> {
@@ -251,7 +227,7 @@ mod tests {
         assert!(!parsed.report_json);
         assert!(!parsed.release);
         assert_eq!(parsed.backend, BackendArg::Vm);
-        assert_eq!(parsed.driver, DriverArg::Cli);
+        assert!(!parsed.new_frontend);
     }
 
     #[test]
@@ -261,6 +237,7 @@ mod tests {
             "--quiet",
             "--report-json",
             "--release",
+            "--new-frontend",
             "--timeout",
             "1234",
             ".",
@@ -270,8 +247,6 @@ mod tests {
             "4",
             "--backend",
             "both",
-            "--driver",
-            "frontend",
         ])
         .unwrap();
 
@@ -282,7 +257,7 @@ mod tests {
         assert!(parsed.report_json);
         assert!(parsed.release);
         assert_eq!(parsed.backend, BackendArg::Both);
-        assert_eq!(parsed.driver, DriverArg::Frontend);
+        assert!(parsed.new_frontend);
     }
 
     #[test]
@@ -331,6 +306,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_driver() {
+        assert_eq!(
+            parse(&["test-runner", ".", "--driver", "cli"]).unwrap_err(),
+            "Unknown option: --driver"
+        );
+    }
+
+    #[test]
     fn rejects_missing_values() {
         assert_eq!(
             parse(&["test-runner", ".", "--timeout", "--quiet"]).unwrap_err(),
@@ -355,10 +338,6 @@ mod tests {
         assert_eq!(
             parse(&["test-runner", ".", "--backend", "unknown"]).unwrap_err(),
             "Unknown backend: 'unknown'. Expected 'vm', 'rust', or 'both'"
-        );
-        assert_eq!(
-            parse(&["test-runner", ".", "--driver", "unknown"]).unwrap_err(),
-            "Unknown driver: 'unknown'. Expected 'cli' or 'frontend'"
         );
     }
 
@@ -390,7 +369,12 @@ mod tests {
     }
 
     #[test]
-    fn usage_documents_driver() {
-        assert!(usage().contains("--driver <cli|frontend>"));
+    fn usage_documents_new_frontend() {
+        assert!(usage().contains("--new-frontend"));
+    }
+
+    #[test]
+    fn usage_omits_driver() {
+        assert!(!usage().contains("--driver"));
     }
 }

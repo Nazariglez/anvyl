@@ -1,9 +1,11 @@
+use std::collections::HashSet;
+
 use crate::{
     ast::Type,
     lexer::tokenize,
     parser,
     resolve::{ModuleKey, ModulePath, ResolveResult, ResolvedModule},
-    typecheck::{self, TypeError},
+    typecheck::{self, ModuleScope, TypeError},
 };
 
 pub(crate) fn assert_no_infer_vars_in_result(result: &typecheck::TypecheckResult) {
@@ -61,13 +63,37 @@ pub(crate) fn typecheck_with_named_modules(
             modules
                 .iter()
                 .map(|(name, source)| ResolvedModule {
-                    key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()])),
+                    key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()]).unwrap()),
                     program: parse(source),
                 })
                 .collect(),
         ],
     };
-    typecheck::check_with_modules(&root, &resolved)
+    typecheck::check_with_modules(&root, &resolved, HashSet::new())
+}
+
+pub(crate) fn typecheck_with_always_active_modules(
+    root_source: &str,
+    modules: &[(&str, &str)],
+    always_active: &[&str],
+) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
+    let root = parse(root_source);
+    let resolved = ResolveResult {
+        module_groups: vec![
+            modules
+                .iter()
+                .map(|(name, source)| ResolvedModule {
+                    key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()]).unwrap()),
+                    program: parse(source),
+                })
+                .collect(),
+        ],
+    };
+    let always_active_modules = always_active
+        .iter()
+        .map(|name| ModuleScope::Named(ModulePath::new(vec![(*name).to_string()]).unwrap()))
+        .collect();
+    typecheck::check_with_modules(&root, &resolved, always_active_modules)
 }
 
 fn last_expr_type(result: &typecheck::TypecheckResult) -> Option<Type> {

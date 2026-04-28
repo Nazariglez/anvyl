@@ -45,6 +45,8 @@ enum Command {
     #[command(about = "Check an Anvyx file")]
     Check {
         file: Option<PathBuf>,
+        #[arg(long)]
+        new_frontend: bool,
         #[arg(long, value_name = "KEY=VALUE")]
         lint: Vec<String>,
         #[arg(long, value_delimiter = ',')]
@@ -171,12 +173,30 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Check {
             file,
+            new_frontend,
             lint,
             feature,
             cfg,
         } => {
             let manifest = manifest::parse_manifest()?;
             let path = resolve_entry(file, manifest.as_ref())?;
+
+            if new_frontend {
+                check::reject_unsupported_new_frontend_inputs(
+                    manifest.as_ref(),
+                    &lint,
+                    &feature,
+                    &cfg,
+                )?;
+                progress::status("Checking", &format!("{}...", path.display()));
+                check::new_frontend_cmd(&path)?;
+                progress::status(
+                    "Finished",
+                    &format!("{} checked successfully", path.display()),
+                );
+                return Ok(());
+            }
+
             let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
             let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
 
@@ -295,4 +315,42 @@ fn resolve_lint_config(
         }
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_accepts_new_frontend_flag() {
+        let cli = Cli::parse_from(["anvyx", "check", "--new-frontend", "main.anv"]);
+
+        match cli.command {
+            Command::Check {
+                file, new_frontend, ..
+            } => {
+                assert!(new_frontend);
+                assert_eq!(file, Some(PathBuf::from("main.anv")));
+            }
+            other => panic!("expected check command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_defaults_new_frontend_to_false() {
+        let cli = Cli::parse_from(["anvyx", "check", "main.anv"]);
+
+        match cli.command {
+            Command::Check { new_frontend, .. } => assert!(!new_frontend),
+            other => panic!("expected check command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_rejects_new_frontend_flag() {
+        let error = Cli::try_parse_from(["anvyx", "run", "--new-frontend", "main.anv"])
+            .expect_err("run must reject check-only flag");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 }
