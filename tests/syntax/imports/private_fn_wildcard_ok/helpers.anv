@@ -1,4 +1,5 @@
-// @helper: helper module for private_fn_wildcard_ok test
+// @helper
+// helper module for private_fn_wildcard_ok test
 
 pub fn visible() -> int { 1 }
 fn hidden() -> int { 2 }

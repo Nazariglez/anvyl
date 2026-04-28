@@ -752,8 +752,10 @@ dependencies = [
 name = "test-runner"
 version = "0.1.0"
 dependencies = [
- "anvyx-lang",
+ "anvyx-frontend",
  "rayon",
+ "serde",
+ "serde_json",
  "wait-timeout",
  "walkdir",
 ]

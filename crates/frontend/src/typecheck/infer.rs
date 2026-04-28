@@ -6,8 +6,8 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParamId, ConstValue, ExprId, FuncParam, GenericArg, Ident,
-        ModulePath, NominalKind, Type, TypeVarId,
+        ArrayLen, ConstArg, ConstParamId, ExprId, FuncParam, GenericArg, Ident, ModulePath,
+        NominalKind, Type, TypeVarId,
     },
     span::Span,
 };
@@ -706,12 +706,6 @@ impl Solver {
         self.temp_handle(Ty::NamedTuple(fields))
     }
 
-    #[cfg(test)]
-    pub(super) fn fresh_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
-        let ty = self.fresh_type(span);
-        self.set_expr_handle(id, span, ty)
-    }
-
     pub(super) fn nil_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
         let ty = self.fresh_nil_type(span);
         self.set_expr_handle(id, span, ty)
@@ -787,12 +781,6 @@ impl Solver {
             })
             .collect();
         (types, errors.into_iter().map(Into::into).collect())
-    }
-
-    #[cfg(test)]
-    pub(super) fn finalize_handle(&self, handle: &TypeHandle) -> (Type, Vec<SolverFinalizeError>) {
-        let (ty, errors) = self.finalize_ty(&self.resolve_ref(&handle.0));
-        (ty, errors.into_iter().map(Into::into).collect())
     }
 
     pub(super) fn alloc_local_type(&mut self, ty: &Type) -> LocalTypeId {
@@ -2053,6 +2041,7 @@ impl From<InferError> for SolverFinalizeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::ConstValue;
 
     fn ident(name: &str) -> Ident {
         Ident::new(name)
@@ -2096,6 +2085,23 @@ mod tests {
         match ty {
             Ty::Infer(id) => id,
             _ => panic!("expected inference var"),
+        }
+    }
+
+    trait SolverTestExt {
+        fn fresh_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle;
+        fn finalize_handle(&self, handle: &TypeHandle) -> (Type, Vec<SolverFinalizeError>);
+    }
+
+    impl SolverTestExt for Solver {
+        fn fresh_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
+            let ty = self.fresh_type(span);
+            self.set_expr_handle(id, span, ty)
+        }
+
+        fn finalize_handle(&self, handle: &TypeHandle) -> (Type, Vec<SolverFinalizeError>) {
+            let (ty, errors) = self.finalize_ty(&self.resolve_ref(&handle.0));
+            (ty, errors.into_iter().map(Into::into).collect())
         }
     }
 

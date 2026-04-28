@@ -1,3 +1,4 @@
-// @helper: helper module for pub_fn_ok test
+// @helper
+// helper module for pub_fn_ok test
 
 pub fn add(a: int, b: int) -> int { a + b }

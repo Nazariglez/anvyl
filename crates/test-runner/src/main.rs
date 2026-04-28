@@ -1,39 +1,40 @@
 mod args;
 mod directives;
+mod model;
+mod report;
 mod run_test;
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
-use args::{BackendArg, USAGE};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use run_test::{ExpectedResult, TestResult, run_test_file};
-
-use crate::run_test::{Mode, RunTestResult};
+use args::{BackendArg, DriverArg, usage};
+use model::{FailurePhase, Mode, RunTestResult, TestResult};
+use rayon::{
+    ThreadPoolBuilder,
+    iter::{IntoParallelRefIterator, ParallelIterator},
+};
+use report::Summary;
+use run_test::{CliDriver, FrontendDriver, TestDriver, run_test_file};
 
 const EXT: &str = "anv";
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
-const CYAN: &str = "\x1b[36m";
-const BLUE: &str = "\x1b[34m";
-const RESET: &str = "\x1b[0m";
-const GREY: &str = "\x1b[90m";
 
 fn main() {
     let args = args::RunnerArgs::new().unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         eprintln!();
-        eprintln!("{USAGE}");
+        eprintln!("{}", usage());
         std::process::exit(1);
     });
 
-    let exe = run_test::compile_lang(args.release).unwrap();
+    let driver: Box<dyn TestDriver> = match args.driver {
+        DriverArg::Cli => Box::new(CliDriver::build(args.release, !args.report_json).unwrap()),
+        DriverArg::Frontend => Box::new(FrontendDriver),
+    };
 
     let start_time = Instant::now();
-    let files: Vec<_> = args
+    let mut files: Vec<_> = args
         .paths
         .iter()
         .flat_map(|path| {
@@ -44,208 +45,71 @@ fn main() {
             }
         })
         .collect();
+    files.sort();
 
-    let work: Vec<(PathBuf, Option<&'static str>)> = match args.backend {
-        BackendArg::Both => files
-            .iter()
-            .flat_map(|f| {
-                vec![
-                    (f.clone(), Some(BackendArg::Vm.as_str())),
-                    (f.clone(), Some(BackendArg::Rust.as_str())),
-                ]
+    let work = expand_backend_work(&files, args.backend);
+
+    if !args.report_json {
+        report::print_start(work.len());
+    }
+
+    let runtime_timeout = Duration::from_millis(args.timeout_ms);
+    let compile_timeout = Duration::from_millis(args.compile_timeout_ms);
+    let run_work = || {
+        work.par_iter()
+            .map(|(file, backend)| {
+                let result = run_test_file(
+                    file,
+                    runtime_timeout,
+                    compile_timeout,
+                    *backend,
+                    driver.as_ref(),
+                )
+                .unwrap_or_else(|e| RunTestResult {
+                    result: TestResult::Fail {
+                        phase: FailurePhase::Compile,
+                        message: format!("Test runner error: {e}"),
+                    },
+                    mode: Mode::Check,
+                    backend: None,
+                    duration: Duration::ZERO,
+                });
+                (file.clone(), *backend, result)
             })
-            .collect(),
-        b => files
-            .iter()
-            .map(|f| (f.clone(), Some(b.as_str())))
-            .collect(),
+            .collect::<Vec<_>>()
+    };
+    let results = if let Some(jobs) = args.jobs {
+        ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("Error: failed to build test-runner thread pool: {e}");
+                std::process::exit(1);
+            })
+            .install(run_work)
+    } else {
+        run_work()
     };
 
-    println!();
-    println!("{CYAN}Running {} tests...{RESET}", work.len());
-    println!();
-
-    let results = work
-        .par_iter()
-        .filter_map(|(file, backend)| {
-            match run_test_file(&exe, file, Duration::from_millis(args.timeout_ms), *backend) {
-                Ok(res) => Some((file.clone(), res)),
-                Err(e) => Some((
-                    file.clone(),
-                    RunTestResult {
-                        result: TestResult::Fail {
-                            message: format!("Test runner error: {e}"),
-                        },
-                        mode: Mode::Check,
-                        backend: None,
-                        duration: Duration::from_secs(0),
-                    },
-                )),
-            }
-        })
-        .collect::<Vec<_>>();
-
     let mut summary = Summary::default();
-    for (file, result) in results {
-        summary.add(file, result, args.quiet);
-    }
-    summary.print_summary(start_time);
-    println!();
-}
-
-#[derive(Debug, Default)]
-struct Summary {
-    passed: usize,
-    failed: usize,
-    skipped: usize,
-    timed_out: usize,
-    helpers: usize,
-
-    failures: Vec<(PathBuf, String)>,
-    timeouts: Vec<PathBuf>,
-    skips: Vec<(PathBuf, String)>,
-}
-
-impl Summary {
-    fn add(&mut self, file: PathBuf, result: RunTestResult, quiet: bool) {
-        let RunTestResult {
+    for (file, scheduled_backend, result) in results {
+        summary.add(
+            file,
+            scheduled_backend,
             result,
-            mode,
-            backend,
-            duration,
-        } = result;
-
-        match result {
-            TestResult::Pass => {
-                self.passed += 1;
-                pass_msg(&file, quiet, mode, backend, duration);
-            }
-            TestResult::Fail { message } => {
-                self.failed += 1;
-                fail_msg(&file, quiet, mode, backend, duration);
-                self.failures.push((file, message));
-            }
-            TestResult::Timeout => {
-                self.timed_out += 1;
-                timeout_msg(&file, quiet, mode, backend, duration);
-                self.timeouts.push(file);
-            }
-            TestResult::Skip { message } => {
-                self.skipped += 1;
-                skip_msg(&file, quiet, mode, backend, duration);
-                self.skips.push((file, message));
-            }
-            TestResult::Helper => {
-                self.helpers += 1;
-                // silent, helper files are not logged
-            }
-        }
-    }
-
-    fn print_summary(&self, start_time: Instant) {
-        println!();
-        println!("{CYAN}Summary: {RESET}");
-        println!();
-
-        if self.skipped > 0 {
-            println!("* {}Skipped:{} {}", YELLOW, RESET, self.skipped);
-            self.skips.iter().for_each(|(f, m)| {
-                println!("{YELLOW}  - {}:{RESET}", f.display());
-                tab_print(4, m, false);
-            });
-            println!();
-        }
-
-        if self.timed_out > 0 {
-            eprintln!("* {}Timed out:{} {}", BLUE, RESET, self.timed_out);
-            self.timeouts
-                .iter()
-                .for_each(|f| eprintln!("{BLUE}  - {}{RESET}", f.display()));
-            println!();
-        }
-
-        if self.failed > 0 {
-            eprintln!("* {}Failed:{} {}", RED, RESET, self.failed);
-            self.failures.iter().for_each(|(f, m)| {
-                println!();
-                eprintln!("{RED}  - {}:{RESET}", f.display());
-                tab_print(4, m, true);
-            });
-            println!();
-        }
-
-        println!("* {GREEN}Passed:{RESET} {}", self.passed);
-        println!();
-        let result = format!(
-            "{GREEN}{}{RESET} passed; {RED}{}{RESET} failed; {BLUE}{}{RESET} timed out; {YELLOW}{}{RESET} skipped; {GREY}{}{RESET} helpers; finished in: {CYAN}{:.2}s{RESET}",
-            self.passed,
-            self.failed,
-            self.timed_out,
-            self.skipped,
-            self.helpers,
-            start_time.elapsed().as_secs_f64()
+            args.quiet || args.report_json,
         );
-        if self.failed > 0 || self.timed_out > 0 {
-            eprintln!("Test Result: {RED}FAILED{RESET}. -- {result}");
-        } else {
-            eprintln!("Test Result: {GREEN}OK{RESET}. -- {result}");
-        }
     }
-}
 
-fn mode_label(mode: Mode, backend: Option<&str>) -> String {
-    match backend {
-        Some(b) => format!("{mode}/{b}"),
-        None => format!("{mode}"),
+    if args.report_json {
+        summary.print_json(&args, start_time).unwrap_or_else(|e| {
+            eprintln!("Error: failed to serialize JSON report: {e}");
+            std::process::exit(1);
+        });
+    } else {
+        summary.print_summary(start_time);
+        println!();
     }
-}
-
-fn pass_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
-    if quiet {
-        return;
-    }
-    println!(
-        "{GREEN}[PASS]{RESET} {} {GREY}({} - {:.3}s){RESET}",
-        file.display(),
-        mode_label(mode, backend),
-        duration.as_secs_f32()
-    );
-}
-
-fn fail_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
-    if quiet {
-        return;
-    }
-    eprintln!(
-        "{RED}[FAIL]{RESET} {} {GREY}({} - {:.3}s){RESET}",
-        file.display(),
-        mode_label(mode, backend),
-        duration.as_secs_f32()
-    );
-}
-
-fn timeout_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
-    if quiet {
-        return;
-    }
-    eprintln!(
-        "{BLUE}[TIMEOUT]{RESET} {} {GREY}({} - {:.3}s){RESET}",
-        file.display(),
-        mode_label(mode, backend),
-        duration.as_secs_f32()
-    );
-}
-
-fn skip_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
-    if quiet {
-        return;
-    }
-    println!(
-        "{YELLOW}[SKIP]{RESET} {} {GREY}({} - {:.3}s){RESET}",
-        file.display(),
-        mode_label(mode, backend),
-        duration.as_secs_f32()
-    );
 }
 
 fn list_all_anv_files(root: &PathBuf) -> Vec<PathBuf> {
@@ -260,13 +124,41 @@ fn list_all_anv_files(root: &PathBuf) -> Vec<PathBuf> {
         .collect()
 }
 
-fn tab_print(spaces: usize, message: &str, is_error: bool) {
-    let message = message.replace("\\n", "\n");
-    for line in message.lines() {
-        if is_error {
-            eprintln!("{:>spaces$}| {line}", "");
-        } else {
-            println!("{:>spaces$}| {line}", "");
-        }
+fn expand_backend_work(
+    files: &[PathBuf],
+    backend: BackendArg,
+) -> Vec<(PathBuf, Option<&'static str>)> {
+    files
+        .iter()
+        .flat_map(|file| {
+            backend
+                .expand()
+                .iter()
+                .map(move |backend| (file.clone(), Some(*backend)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{BackendArg, expand_backend_work};
+
+    #[test]
+    fn both_backend_work_uses_vm_then_rust_per_file() {
+        let files = vec![PathBuf::from("a.anv"), PathBuf::from("b.anv")];
+
+        let work = expand_backend_work(&files, BackendArg::Both);
+
+        assert_eq!(
+            work,
+            vec![
+                (PathBuf::from("a.anv"), Some("vm")),
+                (PathBuf::from("a.anv"), Some("rust")),
+                (PathBuf::from("b.anv"), Some("vm")),
+                (PathBuf::from("b.anv"), Some("rust")),
+            ]
+        );
     }
 }

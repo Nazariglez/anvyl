@@ -1,4 +1,5 @@
-// @helper: helper module for private_struct_err test
+// @helper
+// helper module for private_struct_err test
 
 struct Secret {
     value: int,

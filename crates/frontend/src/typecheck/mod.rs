@@ -425,11 +425,6 @@ impl TypeChecker {
             .map(|info| self.solver.local_type_to_type(info.type_id))
     }
 
-    #[cfg(test)]
-    fn set_local_type(&mut self, id: LocalTypeId, ty: Type) {
-        self.solver.set_local_type_from_type(id, &ty);
-    }
-
     fn type_handle(&self, ty: &Type) -> TypeHandle {
         self.solver.concrete_type(ty)
     }

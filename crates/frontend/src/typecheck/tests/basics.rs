@@ -10,8 +10,18 @@ use crate::{
 mod storage {
     use crate::{
         ast::{Ident, Program, Type},
-        typecheck::{DeclarationIndex, TypeChecker},
+        typecheck::{DeclarationIndex, LocalTypeId, TypeChecker},
     };
+
+    trait TypeCheckerTestExt {
+        fn set_local_type(&mut self, id: LocalTypeId, ty: Type);
+    }
+
+    impl TypeCheckerTestExt for TypeChecker {
+        fn set_local_type(&mut self, id: LocalTypeId, ty: Type) {
+            self.solver.set_local_type_from_type(id, &ty);
+        }
+    }
 
     #[test]
     fn local_type_cell_update() {

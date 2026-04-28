@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use super::{const_term::ConstTerm, decls::CallableId, type_ops::TypeFolder};
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ExprId, GenericArg, Type,
-        TypeParam, TypeVarId,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, ExprId, GenericArg, Type, TypeParam,
+        TypeVarId,
     },
     span::Span,
 };
@@ -293,7 +293,7 @@ pub(crate) fn substitute(ty: &Type, ts: &TypeSubst, cs: &ConstSubst) -> Type {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{FuncParam, Ident, NominalKind};
+    use crate::ast::{ConstValue, FuncParam, Ident, NominalKind};
 
     fn tv(id: u32) -> TypeVarId {
         TypeVarId(id)

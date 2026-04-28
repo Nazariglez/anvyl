@@ -1,6 +1,6 @@
 // @mode: run
 // @expect: success
-// @match-begin:
+// @match-begin
 // 42
 // 0 
 // @match-end

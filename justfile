@@ -7,6 +7,9 @@ check target:
 tests target="tests":
     cargo run --package test-runner -- {{target}} --quiet
 
+frontend-tests target="tests/syntax":
+    cargo run --package test-runner -- {{target}} --driver frontend --quiet
+
 full-tests target="tests":
     cargo test -q --workspace
     cargo run --package test-runner -- {{target}} --quiet
