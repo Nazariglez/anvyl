@@ -1,5 +1,5 @@
 use super::{
-    ConstSubst, GenericArgs, GenericParams, TypeChecker, TypeError, TypeSubst,
+    ConstSubst, GenericArgs, GenericParams, MemberAccessKind, TypeChecker, TypeError, TypeSubst,
     call_map::CallTarget,
     check_expr, check_expr_checked_with_hint,
     decls::{
@@ -21,9 +21,10 @@ pub(super) enum Subject {
     Module(ModuleScope),
     Type(NominalKey),
     Callable {
-        callee: CallableRef,
+        callee: Box<CallableRef>,
         surface_ty: Type,
     },
+    Error,
 }
 
 pub(super) enum PostfixStep<'a> {
@@ -88,7 +89,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
             if let Some(scope) = tc.lookup_module_alias(*name) {
                 return Some(Subject::Module(scope));
             }
-            if let Some(key) = tc.lookup_type_name(*name) {
+            if let Some(key) = tc.resolve_visible_type_key(None, *name) {
                 return Some(Subject::Type(key));
             }
             None
@@ -129,7 +130,11 @@ pub(super) fn check_postfix_chain(
                 let call_expected = is_last_step.then(|| expected.cloned()).flatten();
                 let ty = apply_call(&subject, node, *id, call_expected, tc);
                 tc.set_type(*id, ty.clone(), node.span);
-                Subject::Value(ty)
+                if matches!(subject, Subject::Error) {
+                    Subject::Error
+                } else {
+                    Subject::Value(ty)
+                }
             }
         };
     }
@@ -164,6 +169,7 @@ fn subject_type(subject: &Subject) -> Type {
         | Subject::Callable { surface_ty: ty, .. } => ty.clone(),
         Subject::Module(_) => Type::Void,
         Subject::Type(key) => nominal_type(key),
+        Subject::Error => Type::Infer,
     }
 }
 
@@ -173,30 +179,37 @@ fn apply_field(
     next_is_call: bool,
     tc: &mut TypeChecker,
 ) -> Subject {
+    let kind = if next_is_call {
+        MemberAccessKind::Method
+    } else {
+        MemberAccessKind::Field
+    };
+
     match subject {
-        Subject::Value(ty) => {
-            apply_value_field(ty.clone(), field.node.field, field.span, next_is_call, tc)
-        }
+        Subject::Value(ty) => apply_value_field(ty.clone(), field.node.field, field.span, kind, tc),
         Subject::Module(scope) => apply_module_field(scope, field.node.field, field.span, tc),
-        Subject::Type(key) => apply_type_field(key, field.node.field, field.span, tc),
+        Subject::Type(key) => apply_type_field(key, field.node.field, field.span, kind, tc),
         Subject::NonAggregate(_) | Subject::Callable { .. } => {
-            field_access_on_non_aggregate(subject, field.node.field, field.span, tc)
+            field_access_on_non_aggregate(subject, field.node.field, kind, field.span, tc)
         }
+        Subject::Error => Subject::Error,
     }
 }
 
 fn field_access_on_non_aggregate(
     subject: &Subject,
-    field: Ident,
+    member: Ident,
+    kind: MemberAccessKind,
     span: Span,
     tc: &mut TypeChecker,
 ) -> Subject {
-    tc.push_error(TypeError::FieldAccessOnNonAggregate {
+    tc.push_error(TypeError::MemberAccessOnNonAggregate {
         ty: subject_type(subject),
-        field,
+        member,
+        kind,
         span,
     });
-    Subject::Value(Type::Infer)
+    Subject::Error
 }
 
 fn aggregate_method_subject(
@@ -223,7 +236,7 @@ fn named_value_subject(
     };
     match decls.callable_for_value(&resolved) {
         Some(callee) => Subject::Callable {
-            callee,
+            callee: Box::new(callee),
             surface_ty: value.ty().clone(),
         },
         None => Subject::Value(value.ty().clone()),
@@ -251,7 +264,7 @@ fn enum_variant_subject(
 ) -> Subject {
     match decls.callable_for_variant(enum_key, variant, schema) {
         Some(callee) => Subject::Callable {
-            callee,
+            callee: Box::new(callee),
             surface_ty: nominal_type(enum_key),
         },
         None => Subject::NonAggregate(nominal_type(enum_key)),
@@ -260,7 +273,10 @@ fn enum_variant_subject(
 
 fn func_callable_subject(callee: CallableRef) -> Subject {
     let surface_ty = func_type(&callee.def.sig.params, &callee.def.sig.ret);
-    Subject::Callable { callee, surface_ty }
+    Subject::Callable {
+        callee: Box::new(callee),
+        surface_ty,
+    }
 }
 
 fn unknown_enum_variant(
@@ -274,21 +290,21 @@ fn unknown_enum_variant(
         variant,
         span,
     });
-    Subject::Value(Type::Infer)
+    Subject::Error
 }
 
 fn apply_value_field(
     receiver: Type,
     name: Ident,
     span: Span,
-    next_is_call: bool,
+    kind: MemberAccessKind,
     tc: &mut TypeChecker,
 ) -> Subject {
     let key = tc.decls.key_for_type(&receiver);
 
     if let Some(key) = key.as_ref()
         && let Some(agg) = tc.decls.aggregate(key)
-        && let Some(subject) = aggregate_field_subject(agg, &receiver, name, next_is_call, tc)
+        && let Some(subject) = aggregate_field_subject(agg, &receiver, name, kind, tc)
     {
         return subject;
     }
@@ -298,7 +314,7 @@ fn apply_value_field(
             Ok(subject) => subject,
             Err(ExtendMethodError::Unbound(names)) => {
                 tc.push_unbound_generic_errors(names, span);
-                Subject::Value(Type::Infer)
+                Subject::Error
             }
             Err(ExtendMethodError::Ambiguous { receiver, name }) => {
                 tc.push_error(TypeError::AmbiguousExtendMethod {
@@ -306,14 +322,15 @@ fn apply_value_field(
                     name,
                     span,
                 });
-                Subject::Value(Type::Infer)
+                Subject::Error
             }
         };
     }
 
-    match key {
-        Some(_) => unknown_field(receiver, name, span, tc),
-        None => non_aggregate_field(receiver, name, span, tc),
+    if key.is_some() {
+        unknown_member(receiver, name, kind, span, tc)
+    } else {
+        non_aggregate_member(receiver, name, kind, span, tc)
     }
 }
 
@@ -321,21 +338,35 @@ fn aggregate_field_subject(
     agg: &AggregateSchema,
     receiver: &Type,
     name: Ident,
-    prefer_method: bool,
+    kind: MemberAccessKind,
     tc: &TypeChecker,
 ) -> Option<Subject> {
-    let field_ty = tc.decls.aggregate_field_type(receiver, name);
-    let method = agg.methods.get(&name);
-    match (prefer_method, method, field_ty) {
-        (true, Some(method), _) | (false, Some(method), None) => Some(aggregate_method_subject(
-            &tc.decls,
-            agg,
-            Some(receiver.clone()),
-            name,
-            method,
-        )),
-        (_, _, Some(field_ty)) => Some(Subject::Value(field_ty)),
-        _ => None,
+    match kind {
+        MemberAccessKind::Field => tc
+            .decls
+            .aggregate_field_type(receiver, name)
+            .map(Subject::Value)
+            .or_else(|| {
+                let method = agg.methods.get(&name)?;
+                Some(aggregate_method_subject(
+                    &tc.decls,
+                    agg,
+                    Some(receiver.clone()),
+                    name,
+                    method,
+                ))
+            }),
+        MemberAccessKind::Method => {
+            let method = agg.methods.get(&name)?;
+            method.receiver?;
+            Some(aggregate_method_subject(
+                &tc.decls,
+                agg,
+                Some(receiver.clone()),
+                name,
+                method,
+            ))
+        }
     }
 }
 
@@ -387,10 +418,16 @@ fn apply_module_field(
         name,
         span,
     });
-    Subject::Value(Type::Infer)
+    Subject::Error
 }
 
-fn apply_type_field(key: &NominalKey, name: Ident, span: Span, tc: &mut TypeChecker) -> Subject {
+fn apply_type_field(
+    key: &NominalKey,
+    name: Ident,
+    span: Span,
+    kind: MemberAccessKind,
+    tc: &mut TypeChecker,
+) -> Subject {
     if let Some(schema) = tc.decls.enum_schema(key) {
         if let Some(variant) = schema.variants.get(&name) {
             return enum_variant_subject(&tc.decls, &schema.key, name, variant);
@@ -405,13 +442,13 @@ fn apply_type_field(key: &NominalKey, name: Ident, span: Span, tc: &mut TypeChec
         return unknown_enum_variant(key, name, span, tc);
     }
     let Some(agg) = tc.decls.aggregate(key) else {
-        return unknown_field(nominal_type(key), name, span, tc);
+        return unknown_member(nominal_type(key), name, kind, span, tc);
     };
     let Some(method) = agg.methods.get(&name) else {
-        return unknown_field(nominal_type(key), name, span, tc);
+        return unknown_member(nominal_type(key), name, kind, span, tc);
     };
     if method.receiver.is_some() {
-        return unknown_field(nominal_type(key), name, span, tc);
+        return unknown_member(nominal_type(key), name, kind, span, tc);
     }
     aggregate_method_subject(&tc.decls, agg, None, name, method)
 }
@@ -430,6 +467,12 @@ fn apply_call(
         Subject::Value(ty) => call_value(ty.clone(), call, tc),
         Subject::NonAggregate(_) | Subject::Module(_) | Subject::Type(_) => {
             not_callable(subject_type(subject), call, tc)
+        }
+        Subject::Error => {
+            for arg in &call.node.args {
+                check_expr(arg, tc);
+            }
+            Type::Infer
         }
     }
 }
@@ -739,14 +782,36 @@ fn func_type(params: &[FuncParam], ret: &Type) -> Type {
     }
 }
 
-fn non_aggregate_field(ty: Type, field: Ident, span: Span, tc: &mut TypeChecker) -> Subject {
-    tc.push_error(TypeError::FieldAccessOnNonAggregate { ty, field, span });
-    Subject::Value(Type::Infer)
+fn non_aggregate_member(
+    ty: Type,
+    member: Ident,
+    kind: MemberAccessKind,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Subject {
+    tc.push_error(TypeError::MemberAccessOnNonAggregate {
+        ty,
+        member,
+        kind,
+        span,
+    });
+    Subject::Error
 }
 
-fn unknown_field(ty: Type, field: Ident, span: Span, tc: &mut TypeChecker) -> Subject {
-    tc.push_error(TypeError::UnknownField { ty, field, span });
-    Subject::Value(Type::Infer)
+fn unknown_member(
+    ty: Type,
+    member: Ident,
+    kind: MemberAccessKind,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Subject {
+    tc.push_error(TypeError::UnknownMember {
+        ty,
+        member,
+        kind,
+        span,
+    });
+    Subject::Error
 }
 
 pub(super) fn check_args(

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: already declared
+
+import lib { dup };
+
+fn main() {
+    dup();
+}

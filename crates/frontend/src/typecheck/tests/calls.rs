@@ -1,6 +1,6 @@
 use super::support::{
-    assert_calls, assert_calls_with_modules, assert_err_count, assert_no_infer_vars_in_result,
-    assert_single_error, assert_type, assert_type_with_modules, typecheck, typecheck_with_modules,
+    assert_calls, assert_calls_with_modules, assert_err_count, assert_single_error, assert_ty,
+    assert_ty_mods, assert_typecheck_closed, check, check_mods,
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
@@ -22,15 +22,22 @@ fn option_type(inner: Type) -> Type {
 
 #[test]
 fn direct_call_typechecks() {
-    assert_type(
+    assert_ty(
         "fn foo() -> int { 0 } fn main() -> int { foo() }",
         Type::Int,
     );
 }
 
 #[test]
+fn non_callable_call() {
+    assert_single_error("fn main() { 1(); }", |err| {
+        matches!(err, TypeError::NotCallable { ty: Type::Int, .. })
+    });
+}
+
+#[test]
 fn builtin_calls_typecheck() {
-    typecheck(
+    check(
         r#"
         fn main() {
             println("ok");
@@ -44,8 +51,8 @@ fn builtin_calls_typecheck() {
 }
 
 #[test]
-fn builtin_calls_typecheck_in_named_modules() {
-    typecheck_with_modules(
+fn builtin_calls_in_named_modules() {
+    check_mods(
         "import gamekit { run }; fn main() { run(); }",
         "pub fn run() { println(1); }",
     )
@@ -59,7 +66,7 @@ fn direct_call_target() {
 
 #[test]
 fn generic_fn_inferred() {
-    assert_type(
+    assert_ty(
         "fn id<T>(x: T) -> T { x } fn main() -> int { id(1) }",
         Type::Int,
     );
@@ -67,7 +74,7 @@ fn generic_fn_inferred() {
 
 #[test]
 fn generic_fn_explicit() {
-    assert_type(
+    assert_ty(
         "fn id<T>(x: T) -> T { x } fn main() -> string { id<string>(\"ok\") }",
         Type::String,
     );
@@ -75,7 +82,7 @@ fn generic_fn_explicit() {
 
 #[test]
 fn generic_fn_call_target() {
-    let result = typecheck("fn id<T>(x: T) -> T { x } fn main() { id(1); }").unwrap();
+    let result = check("fn id<T>(x: T) -> T { x } fn main() { id(1); }").unwrap();
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
@@ -90,8 +97,8 @@ fn generic_fn_call_target() {
 }
 
 #[test]
-fn generic_fn_explicit_prefix_call_target_includes_inferred_suffix() {
-    let result = typecheck(
+fn explicit_prefix_call_target() {
+    let result = check(
         "enum Option<T> { Some(T), None } fn make<T, U>(x: T) -> Option<U> { nil } fn main() -> Option<string> { make<int>(1) }",
     )
     .unwrap();
@@ -110,20 +117,20 @@ fn generic_fn_explicit_prefix_call_target_includes_inferred_suffix() {
 
 #[test]
 fn generic_fn_repeated_param_conflict() {
-    let result = typecheck("fn same<T>(a: T, b: T) -> T { a } fn main() { same(1, true); }");
+    let result = check("fn same<T>(a: T, b: T) -> T { a } fn main() { same(1, true); }");
     assert!(result.is_err(), "expected repeated type param conflict");
 }
 
 #[test]
 fn generic_fn_body_err() {
-    let result = typecheck(
+    let result = check(
         "fn mul2(x: int) -> int { x * 2 } fn duplicate<T>(x: T) -> T { mul2(x) } fn main() { duplicate<string>(\"x\"); }",
     );
     assert!(result.is_err(), "expected specialized body error");
 }
 
 #[test]
-fn generic_fn_too_many_explicit_args_err() {
+fn too_many_explicit_args_err() {
     assert_single_error(
         "fn id<T>(x: T) -> T { x } fn main() { id<int, string>(1); }",
         |err| {
@@ -139,7 +146,7 @@ fn generic_fn_too_many_explicit_args_err() {
 }
 
 #[test]
-fn generic_fn_const_arg_in_type_slot_err() {
+fn const_arg_in_type_slot_err() {
     assert_single_error("fn id<T>(x: T) -> T { x } fn main() { id<3>(1); }", |err| {
         matches!(
             err,
@@ -153,7 +160,7 @@ fn generic_fn_const_arg_in_type_slot_err() {
 
 #[test]
 fn explicit_optional_nil() {
-    assert_type(
+    assert_ty(
         "fn id<T>(x: T) -> T { x } fn main() { let x = id<int?>(nil); x; }",
         Type::option_of(Type::Int),
     );
@@ -174,7 +181,7 @@ fn arg_conflict_mismatch() {
 
 #[test]
 fn expected_nil_arg() {
-    assert_type(
+    assert_ty(
         "fn id<T>(x: T) -> T { x } fn main() { let x: int? = id(nil); x; }",
         Type::option_of(Type::Int),
     );
@@ -182,7 +189,7 @@ fn expected_nil_arg() {
 
 #[test]
 fn expected_binding() {
-    assert_type(
+    assert_ty(
         "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() { let x: Option<int> = none(); x; }",
         option_type(Type::Int),
     );
@@ -190,7 +197,7 @@ fn expected_binding() {
 
 #[test]
 fn expected_return() {
-    assert_type(
+    assert_ty(
         "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() -> Option<int> { none() }",
         option_type(Type::Int),
     );
@@ -198,11 +205,11 @@ fn expected_return() {
 
 #[test]
 fn expected_return_no_leak() {
-    let checked = typecheck(
+    let checked = check(
         "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() -> Option<int> { none() }",
     )
     .expect("typecheck failed");
-    assert_no_infer_vars_in_result(&checked);
+    assert_typecheck_closed(&checked);
 }
 
 #[test]
@@ -231,7 +238,7 @@ fn expected_explicit_mismatch() {
 
 #[test]
 fn generic_const_array_inference() {
-    assert_type(
+    assert_ty(
         "fn len<T, N: int>(xs: [T; N]) -> int { N } fn main(xs: [int; 3]) -> int { len(xs) }",
         Type::Int,
     );
@@ -240,8 +247,7 @@ fn generic_const_array_inference() {
 #[test]
 fn const_target() {
     let result =
-        typecheck("fn len<T, N: int>(xs: [T; N]) -> int { N } fn main() { len([1, 2, 3]); }")
-            .unwrap();
+        check("fn len<T, N: int>(xs: [T; N]) -> int { N } fn main() { len([1, 2, 3]); }").unwrap();
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
@@ -274,7 +280,7 @@ fn const_conflict() {
 
 #[test]
 fn generic_const_array_explicit_named() {
-    assert_type(
+    assert_ty(
         "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) -> int { len<int, CAP>(xs) }",
         Type::Int,
     );
@@ -282,7 +288,7 @@ fn generic_const_array_explicit_named() {
 
 #[test]
 fn generic_const_call_target() {
-    let result = typecheck(
+    let result = check(
         "fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, 3>(xs); }",
     )
     .unwrap();
@@ -301,7 +307,7 @@ fn generic_const_call_target() {
 
 #[test]
 fn generic_const_named_target() {
-    let result = typecheck(
+    let result = check(
         "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, CAP>(xs); }",
     )
     .unwrap();
@@ -319,7 +325,7 @@ fn generic_const_named_target() {
 }
 
 #[test]
-fn generic_const_non_bare_type_arg_err() {
+fn non_bare_const_arg_err() {
     assert_single_error(
         "fn take<T, N: int>(xs: [T; N]) {} fn main(xs: [int; 3]) { take<int, [int]>(xs); }",
         |err| {
@@ -344,14 +350,14 @@ fn generic_const_unknown_name_arg_err() {
 
 #[test]
 fn generic_const_arg_kind_mismatch() {
-    let result = typecheck(
+    let result = check(
         "fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<3, int>(xs); }",
     );
     assert!(result.is_err(), "expected generic arg kind mismatch");
 }
 
 #[test]
-fn explicit_generic_bool_used_as_array_len_err() {
+fn bool_const_arg_err() {
     assert_single_error(
         "fn take<N: int>(xs: [int; N]) {} fn main() { take<true>([]); }",
         |err| {
@@ -367,7 +373,7 @@ fn explicit_generic_bool_used_as_array_len_err() {
 }
 
 #[test]
-fn explicit_generic_negative_used_as_array_len_err() {
+fn negative_const_arg_err() {
     assert_single_error(
         "const NEG = -1; fn take<N: int>(xs: [int; N]) {} fn main() { take<NEG>([]); }",
         |err| matches!(err, TypeError::NegativeArrayLength { value: -1, .. }),
@@ -376,15 +382,15 @@ fn explicit_generic_negative_used_as_array_len_err() {
 
 #[test]
 fn generic_method_const_return() {
-    assert_type(
+    assert_ty(
         "struct Arrays { fn len<T, N: int>(xs: [T; N]) -> int { N } } fn main(xs: [int; 4]) -> int { Arrays.len<int, 4>(xs) }",
         Type::Int,
     );
 }
 
 #[test]
-fn generic_method_explicit_args_bind_method_generics_only() {
-    assert_type(
+fn method_args_bind_method_generics() {
+    assert_ty(
         "struct Box<T> { value: T, fn keep<U>(self, x: U) -> U { x } } fn main(b: Box<int>) -> string { b.keep<string>(\"ok\") }",
         Type::String,
     );
@@ -392,7 +398,7 @@ fn generic_method_explicit_args_bind_method_generics_only() {
 
 #[test]
 fn generic_method_named_const_arg() {
-    assert_type(
+    assert_ty(
         "const CAP = 3; struct Arrays { fn len<T, N: int>(xs: [T; N]) -> int { N } } fn main(xs: [int; 3]) -> int { Arrays.len<int, CAP>(xs) }",
         Type::Int,
     );
@@ -405,7 +411,7 @@ fn module_function_call() {
         import gamekit as gk;
         fn main() -> int { gk.init() }
     ";
-    assert_type_with_modules(root, dep, Type::Int);
+    assert_ty_mods(root, dep, Type::Int);
 }
 
 #[test]
@@ -425,7 +431,7 @@ fn module_function_wrong_arg() {
         import gamekit as gk;
         fn main() -> int { gk.init(true) }
     ";
-    let result = typecheck_with_modules(root, dep);
+    let result = check_mods(root, dep);
     assert!(result.is_err(), "expected error for wrong arg type");
 }
 
@@ -436,6 +442,6 @@ fn unknown_module_member() {
         import gamekit as gk;
         fn main() -> int { gk.unknown() }
     ";
-    let result = typecheck_with_modules(root, dep);
+    let result = check_mods(root, dep);
     assert!(result.is_err(), "expected error for unknown module member");
 }

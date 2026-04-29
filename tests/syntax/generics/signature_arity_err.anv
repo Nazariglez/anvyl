@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: wrong number of type parameters
+
+struct One<T> {
+    value: T,
+}
+
+fn f<U>(x: One<int, int>) {}
+
+fn main() {}

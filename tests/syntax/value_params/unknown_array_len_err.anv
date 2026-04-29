@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unknown constant
+
+struct Holder {
+    x: [int; Missing],
+}
+
+fn main() {}

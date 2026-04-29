@@ -1,6 +1,6 @@
 use super::{
-    ArityError, GenericArgs, GenericParams, TypeChecker, TypeError, bare_type_name,
-    const_term::ConstTerm, infer::GenericSolverSeeds,
+    ArityError, GenericArgs, GenericParams, TypeChecker, TypeError, const_term::ConstTerm,
+    infer::GenericSolverSeeds, type_ops::bare_type_name,
 };
 use crate::{
     ast::{ConstParamId, GenericArg, Type, TypeVarId},
@@ -30,22 +30,6 @@ pub(super) fn bind_exact_generic_args(
         generics,
         args,
         span,
-        ExplicitGenericMode::Exact,
-        &mut binder,
-    )?;
-    Some(materialize_exact(generics, &bindings))
-}
-
-pub(super) fn bind_exact_generic_args_no_diag(
-    generics: &GenericParams,
-    args: &[GenericArg],
-    resolve_type: impl FnMut(&Type) -> Type,
-) -> Option<GenericArgs> {
-    let mut binder = NoDiagGenericBinder { resolve_type };
-    let bindings = bind_explicit_generic_args(
-        generics,
-        args,
-        Span::new(0, 0),
         ExplicitGenericMode::Exact,
         &mut binder,
     )?;
@@ -189,34 +173,16 @@ impl ExplicitGenericBinder for TypeCheckerGenericBinder<'_> {
     }
 }
 
-struct NoDiagGenericBinder<F> {
-    resolve_type: F,
-}
-
-impl<F> ExplicitGenericBinder for NoDiagGenericBinder<F>
-where
-    F: FnMut(&Type) -> Type,
-{
-    fn resolve_type_arg(&mut self, ty: &Type, _: Span) -> Option<Type> {
-        Some((self.resolve_type)(ty))
-    }
-
-    fn eval_const_arg(&mut self, term: ConstTerm, _: Span) -> Option<ConstTerm> {
-        Some(term)
-    }
-
-    fn push_arity_error(&mut self, _: usize, _: usize, _: Span) {}
-
-    fn push_kind_error(&mut self, _: &'static str, _: Span) {}
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::{
         ast::{ConstArg, ConstParam, ConstValue, Ident, Program, TypeParam},
         lexer::tokenize,
         parser,
+        resolve::ResolveResult,
         typecheck::{DeclarationIndex, ModuleScope},
     };
 
@@ -278,7 +244,10 @@ mod tests {
 
     fn tc(source: &str) -> TypeChecker {
         let program = parse(source);
-        let decls = DeclarationIndex::from_root(&program);
+        let resolved = ResolveResult {
+            module_groups: vec![],
+        };
+        let decls = DeclarationIndex::from_root_and_modules(&program, &resolved, HashSet::new());
         let mut tc = TypeChecker::new(decls);
         tc.collect_const_decls(ModuleScope::Root, &program);
         tc.push_scope();
@@ -320,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_call_args_succeed_with_only_type_seed() {
+    fn prefix_type_seed() {
         let generics = generics(&[("T", 0), ("U", 1)], &[("N", 0)]);
         let (_, seeds) = bind_prefix("", &generics, &[type_arg(Type::Int)]);
         let seeds = seeds.expect("seeds");
@@ -331,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_call_args_succeed_with_type_and_const_seeds() {
+    fn prefix_type_const_seeds() {
         let generics = generics(&[("T", 0)], &[("N", 0)]);
         let (_, seeds) = bind_prefix("", &generics, &[type_arg(Type::Int), int_arg(4)]);
         let seeds = seeds.expect("seeds");
@@ -344,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn const_bare_name_fallback_succeeds_for_visible_const() {
+    fn visible_const_name() {
         let generics = generics(&[("T", 0)], &[("N", 0)]);
         let (_, args) = bind_exact(
             "const CAP = 4;",
@@ -362,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn const_bare_name_fallback_reports_unknown_const() {
+    fn unknown_const_name() {
         let generics = generics(&[("T", 0)], &[("N", 0)]);
         let (tc, args) = bind_exact(
             "",
@@ -382,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn const_passed_where_type_expected_fails() {
+    fn const_in_type_slot() {
         let generics = generics(&[("T", 0)], &[]);
         let (tc, args) = bind_exact("", &generics, &[int_arg(3)]);
 
@@ -395,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn non_bare_type_passed_where_const_expected_fails() {
+    fn non_bare_type_in_const_slot() {
         let generics = generics(&[("T", 0)], &[("N", 0)]);
         let list_int = Type::List {
             elem: Box::new(Type::Int),

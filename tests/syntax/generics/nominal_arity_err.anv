@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: wrong number of type parameters
+
+struct One<T> {
+    value: T,
+}
+
+struct Holder {
+    x: One<int, int>,
+}
+
+fn main() {}

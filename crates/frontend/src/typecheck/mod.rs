@@ -12,7 +12,8 @@ use self::{
         SolverRelationError, TypeHandle,
     },
     postfix::{check_postfix_chain, collect_postfix_chain},
-    type_ops::{TypeFolder, TypeVisitor},
+    type_ops::{TypeFolder, TypeVisitor, first_unresolved_type_ref, type_contains_unresolved_ref},
+    type_refs::{GenericParamError, GenericTypeContext},
 };
 use crate::{
     ast::*,
@@ -30,6 +31,7 @@ mod infer;
 mod postfix;
 mod result;
 mod type_ops;
+mod type_refs;
 
 #[cfg(test)]
 mod tests;
@@ -41,8 +43,15 @@ pub(crate) enum ConstDiagnostic {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberAccessKind {
+    Field,
+    Method,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TypeError {
+    Decl(DeclError),
     UndefinedVariable {
         name: Ident,
         span: Span,
@@ -61,6 +70,11 @@ pub(crate) enum TypeError {
         span: Span,
     },
     CannotInferType {
+        span: Span,
+    },
+    UnknownType {
+        qualifier: Option<Ident>,
+        name: Ident,
         span: Span,
     },
     CannotInferConst {
@@ -139,14 +153,16 @@ pub(crate) enum TypeError {
     UnreachableFalsePattern {
         span: Span,
     },
-    FieldAccessOnNonAggregate {
+    MemberAccessOnNonAggregate {
         ty: Type,
-        field: Ident,
+        member: Ident,
+        kind: MemberAccessKind,
         span: Span,
     },
-    UnknownField {
+    UnknownMember {
         ty: Type,
-        field: Ident,
+        member: Ident,
+        kind: MemberAccessKind,
         span: Span,
     },
     UndefinedModuleMember {
@@ -170,6 +186,11 @@ pub(crate) enum TypeError {
     InvalidStructLiteral {
         name: Ident,
         kind: String,
+        span: Span,
+    },
+    UnknownStructLiteral {
+        qualifier: Option<Ident>,
+        name: Ident,
         span: Span,
     },
     UnknownEnumVariant {
@@ -221,6 +242,10 @@ pub(crate) enum TypeError {
         expected: &'static str,
         span: Span,
     },
+    DuplicateGenericParam {
+        name: Ident,
+        span: Span,
+    },
 }
 
 impl From<SolverFinalizeError> for TypeError {
@@ -243,6 +268,7 @@ struct VarInfo {
 struct CallableTemplate {
     span: Span,
     receiver: Option<MethodReceiver>,
+    generics: GenericTypeContext,
     params: Vec<Param>,
     body: BlockNode,
 }
@@ -260,37 +286,10 @@ struct TypeChecker {
     module_programs: HashMap<ModuleScope, Rc<Program>>,
     type_substs: Vec<TypeSubst>,
     const_substs: Vec<ConstSubst>,
+    generic_contexts: Vec<GenericTypeContext>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
     specializations: HashMap<SpecializationKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
-}
-
-struct TypeRefResolver<'tc> {
-    tc: &'tc mut TypeChecker,
-}
-
-impl TypeFolder for TypeRefResolver<'_> {
-    fn fold_unresolved_nominal(
-        &mut self,
-        qualifier: Option<Ident>,
-        name: Ident,
-        generic_args: &[GenericArg],
-    ) -> Type {
-        let key = match qualifier {
-            Some(module_name) => self
-                .tc
-                .lookup_module_alias(module_name)
-                .and_then(|scope| self.tc.exported_type_in_module(&scope, name)),
-            None => self.tc.lookup_type_name(name),
-        };
-
-        match key {
-            Some(key) => self
-                .tc
-                .nominal_type_with_args(&key, generic_args, Span::new(0, 0)),
-            None => self.fold_unresolved_nominal_default(qualifier, name, generic_args),
-        }
-    }
 }
 
 struct ConstNormalizer<'tc> {
@@ -363,6 +362,7 @@ impl TypeChecker {
             module_programs: HashMap::new(),
             type_substs: vec![],
             const_substs: vec![],
+            generic_contexts: vec![],
             callable_templates: HashMap::new(),
             specializations: HashMap::new(),
             consts: HashMap::new(),
@@ -621,6 +621,45 @@ impl TypeChecker {
         self.const_substs.pop();
     }
 
+    fn generic_context(
+        &mut self,
+        type_params: &[TypeParam],
+        const_params: &[ConstParam],
+        span: Span,
+    ) -> GenericTypeContext {
+        match GenericTypeContext::try_from_params(type_params, const_params) {
+            Ok(generics) => generics,
+            Err(error) => {
+                self.push_error(generic_param_type_error(error, span));
+                GenericTypeContext::default()
+            }
+        }
+    }
+
+    fn extended_generic_context(
+        &mut self,
+        owner: &GenericTypeContext,
+        type_params: &[TypeParam],
+        const_params: &[ConstParam],
+        span: Span,
+    ) -> GenericTypeContext {
+        match owner.try_with_shadowing_params(type_params, const_params) {
+            Ok(generics) => generics,
+            Err(error) => {
+                self.push_error(generic_param_type_error(error, span));
+                owner.clone()
+            }
+        }
+    }
+
+    fn push_generic_context(&mut self, generics: GenericTypeContext) {
+        self.generic_contexts.push(generics);
+    }
+
+    fn pop_generic_context(&mut self) {
+        self.generic_contexts.pop();
+    }
+
     fn store_callable_template(&mut self, id: CallableId, template: CallableTemplate) {
         self.callable_templates.insert(id, template);
     }
@@ -686,20 +725,31 @@ impl TypeChecker {
             .map(Self::resolved_value)
     }
 
-    fn resolve_type_ref(&mut self, ty: &Type) -> Type {
-        TypeRefResolver { tc: self }.fold_type(ty)
+    fn resolve_type_for_tc(&mut self, ty: &Type) -> Type {
+        self.resolve_type_for_tc_at(ty, Span::new(0, 0))
     }
 
-    fn resolve_type_for_tc(&mut self, ty: &Type) -> Type {
-        let resolved = self.resolve_type_ref(ty);
+    fn resolve_type_for_tc_at(&mut self, ty: &Type, span: Span) -> Type {
+        let generics = self.generic_contexts.last().cloned().unwrap_or_default();
+        let finalized = match self
+            .decls
+            .finalize_type_ref(&self.current_module, &generics, ty)
+        {
+            Ok(ty) => ty,
+            Err(error) => {
+                self.push_error_once(type_ref_error(error, span));
+                return Type::Infer;
+            }
+        };
+        self.validate_nominal_uses(&finalized, span);
         let substituted = match self.type_substs.last().cloned() {
             Some(ts) => {
                 let cs = self.const_substs.last().cloned().unwrap_or_default();
-                self.substitute_checked(&resolved, &ts, &cs, Span::new(0, 0))
+                self.substitute_checked(&finalized, &ts, &cs, span)
             }
-            None => resolved,
+            None => finalized,
         };
-        self.normalize_type_consts(&substituted, Span::new(0, 0))
+        self.normalize_type_consts(&substituted, span)
     }
 
     fn normalize_type_consts(&mut self, ty: &Type, span: Span) -> Type {
@@ -722,23 +772,6 @@ impl TypeChecker {
         .fold_type(ty)
     }
 
-    fn normalize_const_term(&mut self, term: ConstTerm, span: Span) -> ConstTerm {
-        match term {
-            ConstTerm::Name(name) => match self.eval_visible_const(name, span) {
-                Some(Ok(value)) => ConstTerm::Value(value),
-                Some(Err(err)) => {
-                    self.push_error(err);
-                    ConstTerm::Name(name)
-                }
-                None => ConstTerm::Name(name),
-            },
-            ConstTerm::Value(_)
-            | ConstTerm::Param(_)
-            | ConstTerm::ArrayInfer
-            | ConstTerm::Infer(_) => term,
-        }
-    }
-
     fn eval_const_term(&mut self, term: ConstTerm, span: Span) -> Option<ConstTerm> {
         match term {
             ConstTerm::Value(_) => Some(term),
@@ -749,7 +782,7 @@ impl TypeChecker {
                     None
                 }
                 None => {
-                    self.push_error(TypeError::UnknownConst { name, span });
+                    self.push_error_once(TypeError::UnknownConst { name, span });
                     None
                 }
             },
@@ -801,7 +834,9 @@ impl TypeChecker {
     }
 
     fn normalize_const_arg(&mut self, arg: &ConstArg, span: Span) -> ConstArg {
-        let term = self.normalize_const_term(ConstTerm::from_arg(arg), span);
+        let Some(term) = self.eval_const_term(ConstTerm::from_arg(arg), span) else {
+            return arg.clone();
+        };
         term.to_arg_no_infer().unwrap_or_else(|| arg.clone())
     }
 
@@ -839,8 +874,13 @@ impl TypeChecker {
         self.decls.imported_module(&self.current_module, name)
     }
 
-    fn lookup_type_name(&self, name: Ident) -> Option<NominalKey> {
-        self.decls.visible_type(&self.current_module, name)
+    fn resolve_visible_type_key(
+        &self,
+        qualifier: Option<Ident>,
+        name: Ident,
+    ) -> Option<NominalKey> {
+        self.decls
+            .resolve_visible_type_key(&self.current_module, qualifier, name)
     }
 
     fn func_type_from_sig(&mut self, params: &[Param], ret: &Type) -> Type {
@@ -848,12 +888,12 @@ impl TypeChecker {
             .iter()
             .map(|p| {
                 FuncParam::new(
-                    self.resolve_type_for_tc(&p.ty),
+                    self.resolve_type_for_tc_at(&p.ty, Span::new(0, 0)),
                     matches!(p.mutability, Mutability::Mutable),
                 )
             })
             .collect();
-        let resolved_ret = Box::new(self.resolve_type_for_tc(ret));
+        let resolved_ret = Box::new(self.resolve_type_for_tc_at(ret, Span::new(0, 0)));
         Type::Func {
             params: resolved_params,
             ret: resolved_ret,
@@ -869,7 +909,9 @@ impl TypeChecker {
         let (types, finalize_errors) = self.solver.finalize_expr_types();
         let has_finalize_errors = self.push_finalize_errors(finalize_errors);
         if !has_finalize_errors {
-            self.push_result_infer_leaks(&types);
+            for error in self.result_closure_errors(&types) {
+                self.push_error_once(error);
+            }
         }
         if self.errors.is_empty() {
             Ok(TypecheckResult {
@@ -883,67 +925,216 @@ impl TypeChecker {
         }
     }
 
-    fn push_result_infer_leaks(&mut self, types: &HashMap<ExprId, (Span, Type)>) {
+    fn result_closure_errors(&self, types: &HashMap<ExprId, (Span, Type)>) -> Vec<TypeError> {
+        let mut errors = vec![];
         for (span, ty) in types.values() {
-            if type_contains_infer(ty) {
-                self.push_error_once(TypeError::CannotInferType { span: *span });
-            }
+            push_type_closure_error(&mut errors, ty, *span);
         }
+        for (id, target) in &self.calls {
+            let span = types
+                .get(id)
+                .map_or_else(|| Span::new(0, 0), |(span, _)| *span);
+            push_call_target_closure_error(&mut errors, target, span);
+        }
+        errors
     }
 
     fn nominal_generics(&self, key: &NominalKey) -> Option<GenericParams> {
+        self.nominal_generics_in(&self.decls, key)
+    }
+
+    fn nominal_generics_in(
+        &self,
+        decls: &DeclarationIndex,
+        key: &NominalKey,
+    ) -> Option<GenericParams> {
         match key.kind {
-            NominalKind::Struct | NominalKind::DataRef => self
-                .decls
-                .aggregate(key)
-                .map(|schema| schema.generics.clone()),
-            NominalKind::Enum => self
-                .decls
-                .enum_schema(key)
-                .map(|schema| schema.generics.clone()),
+            NominalKind::Struct | NominalKind::DataRef => {
+                decls.aggregate(key).map(|schema| schema.generics.clone())
+            }
+            NominalKind::Enum => decls.enum_schema(key).map(|schema| schema.generics.clone()),
             NominalKind::Extern => Some(GenericParams::default()),
         }
     }
 
-    fn nominal_type_with_args(
+    fn validate_nominal_uses(&mut self, ty: &Type, span: Span) {
+        match ty {
+            Type::Nominal(nominal) => {
+                for arg in &nominal.type_args {
+                    self.validate_nominal_uses(arg, span);
+                }
+                let Some(key) = self.decls.key_for_type(ty) else {
+                    return;
+                };
+                let Some(generics) = self.nominal_generics(&key) else {
+                    return;
+                };
+                let args = GenericArgs {
+                    type_args: nominal.type_args.clone(),
+                    const_args: nominal.const_args.iter().map(ConstTerm::from_arg).collect(),
+                };
+                let decls = self.decls.clone();
+                self.validate_nominal_args(&decls, &key, &generics, &args, span);
+            }
+            Type::Func { params, ret } => {
+                for param in params {
+                    self.validate_nominal_uses(&param.ty, span);
+                }
+                self.validate_nominal_uses(ret, span);
+            }
+            Type::Tuple(elems) => {
+                for elem in elems {
+                    self.validate_nominal_uses(elem, span);
+                }
+            }
+            Type::NamedTuple(fields) => {
+                for (_, field) in fields {
+                    self.validate_nominal_uses(field, span);
+                }
+            }
+            Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
+                self.validate_nominal_uses(elem, span);
+            }
+            Type::Map { key, value } => {
+                self.validate_nominal_uses(key, span);
+                self.validate_nominal_uses(value, span);
+            }
+            Type::Infer
+            | Type::Any
+            | Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Var(_)
+            | Type::UnresolvedName(_)
+            | Type::UnresolvedNominal { .. } => {}
+        }
+    }
+
+    fn finalize_declarations(&mut self) {
+        let saved_module = self.current_module.clone();
+        let mut decls = std::mem::take(&mut self.decls);
+        let lookup = decls.clone();
+        let generic_errors = decls.map_canonical_type_uses(|site, ty| {
+            self.current_module = site.module.clone();
+            let span = site.span;
+            let ty = self.finalize_decl_type(&lookup, site, ty);
+            let ty = self.normalize_type_consts(&ty, span);
+            self.validate_nominal_uses_in(&lookup, &ty, span);
+            ty
+        });
+        for error in generic_errors {
+            self.push_error(generic_param_decl_type_error(error));
+        }
+        self.current_module = saved_module;
+        self.decls = decls;
+    }
+
+    fn finalize_decl_type(
         &mut self,
-        key: &NominalKey,
-        generic_args: &[GenericArg],
-        span: Span,
+        decls: &DeclarationIndex,
+        site: DeclTypeSite,
+        ty: Type,
     ) -> Type {
-        let Some(generics) = self.nominal_generics(key) else {
-            return nominal_type(key);
-        };
-        let Some(args) = bind_exact_generic_args(self, &generics, generic_args, span) else {
-            return Type::Infer;
-        };
-        self.validate_nominal_args(key, &generics, &args, span);
-        let const_args = ConstTerm::to_args_no_infer(&args.const_args)
-            .expect("explicit nominal binder must not produce inference const terms");
-        nominal_type_with_args(key, &args.type_args, &const_args)
+        match decls.finalize_type_ref(&site.module, &site.generics, &ty) {
+            Ok(ty) => ty,
+            Err(TypeRefError::Unknown { qualifier, name }) => {
+                self.push_error(TypeError::Decl(DeclError::UnknownType {
+                    module: site.module,
+                    qualifier,
+                    name,
+                    span: site.span,
+                }));
+                Type::Infer
+            }
+            Err(error) => {
+                self.push_error(type_ref_error(error, site.span));
+                Type::Infer
+            }
+        }
+    }
+
+    fn validate_nominal_uses_in(&mut self, decls: &DeclarationIndex, ty: &Type, span: Span) {
+        match ty {
+            Type::Nominal(nominal) => {
+                for arg in &nominal.type_args {
+                    self.validate_nominal_uses_in(decls, arg, span);
+                }
+                let Some(key) = decls.key_for_type(ty) else {
+                    return;
+                };
+                let Some(generics) = self.nominal_generics_in(decls, &key) else {
+                    return;
+                };
+                let args = GenericArgs {
+                    type_args: nominal.type_args.clone(),
+                    const_args: nominal.const_args.iter().map(ConstTerm::from_arg).collect(),
+                };
+                self.validate_nominal_args(decls, &key, &generics, &args, span);
+            }
+            Type::Func { params, ret } => {
+                for param in params {
+                    self.validate_nominal_uses_in(decls, &param.ty, span);
+                }
+                self.validate_nominal_uses_in(decls, ret, span);
+            }
+            Type::Tuple(elems) => {
+                for elem in elems {
+                    self.validate_nominal_uses_in(decls, elem, span);
+                }
+            }
+            Type::NamedTuple(fields) => {
+                for (_, field) in fields {
+                    self.validate_nominal_uses_in(decls, field, span);
+                }
+            }
+            Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
+                self.validate_nominal_uses_in(decls, elem, span);
+            }
+            Type::Map { key, value } => {
+                self.validate_nominal_uses_in(decls, key, span);
+                self.validate_nominal_uses_in(decls, value, span);
+            }
+            Type::Infer
+            | Type::Any
+            | Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Var(_)
+            | Type::UnresolvedName(_)
+            | Type::UnresolvedNominal { .. } => {}
+        }
     }
 
     fn validate_nominal_args(
         &mut self,
+        decls: &DeclarationIndex,
         key: &NominalKey,
         generics: &GenericParams,
         args: &GenericArgs,
         span: Span,
     ) {
+        let error_count = self.errors.len();
+        for term in &args.const_args {
+            self.require_usize_const(term.clone(), span);
+        }
+        if self.errors.len() != error_count {
+            return;
+        }
         let (type_subst, const_subst) = generics.substitutions(args);
         match key.kind {
             NominalKind::Struct | NominalKind::DataRef => {
-                if let Some(schema) = self.decls.aggregate(key).cloned() {
+                if let Some(schema) = decls.aggregate(key).cloned() {
                     for field in schema.fields.values() {
                         self.substitute_checked(&field.ty, &type_subst, &const_subst, span);
                     }
                 }
             }
             NominalKind::Enum => {
-                if let Some(variants) = self
-                    .decls
-                    .enum_schema(key)
-                    .map(|schema| schema.variants.clone())
+                if let Some(variants) = decls.enum_schema(key).map(|schema| schema.variants.clone())
                 {
                     for variant in variants.values() {
                         match variant {
@@ -978,6 +1169,9 @@ pub(crate) fn check_with_modules(
     always_active_modules: HashSet<ModuleScope>,
 ) -> Result<TypecheckResult, Vec<TypeError>> {
     let decls = DeclarationIndex::from_root_and_modules(program, resolved, always_active_modules);
+    if decls.has_errors() {
+        return Err(decl_errors(decls.errors()));
+    }
     let mut tc = TypeChecker::new(decls);
     tc.collect_const_decls(ModuleScope::Root, program);
     collect_callable_templates(ModuleScope::Root, program, &mut tc);
@@ -995,25 +1189,51 @@ pub(crate) fn check_with_modules(
         }
     }
 
+    tc.eval_module_consts(&ModuleScope::Root);
+    tc.finalize_declarations();
+    if !tc.errors.is_empty() {
+        return Err(tc.errors);
+    }
     push_source_scope(&mut tc);
     register_declarations(program, &mut tc);
-    tc.eval_module_consts(&ModuleScope::Root);
     check_stmts(&program.stmts, &mut tc);
     tc.pop_scope();
     tc.into_result()
 }
 
-pub(crate) fn check(program: &Program) -> Result<TypecheckResult, Vec<TypeError>> {
-    let decls = DeclarationIndex::from_root(program);
-    let mut tc = TypeChecker::new(decls);
-    tc.collect_const_decls(ModuleScope::Root, program);
-    collect_callable_templates(ModuleScope::Root, program, &mut tc);
-    push_source_scope(&mut tc);
-    register_declarations(program, &mut tc);
-    tc.eval_module_consts(&ModuleScope::Root);
-    check_stmts(&program.stmts, &mut tc);
-    tc.pop_scope();
-    tc.into_result()
+fn decl_errors(errors: &[DeclError]) -> Vec<TypeError> {
+    errors.iter().cloned().map(TypeError::Decl).collect()
+}
+
+fn generic_param_decl_type_error(error: GenericContextError) -> TypeError {
+    TypeError::Decl(DeclError::DuplicateGenericParam {
+        module: error.module,
+        name: error.error.name(),
+        span: error.span,
+    })
+}
+
+fn generic_param_type_error(error: GenericParamError, span: Span) -> TypeError {
+    TypeError::DuplicateGenericParam {
+        name: error.name(),
+        span,
+    }
+}
+
+fn type_ref_error(error: TypeRefError, span: Span) -> TypeError {
+    match error {
+        TypeRefError::Unknown { qualifier, name } => TypeError::UnknownType {
+            qualifier,
+            name,
+            span,
+        },
+        TypeRefError::GenericArity { expected, found } => {
+            TypeError::GenericArity(ArityError::TypeArgs { expected, found })
+        }
+        TypeRefError::GenericArgKindMismatch { expected } => {
+            TypeError::GenericArgKindMismatch { expected, span }
+        }
+    }
 }
 
 fn is_generic(func: &Func) -> bool {
@@ -1030,11 +1250,14 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                 if !is_generic(func) {
                     continue;
                 }
+                let generics =
+                    tc.generic_context(&func.type_params, &func.const_params, func_node.span);
                 tc.store_callable_template(
                     CallableId::function(module.clone(), func.name),
                     CallableTemplate {
                         span: func_node.span,
                         receiver: None,
+                        generics,
                         params: func.params.clone(),
                         body: func.body.clone(),
                     },
@@ -1055,6 +1278,14 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                     if !aggregate_is_generic && !method_is_generic {
                         continue;
                     }
+                    let owner_generics =
+                        tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
+                    let generics = tc.extended_generic_context(
+                        &owner_generics,
+                        &method.type_params,
+                        &method.const_params,
+                        agg_node.span,
+                    );
                     tc.store_callable_template(
                         CallableId::aggregate_method(
                             owner.clone(),
@@ -1064,6 +1295,7 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                         CallableTemplate {
                             span: agg_node.span,
                             receiver: method.receiver,
+                            generics,
                             params: method.params.clone(),
                             body: method.body.clone(),
                         },
@@ -1089,11 +1321,17 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                         Mutability::Mutable => MethodReceiver::Var,
                         Mutability::Immutable => MethodReceiver::Value,
                     };
+                    let generics = tc.generic_context(
+                        &extend.type_params,
+                        &extend.const_params,
+                        extend_node.span,
+                    );
                     tc.store_callable_template(
                         CallableId::extend_method(extend_id.clone(), method.name),
                         CallableTemplate {
                             span: extend_node.span,
                             receiver: Some(receiver),
+                            generics,
                             params: params.to_vec(),
                             body: method.body.clone(),
                         },
@@ -1154,7 +1392,7 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
             Stmt::Const(const_node) => {
                 let c = &const_node.node;
                 let ty = match &c.ty {
-                    Some(t) => tc.resolve_type_for_tc(t),
+                    Some(t) => tc.resolve_type_for_tc_at(t, const_node.span),
                     None => Type::Infer,
                 };
                 tc.define(c.name, ty, false);
@@ -1252,7 +1490,7 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
         return;
     }
 
-    let self_ty = tc.resolve_type_for_tc(&extend.ty);
+    let self_ty = tc.resolve_type_for_tc_at(&extend.ty, extend_node.span);
     for method_node in &extend.methods {
         let method = &method_node.node;
         let Some((self_param, params)) = method.params.split_first() else {
@@ -1266,12 +1504,12 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
             .iter()
             .map(|param| {
                 FuncParam::new(
-                    tc.resolve_type_for_tc(&param.ty),
+                    tc.resolve_type_for_tc_at(&param.ty, method_node.span),
                     matches!(param.mutability, Mutability::Mutable),
                 )
             })
             .collect();
-        let ret_ty = tc.resolve_type_for_tc(&method.ret);
+        let ret_ty = tc.resolve_type_for_tc_at(&method.ret, method_node.span);
         check_func_body(
             Some((receiver, self_ty.clone())),
             params,
@@ -1375,7 +1613,7 @@ fn check_specialized_callable_body(
     };
     let receiver = template.receiver.zip(callee.receiver_ty.clone());
 
-    check_with_specialization(key, type_subst, const_subst, tc, |tc| {
+    check_with_specialization(key, type_subst, const_subst, template.generics, tc, |tc| {
         with_source_module_scope(&callee.def.id.module, tc, |tc| {
             check_func_body(
                 receiver,
@@ -1406,6 +1644,7 @@ fn check_with_specialization(
     key: SpecializationKey,
     type_subst: TypeSubst,
     const_subst: ConstSubst,
+    generics: GenericTypeContext,
     tc: &mut TypeChecker,
     check_body: impl FnOnce(&mut TypeChecker),
 ) {
@@ -1413,8 +1652,10 @@ fn check_with_specialization(
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
     tc.push_type_subst(type_subst);
     tc.push_const_subst(const_subst);
+    tc.push_generic_context(generics);
     check_body(tc);
     tc.solve_constraints();
+    tc.pop_generic_context();
     tc.pop_const_subst();
     tc.pop_type_subst();
     tc.store_specialization(
@@ -1569,7 +1810,7 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let mutable = matches!(binding.mutability, Mutability::Mutable);
     match &binding.ty {
         Some(annot) => {
-            let annot_ty = tc.resolve_type_for_tc(annot);
+            let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
             let value =
                 check_expr_checked_with_hint(&binding.value, Some(annot_handle.clone()), tc);
@@ -1595,7 +1836,7 @@ fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
     let value_ty = const_eval::const_type(&value);
     let ty = match &c.ty {
         Some(annot) => {
-            let annot_ty = tc.resolve_type_for_tc(annot);
+            let annot_ty = tc.resolve_type_for_tc_at(annot, const_node.span);
             if annot_ty != value_ty {
                 tc.push_error(TypeError::ConstTypeMismatch {
                     expected: annot_ty.clone(),
@@ -1794,8 +2035,10 @@ fn check_binary(bin: &BinaryNode, tc: &mut TypeChecker) -> Type {
             let r_str = right_ty.is_str();
             let l_stringable = left_ty.is_stringable();
             let r_stringable = right_ty.is_stringable();
-            let is_string_concat =
-                (l_str && r_str) || (l_str && r_stringable) || (r_str && l_stringable);
+            let string_pair = l_str && r_str;
+            let string_lhs = l_str && r_stringable;
+            let string_rhs = r_str && l_stringable;
+            let is_string_concat = string_pair || string_lhs || string_rhs;
             if is_string_concat {
                 return Type::String;
             }
@@ -2139,16 +2382,21 @@ impl NominalLiteralSolver {
             let args = bind_exact_generic_args(tc, generics, args, span)?;
             GenericSolverSeeds::from_args(generics, &args)
         };
-        Some(Self {
-            vars: tc.solver.generic_solver_vars(generics, &seeds, span),
-        })
+        Some(Self::from_seeds(generics, &seeds, span, tc))
     }
 
-    fn empty(generics: &GenericParams, span: Span, tc: &mut TypeChecker) -> Self {
+    fn without_args(generics: &GenericParams, span: Span, tc: &mut TypeChecker) -> Self {
+        Self::from_seeds(generics, &GenericSolverSeeds::default(), span, tc)
+    }
+
+    fn from_seeds(
+        generics: &GenericParams,
+        seeds: &GenericSolverSeeds,
+        span: Span,
+        tc: &mut TypeChecker,
+    ) -> Self {
         Self {
-            vars: tc
-                .solver
-                .generic_solver_vars(generics, &GenericSolverSeeds::default(), span),
+            vars: tc.solver.generic_solver_vars(generics, seeds, span),
         }
     }
 
@@ -2284,7 +2532,7 @@ fn check_inferred_enum_checked_with_hint(
         return checked_from_type(expr, Type::Infer, tc);
     };
 
-    let inf = NominalLiteralSolver::empty(&generics, node.span, tc);
+    let inf = NominalLiteralSolver::without_args(&generics, node.span, tc);
     if !inf.bind_expected(&key, &generics, Some(&expected_ty), node.span, tc) {
         check_inferred_enum_args_without_hint(&node.node.args, tc);
         return checked_from_type(expr, Type::Infer, tc);
@@ -2384,9 +2632,10 @@ fn check_nominal_fields(
                 failed |= tc.solve_constraints();
             }
             None => {
-                tc.push_error(TypeError::UnknownField {
+                tc.push_error(TypeError::UnknownMember {
                     ty: owner_ty.clone(),
-                    field: *name,
+                    member: *name,
+                    kind: MemberAccessKind::Field,
                     span: value.span,
                 });
                 check_expr_checked(value, tc);
@@ -2455,14 +2704,16 @@ fn nominal_literal_type(
     nominal_type_with_args(key, &type_args, &const_args)
 }
 
-fn resolve_struct_key(lit: &StructLiteralNode, tc: &TypeChecker) -> Option<NominalKey> {
-    match lit.node.qualifier {
-        Some(qualifier) => {
-            let scope = tc.lookup_module_alias(qualifier)?;
-            tc.exported_type_in_module(&scope, lit.node.name)
-        }
-        None => tc.lookup_type_name(lit.node.name),
+fn resolve_struct_key(lit: &StructLiteralNode, tc: &mut TypeChecker) -> Option<NominalKey> {
+    let key = tc.resolve_visible_type_key(lit.node.qualifier, lit.node.name);
+    if key.is_none() {
+        tc.push_error(TypeError::UnknownStructLiteral {
+            qualifier: lit.node.qualifier,
+            name: lit.node.name,
+            span: lit.span,
+        });
     }
+    key
 }
 
 fn check_assign(assign: &AssignNode, tc: &mut TypeChecker) {
@@ -2772,18 +3023,6 @@ fn check_match_checked_with_hint(
     }
 }
 
-pub(super) fn bare_type_name(ty: &Type) -> Option<Ident> {
-    match ty {
-        Type::UnresolvedName(name) => Some(*name),
-        Type::UnresolvedNominal {
-            qualifier: None,
-            name,
-            generic_args,
-        } if generic_args.is_empty() => Some(*name),
-        _ => None,
-    }
-}
-
 struct ContainsInfer;
 
 impl TypeVisitor for ContainsInfer {
@@ -2804,6 +3043,52 @@ pub(crate) fn call_target_contains_infer(target: &CallTarget) -> bool {
     match target {
         CallTarget::Callable { args, .. } => args.type_args.iter().any(type_contains_infer),
     }
+}
+
+pub(crate) fn call_target_contains_unresolved_ref(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Callable { args, .. } => {
+            args.type_args.iter().any(type_contains_unresolved_ref)
+        }
+    }
+}
+
+fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarget, span: Span) {
+    let const_infer = match target {
+        CallTarget::Callable { args, .. } => args.const_args.iter().any(const_term_contains_infer),
+    };
+    if !call_target_contains_infer(target)
+        && !call_target_contains_unresolved_ref(target)
+        && !const_infer
+    {
+        return;
+    }
+    match target {
+        CallTarget::Callable { args, .. } => {
+            for ty in &args.type_args {
+                push_type_closure_error(errors, ty, span);
+            }
+            if const_infer {
+                errors.push(TypeError::CannotInferConst { span });
+            }
+        }
+    }
+}
+
+fn push_type_closure_error(errors: &mut Vec<TypeError>, ty: &Type, span: Span) {
+    if let Some(unresolved) = first_unresolved_type_ref(ty) {
+        errors.push(TypeError::UnknownType {
+            qualifier: unresolved.qualifier,
+            name: unresolved.name,
+            span,
+        });
+    } else if type_contains_infer(ty) {
+        errors.push(TypeError::CannotInferType { span });
+    }
+}
+
+fn const_term_contains_infer(term: &ConstTerm) -> bool {
+    matches!(term, ConstTerm::ArrayInfer | ConstTerm::Infer(_))
 }
 
 fn last_expr_id(block: &BlockNode) -> Option<ExprId> {

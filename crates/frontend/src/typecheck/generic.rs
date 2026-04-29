@@ -52,10 +52,6 @@ pub(crate) struct GenericArgs {
 }
 
 impl GenericArgs {
-    pub(crate) fn empty() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.type_args.is_empty() && self.const_args.is_empty()
     }

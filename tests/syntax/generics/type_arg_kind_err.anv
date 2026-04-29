@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected type generic argument
+
+struct One<T> {
+    value: T,
+}
+
+struct Bad {
+    x: One<1>,
+}
+
+fn main() {}

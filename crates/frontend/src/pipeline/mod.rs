@@ -1,7 +1,14 @@
 // Lexer -> Parser -> Resolver -> Typechecker -> AIR lowering
 
+mod diagnostics;
 use std::collections::HashSet;
 
+pub use diagnostics::Diagnostic;
+
+use self::diagnostics::{
+    diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error, diagnose_type_error,
+    diagnose_unresolved_always_active_module,
+};
 use crate::{
     ast::Program,
     lexer, parser,
@@ -53,17 +60,17 @@ pub struct CheckOk;
 pub enum CheckError<E = std::convert::Infallible> {
     Lex {
         label: String,
-        messages: Vec<String>,
+        diagnostics: Vec<Diagnostic>,
     },
     Parse {
         label: String,
-        messages: Vec<String>,
+        diagnostics: Vec<Diagnostic>,
     },
     Resolve {
-        messages: Vec<String>,
+        diagnostics: Vec<Diagnostic>,
     },
     Type {
-        messages: Vec<String>,
+        diagnostics: Vec<Diagnostic>,
     },
     Source(Box<E>),
 }
@@ -94,10 +101,7 @@ pub fn check<L: SourceLoader>(
         Err(ResolveFailure::Fatal(error)) => return Err(error),
         Err(ResolveFailure::Resolve(errors)) => {
             return Err(CheckError::Resolve {
-                messages: errors
-                    .into_iter()
-                    .map(|error| format!("{error:?}"))
-                    .collect(),
+                diagnostics: errors.iter().map(diagnose_resolve_error).collect(),
             });
         }
     };
@@ -106,10 +110,7 @@ pub fn check<L: SourceLoader>(
 
     typecheck::check_with_modules(&root, &resolved, always_active_modules).map_err(|errors| {
         CheckError::Type {
-            messages: errors
-                .into_iter()
-                .map(|error| format!("{error:?}"))
-                .collect(),
+            diagnostics: errors.iter().map(diagnose_type_error).collect(),
         }
     })?;
 
@@ -144,28 +145,16 @@ fn validate_always_active_modules<E>(
         })
         .collect::<HashSet<_>>();
 
-    let missing = always_active_modules
+    let diagnostics = always_active_modules
         .iter()
         .filter(|module| !resolved_modules.contains(module))
-        .map(format_module_scope)
+        .map(diagnose_unresolved_always_active_module)
         .collect::<Vec<_>>();
 
-    if missing.is_empty() {
+    if diagnostics.is_empty() {
         Ok(())
     } else {
-        Err(CheckError::Resolve {
-            messages: missing
-                .into_iter()
-                .map(|module| format!("always-active module was not resolved: {module}"))
-                .collect(),
-        })
-    }
-}
-
-fn format_module_scope(module: &ModuleScope) -> String {
-    match module {
-        ModuleScope::Root => "<root>".to_string(),
-        ModuleScope::Named(path) => path.segments().join("."),
+        Err(CheckError::Resolve { diagnostics })
     }
 }
 
@@ -179,18 +168,12 @@ fn prepend_prelude<E>(program: &mut Program, prelude: &Source) -> Result<(), Che
 fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
     let tokens = lexer::tokenize(&source.code).map_err(|errors| CheckError::Lex {
         label: source.label.clone(),
-        messages: errors
-            .into_iter()
-            .map(|error| format!("{error:?}"))
-            .collect(),
+        diagnostics: errors.iter().map(diagnose_lex_error).collect(),
     })?;
 
     parser::parse_ast(&tokens).map_err(|errors| CheckError::Parse {
         label: source.label.clone(),
-        messages: errors
-            .into_iter()
-            .map(|error| format!("{error:?}"))
-            .collect(),
+        diagnostics: errors.iter().map(diagnose_parse_error).collect(),
     })
 }
 
@@ -237,7 +220,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        CheckError, ModuleInput, ProgramInput, Source, SourceLoadError, SourceLoader, check,
+        CheckError, Diagnostic, ModuleInput, ProgramInput, Source, SourceLoadError, SourceLoader,
+        check,
     };
     use crate::resolve::ModulePath;
 
@@ -312,28 +296,66 @@ mod tests {
         })
     }
 
+    fn diagnostic_messages(diagnostics: &[Diagnostic]) -> Vec<String> {
+        diagnostics.iter().map(ToString::to_string).collect()
+    }
+
+    fn assert_user_diagnostics(diagnostics: &[Diagnostic]) {
+        assert!(!diagnostics.is_empty());
+    }
+
     #[test]
-    fn classifies_lex_errors() {
+    fn renders_lex_errors_through_check() {
         let err = check_source("fn main() { \"unterminated }").unwrap_err();
-        assert!(matches!(err, CheckError::Lex { .. }));
+        let CheckError::Lex { diagnostics, .. } = err else {
+            panic!("expected lex error");
+        };
+        assert_user_diagnostics(&diagnostics);
     }
 
     #[test]
-    fn classifies_parse_errors() {
+    fn renders_parse_errors_through_check() {
         let err = check_source("fn main( {}").unwrap_err();
-        assert!(matches!(err, CheckError::Parse { .. }));
+        let CheckError::Parse { diagnostics, .. } = err else {
+            panic!("expected parse error");
+        };
+        assert_user_diagnostics(&diagnostics);
     }
 
     #[test]
-    fn classifies_resolve_errors() {
+    fn renders_resolve_errors_through_check() {
         let err = check_source("import missing as m; fn main() {} ").unwrap_err();
-        assert!(matches!(err, CheckError::Resolve { .. }));
+        let CheckError::Resolve { diagnostics } = err else {
+            panic!("expected resolve error");
+        };
+        assert!(diagnostics[0].message().contains("Cannot find module file"));
+        assert_user_diagnostics(&diagnostics);
     }
 
     #[test]
-    fn classifies_type_errors() {
+    fn renders_type_errors_through_check() {
         let err = check_source("fn main() { let x: int = true; } ").unwrap_err();
-        assert!(matches!(err, CheckError::Type { .. }));
+        let CheckError::Type { diagnostics } = err else {
+            panic!("expected type error");
+        };
+        assert_eq!(
+            diagnostics[0].message(),
+            "Mismatched types: expected 'int', found 'bool'"
+        );
+        assert_user_diagnostics(&diagnostics);
+    }
+
+    #[test]
+    fn missing_method_through_check_has_no_call_cascade() {
+        let err = check_source("fn main() { 1.foo(); }").unwrap_err();
+        let CheckError::Type { diagnostics } = err else {
+            panic!("expected type error");
+        };
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message(),
+            "Unknown method 'foo' for type 'int'"
+        );
     }
 
     #[test]
@@ -366,6 +388,26 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_always_active_module_is_resolve_error() {
+        let mut loader = TestLoader::default();
+        let err = check(ProgramInput {
+            main: source("fn main() {}", "main.anv"),
+            prelude: None,
+            preloaded_modules: vec![],
+            always_active_modules: vec![module_path(&["missing", "helpers"])],
+            source_loader: &mut loader,
+        })
+        .unwrap_err();
+        let CheckError::Resolve { diagnostics } = err else {
+            panic!("expected resolve error");
+        };
+        assert_eq!(
+            diagnostic_messages(&diagnostics),
+            ["always-active module was not resolved: missing.helpers"]
+        );
+    }
+
+    #[test]
     fn duplicate_preloaded_modules_are_resolve_errors() {
         let mut loader = TestLoader::default();
         let err = check(ProgramInput {
@@ -376,7 +418,13 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap_err();
-        assert!(matches!(err, CheckError::Resolve { .. }));
+        let CheckError::Resolve { diagnostics } = err else {
+            panic!("expected resolve error");
+        };
+        assert_eq!(
+            diagnostic_messages(&diagnostics),
+            ["module 'core_int' is preloaded more than once"]
+        );
         assert!(loader.loads.is_empty());
     }
 
@@ -487,6 +535,13 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap_err();
-        assert!(matches!(err, CheckError::Resolve { .. }));
+        let CheckError::Resolve { diagnostics } = err else {
+            panic!("expected resolve error");
+        };
+        assert_eq!(
+            diagnostic_messages(&diagnostics),
+            ["Cannot load module 'broken': disk error"]
+        );
+        assert_user_diagnostics(&diagnostics);
     }
 }

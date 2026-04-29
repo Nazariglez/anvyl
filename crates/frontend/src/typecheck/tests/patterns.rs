@@ -1,4 +1,4 @@
-use super::support::{assert_err, assert_err_count, assert_type};
+use super::support::{assert_err, assert_err_count, assert_ty};
 use crate::ast::Type;
 
 mod binding_patterns {
@@ -6,12 +6,12 @@ mod binding_patterns {
 
     #[test]
     fn let_tuple_ok() {
-        assert_type("fn main() { let (x, y) = (1, true); x; }", Type::Int);
+        assert_ty("fn main() { let (x, y) = (1, true); x; }", Type::Int);
     }
 
     #[test]
     fn let_tuple_yields_bool() {
-        assert_type("fn main() { let (x, y) = (1, true); y; }", Type::Bool);
+        assert_ty("fn main() { let (x, y) = (1, true); y; }", Type::Bool);
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod if_let {
 
     #[test]
     fn ident_binds() {
-        assert_type(
+        assert_ty(
             "fn main() { if let x = true { x } else { false }; }",
             Type::Bool,
         );
@@ -124,7 +124,7 @@ mod if_let {
 
     #[test]
     fn tuple_ok() {
-        assert_type(
+        assert_ty(
             "fn main() { if let (a, b) = (1, true) { a } else { 0 }; }",
             Type::Int,
         );
@@ -142,7 +142,7 @@ mod if_let {
 
     #[test]
     fn branch_match() {
-        assert_type(
+        assert_ty(
             "fn main() { if let true = true { 1 } else { 2 }; }",
             Type::Int,
         );
@@ -155,7 +155,7 @@ mod if_let {
 
     #[test]
     fn no_else_void() {
-        assert_type("fn main() { if let true = true { 1 }; }", Type::Void);
+        assert_ty("fn main() { if let true = true { 1 }; }", Type::Void);
     }
 }
 
@@ -164,7 +164,7 @@ mod match_stmt {
 
     #[test]
     fn lit_int() {
-        assert_type(
+        assert_ty(
             "fn main() { let _ = match 1 { 1 => 2, _ => 3 }; }",
             Type::Int,
         );
@@ -177,17 +177,17 @@ mod match_stmt {
 
     #[test]
     fn wildcard() {
-        assert_type("fn main() { let _ = match 1 { _ => 42 }; }", Type::Int);
+        assert_ty("fn main() { let _ = match 1 { _ => 42 }; }", Type::Int);
     }
 
     #[test]
     fn ident_binds() {
-        assert_type("fn main() { let _ = match 1 { x => x }; }", Type::Int);
+        assert_ty("fn main() { let _ = match 1 { x => x }; }", Type::Int);
     }
 
     #[test]
     fn ident_bool_condition() {
-        assert_type(
+        assert_ty(
             "fn main() { let _ = match true { x => if x { 1 } else { 2 } }; }",
             Type::Int,
         );
@@ -195,7 +195,7 @@ mod match_stmt {
 
     #[test]
     fn tuple_ok() {
-        assert_type(
+        assert_ty(
             "fn main() { let _ = match (1, true) { (a, b) => a }; }",
             Type::Int,
         );

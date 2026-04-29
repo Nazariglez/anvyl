@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown type
+
+import lib;
+
+struct Holder {
+    x: Point,
+}
+
+fn main() {}

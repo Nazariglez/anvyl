@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf};
 
-use anvyx_frontend::pipeline::CheckError as FCheckError;
+use anvyx_frontend::pipeline::{CheckError as FCheckError, Diagnostic};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckOk;
@@ -43,22 +43,30 @@ fn display_frontend_error(
     error: &FCheckError<CheckError>,
 ) -> fmt::Result {
     match error {
-        FCheckError::Lex { label, messages } => {
-            write_messages(f, &format!("frontend lex failed in {label}"), messages)
+        FCheckError::Lex { label, diagnostics } => {
+            write_diagnostics(f, &format!("frontend lex failed in {label}"), diagnostics)
         }
-        FCheckError::Parse { label, messages } => {
-            write_messages(f, &format!("frontend parse failed in {label}"), messages)
+        FCheckError::Parse { label, diagnostics } => {
+            write_diagnostics(f, &format!("frontend parse failed in {label}"), diagnostics)
         }
-        FCheckError::Resolve { messages } => write_messages(f, "frontend resolve failed", messages),
-        FCheckError::Type { messages } => write_messages(f, "frontend typecheck failed", messages),
+        FCheckError::Resolve { diagnostics } => {
+            write_diagnostics(f, "frontend resolve failed", diagnostics)
+        }
+        FCheckError::Type { diagnostics } => {
+            write_diagnostics(f, "frontend typecheck failed", diagnostics)
+        }
         FCheckError::Source(error) => write!(f, "{error}"),
     }
 }
 
-fn write_messages(f: &mut fmt::Formatter<'_>, header: &str, messages: &[String]) -> fmt::Result {
+fn write_diagnostics(
+    f: &mut fmt::Formatter<'_>,
+    header: &str,
+    diagnostics: &[Diagnostic],
+) -> fmt::Result {
     write!(f, "{header}:")?;
-    for message in messages {
-        write!(f, "\n- {message}")?;
+    for diagnostic in diagnostics {
+        write!(f, "\n- {diagnostic}")?;
     }
     Ok(())
 }
@@ -99,7 +107,7 @@ mod tests {
     #[test]
     fn display_frontend_resolve_error() {
         let frontend = anvyx_frontend::pipeline::CheckError::Resolve {
-            messages: vec!["missing module".to_string()],
+            diagnostics: vec![Diagnostic::error("missing module")],
         };
         let error = CheckError::Frontend(frontend);
 
@@ -113,7 +121,7 @@ mod tests {
     fn display_frontend_parse_error_includes_label() {
         let frontend = anvyx_frontend::pipeline::CheckError::Parse {
             label: "main.anv".to_string(),
-            messages: vec!["expected expression".to_string()],
+            diagnostics: vec![Diagnostic::error("expected expression")],
         };
         let error = CheckError::Frontend(frontend);
 
@@ -126,7 +134,7 @@ mod tests {
     #[test]
     fn frontend_error_converts_from_frontend_check_error() {
         let frontend = anvyx_frontend::pipeline::CheckError::Type {
-            messages: vec!["bad type".to_string()],
+            diagnostics: vec![Diagnostic::error("bad type")],
         };
         let error = CheckError::from(frontend.clone());
 

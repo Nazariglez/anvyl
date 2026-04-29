@@ -1,0 +1,3 @@
+// @helper
+
+pub fn visible() -> int { 1 }

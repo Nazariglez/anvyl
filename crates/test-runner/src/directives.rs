@@ -6,6 +6,8 @@ pub(crate) struct Directives {
     pub(crate) assertions: Assertions,
     pub(crate) stdin: Stdin,
     pub(crate) cli_options: CliOptions,
+    // FIXME: remove frontend once it promoted to the only frtonend
+    pub(crate) frontend: FrontendRequirement,
     pub(crate) skip: Option<String>,
     pub(crate) helper: bool,
 }
@@ -26,6 +28,33 @@ impl TestContract {
         match self.mode {
             Mode::Run => self.exit_code.map(i32::from),
             Mode::Check => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontendRequirement {
+    #[default]
+    Any,
+    Default,
+    New,
+}
+
+impl FrontendRequirement {
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "any" => Ok(Self::Any),
+            "default" => Ok(Self::Default),
+            "new" => Ok(Self::New),
+            _ => Err(format!("invalid @frontend value: {value}")),
+        }
+    }
+
+    pub(crate) fn skip_reason(self, new_frontend: bool) -> Option<&'static str> {
+        match (self, new_frontend) {
+            (Self::Any, _) | (Self::Default, false) | (Self::New, true) => None,
+            (Self::Default, true) => Some("requires default frontend"),
+            (Self::New, false) => Some("requires new frontend"),
         }
     }
 }
@@ -106,12 +135,6 @@ pub(crate) struct ForwardedCliArg {
     value: String,
 }
 
-impl ForwardedCliArg {
-    fn new(flag: CliFlag, value: String) -> Self {
-        Self { flag, value }
-    }
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct CliOptions {
     forwarded: Vec<ForwardedCliArg>,
@@ -119,7 +142,7 @@ pub(crate) struct CliOptions {
 
 impl CliOptions {
     pub(crate) fn push(&mut self, flag: CliFlag, value: String) {
-        self.forwarded.push(ForwardedCliArg::new(flag, value));
+        self.forwarded.push(ForwardedCliArg { flag, value });
     }
 
     pub(crate) fn append_args(&self, args: &mut Vec<String>) {
@@ -143,6 +166,7 @@ enum DirectiveKind {
     Stdin,
     StdinEmptyLine,
     WarnContains,
+    Frontend,
     Skip,
     Helper,
     CliOption(CliFlag),
@@ -253,6 +277,12 @@ const DIRECTIVE_SPECS: &[DirectiveSpec] = &[
         DirectiveKind::WarnContains,
         "substring",
         Repeatability::Many,
+    ),
+    DirectiveSpec::value(
+        "frontend",
+        DirectiveKind::Frontend,
+        "any|default|new",
+        Repeatability::Once,
     ),
     DirectiveSpec::value("skip", DirectiveKind::Skip, "reason", Repeatability::Once),
     DirectiveSpec::flag("helper", DirectiveKind::Helper, Repeatability::Once),
@@ -431,6 +461,7 @@ impl Directives {
             DirectiveKind::WarnContains => {
                 self.assertions.warnings.contains.push(value.to_string());
             }
+            DirectiveKind::Frontend => self.frontend = FrontendRequirement::from_str(value)?,
             DirectiveKind::Skip => self.skip = Some(value.to_string()),
             DirectiveKind::Helper => self.helper = true,
             DirectiveKind::CliOption(flag) => self.cli_options.push(flag, value.to_string()),
@@ -471,7 +502,7 @@ fn validate_directive_value<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CliFlag, Directives};
+    use super::{CliFlag, Directives, FrontendRequirement};
 
     fn fixture(body: &str) -> String {
         format!("// @mode: run\n// @expect: success\n{body}")
@@ -612,6 +643,31 @@ mod tests {
             directives.skip.as_deref(),
             Some("needs old backend behavior")
         );
+    }
+
+    #[test]
+    fn parses_frontend_requirement() {
+        let directives = directives("// @frontend: new\nfn main() {}\n");
+
+        assert_eq!(directives.frontend, FrontendRequirement::New);
+    }
+
+    #[test]
+    fn rejects_invalid_frontend_requirement() {
+        let error = Directives::parse(&fixture("// @frontend: maybe\nfn main() {}\n"))
+            .expect_err("invalid frontend requirement should fail");
+
+        assert_eq!(error, "invalid @frontend value: maybe");
+    }
+
+    #[test]
+    fn rejects_duplicate_frontend_requirement() {
+        let error = Directives::parse(&fixture(
+            "// @frontend: new\n// @frontend: default\nfn main() {}\n",
+        ))
+        .expect_err("duplicate frontend requirement should fail");
+
+        assert_eq!(error, "duplicate @frontend directive");
     }
 
     #[test]

@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown member 'missing' in module 'lib'
+
+pub import lib { missing };
+
+fn main() {}

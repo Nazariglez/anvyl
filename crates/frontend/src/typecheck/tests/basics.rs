@@ -1,15 +1,18 @@
 use super::support::{
-    assert_err, assert_err_count, assert_no_infer_vars_in_result, assert_single_error, assert_type,
-    assert_type_with_modules, assert_type_with_named_modules, typecheck, typecheck_with_modules,
+    assert_err, assert_err_count, assert_single_error, assert_ty, assert_ty_mods, assert_ty_named,
+    assert_typecheck_closed, check, check_mods, check_named,
 };
 use crate::{
     ast::{ArrayLen, ConstArg, ConstValue, FuncParam, GenericArg, Ident, NominalKind, Type},
-    typecheck::{ArityError, ModuleScope, TypeError, type_contains_infer},
+    typecheck::{ArityError, DeclError, ModuleScope, TypeError, type_contains_infer},
 };
 
 mod storage {
+    use std::collections::HashSet;
+
     use crate::{
         ast::{Ident, Program, Type},
+        resolve::ResolveResult,
         typecheck::{DeclarationIndex, LocalTypeId, TypeChecker},
     };
 
@@ -25,7 +28,11 @@ mod storage {
 
     #[test]
     fn local_type_cell_update() {
-        let decls = DeclarationIndex::from_root(&Program { stmts: vec![] });
+        let program = Program { stmts: vec![] };
+        let resolved = ResolveResult {
+            module_groups: vec![],
+        };
+        let decls = DeclarationIndex::from_root_and_modules(&program, &resolved, HashSet::new());
         let mut tc = TypeChecker::new(decls);
         let name = Ident::new("x");
         tc.push_scope();
@@ -64,7 +71,7 @@ mod constraints {
 
     #[test]
     fn branch_join_same_type() {
-        assert_type(
+        assert_ty(
             "fn main(cond: bool) { if cond { 1 } else { 2 }; }",
             Type::Int,
         );
@@ -77,7 +84,7 @@ mod constraints {
 
     #[test]
     fn nil_unresolved_once() {
-        let Err(errors) = typecheck("fn main() { let x = nil; }") else {
+        let Err(errors) = check("fn main() { let x = nil; }") else {
             panic!("expected cannot infer");
         };
         assert_eq!(errors.len(), 1);
@@ -93,7 +100,7 @@ mod constraints {
 
     #[test]
     fn nil_contextual_optional() {
-        assert_type(
+        assert_ty(
             "fn main() { let x: int? = nil; x; }",
             Type::option_of(Type::Int),
         );
@@ -101,7 +108,7 @@ mod constraints {
 
     #[test]
     fn nil_return_optional() {
-        assert_type("fn f() -> int? { nil }", Type::option_of(Type::Int));
+        assert_ty("fn f() -> int? { nil }", Type::option_of(Type::Int));
     }
 
     #[test]
@@ -112,7 +119,7 @@ mod constraints {
 
     #[test]
     fn nil_branch_uses_return_context() {
-        assert_type(
+        assert_ty(
             "fn main(cond: bool) -> int? { if cond { nil } else { 1 } }",
             Type::option_of(Type::Int),
         );
@@ -120,7 +127,7 @@ mod constraints {
 
     #[test]
     fn nil_branch_uses_binding_context() {
-        assert_type(
+        assert_ty(
             "fn main(cond: bool) { let x: int? = if cond { nil } else { 1 }; x; }",
             Type::option_of(Type::Int),
         );
@@ -136,7 +143,7 @@ mod constraints {
 
     #[test]
     fn undefined_no_infer_cascade() {
-        let Err(errors) = typecheck("fn main() { missing; }") else {
+        let Err(errors) = check("fn main() { missing; }") else {
             panic!("expected undefined variable");
         };
         assert_eq!(errors.len(), 1);
@@ -160,9 +167,9 @@ mod constraints {
 
     #[test]
     fn no_infer_leak() {
-        let result = typecheck("fn main(cond: bool) { let x = if cond { 1 } else { 2 }; x; }")
+        let result = check("fn main(cond: bool) { let x = if cond { 1 } else { 2 }; x; }")
             .expect("typecheck failed");
-        assert_no_infer_vars_in_result(&result);
+        assert_typecheck_closed(&result);
     }
 
     #[test]
@@ -184,7 +191,7 @@ mod constraints {
     }
 
     #[test]
-    fn unresolved_nominal_type_arg_infer_guard() {
+    fn unresolved_arg_infer_guard() {
         let ty = Type::UnresolvedNominal {
             qualifier: None,
             name: Ident::new("Box"),
@@ -211,27 +218,27 @@ mod literals {
 
     #[test]
     fn int_literal() {
-        assert_type("fn main() { 1; }", Type::Int);
+        assert_ty("fn main() { 1; }", Type::Int);
     }
 
     #[test]
     fn float_literal() {
-        assert_type("fn main() { 1.0; }", Type::Float);
+        assert_ty("fn main() { 1.0; }", Type::Float);
     }
 
     #[test]
     fn bool_true() {
-        assert_type("fn main() { true; }", Type::Bool);
+        assert_ty("fn main() { true; }", Type::Bool);
     }
 
     #[test]
     fn bool_false() {
-        assert_type("fn main() { false; }", Type::Bool);
+        assert_ty("fn main() { false; }", Type::Bool);
     }
 
     #[test]
     fn string_literal() {
-        assert_type("fn main() { \"hi\"; }", Type::String);
+        assert_ty("fn main() { \"hi\"; }", Type::String);
     }
 }
 
@@ -240,7 +247,7 @@ mod consts {
 
     #[test]
     fn evaluated() {
-        let result = typecheck("const X = 1 + 2; fn main() { X; }").expect("typecheck failed");
+        let result = check("const X = 1 + 2; fn main() { X; }").expect("typecheck failed");
         assert_eq!(
             result.consts().get(&(ModuleScope::Root, Ident::new("X"))),
             Some(&ConstValue::Int(3))
@@ -249,17 +256,17 @@ mod consts {
 
     #[test]
     fn forward_ref() {
-        assert_type("const A = B + 1; const B = 2; fn main() { A; }", Type::Int);
+        assert_ty("const A = B + 1; const B = 2; fn main() { A; }", Type::Int);
     }
 
     #[test]
     fn local() {
-        assert_type("fn main() { const X = 1 + 2; X; }", Type::Int);
+        assert_ty("fn main() { const X = 1 + 2; X; }", Type::Int);
     }
 
     #[test]
     fn local_shadow() {
-        assert_type(
+        assert_ty(
             "const X = 1; fn main() { const X = \"x\"; X; }",
             Type::String,
         );
@@ -267,7 +274,7 @@ mod consts {
 
     #[test]
     fn imported() {
-        assert_type_with_modules(
+        assert_ty_mods(
             "import gamekit { SIZE }; fn main() { SIZE; }",
             "pub const SIZE = 4;",
             Type::Int,
@@ -276,7 +283,7 @@ mod consts {
 
     #[test]
     fn imported_forward_ref() {
-        assert_type_with_modules(
+        assert_ty_mods(
             "import gamekit { SIZE }; fn main() { SIZE; }",
             "pub const SIZE = BASE + 1; const BASE = 3;",
             Type::Int,
@@ -285,7 +292,7 @@ mod consts {
 
     #[test]
     fn module_private_err() {
-        let result = typecheck_with_modules(
+        let result = check_mods(
             "import gamekit as gk; const X = gk.SECRET; fn main() { X; }",
             "const SECRET = 1;",
         );
@@ -304,8 +311,8 @@ mod consts {
 
     #[test]
     fn bool_short_circuit() {
-        let result = typecheck("const X = false && (1 / 0 == 0); fn main() { X; }")
-            .expect("typecheck failed");
+        let result =
+            check("const X = false && (1 / 0 == 0); fn main() { X; }").expect("typecheck failed");
         assert_eq!(
             result.consts().get(&(ModuleScope::Root, Ident::new("X"))),
             Some(&ConstValue::Bool(false))
@@ -403,7 +410,7 @@ mod nominals {
 
     #[test]
     fn literal() {
-        assert_type(
+        assert_ty(
             &buf("fn main(x: FixedBuf<int, 3>) -> FixedBuf<int, 3> { x }"),
             fixed(3),
         );
@@ -411,7 +418,7 @@ mod nominals {
 
     #[test]
     fn imported() {
-        assert_type_with_named_modules(
+        assert_ty_named(
             "import bufs; fn main(x: bufs.FixedBuf<int, 3>) { x.data; }",
             &[("bufs", "pub struct FixedBuf<T, N: int> { data: [T; N] }")],
             array(Type::Int, 3),
@@ -420,7 +427,7 @@ mod nominals {
 
     #[test]
     fn dataref_arg() {
-        assert_type(
+        assert_ty(
             &ref_buf("fn main(x: FixedBuf<int, 3>) -> FixedBuf<int, 3> { x }"),
             dataref(3),
         );
@@ -428,7 +435,7 @@ mod nominals {
 
     #[test]
     fn enum_arg() {
-        assert_type(
+        assert_ty(
             &packets("fn main(x: Packet<int, 3>) -> Packet<int, 3> { x }"),
             packet(3),
         );
@@ -449,7 +456,7 @@ mod nominals {
 
     #[test]
     fn arity_err() {
-        let Err(errors) = typecheck(&buf("fn f(x: FixedBuf<int>) {} fn main() {}")) else {
+        let Err(errors) = check(&buf("fn f(x: FixedBuf<int>) {} fn main() {}")) else {
             panic!("expected arity error");
         };
         assert!(matches!(
@@ -503,7 +510,7 @@ mod nominals {
 
     #[test]
     fn kind_err() {
-        let Err(errors) = typecheck(&buf("fn f(x: FixedBuf<int, true>) {} fn main() {}")) else {
+        let Err(errors) = check(&buf("fn f(x: FixedBuf<int, true>) {} fn main() {}")) else {
             panic!("expected const kind error");
         };
         assert!(matches!(
@@ -516,17 +523,8 @@ mod nominals {
     }
 
     #[test]
-    fn bool_const_arg_ok_when_not_array_len() {
-        assert_type(
-            "struct Flag<N: int> {} fn main(x: Flag<true>) -> Flag<true> { x }",
-            Type::nominal(
-                NominalKind::Struct,
-                Ident::new("Flag"),
-                vec![],
-                vec![ConstArg::Value(ConstValue::Bool(true))],
-                None,
-            ),
-        );
+    fn bool_const_arg_err() {
+        assert_err("struct Flag<N: int> {} fn main(x: Flag<true>) -> Flag<true> { x }");
     }
 
     #[test]
@@ -541,7 +539,7 @@ mod nominals {
 
     #[test]
     fn const_name() {
-        assert_type(
+        assert_ty(
             "const CAP = 3; struct FixedBuf<T, N: int> { data: [T; N] } fn main(x: FixedBuf<int, CAP>) -> FixedBuf<int, 3> { x }",
             fixed(3),
         );
@@ -549,7 +547,7 @@ mod nominals {
 
     #[test]
     fn const_param() {
-        assert_type(
+        assert_ty(
             &buf(
                 "fn f<T, N: int>(x: FixedBuf<T, N>) -> int { N } fn main(x: FixedBuf<int, 3>) -> int { f(x) }",
             ),
@@ -559,7 +557,7 @@ mod nominals {
 
     #[test]
     fn same() {
-        assert_type(
+        assert_ty(
             &buf("fn main(x: FixedBuf<int, 3>) { let y: FixedBuf<int, 3> = x; y; }"),
             fixed(3),
         );
@@ -581,7 +579,7 @@ mod nominals {
 
     #[test]
     fn first() {
-        assert_type(
+        assert_ty(
             "struct FixedBuf<T, N: int> { head: T, data: [T; N] } fn first<T, N: int>(buf: FixedBuf<T, N>) -> T { buf.head } fn main() { first(FixedBuf { head: 1, data: [1, 2, 3] }); }",
             Type::Int,
         );
@@ -589,7 +587,7 @@ mod nominals {
 
     #[test]
     fn literal_args() {
-        assert_type(
+        assert_ty(
             &buf("fn main() { FixedBuf<int, 3> { data: [1, 2, 3] }; }"),
             fixed(3),
         );
@@ -597,7 +595,7 @@ mod nominals {
 
     #[test]
     fn literal_hint() {
-        assert_type(
+        assert_ty(
             &buf("fn main() { let buf: FixedBuf<int, 3> = FixedBuf { data: [1, 2, 3] }; buf; }"),
             fixed(3),
         );
@@ -605,7 +603,7 @@ mod nominals {
 
     #[test]
     fn literal_infers_args() {
-        assert_type(
+        assert_ty(
             &buf("fn main() { FixedBuf { data: [1, 2, 3] }; }"),
             fixed(3),
         );
@@ -613,7 +611,7 @@ mod nominals {
 
     #[test]
     fn dataref_infer() {
-        assert_type(
+        assert_ty(
             &ref_buf("fn main() { FixedBuf { data: [1, 2, 3] }; }"),
             dataref(3),
         );
@@ -621,7 +619,7 @@ mod nominals {
 
     #[test]
     fn field() {
-        assert_type(
+        assert_ty(
             &buf("fn main() { let buf = FixedBuf { data: [1, 2, 3] }; buf.data; }"),
             array(Type::Int, 3),
         );
@@ -629,7 +627,7 @@ mod nominals {
 
     #[test]
     fn method() {
-        assert_type(
+        assert_ty(
             "struct FixedBuf<T, N: int> { data: [T; N], fn get(self) -> [T; N] { self.data } } fn main() { let buf = FixedBuf { data: [1, 2, 3] }; buf.get(); }",
             array(Type::Int, 3),
         );
@@ -637,7 +635,7 @@ mod nominals {
 
     #[test]
     fn enum_payload() {
-        assert_type(
+        assert_ty(
             &packets("fn main() { Packet.Inline([1, 2, 3]); }"),
             packet(3),
         );
@@ -645,7 +643,7 @@ mod nominals {
 
     #[test]
     fn enum_explicit() {
-        assert_type(
+        assert_ty(
             &packets("fn main() { Packet.Inline<int, 3>([1, 2, 3]); }"),
             packet(3),
         );
@@ -653,7 +651,7 @@ mod nominals {
 
     #[test]
     fn literal_expected_optional() {
-        assert_type(
+        assert_ty(
             "struct Box<T> { value: T } fn main() { let x: Box<int?> = Box { value: nil }; x; }",
             box_struct(Type::option_of(Type::Int)),
         );
@@ -661,7 +659,7 @@ mod nominals {
 
     #[test]
     fn explicit_optional_arg() {
-        assert_type(
+        assert_ty(
             "struct Box<T> { value: T } fn main() { let x = Box<int?> { value: nil }; x; }",
             box_struct(Type::option_of(Type::Int)),
         );
@@ -669,7 +667,7 @@ mod nominals {
 
     #[test]
     fn nested_literal_optional() {
-        assert_type(
+        assert_ty(
             "struct Inner<T> { value: T } struct Outer<T> { inner: T } fn main() { let x: Outer<Inner<int?>> = Outer { inner: Inner { value: nil } }; x; }",
             struct_ty(
                 "Outer",
@@ -681,7 +679,7 @@ mod nominals {
 
     #[test]
     fn literal_const_array_hint() {
-        assert_type(
+        assert_ty(
             &buf("fn main() { let x: FixedBuf<int, 3> = FixedBuf { data: [1, 2, 3] }; x; }"),
             fixed(3),
         );
@@ -689,7 +687,7 @@ mod nominals {
 
     #[test]
     fn literal_optional_const_array_hint() {
-        assert_type(
+        assert_ty(
             &buf("fn main() { let x: FixedBuf<int?, 2> = FixedBuf { data: [nil, 1] }; x; }"),
             struct_ty("FixedBuf", vec![Type::option_of(Type::Int)], vec![arg(2)]),
         );
@@ -697,7 +695,7 @@ mod nominals {
 
     #[test]
     fn dataref_expected_optional() {
-        assert_type(
+        assert_ty(
             "dataref Box<T> { value: T } fn main() { let x: Box<int?> = Box { value: nil }; x; }",
             dataref_ty("Box", vec![Type::option_of(Type::Int)]),
         );
@@ -729,7 +727,7 @@ mod nominals {
 
     #[test]
     fn tuple_expected_optional() {
-        assert_type(
+        assert_ty(
             "enum Maybe<T> { Some(T), None } fn main() { let x: Maybe<int?> = .Some(nil); x; }",
             maybe(Type::option_of(Type::Int)),
         );
@@ -737,7 +735,7 @@ mod nominals {
 
     #[test]
     fn struct_expected_optional() {
-        assert_type(
+        assert_ty(
             "enum Maybe<T> { Pair { value: T }, None } fn main() { let x: Maybe<int?> = .Pair { value: nil }; x; }",
             maybe(Type::option_of(Type::Int)),
         );
@@ -745,7 +743,7 @@ mod nominals {
 
     #[test]
     fn unit_expected_enum() {
-        assert_type(
+        assert_ty(
             "enum Maybe<T> { None } fn main() { let x: Maybe<int> = .None; x; }",
             maybe(Type::Int),
         );
@@ -753,7 +751,7 @@ mod nominals {
 
     #[test]
     fn return_expected_optional() {
-        assert_type(
+        assert_ty(
             "enum Maybe<T> { Some(T) } fn main() -> Maybe<int?> { .Some(nil) }",
             maybe(Type::option_of(Type::Int)),
         );
@@ -761,7 +759,7 @@ mod nominals {
 
     #[test]
     fn array_element_expected_optional() {
-        assert_type(
+        assert_ty(
             "enum Maybe<T> { Some(T) } fn main() { let xs: [Maybe<int?>; 1] = [.Some(nil)]; xs; }",
             array(maybe(Type::option_of(Type::Int)), 1),
         );
@@ -812,17 +810,17 @@ mod arrays {
 
     #[test]
     fn literal() {
-        assert_type("fn main() { [1, 2, 3]; }", array(Type::Int, 3));
+        assert_ty("fn main() { [1, 2, 3]; }", array(Type::Int, 3));
     }
 
     #[test]
     fn fill_const_len() {
-        assert_type("const N = 3; fn main() { [0; N]; }", array(Type::Int, 3));
+        assert_ty("const N = 3; fn main() { [0; N]; }", array(Type::Int, 3));
     }
 
     #[test]
     fn annotation_const_len() {
-        assert_type(
+        assert_ty(
             "const N = 3; fn main() { let xs: [int; N] = [1, 2, 3]; xs; }",
             array(Type::Int, 3),
         );
@@ -862,7 +860,7 @@ mod arrays {
 
     #[test]
     fn nominal_const_arg_name_normalizes() {
-        assert_type(
+        assert_ty(
             "const N = 3; struct Buf<N: int> {} fn main(x: Buf<N>) -> Buf<3> { x }",
             Type::nominal(
                 NominalKind::Struct,
@@ -876,7 +874,7 @@ mod arrays {
 
     #[test]
     fn empty_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let xs: [int; 0] = []; xs; }",
             array(Type::Int, 0),
         );
@@ -884,7 +882,7 @@ mod arrays {
 
     #[test]
     fn optional_elements_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let xs: [int?; 2] = [nil, 1]; xs; }",
             array(Type::option_of(Type::Int), 2),
         );
@@ -892,7 +890,7 @@ mod arrays {
 
     #[test]
     fn optional_fill_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let xs: [int?; 2] = [nil; 2]; xs; }",
             array(Type::option_of(Type::Int), 2),
         );
@@ -900,7 +898,7 @@ mod arrays {
 
     #[test]
     fn list_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let xs: [int?] = [nil, 1]; xs; }",
             Type::List {
                 elem: Box::new(Type::option_of(Type::Int)),
@@ -910,7 +908,7 @@ mod arrays {
 
     #[test]
     fn nested_optional_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let xs: [[int?; 1]; 1] = [[nil]]; xs; }",
             array(array(Type::option_of(Type::Int), 1), 1),
         );
@@ -945,7 +943,7 @@ mod arrays {
 
     #[test]
     fn nested_imported_const_len() {
-        assert_type_with_modules(
+        assert_ty_mods(
             "import gamekit { W, H }; fn main() { let grid: [[int; W]; H] = [[0; W]; H]; grid; }",
             "pub const W = 4; pub const H = 3;",
             array(array(Type::Int, 4), 3),
@@ -968,7 +966,7 @@ mod tuples {
 
     #[test]
     fn optional_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let x: (int, string?) = (1, nil); x; }",
             Type::Tuple(vec![Type::Int, Type::option_of(Type::String)]),
         );
@@ -976,7 +974,7 @@ mod tuples {
 
     #[test]
     fn nested_optional_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let x: (int?, (string, bool?)) = (nil, (\"s\", nil)); x; }",
             Type::Tuple(vec![
                 Type::option_of(Type::Int),
@@ -987,7 +985,7 @@ mod tuples {
 
     #[test]
     fn branch_context() {
-        assert_type(
+        assert_ty(
             "fn main(cond: bool) { let x: (int, int?) = if cond { (1, nil) } else { (2, 3) }; x; }",
             Type::Tuple(vec![Type::Int, Type::option_of(Type::Int)]),
         );
@@ -995,7 +993,7 @@ mod tuples {
 
     #[test]
     fn named_context() {
-        assert_type(
+        assert_ty(
             "fn main() { let x: (a: int, b: int?) = (a: 1, b: nil); x; }",
             Type::NamedTuple(vec![
                 (Ident::new("a"), Type::Int),
@@ -1006,7 +1004,7 @@ mod tuples {
 
     #[test]
     fn named_branch_context() {
-        assert_type(
+        assert_ty(
             "fn main(cond: bool) { let x: (a: int, b: int?) = if cond { (a: 1, b: nil) } else { (a: 2, b: 3) }; x; }",
             Type::NamedTuple(vec![
                 (Ident::new("a"), Type::Int),
@@ -1040,13 +1038,21 @@ mod bindings {
     use super::*;
 
     #[test]
+    fn let_unknown_annotation_err() {
+        assert_single_error(
+            "fn main() { let x: Missing = 1; }",
+            |err| matches!(err, TypeError::UnknownType { qualifier: None, name, .. } if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
     fn let_infer() {
-        assert_type("fn main() { let x = 1; x; }", Type::Int);
+        assert_ty("fn main() { let x = 1; x; }", Type::Int);
     }
 
     #[test]
     fn let_annotated() {
-        assert_type("fn main() { let x: int = 1; x; }", Type::Int);
+        assert_ty("fn main() { let x: int = 1; x; }", Type::Int);
     }
 
     #[test]
@@ -1056,7 +1062,7 @@ mod bindings {
 
     #[test]
     fn var_binding() {
-        assert_type("fn main() { var x = 1; x = 2; x; }", Type::Int);
+        assert_ty("fn main() { var x = 1; x = 2; x; }", Type::Int);
     }
 
     #[test]
@@ -1075,22 +1081,22 @@ mod binary_ops {
 
     #[test]
     fn add_ints() {
-        assert_type("fn main() { 1 + 2; }", Type::Int);
+        assert_ty("fn main() { 1 + 2; }", Type::Int);
     }
 
     #[test]
     fn add_floats() {
-        assert_type("fn main() { 1.0 + 2.0; }", Type::Float);
+        assert_ty("fn main() { 1.0 + 2.0; }", Type::Float);
     }
 
     #[test]
     fn add_strings() {
-        assert_type("fn main() { \"a\" + \"b\"; }", Type::String);
+        assert_ty("fn main() { \"a\" + \"b\"; }", Type::String);
     }
 
     #[test]
     fn add_string_int() {
-        assert_type("fn main() { \"hi\" + 1; }", Type::String);
+        assert_ty("fn main() { \"hi\" + 1; }", Type::String);
     }
 
     #[test]
@@ -1100,32 +1106,32 @@ mod binary_ops {
 
     #[test]
     fn compare_ints() {
-        assert_type("fn main() { 1 < 2; }", Type::Bool);
+        assert_ty("fn main() { 1 < 2; }", Type::Bool);
     }
 
     #[test]
     fn eq_ints() {
-        assert_type("fn main() { 1 == 2; }", Type::Bool);
+        assert_ty("fn main() { 1 == 2; }", Type::Bool);
     }
 
     #[test]
     fn and_bools() {
-        assert_type("fn main() { true && false; }", Type::Bool);
+        assert_ty("fn main() { true && false; }", Type::Bool);
     }
 
     #[test]
     fn or_bools() {
-        assert_type("fn main() { true || false; }", Type::Bool);
+        assert_ty("fn main() { true || false; }", Type::Bool);
     }
 
     #[test]
     fn bitor_ints() {
-        assert_type("fn main() { 1 | 2; }", Type::Int);
+        assert_ty("fn main() { 1 | 2; }", Type::Int);
     }
 
     #[test]
     fn bitand_ints() {
-        assert_type("fn main() { 1 & 2; }", Type::Int);
+        assert_ty("fn main() { 1 & 2; }", Type::Int);
     }
 
     #[test]
@@ -1139,22 +1145,22 @@ mod unary_ops {
 
     #[test]
     fn neg_int() {
-        assert_type("fn main() { -1; }", Type::Int);
+        assert_ty("fn main() { -1; }", Type::Int);
     }
 
     #[test]
     fn neg_float() {
-        assert_type("fn main() { -1.0; }", Type::Float);
+        assert_ty("fn main() { -1.0; }", Type::Float);
     }
 
     #[test]
     fn not_bool() {
-        assert_type("fn main() { !true; }", Type::Bool);
+        assert_ty("fn main() { !true; }", Type::Bool);
     }
 
     #[test]
     fn bitnot_int() {
-        assert_type("fn main() { ~1; }", Type::Int);
+        assert_ty("fn main() { ~1; }", Type::Int);
     }
 
     #[test]
@@ -1165,6 +1171,213 @@ mod unary_ops {
 
 mod functions {
     use super::*;
+
+    #[test]
+    fn fn_unknown_param_type_err() {
+        assert_single_error(
+            "fn f(x: Missing) {}",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn struct_unknown_field_type_err() {
+        assert_single_error(
+            "struct Box { value: Missing }",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn enum_unknown_payload_type_err() {
+        assert_single_error(
+            "enum E { A(Missing) }",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn extern_unknown_param_type_err() {
+        assert_single_error(
+            "extern fn host(x: Missing);",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn generic_param_remains_valid() {
+        assert_ty("fn id<T>(x: T) -> T { x } fn main() { id(1); }", Type::Int);
+    }
+
+    #[test]
+    fn duplicate_function_decl_err() {
+        assert_err("fn f() {} fn f() {}");
+    }
+
+    #[test]
+    fn duplicate_function_const_err() {
+        assert_err("fn dup() {} const dup = 1;");
+    }
+
+    #[test]
+    fn duplicate_extern_function_err() {
+        assert_err("extern fn host(); fn host() {}");
+    }
+
+    #[test]
+    fn duplicate_params() {
+        for source in [
+            "fn f<T, T>(x: T) {}",
+            "fn f<N: int, N: int>(x: int) {}",
+            "fn f<T, T: int>(x: int) {}",
+            "struct Box<T, T> { value: T }",
+            "enum Option<T, T> { Some(T), None }",
+            "extend<T, T> T { fn id(self) -> T { self } }",
+        ] {
+            assert_err(source);
+        }
+    }
+
+    #[test]
+    fn wrong_nominal_arity_in_decl() {
+        assert_single_error(
+            "struct Box<T> { value: T } struct Holder { x: Box<int, int> }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::GenericArity(ArityError::TypeArgs {
+                        expected: 1,
+                        found: 2,
+                    })
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn wrong_nominal_arity_in_signature() {
+        assert_single_error(
+            "struct Box<T> { value: T } fn f<U>(x: Box<int, int>) {}",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::GenericArity(ArityError::TypeArgs {
+                        expected: 1,
+                        found: 2,
+                    })
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn field_no_export_fallback() {
+        let result = check_named(
+            "struct Holder { x: Item }",
+            &[("alpha", "pub struct Item { value: int }")],
+        );
+        let Err(errors) = result else {
+            panic!("expected unknown type error");
+        };
+        assert!(errors.iter().any(|err| matches!(
+            err,
+            TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. })
+                if *name == Ident::new("Item")
+        )));
+    }
+
+    #[test]
+    fn unknown_type_arg_in_payload() {
+        assert_single_error(
+            "struct Box<T> { value: T } enum E { A(Box<Missing>) }",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn body_annotation_type_param() {
+        assert_ty(
+            "fn id<T>(x: T) -> T { let y: T = x; y } fn main() { id(1); }",
+            Type::Int,
+        );
+    }
+
+    #[test]
+    fn const_param_as_type_err() {
+        assert_single_error(
+            "fn f<N: int>(x: N) {}",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("N")),
+        );
+    }
+
+    #[test]
+    fn type_param_rejected_as_const_arg() {
+        assert_single_error(
+            "struct FixedBuf<T, N: int> { data: [T; N] } fn f<T>(x: FixedBuf<int, T>) {}",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("T")),
+        );
+    }
+
+    #[test]
+    fn unknown_array_len_in_field() {
+        assert_single_error(
+            "struct Holder { x: [int; Missing] }",
+            |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn unknown_const_arg_in_field() {
+        assert_single_error(
+            "struct FixedBuf<T, N: int> { data: [T; N] } struct Holder { x: FixedBuf<int, Missing> }",
+            |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn bool_const_arg_in_field() {
+        assert_single_error(
+            "struct FixedBuf<T, N: int> { data: [T; N] } struct Holder { x: FixedBuf<int, true> }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::ExpectedIntConst {
+                        found: Type::Bool,
+                        ..
+                    }
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn unknown_const_arg_in_signature() {
+        assert_single_error(
+            "struct FixedBuf<T, N: int> { data: [T; N] } fn f<U>(x: FixedBuf<int, Missing>) {}",
+            |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("Missing")),
+        );
+    }
+
+    #[test]
+    fn type_param_const_arg_in_field() {
+        assert_single_error(
+            "struct FixedBuf<T, N: int> { data: [T; N] } struct Holder<T> { x: FixedBuf<int, T> }",
+            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("T")),
+        );
+    }
+
+    #[test]
+    fn const_param_valid_in_array_len() {
+        assert_err_count("fn f<N: int>(x: [int; N]) {}", 0);
+    }
+
+    #[test]
+    fn nominal_const_arg_uses_const_param() {
+        assert_err_count(
+            "struct FixedBuf<T, N: int> { data: [T; N] } fn f<N: int>(x: FixedBuf<int, N>) {}",
+            0,
+        );
+    }
 
     #[test]
     fn fn_no_params() {
@@ -1210,7 +1423,7 @@ mod if_expr {
 
     #[test]
     fn if_both_int() {
-        assert_type("fn main() { if true { 1 } else { 2 }; }", Type::Int);
+        assert_ty("fn main() { if true { 1 } else { 2 }; }", Type::Int);
     }
 
     #[test]
@@ -1220,7 +1433,7 @@ mod if_expr {
 
     #[test]
     fn if_no_else() {
-        assert_type("fn main() { if true { 1 }; }", Type::Void);
+        assert_ty("fn main() { if true { 1 }; }", Type::Void);
     }
 
     #[test]
@@ -1234,12 +1447,12 @@ mod blocks {
 
     #[test]
     fn block_tail() {
-        assert_type("fn main() { { 1 }; }", Type::Int);
+        assert_ty("fn main() { { 1 }; }", Type::Int);
     }
 
     #[test]
     fn block_void() {
-        assert_type("fn main() { { }; }", Type::Void);
+        assert_ty("fn main() { { }; }", Type::Void);
     }
 }
 
@@ -1326,6 +1539,6 @@ mod for_stmt {
 
     #[test]
     fn for_item_type() {
-        assert_type("fn main(xs: [int]) { for x in xs { x; } }", Type::Int);
+        assert_ty("fn main(xs: [int]) { for x in xs { x; } }", Type::Int);
     }
 }

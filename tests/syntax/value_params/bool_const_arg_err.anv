@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected integer constant
+
+struct FixedBuf<T, N: int> {
+    data: [T; N],
+}
+
+struct Holder {
+    x: FixedBuf<int, true>,
+}
+
+fn main() {}

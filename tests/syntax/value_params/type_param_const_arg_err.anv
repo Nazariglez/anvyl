@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown type
+
+struct FixedBuf<T, N: int> {
+    data: [T; N],
+}
+
+fn f<T>(x: FixedBuf<int, T>) {}
+
+fn main() {}

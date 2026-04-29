@@ -33,7 +33,7 @@ Options:
 
 Options can appear before or after paths. Repeated value options use the last value.
 
-By default, fixtures run through the production CLI old frontend/backend path. `--new-frontend` uses the same compiled CLI binary and adds `--new-frontend` to check-mode child invocations. It is check-only, so run-mode fixtures are skipped before spawning `anvyx`.
+By default, fixtures run through the production CLI default frontend/backend path. `--new-frontend` uses the same compiled CLI binary and adds `--new-frontend` to check-mode child invocations. It is check-only, so run-mode fixtures are skipped before spawning `anvyx`. Use `// @frontend: new` or `// @frontend: default` for fixtures that only apply to one frontend path.
 
 ## Fixture directives
 
@@ -69,6 +69,7 @@ Helper files are different. A helper file must contain only `// @helper` as its 
 | `// @stdin: text` | many | line | Adds one stdin line. Valid only in `run` mode. |
 | `// @stdin-empty-line` | many | none | Adds one blank stdin line. Valid only in `run` mode. |
 | `// @warn-contains: text` | many | substring | Successful test stderr must contain this warning substring. Valid only with `@expect: success`. |
+| `// @frontend: any\|default\|new` | once | frontend | Runs only on the matching frontend path. `any` is the default. Non-matching fixtures are reported as skipped. |
 | `// @skip: reason` | once | reason | Skips the test and reports the reason. |
 | `// @helper` | once | none | Marks a helper module. Cannot be combined with other directives. |
 | `// @lint: value` | many | lint override | Forwards `--lint <value>` to the child CLI. |

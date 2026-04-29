@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown type
+
+fn f<N: int>(x: N) {}
+
+fn main() {}

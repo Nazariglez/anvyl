@@ -1,0 +1,7 @@
+// @helper
+
+import shapes { Point };
+
+pub fn origin() -> Point {
+    Point { x: 0.0, y: 0.0 }
+}

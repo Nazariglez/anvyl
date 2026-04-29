@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+struct FixedBuf<T, N: int> {
+    data: [T; N],
+}
+
+fn f<N: int>(x: FixedBuf<int, N>) {}
+
+fn main() {}

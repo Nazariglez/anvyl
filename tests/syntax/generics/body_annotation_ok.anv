@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+
+fn id<T>(x: T) -> T {
+    let y: T = x;
+    y
+}
+
+fn main() {
+    let x = id(1);
+    let _: int = x;
+}

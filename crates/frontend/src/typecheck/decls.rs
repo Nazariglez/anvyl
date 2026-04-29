@@ -3,16 +3,16 @@ use std::collections::{HashMap, HashSet};
 use super::{
     ConstSubst, GenericArgs, GenericParams, Specificity, TypeSubst, compare_specificity,
     const_term::ConstTerm,
-    generic_bind::bind_exact_generic_args_no_diag,
     infer::{GenericSolverSeeds, Solver},
     substitute,
-    type_ops::TypeFolder,
+    type_ops::{TypeFolder, bare_type_name},
+    type_refs::{GenericParamError, GenericTypeContext, TypeParamBinding},
 };
 use crate::{
     ast::{
-        AggregateKind, ArrayLen, ConstArg, ConstParam, FuncParam, GenericArg, Ident,
-        ImportItemKind, ImportKind, MethodReceiver, Mutability, NominalKind, Param, Program, Stmt,
-        StmtNode, Type, TypeParam, VariantKind, Visibility,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, FuncParam, GenericArg, Ident, ImportItemKind,
+        ImportKind, MethodReceiver, Mutability, NominalKind, Param, Program, Stmt, StmtNode, Type,
+        TypeParam, VariantKind, Visibility,
     },
     resolve::{ModuleKey, ModulePath, ResolveResult},
     span::Span,
@@ -121,12 +121,90 @@ pub(crate) struct ExtendId {
     pub(crate) index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BindingNamespace {
+    Value,
+    Type,
+    Module,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingOrigin {
+    Local,
+    Import { source: ModuleScope },
+    Reexport { source: ModuleScope },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DeclError {
+    DuplicateValue {
+        module: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
+    DuplicateType {
+        module: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
+    MissingImportMember {
+        module: ModuleScope,
+        imported: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
+    PrivateImportMember {
+        module: ModuleScope,
+        imported: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
+    ImportConflict {
+        module: ModuleScope,
+        name: Ident,
+        namespace: BindingNamespace,
+        first: BindingOrigin,
+        second: BindingOrigin,
+        span: Span,
+    },
+    DuplicateModuleBinding {
+        module: ModuleScope,
+        name: Ident,
+        first: BindingOrigin,
+        second: BindingOrigin,
+        span: Span,
+    },
+    DuplicateGenericParam {
+        module: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
+    ReexportConflict {
+        module: ModuleScope,
+        name: Ident,
+        namespace: BindingNamespace,
+        first: BindingOrigin,
+        second: BindingOrigin,
+        span: Span,
+    },
+    UnknownType {
+        module: ModuleScope,
+        qualifier: Option<Ident>,
+        name: Ident,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Default)]
 pub(crate) struct DeclarationIndex {
     modules: HashMap<ModuleScope, ModuleDecls>,
     aggregates: HashMap<NominalKey, AggregateSchema>,
     enums: HashMap<NominalKey, EnumSchema>,
     extends: Vec<ExtendSchema>,
+    value_spans: HashMap<(ModuleScope, Ident), Span>,
+    type_spans: HashMap<NominalKey, Span>,
     always_active_modules: HashSet<ModuleScope>,
+    errors: Vec<DeclError>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +222,23 @@ pub(crate) struct Namespace {
 }
 
 pub(crate) type ModuleExports = Namespace;
+
+type OriginKey = (BindingNamespace, Ident);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportMode {
+    Import,
+    Reexport,
+}
+
+struct ImportScopeBuilder {
+    module: ModuleScope,
+    namespace: Namespace,
+    active_modules: HashSet<ModuleScope>,
+    origins: HashMap<OriginKey, BindingOrigin>,
+    errors: Vec<DeclError>,
+    mode: ImportMode,
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ImportScope {
@@ -177,6 +272,12 @@ impl Namespace {
         self.modules.get(&name)
     }
 
+    fn contains_member(&self, name: Ident) -> bool {
+        self.values.contains_key(&name)
+            || self.types.contains_key(&name)
+            || self.modules.contains_key(&name)
+    }
+
     fn insert_value(&mut self, visible: Ident, value: ResolvedValue) {
         self.values.insert(visible, value);
     }
@@ -187,6 +288,314 @@ impl Namespace {
 
     fn insert_module(&mut self, visible: Ident, module: ModuleScope) {
         self.modules.insert(visible, module);
+    }
+}
+
+impl ImportScopeBuilder {
+    fn new(module: ModuleScope, mode: ImportMode) -> Self {
+        Self {
+            module,
+            namespace: Namespace::default(),
+            active_modules: HashSet::new(),
+            origins: HashMap::new(),
+            errors: vec![],
+            mode,
+        }
+    }
+
+    fn with_namespace(module: ModuleScope, namespace: Namespace, mode: ImportMode) -> Self {
+        let mut builder = Self::new(module, mode);
+        builder.namespace = namespace;
+        builder.seed_existing_origins();
+        builder
+    }
+
+    fn seed_existing_origins(&mut self) {
+        let namespace = self.namespace.clone();
+        self.seed_origins(&namespace, BindingOrigin::Local);
+    }
+
+    fn seed_origins(&mut self, namespace: &Namespace, origin: BindingOrigin) {
+        self.origins.extend(
+            namespace
+                .values
+                .keys()
+                .map(|name| ((BindingNamespace::Value, *name), origin.clone())),
+        );
+        self.origins.extend(
+            namespace
+                .types
+                .keys()
+                .map(|name| ((BindingNamespace::Type, *name), origin.clone())),
+        );
+        self.origins.extend(
+            namespace
+                .modules
+                .keys()
+                .map(|name| ((BindingNamespace::Module, *name), origin.clone())),
+        );
+    }
+
+    fn origin(&self, source: ModuleScope) -> BindingOrigin {
+        match self.mode {
+            ImportMode::Import => BindingOrigin::Import { source },
+            ImportMode::Reexport => BindingOrigin::Reexport { source },
+        }
+    }
+
+    fn apply_import(
+        &mut self,
+        kind: &ImportKind,
+        path: &ModulePath,
+        dep: Option<&ModuleDecls>,
+        span: Span,
+        validate_members: bool,
+    ) {
+        let source = ModuleScope::Named(path.clone());
+        match kind {
+            ImportKind::Module => {
+                if let Some(alias) = path.segments().last() {
+                    self.insert_module(
+                        Ident::new(alias.as_str()),
+                        source.clone(),
+                        self.origin(source),
+                        span,
+                    );
+                }
+            }
+            ImportKind::ModuleAs(alias) => {
+                self.insert_module(*alias, source.clone(), self.origin(source), span);
+            }
+            ImportKind::Selective(items) => {
+                for item in items {
+                    let target = item.alias.unwrap_or_else(|| match item.kind {
+                        ImportItemKind::Name(name) => name,
+                        ImportItemKind::SelfModule => path
+                            .segments()
+                            .last()
+                            .map_or_else(|| Ident::new(""), |segment| Ident::new(segment.as_str())),
+                    });
+                    match item.kind {
+                        ImportItemKind::SelfModule => {
+                            self.insert_module(
+                                target,
+                                source.clone(),
+                                self.origin(source.clone()),
+                                span,
+                            );
+                        }
+                        ImportItemKind::Name(name) => {
+                            if let Some(dep) = dep {
+                                self.copy_named_members(
+                                    dep,
+                                    source.clone(),
+                                    name,
+                                    target,
+                                    span,
+                                    validate_members,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            ImportKind::Wildcard => {
+                if let Some(dep) = dep {
+                    self.copy_wildcard_members(&dep.exports, source, span);
+                }
+            }
+        }
+    }
+
+    fn copy_named_members(
+        &mut self,
+        dep: &ModuleDecls,
+        origin_module: ModuleScope,
+        source_name: Ident,
+        target_name: Ident,
+        span: Span,
+        validate_members: bool,
+    ) {
+        let mut found = false;
+        if let Some(key) = dep.exports.ty(source_name).cloned() {
+            found = true;
+            self.insert_type(target_name, key, self.origin(origin_module.clone()), span);
+        }
+        if let Some(value) = dep.exports.value(source_name).cloned() {
+            found = true;
+            self.insert_value(target_name, value, self.origin(origin_module.clone()), span);
+        }
+        if let Some(module) = dep.exports.module(source_name).cloned() {
+            found = true;
+            self.insert_module(
+                target_name,
+                module,
+                self.origin(origin_module.clone()),
+                span,
+            );
+        }
+        if found || !validate_members {
+            return;
+        }
+        if dep.locals.contains_member(source_name) {
+            self.push_private_member(origin_module, source_name, span);
+        } else {
+            self.push_missing_member(origin_module, source_name, span);
+        }
+    }
+
+    fn push_private_member(&mut self, imported: ModuleScope, name: Ident, span: Span) {
+        self.errors.push(DeclError::PrivateImportMember {
+            module: self.module.clone(),
+            imported,
+            name,
+            span,
+        });
+    }
+
+    fn push_missing_member(&mut self, imported: ModuleScope, name: Ident, span: Span) {
+        self.errors.push(DeclError::MissingImportMember {
+            module: self.module.clone(),
+            imported,
+            name,
+            span,
+        });
+    }
+
+    fn copy_wildcard_members(
+        &mut self,
+        source: &Namespace,
+        origin_module: ModuleScope,
+        span: Span,
+    ) {
+        for (name, key) in &source.types {
+            self.insert_type(*name, key.clone(), self.origin(origin_module.clone()), span);
+        }
+        for (name, value) in &source.values {
+            self.insert_value(
+                *name,
+                value.clone(),
+                self.origin(origin_module.clone()),
+                span,
+            );
+        }
+        for (name, module) in &source.modules {
+            self.insert_module(
+                *name,
+                module.clone(),
+                self.origin(origin_module.clone()),
+                span,
+            );
+        }
+    }
+
+    fn insert_value(
+        &mut self,
+        name: Ident,
+        value: ResolvedValue,
+        origin: BindingOrigin,
+        span: Span,
+    ) -> bool {
+        if !self.claim_origin(BindingNamespace::Value, name, origin, span) {
+            return false;
+        }
+        self.namespace.insert_value(name, value);
+        true
+    }
+
+    fn insert_type(
+        &mut self,
+        name: Ident,
+        key: NominalKey,
+        origin: BindingOrigin,
+        span: Span,
+    ) -> bool {
+        if !self.claim_origin(BindingNamespace::Type, name, origin, span) {
+            return false;
+        }
+        self.namespace.insert_type(name, key);
+        true
+    }
+
+    fn insert_module(
+        &mut self,
+        name: Ident,
+        module: ModuleScope,
+        origin: BindingOrigin,
+        span: Span,
+    ) -> bool {
+        if !self.claim_origin(BindingNamespace::Module, name, origin, span) {
+            return false;
+        }
+        self.namespace.insert_module(name, module);
+        true
+    }
+
+    fn claim_origin(
+        &mut self,
+        namespace: BindingNamespace,
+        name: Ident,
+        second: BindingOrigin,
+        span: Span,
+    ) -> bool {
+        let Some(first) = self.origins.get(&(namespace, name)).cloned() else {
+            self.origins.insert((namespace, name), second);
+            return true;
+        };
+        self.push_conflict(name, namespace, first, second, span);
+        false
+    }
+
+    fn push_conflict(
+        &mut self,
+        name: Ident,
+        namespace: BindingNamespace,
+        first: BindingOrigin,
+        second: BindingOrigin,
+        span: Span,
+    ) {
+        let error = match namespace {
+            BindingNamespace::Module => DeclError::DuplicateModuleBinding {
+                module: self.module.clone(),
+                name,
+                first,
+                second,
+                span,
+            },
+            BindingNamespace::Value | BindingNamespace::Type => match self.mode {
+                ImportMode::Import => DeclError::ImportConflict {
+                    module: self.module.clone(),
+                    name,
+                    namespace,
+                    first,
+                    second,
+                    span,
+                },
+                ImportMode::Reexport => DeclError::ReexportConflict {
+                    module: self.module.clone(),
+                    name,
+                    namespace,
+                    first,
+                    second,
+                    span,
+                },
+            },
+        };
+        self.errors.push(error);
+    }
+
+    fn finish_import_scope(self) -> (ImportScope, Vec<DeclError>) {
+        (
+            ImportScope {
+                namespace: self.namespace,
+                active_modules: self.active_modules,
+            },
+            self.errors,
+        )
+    }
+
+    fn finish_namespace(self) -> (Namespace, Vec<DeclError>) {
+        (self.namespace, self.errors)
     }
 }
 
@@ -232,7 +641,6 @@ pub(crate) struct CallableSig {
 #[derive(Debug, Clone)]
 pub(crate) struct CallableDef {
     pub(crate) id: CallableId,
-    pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) sig: CallableSig,
 }
 
@@ -246,7 +654,6 @@ pub(crate) struct CallableRef {
 #[derive(Clone)]
 pub(crate) struct AggregateSchema {
     pub(crate) key: NominalKey,
-    pub(crate) kind: AggregateKind,
     pub(crate) generics: GenericParams,
     pub(crate) fields: HashMap<Ident, FieldSchema>,
     pub(crate) methods: HashMap<Ident, MethodSchema>,
@@ -254,7 +661,6 @@ pub(crate) struct AggregateSchema {
 
 #[derive(Clone)]
 pub(crate) struct FieldSchema {
-    pub(crate) index: usize,
     pub(crate) ty: Type,
     pub(crate) has_default: bool,
 }
@@ -267,6 +673,7 @@ pub(crate) struct MethodSchema {
     pub(crate) ret: Type,
 }
 
+#[derive(Clone)]
 pub(crate) struct EnumSchema {
     pub(crate) key: NominalKey,
     pub(crate) generics: GenericParams,
@@ -280,14 +687,17 @@ pub(crate) enum VariantSchema {
     Struct(HashMap<Ident, FieldSchema>),
 }
 
+#[derive(Clone)]
 pub(crate) struct ExtendSchema {
     pub(crate) id: ExtendId,
     pub(crate) origin: ModuleScope,
     pub(crate) target: Type,
     pub(crate) generics: GenericParams,
     pub(crate) methods: HashMap<Ident, ExtendMethodSchema>,
+    span: Span,
 }
 
+#[derive(Clone)]
 pub(crate) struct ExtendMethodSchema {
     pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) generics: GenericParams,
@@ -304,33 +714,35 @@ pub(crate) enum ExtendMethodMatch<'a> {
     Ambiguous,
 }
 
-impl DeclarationIndex {
-    pub(crate) fn from_root(program: &Program) -> Self {
-        let mut index = Self::new();
-        let modules = [(ModuleScope::Root, program)];
-        for (scope, program) in &modules {
-            index.collect_module(program, scope.clone(), true);
-        }
-        index.apply_public_import_reexports(&modules);
-        index.build_import_scopes(&modules);
-        index.resolve_nominals();
-        index
-    }
+#[derive(Clone)]
+pub(crate) struct DeclTypeSite {
+    pub(crate) module: ModuleScope,
+    pub(crate) span: Span,
+    pub(crate) generics: GenericTypeContext,
+}
 
+pub(crate) struct GenericContextError {
+    pub(crate) module: ModuleScope,
+    pub(crate) error: GenericParamError,
+    pub(crate) span: Span,
+}
+
+impl DeclarationIndex {
     pub(crate) fn from_root_and_modules(
         root: &Program,
         resolved: &ResolveResult,
         always_active: HashSet<ModuleScope>,
     ) -> Self {
-        let mut index = Self::new();
-        index.always_active_modules = always_active;
+        let mut index = Self {
+            always_active_modules: always_active,
+            ..Self::default()
+        };
         let modules = Self::module_programs(root, resolved);
         for (scope, program) in &modules {
             index.collect_module(program, scope.clone(), matches!(scope, ModuleScope::Root));
         }
         index.apply_public_import_reexports(&modules);
         index.build_import_scopes(&modules);
-        index.resolve_nominals();
         index
     }
 
@@ -350,110 +762,265 @@ impl DeclarationIndex {
         modules
     }
 
-    fn new() -> Self {
-        Self {
-            modules: HashMap::new(),
-            aggregates: HashMap::new(),
-            enums: HashMap::new(),
-            extends: vec![],
-            always_active_modules: HashSet::new(),
-        }
+    pub(crate) fn errors(&self) -> &[DeclError] {
+        &self.errors
     }
 
-    fn resolve_nominals(&mut self) {
-        let mut scoped = HashMap::new();
-        let mut fallback = HashMap::new();
-        let mut ambiguous = HashSet::new();
-        let aggregate_items = self
-            .aggregates
-            .iter()
-            .map(|(key, schema)| (key, schema.generics.clone()));
-        let enum_items = self
-            .enums
-            .iter()
-            .map(|(key, schema)| (key, schema.generics.clone()));
+    pub(crate) fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
 
-        for (key, generics) in aggregate_items.chain(enum_items) {
-            let ty = nominal_type(key);
-            let entry = (ty.clone(), generics);
-            scoped.insert((key.module.clone(), key.name), entry.clone());
-            let is_ambiguous_fallback =
-                !ambiguous.contains(&key.name) && fallback.insert(key.name, entry).is_some();
-            if is_ambiguous_fallback {
-                fallback.remove(&key.name);
-                ambiguous.insert(key.name);
+    pub(crate) fn map_canonical_type_uses<F>(&mut self, mut f: F) -> Vec<GenericContextError>
+    where
+        F: FnMut(DeclTypeSite, Type) -> Type,
+    {
+        let mut errors = vec![];
+
+        let aggregate_keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
+        for key in aggregate_keys {
+            if !self.should_finalize_module(&key.module) {
+                continue;
+            }
+            let span = self.type_span_or_default(&key);
+            let Some(schema) = self.aggregates.get_mut(&key) else {
+                continue;
+            };
+            let owner_generics = generic_context(
+                key.module.clone(),
+                &schema.generics.type_params,
+                &schema.generics.const_params,
+                span,
+                &mut errors,
+            );
+            for field in schema.fields.values_mut() {
+                let site = DeclTypeSite {
+                    module: key.module.clone(),
+                    span,
+                    generics: owner_generics.clone(),
+                };
+                field.ty = f(site, field.ty.clone());
+            }
+            for method in schema.methods.values_mut() {
+                let generics = extend_generic_context(
+                    key.module.clone(),
+                    &owner_generics,
+                    &method.generics.type_params,
+                    &method.generics.const_params,
+                    span,
+                    &mut errors,
+                );
+                for param in &mut method.params {
+                    let site = DeclTypeSite {
+                        module: key.module.clone(),
+                        span,
+                        generics: generics.clone(),
+                    };
+                    param.ty = f(site, param.ty.clone());
+                }
+                let site = DeclTypeSite {
+                    module: key.module.clone(),
+                    span,
+                    generics,
+                };
+                method.ret = f(site, method.ret.clone());
             }
         }
 
-        for agg in self.aggregates.values_mut() {
-            for field in agg.fields.values_mut() {
-                field.ty = resolve_nominal(&agg.key.module, &field.ty, &scoped, &fallback);
+        let enum_keys = self.enums.keys().cloned().collect::<Vec<_>>();
+        for key in enum_keys {
+            if !self.should_finalize_module(&key.module) {
+                continue;
             }
-            for method in agg.methods.values_mut() {
-                method.ret = resolve_nominal(&agg.key.module, &method.ret, &scoped, &fallback);
-                for param in &mut method.params {
-                    param.ty = resolve_nominal(&agg.key.module, &param.ty, &scoped, &fallback);
-                }
-            }
-        }
-        for extend in &mut self.extends {
-            extend.target = resolve_nominal(&extend.origin, &extend.target, &scoped, &fallback);
-            for method in extend.methods.values_mut() {
-                method.ret = resolve_nominal(&extend.origin, &method.ret, &scoped, &fallback);
-                for param in &mut method.params {
-                    param.ty = resolve_nominal(&extend.origin, &param.ty, &scoped, &fallback);
-                }
-            }
-        }
-        for enm in self.enums.values_mut() {
-            for variant in enm.variants.values_mut() {
+            let span = self.type_span_or_default(&key);
+            let Some(schema) = self.enums.get_mut(&key) else {
+                continue;
+            };
+            let generics = generic_context(
+                key.module.clone(),
+                &schema.generics.type_params,
+                &schema.generics.const_params,
+                span,
+                &mut errors,
+            );
+            for variant in schema.variants.values_mut() {
                 match variant {
+                    VariantSchema::Unit => {}
                     VariantSchema::Tuple(types) => {
-                        for ty in types.iter_mut() {
-                            *ty = resolve_nominal(&enm.key.module, ty, &scoped, &fallback);
+                        for ty in types {
+                            let site = DeclTypeSite {
+                                module: key.module.clone(),
+                                span,
+                                generics: generics.clone(),
+                            };
+                            *ty = f(site, ty.clone());
                         }
                     }
                     VariantSchema::Struct(fields) => {
                         for field in fields.values_mut() {
-                            field.ty =
-                                resolve_nominal(&enm.key.module, &field.ty, &scoped, &fallback);
+                            let site = DeclTypeSite {
+                                module: key.module.clone(),
+                                span,
+                                generics: generics.clone(),
+                            };
+                            field.ty = f(site, field.ty.clone());
                         }
                     }
-                    VariantSchema::Unit => {}
                 }
             }
         }
+
+        for index in 0..self.extends.len() {
+            let origin = self.extends[index].origin.clone();
+            if !self.should_finalize_module(&origin) {
+                continue;
+            }
+            let span = self.extends[index].span;
+            let extend = &mut self.extends[index];
+            let mut generics = generic_context(
+                origin.clone(),
+                &extend.generics.type_params,
+                &extend.generics.const_params,
+                span,
+                &mut errors,
+            );
+            collect_implicit_extend_generics(&extend.target, &mut generics, true);
+            let target_site = DeclTypeSite {
+                module: origin.clone(),
+                span,
+                generics: generics.clone(),
+            };
+            extend.target = f(target_site, extend.target.clone());
+            for method in extend.methods.values_mut() {
+                for param in &mut method.params {
+                    let site = DeclTypeSite {
+                        module: origin.clone(),
+                        span,
+                        generics: generics.clone(),
+                    };
+                    param.ty = f(site, param.ty.clone());
+                }
+                let site = DeclTypeSite {
+                    module: origin.clone(),
+                    span,
+                    generics: generics.clone(),
+                };
+                method.ret = f(site, method.ret.clone());
+            }
+        }
+
+        let module_keys = self.modules.keys().cloned().collect::<Vec<_>>();
+        for module in module_keys {
+            if !self.should_finalize_module(&module) {
+                continue;
+            }
+            let Some(decls) = self.modules.get_mut(&module) else {
+                continue;
+            };
+            for value in decls.locals.values.values_mut() {
+                let span = self
+                    .value_spans
+                    .get(&(value.module.clone(), value.name))
+                    .copied()
+                    .unwrap_or(Span::new(0, 0));
+                let generics = match &value.decl {
+                    ValueDecl::Func(sig) => generic_context(
+                        value.module.clone(),
+                        &sig.generics.type_params,
+                        &sig.generics.const_params,
+                        span,
+                        &mut errors,
+                    ),
+                    ValueDecl::Const(_) => GenericTypeContext::default(),
+                };
+                let site = DeclTypeSite {
+                    module: value.module.clone(),
+                    span,
+                    generics,
+                };
+                match &mut value.decl {
+                    ValueDecl::Func(sig) => sig.ty = f(site, sig.ty.clone()),
+                    ValueDecl::Const(ty) => *ty = f(site, ty.clone()),
+                }
+            }
+        }
+
+        self.sync_value_projections();
+        errors
+    }
+
+    fn type_span_or_default(&self, key: &NominalKey) -> Span {
+        self.type_spans.get(key).copied().unwrap_or(Span::new(0, 0))
+    }
+
+    pub(crate) fn should_finalize_type_refs(&self, module: &ModuleScope) -> bool {
+        should_finalize_type_refs(module, &self.always_active_modules)
+    }
+
+    fn should_finalize_module(&self, module: &ModuleScope) -> bool {
+        self.should_finalize_type_refs(module)
+    }
+
+    fn sync_value_projections(&mut self) {
+        let locals = self
+            .modules
+            .values()
+            .flat_map(|decls| decls.locals.values.values())
+            .map(|value| ((value.module.clone(), value.name), value.decl.clone()))
+            .collect::<HashMap<_, _>>();
+
         for decls in self.modules.values_mut() {
-            Self::resolve_namespace_values(&mut decls.locals, &scoped, &fallback);
-            Self::resolve_namespace_values(&mut decls.exports, &scoped, &fallback);
-            Self::resolve_namespace_values(&mut decls.imports.namespace, &scoped, &fallback);
+            sync_namespace_values(&mut decls.exports, &locals);
+            sync_namespace_values(&mut decls.imports.namespace, &locals);
         }
     }
 
-    fn resolve_namespace_values(
-        namespace: &mut Namespace,
-        scoped: &HashMap<(ModuleScope, Ident), (Type, GenericParams)>,
-        fallback: &HashMap<Ident, (Type, GenericParams)>,
-    ) {
-        for value in namespace.values.values_mut() {
-            Self::resolve_value_decl(&value.module, &mut value.decl, scoped, fallback);
-        }
-    }
-
-    fn resolve_value_decl(
+    fn insert_local_value(
+        &mut self,
+        decls: &mut ModuleDecls,
         scope: &ModuleScope,
-        decl: &mut ValueDecl,
-        scoped: &HashMap<(ModuleScope, Ident), (Type, GenericParams)>,
-        fallback: &HashMap<Ident, (Type, GenericParams)>,
-    ) {
-        match decl {
-            ValueDecl::Func(sig) => {
-                sig.ty = resolve_nominal(scope, &sig.ty, scoped, fallback);
-            }
-            ValueDecl::Const(ty) => {
-                *ty = resolve_nominal(scope, ty, scoped, fallback);
-            }
+        name: Ident,
+        value: ResolvedValue,
+        exported: bool,
+        span: Span,
+    ) -> bool {
+        if decls.locals.values.contains_key(&name) {
+            self.errors.push(DeclError::DuplicateValue {
+                module: scope.clone(),
+                name,
+                span,
+            });
+            return false;
         }
+        decls.locals.insert_value(name, value.clone());
+        if exported {
+            decls.exports.insert_value(name, value);
+        }
+        self.value_spans.insert((scope.clone(), name), span);
+        true
+    }
+
+    fn insert_local_type(
+        &mut self,
+        decls: &mut ModuleDecls,
+        scope: &ModuleScope,
+        name: Ident,
+        key: NominalKey,
+        exported: bool,
+        span: Span,
+    ) -> bool {
+        if decls.locals.types.contains_key(&name) {
+            self.errors.push(DeclError::DuplicateType {
+                module: scope.clone(),
+                name,
+                span,
+            });
+            return false;
+        }
+        decls.locals.insert_type(name, key.clone());
+        if exported {
+            decls.exports.insert_type(name, key);
+        }
+        true
     }
 
     fn collect_module(&mut self, program: &Program, scope: ModuleScope, export_all: bool) {
@@ -475,10 +1042,14 @@ impl DeclarationIndex {
                             ty,
                         }),
                     };
-                    decls.locals.insert_value(func.name, value.clone());
-                    if exported {
-                        decls.exports.insert_value(func.name, value);
-                    }
+                    self.insert_local_value(
+                        &mut decls,
+                        &scope,
+                        func.name,
+                        value,
+                        exported,
+                        func_node.span,
+                    );
                 }
                 Stmt::Aggregate(agg_node) => {
                     let agg = &agg_node.node;
@@ -488,11 +1059,10 @@ impl DeclarationIndex {
                         name: agg.name,
                     };
                     let mut fields = HashMap::new();
-                    for (i, field) in agg.fields.iter().enumerate() {
+                    for field in &agg.fields {
                         fields.insert(
                             field.name,
                             FieldSchema {
-                                index: i,
                                 ty: field.ty.clone(),
                                 has_default: field.default.is_some(),
                             },
@@ -510,20 +1080,25 @@ impl DeclarationIndex {
                             },
                         );
                     }
-                    decls.locals.insert_type(agg.name, key.clone());
-                    if exported {
-                        decls.exports.insert_type(agg.name, key.clone());
-                    }
-                    self.aggregates.insert(
+                    if self.insert_local_type(
+                        &mut decls,
+                        &scope,
+                        agg.name,
                         key.clone(),
-                        AggregateSchema {
-                            key,
-                            kind: agg.kind,
-                            generics: generic_params(&agg.type_params, &agg.const_params),
-                            fields,
-                            methods,
-                        },
-                    );
+                        exported,
+                        agg_node.span,
+                    ) {
+                        self.type_spans.insert(key.clone(), agg_node.span);
+                        self.aggregates.insert(
+                            key.clone(),
+                            AggregateSchema {
+                                key,
+                                generics: generic_params(&agg.type_params, &agg.const_params),
+                                fields,
+                                methods,
+                            },
+                        );
+                    }
                 }
                 Stmt::Enum(enum_node) => {
                     let enm = &enum_node.node;
@@ -539,11 +1114,10 @@ impl DeclarationIndex {
                             VariantKind::Tuple(types) => VariantSchema::Tuple(types.clone()),
                             VariantKind::Struct(fields) => {
                                 let mut field_map = HashMap::new();
-                                for (i, f) in fields.iter().enumerate() {
+                                for f in fields {
                                     field_map.insert(
                                         f.name,
                                         FieldSchema {
-                                            index: i,
                                             ty: f.ty.clone(),
                                             has_default: f.default.is_some(),
                                         },
@@ -554,18 +1128,24 @@ impl DeclarationIndex {
                         };
                         variants.insert(variant.name, schema);
                     }
-                    decls.locals.insert_type(enm.name, key.clone());
-                    if exported {
-                        decls.exports.insert_type(enm.name, key.clone());
-                    }
-                    self.enums.insert(
+                    if self.insert_local_type(
+                        &mut decls,
+                        &scope,
+                        enm.name,
                         key.clone(),
-                        EnumSchema {
-                            key,
-                            generics: generic_params(&enm.type_params, &enm.const_params),
-                            variants,
-                        },
-                    );
+                        exported,
+                        enum_node.span,
+                    ) {
+                        self.type_spans.insert(key.clone(), enum_node.span);
+                        self.enums.insert(
+                            key.clone(),
+                            EnumSchema {
+                                key,
+                                generics: generic_params(&enm.type_params, &enm.const_params),
+                                variants,
+                            },
+                        );
+                    }
                 }
                 Stmt::ExternFunc(ext_node) => {
                     let ext = &ext_node.node;
@@ -579,10 +1159,14 @@ impl DeclarationIndex {
                             ty,
                         }),
                     };
-                    decls.locals.insert_value(ext.name, value.clone());
-                    if exported {
-                        decls.exports.insert_value(ext.name, value);
-                    }
+                    self.insert_local_value(
+                        &mut decls,
+                        &scope,
+                        ext.name,
+                        value,
+                        exported,
+                        ext_node.span,
+                    );
                 }
                 Stmt::ExternType(ext_node) => {
                     let ext = &ext_node.node;
@@ -591,9 +1175,15 @@ impl DeclarationIndex {
                         kind: NominalKind::Extern,
                         name: ext.name,
                     };
-                    decls.locals.insert_type(ext.name, key.clone());
-                    if exported {
-                        decls.exports.insert_type(ext.name, key);
+                    if self.insert_local_type(
+                        &mut decls,
+                        &scope,
+                        ext.name,
+                        key.clone(),
+                        exported,
+                        ext_node.span,
+                    ) {
+                        self.type_spans.insert(key, ext_node.span);
                     }
                 }
                 Stmt::Const(const_node) => {
@@ -603,10 +1193,14 @@ impl DeclarationIndex {
                         name: c.name,
                         decl: ValueDecl::Const(c.ty.clone().unwrap_or(Type::Infer)),
                     };
-                    decls.locals.insert_value(c.name, value.clone());
-                    if exported {
-                        decls.exports.insert_value(c.name, value);
-                    }
+                    self.insert_local_value(
+                        &mut decls,
+                        &scope,
+                        c.name,
+                        value,
+                        exported,
+                        const_node.span,
+                    );
                 }
                 Stmt::Extend(extend_node) => {
                     let id = ExtendId {
@@ -647,6 +1241,7 @@ impl DeclarationIndex {
                         target: ext.ty.clone(),
                         generics: generic_params(&ext.type_params, &ext.const_params),
                         methods,
+                        span: extend_node.span,
                     });
                 }
                 _ => {}
@@ -658,11 +1253,12 @@ impl DeclarationIndex {
 
     fn apply_public_import_reexports(&mut self, modules: &[(ModuleScope, &Program)]) {
         for (scope, program) in modules {
-            let Some(mut exports) = self.modules.get(scope).map(|decls| decls.exports.clone())
-            else {
+            let Some(exports) = self.modules.get(scope).map(|decls| decls.exports.clone()) else {
                 continue;
             };
 
+            let mut builder =
+                ImportScopeBuilder::with_namespace(scope.clone(), exports, ImportMode::Reexport);
             for stmt in &program.stmts {
                 let Stmt::Import(import) = &stmt.node else {
                     continue;
@@ -672,10 +1268,12 @@ impl DeclarationIndex {
                 }
                 let path = ModulePath::from_idents(&import.node.path);
                 let dep_scope = ModuleScope::Named(path.clone());
-                let dep_exports = self.modules.get(&dep_scope).map(|decls| &decls.exports);
-                Self::apply_import(&import.node.kind, &path, dep_exports, &mut exports);
+                let dep = self.modules.get(&dep_scope);
+                builder.apply_import(&import.node.kind, &path, dep, import.span, true);
             }
 
+            let (exports, errors) = builder.finish_namespace();
+            self.errors.extend(errors);
             if let Some(decls) = self.modules.get_mut(scope) {
                 decls.exports = exports;
             }
@@ -684,100 +1282,27 @@ impl DeclarationIndex {
 
     fn build_import_scopes(&mut self, modules: &[(ModuleScope, &Program)]) {
         for (scope, program) in modules {
-            let mut imports = ImportScope::default();
+            let mut builder = ImportScopeBuilder::new(scope.clone(), ImportMode::Import);
+            if let Some(decls) = self.modules.get(scope) {
+                builder.seed_origins(&decls.locals, BindingOrigin::Local);
+            }
             for stmt in &program.stmts {
                 let Stmt::Import(import) = &stmt.node else {
                     continue;
                 };
                 let path = ModulePath::from_idents(&import.node.path);
                 let dep_scope = ModuleScope::Named(path.clone());
-                imports.active_modules.insert(dep_scope.clone());
-                let dep_exports = self.modules.get(&dep_scope).map(|decls| &decls.exports);
-                Self::apply_import(
-                    &import.node.kind,
-                    &path,
-                    dep_exports,
-                    &mut imports.namespace,
-                );
+                builder.active_modules.insert(dep_scope.clone());
+                let dep = self.modules.get(&dep_scope);
+                let validate_members = !matches!(import.node.visibility, Visibility::Public);
+                builder.apply_import(&import.node.kind, &path, dep, import.span, validate_members);
             }
+            let (mut imports, errors) = builder.finish_import_scope();
+            self.errors.extend(errors);
             imports.activate_imported_origins();
             if let Some(decls) = self.modules.get_mut(scope) {
                 decls.imports = imports;
             }
-        }
-    }
-
-    fn apply_import(
-        kind: &ImportKind,
-        path: &ModulePath,
-        dep_exports: Option<&Namespace>,
-        namespace: &mut Namespace,
-    ) {
-        let module = ModuleScope::Named(path.clone());
-        match kind {
-            ImportKind::Module => {
-                if let Some(alias) = path.segments().last() {
-                    namespace.insert_module(Ident::new(alias.as_str()), module);
-                }
-            }
-            ImportKind::ModuleAs(alias) => {
-                namespace.insert_module(*alias, module);
-            }
-            ImportKind::Selective(items) => {
-                for item in items {
-                    let target = item.alias.unwrap_or_else(|| match item.kind {
-                        ImportItemKind::Name(name) => name,
-                        ImportItemKind::SelfModule => path
-                            .segments()
-                            .last()
-                            .map_or_else(|| Ident::new(""), |segment| Ident::new(segment.as_str())),
-                    });
-                    match item.kind {
-                        ImportItemKind::SelfModule => {
-                            namespace.insert_module(target, module.clone());
-                        }
-                        ImportItemKind::Name(name) => {
-                            if let Some(dep_exports) = dep_exports {
-                                Self::copy_named_members(dep_exports, name, target, namespace);
-                            }
-                        }
-                    }
-                }
-            }
-            ImportKind::Wildcard => {
-                if let Some(dep_exports) = dep_exports {
-                    Self::copy_wildcard_members(dep_exports, namespace);
-                }
-            }
-        }
-    }
-
-    fn copy_named_members(
-        source: &Namespace,
-        source_name: Ident,
-        target_name: Ident,
-        dest: &mut Namespace,
-    ) {
-        if let Some(key) = source.ty(source_name).cloned() {
-            dest.insert_type(target_name, key);
-        }
-        if let Some(value) = source.value(source_name).cloned() {
-            dest.insert_value(target_name, value);
-        }
-        if let Some(module) = source.module(source_name).cloned() {
-            dest.insert_module(target_name, module);
-        }
-    }
-
-    fn copy_wildcard_members(source: &Namespace, dest: &mut Namespace) {
-        for (name, key) in &source.types {
-            dest.types.entry(*name).or_insert_with(|| key.clone());
-        }
-        for (name, value) in &source.values {
-            dest.values.entry(*name).or_insert_with(|| value.clone());
-        }
-        for (name, module) in &source.modules {
-            dest.modules.entry(*name).or_insert_with(|| module.clone());
         }
     }
 
@@ -841,6 +1366,15 @@ impl DeclarationIndex {
             .or_else(|| self.imported_type(module, name))
     }
 
+    pub(crate) fn resolve_visible_type_key(
+        &self,
+        module: &ModuleScope,
+        qualifier: Option<Ident>,
+        name: Ident,
+    ) -> Option<NominalKey> {
+        resolve_visible_type_key_in(self, module, qualifier, name)
+    }
+
     pub(crate) fn imports_module(&self, module: &ModuleScope, imported: &ModuleScope) -> bool {
         self.modules
             .get(module)
@@ -883,38 +1417,34 @@ impl DeclarationIndex {
         self.enums.get(key)
     }
 
+    fn nominal_generics(&self, key: &NominalKey) -> Option<GenericParams> {
+        match key.kind {
+            NominalKind::Struct | NominalKind::DataRef => {
+                self.aggregate(key).map(|schema| schema.generics.clone())
+            }
+            NominalKind::Enum => self.enum_schema(key).map(|schema| schema.generics.clone()),
+            NominalKind::Extern => self
+                .modules
+                .get(&key.module)?
+                .locals
+                .ty(key.name)
+                .map(|_| GenericParams::default()),
+        }
+    }
+
     pub(crate) fn key_for_type(&self, ty: &Type) -> Option<NominalKey> {
         let Type::Nominal(nominal) = ty else {
             return None;
         };
-        let name = nominal.name;
-        let origin = nominal.origin.clone();
-
-        if let Some(origin) = origin {
-            let scope = ModuleScope::Named(
+        let scope = match &nominal.origin {
+            Some(origin) => ModuleScope::Named(
                 ModulePath::new(origin.iter().cloned().collect())
                     .expect("AST validates module paths"),
-            );
-            if let Some(key) = self.local_type(&scope, name) {
-                return Some(key);
-            }
-        }
-
-        if let Some(key) = self.local_type(&ModuleScope::Root, name) {
-            return Some(key);
-        }
-
-        let mut found = None;
-        for decls in self.modules.values() {
-            let Some(key) = decls.exports.ty(name) else {
-                continue;
-            };
-            if found.is_some() {
-                return None;
-            }
-            found = Some(key.clone());
-        }
-        found
+            ),
+            None => ModuleScope::Root,
+        };
+        self.local_type(&scope, nominal.name)
+            .filter(|key| key.kind == nominal.kind)
     }
 
     pub(crate) fn aggregate_field_type(&self, receiver: &Type, name: Ident) -> Option<Type> {
@@ -930,10 +1460,6 @@ impl DeclarationIndex {
 
     pub(crate) fn extends(&self) -> impl Iterator<Item = &ExtendSchema> {
         self.extends.iter()
-    }
-
-    pub(crate) fn extends_for(&self, receiver: &Type) -> impl Iterator<Item = &ExtendSchema> {
-        self.extends().filter(move |e| &e.target == receiver)
     }
 
     pub(crate) fn find_extend_method<F>(
@@ -1003,7 +1529,6 @@ impl DeclarationIndex {
         Some(CallableRef {
             def: CallableDef {
                 id,
-                receiver: None,
                 sig: CallableSig {
                     owner_generics: GenericParams::default(),
                     generics: sig.generics.clone(),
@@ -1012,7 +1537,7 @@ impl DeclarationIndex {
                 },
             },
             receiver_ty: None,
-            owner_args: GenericArgs::empty(),
+            owner_args: GenericArgs::default(),
         })
     }
 
@@ -1048,7 +1573,6 @@ impl DeclarationIndex {
                     name,
                     method.receiver.is_some(),
                 ),
-                receiver: method.receiver,
                 sig: CallableSig {
                     owner_generics: aggregate.generics.clone(),
                     generics: method.generics.clone(),
@@ -1057,7 +1581,7 @@ impl DeclarationIndex {
                 },
             },
             receiver_ty,
-            owner_args: GenericArgs::empty(),
+            owner_args: GenericArgs::default(),
         }
     }
 
@@ -1069,7 +1593,7 @@ impl DeclarationIndex {
         method: &ExtendMethodSchema,
         owner_args: GenericArgs,
     ) -> Option<CallableRef> {
-        let receiver = method.receiver?;
+        method.receiver?;
         let (type_subst, const_subst) = extend.generics.substitutions(&owner_args);
         let template_params = method
             .params
@@ -1086,7 +1610,6 @@ impl DeclarationIndex {
         Some(CallableRef {
             def: CallableDef {
                 id: CallableId::extend_method(extend.id.clone(), name),
-                receiver: Some(receiver),
                 sig: CallableSig {
                     owner_generics: extend.generics.clone(),
                     generics: method.generics.clone(),
@@ -1117,7 +1640,6 @@ impl DeclarationIndex {
         Some(CallableRef {
             def: CallableDef {
                 id: CallableId::enum_variant(enum_key.clone(), variant),
-                receiver: None,
                 sig: CallableSig {
                     owner_generics,
                     generics: GenericParams::default(),
@@ -1126,7 +1648,7 @@ impl DeclarationIndex {
                 },
             },
             receiver_ty: None,
-            owner_args: GenericArgs::empty(),
+            owner_args: GenericArgs::default(),
         })
     }
 }
@@ -1204,7 +1726,7 @@ fn match_generic_template_args(
     span: Span,
 ) -> Option<GenericTemplateMatch> {
     if generics.is_empty() {
-        return (template == concrete).then(|| Ok(GenericArgs::empty()));
+        return (template == concrete).then(|| Ok(GenericArgs::default()));
     }
 
     let mut solver = Solver::default();
@@ -1250,17 +1772,302 @@ fn more_specific(a: &Type, b: &Type) -> bool {
     compare_specificity(a, b) == Specificity::MoreSpecific
 }
 
-struct GenericTemplate<'a> {
-    generics: &'a GenericParams,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypeRefError {
+    Unknown {
+        qualifier: Option<Ident>,
+        name: Ident,
+    },
+    GenericArity {
+        expected: usize,
+        found: usize,
+    },
+    GenericArgKindMismatch {
+        expected: &'static str,
+    },
 }
 
-impl TypeFolder for GenericTemplate<'_> {
+impl DeclarationIndex {
+    pub(crate) fn finalize_type_ref(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        ty: &Type,
+    ) -> Result<Type, TypeRefError> {
+        match ty {
+            Type::UnresolvedName(name) => {
+                if let Some(TypeParamBinding::Explicit(id)) = generics.type_param(*name) {
+                    return Ok(Type::Var(id));
+                }
+                if generics.has_const_param(*name) {
+                    return Err(TypeRefError::Unknown {
+                        qualifier: None,
+                        name: *name,
+                    });
+                }
+                self.resolve_visible_type_key(module, None, *name)
+                    .map(|key| nominal_type(&key))
+                    .ok_or(TypeRefError::Unknown {
+                        qualifier: None,
+                        name: *name,
+                    })
+            }
+            Type::UnresolvedNominal {
+                qualifier,
+                name,
+                generic_args,
+            } => {
+                if qualifier.is_none() && generic_args.is_empty() {
+                    if let Some(TypeParamBinding::Explicit(id)) = generics.type_param(*name) {
+                        return Ok(Type::Var(id));
+                    }
+                    if generics.has_const_param(*name) {
+                        return Err(TypeRefError::Unknown {
+                            qualifier: None,
+                            name: *name,
+                        });
+                    }
+                }
+                let key = self
+                    .resolve_visible_type_key(module, *qualifier, *name)
+                    .ok_or(TypeRefError::Unknown {
+                        qualifier: *qualifier,
+                        name: *name,
+                    })?;
+                self.finalize_nominal_type_ref(module, generics, &key, generic_args)
+            }
+            Type::Func { params, ret } => Ok(Type::Func {
+                params: params
+                    .iter()
+                    .map(|param| {
+                        Ok(FuncParam::new(
+                            self.finalize_type_ref(module, generics, &param.ty)?,
+                            param.mutable,
+                        ))
+                    })
+                    .collect::<Result<_, _>>()?,
+                ret: Box::new(self.finalize_type_ref(module, generics, ret)?),
+            }),
+            Type::Tuple(elems) => elems
+                .iter()
+                .map(|ty| self.finalize_type_ref(module, generics, ty))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Type::Tuple),
+            Type::NamedTuple(fields) => fields
+                .iter()
+                .map(|(name, ty)| Ok((*name, self.finalize_type_ref(module, generics, ty)?)))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Type::NamedTuple),
+            Type::Nominal(nominal) => Ok(Type::nominal(
+                nominal.kind,
+                nominal.name,
+                nominal
+                    .type_args
+                    .iter()
+                    .map(|ty| self.finalize_type_ref(module, generics, ty))
+                    .collect::<Result<_, _>>()?,
+                nominal
+                    .const_args
+                    .iter()
+                    .map(|arg| self.finalize_const_arg(generics, arg))
+                    .collect::<Result<_, _>>()?,
+                nominal.origin.clone(),
+            )),
+            Type::List { elem } => Ok(Type::List {
+                elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
+            }),
+            Type::Slice { elem } => Ok(Type::Slice {
+                elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
+            }),
+            Type::Array { elem, len } => Ok(Type::Array {
+                elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
+                len: self.finalize_array_len(generics, *len)?,
+            }),
+            Type::Map { key, value } => Ok(Type::Map {
+                key: Box::new(self.finalize_type_ref(module, generics, key)?),
+                value: Box::new(self.finalize_type_ref(module, generics, value)?),
+            }),
+            Type::Infer
+            | Type::Any
+            | Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Var(_) => Ok(ty.clone()),
+        }
+    }
+
+    fn finalize_nominal_type_ref(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        key: &NominalKey,
+        args: &[GenericArg],
+    ) -> Result<Type, TypeRefError> {
+        let params = self.nominal_generics(key).unwrap_or_default();
+        let type_len = params.type_params.len();
+        let expected = type_len + params.const_params.len();
+        if args.len() != expected {
+            return Err(TypeRefError::GenericArity {
+                expected,
+                found: args.len(),
+            });
+        }
+
+        let mut type_args = Vec::with_capacity(type_len);
+        let mut const_args = Vec::with_capacity(params.const_params.len());
+        for (index, arg) in args.iter().enumerate() {
+            if index < type_len {
+                let GenericArg::Type(ty) = arg else {
+                    return Err(TypeRefError::GenericArgKindMismatch { expected: "type" });
+                };
+                type_args.push(self.finalize_type_ref(module, generics, ty)?);
+            } else {
+                const_args.push(self.finalize_generic_const_arg(module, generics, arg)?);
+            }
+        }
+        Ok(nominal_type_with_args(key, &type_args, &const_args))
+    }
+
+    fn finalize_generic_const_arg(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        arg: &GenericArg,
+    ) -> Result<ConstArg, TypeRefError> {
+        match arg {
+            GenericArg::Const(arg) => self.finalize_const_arg(generics, arg),
+            GenericArg::Type(ty) => match bare_type_name(ty) {
+                Some(name) => self.finalize_const_name_arg(generics, name),
+                None => {
+                    let ty = self.finalize_type_ref(module, generics, ty)?;
+                    match ty {
+                        Type::Var(id) => {
+                            let name = generics.type_param_name(id).unwrap_or(Ident::new("_"));
+                            Err(TypeRefError::Unknown {
+                                qualifier: None,
+                                name,
+                            })
+                        }
+                        _ => Err(TypeRefError::GenericArgKindMismatch { expected: "const" }),
+                    }
+                }
+            },
+        }
+    }
+
+    fn finalize_const_arg(
+        &self,
+        generics: &GenericTypeContext,
+        arg: &ConstArg,
+    ) -> Result<ConstArg, TypeRefError> {
+        match arg {
+            ConstArg::Name(name) => self.finalize_const_name_arg(generics, *name),
+            ConstArg::Value(_) | ConstArg::Param(_) => Ok(arg.clone()),
+        }
+    }
+
+    fn finalize_const_name_arg(
+        &self,
+        generics: &GenericTypeContext,
+        name: Ident,
+    ) -> Result<ConstArg, TypeRefError> {
+        Ok(self
+            .finalize_const_name(generics, name)?
+            .map_or(ConstArg::Name(name), ConstArg::Param))
+    }
+
+    fn finalize_const_name(
+        &self,
+        generics: &GenericTypeContext,
+        name: Ident,
+    ) -> Result<Option<ConstParamId>, TypeRefError> {
+        if generics.has_type_param(name) {
+            return Err(TypeRefError::Unknown {
+                qualifier: None,
+                name,
+            });
+        }
+        Ok(generics.const_param(name))
+    }
+
+    fn finalize_array_len(
+        &self,
+        generics: &GenericTypeContext,
+        len: ArrayLen,
+    ) -> Result<ArrayLen, TypeRefError> {
+        match len {
+            ArrayLen::Named(name) => Ok(self
+                .finalize_const_name(generics, name)?
+                .map_or(ArrayLen::Named(name), ArrayLen::Param)),
+            ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Param(_) => Ok(len),
+        }
+    }
+}
+
+fn generic_context(
+    module: ModuleScope,
+    type_params: &[TypeParam],
+    const_params: &[ConstParam],
+    span: Span,
+    errors: &mut Vec<GenericContextError>,
+) -> GenericTypeContext {
+    match GenericTypeContext::try_from_params(type_params, const_params) {
+        Ok(generics) => generics,
+        Err(error) => {
+            errors.push(GenericContextError {
+                module,
+                error,
+                span,
+            });
+            GenericTypeContext::default()
+        }
+    }
+}
+
+fn extend_generic_context(
+    module: ModuleScope,
+    owner: &GenericTypeContext,
+    type_params: &[TypeParam],
+    const_params: &[ConstParam],
+    span: Span,
+    errors: &mut Vec<GenericContextError>,
+) -> GenericTypeContext {
+    match owner.try_with_shadowing_params(type_params, const_params) {
+        Ok(generics) => generics,
+        Err(error) => {
+            errors.push(GenericContextError {
+                module,
+                error,
+                span,
+            });
+            owner.clone()
+        }
+    }
+}
+
+fn sync_namespace_values(
+    namespace: &mut Namespace,
+    locals: &HashMap<(ModuleScope, Ident), ValueDecl>,
+) {
+    for value in namespace.values.values_mut() {
+        if let Some(decl) = locals.get(&(value.module.clone(), value.name)) {
+            value.decl = decl.clone();
+        }
+    }
+}
+
+struct GenericTemplate {
+    generics: GenericTypeContext,
+}
+
+impl TypeFolder for GenericTemplate {
     fn fold_unresolved_name(&mut self, name: Ident) -> Type {
-        self.generics
-            .type_params
-            .iter()
-            .find(|param| param.name == name)
-            .map_or(Type::UnresolvedName(name), |param| Type::Var(param.id))
+        match self.generics.type_param(name) {
+            Some(TypeParamBinding::Explicit(id)) => Type::Var(id),
+            Some(TypeParamBinding::ImplicitExtend) | None => Type::UnresolvedName(name),
+        }
     }
 
     fn fold_unresolved_nominal(
@@ -1271,13 +2078,9 @@ impl TypeFolder for GenericTemplate<'_> {
     ) -> Type {
         if qualifier.is_none()
             && generic_args.is_empty()
-            && let Some(param) = self
-                .generics
-                .type_params
-                .iter()
-                .find(|param| param.name == name)
+            && let Some(TypeParamBinding::Explicit(id)) = self.generics.type_param(name)
         {
-            return Type::Var(param.id);
+            return Type::Var(id);
         }
         self.fold_unresolved_nominal_default(qualifier, name, generic_args)
     }
@@ -1286,10 +2089,8 @@ impl TypeFolder for GenericTemplate<'_> {
         match arg {
             ConstArg::Name(name) => self
                 .generics
-                .const_params
-                .iter()
-                .find(|param| param.name == *name)
-                .map_or_else(|| arg.clone(), |param| ConstArg::Param(param.id)),
+                .const_param(*name)
+                .map_or_else(|| arg.clone(), ConstArg::Param),
             ConstArg::Value(_) | ConstArg::Param(_) => arg.clone(),
         }
     }
@@ -1298,81 +2099,70 @@ impl TypeFolder for GenericTemplate<'_> {
         match len {
             ArrayLen::Named(name) => self
                 .generics
-                .const_params
-                .iter()
-                .find(|param| param.name == name)
-                .map_or(ArrayLen::Named(name), |param| ArrayLen::Param(param.id)),
+                .const_param(name)
+                .map_or(ArrayLen::Named(name), ArrayLen::Param),
             other => other,
         }
     }
 }
 
 pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type {
-    GenericTemplate { generics }.fold_type(ty)
-}
-
-struct NominalResolver<'a> {
-    scope: &'a ModuleScope,
-    scoped: &'a HashMap<(ModuleScope, Ident), (Type, GenericParams)>,
-    fallback: &'a HashMap<Ident, (Type, GenericParams)>,
-}
-
-impl TypeFolder for NominalResolver<'_> {
-    fn fold_unresolved_name(&mut self, name: Ident) -> Type {
-        self.scoped
-            .get(&(self.scope.clone(), name))
-            .or_else(|| self.fallback.get(&name))
-            .map_or(Type::UnresolvedName(name), |(ty, _)| ty.clone())
+    GenericTemplate {
+        generics: GenericTypeContext::try_from_params(
+            &generics.type_params,
+            &generics.const_params,
+        )
+        .expect("generic_template_type requires validated generic params"),
     }
+    .fold_type(ty)
+}
 
-    fn fold_unresolved_nominal(
-        &mut self,
-        qualifier: Option<Ident>,
-        name: Ident,
-        generic_args: &[GenericArg],
-    ) -> Type {
-        let resolved = self
-            .scoped
-            .get(&(self.scope.clone(), name))
-            .cloned()
-            .or_else(|| self.fallback.get(&name).cloned());
+trait VisibleTypeLookup {
+    fn imported_module_binding(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope>;
+    fn exported_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey>;
+    fn visible_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey>;
+}
 
-        if let Some((base, generics)) = resolved {
-            if let Some(ty) = self.merge_generic_args(base, &generics, generic_args) {
-                return ty;
-            }
+fn resolve_visible_type_key_in(
+    lookup: &impl VisibleTypeLookup,
+    module: &ModuleScope,
+    qualifier: Option<Ident>,
+    name: Ident,
+) -> Option<NominalKey> {
+    match qualifier {
+        Some(alias) => {
+            let target = lookup.imported_module_binding(module, alias)?;
+            lookup.exported_type_binding(&target, name)
         }
-
-        self.fold_unresolved_nominal_default(qualifier, name, generic_args)
+        None => lookup.visible_type_binding(module, name),
     }
 }
 
-impl NominalResolver<'_> {
-    fn merge_generic_args(
-        &mut self,
-        base: Type,
-        generics: &GenericParams,
-        args: &[GenericArg],
-    ) -> Option<Type> {
-        let args = bind_exact_generic_args_no_diag(generics, args, |ty| self.fold_type(ty))?;
-        let const_args = ConstTerm::to_args_no_infer(&args.const_args)?;
-        Some(match base {
-            Type::Nominal(nominal) if nominal.kind == NominalKind::Extern => {
-                if !args.type_args.is_empty() || !const_args.is_empty() {
-                    return None;
-                }
-                Type::nominal(nominal.kind, nominal.name, vec![], vec![], nominal.origin)
-            }
-            Type::Nominal(nominal) => Type::nominal(
-                nominal.kind,
-                nominal.name,
-                args.type_args,
-                const_args,
-                nominal.origin,
-            ),
-            other if args.is_empty() => other,
-            _ => return None,
-        })
+impl VisibleTypeLookup for DeclarationIndex {
+    fn imported_module_binding(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope> {
+        self.imported_module(module, name)
+    }
+
+    fn exported_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+        self.exported_type(module, name)
+    }
+
+    fn visible_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+        self.visible_type(module, name)
+    }
+}
+
+pub(crate) fn should_finalize_type_refs(
+    scope: &ModuleScope,
+    always_active_modules: &HashSet<ModuleScope>,
+) -> bool {
+    // FIXME: temporary finding-16 until Phase 4 audits core/std source type refs
+    match scope {
+        ModuleScope::Root => true,
+        ModuleScope::Named(path) => {
+            !matches!(path.first_segment(), Some("core" | "std"))
+                && !always_active_modules.contains(scope)
+        }
     }
 }
 
@@ -1380,6 +2170,69 @@ fn generic_params(type_params: &[TypeParam], const_params: &[ConstParam]) -> Gen
     GenericParams {
         type_params: type_params.to_vec(),
         const_params: const_params.to_vec(),
+    }
+}
+
+fn collect_implicit_extend_generics(
+    ty: &Type,
+    generics: &mut GenericTypeContext,
+    target_root: bool,
+) {
+    match ty {
+        Type::UnresolvedName(name) if !target_root => {
+            generics.insert_implicit_extend_type(*name);
+        }
+        Type::UnresolvedNominal {
+            name,
+            generic_args,
+            qualifier,
+        } => {
+            if qualifier.is_none() && !target_root {
+                generics.insert_implicit_extend_type(*name);
+            }
+            for arg in generic_args {
+                if let GenericArg::Type(ty) = arg {
+                    collect_implicit_extend_generics(ty, generics, false);
+                }
+            }
+        }
+        Type::Func { params, ret } => {
+            for param in params {
+                collect_implicit_extend_generics(&param.ty, generics, false);
+            }
+            collect_implicit_extend_generics(ret, generics, false);
+        }
+        Type::Tuple(elems) => {
+            for ty in elems {
+                collect_implicit_extend_generics(ty, generics, false);
+            }
+        }
+        Type::NamedTuple(fields) => {
+            for (_, ty) in fields {
+                collect_implicit_extend_generics(ty, generics, false);
+            }
+        }
+        Type::Nominal(nominal) => {
+            for ty in &nominal.type_args {
+                collect_implicit_extend_generics(ty, generics, false);
+            }
+        }
+        Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
+            collect_implicit_extend_generics(elem, generics, false);
+        }
+        Type::Map { key, value } => {
+            collect_implicit_extend_generics(key, generics, false);
+            collect_implicit_extend_generics(value, generics, false);
+        }
+        Type::UnresolvedName(_)
+        | Type::Infer
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Var(_) => {}
     }
 }
 
@@ -1413,20 +2266,6 @@ fn stmt_visibility(stmt: &StmtNode) -> Visibility {
     }
 }
 
-fn resolve_nominal(
-    scope: &ModuleScope,
-    ty: &Type,
-    scoped: &HashMap<(ModuleScope, Ident), (Type, GenericParams)>,
-    fallback: &HashMap<Ident, (Type, GenericParams)>,
-) -> Type {
-    let mut resolver = NominalResolver {
-        scope,
-        scoped,
-        fallback,
-    };
-    resolver.fold_type(ty)
-}
-
 pub(crate) fn nominal_type(key: &NominalKey) -> Type {
     nominal_type_with_args(key, &[], &[])
 }
@@ -1447,10 +2286,11 @@ pub(crate) fn nominal_type_with_args(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::{ast::TypeVarId, lexer::tokenize, parser, resolve::ResolvedModule};
+    use crate::{
+        ast::TypeVarId, lexer::tokenize, parser, resolve::ResolvedModule,
+        typecheck::type_ops::type_contains_unresolved_ref,
+    };
 
     fn ident(name: &str) -> Ident {
         Ident::new(name)
@@ -1465,9 +2305,8 @@ mod tests {
         ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
     }
 
-    fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
-        let root = parse(root);
-        let resolved = ResolveResult {
+    fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
+        ResolveResult {
             module_groups: modules
                 .iter()
                 .map(|(name, source)| {
@@ -1477,12 +2316,50 @@ mod tests {
                     }]
                 })
                 .collect(),
+        }
+    }
+
+    fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
+        let root = parse(root);
+        DeclarationIndex::from_root_and_modules(&root, &resolved_modules(modules), HashSet::new())
+    }
+
+    fn checked_index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
+        let root = parse(root);
+        super::super::check_with_modules(&root, &resolved_modules(modules), HashSet::new())
+            .expect("typecheck failed")
+            .decls()
+            .clone()
+    }
+
+    fn func_ret(ty: &Type) -> &Type {
+        let Type::Func { ret, .. } = ty else {
+            panic!("expected function type: {ty:?}");
         };
-        DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new())
+        ret
+    }
+
+    fn assert_nominal(ty: &Type, kind: NominalKind, module: Option<&str>, name: &str) {
+        let Type::Nominal(nominal) = ty else {
+            panic!("expected nominal type: {ty:?}");
+        };
+        assert_eq!(nominal.kind, kind);
+        assert_eq!(nominal.name, ident(name));
+        assert_eq!(
+            nominal.origin,
+            module.map(|name| std::rc::Rc::from(vec![name.to_string()].into_boxed_slice()))
+        );
+    }
+
+    fn assert_no_unresolved_nominal(ty: &Type) {
+        assert!(
+            !type_contains_unresolved_ref(ty),
+            "unresolved nominal survived: {ty:?}"
+        );
     }
 
     #[test]
-    fn generic_template_keeps_nominal_with_args() {
+    fn generic_template_nominal_args() {
         let generics = GenericParams {
             type_params: vec![TypeParam {
                 name: ident("T"),
@@ -1511,25 +2388,15 @@ mod tests {
     fn type_args_origin() {
         let name = ident("Box");
         let scope = ModuleScope::Named(ModulePath::new(vec!["tools".into()]).unwrap());
-        let key = NominalKey {
-            module: scope.clone(),
-            kind: NominalKind::Struct,
-            name,
-        };
         let ty = Type::UnresolvedNominal {
             qualifier: None,
             name,
             generic_args: vec![GenericArg::Type(Type::Int)],
         };
-        let generics = GenericParams {
-            type_params: vec![TypeParam {
-                name: ident("T"),
-                id: TypeVarId(0),
-            }],
-            const_params: vec![],
-        };
-        let scoped = HashMap::from([((scope.clone(), name), (nominal_type(&key), generics))]);
-        let result = resolve_nominal(&scope, &ty, &scoped, &HashMap::new());
+        let index = index("", &[("tools", "pub struct Box<T> { value: T }")]);
+        let result = index
+            .finalize_type_ref(&scope, &GenericTypeContext::default(), &ty)
+            .unwrap();
 
         assert_eq!(
             result,
@@ -1548,39 +2415,18 @@ mod tests {
         let wrapper = ident("Wrapper");
         let inner = ident("Inner");
         let scope = ModuleScope::Root;
-        let wrapper_key = NominalKey {
-            module: scope.clone(),
-            kind: NominalKind::Struct,
-            name: wrapper,
-        };
-        let inner_key = NominalKey {
-            module: scope.clone(),
-            kind: NominalKind::Struct,
-            name: inner,
-        };
         let ty = Type::UnresolvedNominal {
             qualifier: None,
             name: wrapper,
             generic_args: vec![GenericArg::Type(Type::UnresolvedName(inner))],
         };
-        let wrapper_generics = GenericParams {
-            type_params: vec![TypeParam {
-                name: ident("T"),
-                id: TypeVarId(0),
-            }],
-            const_params: vec![],
-        };
-        let scoped = HashMap::from([
-            (
-                (scope.clone(), wrapper),
-                (nominal_type(&wrapper_key), wrapper_generics),
-            ),
-            (
-                (scope.clone(), inner),
-                (nominal_type(&inner_key), GenericParams::default()),
-            ),
-        ]);
-        let result = resolve_nominal(&scope, &ty, &scoped, &HashMap::new());
+        let index = index(
+            "struct Wrapper<T> { value: T } struct Inner { value: int }",
+            &[],
+        );
+        let result = index
+            .finalize_type_ref(&scope, &GenericTypeContext::default(), &ty)
+            .unwrap();
 
         assert_eq!(
             result,
@@ -1607,13 +2453,22 @@ mod tests {
             name: ident("Thing"),
             generic_args: vec![GenericArg::Type(Type::Int)],
         };
-        let result = resolve_nominal(&ModuleScope::Root, &ty, &HashMap::new(), &HashMap::new());
+        let index = index("", &[]);
+        let error = index
+            .finalize_type_ref(&ModuleScope::Root, &GenericTypeContext::default(), &ty)
+            .expect_err("unknown qualified type should fail finalization");
 
-        assert_eq!(result, ty);
+        assert!(matches!(
+            error,
+            TypeRefError::Unknown {
+                qualifier: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn module_locals_include_private_but_exports_do_not() {
+    fn private_not_exported() {
         let index = index("", &[("tools", "fn hidden() {} pub fn shown() {}")]);
         let tools = scope("tools");
 
@@ -1640,7 +2495,7 @@ mod tests {
     }
 
     #[test]
-    fn type_reexport_preserves_nominal_origin() {
+    fn type_reexport_origin() {
         let index = index(
             "",
             &[
@@ -1658,7 +2513,200 @@ mod tests {
     }
 
     #[test]
-    fn import_alias_populates_module_namespace() {
+    fn return_type_module_imports() {
+        let index = checked_index(
+            "import facade { make };",
+            &[
+                ("alpha", "pub struct Item { value: int }"),
+                ("beta", "pub struct Item { label: string }"),
+                (
+                    "facade",
+                    "import alpha { Item }; pub fn make() -> Item { Item { value: 1 } }",
+                ),
+            ],
+        );
+        let value = index
+            .imported_value(&ModuleScope::Root, ident("make"))
+            .expect("missing import");
+
+        assert_no_unresolved_nominal(value.decl.ty());
+        assert_nominal(
+            func_ret(value.decl.ty()),
+            NominalKind::Struct,
+            Some("alpha"),
+            "Item",
+        );
+    }
+
+    #[test]
+    fn reexported_return_origin() {
+        let index = checked_index(
+            "import facade { make };",
+            &[
+                (
+                    "tools",
+                    "pub struct Point { x: int } pub fn make() -> Point { Point { x: 1 } }",
+                ),
+                ("other", "pub struct Point { y: int }"),
+                ("facade", "pub import tools { make };"),
+            ],
+        );
+        let value = index
+            .imported_value(&ModuleScope::Root, ident("make"))
+            .expect("missing import");
+
+        assert_no_unresolved_nominal(value.decl.ty());
+        assert_eq!(value.module, scope("tools"));
+        assert_eq!(value.name, ident("make"));
+        assert_nominal(
+            func_ret(value.decl.ty()),
+            NominalKind::Struct,
+            Some("tools"),
+            "Point",
+        );
+    }
+
+    #[test]
+    fn module_import_not_bare_type() {
+        let index = index(
+            "import shapes;",
+            &[("shapes", "pub struct Point { x: int }")],
+        );
+
+        assert_eq!(
+            index.imported_module(&ModuleScope::Root, ident("shapes")),
+            Some(scope("shapes"))
+        );
+        assert!(
+            index
+                .imported_type(&ModuleScope::Root, ident("Point"))
+                .is_none()
+        );
+        assert!(
+            index
+                .visible_type(&ModuleScope::Root, ident("Point"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn qualified_module_export_key() {
+        let index = index(
+            "import shapes;",
+            &[("shapes", "pub struct Point { x: int }")],
+        );
+        let key = index
+            .exported_type(&scope("shapes"), ident("Point"))
+            .expect("missing export");
+
+        assert_eq!(key.module, scope("shapes"));
+        assert_eq!(key.name, ident("Point"));
+        assert_eq!(key.kind, NominalKind::Struct);
+    }
+
+    #[test]
+    fn qualified_visible_module_binding() {
+        let index = index(
+            "import shapes;",
+            &[("shapes", "pub struct Point { x: int }")],
+        );
+
+        let key = index
+            .resolve_visible_type_key(&ModuleScope::Root, Some(ident("shapes")), ident("Point"))
+            .expect("missing qualified type");
+
+        assert_eq!(key.module, scope("shapes"));
+        assert_eq!(key.name, ident("Point"));
+        assert_eq!(key.kind, NominalKind::Struct);
+    }
+
+    #[test]
+    fn qualified_visible_requires_binding() {
+        let index = index("", &[("shapes", "pub struct Point { x: int }")]);
+
+        assert!(
+            index
+                .resolve_visible_type_key(&ModuleScope::Root, Some(ident("shapes")), ident("Point"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn key_for_type_uses_nominal_origin() {
+        let index = index(
+            "",
+            &[
+                ("alpha", "pub struct Point { x: int }"),
+                ("beta", "pub struct Point { y: int }"),
+            ],
+        );
+        let ty = Type::nominal(
+            NominalKind::Struct,
+            ident("Point"),
+            vec![],
+            vec![],
+            Some(std::rc::Rc::new(["alpha".into()])),
+        );
+
+        let key = index.key_for_type(&ty).expect("missing key");
+
+        assert_eq!(key.module, scope("alpha"));
+        assert_eq!(key.name, ident("Point"));
+        assert_eq!(key.kind, NominalKind::Struct);
+    }
+
+    #[test]
+    fn root_originless_nominal_key() {
+        let index = index("struct Point { x: int }", &[]);
+        let ty = Type::nominal(NominalKind::Struct, ident("Point"), vec![], vec![], None);
+
+        let key = index.key_for_type(&ty).expect("missing key");
+
+        assert_eq!(key.module, ModuleScope::Root);
+        assert_eq!(key.name, ident("Point"));
+        assert_eq!(key.kind, NominalKind::Struct);
+    }
+
+    #[test]
+    fn imported_originless_no_guess() {
+        let index = index("", &[("alpha", "pub struct Point { x: int }")]);
+        let ty = Type::nominal(NominalKind::Struct, ident("Point"), vec![], vec![], None);
+
+        assert!(index.key_for_type(&ty).is_none());
+    }
+
+    #[test]
+    fn key_for_type_rejects_kind_mismatch() {
+        let index = index("enum Point { A }", &[]);
+        let ty = Type::nominal(NominalKind::Struct, ident("Point"), vec![], vec![], None);
+
+        assert!(index.key_for_type(&ty).is_none());
+    }
+
+    #[test]
+    fn enum_return_type_keeps_origin() {
+        let index = checked_index(
+            "import states { current };",
+            &[(
+                "states",
+                "pub enum Status { Active } pub fn current() -> Status { Status.Active }",
+            )],
+        );
+        let value = index
+            .imported_value(&ModuleScope::Root, ident("current"))
+            .expect("missing import");
+
+        assert_no_unresolved_nominal(value.decl.ty());
+        assert_nominal(
+            func_ret(value.decl.ty()),
+            NominalKind::Enum,
+            Some("states"),
+            "Status",
+        );
+    }
+
+    #[test]
+    fn alias_module_namespace() {
         let index = index("import facade { self as f };", &[("facade", "")]);
 
         assert_eq!(
@@ -1668,7 +2716,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_reexported_value_preserves_origin() {
+    fn reexported_value_origin() {
         let index = index(
             "import facade { dup };",
             &[
@@ -1685,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_type_activates_direct_and_origin_modules() {
+    fn imported_type_activates_origins() {
         let index = index(
             "import facade { P };",
             &[
@@ -1715,7 +2763,7 @@ mod tests {
     }
 
     #[test]
-    fn callable_for_value_distinguishes_function_extern_and_const() {
+    fn callable_value_kinds() {
         let index = index(
             "fn f<T>(x: T) -> T { x } extern fn e(x: int) -> int; const C = 1;",
             &[],
@@ -1733,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn callable_for_aggregate_methods_keeps_kind_receiver_and_member_types() {
+    fn aggregate_method_callable() {
         let index = index(
             "struct Box<T> { value: T, fn make(value: T) -> T { value } fn get(self, fallback: T) -> T { self.value } }",
             &[],
@@ -1770,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn callable_for_extend_method_keeps_lookup_owner_args() {
+    fn extend_method_owner_args() {
         let index = index("extend<T> T { fn id(self, x: T) -> T { x } }", &[]);
         let ExtendMethodMatch::Match {
             extend,
@@ -1789,13 +2837,12 @@ mod tests {
         assert_eq!(callable.def.id.kind, CallableKind::ExtendMethod);
         assert_eq!(callable.owner_args, owner_args);
         assert_eq!(callable.receiver_ty, Some(Type::Int));
-        assert_eq!(callable.def.receiver, Some(MethodReceiver::Value));
         assert_eq!(callable.def.sig.params, vec![FuncParam::immut(Type::Int)]);
         assert_eq!(callable.def.sig.ret, Type::Int);
     }
 
     #[test]
-    fn callable_for_enum_variants_models_unit_tuple_and_rejects_struct() {
+    fn enum_variant_callables() {
         let index = index("enum E<T> { A, B(T), C { x: T } }", &[]);
         let key = index.local_type(&ModuleScope::Root, ident("E")).unwrap();
         let enm = index.enum_schema(&key).unwrap();
@@ -1831,7 +2878,7 @@ mod tests {
     }
 
     #[test]
-    fn set_const_type_updates_exported_and_imported_copies() {
+    fn set_const_type_syncs_copies() {
         let mut index = index(
             "import tools { SIZE };",
             &[("tools", "pub const SIZE = 1;")],

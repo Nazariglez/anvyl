@@ -102,6 +102,14 @@ fn plan_test(
     if let Some(reason) = directives.skip {
         return TestPlan::Done(done(TestResult::Skip { message: reason }, contract.mode));
     }
+    if let Some(reason) = directives.frontend.skip_reason(new_frontend) {
+        return TestPlan::Done(done(
+            TestResult::Skip {
+                message: reason.to_string(),
+            },
+            contract.mode,
+        ));
+    }
     if new_frontend && contract.mode == Mode::Run {
         return TestPlan::Done(done(
             TestResult::Skip {
@@ -221,6 +229,44 @@ mod tests {
         };
 
         assert!(matches!(result.result, TestResult::Skip { .. }));
+    }
+
+    #[test]
+    fn frontend_requirement_skips_incompatible_runner() {
+        let TestPlan::Done(result) = plan(
+            "// @mode: check\n// @expect: success\n// @frontend: new\n",
+            false,
+        ) else {
+            panic!("expected done plan");
+        };
+
+        assert!(
+            matches!(result.result, TestResult::Skip { message } if message == "requires new frontend")
+        );
+    }
+
+    #[test]
+    fn frontend_requirement_allows_matching_runner() {
+        let TestPlan::Run { .. } = plan(
+            "// @mode: check\n// @expect: success\n// @frontend: new\n",
+            true,
+        ) else {
+            panic!("expected runnable plan");
+        };
+    }
+
+    #[test]
+    fn default_frontend_requirement_skips_new_frontend_runner() {
+        let TestPlan::Done(result) = plan(
+            "// @mode: check\n// @expect: success\n// @frontend: default\n",
+            true,
+        ) else {
+            panic!("expected done plan");
+        };
+
+        assert!(
+            matches!(result.result, TestResult::Skip { message } if message == "requires default frontend")
+        );
     }
 
     #[test]

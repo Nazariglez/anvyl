@@ -1,0 +1,4 @@
+// @helper
+
+pub fn dup() -> int { 1 }
+pub fn dup() -> int { 2 }

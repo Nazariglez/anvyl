@@ -1,11 +1,11 @@
 use super::support::{
-    assert_calls, assert_err, assert_err_count, assert_no_infer_vars_in_result, assert_type,
-    assert_type_with_modules, errors, typecheck, typecheck_with_named_modules,
+    assert_calls, assert_err, assert_err_count, assert_single_error, assert_ty, assert_ty_mods,
+    assert_ty_named, assert_typecheck_closed, check, check_named, errors,
 };
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
-        CallTarget, GenericArgs, TypeError, TypecheckResult,
+        CallTarget, GenericArgs, MemberAccessKind, TypeError, TypecheckResult,
         decls::{CallableId, ExtendId, ModuleScope, NominalKey, VariantSchema},
     },
 };
@@ -32,7 +32,7 @@ mod field_access {
 
     #[test]
     fn field_access() {
-        assert_type(
+        assert_ty(
             "struct Point { 
                 x: int, 
                 y: int 
@@ -47,7 +47,7 @@ mod field_access {
 
     #[test]
     fn nested_field_access() {
-        assert_type(
+        assert_ty(
             "struct Pos { x: int } 
             struct Player { pos: Pos } 
             fn main() { 
@@ -60,24 +60,43 @@ mod field_access {
 
     #[test]
     fn unknown_field() {
-        assert_err_count(
+        assert_single_error(
             "struct Point { x: int } 
             fn main() { 
                 let p = Point { x: 1 }; 
                 p.z; 
             }",
-            1,
+            |err| {
+                matches!(
+                    err,
+                    TypeError::UnknownMember {
+                        member,
+                        kind: MemberAccessKind::Field,
+                        ..
+                    } if *member == Ident::new("z")
+                )
+            },
         );
     }
 
     #[test]
     fn field_on_int() {
-        assert_err_count("fn main() { let x = 1; x.y; }", 1);
+        assert_single_error("fn main() { let x = 1; x.y; }", |err| {
+            matches!(
+                err,
+                TypeError::MemberAccessOnNonAggregate {
+                    ty: Type::Int,
+                    member,
+                    kind: MemberAccessKind::Field,
+                    ..
+                } if *member == Ident::new("y")
+            )
+        });
     }
 
     #[test]
     fn imported_field_access() {
-        assert_type_with_modules(
+        assert_ty_mods(
             "import gamekit { Point }; 
             fn main() { 
                 let p = Point { x: 1, y: 2 }; 
@@ -89,8 +108,59 @@ mod field_access {
     }
 
     #[test]
+    fn imported_field_origin() {
+        assert_ty_named(
+            "import alpha { Item };
+            fn main() {
+                let item = Item { value: 1 };
+                item.value;
+            }",
+            &[
+                ("alpha", "pub struct Item { value: int }"),
+                ("beta", "pub struct Item { label: string }"),
+            ],
+            Type::Int,
+        );
+    }
+
+    #[test]
+    fn qualified_method_origin() {
+        assert_ty_named(
+            "import shapes;
+            fn main() {
+                let p = shapes.Point { x: 1 };
+                p.x();
+            }",
+            &[
+                (
+                    "shapes",
+                    "pub struct Point { x: int } pub extend Point { fn x(self) -> int { self.x } }",
+                ),
+                (
+                    "other",
+                    "pub struct Point { y: string } pub extend Point { fn x(self) -> string { self.y } }",
+                ),
+            ],
+            Type::Int,
+        );
+    }
+
+    #[test]
+    fn originless_receiver_no_guess() {
+        let result = check_named(
+            "fn main() {
+                let p: Point = 1;
+                p.value;
+            }",
+            &[("alpha", "pub struct Point { value: int }")],
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn receiver_args() {
-        assert_type(
+        assert_ty(
             "struct Wrapper<T> { value: T } fn main() { let w = Wrapper { value: 42 }; w.value; }",
             Type::Int,
         );
@@ -98,7 +168,7 @@ mod field_access {
 
     #[test]
     fn dataref_receiver_args() {
-        assert_type(
+        assert_ty(
             "dataref Box<T> { value: T } fn main() { let b = Box { value: true }; b.value; }",
             Type::Bool,
         );
@@ -106,7 +176,7 @@ mod field_access {
 
     #[test]
     fn nested_receiver_args() {
-        assert_type(
+        assert_ty(
             "struct Box<T> { value: T } 
             struct Wrapper<T> { value: T } 
             fn main() { 
@@ -121,7 +191,7 @@ mod field_access {
 
     #[test]
     fn imported_receiver_args() {
-        assert_type_with_modules(
+        assert_ty_mods(
             "import gamekit { Wrapper }; fn main() { let w = Wrapper { value: 42 }; w.value; }",
             "pub struct Wrapper<T> { value: T }",
             Type::Int,
@@ -134,7 +204,7 @@ mod struct_literal {
 
     #[test]
     fn local_struct_literal() {
-        assert_type(
+        assert_ty(
             "struct Point { x: int, y: int } fn main() { Point { x: 1, y: 2 }; }",
             nominal(NominalKind::Struct, "Point", vec![], None),
         );
@@ -174,7 +244,7 @@ mod struct_literal {
 
     #[test]
     fn module_struct_literal() {
-        assert_type_with_modules(
+        assert_ty_mods(
             "import gamekit { Point }; fn main() { Point { x: 1, y: 2 }; }",
             "pub struct Point { x: int, y: int }",
             nominal(
@@ -190,7 +260,7 @@ mod struct_literal {
 
     #[test]
     fn struct_infer() {
-        assert_type(
+        assert_ty(
             "struct Wrapper<T> { value: T } fn main() { Wrapper { value: 42 }; }",
             nominal(NominalKind::Struct, "Wrapper", vec![Type::Int], None),
         );
@@ -198,7 +268,7 @@ mod struct_literal {
 
     #[test]
     fn dataref_infer() {
-        assert_type(
+        assert_ty(
             "dataref Box<T> { value: T } fn main() { Box { value: \"hi\" }; }",
             nominal(NominalKind::DataRef, "Box", vec![Type::String], None),
         );
@@ -206,7 +276,7 @@ mod struct_literal {
 
     #[test]
     fn annotation_unconstrained() {
-        assert_type(
+        assert_ty(
             "struct Token<T> {} fn main() { let value: Token<int> = Token {}; value; }",
             nominal(NominalKind::Struct, "Token", vec![Type::Int], None),
         );
@@ -214,7 +284,7 @@ mod struct_literal {
 
     #[test]
     fn nested_annotation() {
-        assert_type(
+        assert_ty(
             "struct Token<T> {}
              struct Wrapper<T> { value: Token<T> } 
              fn main() { 
@@ -236,7 +306,7 @@ mod aggregate_schemas {
 
     #[test]
     fn struct_schema() {
-        let result = typecheck("struct Wrapper<T> { value: T } fn main() {}").unwrap();
+        let result = check("struct Wrapper<T> { value: T } fn main() {}").unwrap();
         let key = root_key(NominalKind::Struct, "Wrapper");
         let agg = result.decls().aggregate(&key).expect("no aggregate");
         let field = agg.fields.get(&Ident::new("value")).expect("no field");
@@ -249,7 +319,7 @@ mod aggregate_schemas {
 
     #[test]
     fn dataref_schema() {
-        let result = typecheck("dataref Buffer<T, N: int> { data: [T; N] } fn main() {}").unwrap();
+        let result = check("dataref Buffer<T, N: int> { data: [T; N] } fn main() {}").unwrap();
         let key = root_key(NominalKind::DataRef, "Buffer");
         let agg = result.decls().aggregate(&key).expect("no aggregate");
         let field = agg.fields.get(&Ident::new("data")).expect("no field");
@@ -273,7 +343,7 @@ mod enum_schemas {
 
     #[test]
     fn enum_schema() {
-        let result = typecheck("enum Option<T> { Some(T), None } fn main() {}").unwrap();
+        let result = check("enum Option<T> { Some(T), None } fn main() {}").unwrap();
         let key = root_key(NominalKind::Enum, "Option");
         let enm = result.decls().enum_schema(&key).expect("no enum");
         let t = enm.generics.type_params[0].id;
@@ -296,7 +366,7 @@ mod method_schemas {
 
     #[test]
     fn collects_instance_method() {
-        let result = typecheck(
+        let result = check(
             "struct Point { 
                 x: int, 
                 fn len(self) -> int { 0 }
@@ -317,7 +387,7 @@ mod method_schemas {
 
     #[test]
     fn collects_static_method() {
-        let result = typecheck(
+        let result = check(
             "struct Point { x: int, fn origin() -> Point { Point { x: 0 } } } 
             fn main() {}
         ",
@@ -335,7 +405,7 @@ mod method_schemas {
     #[test]
     fn instance_method_with_params() {
         let result =
-            typecheck("struct Point { x: int, fn add(self, v: int) -> int { 0 } } fn main() {}")
+            check("struct Point { x: int, fn add(self, v: int) -> int { 0 } } fn main() {}")
                 .unwrap();
         let agg = result
             .decls()
@@ -351,7 +421,7 @@ mod method_schemas {
     #[test]
     fn collects_generic_instance_method() {
         let result =
-            typecheck("struct Point { fn map<T>(self, f: T) -> T { f } } fn main() {}").unwrap();
+            check("struct Point { fn map<T>(self, f: T) -> T { f } } fn main() {}").unwrap();
         let agg = result
             .decls()
             .aggregate(&root_key(NominalKind::Struct, "Point"))
@@ -368,10 +438,9 @@ mod method_schemas {
 
     #[test]
     fn collects_generic_static_method() {
-        let result = typecheck(
-            "struct Point { fn wrap<T, N: int>(x: [T; N]) -> [T; N] { x } } fn main() {}",
-        )
-        .unwrap();
+        let result =
+            check("struct Point { fn wrap<T, N: int>(x: [T; N]) -> [T; N] { x } } fn main() {}")
+                .unwrap();
         let agg = result
             .decls()
             .aggregate(&root_key(NominalKind::Struct, "Point"))
@@ -421,7 +490,7 @@ mod method_calls {
 
     #[test]
     fn method_call() {
-        assert_type(
+        assert_ty(
             "struct Point { x: int, fn len(self) -> int { 0 } } fn main() -> int { let p = Point { x: 1 }; p.len() }",
             Type::Int,
         );
@@ -429,9 +498,108 @@ mod method_calls {
 
     #[test]
     fn method_call_with_args() {
-        assert_type(
+        assert_ty(
             "struct Point { x: int, fn add(self, v: int) -> int { 0 } } fn main() -> int { let p = Point { x: 1 }; p.add(2) }",
             Type::Int,
+        );
+    }
+
+    #[test]
+    fn unknown_method_on_aggregate() {
+        assert_single_error(
+            "struct Point { x: int } fn main() { let p = Point { x: 1 }; p.move(); }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::UnknownMember {
+                        member,
+                        kind: MemberAccessKind::Method,
+                        ..
+                    } if *member == Ident::new("move")
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn unknown_method_on_primitive() {
+        assert_single_error("fn main() { 1.foo(); }", |err| {
+            matches!(
+                err,
+                TypeError::MemberAccessOnNonAggregate {
+                    ty: Type::Int,
+                    member,
+                    kind: MemberAccessKind::Method,
+                    ..
+                } if *member == Ident::new("foo")
+            )
+        });
+    }
+
+    #[test]
+    fn unknown_enum_variant_call() {
+        assert_single_error("enum Color { Red } fn main() { Color.Yellow(); }", |err| {
+            matches!(
+                err,
+                TypeError::UnknownEnumVariant {
+                    enum_name,
+                    variant,
+                    ..
+                } if *enum_name == Ident::new("Color") && *variant == Ident::new("Yellow")
+            )
+        });
+    }
+
+    #[test]
+    fn field_called_as_method() {
+        assert_single_error(
+            "struct Point { x: int } fn main() { let p = Point { x: 1 }; p.x(); }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::UnknownMember {
+                        member,
+                        kind: MemberAccessKind::Method,
+                        ..
+                    } if *member == Ident::new("x")
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn error_callee_checks_args() {
+        let errors = errors("enum Color { Red } fn main() { Color.Yellow(missing); }");
+        assert_eq!(errors.len(), 2, "unexpected errors: {errors:?}");
+        assert!(errors.iter().any(|err| {
+            matches!(
+                err,
+                TypeError::UnknownEnumVariant { enum_name, variant, .. }
+                    if *enum_name == Ident::new("Color") && *variant == Ident::new("Yellow")
+            )
+        }));
+        assert!(errors.iter().any(|err| {
+            matches!(
+                err,
+                TypeError::UndefinedVariable { name, .. } if *name == Ident::new("missing")
+            )
+        }));
+        assert!(
+            !errors
+                .iter()
+                .any(|err| matches!(err, TypeError::NotCallable { .. }))
+        );
+    }
+
+    #[test]
+    fn field_and_method_share_name() {
+        assert_ty(
+            "struct Point { x: int, fn x(self) -> bool { true } } fn main() { let p = Point { x: 1 }; p.x; }",
+            Type::Int,
+        );
+        assert_ty(
+            "struct Point { x: int, fn x(self) -> bool { true } } fn main() { let p = Point { x: 1 }; p.x(); }",
+            Type::Bool,
         );
     }
 
@@ -453,7 +621,7 @@ mod method_calls {
 
     #[test]
     fn call_target_method() {
-        let result = typecheck(
+        let result = check(
             "struct Point { x: int, fn len(self) -> int { 0 } } fn main() { let p = Point { x: 1 }; p.len(); }",
         )
         .unwrap();
@@ -467,7 +635,7 @@ mod method_calls {
 
     #[test]
     fn static_explicit_args() {
-        assert_type(
+        assert_ty(
             "struct Foo { fn make<T>(x: T) -> T { x } } fn main() -> int { Foo.make<int>(42) }",
             Type::Int,
         );
@@ -475,7 +643,7 @@ mod method_calls {
 
     #[test]
     fn static_infer_args() {
-        assert_type(
+        assert_ty(
             "struct Foo { fn make<T>(x: T) -> T { x } } fn main() -> string { Foo.make(\"hi\") }",
             Type::String,
         );
@@ -483,7 +651,7 @@ mod method_calls {
 
     #[test]
     fn instance_explicit_args() {
-        assert_type(
+        assert_ty(
             "struct Foo { fn pair<A, B>(self, a: A, b: B) -> B { b } } fn main() -> string { let f = Foo {}; f.pair<int, string>(1, \"ok\") }",
             Type::String,
         );
@@ -491,7 +659,7 @@ mod method_calls {
 
     #[test]
     fn instance_infer_args() {
-        assert_type(
+        assert_ty(
             "struct Foo { fn pair<A, B>(self, a: A, b: B) -> B { b } } fn main() -> int { let f = Foo {}; f.pair(\"x\", 7) }",
             Type::Int,
         );
@@ -499,7 +667,7 @@ mod method_calls {
 
     #[test]
     fn owner_instance_receiver_args() {
-        assert_type(
+        assert_ty(
             "struct Wrapper<T> { value: T, fn get(self) -> T { self.value } } fn main() -> int { let w = Wrapper { value: 42 }; w.get() }",
             Type::Int,
         );
@@ -507,7 +675,7 @@ mod method_calls {
 
     #[test]
     fn owner_static_infer_args() {
-        assert_type(
+        assert_ty(
             "struct Wrapper<T> { value: T, fn new(value: T) -> Self { Wrapper { value: value } } } fn main() -> int { Wrapper.new(42).value }",
             Type::Int,
         );
@@ -515,7 +683,7 @@ mod method_calls {
 
     #[test]
     fn static_expected_nil() {
-        assert_type(
+        assert_ty(
             "struct Foo { fn id<T>(x: T) -> T { x } } fn main() { let x: int? = Foo.id(nil); x; }",
             Type::option_of(Type::Int),
         );
@@ -523,16 +691,16 @@ mod method_calls {
 
     #[test]
     fn static_nil_no_leak() {
-        let checked = typecheck(
+        let checked = check(
             "struct Foo { fn id<T>(x: T) -> T { x } } fn main() { let x: int? = Foo.id(nil); x; }",
         )
         .expect("typecheck failed");
-        assert_no_infer_vars_in_result(&checked);
+        assert_typecheck_closed(&checked);
     }
 
     #[test]
     fn instance_expected_nil() {
-        assert_type(
+        assert_ty(
             "struct Foo { fn id<T>(self, x: T) -> T { x } } fn main() { let f = Foo {}; let x: int? = f.id(nil); x; }",
             Type::option_of(Type::Int),
         );
@@ -540,16 +708,15 @@ mod method_calls {
 
     #[test]
     fn static_target_args() {
-        let result = typecheck(
-            "struct Foo { fn make<T>(x: T) -> T { x } } fn main() { Foo.make<int>(42); }",
-        )
-        .unwrap();
+        let result =
+            check("struct Foo { fn make<T>(x: T) -> T { x } } fn main() { Foo.make<int>(42); }")
+                .unwrap();
         assert_method_target(&result, "Foo", "make", false, vec![Type::Int]);
     }
 
     #[test]
     fn owner_static_target_args() {
-        let result = typecheck(
+        let result = check(
             "struct Wrapper<T> { value: T, fn new(value: T) -> Self { Wrapper { value: value } } } fn main() { Wrapper.new(42); }",
         )
         .unwrap();
@@ -590,7 +757,7 @@ mod method_calls {
 
     #[test]
     fn generic_parity() {
-        let result = typecheck(
+        let result = check(
             "struct Foo {
                 fn make<T>(x: T) -> T { x }
                 fn pair<A, B>(self, a: A, b: B) -> B { b }
@@ -615,10 +782,14 @@ mod extend_schemas {
     #[test]
     fn collects_extend_on_primitive() {
         let result =
-            typecheck("extend int { fn double(self) -> int { self * 2 } } fn main() {}").unwrap();
+            check("extend int { fn double(self) -> int { self * 2 } } fn main() {}").unwrap();
         let mut found = false;
-        for ext in result.decls().extends_for(&Type::Int) {
-            if ext.methods.get(&Ident::new("double")).is_some() {
+        for ext in result
+            .decls()
+            .extends()
+            .filter(|ext| ext.target == Type::Int)
+        {
+            if ext.methods.contains_key(&Ident::new("double")) {
                 found = true;
                 break;
             }
@@ -629,12 +800,11 @@ mod extend_schemas {
     #[test]
     fn extend_method_params_skip_self() {
         let result =
-            typecheck("extend int { fn add(self, v: int) -> int { self + v } } fn main() {}")
-                .unwrap();
+            check("extend int { fn add(self, v: int) -> int { self + v } } fn main() {}").unwrap();
         let ext = result
             .decls()
-            .extends_for(&Type::Int)
-            .next()
+            .extends()
+            .find(|ext| ext.target == Type::Int)
             .expect("no extend");
         let method = ext.methods.get(&Ident::new("add")).expect("no method");
         assert_eq!(method.params.len(), 1);
@@ -644,54 +814,55 @@ mod extend_schemas {
 
     #[test]
     fn generic_extend() {
-        let result = typecheck(
+        let result = check(
             "struct Box<T> { value: T } extend<T> Box<T> { fn get(self) -> T { self.value } } fn main() {}",
         )
         .unwrap();
         let ext = result.decls().extends().next().expect("no extend");
         let method = ext.methods.get(&Ident::new("get")).expect("no method");
 
+        assert_eq!(ext.generics.type_params.len(), 1);
+        let type_param = ext.generics.type_params[0].id;
         assert_eq!(
             ext.target,
             nominal(
                 NominalKind::Struct,
                 "Box",
-                vec![Type::UnresolvedNominal {
-                    qualifier: None,
-                    name: Ident::new("T"),
-                    generic_args: vec![],
-                }],
-                None,
+                vec![Type::Var(type_param)],
+                None
             )
         );
-        assert_eq!(ext.generics.type_params.len(), 1);
         assert!(ext.generics.const_params.is_empty());
         assert!(method.generics.is_empty());
         assert!(method.params.is_empty());
-        assert_eq!(
-            method.ret,
-            Type::UnresolvedNominal {
-                qualifier: None,
-                name: Ident::new("T"),
-                generic_args: vec![],
-            }
-        );
+        assert_eq!(method.ret, Type::Var(type_param));
     }
 
     #[test]
-    fn extends_for_exact() {
-        let result = typecheck("extend<T> T { fn id(self) -> T { self } } fn main() {}").unwrap();
-        assert_eq!(result.decls().extends_for(&Type::Int).count(), 0);
+    fn exact_extend_match() {
+        let result = check("extend<T> T { fn id(self) -> T { self } } fn main() {}").unwrap();
+        assert_eq!(
+            result
+                .decls()
+                .extends()
+                .filter(|ext| ext.target == Type::Int)
+                .count(),
+            0
+        );
     }
 
     #[test]
     fn collects_extend_on_struct() {
-        let result = typecheck(
+        let result = check(
             "struct Point { x: int } extend Point { fn len(self) -> int { 0 } } fn main() {}",
         )
         .unwrap();
         let ty = nominal(NominalKind::Struct, "Point", vec![], None);
-        let ext = result.decls().extends_for(&ty).next().expect("no extend");
+        let ext = result
+            .decls()
+            .extends()
+            .find(|ext| ext.target == ty)
+            .expect("no extend");
         assert!(ext.methods.contains_key(&Ident::new("len")));
     }
 }
@@ -729,7 +900,7 @@ mod extend_calls {
     }
 
     fn assert_buf_type(src: &str, ty: Type) {
-        assert_type(&buf(src), ty);
+        assert_ty(&buf(src), ty);
     }
 
     fn assert_buf_err(src: &str) {
@@ -738,7 +909,7 @@ mod extend_calls {
 
     #[test]
     fn call_extend_on_primitive() {
-        assert_type(
+        assert_ty(
             "extend int { fn double(self) -> int { self * 2 } } fn main() -> int { 5.double() }",
             Type::Int,
         );
@@ -746,7 +917,7 @@ mod extend_calls {
 
     #[test]
     fn call_extend_with_args() {
-        assert_type(
+        assert_ty(
             "extend int { fn add(self, v: int) -> int { self + v } } fn main() -> int { 1.add(2) }",
             Type::Int,
         );
@@ -770,16 +941,15 @@ mod extend_calls {
 
     #[test]
     fn call_target_extend() {
-        let result = typecheck(
-            "extend int { fn double(self) -> int { self * 2 } } fn main() { 5.double(); }",
-        )
-        .unwrap();
+        let result =
+            check("extend int { fn double(self) -> int { self * 2 } } fn main() { 5.double(); }")
+                .unwrap();
         assert_extend_target(&result, 0, "double", vec![]);
     }
 
     #[test]
     fn call_extend_on_struct() {
-        assert_type(
+        assert_ty(
             "struct Point { x: int } extend Point { fn len(self) -> int { 0 } } fn main() -> int { let p = Point { x: 1 }; p.len() }",
             Type::Int,
         );
@@ -787,7 +957,7 @@ mod extend_calls {
 
     #[test]
     fn extend_via_variable() {
-        assert_type(
+        assert_ty(
             "extend int { fn double(self) -> int { self * 2 } } fn main() -> int { let x = 3; x.double() }",
             Type::Int,
         );
@@ -803,7 +973,7 @@ mod extend_calls {
 
     #[test]
     fn generic_primitive() {
-        assert_type(
+        assert_ty(
             "extend<T> T { fn tag(self) -> int { 0 } } fn main() -> int { 1.tag() }",
             Type::Int,
         );
@@ -819,14 +989,14 @@ mod extend_calls {
     }
 
     #[test]
-    fn generic_receiver_mismatch_is_not_unbound() {
+    fn receiver_mismatch_not_unbound() {
         let errors = errors(
             "struct Box<T> { value: T } extend<T> Box<T> { fn get(self) -> T { self.value } } fn main() { 1.get(); }",
         );
         assert!(
             errors
                 .iter()
-                .any(|err| matches!(err, TypeError::FieldAccessOnNonAggregate { .. }))
+                .any(|err| matches!(err, TypeError::MemberAccessOnNonAggregate { .. }))
         );
         assert!(
             !errors
@@ -837,7 +1007,7 @@ mod extend_calls {
 
     #[test]
     fn generic_struct() {
-        assert_type(
+        assert_ty(
             "struct Box<T> { value: T } extend<T> Box<T> { fn tag(self) -> int { 0 } } fn main() -> int { let b = Box { value: 1 }; b.tag() }",
             Type::Int,
         );
@@ -845,7 +1015,7 @@ mod extend_calls {
 
     #[test]
     fn generic_return() {
-        assert_type(
+        assert_ty(
             "extend<T> T { fn id(self) -> T { self } } fn main() -> int { 1.id() }",
             Type::Int,
         );
@@ -854,13 +1024,13 @@ mod extend_calls {
     #[test]
     fn generic_call_target() {
         let result =
-            typecheck("extend<T> T { fn id(self) -> T { self } } fn main() { 1.id(); }").unwrap();
+            check("extend<T> T { fn id(self) -> T { self } } fn main() { 1.id(); }").unwrap();
         assert_extend_target(&result, 0, "id", vec![Type::Int]);
     }
 
     #[test]
     fn generic_param() {
-        assert_type(
+        assert_ty(
             "extend<T> T { fn pick(self, x: T) -> T { x } } fn main() -> int { 1.pick(2) }",
             Type::Int,
         );
@@ -868,7 +1038,7 @@ mod extend_calls {
 
     #[test]
     fn generic_receiver_args() {
-        assert_type(
+        assert_ty(
             "struct Box<T> { value: T } extend<T> Box<T> { fn get(self) -> T { self.value } } fn main() -> int { let b = Box { value: 1 }; b.get() }",
             Type::Int,
         );
@@ -876,7 +1046,7 @@ mod extend_calls {
 
     #[test]
     fn generic_dataref() {
-        assert_type(
+        assert_ty(
             "dataref Box<T> { value: T } extend<T> Box<T> { fn get(self) -> T { self.value } } fn main() -> bool { let b = Box { value: true }; b.get() }",
             Type::Bool,
         );
@@ -884,7 +1054,7 @@ mod extend_calls {
 
     #[test]
     fn generic_enum() {
-        assert_type(
+        assert_ty(
             "enum Option<T> { Some(T), None } extend<T> Option<T> { fn keep(self, other: Option<T>) -> Option<T> { other } } fn main() -> int { let _: Option<int> = Option.Some(1).keep(Option.Some(2)); 0 }",
             Type::Int,
         );
@@ -899,8 +1069,8 @@ mod extend_calls {
     }
 
     #[test]
-    fn generic_public_extend_template_index_counts_private_extends() {
-        let result = typecheck_with_named_modules(
+    fn public_extend_private_slots() {
+        let result = check_named(
             "import ext { * }; fn main() { 1.bad(); }",
             &[(
                 "ext",
@@ -932,7 +1102,7 @@ mod extend_calls {
 
     #[test]
     fn exact_beats_generic() {
-        assert_type(
+        assert_ty(
             "extend<T> T { fn tag(self) -> bool { true } } extend int { fn tag(self) -> int { self } } fn main() -> int { 1.tag() }",
             Type::Int,
         );
@@ -1007,7 +1177,7 @@ mod extend_calls {
 
     #[test]
     fn exact_array_len() {
-        assert_type(
+        assert_ty(
             "
                 extend<T, N: int> [T; N] { fn tag(self) -> bool { true } }
                 extend<T> [T; 3] { fn tag(self) -> int { 3 } }
@@ -1019,7 +1189,7 @@ mod extend_calls {
 
     #[test]
     fn nested() {
-        assert_type(
+        assert_ty(
             "extend<T, N: int> [T; N] { fn tag(self) -> bool { true } } extend<T, N: int, M: int> [[T; N]; M] { fn tag(self) -> int { 0 } } fn main() -> int { [[1]].tag() }",
             Type::Int,
         );
@@ -1072,7 +1242,7 @@ mod extend_calls {
 
     #[test]
     fn method_beats_extend() {
-        assert_type(
+        assert_ty(
             "struct Point { 
                 x: int,
 
@@ -1105,7 +1275,7 @@ mod enum_variants {
 
     #[test]
     fn enum_unit_variant() {
-        assert_type(
+        assert_ty(
             "enum Color { Red, Blue } fn main() { Color.Red; }",
             color_type(),
         );
@@ -1113,7 +1283,7 @@ mod enum_variants {
 
     #[test]
     fn enum_tuple_variant() {
-        assert_type(
+        assert_ty(
             "enum Color { Rgb(int, int, int) } fn main() { Color.Rgb(1, 2, 3); }",
             color_type(),
         );
@@ -1149,7 +1319,7 @@ mod enum_variants {
 
     #[test]
     fn enum_unit_variant_no_args() {
-        assert_type(
+        assert_ty(
             "enum Color { Red } fn main() { Color.Red(); }",
             color_type(),
         );
@@ -1162,7 +1332,7 @@ mod enum_variants {
 
     #[test]
     fn enum_unit_variant_via_variable() {
-        assert_type(
+        assert_ty(
             "enum Color { Red, Blue } fn main() { let c = Color.Red; c; }",
             color_type(),
         );
@@ -1170,7 +1340,7 @@ mod enum_variants {
 
     #[test]
     fn tuple_infer() {
-        assert_type(
+        assert_ty(
             "enum Option<T> { Some(T), None } fn main() { Option.Some(42); }",
             option_type(Type::Int),
         );
@@ -1178,7 +1348,7 @@ mod enum_variants {
 
     #[test]
     fn tuple_explicit_args() {
-        assert_type(
+        assert_ty(
             "enum Option<T> { Some(T), None } fn main() { Option.Some<int>(42); }",
             option_type(Type::Int),
         );
@@ -1202,7 +1372,7 @@ mod enum_variants {
 
     #[test]
     fn unit_explicit_args() {
-        assert_type(
+        assert_ty(
             "enum Option<T> { Some(T), None } fn main() { Option.None<int>(); }",
             option_type(Type::Int),
         );
@@ -1210,7 +1380,7 @@ mod enum_variants {
 
     #[test]
     fn tuple_optional_nil() {
-        assert_type(
+        assert_ty(
             "enum Option<T> { Some(T), None } fn main() { let x: Option<int?> = Option.Some(nil); x; }",
             option_type(Type::option_of(Type::Int)),
         );
@@ -1218,16 +1388,16 @@ mod enum_variants {
 
     #[test]
     fn tuple_nil_no_leak() {
-        let checked = typecheck(
+        let checked = check(
             "enum Option<T> { Some(T), None } fn main() { let x: Option<int?> = Option.Some(nil); x; }",
         )
         .expect("typecheck failed");
-        assert_no_infer_vars_in_result(&checked);
+        assert_typecheck_closed(&checked);
     }
 
     #[test]
     fn unit_expected_return() {
-        assert_type(
+        assert_ty(
             "enum Option<T> { Some(T), None } fn main() -> Option<int> { Option.None() }",
             option_type(Type::Int),
         );
