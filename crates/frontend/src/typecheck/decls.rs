@@ -2326,10 +2326,15 @@ mod tests {
 
     fn checked_index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
         let root = parse(root);
-        super::super::check_with_modules(&root, &resolved_modules(modules), HashSet::new())
-            .expect("typecheck failed")
-            .decls()
-            .clone()
+        super::super::check_with_modules(
+            &root,
+            &resolved_modules(modules),
+            HashSet::new(),
+            crate::externs::RawExterns::default(),
+        )
+        .expect("typecheck failed")
+        .decls()
+        .clone()
     }
 
     fn func_ret(ty: &Type) -> &Type {

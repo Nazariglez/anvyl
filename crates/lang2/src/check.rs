@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anvyx_frontend::pipeline::{self, ProgramInput, Source as FrontendSource};
+use anvyx_frontend::pipeline::{self, FrontendConfig, ProgramInput, Source as FrontendSource};
 
 use crate::{
     CheckError, CheckOk, CheckResult, ModuleSource, SourceBundle, SourceText,
@@ -43,27 +43,30 @@ pub fn check_file(input: CheckFileInput) -> CheckResult {
     let root = source_root(&file);
     let mut source_loader = SourceEnvironment::new(root, &sources);
 
-    pipeline::check(ProgramInput {
-        main: FrontendSource {
-            code,
-            label: file.display().to_string(),
+    pipeline::check(
+        ProgramInput {
+            main: FrontendSource {
+                code,
+                label: file.display().to_string(),
+            },
+            prelude: sources.core_prelude().map(SourceText::to_frontend_source),
+            preloaded_modules: sources
+                .core_modules()
+                .iter()
+                .map(ModuleSource::to_frontend_module)
+                .collect(),
+            always_active_modules: sources
+                .always_active_modules()
+                .iter()
+                .map(|path| {
+                    anvyx_frontend::resolve::ModulePath::new(path.clone())
+                        .expect("SourceBundle validates module paths")
+                })
+                .collect(),
+            source_loader: &mut source_loader,
         },
-        prelude: sources.core_prelude().map(SourceText::to_frontend_source),
-        preloaded_modules: sources
-            .core_modules()
-            .iter()
-            .map(ModuleSource::to_frontend_module)
-            .collect(),
-        always_active_modules: sources
-            .always_active_modules()
-            .iter()
-            .map(|path| {
-                anvyx_frontend::resolve::ModulePath::new(path.clone())
-                    .expect("SourceBundle validates module paths")
-            })
-            .collect(),
-        source_loader: &mut source_loader,
-    })?;
+        FrontendConfig::default(),
+    )?;
 
     Ok(CheckOk)
 }

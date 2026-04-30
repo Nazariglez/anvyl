@@ -1,7 +1,16 @@
+use anvyx_externs::{
+    ExternDescriptorError, ExternOperator, ExternTypeExpr, ExternTypeKey,
+    ModulePath as ExternModulePath, NameKind, OperatorReturn, TypeContext,
+};
 use chumsky::error::{Rich, RichReason};
 
 use crate::{
     ast::{ConstValue, Ident},
+    externs::{
+        ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey,
+        RawExternIdentityKey, RawExternMemberKey, RawExternScope, RawExternTypeKey,
+        UnsupportedSourceKind, UnsupportedSourceParamReason,
+    },
     lexer::SpannedToken,
     resolve::{ModulePath, ResolveError},
     typecheck::{
@@ -88,6 +97,148 @@ pub(super) fn diagnose_unresolved_always_active_module(module: &ModuleScope) -> 
         "always-active module was not resolved: {}",
         render_module_scope(module)
     ))
+}
+
+pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnostic {
+    let message = match error {
+        ExternInputError::InvalidProviderDescriptor { provider, error } => format!(
+            "invalid extern descriptor from provider '{}': {}",
+            provider.name,
+            render_extern_descriptor_error(error, None)
+        ),
+        ExternInputError::InvalidRawDescriptor { decl, scope, error } => format!(
+            "invalid extern descriptor from {}: {}",
+            render_raw_decl(decl),
+            render_extern_descriptor_error(error, Some(scope))
+        ),
+        ExternInputError::DuplicateRawIdentity {
+            key,
+            first,
+            duplicate,
+        } => render_duplicate_raw_identity(
+            render_raw_identity_kind(key),
+            &render_raw_identity_key(key),
+            first,
+            duplicate,
+        ),
+        ExternInputError::UnsupportedSource { kind, .. } => render_unsupported_source(kind),
+    };
+    Diagnostic::error(message)
+}
+
+fn render_unsupported_source(kind: &UnsupportedSourceKind) -> String {
+    match kind {
+        UnsupportedSourceKind::Type(ty) => format!("unsupported source extern type '{ty}'"),
+        UnsupportedSourceKind::Operator(op) => format!("unsupported source extern operator '{op}'"),
+        UnsupportedSourceKind::Param { name, reason } => format!(
+            "unsupported source extern parameter '{name}': {}",
+            render_unsupported_source_param_reason(*reason)
+        ),
+    }
+}
+
+fn render_unsupported_source_param_reason(reason: UnsupportedSourceParamReason) -> &'static str {
+    match reason {
+        UnsupportedSourceParamReason::Mutable => {
+            "mutable parameters are not supported in source extern declarations"
+        }
+        UnsupportedSourceParamReason::CastAccept => {
+            "cast-accepting parameters are not supported in source extern declarations"
+        }
+        UnsupportedSourceParamReason::Default => {
+            "default parameters are not supported in source extern declarations"
+        }
+    }
+}
+
+fn render_raw_identity_kind(key: &RawExternIdentityKey) -> &'static str {
+    match key {
+        RawExternIdentityKey::Function(_) => "function",
+        RawExternIdentityKey::Type(_) => "type",
+        RawExternIdentityKey::Member(key) => render_raw_member_kind(key),
+    }
+}
+
+fn render_raw_member_kind(key: &RawExternMemberKey) -> &'static str {
+    match &key.selector {
+        anvyx_externs::ExternMemberSelector::Field(_) => "field",
+        anvyx_externs::ExternMemberSelector::Method(_) => "method",
+        anvyx_externs::ExternMemberSelector::Static(_) => "static method",
+        anvyx_externs::ExternMemberSelector::Init => "init",
+        anvyx_externs::ExternMemberSelector::Operator(_) => "operator",
+    }
+}
+
+fn render_raw_identity_key(key: &RawExternIdentityKey) -> String {
+    match key {
+        RawExternIdentityKey::Function(key) => render_raw_function_key(key),
+        RawExternIdentityKey::Type(key) => render_raw_type_key(key),
+        RawExternIdentityKey::Member(key) => render_raw_member_key(key),
+    }
+}
+
+fn render_duplicate_raw_identity(
+    kind: &str,
+    key: &str,
+    first: &RawExternDecl,
+    duplicate: &RawExternDecl,
+) -> String {
+    format!(
+        "duplicate extern {kind} '{key}' declared in {} and {}",
+        render_raw_decl(first),
+        render_raw_decl(duplicate)
+    )
+}
+
+fn render_raw_decl(decl: &RawExternDecl) -> String {
+    render_extern_provenance(&decl.provenance)
+}
+
+fn render_extern_provenance(provenance: &ExternProvenance) -> String {
+    match provenance {
+        ExternProvenance::Provider { provider } => format!("provider '{}'", provider.name),
+        ExternProvenance::Source { module } => match module {
+            RawExternScope::Root => "source root".to_string(),
+            RawExternScope::Named(path) => {
+                format!("source module '{}'", render_extern_module_path(path))
+            }
+        },
+    }
+}
+
+fn render_raw_function_key(key: &RawExternFunctionKey) -> String {
+    format!("{}.{}", render_raw_scope(&key.module), key.name)
+}
+
+fn render_raw_type_key(key: &RawExternTypeKey) -> String {
+    format!("{}.{}", render_raw_scope(&key.module), key.name)
+}
+
+fn render_raw_member_key(key: &RawExternMemberKey) -> String {
+    format!(
+        "{}.{}",
+        render_raw_type_key(&key.owner),
+        render_extern_member_selector(&key.selector)
+    )
+}
+
+fn render_raw_scope(scope: &RawExternScope) -> String {
+    match scope {
+        RawExternScope::Root => "<root>".to_string(),
+        RawExternScope::Named(path) => render_extern_module_path(path),
+    }
+}
+
+fn render_extern_member_selector(selector: &anvyx_externs::ExternMemberSelector) -> String {
+    match selector {
+        anvyx_externs::ExternMemberSelector::Field(name)
+        | anvyx_externs::ExternMemberSelector::Method(name)
+        | anvyx_externs::ExternMemberSelector::Static(name) => name.clone(),
+        anvyx_externs::ExternMemberSelector::Init => "init".to_string(),
+        anvyx_externs::ExternMemberSelector::Operator(op) => {
+            render_extern_operator(*op).to_string()
+        }
+    }
 }
 
 pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
@@ -334,6 +485,180 @@ fn render_const_value(value: &ConstValue) -> String {
         ConstValue::Float(value) => value.to_string(),
         ConstValue::Bool(value) => value.to_string(),
         ConstValue::String(value) => value.clone(),
+    }
+}
+
+fn render_extern_descriptor_error(
+    error: &ExternDescriptorError,
+    raw_scope: Option<&RawExternScope>,
+) -> String {
+    match error {
+        ExternDescriptorError::InvalidName { kind, name } => {
+            format!("invalid {} name '{name}'", render_name_kind(*kind))
+        }
+        ExternDescriptorError::EmptyModulePath => "module path must not be empty".to_string(),
+        ExternDescriptorError::DuplicateModule(path) => {
+            format!("duplicate module '{}'", render_extern_module_path(path))
+        }
+        ExternDescriptorError::DuplicateType { module, name } => format!(
+            "duplicate type '{name}' in module '{}'",
+            render_extern_module_path(module)
+        ),
+        ExternDescriptorError::DuplicateFunction { module, name } => format!(
+            "duplicate function '{name}' in module '{}'",
+            render_extern_module_path(module)
+        ),
+        ExternDescriptorError::DuplicateField { ty, name } => format!(
+            "duplicate field '{name}' on extern type '{}'",
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::DuplicateMethod { ty, name } => format!(
+            "duplicate method '{name}' on extern type '{}'",
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::DuplicateStatic { ty, name } => format!(
+            "duplicate static method '{name}' on extern type '{}'",
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::DuplicateOperator { ty, op } => format!(
+            "duplicate operator '{}' on extern type '{}'",
+            render_extern_operator(*op),
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::InvalidOperatorSignature {
+            ty,
+            op,
+            expected_params,
+            actual_params,
+        } => format!(
+            "invalid operator '{}' on extern type '{}': expected {expected_params} parameter(s), found {actual_params}",
+            render_extern_operator(*op),
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::InvalidOperatorReturn {
+            ty,
+            op,
+            expected,
+            actual,
+        } => format!(
+            "invalid operator '{}' on extern type '{}': expected {} return type, found '{}'",
+            render_extern_operator(*op),
+            render_extern_type_key(ty, raw_scope),
+            render_operator_return(*expected),
+            render_extern_type_expr(actual)
+        ),
+        ExternDescriptorError::DuplicateFieldInit { ty, name } => format!(
+            "duplicate init field '{name}' on extern type '{}'",
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::VoidType { context } => {
+            format!(
+                "void type is not allowed in {}",
+                render_type_context(*context)
+            )
+        }
+    }
+}
+
+fn render_name_kind(kind: NameKind) -> &'static str {
+    match kind {
+        NameKind::Provider => "provider",
+        NameKind::ModuleSegment => "module segment",
+        NameKind::Type => "type",
+        NameKind::Function => "function",
+        NameKind::Field => "field",
+        NameKind::FieldInit => "field init",
+        NameKind::Method => "method",
+        NameKind::Static => "static method",
+        NameKind::Param => "parameter",
+        NameKind::NamedType => "named type",
+    }
+}
+
+fn render_operator_return(expected: OperatorReturn) -> &'static str {
+    match expected {
+        OperatorReturn::Bool => "bool",
+        OperatorReturn::NonVoid => "non-void",
+    }
+}
+
+fn render_type_context(context: TypeContext) -> &'static str {
+    match context {
+        TypeContext::Param => "parameter position",
+        TypeContext::Nested => "nested type position",
+    }
+}
+
+fn render_extern_type_key(key: &ExternTypeKey, raw_scope: Option<&RawExternScope>) -> String {
+    let module = raw_scope.map_or_else(|| render_extern_module_path(&key.module), render_raw_scope);
+    format!("{}.{}", module, key.name)
+}
+
+fn render_extern_module_path(path: &ExternModulePath) -> String {
+    path.segments.join(".")
+}
+
+fn render_extern_operator(op: ExternOperator) -> &'static str {
+    match op {
+        ExternOperator::Unary(anvyx_externs::UnaryOp::Neg) => "unary -",
+        ExternOperator::Binary { op, self_on_right } => match (op, self_on_right) {
+            (anvyx_externs::BinaryOp::Add, false) => "+",
+            (anvyx_externs::BinaryOp::Add, true) => "right +",
+            (anvyx_externs::BinaryOp::Sub, false) => "-",
+            (anvyx_externs::BinaryOp::Sub, true) => "right -",
+            (anvyx_externs::BinaryOp::Mul, false) => "*",
+            (anvyx_externs::BinaryOp::Mul, true) => "right *",
+            (anvyx_externs::BinaryOp::Div, false) => "/",
+            (anvyx_externs::BinaryOp::Div, true) => "right /",
+            (anvyx_externs::BinaryOp::Rem, false) => "%",
+            (anvyx_externs::BinaryOp::Rem, true) => "right %",
+            (anvyx_externs::BinaryOp::Eq, false) => "==",
+            (anvyx_externs::BinaryOp::Eq, true) => "right ==",
+            (anvyx_externs::BinaryOp::NotEq, false) => "!=",
+            (anvyx_externs::BinaryOp::NotEq, true) => "right !=",
+            (anvyx_externs::BinaryOp::LessThan, false) => "<",
+            (anvyx_externs::BinaryOp::LessThan, true) => "right <",
+            (anvyx_externs::BinaryOp::GreaterThan, false) => ">",
+            (anvyx_externs::BinaryOp::GreaterThan, true) => "right >",
+            (anvyx_externs::BinaryOp::LessThanEq, false) => "<=",
+            (anvyx_externs::BinaryOp::LessThanEq, true) => "right <=",
+            (anvyx_externs::BinaryOp::GreaterThanEq, false) => ">=",
+            (anvyx_externs::BinaryOp::GreaterThanEq, true) => "right >=",
+        },
+    }
+}
+
+fn render_extern_type_expr(ty: &ExternTypeExpr) -> String {
+    match ty {
+        ExternTypeExpr::Void => "void".to_string(),
+        ExternTypeExpr::Bool => "bool".to_string(),
+        ExternTypeExpr::Int => "int".to_string(),
+        ExternTypeExpr::Float => "float".to_string(),
+        ExternTypeExpr::String => "string".to_string(),
+        ExternTypeExpr::Any => "any".to_string(),
+        ExternTypeExpr::List(item) => format!("[{}]", render_extern_type_expr(item)),
+        ExternTypeExpr::Map(key, value) => format!(
+            "[{}: {}]",
+            render_extern_type_expr(key),
+            render_extern_type_expr(value)
+        ),
+        ExternTypeExpr::Option(item) => format!("{}?", render_extern_type_expr(item)),
+        ExternTypeExpr::Named { module, name, args } => {
+            let mut rendered = match module {
+                Some(module) => format!("{}.{}", render_extern_module_path(module), name),
+                None => name.clone(),
+            };
+            if !args.is_empty() {
+                let args = args
+                    .iter()
+                    .map(render_extern_type_expr)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                rendered.push_str(&format!("<{args}>"));
+            }
+            rendered
+        }
+        ExternTypeExpr::Callback(_) => "callback".to_string(),
     }
 }
 

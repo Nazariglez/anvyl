@@ -55,6 +55,9 @@ fn display_frontend_error(
         FCheckError::Type { diagnostics } => {
             write_diagnostics(f, "frontend typecheck failed", diagnostics)
         }
+        FCheckError::Extern { diagnostics } => {
+            write_diagnostics(f, "frontend extern input failed", diagnostics)
+        }
         FCheckError::Source(error) => write!(f, "{error}"),
     }
 }

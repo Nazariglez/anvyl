@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     ast::Type,
+    externs::RawExterns,
     lexer::tokenize,
     parser,
     resolve::{ModuleKey, ModulePath, ResolveResult, ResolvedModule},
@@ -41,7 +42,7 @@ pub(crate) fn check(source: &str) -> Result<typecheck::TypecheckResult, Vec<Type
     let resolved = ResolveResult {
         module_groups: vec![],
     };
-    typecheck::check_with_modules(&program, &resolved, HashSet::new())
+    typecheck::check_with_modules(&program, &resolved, HashSet::new(), RawExterns::default())
 }
 
 pub(crate) fn errors(source: &str) -> Vec<TypeError> {
@@ -108,7 +109,12 @@ fn check_with_active(
         .iter()
         .map(|name| ModuleScope::Named(module_path(name)))
         .collect();
-    typecheck::check_with_modules(&root, &resolved, always_active_modules)
+    typecheck::check_with_modules(
+        &root,
+        &resolved,
+        always_active_modules,
+        RawExterns::default(),
+    )
 }
 
 fn last_expr_type(result: &typecheck::TypecheckResult) -> Option<Type> {

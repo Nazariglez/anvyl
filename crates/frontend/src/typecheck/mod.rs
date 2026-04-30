@@ -17,6 +17,7 @@ use self::{
 };
 use crate::{
     ast::*,
+    externs::RawExterns,
     resolve::{ModuleKey, ResolveResult},
     span::Span,
 };
@@ -1167,6 +1168,7 @@ pub(crate) fn check_with_modules(
     program: &Program,
     resolved: &ResolveResult,
     always_active_modules: HashSet<ModuleScope>,
+    _externs: RawExterns,
 ) -> Result<TypecheckResult, Vec<TypeError>> {
     let decls = DeclarationIndex::from_root_and_modules(program, resolved, always_active_modules);
     if decls.has_errors() {

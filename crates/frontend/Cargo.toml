@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anvyx-externs = { path = "../externs" }
 chumsky = "0.11.2"
 internment = "0.8.6"
 

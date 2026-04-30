@@ -123,6 +123,18 @@ pub fn validate(provider: &ProviderDescriptor) -> Result<(), Vec<ExternDescripto
     }
 }
 
+pub fn validate_module_contents(
+    module: &ExternModuleDescriptor,
+) -> Result<(), Vec<ExternDescriptorError>> {
+    let mut errors = vec![];
+    check_module(module, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 fn check_module(module: &ExternModuleDescriptor, errors: &mut Vec<ExternDescriptorError>) {
     let mut types = HashSet::new();
     for ty in &module.types {

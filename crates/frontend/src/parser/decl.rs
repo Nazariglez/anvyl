@@ -505,12 +505,17 @@ fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
     };
 
     let unary = select! { (Token::Op(Op::Sub), _) => () }
-        .then_ignore(type_ident())
+        .ignore_then(type_ident())
         .then_ignore(arrow)
         .then(type_ident())
-        .map(|((), ret)| ast::ExternTypeMember::UnaryOperator {
-            op: ast::UnaryOp::Neg,
-            ret,
+        .validate(|(operand, ret), extra, emitter| {
+            if !is_self_type(&operand) {
+                emitter.emit(Rich::custom(extra.span(), "unary operand must be 'Self'"));
+            }
+            ast::ExternTypeMember::UnaryOperator {
+                op: ast::UnaryOp::Neg,
+                ret,
+            }
         });
 
     let binary = type_ident()

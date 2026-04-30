@@ -6,11 +6,12 @@ use std::collections::HashSet;
 pub use diagnostics::Diagnostic;
 
 use self::diagnostics::{
-    diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error, diagnose_type_error,
-    diagnose_unresolved_always_active_module,
+    diagnose_extern_input_error, diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error,
+    diagnose_type_error, diagnose_unresolved_always_active_module,
 };
 use crate::{
     ast::Program,
+    externs::{self, ExternInputs},
     lexer, parser,
     resolve::{
         self, ModuleKey, ModuleLoadError, ModuleLoader, ModulePath, PreloadedModule, ResolveFailure,
@@ -53,6 +54,11 @@ pub struct ProgramInput<'a, L: SourceLoader> {
     pub source_loader: &'a mut L,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrontendConfig {
+    pub externs: ExternInputs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckOk;
 
@@ -72,11 +78,15 @@ pub enum CheckError<E = std::convert::Infallible> {
     Type {
         diagnostics: Vec<Diagnostic>,
     },
+    Extern {
+        diagnostics: Vec<Diagnostic>,
+    },
     Source(Box<E>),
 }
 
 pub fn check<L: SourceLoader>(
     input: ProgramInput<'_, L>,
+    config: FrontendConfig,
 ) -> Result<CheckOk, CheckError<L::FatalError>> {
     let mut root = parse_source(&input.main)?;
     if let Some(prelude) = input.prelude {
@@ -108,11 +118,27 @@ pub fn check<L: SourceLoader>(
 
     validate_always_active_modules(&resolved, &always_active_modules)?;
 
-    typecheck::check_with_modules(&root, &resolved, always_active_modules).map_err(|errors| {
-        CheckError::Type {
-            diagnostics: errors.iter().map(diagnose_type_error).collect(),
-        }
+    let mut raw_externs =
+        externs::ingest_providers(config.externs).map_err(|errors| CheckError::Extern {
+            diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
+        })?;
+    let source_externs =
+        externs::collect_source_externs(&root, &resolved).map_err(|errors| CheckError::Extern {
+            diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
+        })?;
+    raw_externs.append(source_externs);
+    externs::validate_raw_shapes(&raw_externs).map_err(|errors| CheckError::Extern {
+        diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
     })?;
+    externs::validate_raw_identities(&raw_externs).map_err(|errors| CheckError::Extern {
+        diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
+    })?;
+
+    typecheck::check_with_modules(&root, &resolved, always_active_modules, raw_externs).map_err(
+        |errors| CheckError::Type {
+            diagnostics: errors.iter().map(diagnose_type_error).collect(),
+        },
+    )?;
 
     Ok(CheckOk)
 }
@@ -220,10 +246,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        CheckError, Diagnostic, ModuleInput, ProgramInput, Source, SourceLoadError, SourceLoader,
-        check,
+        CheckError, CheckOk, Diagnostic, FrontendConfig, ModuleInput, ProgramInput, Source,
+        SourceLoadError, SourceLoader, check as pipeline_check,
     };
-    use crate::resolve::ModulePath;
+    use crate::{externs::ExternInputs, resolve::ModulePath};
 
     #[derive(Default)]
     struct TestLoader {
@@ -285,7 +311,13 @@ mod tests {
         }
     }
 
-    fn check_source(source_code: &str) -> Result<super::CheckOk, CheckError> {
+    fn check<L: SourceLoader>(
+        input: ProgramInput<'_, L>,
+    ) -> Result<CheckOk, CheckError<L::FatalError>> {
+        pipeline_check(input, FrontendConfig::default())
+    }
+
+    fn check_source(source_code: &str) -> Result<CheckOk, CheckError> {
         let mut loader = TestLoader::default();
         check(ProgramInput {
             main: source(source_code, "main.anv"),
@@ -294,6 +326,219 @@ mod tests {
             always_active_modules: vec![],
             source_loader: &mut loader,
         })
+    }
+
+    fn extern_messages(source: &str) -> Vec<String> {
+        let CheckError::Extern { diagnostics } = check_source(source).unwrap_err() else {
+            panic!("expected extern error");
+        };
+        diagnostic_messages(&diagnostics)
+    }
+
+    #[test]
+    fn default_config_has_empty_externs() {
+        assert_eq!(
+            FrontendConfig::default(),
+            FrontendConfig {
+                externs: ExternInputs::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_valid_provider_descriptors() {
+        let mut loader = TestLoader::default();
+        pipeline_check(
+            ProgramInput {
+                main: source("fn main() {}", "main.anv"),
+                prelude: None,
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: ExternInputs {
+                    providers: vec![valid_provider_descriptor()],
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn invalid_provider_descriptor_is_extern_error() {
+        let mut loader = TestLoader::default();
+        let err = pipeline_check(
+            ProgramInput {
+                main: source("fn main() {}", "main.anv"),
+                prelude: None,
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: ExternInputs {
+                    providers: vec![invalid_provider_descriptor()],
+                },
+            },
+        )
+        .unwrap_err();
+
+        let CheckError::Extern { diagnostics } = err else {
+            panic!("expected extern error");
+        };
+        assert_eq!(
+            diagnostic_messages(&diagnostics),
+            [
+                "invalid extern descriptor from provider 'math': duplicate function 'dot' in module 'math'"
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_raw_extern_identities_are_extern_errors() {
+        assert_eq!(
+            extern_messages("extern fn f() -> void; extern fn f() -> void;"),
+            ["duplicate extern function '<root>.f' declared in source root and source root"]
+        );
+    }
+
+    #[test]
+    fn duplicate_provider_externs_are_rejected_before_typechecking() {
+        let mut provider = valid_provider_descriptor();
+        provider.provider.name = "other_math".to_string();
+        let mut loader = TestLoader::default();
+        let err = pipeline_check(
+            ProgramInput {
+                main: source("fn main() { missing; }", "main.anv"),
+                prelude: None,
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: ExternInputs {
+                    providers: vec![valid_provider_descriptor(), provider],
+                },
+            },
+        )
+        .unwrap_err();
+
+        let CheckError::Extern { diagnostics } = err else {
+            panic!("expected extern error");
+        };
+        assert_eq!(
+            diagnostic_messages(&diagnostics),
+            [
+                "duplicate extern function 'math.dot' declared in provider 'math' and provider 'other_math'"
+            ]
+        );
+    }
+
+    #[test]
+    fn source_extern_normalization_errors_are_extern_errors() {
+        assert_eq!(
+            extern_messages("extern fn f(x: (int, int)) -> void;"),
+            ["unsupported source extern type '(int, int)'"]
+        );
+    }
+
+    #[test]
+    fn source_extern_shape_errors_are_extern_errors() {
+        assert_eq!(
+            extern_messages("extern fn f(x: void) -> void;"),
+            [
+                "invalid extern descriptor from source root: void type is not allowed in parameter position"
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_root_scope() {
+        assert_eq!(
+            extern_messages("extern type T { op Self + int -> void; }"),
+            [
+                "invalid extern descriptor from source root: invalid operator '+' on extern type '<root>.T': expected non-void return type, found 'void'"
+            ]
+        );
+    }
+
+    #[test]
+    fn param_decorations_are_extern_errors() {
+        assert_eq!(
+            extern_messages("extern fn f(var x: int) -> void;"),
+            [
+                "unsupported source extern parameter 'x': mutable parameters are not supported in source extern declarations"
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_unary_operand_is_parse_error() {
+        let err = check_source("extern type T { op -int -> int; }").unwrap_err();
+
+        assert!(matches!(err, CheckError::Parse { .. }));
+    }
+
+    #[test]
+    fn source_only_program_without_externs_still_passes() {
+        check_source("fn main() {}").unwrap();
+    }
+
+    #[test]
+    fn parse_errors_take_precedence_over_provider_errors() {
+        let mut loader = TestLoader::default();
+        let err = pipeline_check(
+            ProgramInput {
+                main: source("fn main( {}", "main.anv"),
+                prelude: None,
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: ExternInputs {
+                    providers: vec![invalid_provider_descriptor()],
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Parse { .. }));
+    }
+
+    fn valid_provider_descriptor() -> anvyx_externs::ProviderDescriptor {
+        anvyx_externs::ProviderDescriptor {
+            provider: anvyx_externs::ProviderId {
+                name: "math".to_string(),
+            },
+            modules: vec![anvyx_externs::ExternModuleDescriptor {
+                path: extern_module_path(&["math"]),
+                types: vec![],
+                functions: vec![anvyx_externs::ExternFunctionDescriptor {
+                    name: "dot".to_string(),
+                    doc: None,
+                    signature: anvyx_externs::ExternSignature {
+                        params: vec![],
+                        ret: anvyx_externs::ExternTypeExpr::Float,
+                    },
+                    effects: anvyx_externs::ExternEffects::default(),
+                }],
+            }],
+        }
+    }
+
+    fn invalid_provider_descriptor() -> anvyx_externs::ProviderDescriptor {
+        let mut provider = valid_provider_descriptor();
+        let function = provider.modules[0].functions[0].clone();
+        provider.modules[0].functions.push(function);
+        provider
+    }
+
+    fn extern_module_path(path: &[&str]) -> anvyx_externs::ModulePath {
+        anvyx_externs::ModulePath {
+            segments: path.iter().map(|segment| (*segment).to_string()).collect(),
+        }
     }
 
     fn diagnostic_messages(diagnostics: &[Diagnostic]) -> Vec<String> {
