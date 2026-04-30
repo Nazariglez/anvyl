@@ -103,6 +103,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvyx-externs"
+version = "0.1.0"
+
+[[package]]
 name = "anvyx-fmt"
 version = "0.1.0"
 dependencies = [

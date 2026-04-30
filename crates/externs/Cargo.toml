@@ -1,0 +1,9 @@
+[package]
+name = "anvyx-externs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
