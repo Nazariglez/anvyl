@@ -130,24 +130,42 @@ fn render_unsupported_source(kind: &UnsupportedSourceKind) -> String {
     match kind {
         UnsupportedSourceKind::Type(ty) => format!("unsupported source extern type '{ty}'"),
         UnsupportedSourceKind::Operator(op) => format!("unsupported source extern operator '{op}'"),
-        UnsupportedSourceKind::Param { name, reason } => format!(
-            "unsupported source extern parameter '{name}': {}",
-            render_unsupported_source_param_reason(*reason)
-        ),
+        UnsupportedSourceKind::Param { name, reason } => {
+            render_unsupported_param(Some(name), *reason, false)
+        }
+        UnsupportedSourceKind::CallbackParam { reason } => {
+            render_unsupported_param(None, *reason, true)
+        }
     }
 }
 
-fn render_unsupported_source_param_reason(reason: UnsupportedSourceParamReason) -> &'static str {
-    match reason {
-        UnsupportedSourceParamReason::Mutable => {
-            "mutable parameters are not supported in source extern declarations"
-        }
-        UnsupportedSourceParamReason::CastAccept => {
-            "cast-accepting parameters are not supported in source extern declarations"
-        }
-        UnsupportedSourceParamReason::Default => {
-            "default parameters are not supported in source extern declarations"
-        }
+fn render_unsupported_param(
+    name: Option<&str>,
+    reason: UnsupportedSourceParamReason,
+    callback: bool,
+) -> String {
+    let prefix = match reason {
+        UnsupportedSourceParamReason::Mutable => "mutable",
+        UnsupportedSourceParamReason::CastAccept => "cast-accepting",
+        UnsupportedSourceParamReason::Default => "default",
+    };
+    let subject = if callback {
+        "callback parameter"
+    } else {
+        "parameter"
+    };
+    let plural = if callback {
+        "callback parameters"
+    } else {
+        "parameters"
+    };
+    match name {
+        Some(name) => format!(
+            "unsupported source extern {subject} '{name}': {prefix} {plural} are not supported in source extern declarations"
+        ),
+        None => format!(
+            "unsupported source extern {subject}: {prefix} {plural} are not supported in source extern declarations"
+        ),
     }
 }
 

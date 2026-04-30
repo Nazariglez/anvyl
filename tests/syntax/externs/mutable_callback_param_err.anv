@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unsupported source extern callback parameter
+
+extern fn bad(callback: fn(var int) -> void);

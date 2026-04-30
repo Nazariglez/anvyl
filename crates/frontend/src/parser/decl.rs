@@ -271,6 +271,19 @@ pub(super) fn extern_declaration<'src>(
         .boxed()
 }
 
+fn contextual_ident<'src>(word: &'static str) -> BoxedParser<'src, ()> {
+    select! { (Token::Ident(ident), _) if ident.0.as_ref() == word => () }.boxed()
+}
+
+fn extern_type_rep<'src>() -> BoxedParser<'src, ast::ExternTypeRep> {
+    contextual_ident("rep")
+        .ignore_then(choice((
+            contextual_ident("shared").to(ast::ExternTypeRep::Shared),
+            contextual_ident("inline").to(ast::ExternTypeRep::Inline),
+        )))
+        .boxed()
+}
+
 fn extern_type_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
@@ -278,17 +291,19 @@ fn extern_type_declaration<'src>(
 
     select! { (Token::Keyword(Keyword::Type), _) => () }
         .ignore_then(identifier())
+        .then(extern_type_rep().or_not())
         .then(choice((
             extern_type_body(stmt).map(Some),
             semicolon.map(|()| None),
         )))
-        .map_with(|(name, body), e| {
+        .map_with(|((name, rep), body), e| {
             let s = e.span();
-            let (members, has_init) = body.unwrap_or((vec![], false));
+            let (members, init) = body.unwrap_or((vec![], None));
             let self_type =
                 ast::Type::nominal(ast::NominalKind::Extern, name, vec![], vec![], None);
             let empty_map = HashMap::new();
             let empty_const_map = HashMap::new();
+            let init = resolve_extern_init(init, &empty_map, &empty_const_map, &self_type);
             let resolved_members =
                 resolve_extern_members(members, &empty_map, &empty_const_map, &self_type);
             let node = Spanned::new(
@@ -296,8 +311,8 @@ fn extern_type_declaration<'src>(
                     annotations: vec![],
                     doc: None,
                     name,
-                    kind: ast::ExternKind::SharedIdentity,
-                    has_init,
+                    rep: rep.unwrap_or(ast::ExternTypeRep::Shared),
+                    init,
                     members: resolved_members,
                 },
                 Span::new(s.start, s.end),
@@ -306,6 +321,40 @@ fn extern_type_declaration<'src>(
             Spanned::new(ast::Stmt::ExternType(node), span)
         })
         .boxed()
+}
+
+fn resolve_extern_init(
+    init: Option<ast::ExternInit>,
+    type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+    const_param_map: &HashMap<ast::Ident, ast::ConstParamId>,
+    self_type: &ast::Type,
+) -> Option<ast::ExternInit> {
+    init.map(|init| ast::ExternInit {
+        params: resolve_extern_params(init.params, type_param_map, const_param_map, self_type),
+    })
+}
+
+fn resolve_extern_params(
+    params: Vec<ast::Param>,
+    type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+    const_param_map: &HashMap<ast::Ident, ast::ConstParamId>,
+    self_type: &ast::Type,
+) -> Vec<ast::Param> {
+    params
+        .into_iter()
+        .map(|p| ast::Param {
+            mutability: p.mutability,
+            name: p.name,
+            ty: resolve_type_params_with_self(
+                &p.ty,
+                type_param_map,
+                const_param_map,
+                Some(self_type),
+            ),
+            default: p.default,
+            cast_accept: p.cast_accept,
+        })
+        .collect()
 }
 
 fn resolve_extern_members(
@@ -321,6 +370,7 @@ fn resolve_extern_members(
                 doc,
                 name,
                 ty,
+                access,
                 computed,
             } => ast::ExternTypeMember::Field {
                 doc,
@@ -331,6 +381,7 @@ fn resolve_extern_members(
                     const_param_map,
                     Some(self_type),
                 ),
+                access,
                 computed,
             },
             ast::ExternTypeMember::Method {
@@ -343,21 +394,7 @@ fn resolve_extern_members(
                 doc,
                 name,
                 receiver,
-                params: params
-                    .iter()
-                    .map(|p| ast::Param {
-                        mutability: p.mutability,
-                        name: p.name,
-                        ty: resolve_type_params_with_self(
-                            &p.ty,
-                            type_param_map,
-                            const_param_map,
-                            Some(self_type),
-                        ),
-                        default: p.default.clone(),
-                        cast_accept: p.cast_accept,
-                    })
-                    .collect(),
+                params: resolve_extern_params(params, type_param_map, const_param_map, self_type),
                 ret: resolve_type_params_with_self(
                     &ret,
                     type_param_map,
@@ -373,21 +410,7 @@ fn resolve_extern_members(
             } => ast::ExternTypeMember::StaticMethod {
                 doc,
                 name,
-                params: params
-                    .iter()
-                    .map(|p| ast::Param {
-                        mutability: p.mutability,
-                        name: p.name,
-                        ty: resolve_type_params_with_self(
-                            &p.ty,
-                            type_param_map,
-                            const_param_map,
-                            Some(self_type),
-                        ),
-                        default: p.default.clone(),
-                        cast_accept: p.cast_accept,
-                    })
-                    .collect(),
+                params: resolve_extern_params(params, type_param_map, const_param_map, self_type),
                 ret: resolve_type_params_with_self(
                     &ret,
                     type_param_map,
@@ -433,16 +456,21 @@ fn resolve_extern_members(
 
 fn extern_type_body<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
-) -> BoxedParser<'src, (Vec<ast::ExternTypeMember>, bool)> {
+) -> BoxedParser<'src, (Vec<ast::ExternTypeMember>, Option<ast::ExternInit>)> {
     enum BodyItem {
         Member(ast::ExternTypeMember),
-        Init,
+        Init(ast::ExternInit),
     }
 
     let semicolon = select! { (Token::Semicolon, _) => () };
-    let init_item = select! { (Token::Ident(ident), _) if ident.0.as_ref() == "init" => () }
+    let init_item = contextual_ident("init")
+        .ignore_then(params(stmt.clone()).or_not())
         .then_ignore(semicolon)
-        .map(|()| BodyItem::Init);
+        .map(|params| {
+            BodyItem::Init(ast::ExternInit {
+                params: params.unwrap_or_default(),
+            })
+        });
     let member_item = extern_type_member(stmt).map(BodyItem::Member);
 
     select! { (Token::Open(Delimiter::Brace), _) => () }
@@ -454,22 +482,23 @@ fn extern_type_body<'src>(
         .then_ignore(select! { (Token::Close(Delimiter::Brace), _) => () })
         .validate(|items, extra, emitter| {
             let mut members = vec![];
-            let mut init_count = 0usize;
+            let mut init = None;
             for item in items {
                 match item {
-                    BodyItem::Member(m) => members.push(m),
-                    BodyItem::Init => {
-                        init_count += 1;
-                        if init_count > 1 {
+                    BodyItem::Member(member) => members.push(member),
+                    BodyItem::Init(next_init) => {
+                        if init.is_some() {
                             emitter.emit(Rich::custom(
                                 extra.span(),
                                 "duplicate 'init' in extern type body",
                             ));
+                        } else {
+                            init = Some(next_init);
                         }
                     }
                 }
             }
-            (members, init_count > 0)
+            (members, init)
         })
         .boxed()
 }
@@ -502,6 +531,11 @@ fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
         (Token::Op(Op::Div), _) => ast::BinaryOp::Div,
         (Token::Op(Op::Rem), _) => ast::BinaryOp::Rem,
         (Token::Op(Op::Eq), _) => ast::BinaryOp::Eq,
+        (Token::Op(Op::NotEq), _) => ast::BinaryOp::NotEq,
+        (Token::Op(Op::LessThan), _) => ast::BinaryOp::LessThan,
+        (Token::Op(Op::GreaterThan), _) => ast::BinaryOp::GreaterThan,
+        (Token::Op(Op::LessThanEq), _) => ast::BinaryOp::LessThanEq,
+        (Token::Op(Op::GreaterThanEq), _) => ast::BinaryOp::GreaterThanEq,
     };
 
     let unary = select! { (Token::Op(Op::Sub), _) => () }
@@ -544,16 +578,43 @@ fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
 }
 
 fn extern_type_field_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
+    let var_kw = select! { (Token::Keyword(Keyword::Var), _) => () };
+    let let_kw = select! { (Token::Keyword(Keyword::Let), _) => () };
+
+    let direct_access = choice((
+        var_kw.to(ast::ExternFieldAccess::ReadWrite),
+        let_kw.to(ast::ExternFieldAccess::ReadOnly),
+    ))
+    .or_not()
+    .map(|access| access.unwrap_or(ast::ExternFieldAccess::ReadWrite));
+
+    let computed_access = contextual_ident("computed")
+        .ignore_then(var_kw.or_not())
+        .map(|var_opt| {
+            if var_opt.is_some() {
+                ast::ExternFieldAccess::ReadWrite
+            } else {
+                ast::ExternFieldAccess::ReadOnly
+            }
+        });
+
     doc_comment_block()
+        .then(choice((
+            computed_access.map(|access| (access, true)),
+            direct_access.map(|access| (access, false)),
+        )))
         .then(identifier())
         .then_ignore(select! { (Token::Colon, _) => () })
         .then(type_ident())
-        .map(|((doc, name), ty)| ast::ExternTypeMember::Field {
-            doc,
-            name,
-            ty,
-            computed: false,
-        })
+        .map(
+            |(((doc, (access, computed)), name), ty)| ast::ExternTypeMember::Field {
+                doc,
+                name,
+                ty,
+                access,
+                computed,
+            },
+        )
         .boxed()
 }
 
@@ -564,16 +625,16 @@ fn extern_type_method_member<'src>(
         .then(
             select! { (Token::Keyword(Keyword::Fn), _) => () }
                 .ignore_then(field_name_ident())
-                .then(method_params(stmt))
+                .then(extern_method_params(stmt))
                 .then(return_type()),
         )
-        .map(|(doc, ((name, (receiver, _, params)), ret))| {
+        .map(|(doc, ((name, (receiver, params)), ret))| {
             let ret = ret.unwrap_or(ast::Type::Void);
             match receiver {
-                Some(recv) => ast::ExternTypeMember::Method {
+                Some(receiver) => ast::ExternTypeMember::Method {
                     doc,
                     name,
-                    receiver: recv,
+                    receiver,
                     params,
                     ret,
                 },
@@ -586,6 +647,79 @@ fn extern_type_method_member<'src>(
             }
         })
         .boxed()
+}
+
+fn extern_method_params<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, (Option<ast::ExternReceiverMode>, Vec<ast::Param>)> {
+    select! { (Token::Open(Delimiter::Parent), _) => () }
+        .ignore_then(
+            extern_method_param_list(stmt)
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .then_ignore(select! { (Token::Close(Delimiter::Parent), _) => () })
+        .boxed()
+}
+
+fn extern_self_param<'src>() -> BoxedParser<'src, ast::ExternReceiverMode> {
+    let value_self = extern_self_ident().to(ast::ExternReceiverMode::Value);
+    let shared_self = contextual_ident("shared")
+        .ignore_then(extern_self_ident())
+        .to(ast::ExternReceiverMode::Shared);
+    let mutable_self = select! { (Token::Keyword(Keyword::Var), _) => () }
+        .ignore_then(extern_self_ident())
+        .to(ast::ExternReceiverMode::Mutable);
+
+    choice((shared_self, mutable_self, value_self)).boxed()
+}
+
+fn extern_self_ident<'src>() -> BoxedParser<'src, ()> {
+    identifier()
+        .try_map(|ident, span| {
+            if ident.0.as_ref() == SELF_ITEM {
+                Ok(())
+            } else {
+                Err(Rich::custom(span, "expected 'self'"))
+            }
+        })
+        .boxed()
+}
+
+fn extern_method_param_list<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, (Option<ast::ExternReceiverMode>, Vec<ast::Param>)> {
+    let regular_params = param(stmt)
+        .separated_by(select! { (Token::Comma, _) => () })
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .validate(|params, extra, emitter| {
+            if params.iter().any(|param| param.name.0.as_ref() == SELF_ITEM) {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "extern method receiver must be 'self', 'shared self', or 'var self' without a type annotation",
+                ));
+            }
+            params
+        });
+
+    choice((
+        extern_self_param()
+            .then(
+                select! { (Token::Comma, _) => () }
+                    .ignore_then(
+                        regular_params
+                            .clone()
+                            .or_not()
+                            .map(Option::unwrap_or_default),
+                    )
+                    .or_not()
+                    .map(Option::unwrap_or_default),
+            )
+            .map(|(receiver, params)| (Some(receiver), params)),
+        regular_params.map(|params| (None, params)),
+    ))
+    .boxed()
 }
 
 fn visibility<'src>() -> BoxedParser<'src, ast::Visibility> {
@@ -1252,7 +1386,7 @@ pub(super) fn extend_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::ExtendDeclNode> {
     enum ExtendMember {
-        Method(ast::ExtendMethodNode),
+        Method(Box<ast::ExtendMethodNode>),
         CastFrom(Box<ast::CastFromNode>),
     }
 
@@ -1285,7 +1419,7 @@ pub(super) fn extend_declaration<'src>(
                 .ignore_then(
                     choice((
                         cast_from_decl(stmt.clone()).map(|cf| ExtendMember::CastFrom(Box::new(cf))),
-                        extend_method(stmt).map(ExtendMember::Method),
+                        extend_method(stmt).map(|method| ExtendMember::Method(Box::new(method))),
                     ))
                     .repeated()
                     .collect::<Vec<_>>(),
@@ -1302,7 +1436,7 @@ pub(super) fn extend_declaration<'src>(
             let mut cast_froms = vec![];
             for m in members {
                 match m {
-                    ExtendMember::Method(method) => methods.push(method),
+                    ExtendMember::Method(method) => methods.push(*method),
                     ExtendMember::CastFrom(cf) => cast_froms.push(*cf),
                 }
             }

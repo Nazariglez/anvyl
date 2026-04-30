@@ -156,6 +156,9 @@ pub(crate) enum UnsupportedSourceKind {
         name: String,
         reason: UnsupportedSourceParamReason,
     },
+    CallbackParam {
+        reason: UnsupportedSourceParamReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

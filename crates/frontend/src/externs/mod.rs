@@ -25,13 +25,13 @@ mod tests {
         ExternInitDescriptor, ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor,
         ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
         ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, FieldAccess, ModulePath,
-        ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, TypeContext,
+        OperatorReturn, ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, TypeContext,
     };
 
     use super::*;
     use crate::{
         ast::Program,
-        externs::raw::{RawExternGroup, RawExternModule},
+        externs::raw::{RawExternGroup, RawExternModule, RawExternType},
         lexer::tokenize,
         parser,
         resolve::{ModuleKey, ModulePath as ResolveModulePath, ResolveResult, ResolvedModule},
@@ -76,6 +76,19 @@ mod tests {
     fn empty_resolved() -> ResolveResult {
         ResolveResult {
             module_groups: vec![],
+        }
+    }
+
+    fn collect_root_type(source: &str) -> RawExternType {
+        let mut raw = collect_source_externs(&parse(source), &empty_resolved()).unwrap();
+        raw.groups.remove(0).modules.remove(0).types.remove(0)
+    }
+
+    fn named(name: &str) -> ExternTypeExpr {
+        ExternTypeExpr::Named {
+            module: None,
+            name: name.to_string(),
+            args: vec![],
         }
     }
 
@@ -272,7 +285,7 @@ mod tests {
     #[test]
     fn normalizes_source_extern_type_members() {
         let root = parse(
-            r#"
+            r"
             /// A point.
             extern type Point {
                 init;
@@ -286,7 +299,7 @@ mod tests {
                 op float + Self -> Self;
                 op - Self -> Self;
             }
-            "#,
+            ",
         );
 
         let raw = collect_source_externs(&root, &empty_resolved()).unwrap();
@@ -337,6 +350,279 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_source_extern_representations() {
+        assert_eq!(collect_root_type("extern type T;").rep, ExternRep::Shared);
+        assert_eq!(
+            collect_root_type("extern type T rep shared;").rep,
+            ExternRep::Shared
+        );
+        assert_eq!(
+            collect_root_type("extern type T rep inline;").rep,
+            ExternRep::Inline
+        );
+    }
+
+    #[test]
+    fn normalizes_source_field_access() {
+        let ty = collect_root_type(
+            r"
+            extern type T {
+                plain: int;
+                var mutable: int;
+                let readonly: int;
+                computed cached: int;
+                computed var live: int;
+            }
+            ",
+        );
+
+        let fields = ty
+            .fields
+            .iter()
+            .map(|field| (field.decl.name.as_str(), field.decl.access))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            fields,
+            [
+                ("plain", FieldAccess::ReadWrite { computed: false }),
+                ("mutable", FieldAccess::ReadWrite { computed: false }),
+                ("readonly", FieldAccess::ReadOnly { computed: false }),
+                ("cached", FieldAccess::ReadOnly { computed: true }),
+                ("live", FieldAccess::ReadWrite { computed: true }),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalizes_source_init_forms() {
+        for source in ["extern type T { init; }", "extern type T { init(); }"] {
+            let ty = collect_root_type(source);
+            assert_eq!(ty.init.unwrap().decl.params, []);
+        }
+
+        let ty = collect_root_type("extern type Point { init(x: float, y: float); }");
+        let init = ty.init.unwrap();
+        assert_eq!(
+            init.decl.params,
+            [
+                param("x", ExternTypeExpr::Float),
+                param("y", ExternTypeExpr::Float),
+            ]
+        );
+        assert_eq!(init.decl.field_init, Vec::<String>::new());
+        assert!(init.site.span.is_some());
+    }
+
+    #[test]
+    fn normalizes_source_init_type_expressions() {
+        let ty = collect_root_type(
+            r"
+            extern type Owner {
+                init(
+                    owner: Self,
+                    callback: fn(Self) -> Self,
+                    optional: Self?,
+                    list: [Self],
+                    map: [string: Self],
+                    named: other.Type
+                );
+            }
+            ",
+        );
+
+        let params = &ty.init.unwrap().decl.params;
+        assert_eq!(params[0], param("owner", named("Owner")));
+        assert!(matches!(params[1].ty, ExternTypeExpr::Callback(_)));
+        assert_eq!(
+            params[2].ty,
+            ExternTypeExpr::Option(Box::new(named("Owner")))
+        );
+        assert_eq!(params[3].ty, ExternTypeExpr::List(Box::new(named("Owner"))));
+        assert_eq!(
+            params[4].ty,
+            ExternTypeExpr::Map(Box::new(ExternTypeExpr::String), Box::new(named("Owner")))
+        );
+        assert_eq!(
+            params[5].ty,
+            ExternTypeExpr::Named {
+                module: Some(module(&["other"])),
+                name: "Type".to_string(),
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_source_init_params() {
+        for source in [
+            "extern type T { init(var x: int); }",
+            "extern type T { init(x: as int); }",
+            "extern type T { init(x: int = 1); }",
+            "extern type T { init(x: (int, int)); }",
+            "extern type T { init(x: [int; 2]); }",
+            "extern type T { init(x: [int; _]); }",
+            "extern type T { init(x: Vec<4>); }",
+        ] {
+            assert!(matches!(
+                collect_source_externs(&parse(source), &empty_resolved()).unwrap_err()[0],
+                ExternInputError::UnsupportedSource { .. }
+            ));
+        }
+
+        let raw = collect_source_externs(
+            &parse("extern type T { init(x: void); }"),
+            &empty_resolved(),
+        )
+        .unwrap();
+        let errors = validate_raw_shapes(&raw).unwrap_err();
+        assert!(matches!(
+            errors[0],
+            ExternInputError::InvalidRawDescriptor {
+                error: ExternDescriptorError::VoidType {
+                    context: TypeContext::Param
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn normalizes_source_receiver_modes() {
+        let ty = collect_root_type(
+            r"
+            extern type T {
+                fn value(self) -> void;
+                fn shared(shared self) -> void;
+                fn mutable(var self) -> void;
+            }
+            ",
+        );
+
+        let receivers = ty
+            .methods
+            .iter()
+            .map(|method| method.decl.receiver)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receivers,
+            [
+                ReceiverMode::Value,
+                ReceiverMode::Shared,
+                ReceiverMode::Mutable,
+            ]
+        );
+    }
+
+    #[test]
+    fn normalizes_source_comparison_operators() {
+        let ty = collect_root_type(
+            r"
+            extern type T {
+                op Self != Self -> bool;
+                op Self < Self -> bool;
+                op Self > Self -> bool;
+                op Self <= Self -> bool;
+                op Self >= Self -> bool;
+            }
+            ",
+        );
+
+        let ops = ty
+            .operators
+            .iter()
+            .map(|operator| operator.decl.op)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ops,
+            [
+                ExternOperator::Binary {
+                    op: BinaryOp::NotEq,
+                    self_on_right: false,
+                },
+                ExternOperator::Binary {
+                    op: BinaryOp::LessThan,
+                    self_on_right: false,
+                },
+                ExternOperator::Binary {
+                    op: BinaryOp::GreaterThan,
+                    self_on_right: false,
+                },
+                ExternOperator::Binary {
+                    op: BinaryOp::LessThanEq,
+                    self_on_right: false,
+                },
+                ExternOperator::Binary {
+                    op: BinaryOp::GreaterThanEq,
+                    self_on_right: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_non_bool_comparison_operator_return() {
+        for (source, op) in [
+            ("extern type T { op Self == Self -> int; }", BinaryOp::Eq),
+            ("extern type T { op Self != Self -> int; }", BinaryOp::NotEq),
+            (
+                "extern type T { op Self < Self -> int; }",
+                BinaryOp::LessThan,
+            ),
+            (
+                "extern type T { op Self > Self -> int; }",
+                BinaryOp::GreaterThan,
+            ),
+            (
+                "extern type T { op Self <= Self -> int; }",
+                BinaryOp::LessThanEq,
+            ),
+            (
+                "extern type T { op Self >= Self -> int; }",
+                BinaryOp::GreaterThanEq,
+            ),
+        ] {
+            let raw = collect_source_externs(&parse(source), &empty_resolved()).unwrap();
+            let errors = validate_raw_shapes(&raw).unwrap_err();
+            assert!(matches!(
+                &errors[0],
+                ExternInputError::InvalidRawDescriptor {
+                    error: ExternDescriptorError::InvalidOperatorReturn {
+                        op: ExternOperator::Binary { op: actual, .. },
+                        expected: OperatorReturn::Bool,
+                        actual: ExternTypeExpr::Int,
+                        ..
+                    },
+                    ..
+                } if *actual == op
+            ));
+        }
+    }
+
+    #[test]
+    fn normalizes_source_self_in_member_types() {
+        let ty = collect_root_type(
+            r"
+            extern type Owner {
+                field: Self;
+                init(owner: Self);
+                fn method(self, owner: Self) -> Self;
+                fn make() -> Self;
+                op Self + Self -> Self;
+            }
+            ",
+        );
+
+        assert_eq!(ty.fields[0].decl.ty, named("Owner"));
+        assert_eq!(ty.init.unwrap().decl.params[0].ty, named("Owner"));
+        assert_eq!(ty.methods[0].decl.signature.params[0].ty, named("Owner"));
+        assert_eq!(ty.methods[0].decl.signature.ret, named("Owner"));
+        assert_eq!(ty.statics[0].decl.signature.ret, named("Owner"));
+        assert_eq!(ty.operators[0].decl.signature.params[0].ty, named("Owner"));
+        assert_eq!(ty.operators[0].decl.signature.ret, named("Owner"));
+    }
+
+    #[test]
     fn normalizes_source_callback_type() {
         let root = parse("extern fn each(callback: fn(int) -> string) -> void;");
         let raw = collect_source_externs(&root, &empty_resolved()).unwrap();
@@ -355,6 +641,25 @@ mod tests {
                 thread: CallbackThread::SameThread,
             }
         );
+    }
+
+    #[test]
+    fn rejects_mutable_source_callback_params() {
+        let errors = collect_source_externs(
+            &parse("extern fn each(callback: fn(var int) -> void);"),
+            &empty_resolved(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            errors[0],
+            ExternInputError::UnsupportedSource {
+                kind: UnsupportedSourceKind::CallbackParam {
+                    reason: UnsupportedSourceParamReason::Mutable
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -585,7 +890,7 @@ mod tests {
     fn rejects_duplicate_source_members() {
         let raw = collect_source_externs(
             &parse(
-                r#"
+                r"
                 extern type T {
                     x: int;
                     x: int;
@@ -596,7 +901,7 @@ mod tests {
                     op Self + int -> Self;
                     op Self + int -> Self;
                 }
-                "#,
+                ",
             ),
             &empty_resolved(),
         )
@@ -680,12 +985,12 @@ mod tests {
     fn accepts_distinct_raw_namespaces() {
         let raw = collect_source_externs(
             &parse(
-                r#"
+                r"
                 extern type T {
                     fn size(self) -> int;
                     fn size() -> int;
                 }
-                "#,
+                ",
             ),
             &empty_resolved(),
         )

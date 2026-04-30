@@ -705,9 +705,14 @@ pub struct ExternType {
     pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
     pub name: Ident,
-    pub kind: ExternKind,
-    pub has_init: bool,
+    pub rep: ExternTypeRep,
+    pub init: Option<ExternInit>,
     pub members: Vec<ExternTypeMember>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternInit {
+    pub params: Vec<Param>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -716,12 +721,13 @@ pub enum ExternTypeMember {
         doc: Option<String>,
         name: Ident,
         ty: Type,
+        access: ExternFieldAccess,
         computed: bool,
     },
     Method {
         doc: Option<String>,
         name: Ident,
-        receiver: MethodReceiver,
+        receiver: ExternReceiverMode,
         params: Vec<Param>,
         ret: Type,
     },
@@ -1356,9 +1362,22 @@ impl AggregateTypeRef<'_> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternKind {
-    InlineCopy,
-    SharedIdentity,
+pub enum ExternTypeRep {
+    Shared,
+    Inline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternFieldAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternReceiverMode {
+    Value,
+    Shared,
+    Mutable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

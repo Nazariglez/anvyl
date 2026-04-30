@@ -8,12 +8,15 @@ use anvyx_externs::{
 use super::raw::*;
 use crate::{
     ast::{
-        self, BinaryOp, ExternFuncNode, ExternKind, ExternTypeMember, ExternTypeNode, GenericArg,
-        MethodReceiver, Mutability, Param, Program, Stmt, Type, UnaryOp,
+        self, BinaryOp, ExternFieldAccess, ExternFuncNode, ExternReceiverMode, ExternTypeMember,
+        ExternTypeNode, ExternTypeRep, GenericArg, Mutability, Param, Program, Stmt, Type, UnaryOp,
     },
     resolve::{ModuleKey, ResolveResult},
     span::Span,
 };
+
+type SourceError = Box<ExternInputError>;
+type SourceResult<T> = Result<T, SourceError>;
 
 pub(crate) fn collect_source_externs(
     root: &Program,
@@ -53,11 +56,11 @@ fn collect_source_program(
 
     for stmt in &program.stmts {
         match &stmt.node {
-            Stmt::ExternFunc(func) => match normalize_source_function(func) {
+            Stmt::ExternFunc(func) => match normalize_function(func) {
                 Ok(func) => functions.push(func),
-                Err(error) => errors.push(error),
+                Err(error) => errors.push(*error),
             },
-            Stmt::ExternType(ty) => match normalize_source_type(ty) {
+            Stmt::ExternType(ty) => match normalize_type(ty) {
                 Ok(ty) => types.push(ty),
                 Err(type_errors) => errors.extend(type_errors),
             },
@@ -87,22 +90,20 @@ fn module_path_from_resolve(path: &crate::resolve::ModulePath) -> ModulePath {
     }
 }
 
-fn normalize_source_function(func: &ExternFuncNode) -> Result<RawExternFunction, ExternInputError> {
+fn normalize_function(func: &ExternFuncNode) -> SourceResult<RawExternFunction> {
     let span = func.span;
-    let params = source_params(&func.node.params, span)?;
-    let ret = source_type_expr(&func.node.ret, span)?;
     Ok(RawExternFunction {
         decl: ExternFunctionDescriptor {
             name: func.node.name.to_string(),
             doc: func.node.doc.clone(),
-            signature: ExternSignature { params, ret },
+            signature: signature(&func.node.params, &func.node.ret, span)?,
             effects: ExternEffects::default(),
         },
         site: RawExternSite { span: Some(span) },
     })
 }
 
-fn normalize_source_type(ty: &ExternTypeNode) -> Result<RawExternType, Vec<ExternInputError>> {
+fn normalize_type(ty: &ExternTypeNode) -> Result<RawExternType, Vec<ExternInputError>> {
     let mut errors = vec![];
     let span = ty.span;
     let mut fields = vec![];
@@ -111,14 +112,31 @@ fn normalize_source_type(ty: &ExternTypeNode) -> Result<RawExternType, Vec<Exter
     let mut operators = vec![];
 
     for member in &ty.node.members {
-        match normalize_source_member(member, span) {
+        match normalize_member(member, span) {
             Ok(RawSourceMember::Field(field)) => fields.push(field),
             Ok(RawSourceMember::Method(method)) => methods.push(method),
             Ok(RawSourceMember::Static(static_method)) => statics.push(static_method),
             Ok(RawSourceMember::Operator(operator)) => operators.push(operator),
-            Err(error) => errors.push(error),
+            Err(error) => errors.push(*error),
         }
     }
+
+    let init = match &ty.node.init {
+        Some(init) => match param_list(&init.params, span) {
+            Ok(params) => Some(RawExternInit {
+                decl: ExternInitDescriptor {
+                    params,
+                    field_init: vec![],
+                },
+                site: RawExternSite { span: Some(span) },
+            }),
+            Err(error) => {
+                errors.push(*error);
+                None
+            }
+        },
+        None => None,
+    };
 
     if !errors.is_empty() {
         return Err(errors);
@@ -127,18 +145,12 @@ fn normalize_source_type(ty: &ExternTypeNode) -> Result<RawExternType, Vec<Exter
     Ok(RawExternType {
         name: ty.node.name.to_string(),
         doc: ty.node.doc.clone(),
-        rep: match ty.node.kind {
-            ExternKind::SharedIdentity => ExternRep::Shared,
-            ExternKind::InlineCopy => ExternRep::Inline,
+        rep: match ty.node.rep {
+            ExternTypeRep::Shared => ExternRep::Shared,
+            ExternTypeRep::Inline => ExternRep::Inline,
         },
         fields,
-        init: ty.node.has_init.then(|| RawExternInit {
-            decl: ExternInitDescriptor {
-                params: vec![],
-                field_init: vec![],
-            },
-            site: RawExternSite { span: Some(span) },
-        }),
+        init,
         methods,
         statics,
         operators,
@@ -153,22 +165,25 @@ enum RawSourceMember {
     Operator(RawExternOperator),
 }
 
-fn normalize_source_member(
-    member: &ExternTypeMember,
-    span: Span,
-) -> Result<RawSourceMember, ExternInputError> {
+fn normalize_member(member: &ExternTypeMember, span: Span) -> SourceResult<RawSourceMember> {
     match member {
         ExternTypeMember::Field {
             doc,
             name,
             ty,
+            access,
             computed,
         } => Ok(RawSourceMember::Field(RawExternField {
             decl: ExternFieldDescriptor {
                 name: name.to_string(),
-                ty: source_type_expr(ty, span)?,
-                access: FieldAccess::ReadWrite {
-                    computed: *computed,
+                ty: type_expr(ty, span)?,
+                access: match access {
+                    ExternFieldAccess::ReadOnly => FieldAccess::ReadOnly {
+                        computed: *computed,
+                    },
+                    ExternFieldAccess::ReadWrite => FieldAccess::ReadWrite {
+                        computed: *computed,
+                    },
                 },
                 doc: doc.clone(),
             },
@@ -185,13 +200,11 @@ fn normalize_source_member(
                 name: name.to_string(),
                 doc: doc.clone(),
                 receiver: match receiver {
-                    MethodReceiver::Value => ReceiverMode::Value,
-                    MethodReceiver::Var => ReceiverMode::Mutable,
+                    ExternReceiverMode::Value => ReceiverMode::Value,
+                    ExternReceiverMode::Shared => ReceiverMode::Shared,
+                    ExternReceiverMode::Mutable => ReceiverMode::Mutable,
                 },
-                signature: ExternSignature {
-                    params: source_params(params, span)?,
-                    ret: source_type_expr(ret, span)?,
-                },
+                signature: signature(params, ret, span)?,
                 effects: ExternEffects::default(),
             },
             site: RawExternSite { span: Some(span) },
@@ -205,10 +218,7 @@ fn normalize_source_member(
             decl: ExternStaticDescriptor {
                 name: name.to_string(),
                 doc: doc.clone(),
-                signature: ExternSignature {
-                    params: source_params(params, span)?,
-                    ret: source_type_expr(ret, span)?,
-                },
+                signature: signature(params, ret, span)?,
                 effects: ExternEffects::default(),
             },
             site: RawExternSite { span: Some(span) },
@@ -221,16 +231,16 @@ fn normalize_source_member(
         } => Ok(RawSourceMember::Operator(RawExternOperator {
             decl: ExternOperatorDescriptor {
                 op: ExternOperator::Binary {
-                    op: source_binary_op(*op, span)?,
+                    op: binary_op(*op, span)?,
                     self_on_right: *self_on_right,
                 },
                 signature: ExternSignature {
                     params: vec![ExternParam {
                         name: None,
-                        ty: source_type_expr(other_ty, span)?,
+                        ty: type_expr(other_ty, span)?,
                         flow: ParamFlow::Value,
                     }],
-                    ret: source_type_expr(ret, span)?,
+                    ret: type_expr(ret, span)?,
                 },
                 effects: ExternEffects::default(),
             },
@@ -239,10 +249,10 @@ fn normalize_source_member(
         ExternTypeMember::UnaryOperator { op, ret } => {
             Ok(RawSourceMember::Operator(RawExternOperator {
                 decl: ExternOperatorDescriptor {
-                    op: ExternOperator::Unary(source_unary_op(*op, span)?),
+                    op: ExternOperator::Unary(unary_op(*op, span)?),
                     signature: ExternSignature {
                         params: vec![],
-                        ret: source_type_expr(ret, span)?,
+                        ret: type_expr(ret, span)?,
                     },
                     effects: ExternEffects::default(),
                 },
@@ -252,30 +262,37 @@ fn normalize_source_member(
     }
 }
 
-fn source_params(params: &[Param], span: Span) -> Result<Vec<ExternParam>, ExternInputError> {
+fn signature(params: &[Param], ret: &Type, span: Span) -> SourceResult<ExternSignature> {
+    Ok(ExternSignature {
+        params: param_list(params, span)?,
+        ret: type_expr(ret, span)?,
+    })
+}
+
+fn param_list(params: &[Param], span: Span) -> SourceResult<Vec<ExternParam>> {
     params
         .iter()
-        .map(|param| source_param(param, span))
+        .map(|param| lower_param(param, span))
         .collect()
 }
 
-fn source_param(param: &Param, span: Span) -> Result<ExternParam, ExternInputError> {
+fn lower_param(param: &Param, span: Span) -> SourceResult<ExternParam> {
     if matches!(param.mutability, Mutability::Mutable) {
-        return Err(unsupported_source_param(
+        return Err(unsupported_param(
             param,
             span,
             UnsupportedSourceParamReason::Mutable,
         ));
     }
     if param.cast_accept {
-        return Err(unsupported_source_param(
+        return Err(unsupported_param(
             param,
             span,
             UnsupportedSourceParamReason::CastAccept,
         ));
     }
     if param.default.is_some() {
-        return Err(unsupported_source_param(
+        return Err(unsupported_param(
             param,
             span,
             UnsupportedSourceParamReason::Default,
@@ -284,30 +301,28 @@ fn source_param(param: &Param, span: Span) -> Result<ExternParam, ExternInputErr
 
     Ok(ExternParam {
         name: Some(param.name.to_string()),
-        ty: source_type_expr(&param.ty, span)?,
+        ty: type_expr(&param.ty, span)?,
         flow: ParamFlow::Value,
     })
 }
 
-fn unsupported_source_param(
+fn unsupported_param(
     param: &Param,
     span: Span,
     reason: UnsupportedSourceParamReason,
-) -> ExternInputError {
-    ExternInputError::UnsupportedSource {
+) -> SourceError {
+    Box::new(ExternInputError::UnsupportedSource {
         span,
         kind: UnsupportedSourceKind::Param {
             name: param.name.to_string(),
             reason,
         },
-    }
+    })
 }
 
-fn source_type_expr(ty: &Type, span: Span) -> Result<ExternTypeExpr, ExternInputError> {
+fn type_expr(ty: &Type, span: Span) -> SourceResult<ExternTypeExpr> {
     if let Some(inner) = ty.option_inner() {
-        return Ok(ExternTypeExpr::Option(Box::new(source_type_expr(
-            inner, span,
-        )?)));
+        return Ok(ExternTypeExpr::Option(Box::new(type_expr(inner, span)?)));
     }
 
     match ty {
@@ -317,24 +332,31 @@ fn source_type_expr(ty: &Type, span: Span) -> Result<ExternTypeExpr, ExternInput
         Type::Float => Ok(ExternTypeExpr::Float),
         Type::String => Ok(ExternTypeExpr::String),
         Type::Any => Ok(ExternTypeExpr::Any),
-        Type::List { elem } => Ok(ExternTypeExpr::List(Box::new(source_type_expr(
-            elem, span,
-        )?))),
+        Type::List { elem } => Ok(ExternTypeExpr::List(Box::new(type_expr(elem, span)?))),
         Type::Map { key, value } => Ok(ExternTypeExpr::Map(
-            Box::new(source_type_expr(key, span)?),
-            Box::new(source_type_expr(value, span)?),
+            Box::new(type_expr(key, span)?),
+            Box::new(type_expr(value, span)?),
         )),
-        Type::Func { params, ret } => Ok(ExternTypeExpr::Callback(ExternCallbackSignature {
-            params: params
-                .iter()
-                .map(|param| source_type_expr(&param.ty, span))
-                .collect::<Result<Vec<_>, _>>()?,
-            ret: Box::new(source_type_expr(ret, span)?),
-            policy: CallbackPolicy {
-                escape: CallbackEscape::NonEscaping,
-                thread: CallbackThread::SameThread,
-            },
-        })),
+        Type::Func { params, ret } => {
+            if params.iter().any(|param| param.mutable) {
+                return Err(unsupported_callback_param(
+                    span,
+                    UnsupportedSourceParamReason::Mutable,
+                ));
+            }
+
+            Ok(ExternTypeExpr::Callback(ExternCallbackSignature {
+                params: params
+                    .iter()
+                    .map(|param| type_expr(&param.ty, span))
+                    .collect::<SourceResult<Vec<_>>>()?,
+                ret: Box::new(type_expr(ret, span)?),
+                policy: CallbackPolicy {
+                    escape: CallbackEscape::NonEscaping,
+                    thread: CallbackThread::SameThread,
+                },
+            }))
+        }
         Type::UnresolvedNominal {
             qualifier,
             name,
@@ -344,7 +366,7 @@ fn source_type_expr(ty: &Type, span: Span) -> Result<ExternTypeExpr, ExternInput
                 segments: vec![qualifier.to_string()],
             }),
             name: name.to_string(),
-            args: source_generic_args(generic_args, span)?,
+            args: type_args(generic_args, span)?,
         }),
         Type::Nominal(nominal) if nominal.const_args.is_empty() => Ok(ExternTypeExpr::Named {
             module: nominal.origin.as_ref().map(|path| ModulePath {
@@ -354,21 +376,18 @@ fn source_type_expr(ty: &Type, span: Span) -> Result<ExternTypeExpr, ExternInput
             args: nominal
                 .type_args
                 .iter()
-                .map(|arg| source_type_expr(arg, span))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|arg| type_expr(arg, span))
+                .collect::<SourceResult<Vec<_>>>()?,
         }),
-        _ => Err(unsupported_source_type(ty, span)),
+        _ => Err(unsupported_type(ty, span)),
     }
 }
 
-fn source_generic_args(
-    args: &[GenericArg],
-    span: Span,
-) -> Result<Vec<ExternTypeExpr>, ExternInputError> {
+fn type_args(args: &[GenericArg], span: Span) -> SourceResult<Vec<ExternTypeExpr>> {
     args.iter()
         .map(|arg| match arg {
-            GenericArg::Type(ty) => source_type_expr(ty, span),
-            GenericArg::Const(_) => Err(unsupported_source_type(
+            GenericArg::Type(ty) => type_expr(ty, span),
+            GenericArg::Const(_) => Err(unsupported_type(
                 &Type::UnresolvedNominal {
                     qualifier: None,
                     name: ast::Ident::new("const generic"),
@@ -380,14 +399,21 @@ fn source_generic_args(
         .collect()
 }
 
-fn unsupported_source_type(ty: &Type, span: Span) -> ExternInputError {
-    ExternInputError::UnsupportedSource {
+fn unsupported_type(ty: &Type, span: Span) -> SourceError {
+    Box::new(ExternInputError::UnsupportedSource {
         span,
         kind: UnsupportedSourceKind::Type(ty.to_string()),
-    }
+    })
 }
 
-fn source_binary_op(op: BinaryOp, span: Span) -> Result<anvyx_externs::BinaryOp, ExternInputError> {
+fn unsupported_callback_param(span: Span, reason: UnsupportedSourceParamReason) -> SourceError {
+    Box::new(ExternInputError::UnsupportedSource {
+        span,
+        kind: UnsupportedSourceKind::CallbackParam { reason },
+    })
+}
+
+fn binary_op(op: BinaryOp, span: Span) -> SourceResult<anvyx_externs::BinaryOp> {
     match op {
         BinaryOp::Add => Ok(anvyx_externs::BinaryOp::Add),
         BinaryOp::Sub => Ok(anvyx_externs::BinaryOp::Sub),
@@ -400,20 +426,20 @@ fn source_binary_op(op: BinaryOp, span: Span) -> Result<anvyx_externs::BinaryOp,
         BinaryOp::GreaterThan => Ok(anvyx_externs::BinaryOp::GreaterThan),
         BinaryOp::LessThanEq => Ok(anvyx_externs::BinaryOp::LessThanEq),
         BinaryOp::GreaterThanEq => Ok(anvyx_externs::BinaryOp::GreaterThanEq),
-        _ => Err(unsupported_source_operator(op, span)),
+        _ => Err(unsupported_operator(op, span)),
     }
 }
 
-fn source_unary_op(op: UnaryOp, span: Span) -> Result<anvyx_externs::UnaryOp, ExternInputError> {
+fn unary_op(op: UnaryOp, span: Span) -> SourceResult<anvyx_externs::UnaryOp> {
     match op {
         UnaryOp::Neg => Ok(anvyx_externs::UnaryOp::Neg),
-        _ => Err(unsupported_source_operator(op, span)),
+        _ => Err(unsupported_operator(op, span)),
     }
 }
 
-fn unsupported_source_operator(op: impl std::fmt::Display, span: Span) -> ExternInputError {
-    ExternInputError::UnsupportedSource {
+fn unsupported_operator(op: impl std::fmt::Display, span: Span) -> SourceError {
+    Box::new(ExternInputError::UnsupportedSource {
         span,
         kind: UnsupportedSourceKind::Operator(op.to_string()),
-    }
+    })
 }

@@ -1,0 +1,31 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Texture;
+extern type SharedTexture rep shared;
+extern type Rect;
+
+extern type Vec2 rep inline {
+    init(x: float, y: float);
+    x: float;
+    var y: float;
+    let length: float;
+    computed bounds: Rect;
+    computed var label: string;
+    fn zero() -> Self;
+    fn magnitude(shared self) -> float;
+    fn translate(var self, dx: float, dy: float) -> void;
+    op - Self -> Self;
+    op Self + Self -> Self;
+    op Self == Self -> bool;
+    op Self != Self -> bool;
+    op Self < Self -> bool;
+    op Self > Self -> bool;
+    op Self <= Self -> bool;
+    op Self >= Self -> bool;
+}
+
+extern fn native_apply(value: int, callback: fn(int) -> int) -> int;
+
+fn main() {}

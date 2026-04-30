@@ -118,21 +118,11 @@ pub fn check<L: SourceLoader>(
 
     validate_always_active_modules(&resolved, &always_active_modules)?;
 
-    let mut raw_externs =
-        externs::ingest_providers(config.externs).map_err(|errors| CheckError::Extern {
-            diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
-        })?;
-    let source_externs =
-        externs::collect_source_externs(&root, &resolved).map_err(|errors| CheckError::Extern {
-            diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
-        })?;
+    let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
+    let source_externs = externs::collect_source_externs(&root, &resolved).map_err(extern_error)?;
     raw_externs.append(source_externs);
-    externs::validate_raw_shapes(&raw_externs).map_err(|errors| CheckError::Extern {
-        diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
-    })?;
-    externs::validate_raw_identities(&raw_externs).map_err(|errors| CheckError::Extern {
-        diagnostics: errors.iter().map(diagnose_extern_input_error).collect(),
-    })?;
+    externs::validate_raw_shapes(&raw_externs).map_err(extern_error)?;
+    externs::validate_raw_identities(&raw_externs).map_err(extern_error)?;
 
     typecheck::check_with_modules(&root, &resolved, always_active_modules, raw_externs).map_err(
         |errors| CheckError::Type {
@@ -141,6 +131,15 @@ pub fn check<L: SourceLoader>(
     )?;
 
     Ok(CheckOk)
+}
+
+fn extern_error<E>(errors: Vec<externs::ExternInputError>) -> CheckError<E> {
+    CheckError::Extern {
+        diagnostics: errors
+            .into_iter()
+            .map(|error| diagnose_extern_input_error(&error))
+            .collect(),
+    }
 }
 
 fn parse_preloaded_modules<E>(
@@ -451,6 +450,48 @@ mod tests {
                 "invalid extern descriptor from source root: void type is not allowed in parameter position"
             ]
         );
+    }
+
+    #[test]
+    fn source_extern_new_forms_reach_typechecking() {
+        check_source(
+            r#"
+            extern type Vec2 rep inline {
+                init(x: float, y: float);
+                x: float;
+                var y: float;
+                let length: float;
+                computed bounds: Rect;
+                computed var label: string;
+                fn magnitude(shared self) -> float;
+                fn translate(var self, dx: float, dy: float) -> void;
+                fn zero() -> Self;
+                op Self != Self -> bool;
+                op Self < Self -> bool;
+                op Self > Self -> bool;
+                op Self <= Self -> bool;
+                op Self >= Self -> bool;
+            }
+            extern type Rect;
+            fn main() {}
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn new_source_extern_shape_errors_are_extern_errors() {
+        let err =
+            check_source("extern type T { op Self < Self -> int; } fn main() {}").unwrap_err();
+
+        assert!(matches!(err, CheckError::Extern { .. }));
+    }
+
+    #[test]
+    fn new_source_extern_parser_errors_take_precedence() {
+        let err = check_source("extern type T { computed let x: int; } fn main() {}").unwrap_err();
+
+        assert!(matches!(err, CheckError::Parse { .. }));
     }
 
     #[test]

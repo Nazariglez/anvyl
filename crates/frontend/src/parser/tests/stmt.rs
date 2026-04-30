@@ -1,5 +1,8 @@
 use super::helpers::{parse_program, parse_program_err};
-use crate::ast::{self, MethodReceiver, Mutability, NominalKind, Type};
+use crate::ast::{
+    self, BinaryOp, ExternFieldAccess, ExternReceiverMode, ExternTypeRep, MethodReceiver,
+    Mutability, NominalKind, Type,
+};
 
 #[test]
 fn while_let() {
@@ -46,7 +49,7 @@ fn while_binary_cond() {
     let cond = &while_node.node.cond;
     match &cond.node.kind {
         ast::ExprKind::Binary(bin) => {
-            assert_eq!(bin.node.op, ast::BinaryOp::LessThan);
+            assert_eq!(bin.node.op, BinaryOp::LessThan);
         }
         other => panic!("expected Binary cond, found {other:?}"),
     }
@@ -387,185 +390,345 @@ fn method_self_trailing_comma() {
     assert!(methods[0].params.is_empty());
 }
 
-#[test]
-fn extern_fn_no_params() {
-    let prog = parse_program("extern fn tick() -> void;");
-    assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::ExternFunc(node) = &prog.stmts[0].node else {
-        panic!("expected ExternFunc");
-    };
-    assert_eq!(node.node.name.0.as_ref(), "tick");
-    assert_eq!(node.node.params.len(), 0);
-    assert_eq!(node.node.ret, Type::Void);
-}
+mod externs {
+    use super::*;
 
-#[test]
-fn extern_fn_params() {
-    let prog = parse_program("extern fn add(a: int, b: int) -> int;");
-    assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::ExternFunc(node) = &prog.stmts[0].node else {
-        panic!("expected ExternFunc");
-    };
-    let ef = &node.node;
-    assert_eq!(ef.name.0.as_ref(), "add");
-    assert_eq!(ef.params.len(), 2);
-    assert_eq!(ef.params[0].name.0.as_ref(), "a");
-    assert_eq!(ef.params[0].ty, Type::Int);
-    assert_eq!(ef.params[1].name.0.as_ref(), "b");
-    assert_eq!(ef.params[1].ty, Type::Int);
-    assert_eq!(ef.ret, Type::Int);
-}
+    fn parse_extern_func(src: &str) -> ast::ExternFuncNode {
+        let mut prog = parse_program(src);
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::ExternFunc(node) = prog.stmts.pop().unwrap().node else {
+            panic!("expected ExternFunc");
+        };
+        node
+    }
 
-#[test]
-fn extern_fn_void_default() {
-    let prog = parse_program("extern fn fire();");
-    assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::ExternFunc(node) = &prog.stmts[0].node else {
-        panic!("expected ExternFunc");
-    };
-    assert_eq!(node.node.ret, Type::Void);
-}
+    fn parse_extern_type(src: &str) -> ast::ExternTypeNode {
+        let mut prog = parse_program(src);
+        assert_eq!(prog.stmts.len(), 1);
+        let ast::Stmt::ExternType(node) = prog.stmts.pop().unwrap().node else {
+            panic!("expected ExternType");
+        };
+        node
+    }
 
-#[test]
-fn extern_type() {
-    let prog = parse_program("extern type Sprite;");
-    assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
-        panic!("expected ExternType");
-    };
-    assert_eq!(node.node.name.0.as_ref(), "Sprite");
-    assert!(node.node.members.is_empty());
-}
+    #[test]
+    fn fn_no_params() {
+        let node = parse_extern_func("extern fn tick() -> void;");
+        assert_eq!(node.node.name.0.as_ref(), "tick");
+        assert_eq!(node.node.params.len(), 0);
+        assert_eq!(node.node.ret, Type::Void);
+    }
 
-#[test]
-fn extern_type_fields() {
-    let prog = parse_program(
-        r"
+    #[test]
+    fn fn_params() {
+        let node = parse_extern_func("extern fn add(a: int, b: int) -> int;");
+        let ef = &node.node;
+        assert_eq!(ef.name.0.as_ref(), "add");
+        assert_eq!(ef.params.len(), 2);
+        assert_eq!(ef.params[0].name.0.as_ref(), "a");
+        assert_eq!(ef.params[0].ty, Type::Int);
+        assert_eq!(ef.params[1].name.0.as_ref(), "b");
+        assert_eq!(ef.params[1].ty, Type::Int);
+        assert_eq!(ef.ret, Type::Int);
+    }
+
+    #[test]
+    fn fn_void_default() {
+        let node = parse_extern_func("extern fn fire();");
+        assert_eq!(node.node.ret, Type::Void);
+    }
+
+    #[test]
+    fn opaque_type() {
+        let node = parse_extern_type("extern type Sprite;");
+        assert_eq!(node.node.name.0.as_ref(), "Sprite");
+        assert!(node.node.members.is_empty());
+    }
+
+    #[test]
+    fn rep_shared() {
+        let node = parse_extern_type("extern type Texture rep shared;");
+        assert_eq!(node.node.rep, ExternTypeRep::Shared);
+    }
+
+    #[test]
+    fn rep_inline() {
+        let node = parse_extern_type("extern type Vec2 rep inline { x: float; }");
+        assert_eq!(node.node.rep, ExternTypeRep::Inline);
+    }
+
+    #[test]
+    fn rep_defaults_shared() {
+        let node = parse_extern_type("extern type Sprite;");
+        assert_eq!(node.node.rep, ExternTypeRep::Shared);
+    }
+
+    #[test]
+    fn bad_rep() {
+        parse_program_err("extern type T rep value;");
+    }
+
+    #[test]
+    fn init_params() {
+        let node = parse_extern_type("extern type Point { init(x: float, y: float); }");
+        let init = node.node.init.as_ref().expect("expected init");
+        assert_eq!(init.params.len(), 2);
+        assert_eq!(init.params[0].name.0.as_ref(), "x");
+        assert_eq!(init.params[0].ty, Type::Float);
+        assert_eq!(init.params[1].name.0.as_ref(), "y");
+        assert_eq!(init.params[1].ty, Type::Float);
+    }
+
+    #[test]
+    fn init_empty_forms() {
+        for src in ["extern type T { init; }", "extern type T { init(); }"] {
+            let node = parse_extern_type(src);
+            assert!(
+                node.node
+                    .init
+                    .as_ref()
+                    .is_some_and(|init| init.params.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_init_fails() {
+        parse_program_err("extern type T { init; init(); }");
+    }
+
+    #[test]
+    fn fields() {
+        let node = parse_extern_type(
+            r"
         extern type Point {
             x: float;
             y: float;
         }
     ",
-    );
-    assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
-        panic!("expected ExternType");
-    };
-    assert_eq!(node.node.name.0.as_ref(), "Point");
-    assert_eq!(node.node.members.len(), 2);
-    let ast::ExternTypeMember::Field { name, ty, .. } = &node.node.members[0] else {
-        panic!("expected Field");
-    };
-    assert_eq!(name.0.as_ref(), "x");
-    assert_eq!(*ty, Type::Float);
-    let ast::ExternTypeMember::Field { name, ty, .. } = &node.node.members[1] else {
-        panic!("expected Field");
-    };
-    assert_eq!(name.0.as_ref(), "y");
-    assert_eq!(*ty, Type::Float);
-}
+        );
+        assert_eq!(node.node.name.0.as_ref(), "Point");
+        assert_eq!(node.node.members.len(), 2);
+        let ast::ExternTypeMember::Field { name, ty, .. } = &node.node.members[0] else {
+            panic!("expected Field");
+        };
+        assert_eq!(name.0.as_ref(), "x");
+        assert_eq!(*ty, Type::Float);
+        let ast::ExternTypeMember::Field { name, ty, .. } = &node.node.members[1] else {
+            panic!("expected Field");
+        };
+        assert_eq!(name.0.as_ref(), "y");
+        assert_eq!(*ty, Type::Float);
+    }
 
-#[test]
-fn extern_type_static() {
-    let prog = parse_program(
-        r"
+    #[test]
+    fn field_access() {
+        let node = parse_extern_type(
+            r"
+        extern type T {
+            plain: int;
+            var mutable: int;
+            let readonly: int;
+            computed cached: int;
+            computed var live: int;
+        }
+    ",
+        );
+
+        let fields = node
+            .node
+            .members
+            .iter()
+            .map(|member| {
+                let ast::ExternTypeMember::Field {
+                    name,
+                    access,
+                    computed,
+                    ..
+                } = member
+                else {
+                    panic!("expected Field");
+                };
+                (name.0.as_ref().as_str(), *access, *computed)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            fields,
+            [
+                ("plain", ExternFieldAccess::ReadWrite, false),
+                ("mutable", ExternFieldAccess::ReadWrite, false),
+                ("readonly", ExternFieldAccess::ReadOnly, false),
+                ("cached", ExternFieldAccess::ReadOnly, true),
+                ("live", ExternFieldAccess::ReadWrite, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn computed_let_field_fails() {
+        parse_program_err("extern type T { computed let x: int; }");
+    }
+
+    #[test]
+    fn static_method() {
+        let node = parse_extern_type(
+            r"
         extern type Point {
             fn new(x: float, y: float) -> Point;
         }
     ",
-    );
-    let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
-        panic!("expected ExternType");
-    };
-    assert_eq!(node.node.members.len(), 1);
-    let ast::ExternTypeMember::StaticMethod {
-        name, params, ret, ..
-    } = &node.node.members[0]
-    else {
-        panic!("expected StaticMethod");
-    };
-    assert_eq!(name.0.as_ref(), "new");
-    assert_eq!(params.len(), 2);
-    let Type::UnresolvedNominal {
-        qualifier: None,
-        name,
-        generic_args,
-    } = ret
-    else {
-        panic!("expected Point nominal, found {ret:?}");
-    };
-    let is_point = name.0.as_ref() == "Point" && generic_args.is_empty();
-    assert!(is_point);
-}
+        );
+        assert_eq!(node.node.members.len(), 1);
+        let ast::ExternTypeMember::StaticMethod {
+            name, params, ret, ..
+        } = &node.node.members[0]
+        else {
+            panic!("expected StaticMethod");
+        };
+        assert_eq!(name.0.as_ref(), "new");
+        assert_eq!(params.len(), 2);
+        let Type::UnresolvedNominal {
+            qualifier: None,
+            name,
+            generic_args,
+        } = ret
+        else {
+            panic!("expected Point nominal, found {ret:?}");
+        };
+        let is_point = name.0.as_ref() == "Point" && generic_args.is_empty();
+        assert!(is_point);
+    }
 
-#[test]
-fn extern_type_methods() {
-    let prog = parse_program(
-        r"
+    #[test]
+    fn methods() {
+        let node = parse_extern_type(
+            r"
         extern type Point {
             fn get_x(self) -> float;
             fn move_by(var self, dx: float, dy: float);
         }
     ",
-    );
-    let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
-        panic!("expected ExternType");
-    };
-    assert_eq!(node.node.members.len(), 2);
+        );
+        assert_eq!(node.node.members.len(), 2);
 
-    let ast::ExternTypeMember::Method {
-        name,
-        receiver,
-        params,
-        ret,
-        ..
-    } = &node.node.members[0]
-    else {
-        panic!("expected Method");
-    };
-    assert_eq!(name.0.as_ref(), "get_x");
-    assert_eq!(*receiver, MethodReceiver::Value);
-    assert!(params.is_empty());
-    assert_eq!(*ret, Type::Float);
+        let ast::ExternTypeMember::Method {
+            name,
+            receiver,
+            params,
+            ret,
+            ..
+        } = &node.node.members[0]
+        else {
+            panic!("expected Method");
+        };
+        assert_eq!(name.0.as_ref(), "get_x");
+        assert_eq!(*receiver, ExternReceiverMode::Value);
+        assert!(params.is_empty());
+        assert_eq!(*ret, Type::Float);
 
-    let ast::ExternTypeMember::Method { name, receiver, .. } = &node.node.members[1] else {
-        panic!("expected Method");
-    };
-    assert_eq!(name.0.as_ref(), "move_by");
-    assert_eq!(*receiver, MethodReceiver::Var);
-}
+        let ast::ExternTypeMember::Method { name, receiver, .. } = &node.node.members[1] else {
+            panic!("expected Method");
+        };
+        assert_eq!(name.0.as_ref(), "move_by");
+        assert_eq!(*receiver, ExternReceiverMode::Mutable);
+    }
 
-#[test]
-fn extern_type_self_return() {
-    let prog = parse_program(
-        r"
+    #[test]
+    fn shared_receiver() {
+        let node = parse_extern_type("extern type Vec2 { fn length(shared self) -> float; }");
+        let ast::ExternTypeMember::Method { receiver, ret, .. } = &node.node.members[0] else {
+            panic!("expected Method");
+        };
+        assert_eq!(*receiver, ExternReceiverMode::Shared);
+        assert_eq!(*ret, Type::Float);
+    }
+
+    #[test]
+    fn shared_self_is_extern_only() {
+        parse_program_err("struct Vec2 { fn length(shared self) -> float {} }");
+    }
+
+    #[test]
+    fn typed_self_receiver_fails() {
+        for source in [
+            "extern type T { fn f(self: int) -> void; }",
+            "extern type T { fn f(var self: int) -> void; }",
+            "extern type T { fn f(self, self: int) -> void; }",
+        ] {
+            parse_program_err(source);
+        }
+    }
+
+    #[test]
+    fn unsupported_operator_fails() {
+        parse_program_err("extern type T { op Self && Self -> bool; }");
+    }
+
+    #[test]
+    fn self_return() {
+        let node = parse_extern_type(
+            r"
         extern type Point {
             fn new(x: float, y: float) -> Self;
         }
     ",
-    );
-    let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
-        panic!("expected ExternType");
-    };
-    let ast::ExternTypeMember::StaticMethod { ret, .. } = &node.node.members[0] else {
-        panic!("expected StaticMethod");
-    };
-    assert_eq!(
-        *ret,
-        Type::nominal(
-            NominalKind::Extern,
-            ast::Ident(internment::Intern::new("Point".to_string())),
-            vec![],
-            vec![],
-            None,
-        )
-    );
-}
+        );
+        let ast::ExternTypeMember::StaticMethod { ret, .. } = &node.node.members[0] else {
+            panic!("expected StaticMethod");
+        };
+        assert_eq!(
+            *ret,
+            Type::nominal(
+                NominalKind::Extern,
+                ast::Ident(internment::Intern::new("Point".to_string())),
+                vec![],
+                vec![],
+                None,
+            )
+        );
+    }
 
-#[test]
-fn extern_type_full() {
-    let prog = parse_program(
-        r"
+    #[test]
+    fn comparison_operators() {
+        let node = parse_extern_type(
+            r"
+        extern type T {
+            op Self != Self -> bool;
+            op Self < Self -> bool;
+            op Self > Self -> bool;
+            op Self <= Self -> bool;
+            op Self >= Self -> bool;
+        }
+    ",
+        );
+        let ops = node
+            .node
+            .members
+            .iter()
+            .map(|member| {
+                let ast::ExternTypeMember::Operator { op, .. } = member else {
+                    panic!("expected Operator");
+                };
+                *op
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ops,
+            [
+                BinaryOp::NotEq,
+                BinaryOp::LessThan,
+                BinaryOp::GreaterThan,
+                BinaryOp::LessThanEq,
+                BinaryOp::GreaterThanEq,
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_members() {
+        let node = parse_extern_type(
+            r"
         extern type Point {
             x: float;
             y: float;
@@ -574,62 +737,44 @@ fn extern_type_full() {
             fn distance_to(self, other: Point) -> float;
         }
     ",
-    );
-    let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
-        panic!("expected ExternType");
-    };
-    assert_eq!(node.node.members.len(), 5);
-    assert!(matches!(
-        &node.node.members[0],
-        ast::ExternTypeMember::Field { .. }
-    ));
-    assert!(matches!(
-        &node.node.members[1],
-        ast::ExternTypeMember::Field { .. }
-    ));
-    assert!(matches!(
-        &node.node.members[2],
-        ast::ExternTypeMember::StaticMethod { .. }
-    ));
-    assert!(matches!(
-        &node.node.members[3],
-        ast::ExternTypeMember::Method { .. }
-    ));
-    assert!(matches!(
-        &node.node.members[4],
-        ast::ExternTypeMember::Method { .. }
-    ));
-}
+        );
+        assert_eq!(node.node.members.len(), 5);
+        assert!(matches!(
+            &node.node.members[0],
+            ast::ExternTypeMember::Field { .. }
+        ));
+        assert!(matches!(
+            &node.node.members[1],
+            ast::ExternTypeMember::Field { .. }
+        ));
+        assert!(matches!(
+            &node.node.members[2],
+            ast::ExternTypeMember::StaticMethod { .. }
+        ));
+        assert!(matches!(
+            &node.node.members[3],
+            ast::ExternTypeMember::Method { .. }
+        ));
+        assert!(matches!(
+            &node.node.members[4],
+            ast::ExternTypeMember::Method { .. }
+        ));
+    }
 
-#[test]
-fn extern_type_empty() {
-    let prog = parse_program("extern type Foo {}");
-    let ast::Stmt::ExternType(node) = &prog.stmts[0].node else {
-        panic!("expected ExternType");
-    };
-    assert_eq!(node.node.name.0.as_ref(), "Foo");
-    assert!(node.node.members.is_empty());
-}
+    #[test]
+    fn empty_type() {
+        let node = parse_extern_type("extern type Foo {}");
+        assert_eq!(node.node.name.0.as_ref(), "Foo");
+        assert!(node.node.members.is_empty());
+    }
 
-#[test]
-fn extern_fn_post_refactor() {
-    let prog = parse_program("extern fn add(a: int, b: int) -> int;");
-    assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::ExternFunc(node) = &prog.stmts[0].node else {
-        panic!("expected ExternFunc");
-    };
-    let ef = &node.node;
-    assert_eq!(ef.name.0.as_ref(), "add");
-    assert_eq!(ef.params.len(), 2);
-    assert_eq!(ef.ret, Type::Int);
-}
-
-#[test]
-fn extern_type_fn_mixed() {
-    let prog = parse_program("extern type Sprite;\nextern fn create() -> Sprite;");
-    assert_eq!(prog.stmts.len(), 2);
-    assert!(matches!(prog.stmts[0].node, ast::Stmt::ExternType(_)));
-    assert!(matches!(prog.stmts[1].node, ast::Stmt::ExternFunc(_)));
+    #[test]
+    fn type_and_fn() {
+        let prog = parse_program("extern type Sprite;\nextern fn create() -> Sprite;");
+        assert_eq!(prog.stmts.len(), 2);
+        assert!(matches!(prog.stmts[0].node, ast::Stmt::ExternType(_)));
+        assert!(matches!(prog.stmts[1].node, ast::Stmt::ExternFunc(_)));
+    }
 }
 
 #[test]
