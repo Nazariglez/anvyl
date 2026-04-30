@@ -1,8 +1,11 @@
+pub(crate) mod catalog;
 mod identity;
 mod providers;
 mod raw;
 mod shape;
 mod source;
+
+use std::collections::HashSet;
 
 pub(crate) use identity::validate_raw_identities;
 pub(crate) use providers::ingest_providers;
@@ -11,12 +14,43 @@ use providers::normalize_type;
 pub use raw::ExternInputs;
 pub(crate) use raw::{
     ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey, RawExternIdentityKey,
-    RawExternMemberKey, RawExternScope, RawExternTypeKey, RawExterns, UnsupportedSourceKind,
-    UnsupportedSourceParamReason,
+    RawExternMemberKey, RawExternModule, RawExternScope, RawExternSite, RawExternTypeKey,
+    RawExterns, UnsupportedSourceKind, UnsupportedSourceParamReason,
 };
 pub(crate) use shape::validate_raw_shapes;
 pub(crate) use source::collect_source_externs;
 
+use crate::{resolve::ModulePath as ResolveModulePath, typecheck::ModuleScope};
+
+pub(crate) fn extern_module_path(path: &anvyx_externs::ModulePath) -> ResolveModulePath {
+    ResolveModulePath::new(path.segments.clone()).expect("raw extern module paths are validated")
+}
+
+pub(crate) fn extern_module_scope(path: &anvyx_externs::ModulePath) -> ModuleScope {
+    ModuleScope::Named(extern_module_path(path))
+}
+
+pub(crate) fn raw_named_module_path(scope: &RawExternScope) -> Option<ResolveModulePath> {
+    match scope {
+        RawExternScope::Root => None,
+        RawExternScope::Named(path) => Some(extern_module_path(path)),
+    }
+}
+
+pub(crate) fn raw_module_scope(scope: &RawExternScope) -> ModuleScope {
+    match scope {
+        RawExternScope::Root => ModuleScope::Root,
+        RawExternScope::Named(path) => extern_module_scope(path),
+    }
+}
+
+pub(crate) fn raw_extern_module_paths(raw: &RawExterns) -> HashSet<ResolveModulePath> {
+    raw.groups
+        .iter()
+        .flat_map(|group| &group.modules)
+        .filter_map(|module| raw_named_module_path(&module.scope))
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use anvyx_externs::{

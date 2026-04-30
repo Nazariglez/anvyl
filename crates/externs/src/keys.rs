@@ -80,8 +80,23 @@ pub enum ExternOperator {
     Binary { op: BinaryOp, self_on_right: bool },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperatorReturn {
+    Bool,
+    NonVoid,
+}
+
+impl ExternOperator {
+    pub fn return_requirement(self) -> OperatorReturn {
+        match self {
+            ExternOperator::Binary { op, .. } if op.returns_bool() => OperatorReturn::Bool,
+            _ => OperatorReturn::NonVoid,
+        }
+    }
+}
+
 impl BinaryOp {
-    pub(crate) fn returns_bool(self) -> bool {
+    fn returns_bool(self) -> bool {
         matches!(
             self,
             BinaryOp::Eq
@@ -181,6 +196,49 @@ mod tests {
             });
 
         assert_eq!(keys.collect::<HashSet<_>>().len(), 12);
+    }
+
+    #[test]
+    fn operators_report_return_requirements() {
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::NotEq,
+            BinaryOp::LessThan,
+            BinaryOp::GreaterThan,
+            BinaryOp::LessThanEq,
+            BinaryOp::GreaterThanEq,
+        ] {
+            assert_eq!(
+                ExternOperator::Binary {
+                    op,
+                    self_on_right: false,
+                }
+                .return_requirement(),
+                OperatorReturn::Bool
+            );
+        }
+
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Rem,
+        ] {
+            assert_eq!(
+                ExternOperator::Binary {
+                    op,
+                    self_on_right: false,
+                }
+                .return_requirement(),
+                OperatorReturn::NonVoid
+            );
+        }
+
+        assert_eq!(
+            ExternOperator::Unary(UnaryOp::Neg).return_requirement(),
+            OperatorReturn::NonVoid
+        );
     }
 
     #[test]

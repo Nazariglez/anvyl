@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     ast::Type,
-    externs::RawExterns,
+    externs,
     lexer::tokenize,
     parser,
     resolve::{ModuleKey, ModulePath, ResolveResult, ResolvedModule},
@@ -11,25 +11,42 @@ use crate::{
 
 pub(crate) fn assert_typecheck_closed(result: &typecheck::TypecheckResult) {
     for ty in result.types().map(|(_, (_, ty))| ty) {
-        assert!(
-            !typecheck::type_contains_infer(ty),
-            "result contains inferred type: {ty:?}"
-        );
-        assert!(
-            !typecheck::type_contains_unresolved_ref(ty),
-            "result contains unresolved type ref: {ty:?}"
-        );
+        assert_closed_type(ty, "result");
     }
     for target in result.calls().values() {
+        let facts = typecheck::call_target_closure_facts(target);
         assert!(
-            !typecheck::call_target_contains_infer(target),
+            !facts.contains_infer,
             "call target contains inferred type: {target:?}"
         );
         assert!(
-            !typecheck::call_target_contains_unresolved_ref(target),
+            !facts.contains_unresolved_ref,
             "call target contains unresolved type ref: {target:?}"
         );
+        assert!(
+            !facts.contains_unresolved_const,
+            "call target contains unresolved const: {target:?}"
+        );
     }
+    result.externs().for_each_resolved_ty(|ty, _| {
+        assert_closed_type(&ty.ty, "extern");
+    });
+}
+
+fn assert_closed_type(ty: &Type, label: &str) {
+    let facts = typecheck::type_closure_facts(ty);
+    assert!(
+        !facts.contains_infer,
+        "{label} type contains inferred type: {ty:?}"
+    );
+    assert!(
+        facts.first_unresolved.is_none(),
+        "{label} type contains unresolved type ref: {ty:?}"
+    );
+    assert!(
+        !facts.contains_unresolved_const,
+        "{label} type contains unresolved const: {ty:?}"
+    );
 }
 
 fn parse(source: &str) -> crate::ast::Program {
@@ -42,7 +59,8 @@ pub(crate) fn check(source: &str) -> Result<typecheck::TypecheckResult, Vec<Type
     let resolved = ResolveResult {
         module_groups: vec![],
     };
-    typecheck::check_with_modules(&program, &resolved, HashSet::new(), RawExterns::default())
+    let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
+    typecheck::check_with_modules(&program, &resolved, HashSet::new(), raw_externs)
 }
 
 pub(crate) fn errors(source: &str) -> Vec<TypeError> {
@@ -109,12 +127,8 @@ fn check_with_active(
         .iter()
         .map(|name| ModuleScope::Named(module_path(name)))
         .collect();
-    typecheck::check_with_modules(
-        &root,
-        &resolved,
-        always_active_modules,
-        RawExterns::default(),
-    )
+    let raw_externs = externs::collect_source_externs(&root, &resolved).unwrap();
+    typecheck::check_with_modules(&root, &resolved, always_active_modules, raw_externs)
 }
 
 fn last_expr_type(result: &typecheck::TypecheckResult) -> Option<Type> {

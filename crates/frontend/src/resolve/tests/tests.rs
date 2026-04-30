@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+
 use super::support::{
     InMemoryLoader, ignored_roots, module_path, preloaded, resolve, resolve_errors,
-    resolve_with_ignored, resolve_with_preloaded,
+    resolve_with_external, resolve_with_ignored, resolve_with_preloaded,
+    resolve_with_preloaded_and_external,
 };
 use crate::resolve::{ModuleKey, ModulePath, ResolveError, ResolveResult};
 
@@ -151,6 +154,70 @@ fn load_failure() {
     loader.add_failure(module_path(vec!["bad"]), "disk error");
     let errors = resolve_errors(resolve("import bad;", &mut loader));
     assert!(has_error(&errors, &["bad"]));
+}
+
+#[test]
+fn external_module_import_resolves_without_source_module() {
+    let mut loader = InMemoryLoader::default();
+    let path = module_path(vec!["host"]);
+    loader.add_missing(path.clone());
+    let external_modules = HashSet::from([path.clone()]);
+
+    let result = resolve_with_external("import host;", &mut loader, &external_modules).unwrap();
+
+    assert!(!has_key(&result, &["host"]));
+    assert_eq!(loader.load_count(&path), 1);
+}
+
+#[test]
+fn missing_non_external_module_still_fails() {
+    let mut loader = InMemoryLoader::default();
+    loader.add_missing(module_path(vec!["missing"]));
+    let errors = resolve_errors(resolve_with_external(
+        "import missing;",
+        &mut loader,
+        &HashSet::new(),
+    ));
+
+    assert!(has_error(&errors, &["missing"]));
+}
+
+#[test]
+fn preloaded_module_wins_over_external_fallback() {
+    let mut loader = InMemoryLoader::default();
+    let path = module_path(vec!["host"]);
+    let external_modules = HashSet::from([path.clone()]);
+
+    let result = resolve_with_preloaded_and_external(
+        "import host;",
+        vec![preloaded(&["host"], "pub fn f() {}")],
+        &mut loader,
+        &external_modules,
+    )
+    .unwrap();
+
+    assert!(has_key(&result, &["host"]));
+    assert_eq!(loader.load_count(&path), 0);
+}
+
+#[test]
+fn load_failure_beats_external_fallback() {
+    let mut loader = InMemoryLoader::default();
+    let path = module_path(vec!["host"]);
+    loader.add_failure(path.clone(), "disk error");
+    let external_modules = HashSet::from([path]);
+
+    let errors = resolve_errors(resolve_with_external(
+        "import host;",
+        &mut loader,
+        &external_modules,
+    ));
+
+    assert!(matches!(
+        errors.as_slice(),
+        [ResolveError::LoadFailed { path, message, .. }]
+            if path.segments() == ["host"] && message == "disk error"
+    ));
 }
 
 #[test]

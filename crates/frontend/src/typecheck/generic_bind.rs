@@ -247,8 +247,13 @@ mod tests {
         let resolved = ResolveResult {
             module_groups: vec![],
         };
-        let decls = DeclarationIndex::from_root_and_modules(&program, &resolved, HashSet::new());
-        let mut tc = TypeChecker::new(decls);
+        let decls = DeclarationIndex::from_root_and_modules(
+            &program,
+            &resolved,
+            HashSet::new(),
+            &crate::externs::RawExterns::default(),
+        );
+        let mut tc = TypeChecker::new(decls, crate::externs::catalog::ExternCatalog::default());
         tc.collect_const_decls(ModuleScope::Root, &program);
         tc.push_scope();
         tc

@@ -18,56 +18,70 @@ pub(crate) fn bare_type_name(ty: &Type) -> Option<Ident> {
     }
 }
 
-pub(crate) fn first_unresolved_type_ref(ty: &Type) -> Option<UnresolvedTypeRef> {
-    match ty {
-        Type::UnresolvedName(name) => Some(UnresolvedTypeRef {
-            qualifier: None,
-            name: *name,
-        }),
-        Type::UnresolvedNominal {
-            qualifier,
-            name,
-            generic_args,
-        } => Some(UnresolvedTypeRef {
-            qualifier: *qualifier,
-            name: *name,
-        })
-        .or_else(|| first_unresolved_generic_arg(generic_args)),
-        Type::Func { params, ret } => params
-            .iter()
-            .find_map(|param| first_unresolved_type_ref(&param.ty))
-            .or_else(|| first_unresolved_type_ref(ret)),
-        Type::Tuple(elems) => elems.iter().find_map(first_unresolved_type_ref),
-        Type::NamedTuple(fields) => fields
-            .iter()
-            .find_map(|(_, ty)| first_unresolved_type_ref(ty)),
-        Type::Nominal(nominal) => nominal.type_args.iter().find_map(first_unresolved_type_ref),
-        Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
-            first_unresolved_type_ref(elem)
-        }
-        Type::Map { key, value } => {
-            first_unresolved_type_ref(key).or_else(|| first_unresolved_type_ref(value))
-        }
-        Type::Infer
-        | Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Var(_) => None,
-    }
-}
-
 pub(crate) fn type_contains_unresolved_ref(ty: &Type) -> bool {
-    first_unresolved_type_ref(ty).is_some()
+    type_closure_facts(ty).first_unresolved.is_some()
 }
 
-fn first_unresolved_generic_arg(args: &[GenericArg]) -> Option<UnresolvedTypeRef> {
-    args.iter().find_map(|arg| match arg {
-        GenericArg::Type(ty) => first_unresolved_type_ref(ty),
-        GenericArg::Const(_) => None,
-    })
+pub(crate) fn type_contains_infer(ty: &Type) -> bool {
+    type_closure_facts(ty).contains_infer
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TypeClosureFacts {
+    pub(crate) first_unresolved: Option<UnresolvedTypeRef>,
+    pub(crate) contains_infer: bool,
+    pub(crate) contains_unresolved_const: bool,
+    pub(crate) contains_any: bool,
+}
+
+pub(crate) fn type_closure_facts(ty: &Type) -> TypeClosureFacts {
+    let mut facts = TypeClosureFacts::default();
+    facts.visit_type(ty);
+    facts
+}
+
+impl TypeVisitor for TypeClosureFacts {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        match ty {
+            Type::UnresolvedName(name) => {
+                self.first_unresolved.get_or_insert(UnresolvedTypeRef {
+                    qualifier: None,
+                    name: *name,
+                });
+            }
+            Type::UnresolvedNominal {
+                qualifier, name, ..
+            } => {
+                self.first_unresolved.get_or_insert(UnresolvedTypeRef {
+                    qualifier: *qualifier,
+                    name: *name,
+                });
+            }
+            Type::Infer => self.contains_infer = true,
+            Type::Any => self.contains_any = true,
+            _ => {}
+        }
+        false
+    }
+
+    fn visit_const_arg(&mut self, arg: &ConstArg) -> bool {
+        if matches!(arg, ConstArg::Name(_)) {
+            self.contains_unresolved_const = true;
+        }
+        false
+    }
+
+    fn visit_array_len(&mut self, len: ArrayLen) -> bool {
+        match len {
+            ArrayLen::Infer => {
+                self.contains_infer = true;
+                self.contains_unresolved_const = true;
+            }
+            ArrayLen::Named(_) => self.contains_unresolved_const = true,
+            ArrayLen::Fixed(_) | ArrayLen::Param(_) => {}
+        }
+        false
+    }
 }
 
 pub(crate) trait TypeFolder {

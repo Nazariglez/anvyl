@@ -3,7 +3,7 @@ use std::{
     rc::Rc,
 };
 
-pub(crate) use self::{call_map::*, decls::*, generic::*, result::*};
+pub(crate) use self::{call_map::*, decls::*, generic::*, result::*, type_ops::type_closure_facts};
 use self::{
     const_term::ConstTerm,
     generic_bind::bind_exact_generic_args,
@@ -12,12 +12,15 @@ use self::{
         SolverRelationError, TypeHandle,
     },
     postfix::{check_postfix_chain, collect_postfix_chain},
-    type_ops::{TypeFolder, TypeVisitor, first_unresolved_type_ref, type_contains_unresolved_ref},
+    type_ops::{TypeFolder, type_contains_infer, type_contains_unresolved_ref},
     type_refs::{GenericParamError, GenericTypeContext},
 };
 use crate::{
     ast::*,
-    externs::RawExterns,
+    externs::{
+        RawExterns,
+        catalog::{ExternCatalog, ExternCatalogError},
+    },
     resolve::{ModuleKey, ResolveResult},
     span::Span,
 };
@@ -53,6 +56,7 @@ pub(crate) enum MemberAccessKind {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TypeError {
     Decl(DeclError),
+    ExternCatalog(ExternCatalogError),
     UndefinedVariable {
         name: Ident,
         span: Span,
@@ -278,6 +282,7 @@ struct TypeChecker {
     solver: Solver,
     calls: HashMap<ExprId, CallTarget>,
     decls: DeclarationIndex,
+    externs: ExternCatalog,
     scopes: Vec<HashMap<Ident, VarInfo>>,
     return_types: Vec<Type>,
     return_seen: Vec<bool>,
@@ -349,11 +354,12 @@ impl TypeFolder for CheckedSubstituter<'_, '_> {
 }
 
 impl TypeChecker {
-    fn new(decls: DeclarationIndex) -> Self {
+    fn new(decls: DeclarationIndex, externs: ExternCatalog) -> Self {
         Self {
             solver: Solver::default(),
             calls: HashMap::new(),
             decls,
+            externs,
             scopes: vec![],
             return_types: vec![],
             return_seen: vec![],
@@ -919,6 +925,7 @@ impl TypeChecker {
                 types,
                 calls: self.calls,
                 decls: self.decls,
+                externs: self.externs,
                 consts: const_eval::evaluated_consts(self.consts),
             })
         } else {
@@ -937,6 +944,9 @@ impl TypeChecker {
                 .map_or_else(|| Span::new(0, 0), |(span, _)| *span);
             push_call_target_closure_error(&mut errors, target, span);
         }
+        self.externs.for_each_resolved_ty(|ty, site| {
+            push_extern_ty_closure_error(&mut errors, ty, extern_site_span(site));
+        });
         errors
     }
 
@@ -1168,13 +1178,22 @@ pub(crate) fn check_with_modules(
     program: &Program,
     resolved: &ResolveResult,
     always_active_modules: HashSet<ModuleScope>,
-    _externs: RawExterns,
+    externs: RawExterns,
 ) -> Result<TypecheckResult, Vec<TypeError>> {
-    let decls = DeclarationIndex::from_root_and_modules(program, resolved, always_active_modules);
+    let mut decls =
+        DeclarationIndex::from_root_and_modules(program, resolved, always_active_modules, &externs);
     if decls.has_errors() {
         return Err(decl_errors(decls.errors()));
     }
-    let mut tc = TypeChecker::new(decls);
+    let catalog = crate::externs::catalog::build_catalog(externs, &decls).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(TypeError::ExternCatalog)
+            .collect::<Vec<_>>()
+    })?;
+    decls.sync_extern_headers_from_catalog(&catalog);
+
+    let mut tc = TypeChecker::new(decls, catalog);
     tc.collect_const_decls(ModuleScope::Root, program);
     collect_callable_templates(ModuleScope::Root, program, &mut tc);
 
@@ -1387,8 +1406,13 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
             Stmt::Aggregate(_) | Stmt::Enum(_) => {}
             Stmt::ExternFunc(ext_node) => {
                 let ext = &ext_node.node;
-                let func_ty = tc.func_type_from_sig(&ext.params, &ext.ret);
-                tc.define(ext.name, func_ty, false);
+                let (_, _, ValueDecl::Func(sig)) = tc
+                    .current_module_value(ext.name)
+                    .expect("extern function declaration missing synced signature")
+                else {
+                    unreachable!("extern function declaration synced as non-function value")
+                };
+                tc.define(ext.name, sig.ty, false);
             }
             Stmt::ExternType(_) => {}
             Stmt::Const(const_node) => {
@@ -3025,34 +3049,50 @@ fn check_match_checked_with_hint(
     }
 }
 
-struct ContainsInfer;
-
-impl TypeVisitor for ContainsInfer {
-    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
-        matches!(ty, Type::Infer)
-    }
-
-    fn visit_array_len(&mut self, len: ArrayLen) -> bool {
-        matches!(len, ArrayLen::Infer)
-    }
-}
-
-pub(crate) fn type_contains_infer(ty: &Type) -> bool {
-    ContainsInfer.visit_type(ty)
-}
-
 pub(crate) fn call_target_contains_infer(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::Callable { args, .. } => args.type_args.iter().any(type_contains_infer),
-    }
+    call_target_closure_facts(target).contains_infer
 }
 
 pub(crate) fn call_target_contains_unresolved_ref(target: &CallTarget) -> bool {
+    call_target_closure_facts(target).contains_unresolved_ref
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CallTargetClosureFacts {
+    pub(crate) contains_infer: bool,
+    pub(crate) contains_unresolved_ref: bool,
+    pub(crate) contains_unresolved_const: bool,
+}
+
+pub(crate) fn call_target_closure_facts(target: &CallTarget) -> CallTargetClosureFacts {
+    let mut facts = CallTargetClosureFacts::default();
     match target {
         CallTarget::Callable { args, .. } => {
-            args.type_args.iter().any(type_contains_unresolved_ref)
+            for ty in &args.type_args {
+                let ty_facts = type_closure_facts(ty);
+                facts.contains_infer |= type_contains_infer(ty);
+                facts.contains_unresolved_ref |= type_contains_unresolved_ref(ty);
+                facts.contains_unresolved_const |= ty_facts.contains_unresolved_const;
+            }
+            for arg in &args.const_args {
+                facts.contains_infer |= const_term_contains_infer(arg);
+                facts.contains_unresolved_const |= matches!(arg, ConstTerm::Name(_));
+            }
         }
     }
+    facts
+}
+
+fn extern_site_span(site: crate::externs::RawExternSite) -> Span {
+    site.span.unwrap_or_else(|| Span::new(0, 0))
+}
+
+fn push_extern_ty_closure_error(
+    errors: &mut Vec<TypeError>,
+    ty: &crate::externs::catalog::ResolvedExternTy,
+    span: Span,
+) {
+    push_type_closure_error(errors, &ty.ty, span);
 }
 
 fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarget, span: Span) {
@@ -3078,14 +3118,17 @@ fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarg
 }
 
 fn push_type_closure_error(errors: &mut Vec<TypeError>, ty: &Type, span: Span) {
-    if let Some(unresolved) = first_unresolved_type_ref(ty) {
+    let facts = type_closure_facts(ty);
+    if let Some(unresolved) = facts.first_unresolved {
         errors.push(TypeError::UnknownType {
             qualifier: unresolved.qualifier,
             name: unresolved.name,
             span,
         });
-    } else if type_contains_infer(ty) {
+    } else if facts.contains_infer {
         errors.push(TypeError::CannotInferType { span });
+    } else if facts.contains_unresolved_const {
+        errors.push(TypeError::CannotInferConst { span });
     }
 }
 

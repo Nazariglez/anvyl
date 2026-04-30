@@ -159,12 +159,14 @@ pub fn resolve_modules<L: ModuleLoader>(
     preloaded_modules: Vec<PreloadedModule>,
     loader: &mut L,
     ignored_roots: &HashSet<String>,
+    external_modules: &HashSet<ModulePath>,
 ) -> Result<ResolveResult, ResolveFailure<L::FatalError>> {
     let preloaded_roots =
         prepare_preloaded_modules(preloaded_modules).map_err(ResolveFailure::Resolve)?;
     let mut resolver = Resolver {
         loader,
         ignored_roots,
+        external_modules,
         preloaded: preloaded_roots.iter().cloned().collect(),
         visiting: HashSet::new(),
         loaded: HashSet::new(),
@@ -215,6 +217,7 @@ fn prepare_preloaded_modules(
 struct Resolver<'a, L: ModuleLoader> {
     loader: &'a mut L,
     ignored_roots: &'a HashSet<String>,
+    external_modules: &'a HashSet<ModulePath>,
     preloaded: HashMap<ModulePath, Program>,
     visiting: HashSet<ModuleKey>,
     loaded: HashSet<ModuleKey>,
@@ -266,6 +269,9 @@ impl<L: ModuleLoader> Resolver<'_, L> {
             match self.loader.load(path) {
                 Ok(Some(module_program)) => {
                     self.resolve_module(import_key.clone(), module_program);
+                }
+                Ok(None) if self.external_modules.contains(path) => {
+                    self.loaded.insert(import_key.clone());
                 }
                 Ok(None) => {
                     self.errors.push(ResolveError::ModuleNotFound {

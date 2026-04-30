@@ -14,6 +14,7 @@ use crate::{
         ImportKind, MethodReceiver, Mutability, NominalKind, Param, Program, Stmt, StmtNode, Type,
         TypeParam, VariantKind, Visibility,
     },
+    externs::{RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope},
     resolve::{ModuleKey, ModulePath, ResolveResult},
     span::Span,
 };
@@ -732,6 +733,7 @@ impl DeclarationIndex {
         root: &Program,
         resolved: &ResolveResult,
         always_active: HashSet<ModuleScope>,
+        externs: &RawExterns,
     ) -> Self {
         let mut index = Self {
             always_active_modules: always_active,
@@ -741,6 +743,7 @@ impl DeclarationIndex {
         for (scope, program) in &modules {
             index.collect_module(program, scope.clone(), matches!(scope, ModuleScope::Root));
         }
+        index.collect_extern_headers(externs);
         index.apply_public_import_reexports(&modules);
         index.build_import_scopes(&modules);
         index
@@ -768,6 +771,27 @@ impl DeclarationIndex {
 
     pub(crate) fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+    }
+
+    pub(crate) fn sync_extern_headers_from_catalog(&mut self, catalog: &ExternCatalog) {
+        for function in catalog.functions() {
+            let decls = self
+                .modules
+                .get_mut(&function.key.module)
+                .expect("catalog extern function module exists in declarations");
+            let value = decls
+                .locals
+                .values
+                .get_mut(&function.key.name)
+                .expect("catalog extern function exists in declarations");
+            let ValueDecl::Func(sig) = &mut value.decl else {
+                panic!("catalog extern function points to non-function declaration");
+            };
+            assert_eq!(sig.kind, CallableKind::ExternFunction);
+            sig.ty = function.signature.to_func_type();
+        }
+
+        self.sync_value_projections();
     }
 
     pub(crate) fn map_canonical_type_uses<F>(&mut self, mut f: F) -> Vec<GenericContextError>
@@ -1147,45 +1171,6 @@ impl DeclarationIndex {
                         );
                     }
                 }
-                Stmt::ExternFunc(ext_node) => {
-                    let ext = &ext_node.node;
-                    let ty = func_type_from_params(&ext.params, &ext.ret);
-                    let value = ResolvedValue {
-                        module: scope.clone(),
-                        name: ext.name,
-                        decl: ValueDecl::Func(FuncSig {
-                            kind: CallableKind::ExternFunction,
-                            generics: GenericParams::default(),
-                            ty,
-                        }),
-                    };
-                    self.insert_local_value(
-                        &mut decls,
-                        &scope,
-                        ext.name,
-                        value,
-                        exported,
-                        ext_node.span,
-                    );
-                }
-                Stmt::ExternType(ext_node) => {
-                    let ext = &ext_node.node;
-                    let key = NominalKey {
-                        module: scope.clone(),
-                        kind: NominalKind::Extern,
-                        name: ext.name,
-                    };
-                    if self.insert_local_type(
-                        &mut decls,
-                        &scope,
-                        ext.name,
-                        key.clone(),
-                        exported,
-                        ext_node.span,
-                    ) {
-                        self.type_spans.insert(key, ext_node.span);
-                    }
-                }
                 Stmt::Const(const_node) => {
                     let c = &const_node.node;
                     let value = ResolvedValue {
@@ -1246,6 +1231,58 @@ impl DeclarationIndex {
                 }
                 _ => {}
             }
+        }
+
+        self.modules.insert(scope, decls);
+    }
+
+    fn collect_extern_headers(&mut self, externs: &RawExterns) {
+        for group in &externs.groups {
+            for module in &group.modules {
+                self.collect_extern_module(module);
+            }
+        }
+    }
+
+    fn collect_extern_module(&mut self, module: &RawExternModule) {
+        let scope = raw_module_scope(&module.scope);
+        let mut decls = self.modules.remove(&scope).unwrap_or_default();
+
+        for ty in &module.types {
+            let name = Ident::new(&ty.name);
+            let key = NominalKey {
+                module: scope.clone(),
+                kind: NominalKind::Extern,
+                name,
+            };
+            let span = ty.site.span.unwrap_or(Span::new(0, 0));
+            if self.insert_local_type(&mut decls, &scope, name, key.clone(), true, span) {
+                self.type_spans.insert(key, span);
+            }
+        }
+
+        for func in &module.functions {
+            let name = Ident::new(&func.decl.name);
+            let value = ResolvedValue {
+                module: scope.clone(),
+                name,
+                decl: ValueDecl::Func(FuncSig {
+                    kind: CallableKind::ExternFunction,
+                    generics: GenericParams::default(),
+                    ty: Type::Func {
+                        params: vec![],
+                        ret: Box::new(Type::Void),
+                    },
+                }),
+            };
+            self.insert_local_value(
+                &mut decls,
+                &scope,
+                name,
+                value,
+                true,
+                func.site.span.unwrap_or(Span::new(0, 0)),
+            );
         }
 
         self.modules.insert(scope, decls);
@@ -1898,6 +1935,16 @@ impl DeclarationIndex {
         }
     }
 
+    pub(crate) fn finalize_nominal_type_args(
+        &self,
+        module: &ModuleScope,
+        key: &NominalKey,
+        args: Vec<Type>,
+    ) -> Result<Type, TypeRefError> {
+        let args = args.into_iter().map(GenericArg::Type).collect::<Vec<_>>();
+        self.finalize_nominal_type_ref(module, &GenericTypeContext::default(), key, &args)
+    }
+
     fn finalize_nominal_type_ref(
         &self,
         module: &ModuleScope,
@@ -2286,6 +2333,12 @@ pub(crate) fn nominal_type_with_args(
 
 #[cfg(test)]
 mod tests {
+    use anvyx_externs::{
+        ExternEffects, ExternFunctionDescriptor, ExternModuleDescriptor, ExternParam, ExternRep,
+        ExternSignature, ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath,
+        ParamFlow, ProviderDescriptor, ProviderId,
+    };
+
     use super::*;
     use crate::{
         ast::TypeVarId, lexer::tokenize, parser, resolve::ResolvedModule,
@@ -2321,20 +2374,81 @@ mod tests {
 
     fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
         let root = parse(root);
-        DeclarationIndex::from_root_and_modules(&root, &resolved_modules(modules), HashSet::new())
+        let resolved = resolved_modules(modules);
+        let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
+        DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new(), &externs)
     }
 
     fn checked_index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
         let root = parse(root);
-        super::super::check_with_modules(
-            &root,
-            &resolved_modules(modules),
-            HashSet::new(),
-            crate::externs::RawExterns::default(),
-        )
-        .expect("typecheck failed")
-        .decls()
-        .clone()
+        let resolved = resolved_modules(modules);
+        let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
+        super::super::check_with_modules(&root, &resolved, HashSet::new(), externs)
+            .expect("typecheck failed")
+            .decls()
+            .clone()
+    }
+
+    fn provider_index(root: &str, provider: ProviderDescriptor) -> DeclarationIndex {
+        provider_index_with_modules(root, &[], provider)
+    }
+
+    fn provider_index_with_modules(
+        root: &str,
+        modules: &[(&str, &str)],
+        provider: ProviderDescriptor,
+    ) -> DeclarationIndex {
+        let root = parse(root);
+        let resolved = resolved_modules(modules);
+        let raw = crate::externs::ingest_providers(crate::externs::ExternInputs {
+            providers: vec![provider],
+        })
+        .unwrap();
+        DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new(), &raw)
+    }
+
+    fn provider_with_module(module: ExternModuleDescriptor) -> ProviderDescriptor {
+        ProviderDescriptor {
+            provider: ProviderId {
+                name: "host".to_string(),
+            },
+            modules: vec![module],
+        }
+    }
+
+    fn extern_module(path: &[&str]) -> ExternModulePath {
+        ExternModulePath {
+            segments: path.iter().map(|segment| (*segment).to_string()).collect(),
+        }
+    }
+
+    fn extern_fn(name: &str) -> ExternFunctionDescriptor {
+        ExternFunctionDescriptor {
+            name: name.to_string(),
+            doc: None,
+            signature: ExternSignature {
+                params: vec![ExternParam {
+                    name: Some("x".to_string()),
+                    ty: ExternTypeExpr::Int,
+                    flow: ParamFlow::Value,
+                }],
+                ret: ExternTypeExpr::Float,
+            },
+            effects: ExternEffects::default(),
+        }
+    }
+
+    fn extern_type(name: &str) -> ExternTypeDescriptor {
+        ExternTypeDescriptor {
+            name: name.to_string(),
+            doc: None,
+            rep: ExternRep::Shared,
+            fields: vec![],
+            init: None,
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+        }
     }
 
     fn func_ret(ty: &Type) -> &Type {
@@ -2765,6 +2879,115 @@ mod tests {
             .expect("missing import");
 
         assert_eq!(value.module, scope("a"));
+    }
+
+    #[test]
+    fn provider_extern_headers_are_visible_through_imports() {
+        let index = provider_index(
+            "import host { Handle, load }; import host { * };",
+            provider_with_module(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![extern_type("Handle")],
+                functions: vec![extern_fn("load")],
+            }),
+        );
+        let host = scope("host");
+        let ty = index
+            .imported_type(&ModuleScope::Root, ident("Handle"))
+            .expect("missing provider type import");
+        let value = index
+            .imported_value(&ModuleScope::Root, ident("load"))
+            .expect("missing provider function import");
+
+        assert_eq!(ty.module, host);
+        assert_eq!(ty.kind, NominalKind::Extern);
+        assert_eq!(value.module, scope("host"));
+        assert!(matches!(
+            value.decl,
+            ValueDecl::Func(FuncSig {
+                kind: CallableKind::ExternFunction,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_module_import_creates_alias() {
+        let index = provider_index(
+            "import host;",
+            provider_with_module(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![extern_type("Handle")],
+                functions: vec![],
+            }),
+        );
+
+        assert_eq!(
+            index.imported_module(&ModuleScope::Root, ident("host")),
+            Some(scope("host"))
+        );
+    }
+
+    #[test]
+    fn provider_members_are_not_module_values() {
+        let index = provider_index(
+            "import host { * };",
+            provider_with_module(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![anvyx_externs::ExternFieldDescriptor {
+                        name: "x".to_string(),
+                        ty: ExternTypeExpr::Int,
+                        access: anvyx_externs::FieldAccess::ReadOnly { computed: false },
+                        doc: None,
+                    }],
+                    ..extern_type("Handle")
+                }],
+                functions: vec![],
+            }),
+        );
+
+        assert!(
+            index
+                .imported_value(&ModuleScope::Root, ident("x"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_extern_type_conflicts_with_source_type() {
+        let index = provider_index_with_modules(
+            "",
+            &[("host", "pub struct Handle { id: int }")],
+            provider_with_module(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![extern_type("Handle")],
+                functions: vec![],
+            }),
+        );
+
+        assert!(matches!(
+            index.errors().first(),
+            Some(DeclError::DuplicateType { name, .. }) if *name == ident("Handle")
+        ));
+    }
+
+    #[test]
+    fn provider_extern_function_conflicts_with_source_function() {
+        let index = provider_index_with_modules(
+            "",
+            &[("host", "pub fn load() -> float { 0.0 }")],
+            provider_with_module(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![extern_fn("load")],
+            }),
+        );
+
+        assert!(matches!(
+            index.errors().first(),
+            Some(DeclError::DuplicateValue { name, .. }) if *name == ident("load")
+        ));
     }
 
     #[test]

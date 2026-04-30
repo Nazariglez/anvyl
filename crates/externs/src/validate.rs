@@ -75,12 +75,6 @@ pub enum TypeContext {
     Nested,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OperatorReturn {
-    Bool,
-    NonVoid,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypePosition {
     Param,
@@ -293,10 +287,7 @@ fn check_operator_signature(
         });
     }
 
-    let expected = match operator.op {
-        ExternOperator::Binary { op, .. } if op.returns_bool() => OperatorReturn::Bool,
-        _ => OperatorReturn::NonVoid,
-    };
+    let expected = operator.op.return_requirement();
     if !operator_return_matches(expected, &operator.signature.ret) {
         errors.push(ExternDescriptorError::InvalidOperatorReturn {
             ty: ty.clone(),

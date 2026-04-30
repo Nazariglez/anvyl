@@ -71,7 +71,13 @@ pub fn resolve(
     source: &str,
     loader: &mut InMemoryLoader,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
-    resolve::resolve_modules(parse_program(source), vec![], loader, &HashSet::new())
+    resolve::resolve_modules(
+        parse_program(source),
+        vec![],
+        loader,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
 }
 
 pub fn resolve_with_ignored(
@@ -79,7 +85,13 @@ pub fn resolve_with_ignored(
     loader: &mut InMemoryLoader,
     ignored: &HashSet<String>,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
-    resolve::resolve_modules(parse_program(source), vec![], loader, ignored)
+    resolve::resolve_modules(
+        parse_program(source),
+        vec![],
+        loader,
+        ignored,
+        &HashSet::new(),
+    )
 }
 
 pub fn preloaded(path: &[&str], source: &str) -> PreloadedModule {
@@ -94,11 +106,35 @@ pub fn resolve_with_preloaded(
     preloaded_modules: Vec<PreloadedModule>,
     loader: &mut InMemoryLoader,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
+    resolve_with_preloaded_and_external(source, preloaded_modules, loader, &HashSet::new())
+}
+
+pub fn resolve_with_external(
+    source: &str,
+    loader: &mut InMemoryLoader,
+    external_modules: &HashSet<ModulePath>,
+) -> Result<ResolveResult, ResolveFailure<Infallible>> {
+    resolve::resolve_modules(
+        parse_program(source),
+        vec![],
+        loader,
+        &HashSet::new(),
+        external_modules,
+    )
+}
+
+pub fn resolve_with_preloaded_and_external(
+    source: &str,
+    preloaded_modules: Vec<PreloadedModule>,
+    loader: &mut InMemoryLoader,
+    external_modules: &HashSet<ModulePath>,
+) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_modules(
         parse_program(source),
         preloaded_modules,
         loader,
         &HashSet::new(),
+        external_modules,
     )
 }
 

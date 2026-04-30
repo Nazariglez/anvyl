@@ -10,6 +10,9 @@ use crate::{
         ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey,
         RawExternIdentityKey, RawExternMemberKey, RawExternScope, RawExternTypeKey,
         UnsupportedSourceKind, UnsupportedSourceParamReason,
+        catalog::{
+            ExternCatalogContext, ExternCatalogError, ExternContextItem, InvalidExternTypeReason,
+        },
     },
     lexer::SpannedToken,
     resolve::{ModulePath, ResolveError},
@@ -262,6 +265,7 @@ fn render_extern_member_selector(selector: &anvyx_externs::ExternMemberSelector)
 pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
     Diagnostic::error(match error {
         TypeError::Decl(error) => render_decl_error(error),
+        TypeError::ExternCatalog(error) => render_extern_catalog_error(error),
         TypeError::UndefinedVariable { name, .. } => format!("Unknown variable '{name}'"),
         TypeError::TypeMismatch {
             expected, found, ..
@@ -397,6 +401,130 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("duplicate generic parameter '{name}'")
         }
     })
+}
+
+fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
+    let (context, message) = match error {
+        ExternCatalogError::UnknownType {
+            context,
+            module,
+            name,
+            ..
+        } => {
+            let ty = module.as_ref().map_or_else(
+                || name.to_string(),
+                |module| format!("{}.{name}", render_module_scope(module)),
+            );
+            (
+                context,
+                format!(
+                    "Unknown extern type '{ty}' in {}",
+                    render_extern_item(context)
+                ),
+            )
+        }
+        ExternCatalogError::GenericArity {
+            context,
+            name,
+            expected,
+            found,
+            ..
+        } => (
+            context,
+            format!(
+                "wrong number of extern type arguments for '{name}' in {}: expected {expected}, found {found}",
+                render_extern_item(context)
+            ),
+        ),
+        ExternCatalogError::GenericArgKindMismatch {
+            context,
+            name,
+            expected,
+            ..
+        } => (
+            context,
+            format!(
+                "expected {expected} extern generic argument for '{name}' in {}",
+                render_extern_item(context)
+            ),
+        ),
+        ExternCatalogError::InvalidType {
+            context,
+            ty,
+            reason,
+            ..
+        } => {
+            let item = render_extern_item(context);
+            let message = match reason {
+                InvalidExternTypeReason::Unresolved => {
+                    format!("unresolved extern type '{ty}' in {item}")
+                }
+                InvalidExternTypeReason::Infer => {
+                    format!("extern type '{ty}' contains inference in {item}")
+                }
+                InvalidExternTypeReason::Void => {
+                    format!("void type is not allowed in extern type position '{ty}' in {item}")
+                }
+                InvalidExternTypeReason::UnresolvedConst => {
+                    format!("extern type '{ty}' contains an unresolved const argument in {item}")
+                }
+            };
+            (context, message)
+        }
+        ExternCatalogError::UnknownInitField { context, field, .. } => (
+            context,
+            format!(
+                "{} references unknown field '{field}'",
+                render_extern_item(context)
+            ),
+        ),
+        ExternCatalogError::ComputedInitField { context, field, .. } => (
+            context,
+            format!(
+                "{} cannot initialize computed field '{field}'",
+                render_extern_item(context)
+            ),
+        ),
+        ExternCatalogError::InvalidOperatorReturn {
+            context,
+            found,
+            expected,
+            ..
+        } => (
+            context,
+            format!(
+                "invalid {}: expected {} return type, found '{found}'",
+                render_extern_item(context),
+                render_operator_return(*expected)
+            ),
+        ),
+    };
+    format!(
+        "{message} from {}",
+        render_extern_provenance(&context.provenance)
+    )
+}
+
+fn render_extern_item(context: &ExternCatalogContext) -> String {
+    let module = render_module_scope(&context.module);
+    match &context.item {
+        ExternContextItem::Function { name } => format!("extern function {module}.{name}"),
+        ExternContextItem::Type { name } => format!("extern type {module}.{name}"),
+        ExternContextItem::Field { ty, field } => format!("extern field {module}.{ty}.{field}"),
+        ExternContextItem::Init { ty } => format!("extern init {module}.{ty}"),
+        ExternContextItem::Method { ty, method } => {
+            format!("extern method {module}.{ty}.{method}")
+        }
+        ExternContextItem::Static { ty, method } => {
+            format!("extern static {module}.{ty}.{method}")
+        }
+        ExternContextItem::Operator { ty, op } => {
+            format!(
+                "extern operator {module}.{ty}.{}",
+                render_extern_operator(*op)
+            )
+        }
+    }
 }
 
 fn render_member_access_kind(kind: MemberAccessKind) -> &'static str {
@@ -672,7 +800,9 @@ fn render_extern_type_expr(ty: &ExternTypeExpr) -> String {
                     .map(render_extern_type_expr)
                     .collect::<Vec<_>>()
                     .join(", ");
-                rendered.push_str(&format!("<{args}>"));
+                rendered.push('<');
+                rendered.push_str(&args);
+                rendered.push('>');
             }
             rendered
         }
@@ -693,6 +823,7 @@ fn render_module_scope(scope: &ModuleScope) -> String {
 
 #[cfg(test)]
 mod tests {
+    use anvyx_externs::BinaryOp;
     use chumsky::error::{LabelError, RichPattern};
 
     use super::*;
@@ -712,6 +843,16 @@ mod tests {
 
     fn module_scope(path: &[&str]) -> ModuleScope {
         ModuleScope::Named(module_path(path))
+    }
+
+    fn catalog_context(module: &[&str], item: ExternContextItem) -> ExternCatalogContext {
+        ExternCatalogContext {
+            provenance: ExternProvenance::Source {
+                module: RawExternScope::Root,
+            },
+            module: module_scope(module),
+            item,
+        }
     }
 
     fn span() -> Span {
@@ -972,6 +1113,187 @@ mod tests {
         for (diagnostic, expected) in cases {
             assert_msg(diagnostic, expected);
         }
+    }
+
+    #[test]
+    fn renders_extern_catalog_errors() {
+        let cases = [
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+                    context: catalog_context(
+                        &["host"],
+                        ExternContextItem::Function {
+                            name: ident("tick"),
+                        },
+                    ),
+                    module: None,
+                    name: ident("Missing"),
+                    site: Default::default(),
+                })),
+                "Unknown extern type 'Missing' in extern function host.tick from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::InvalidType {
+                    context: catalog_context(
+                        &["host"],
+                        ExternContextItem::Type {
+                            name: ident("Handle"),
+                        },
+                    ),
+                    ty: Type::Infer,
+                    reason: InvalidExternTypeReason::Infer,
+                    site: Default::default(),
+                })),
+                "extern type '_' contains inference in extern type host.Handle from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(
+                    ExternCatalogError::UnknownInitField {
+                        context: catalog_context(
+                            &["host"],
+                            ExternContextItem::Init {
+                                ty: ident("Handle"),
+                            },
+                        ),
+                        field: ident("missing"),
+                        site: Default::default(),
+                    },
+                )),
+                "extern init host.Handle references unknown field 'missing' from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(
+                    ExternCatalogError::ComputedInitField {
+                        context: catalog_context(
+                            &["host"],
+                            ExternContextItem::Init {
+                                ty: ident("Handle"),
+                            },
+                        ),
+                        field: ident("x"),
+                        site: Default::default(),
+                    },
+                )),
+                "extern init host.Handle cannot initialize computed field 'x' from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+                    context: catalog_context(
+                        &["host"],
+                        ExternContextItem::Method {
+                            ty: ident("Handle"),
+                            method: ident("move_by"),
+                        },
+                    ),
+                    module: None,
+                    name: ident("Missing"),
+                    site: Default::default(),
+                })),
+                "Unknown extern type 'Missing' in extern method host.Handle.move_by from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+                    context: catalog_context(
+                        &["host"],
+                        ExternContextItem::Static {
+                            ty: ident("Handle"),
+                            method: ident("make"),
+                        },
+                    ),
+                    module: None,
+                    name: ident("Missing"),
+                    site: Default::default(),
+                })),
+                "Unknown extern type 'Missing' in extern static host.Handle.make from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(
+                    ExternCatalogError::InvalidOperatorReturn {
+                        context: catalog_context(
+                            &["math"],
+                            ExternContextItem::Operator {
+                                ty: ident("Vec2"),
+                                op: ExternOperator::Binary {
+                                    op: BinaryOp::Eq,
+                                    self_on_right: false,
+                                },
+                            },
+                        ),
+                        found: Type::Int,
+                        expected: OperatorReturn::Bool,
+                        site: Default::default(),
+                    },
+                )),
+                "invalid extern operator math.Vec2.==: expected bool return type, found 'int' from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::InvalidType {
+                    context: catalog_context(
+                        &["host"],
+                        ExternContextItem::Field {
+                            ty: ident("Handle"),
+                            field: ident("id"),
+                        },
+                    ),
+                    ty: Type::Void,
+                    reason: InvalidExternTypeReason::Void,
+                    site: Default::default(),
+                })),
+                "void type is not allowed in extern type position 'void' in extern field host.Handle.id from source root",
+            ),
+        ];
+
+        for (diagnostic, expected) in cases {
+            assert_msg(diagnostic, expected);
+        }
+    }
+
+    #[test]
+    fn operator_return_messages_match() {
+        let op = ExternOperator::Binary {
+            op: BinaryOp::Eq,
+            self_on_right: false,
+        };
+        let descriptor =
+            diagnose_extern_input_error(&ExternInputError::InvalidProviderDescriptor {
+                provider: anvyx_externs::ProviderId {
+                    name: "host".to_string(),
+                },
+                error: ExternDescriptorError::InvalidOperatorReturn {
+                    ty: ExternTypeKey {
+                        module: ExternModulePath {
+                            segments: vec!["math".to_string()],
+                        },
+                        name: "Vec2".to_string(),
+                    },
+                    op,
+                    expected: OperatorReturn::Bool,
+                    actual: ExternTypeExpr::Int,
+                },
+            });
+        let catalog = diagnose_type_error(&TypeError::ExternCatalog(
+            ExternCatalogError::InvalidOperatorReturn {
+                context: catalog_context(
+                    &["math"],
+                    ExternContextItem::Operator {
+                        ty: ident("Vec2"),
+                        op,
+                    },
+                ),
+                found: Type::Int,
+                expected: OperatorReturn::Bool,
+                site: Default::default(),
+            },
+        ));
+
+        assert_msg(
+            descriptor,
+            "invalid extern descriptor from provider 'host': invalid operator '==' on extern type 'math.Vec2': expected bool return type, found 'int'",
+        );
+        assert_msg(
+            catalog,
+            "invalid extern operator math.Vec2.==: expected bool return type, found 'int' from source root",
+        );
     }
 
     #[test]

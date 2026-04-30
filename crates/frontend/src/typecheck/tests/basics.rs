@@ -4,7 +4,7 @@ use super::support::{
 };
 use crate::{
     ast::{ArrayLen, ConstArg, ConstValue, FuncParam, GenericArg, Ident, NominalKind, Type},
-    typecheck::{ArityError, DeclError, ModuleScope, TypeError, type_contains_infer},
+    typecheck::{ArityError, DeclError, ModuleScope, TypeError, type_closure_facts},
 };
 
 mod storage {
@@ -32,8 +32,13 @@ mod storage {
         let resolved = ResolveResult {
             module_groups: vec![],
         };
-        let decls = DeclarationIndex::from_root_and_modules(&program, &resolved, HashSet::new());
-        let mut tc = TypeChecker::new(decls);
+        let decls = DeclarationIndex::from_root_and_modules(
+            &program,
+            &resolved,
+            HashSet::new(),
+            &crate::externs::RawExterns::default(),
+        );
+        let mut tc = TypeChecker::new(decls, crate::externs::catalog::ExternCatalog::default());
         let name = Ident::new("x");
         tc.push_scope();
         tc.define(name, Type::Int, false);
@@ -178,7 +183,7 @@ mod constraints {
             elem: Box::new(Type::Int),
             len: ArrayLen::Infer,
         };
-        assert!(type_contains_infer(&ty));
+        assert!(type_closure_facts(&ty).contains_infer);
     }
 
     #[test]
@@ -187,7 +192,7 @@ mod constraints {
             params: vec![FuncParam::new(Type::Int, false)],
             ret: Box::new(Type::Tuple(vec![Type::Infer])),
         };
-        assert!(type_contains_infer(&ty));
+        assert!(type_closure_facts(&ty).contains_infer);
     }
 
     #[test]
@@ -197,7 +202,7 @@ mod constraints {
             name: Ident::new("Box"),
             generic_args: vec![GenericArg::Type(Type::Infer)],
         };
-        assert!(type_contains_infer(&ty));
+        assert!(type_closure_facts(&ty).contains_infer);
     }
 
     #[test]
@@ -209,7 +214,7 @@ mod constraints {
             vec![],
             None,
         );
-        assert!(type_contains_infer(&ty));
+        assert!(type_closure_facts(&ty).contains_infer);
     }
 }
 
@@ -1200,7 +1205,7 @@ mod functions {
     fn extern_unknown_param_type_err() {
         assert_single_error(
             "extern fn host(x: Missing);",
-            |err| matches!(err, TypeError::Decl(DeclError::UnknownType { qualifier: None, name, .. }) if *name == Ident::new("Missing")),
+            |err| matches!(err, TypeError::ExternCatalog(crate::externs::catalog::ExternCatalogError::UnknownType { name, .. }) if *name == Ident::new("Missing")),
         );
     }
 

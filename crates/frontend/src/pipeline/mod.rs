@@ -100,12 +100,16 @@ pub fn check<L: SourceLoader>(
         .map(module_scope)
         .collect::<HashSet<_>>();
 
+    let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
+    let external_modules = externs::raw_extern_module_paths(&raw_externs);
+
     let mut loader = InputModuleLoader::new(input.source_loader);
     let resolved = match resolve::resolve_modules(
         root.clone(),
         preloaded_modules,
         &mut loader,
         &HashSet::new(),
+        &external_modules,
     ) {
         Ok(resolved) => resolved,
         Err(ResolveFailure::Fatal(error)) => return Err(error),
@@ -118,7 +122,6 @@ pub fn check<L: SourceLoader>(
 
     validate_always_active_modules(&resolved, &always_active_modules)?;
 
-    let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
     let source_externs = externs::collect_source_externs(&root, &resolved).map_err(extern_error)?;
     raw_externs.append(source_externs);
     externs::validate_raw_shapes(&raw_externs).map_err(extern_error)?;
@@ -362,6 +365,49 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn provider_only_module_import_resolves() {
+        let mut loader = TestLoader::default();
+        pipeline_check(
+            ProgramInput {
+                main: source("import math { dot }; fn main() {}", "main.anv"),
+                prelude: None,
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: ExternInputs {
+                    providers: vec![valid_provider_descriptor()],
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn provider_import_does_not_hide_loader_failure() {
+        let mut loader = TestLoader::default();
+        loader.failure(&["math"], "disk error");
+        let err = pipeline_check(
+            ProgramInput {
+                main: source("import math { dot }; fn main() {}", "main.anv"),
+                prelude: None,
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: ExternInputs {
+                    providers: vec![valid_provider_descriptor()],
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Resolve { .. }));
     }
 
     #[test]
