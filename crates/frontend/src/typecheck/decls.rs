@@ -962,6 +962,7 @@ impl DeclarationIndex {
                     generics,
                 };
                 match &mut value.decl {
+                    ValueDecl::Func(sig) if sig.kind == CallableKind::ExternFunction => {}
                     ValueDecl::Func(sig) => sig.ty = f(site, sig.ty.clone()),
                     ValueDecl::Const(ty) => *ty = f(site, ty.clone()),
                 }

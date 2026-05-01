@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{ModuleScope, call_map::CallMap, decls::DeclarationIndex};
+use super::{CallMap, ExternUseMap, ModuleScope, decls::DeclarationIndex};
 use crate::{
     ast::{ConstValue, ExprId, Ident, Type},
     externs::catalog::ExternCatalog,
@@ -10,6 +10,7 @@ use crate::{
 pub(crate) struct TypecheckResult {
     pub(crate) types: HashMap<ExprId, (Span, Type)>,
     pub(crate) calls: CallMap,
+    pub(crate) extern_uses: ExternUseMap,
     pub(crate) decls: DeclarationIndex,
     pub(crate) externs: ExternCatalog,
     pub(crate) consts: HashMap<(ModuleScope, Ident), ConstValue>,
@@ -22,6 +23,10 @@ impl TypecheckResult {
 
     pub(crate) fn calls(&self) -> &CallMap {
         &self.calls
+    }
+
+    pub(crate) fn extern_uses(&self) -> &ExternUseMap {
+        &self.extern_uses
     }
 
     pub(crate) fn decls(&self) -> &DeclarationIndex {

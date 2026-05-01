@@ -503,7 +503,7 @@ mod tests {
         check_source(
             r#"
             extern type Vec2 rep inline {
-                init(x: float, y: float);
+                init;
                 x: float;
                 var y: float;
                 let length: float;

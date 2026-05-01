@@ -7,7 +7,7 @@ extern type SharedTexture rep shared;
 extern type Rect;
 
 extern type Vec2 rep inline {
-    init(x: float, y: float);
+    init;
     x: float;
     var y: float;
     let length: float;

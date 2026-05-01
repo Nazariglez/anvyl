@@ -86,7 +86,7 @@ fn generic_fn_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::Callable {
+        &CallTarget {
             id: CallableId::function(ModuleScope::Root, Ident::new("id")),
             args: GenericArgs {
                 type_args: vec![Type::Int],
@@ -105,7 +105,7 @@ fn explicit_prefix_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::Callable {
+        &CallTarget {
             id: CallableId::function(ModuleScope::Root, Ident::new("make")),
             args: GenericArgs {
                 type_args: vec![Type::Int, Type::String],
@@ -251,7 +251,7 @@ fn const_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::Callable {
+        &CallTarget {
             id: CallableId::function(ModuleScope::Root, Ident::new("len")),
             args: GenericArgs {
                 type_args: vec![Type::Int],
@@ -295,7 +295,7 @@ fn generic_const_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::Callable {
+        &CallTarget {
             id: CallableId::function(ModuleScope::Root, Ident::new("len")),
             args: GenericArgs {
                 type_args: vec![Type::Int],
@@ -314,7 +314,7 @@ fn generic_const_named_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::Callable {
+        &CallTarget {
             id: CallableId::function(ModuleScope::Root, Ident::new("len")),
             args: GenericArgs {
                 type_args: vec![Type::Int],

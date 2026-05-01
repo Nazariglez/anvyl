@@ -279,6 +279,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             render_const_diagnostic(expected),
             render_const_diagnostic(found)
         ),
+        TypeError::ExternAnyEscape { .. } => {
+            "extern 'any' value cannot escape an extern boundary".to_string()
+        }
         TypeError::RecursiveInference { .. } => {
             "recursive type inference is not allowed".to_string()
         }
@@ -482,6 +485,13 @@ fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
             context,
             format!(
                 "{} cannot initialize computed field '{field}'",
+                render_extern_item(context)
+            ),
+        ),
+        ExternCatalogError::UnsupportedInitParams { context, count, .. } => (
+            context,
+            format!(
+                "{} does not support parameters: found {count} parameter(s)",
                 render_extern_item(context)
             ),
         ),
@@ -697,6 +707,10 @@ fn render_extern_descriptor_error(
             "duplicate init field '{name}' on extern type '{}'",
             render_extern_type_key(ty, raw_scope)
         ),
+        ExternDescriptorError::UnsupportedInitParams { ty, count } => format!(
+            "extern init parameters are not supported on type '{}': found {count} parameter(s)",
+            render_extern_type_key(ty, raw_scope)
+        ),
         ExternDescriptorError::VoidType { context } => {
             format!(
                 "void type is not allowed in {}",
@@ -829,6 +843,7 @@ mod tests {
     use super::*;
     use crate::{
         ast::{Ident, Type},
+        externs::RawExternSite,
         lexer::Token,
         span::Span,
     };
@@ -1128,7 +1143,7 @@ mod tests {
                     ),
                     module: None,
                     name: ident("Missing"),
-                    site: Default::default(),
+                    site: RawExternSite::default(),
                 })),
                 "Unknown extern type 'Missing' in extern function host.tick from source root",
             ),
@@ -1142,7 +1157,7 @@ mod tests {
                     ),
                     ty: Type::Infer,
                     reason: InvalidExternTypeReason::Infer,
-                    site: Default::default(),
+                    site: RawExternSite::default(),
                 })),
                 "extern type '_' contains inference in extern type host.Handle from source root",
             ),
@@ -1156,7 +1171,7 @@ mod tests {
                             },
                         ),
                         field: ident("missing"),
-                        site: Default::default(),
+                        site: RawExternSite::default(),
                     },
                 )),
                 "extern init host.Handle references unknown field 'missing' from source root",
@@ -1171,10 +1186,25 @@ mod tests {
                             },
                         ),
                         field: ident("x"),
-                        site: Default::default(),
+                        site: RawExternSite::default(),
                     },
                 )),
                 "extern init host.Handle cannot initialize computed field 'x' from source root",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternCatalog(
+                    ExternCatalogError::UnsupportedInitParams {
+                        context: catalog_context(
+                            &["host"],
+                            ExternContextItem::Init {
+                                ty: ident("Handle"),
+                            },
+                        ),
+                        count: 2,
+                        site: RawExternSite::default(),
+                    },
+                )),
+                "extern init host.Handle does not support parameters: found 2 parameter(s) from source root",
             ),
             (
                 diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
@@ -1187,7 +1217,7 @@ mod tests {
                     ),
                     module: None,
                     name: ident("Missing"),
-                    site: Default::default(),
+                    site: RawExternSite::default(),
                 })),
                 "Unknown extern type 'Missing' in extern method host.Handle.move_by from source root",
             ),
@@ -1202,7 +1232,7 @@ mod tests {
                     ),
                     module: None,
                     name: ident("Missing"),
-                    site: Default::default(),
+                    site: RawExternSite::default(),
                 })),
                 "Unknown extern type 'Missing' in extern static host.Handle.make from source root",
             ),
@@ -1221,7 +1251,7 @@ mod tests {
                         ),
                         found: Type::Int,
                         expected: OperatorReturn::Bool,
-                        site: Default::default(),
+                        site: RawExternSite::default(),
                     },
                 )),
                 "invalid extern operator math.Vec2.==: expected bool return type, found 'int' from source root",
@@ -1237,7 +1267,7 @@ mod tests {
                     ),
                     ty: Type::Void,
                     reason: InvalidExternTypeReason::Void,
-                    site: Default::default(),
+                    site: RawExternSite::default(),
                 })),
                 "void type is not allowed in extern type position 'void' in extern field host.Handle.id from source root",
             ),
@@ -1282,7 +1312,7 @@ mod tests {
                 ),
                 found: Type::Int,
                 expected: OperatorReturn::Bool,
-                site: Default::default(),
+                site: RawExternSite::default(),
             },
         ));
 

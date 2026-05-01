@@ -50,6 +50,10 @@ pub enum ExternDescriptorError {
         ty: ExternTypeKey,
         name: String,
     },
+    UnsupportedInitParams {
+        ty: ExternTypeKey,
+        count: usize,
+    },
     VoidType {
         context: TypeContext,
     },
@@ -179,7 +183,12 @@ fn check_type(
     }
 
     if let Some(init) = &ty.init {
-        check_params(&init.params, errors);
+        if !init.params.is_empty() {
+            errors.push(ExternDescriptorError::UnsupportedInitParams {
+                ty: key.clone(),
+                count: init.params.len(),
+            });
+        }
         let mut field_inits = HashSet::new();
         for field in &init.field_init {
             check_unique_name(
@@ -427,11 +436,7 @@ mod tests {
                         doc: None,
                     }],
                     init: Some(ExternInitDescriptor {
-                        params: vec![ExternParam {
-                            name: Some("x".to_string()),
-                            ty: ExternTypeExpr::Float,
-                            flow: ParamFlow::Value,
-                        }],
+                        params: vec![],
                         field_init: vec!["x".to_string()],
                     }),
                     methods: vec![ExternMethodDescriptor {
@@ -529,8 +534,7 @@ mod tests {
             segments: vec!["bad-name".to_string()],
         };
         provider.modules[0].types[0].name = "1Vec2".to_string();
-        provider.modules[0].types[0].init.as_mut().unwrap().params[0].name =
-            Some("__x".to_string());
+        provider.modules[0].functions[0].signature.params[0].name = Some("__x".to_string());
         provider.modules[0].types[0].operators[0].signature.ret = ExternTypeExpr::Named {
             module: None,
             name: String::new(),
@@ -555,6 +559,25 @@ mod tests {
             kind: NameKind::NamedType,
             name: String::new(),
         }));
+    }
+
+    #[test]
+    fn rejects_init_params() {
+        let mut provider = valid_provider();
+        provider.modules[0].types[0].init.as_mut().unwrap().params = vec![ExternParam {
+            name: Some("x".to_string()),
+            ty: ExternTypeExpr::Float,
+            flow: ParamFlow::Value,
+        }];
+
+        let errors = validate(&provider).unwrap_err();
+
+        assert!(
+            errors.contains(&ExternDescriptorError::UnsupportedInitParams {
+                ty: ty(module(&["math"]), "Vec2"),
+                count: 1,
+            })
+        );
     }
 
     #[test]

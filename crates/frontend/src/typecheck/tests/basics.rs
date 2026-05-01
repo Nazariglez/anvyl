@@ -75,6 +75,25 @@ mod constraints {
     }
 
     #[test]
+    fn compound_assignment_uses_binary_operator_type() {
+        check("fn main() { var x = \"score: \"; x += 1; }").expect("typecheck failed");
+    }
+
+    #[test]
+    fn compound_assignment_rejects_invalid_binary_operand() {
+        assert_single_error("fn main() { var x = 1; x += true; }", |error| {
+            matches!(error, TypeError::InvalidOperand { .. })
+        });
+    }
+
+    #[test]
+    fn compound_assignment_rejects_non_assignable_binary_result() {
+        assert_single_error("fn main() { var x = 1; x += \" apples\"; }", |error| {
+            matches!(error, TypeError::TypeMismatch { .. })
+        });
+    }
+
+    #[test]
     fn branch_join_same_type() {
         assert_ty(
             "fn main(cond: bool) { if cond { 1 } else { 2 }; }",

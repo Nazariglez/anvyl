@@ -121,22 +121,20 @@ fn normalize_type(ty: &ExternTypeNode) -> Result<RawExternType, Vec<ExternInputE
         }
     }
 
-    let init = match &ty.node.init {
-        Some(init) => match param_list(&init.params, span) {
-            Ok(params) => Some(RawExternInit {
-                decl: ExternInitDescriptor {
-                    params,
-                    field_init: vec![],
-                },
-                site: RawExternSite { span: Some(span) },
-            }),
-            Err(error) => {
-                errors.push(*error);
-                None
-            }
+    let init = ty.node.init.as_ref().map(|init| RawExternInit {
+        decl: ExternInitDescriptor {
+            params: vec![
+                ExternParam {
+                    name: None,
+                    ty: ExternTypeExpr::Int,
+                    flow: ParamFlow::Value,
+                };
+                init.params.len()
+            ],
+            field_init: vec![],
         },
-        None => None,
-    };
+        site: RawExternSite { span: Some(span) },
+    });
 
     if !errors.is_empty() {
         return Err(errors);

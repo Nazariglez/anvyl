@@ -3,8 +3,7 @@ use crate::{
     ast::{Ident, NominalKind, Type},
     resolve::ModulePath,
     typecheck::{
-        GenericArgs, TypeError, TypecheckResult,
-        call_map::CallTarget,
+        CallTarget, GenericArgs, TypeError, TypecheckResult,
         decls::{BindingNamespace, BindingOrigin, CallableId, DeclError, ModuleScope},
     },
 };
@@ -520,7 +519,7 @@ fn reexport_alias_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::Callable {
+        &CallTarget {
             id: CallableId::function(
                 ModuleScope::Named(ModulePath::new(vec!["tools".to_string()]).unwrap()),
                 Ident::new("id"),
@@ -1048,7 +1047,7 @@ fn qualified_reexport_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget::Callable {
+        &CallTarget {
             id: CallableId::function(
                 ModuleScope::Named(ModulePath::new(vec!["tools".to_string()]).unwrap()),
                 Ident::new("id"),

@@ -429,93 +429,29 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_source_init_forms() {
+    fn normalizes_empty_source_init_forms() {
         for source in ["extern type T { init; }", "extern type T { init(); }"] {
             let ty = collect_root_type(source);
-            assert_eq!(ty.init.unwrap().decl.params, []);
+            let init = ty.init.unwrap();
+            assert_eq!(init.decl.params, []);
+            assert_eq!(init.decl.field_init, Vec::<String>::new());
+            assert!(init.site.span.is_some());
         }
-
-        let ty = collect_root_type("extern type Point { init(x: float, y: float); }");
-        let init = ty.init.unwrap();
-        assert_eq!(
-            init.decl.params,
-            [
-                param("x", ExternTypeExpr::Float),
-                param("y", ExternTypeExpr::Float),
-            ]
-        );
-        assert_eq!(init.decl.field_init, Vec::<String>::new());
-        assert!(init.site.span.is_some());
     }
 
     #[test]
-    fn normalizes_source_init_type_expressions() {
-        let ty = collect_root_type(
-            r"
-            extern type Owner {
-                init(
-                    owner: Self,
-                    callback: fn(Self) -> Self,
-                    optional: Self?,
-                    list: [Self],
-                    map: [string: Self],
-                    named: other.Type
-                );
-            }
-            ",
-        );
-
-        let params = &ty.init.unwrap().decl.params;
-        assert_eq!(params[0], param("owner", named("Owner")));
-        assert!(matches!(params[1].ty, ExternTypeExpr::Callback(_)));
-        assert_eq!(
-            params[2].ty,
-            ExternTypeExpr::Option(Box::new(named("Owner")))
-        );
-        assert_eq!(params[3].ty, ExternTypeExpr::List(Box::new(named("Owner"))));
-        assert_eq!(
-            params[4].ty,
-            ExternTypeExpr::Map(Box::new(ExternTypeExpr::String), Box::new(named("Owner")))
-        );
-        assert_eq!(
-            params[5].ty,
-            ExternTypeExpr::Named {
-                module: Some(module(&["other"])),
-                name: "Type".to_string(),
-                args: vec![],
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_source_init_params() {
-        for source in [
-            "extern type T { init(var x: int); }",
-            "extern type T { init(x: as int); }",
-            "extern type T { init(x: int = 1); }",
-            "extern type T { init(x: (int, int)); }",
-            "extern type T { init(x: [int; 2]); }",
-            "extern type T { init(x: [int; _]); }",
-            "extern type T { init(x: Vec<4>); }",
-        ] {
-            assert!(matches!(
-                collect_source_externs(&parse(source), &empty_resolved()).unwrap_err()[0],
-                ExternInputError::UnsupportedSource { .. }
-            ));
-        }
-
+    fn rejects_source_init_params_during_shape_validation() {
         let raw = collect_source_externs(
-            &parse("extern type T { init(x: void); }"),
+            &parse("extern type Point { init(x: float, y: float); }"),
             &empty_resolved(),
         )
         .unwrap();
+
         let errors = validate_raw_shapes(&raw).unwrap_err();
         assert!(matches!(
             errors[0],
             ExternInputError::InvalidRawDescriptor {
-                error: ExternDescriptorError::VoidType {
-                    context: TypeContext::Param
-                },
+                error: ExternDescriptorError::UnsupportedInitParams { count: 2, .. },
                 ..
             }
         ));
@@ -639,7 +575,7 @@ mod tests {
             r"
             extern type Owner {
                 field: Self;
-                init(owner: Self);
+                init;
                 fn method(self, owner: Self) -> Self;
                 fn make() -> Self;
                 op Self + Self -> Self;
@@ -648,7 +584,7 @@ mod tests {
         );
 
         assert_eq!(ty.fields[0].decl.ty, named("Owner"));
-        assert_eq!(ty.init.unwrap().decl.params[0].ty, named("Owner"));
+        assert!(ty.init.unwrap().decl.params.is_empty());
         assert_eq!(ty.methods[0].decl.signature.params[0].ty, named("Owner"));
         assert_eq!(ty.methods[0].decl.signature.ret, named("Owner"));
         assert_eq!(ty.statics[0].decl.signature.ret, named("Owner"));
@@ -1016,6 +952,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_provider_init_params_during_shape_validation() {
+        let mut ty = extern_type("T");
+        ty.init = Some(ExternInitDescriptor {
+            params: vec![param("x", ExternTypeExpr::Int)],
+            field_init: vec![],
+        });
+        let raw = raw_provider_types(vec![ty]);
+
+        let errors = validate_raw_shapes(&raw).unwrap_err();
+
+        assert!(matches!(
+            errors[0],
+            ExternInputError::InvalidRawDescriptor {
+                error: ExternDescriptorError::UnsupportedInitParams { count: 1, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn accepts_distinct_raw_namespaces() {
         let raw = collect_source_externs(
             &parse(
@@ -1094,7 +1050,7 @@ mod tests {
                             doc: Some("x pos".to_string()),
                         }],
                         init: Some(ExternInitDescriptor {
-                            params: vec![param("callback", callback.clone())],
+                            params: vec![],
                             field_init: vec!["x".to_string()],
                         }),
                         methods: vec![ExternMethodDescriptor {

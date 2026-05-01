@@ -42,6 +42,30 @@ pub(crate) struct ExternStaticId(usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ExternOperatorId(usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ExternFieldRef {
+    owner: ExternTypeId,
+    id: ExternFieldId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ExternMethodRef {
+    owner: ExternTypeId,
+    id: ExternMethodId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ExternStaticRef {
+    owner: ExternTypeId,
+    id: ExternStaticId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ExternOperatorRef {
+    owner: ExternTypeId,
+    id: ExternOperatorId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FunctionKey {
     pub(crate) module: ModuleScope,
@@ -122,11 +146,6 @@ impl ExternCatalog {
             for field in &ty.fields {
                 visit_extern_ty(&field.ty, field.site, &mut visit);
             }
-            if let Some(init) = &ty.init {
-                for param in &init.params {
-                    visit_extern_ty(&param.ty, init.site, &mut visit);
-                }
-            }
             for method in &ty.methods {
                 visit_extern_signature(&method.signature, method.site, &mut visit);
             }
@@ -171,30 +190,30 @@ impl ExternCatalog {
         &self,
         owner: ExternTypeId,
         name: Ident,
-    ) -> Option<(ExternFieldId, &ExternField)> {
+    ) -> Option<(ExternFieldRef, &ExternField)> {
         let ty = self.ty(owner);
         let id = ty.fields_by_name.get(&name).copied()?;
-        Some((id, &ty.fields[id.0]))
+        Some((ExternFieldRef { owner, id }, &ty.fields[id.0]))
     }
 
     pub(crate) fn method(
         &self,
         owner: ExternTypeId,
         name: Ident,
-    ) -> Option<(ExternMethodId, &ExternMethod)> {
+    ) -> Option<(ExternMethodRef, &ExternMethod)> {
         let ty = self.ty(owner);
         let id = ty.methods_by_name.get(&name).copied()?;
-        Some((id, &ty.methods[id.0]))
+        Some((ExternMethodRef { owner, id }, &ty.methods[id.0]))
     }
 
     pub(crate) fn static_method(
         &self,
         owner: ExternTypeId,
         name: Ident,
-    ) -> Option<(ExternStaticId, &ExternStatic)> {
+    ) -> Option<(ExternStaticRef, &ExternStatic)> {
         let ty = self.ty(owner);
         let id = ty.statics_by_name.get(&name).copied()?;
-        Some((id, &ty.statics[id.0]))
+        Some((ExternStaticRef { owner, id }, &ty.statics[id.0]))
     }
 
     pub(crate) fn init(&self, owner: ExternTypeId) -> Option<&ExternInit> {
@@ -205,7 +224,7 @@ impl ExternCatalog {
         &self,
         owner: ExternTypeId,
         op: UnaryOp,
-    ) -> Option<(ExternOperatorId, &ExternOperatorDecl)> {
+    ) -> Option<(ExternOperatorRef, &ExternOperatorDecl)> {
         self.operator(owner, ExternOperator::Unary(op))
     }
 
@@ -214,7 +233,7 @@ impl ExternCatalog {
         owner: ExternTypeId,
         op: BinaryOp,
         self_on_right: bool,
-    ) -> Option<(ExternOperatorId, &ExternOperatorDecl)> {
+    ) -> Option<(ExternOperatorRef, &ExternOperatorDecl)> {
         self.operator(owner, ExternOperator::Binary { op, self_on_right })
     }
 
@@ -222,10 +241,10 @@ impl ExternCatalog {
         &self,
         owner: ExternTypeId,
         op: ExternOperator,
-    ) -> Option<(ExternOperatorId, &ExternOperatorDecl)> {
+    ) -> Option<(ExternOperatorRef, &ExternOperatorDecl)> {
         let ty = self.ty(owner);
         let id = ty.operators_by_op.get(&op).copied()?;
-        Some((id, &ty.operators[id.0]))
+        Some((ExternOperatorRef { owner, id }, &ty.operators[id.0]))
     }
 }
 
@@ -249,13 +268,17 @@ fn debug_assert_consistent(catalog: &ExternCatalog) {
             debug_assert_eq!(catalog.type_by_nominal(&ty.nominal), Some(*id));
             for field in &ty.fields {
                 debug_assert_eq!(
-                    catalog.field(*id, field.name).map(|(id, _)| id),
+                    catalog
+                        .field(*id, field.name)
+                        .map(|(field_ref, _)| field_ref.id),
                     Some(field.id)
                 );
             }
             for method in &ty.methods {
                 debug_assert_eq!(
-                    catalog.method(*id, method.name).map(|(id, _)| id),
+                    catalog
+                        .method(*id, method.name)
+                        .map(|(method_ref, _)| method_ref.id),
                     Some(method.id)
                 );
             }
@@ -263,7 +286,7 @@ fn debug_assert_consistent(catalog: &ExternCatalog) {
                 debug_assert_eq!(
                     catalog
                         .static_method(*id, static_method.name)
-                        .map(|(id, _)| id),
+                        .map(|(static_ref, _)| static_ref.id),
                     Some(static_method.id)
                 );
             }
@@ -277,7 +300,10 @@ fn debug_assert_consistent(catalog: &ExternCatalog) {
                         catalog.binary_operator(*id, op, self_on_right)
                     }
                 };
-                debug_assert_eq!(resolved.map(|(id, _)| id), Some(operator.id));
+                debug_assert_eq!(
+                    resolved.map(|(operator_ref, _)| operator_ref.id),
+                    Some(operator.id)
+                );
             }
         }
     }
@@ -334,7 +360,6 @@ pub(crate) struct ExternField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternInit {
-    pub(crate) params: Vec<ResolvedExternParam>,
     pub(crate) field_init: Vec<Ident>,
     pub(crate) site: RawExternSite,
 }
@@ -487,6 +512,11 @@ pub(crate) enum ExternCatalogError {
     ComputedInitField {
         context: ExternCatalogContext,
         field: Ident,
+        site: RawExternSite,
+    },
+    UnsupportedInitParams {
+        context: ExternCatalogContext,
+        count: usize,
         site: RawExternSite,
     },
     InvalidOperatorReturn {
@@ -737,12 +767,14 @@ impl<'a> CatalogBuilder<'a> {
 
         if let Some(raw_init) = &raw.init {
             let context = self.catalog.types[type_id.0].context.init();
-            let params = self.resolve_params(
-                ResolveCtx::new(scope, &context, Some(&owner), raw_init.site),
-                &raw_init.decl.params,
-            );
+            if !raw_init.decl.params.is_empty() {
+                self.errors.push(ExternCatalogError::UnsupportedInitParams {
+                    context,
+                    count: raw_init.decl.params.len(),
+                    site: raw_init.site,
+                });
+            }
             self.catalog.types[type_id.0].init = Some(ExternInit {
-                params,
                 field_init: raw_init.decl.field_init.iter().map(Ident::new).collect(),
                 site: raw_init.site,
             });
@@ -870,29 +902,28 @@ impl<'a> CatalogBuilder<'a> {
             ExternTypeExpr::String => Type::String,
             ExternTypeExpr::Any => Type::Any,
             ExternTypeExpr::List(elem) => Type::List {
-                elem: Box::new(self.resolve_nested(ctx, elem)),
+                elem: Box::new(self.resolve_ty(ctx, elem).ty),
             },
             ExternTypeExpr::Map(key, value) => Type::Map {
-                key: Box::new(self.resolve_nested(ctx, key)),
-                value: Box::new(self.resolve_nested(ctx, value)),
+                key: Box::new(self.resolve_ty(ctx, key).ty),
+                value: Box::new(self.resolve_ty(ctx, value).ty),
             },
-            ExternTypeExpr::Option(inner) => Type::option_of(self.resolve_nested(ctx, inner)),
-            ExternTypeExpr::Callback(callback) => Type::Func {
-                params: callback
+            ExternTypeExpr::Option(inner) => Type::option_of(self.resolve_ty(ctx, inner).ty),
+            ExternTypeExpr::Callback(callback) => {
+                let params = callback
                     .params
                     .iter()
                     .map(|param| FuncParam::immut(self.resolve_ty(ctx, param).ty))
-                    .collect(),
-                ret: Box::new(self.resolve_ty(ctx, &callback.ret).ty),
-            },
+                    .collect();
+                Type::Func {
+                    params,
+                    ret: Box::new(self.resolve_ty(ctx, &callback.ret).ty),
+                }
+            }
             ExternTypeExpr::Named { module, name, args } => {
                 self.resolve_named(ctx, module.as_ref(), name, args)
             }
         }
-    }
-
-    fn resolve_nested(&mut self, ctx: ResolveCtx<'_>, ty: &ExternTypeExpr) -> Type {
-        self.resolve_ty(ctx, ty).ty
     }
 
     fn resolve_named(
@@ -1067,9 +1098,6 @@ fn validate_extern_type(ty: &ExternType, errors: &mut Vec<ExternCatalogError>) {
 
 fn validate_init(ty: &ExternType, init: &ExternInit, errors: &mut Vec<ExternCatalogError>) {
     let context = ty.context.init();
-    for param in &init.params {
-        validate_ty(&context, &param.ty, TypePosition::Param, init.site, errors);
-    }
     for name in &init.field_init {
         let Some(field) = ty.fields_by_name.get(name).map(|id| &ty.fields[id.0]) else {
             errors.push(ExternCatalogError::UnknownInitField {
@@ -1408,10 +1436,6 @@ mod tests {
             id
         }
 
-        fn field_access(&mut self, owner: ExternTypeId, field: ExternFieldId, access: FieldAccess) {
-            self.catalog.types[owner.0].fields[field.0].access = access;
-        }
-
         fn field_ty(&mut self, owner: ExternTypeId, field: ExternFieldId, ty: Type) {
             self.catalog.types[owner.0].fields[field.0].ty = resolved_ty(ty);
         }
@@ -1420,7 +1444,6 @@ mod tests {
             let ty = &mut self.catalog.types[owner.0];
             assert!(ty.init.is_none());
             ty.init = Some(ExternInit {
-                params: vec![],
                 field_init,
                 site: RawExternSite::default(),
             });
@@ -1558,7 +1581,12 @@ mod tests {
     fn decls(root: &str, modules: &[(&str, &str)], raw: &RawExterns) -> DeclarationIndex {
         let root = parse(root);
         let resolved = resolved_modules(modules);
-        DeclarationIndex::from_root_and_modules(&root, &resolved, Default::default(), raw)
+        DeclarationIndex::from_root_and_modules(
+            &root,
+            &resolved,
+            std::collections::HashSet::default(),
+            raw,
+        )
     }
 
     fn extern_module(path: &[&str]) -> ExternModulePath {
@@ -1627,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_type_visitor_covers_all_boundary_positions() {
+    fn resolved_type_visitor_covers_all_member_positions() {
         let mut builder = CatalogBuilder::default();
         let module = builder.module(ModuleScope::Root);
         let function = builder.function(
@@ -1656,11 +1684,6 @@ mod tests {
         };
         catalog.types[owner.0].fields[field.0].ty = unresolved_ty("Field");
         catalog.types[owner.0].init = Some(ExternInit {
-            params: vec![ResolvedExternParam {
-                name: None,
-                ty: unresolved_ty("InitParam"),
-                flow: ParamFlow::Value,
-            }],
             field_init: vec![],
             site: RawExternSite::default(),
         });
@@ -1699,7 +1722,6 @@ mod tests {
                 "Field",
                 "FreeParam",
                 "FreeRet",
-                "InitParam",
                 "MethodParam",
                 "MethodRet",
                 "OperatorParam",
@@ -1891,8 +1913,12 @@ mod tests {
                 program: parse("pub struct Point { x: int }"),
             }]],
         };
-        let decls =
-            DeclarationIndex::from_root_and_modules(&root, &resolved, Default::default(), &raw);
+        let decls = DeclarationIndex::from_root_and_modules(
+            &root,
+            &resolved,
+            std::collections::HashSet::default(),
+            &raw,
+        );
         let errors = build_catalog(raw, &decls).unwrap_err();
 
         assert!(matches!(
@@ -1937,7 +1963,7 @@ mod tests {
 
     #[test]
     fn self_resolves_in_members() {
-        let source = "extern type Handle { next: Self; init(other: Self); fn same(self, other: Self) -> Self; fn make() -> Self; op Self + Self -> Self; op - Self -> Self; }";
+        let source = "extern type Handle { next: Self; init; fn same(self, other: Self) -> Self; fn make() -> Self; op Self + Self -> Self; op - Self -> Self; }";
         let raw = source_raw(source, &[]);
         let decls = decls(source, &[], &raw);
         let catalog = build_catalog(raw, &decls).unwrap();
@@ -1950,7 +1976,7 @@ mod tests {
             catalog.field(owner, ident("next")).unwrap().1.ty.ty,
             self_ty
         );
-        assert_eq!(catalog.init(owner).unwrap().params[0].ty.ty, self_ty);
+        assert!(catalog.init(owner).is_some());
         assert_eq!(
             catalog
                 .method(owner, ident("same"))
@@ -2047,6 +2073,18 @@ mod tests {
             .ty;
 
         assert!(param.contains_any);
+        let Type::List { elem } = &param.ty else {
+            panic!("expected list");
+        };
+        let Type::Map { value, .. } = elem.as_ref() else {
+            panic!("expected map");
+        };
+        let Type::Func { params, ret } = value.as_ref() else {
+            panic!("expected callback");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].ty, Type::Any);
+        assert_eq!(ret.as_ref(), &Type::option_of(Type::Int));
     }
 
     #[test]
@@ -2129,6 +2167,26 @@ mod tests {
             errors.first(),
             Some(ExternCatalogError::GenericArgKindMismatch { name, expected: "const", .. })
                 if *name == ident("ArrayBox")
+        ));
+    }
+
+    #[test]
+    fn init_params_fail() {
+        let source = "extern type Handle { init(x: int); }";
+        let raw = source_raw(source, &[]);
+        let decls = decls(source, &[], &raw);
+        let errors = build_catalog(raw, &decls).unwrap_err();
+
+        assert!(matches!(
+            errors.first(),
+            Some(ExternCatalogError::UnsupportedInitParams {
+                context: ExternCatalogContext {
+                    item: ExternContextItem::Init { ty, .. },
+                    ..
+                },
+                count: 1,
+                ..
+            }) if *ty == ident("Handle")
         ));
     }
 
@@ -2417,10 +2475,20 @@ mod tests {
         builder.init(ty, vec![name]);
         let catalog = builder.finish();
 
-        assert_eq!(catalog.field(ty, name).map(|(id, _)| id), Some(field));
-        assert_eq!(catalog.method(ty, name).map(|(id, _)| id), Some(method));
         assert_eq!(
-            catalog.static_method(ty, name).map(|(id, _)| id),
+            catalog.field(ty, name).map(|(field_ref, _)| field_ref.id),
+            Some(field)
+        );
+        assert_eq!(
+            catalog
+                .method(ty, name)
+                .map(|(method_ref, _)| method_ref.id),
+            Some(method)
+        );
+        assert_eq!(
+            catalog
+                .static_method(ty, name)
+                .map(|(static_ref, _)| static_ref.id),
             Some(static_method)
         );
         assert_eq!(catalog.init(ty).unwrap().field_init, vec![name]);
@@ -2454,19 +2522,21 @@ mod tests {
         let catalog = builder.finish();
 
         assert_eq!(
-            catalog.unary_operator(ty, UnaryOp::Neg).map(|(id, _)| id),
+            catalog
+                .unary_operator(ty, UnaryOp::Neg)
+                .map(|(operator_ref, _)| operator_ref.id),
             Some(unary)
         );
         assert_eq!(
             catalog
                 .binary_operator(ty, BinaryOp::Add, false)
-                .map(|(id, _)| id),
+                .map(|(operator_ref, _)| operator_ref.id),
             Some(add_left)
         );
         assert_eq!(
             catalog
                 .binary_operator(ty, BinaryOp::Add, true)
-                .map(|(id, _)| id),
+                .map(|(operator_ref, _)| operator_ref.id),
             Some(add_right)
         );
     }

@@ -474,7 +474,7 @@ mod method_calls {
         let target = result.calls().values().next().expect("missing call target");
         assert_eq!(
             target,
-            &CallTarget::Callable {
+            &CallTarget {
                 id: CallableId::aggregate_method(
                     root_key(NominalKind::Struct, owner),
                     Ident::new(name),
@@ -879,7 +879,7 @@ mod extend_calls {
         let target = result.calls().values().next().expect("missing call target");
         assert_eq!(
             target,
-            &CallTarget::Callable {
+            &CallTarget {
                 id: CallableId::extend_method(
                     ExtendId {
                         module: ModuleScope::Root,

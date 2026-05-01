@@ -3,7 +3,6 @@ use std::{
     rc::Rc,
 };
 
-pub(crate) use self::{call_map::*, decls::*, generic::*, result::*, type_ops::type_closure_facts};
 use self::{
     const_term::ConstTerm,
     generic_bind::bind_exact_generic_args,
@@ -11,29 +10,39 @@ use self::{
         GenericSolverSeeds, GenericSolverVars, LocalTypeId, Solver, SolverFinalizeError,
         SolverRelationError, TypeHandle,
     },
+    place::{PlaceAccess, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, type_contains_infer, type_contains_unresolved_ref},
     type_refs::{GenericParamError, GenericTypeContext},
+};
+pub(crate) use self::{
+    decls::*, generic::*, result::*, semantic_use::*, type_ops::type_closure_facts,
 };
 use crate::{
     ast::*,
     externs::{
         RawExterns,
-        catalog::{ExternCatalog, ExternCatalogError},
+        catalog::{
+            ExternCatalog, ExternCatalogError, ExternField, ExternFieldRef, ExternFunctionId,
+            ExternType, ExternTypeId,
+        },
     },
     resolve::{ModuleKey, ResolveResult},
     span::Span,
 };
 
-mod call_map;
 mod const_eval;
 mod const_term;
 mod decls;
+mod extern_boundary;
+mod extern_ops;
 mod generic;
 mod generic_bind;
 mod infer;
+mod place;
 mod postfix;
 mod result;
+mod semantic_use;
 mod type_ops;
 mod type_refs;
 
@@ -247,6 +256,9 @@ pub(crate) enum TypeError {
         expected: &'static str,
         span: Span,
     },
+    ExternAnyEscape {
+        span: Span,
+    },
     DuplicateGenericParam {
         name: Ident,
         span: Span,
@@ -281,6 +293,7 @@ struct CallableTemplate {
 struct TypeChecker {
     solver: Solver,
     calls: HashMap<ExprId, CallTarget>,
+    extern_uses: ExternUseMap,
     decls: DeclarationIndex,
     externs: ExternCatalog,
     scopes: Vec<HashMap<Ident, VarInfo>>,
@@ -358,6 +371,7 @@ impl TypeChecker {
         Self {
             solver: Solver::default(),
             calls: HashMap::new(),
+            extern_uses: HashMap::new(),
             decls,
             externs,
             scopes: vec![],
@@ -437,10 +451,6 @@ impl TypeChecker {
 
     fn type_handle(&self, ty: &Type) -> TypeHandle {
         self.solver.concrete_type(ty)
-    }
-
-    fn expr_handle(&self, id: ExprId) -> TypeHandle {
-        self.solver.expr_handle(id)
     }
 
     fn local_handle(&self, id: LocalTypeId) -> TypeHandle {
@@ -558,6 +568,47 @@ impl TypeChecker {
 
     fn record_call(&mut self, expr_id: ExprId, target: CallTarget) {
         self.calls.insert(expr_id, target);
+    }
+
+    fn record_extern_use(&mut self, expr_id: ExprId, target: ExternUseTarget) {
+        self.extern_uses.entry(expr_id).or_default().push(target);
+    }
+
+    fn reject_extern_any_escape(&mut self, checked: &CheckedType, span: Span) {
+        if checked.contains_extern_any {
+            self.push_error(TypeError::ExternAnyEscape { span });
+        }
+    }
+
+    fn reject_user_any_type(&mut self, ty: &Type, span: Span) -> bool {
+        if !type_closure_facts(ty).contains_any {
+            return false;
+        }
+        self.push_error(TypeError::ExternAnyEscape { span });
+        true
+    }
+
+    fn extern_type_id(&self, ty: &Type) -> Option<ExternTypeId> {
+        let key = self.decls.key_for_type(ty)?;
+        (key.kind == NominalKind::Extern)
+            .then(|| self.externs.type_by_nominal(&key))
+            .flatten()
+    }
+
+    fn extern_function_id(&self, id: &CallableId) -> Option<ExternFunctionId> {
+        self.externs.function_by_callable(id)
+    }
+
+    fn extern_type(&self, owner: ExternTypeId) -> &ExternType {
+        self.externs.ty(owner)
+    }
+
+    fn extern_field(
+        &self,
+        owner: ExternTypeId,
+        name: Ident,
+    ) -> Option<(ExternFieldRef, &ExternField)> {
+        self.externs.field(owner, name)
     }
 
     fn push_return_type(&mut self, ty: Type) {
@@ -756,7 +807,9 @@ impl TypeChecker {
             }
             None => finalized,
         };
-        self.normalize_type_consts(&substituted, span)
+        let ty = self.normalize_type_consts(&substituted, span);
+        self.reject_user_any_type(&ty, span);
+        ty
     }
 
     fn normalize_type_consts(&mut self, ty: &Type, span: Span) -> Type {
@@ -924,6 +977,7 @@ impl TypeChecker {
             Ok(TypecheckResult {
                 types,
                 calls: self.calls,
+                extern_uses: self.extern_uses,
                 decls: self.decls,
                 externs: self.externs,
                 consts: const_eval::evaluated_consts(self.consts),
@@ -1033,6 +1087,7 @@ impl TypeChecker {
             let ty = self.finalize_decl_type(&lookup, site, ty);
             let ty = self.normalize_type_consts(&ty, span);
             self.validate_nominal_uses_in(&lookup, &ty, span);
+            self.reject_user_any_type(&ty, span);
             ty
         });
         for error in generic_errors {
@@ -1470,14 +1525,13 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
         Stmt::Extend(extend_node) => {
             check_extend(extend_node, tc);
         }
+        Stmt::Aggregate(_) | Stmt::Enum(_) => {}
         Stmt::Const(const_node) => {
             if tc.scopes.len() > 1 {
                 check_const(const_node, tc);
             }
         }
         Stmt::Import(_)
-        | Stmt::Aggregate(_)
-        | Stmt::Enum(_)
         | Stmt::ExternFunc(_)
         | Stmt::ExternType(_)
         | Stmt::LetElse(_)
@@ -1595,16 +1649,15 @@ fn check_func_body(
                 span,
             });
         } else if !body_is_void {
+            tc.reject_extern_any_escape(&body_checked, span);
             let ret_handle = tc.type_handle(&ret_ty);
             tc.expect_assignable(span, body_checked.handle, ret_handle);
         }
-    } else if !body_is_void {
-        if let Some(id) = last_expr_id(body) {
-            let span = tc
-                .get_type(id)
-                .map_or_else(|| Span::new(0, 0), |(span, _)| span);
-            tc.push_error(TypeError::UnusedValue { span });
-        }
+    } else if !body_is_void && let Some(tail) = &body.node.tail {
+        let span = tc
+            .get_type(tail.node.id)
+            .map_or_else(|| Span::new(0, 0), |(span, _)| span);
+        tc.push_error(TypeError::UnusedValue { span });
     }
     tc.pop_return_type();
     tc.pop_scope();
@@ -1773,12 +1826,14 @@ fn with_source_module_scope<R>(
 struct CheckedType {
     ty: Type,
     handle: TypeHandle,
+    contains_extern_any: bool,
 }
 
 fn checked_type(ty: Type, tc: &TypeChecker) -> CheckedType {
     CheckedType {
         handle: tc.type_handle(&ty),
         ty,
+        contains_extern_any: false,
     }
 }
 
@@ -1798,11 +1853,14 @@ fn join_checked(
         return checked_void(tc);
     }
     let result = tc.fresh_temp_handle(right_span);
+    let contains_extern_any = left.contains_extern_any || right.contains_extern_any;
     tc.expect_assignable(left_span, left.handle, result.clone());
     tc.expect_assignable(right_span, right.handle, result.clone());
+    tc.solve_constraints();
     CheckedType {
         ty: tc.handle_type(&result),
         handle: result,
+        contains_extern_any,
     }
 }
 
@@ -1840,11 +1898,16 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             let annot_handle = tc.type_handle(&annot_ty);
             let value =
                 check_expr_checked_with_hint(&binding.value, Some(annot_handle.clone()), tc);
+            tc.reject_extern_any_escape(&value, binding.value.span);
             tc.expect_assignable(binding_node.span, value.handle, annot_handle);
+            record_extern_pattern_reads(&binding.pattern, &annot_ty, binding.value.node.id, tc);
             check_pattern(&binding.pattern, &annot_ty, mutable, tc);
         }
         None => {
             let value = check_expr_checked(&binding.value, tc);
+            tc.reject_extern_any_escape(&value, binding.value.span);
+            tc.reject_user_any_type(&value.ty, binding_node.span);
+            record_extern_pattern_reads(&binding.pattern, &value.ty, binding.value.node.id, tc);
             check_pattern_from_handle(&binding.pattern, value.handle, value.ty, mutable, tc);
         }
     }
@@ -1863,6 +1926,7 @@ fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
     let ty = match &c.ty {
         Some(annot) => {
             let annot_ty = tc.resolve_type_for_tc_at(annot, const_node.span);
+            tc.reject_user_any_type(&annot_ty, const_node.span);
             if annot_ty != value_ty {
                 tc.push_error(TypeError::ConstTypeMismatch {
                     expected: annot_ty.clone(),
@@ -1884,9 +1948,11 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
         if let Some(expected_ty) = tc.return_type().cloned() {
             let expected = tc.type_handle(&expected_ty);
             let actual = check_expr_checked_with_hint(expr, Some(expected.clone()), tc);
+            tc.reject_extern_any_escape(&actual, expr.span);
             tc.expect_assignable(ret_node.span, actual.handle, expected);
         } else {
-            check_expr(expr, tc);
+            let actual = check_expr_checked(expr, tc);
+            tc.reject_extern_any_escape(&actual, expr.span);
         }
     } else if let Some(expected_ty) = tc.return_type().cloned()
         && !expected_ty.is_void()
@@ -1908,13 +1974,35 @@ fn check_expr_checked(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
 
 fn checked_from_type(expr: &ExprNode, ty: Type, tc: &mut TypeChecker) -> CheckedType {
     let handle = tc.set_type(expr.node.id, ty.clone(), expr.span);
-    CheckedType { ty, handle }
+    CheckedType {
+        ty,
+        handle,
+        contains_extern_any: false,
+    }
 }
 
 fn checked_from_handle(expr: &ExprNode, handle: TypeHandle, tc: &mut TypeChecker) -> CheckedType {
     let handle = tc.set_type_from_handle(expr.node.id, expr.span, handle);
     let ty = tc.handle_type(&handle);
-    CheckedType { ty, handle }
+    CheckedType {
+        ty,
+        handle,
+        contains_extern_any: false,
+    }
+}
+
+fn checked_from_checked(
+    expr: &ExprNode,
+    checked: CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let handle = tc.set_type_from_handle(expr.node.id, expr.span, checked.handle);
+    let ty = tc.handle_type(&handle);
+    CheckedType {
+        ty,
+        handle,
+        contains_extern_any: checked.contains_extern_any,
+    }
 }
 
 fn solve_and_checked_from_handle(
@@ -1949,6 +2037,7 @@ fn check_expr_checked_with_hint(
                 CheckedType {
                     ty: Type::Infer,
                     handle,
+                    contains_extern_any: false,
                 }
             }
         },
@@ -1989,20 +2078,22 @@ fn check_expr_checked_with_hint(
                 checked_from_type(expr, ty, tc)
             }
         },
-        ExprKind::Binary(bin_node) => checked_from_type(expr, check_binary(bin_node, tc), tc),
-        ExprKind::Unary(unary_node) => checked_from_type(expr, check_unary(unary_node, tc), tc),
-        ExprKind::Block(block_node) => checked_from_handle(
+        ExprKind::Binary(bin_node) => {
+            checked_from_checked(expr, check_binary(expr.node.id, bin_node, tc), tc)
+        }
+        ExprKind::Unary(unary_node) => {
+            checked_from_checked(expr, check_unary(expr.node.id, unary_node, tc), tc)
+        }
+        ExprKind::Block(block_node) => checked_from_checked(
             expr,
-            check_block_checked_with_hint(block_node, expected, tc).handle,
+            check_block_checked_with_hint(block_node, expected, tc),
             tc,
         ),
-        ExprKind::If(if_node) => checked_from_handle(
-            expr,
-            check_if_checked_with_hint(if_node, expected, tc).handle,
-            tc,
-        ),
+        ExprKind::If(if_node) => {
+            checked_from_checked(expr, check_if_checked_with_hint(if_node, expected, tc), tc)
+        }
         ExprKind::Assign(assign_node) => {
-            check_assign(assign_node, tc);
+            check_assign(expr.node.id, assign_node, tc);
             checked_from_type(expr, Type::Void, tc)
         }
         ExprKind::StructLiteral(lit) => {
@@ -2013,11 +2104,7 @@ fn check_expr_checked_with_hint(
         }
         ExprKind::Field(_) | ExprKind::Call(_) => {
             let chain = collect_postfix_chain(expr).expect("postfix chain");
-            let ty = check_postfix_chain(&chain, expr, expected.as_ref(), tc);
-            CheckedType {
-                ty,
-                handle: tc.expr_handle(expr.node.id),
-            }
+            check_postfix_chain(&chain, expr, expected.as_ref(), tc)
         }
         ExprKind::Tuple(elems) => check_tuple_checked_with_hint(expr, elems, expected, tc),
         ExprKind::NamedTuple(fields) => {
@@ -2027,14 +2114,14 @@ fn check_expr_checked_with_hint(
             check_array_literal_checked_with_hint(expr, lit, expected, tc)
         }
         ExprKind::ArrayFill(fill) => check_array_fill_checked_with_hint(expr, fill, expected, tc),
-        ExprKind::IfLet(if_let_node) => checked_from_handle(
+        ExprKind::IfLet(if_let_node) => checked_from_checked(
             expr,
-            check_if_let_checked_with_hint(if_let_node, expected, tc).handle,
+            check_if_let_checked_with_hint(if_let_node, expected, tc),
             tc,
         ),
-        ExprKind::Match(match_node) => checked_from_handle(
+        ExprKind::Match(match_node) => checked_from_checked(
             expr,
-            check_match_checked_with_hint(match_node, expected, tc).handle,
+            check_match_checked_with_hint(match_node, expected, tc),
             tc,
         ),
         _ => checked_from_type(expr, Type::Void, tc),
@@ -2051,54 +2138,100 @@ fn type_from_lit(lit: &Lit) -> Type {
     }
 }
 
-fn check_binary(bin: &BinaryNode, tc: &mut TypeChecker) -> Type {
-    let left_ty = check_expr(&bin.node.left, tc);
-    let right_ty = check_expr(&bin.node.right, tc);
+fn check_binary(expr_id: ExprId, bin: &BinaryNode, tc: &mut TypeChecker) -> CheckedType {
+    let left = check_expr_checked(&bin.node.left, tc);
+    let right = check_expr_checked(&bin.node.right, tc);
+    check_binary_checked(
+        expr_id,
+        bin.node.op,
+        &bin.node.left,
+        left,
+        &bin.node.right,
+        right,
+        bin.span,
+        tc,
+    )
+}
+
+fn check_binary_checked(
+    expr_id: ExprId,
+    op: BinaryOp,
+    left_expr: &ExprNode,
+    left: CheckedType,
+    right_expr: &ExprNode,
+    right: CheckedType,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match builtin_binary_type(op, &left.ty, &right.ty, tc) {
+        Ok(ty) => checked_type(ty, tc),
+        Err(failure) => {
+            extern_ops::check_binary(expr_id, op, left_expr, &left, right_expr, &right, span, tc)
+                .unwrap_or_else(|| checked_type(emit_binary_failure(failure, span, tc), tc))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BinaryTypeFailure {
+    InvalidOperand {
+        op: String,
+        operand_type: Type,
+    },
+    TypeMismatch {
+        expected: Type,
+        found: Type,
+        fallback: Type,
+    },
+}
+
+fn builtin_binary_type(
+    op: BinaryOp,
+    left_ty: &Type,
+    right_ty: &Type,
+    tc: &TypeChecker,
+) -> Result<Type, BinaryTypeFailure> {
     let same = left_ty == right_ty;
-    match bin.node.op {
+    match op {
         BinaryOp::Add => {
-            let l_str = left_ty.is_str();
-            let r_str = right_ty.is_str();
-            let l_stringable = left_ty.is_stringable();
-            let r_stringable = right_ty.is_stringable();
-            let string_pair = l_str && r_str;
-            let string_lhs = l_str && r_stringable;
-            let string_rhs = r_str && l_stringable;
-            let is_string_concat = string_pair || string_lhs || string_rhs;
-            if is_string_concat {
-                return Type::String;
+            let string_pair = left_ty.is_str() && right_ty.is_str();
+            let string_lhs = left_ty.is_str() && right_ty.is_stringable();
+            let string_rhs = right_ty.is_str() && left_ty.is_stringable();
+            if string_pair || string_lhs || string_rhs {
+                return Ok(Type::String);
             }
             if left_ty.is_num() && same {
-                return left_ty;
+                return Ok(left_ty.clone());
             }
-            tc.push_error(TypeError::InvalidOperand {
-                op: "+".to_string(),
-                operand_type: right_ty,
-                span: bin.span,
-            });
-            Type::Infer
+            Err(BinaryTypeFailure::InvalidOperand {
+                op: op.to_string(),
+                operand_type: right_ty.clone(),
+            })
         }
         BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
             if left_ty.is_num() && same {
-                return left_ty;
+                return Ok(left_ty.clone());
             }
-            tc.push_error(TypeError::InvalidOperand {
-                op: format!("{}", bin.node.op),
-                operand_type: right_ty,
-                span: bin.span,
-            });
-            Type::Infer
+            Err(BinaryTypeFailure::InvalidOperand {
+                op: op.to_string(),
+                operand_type: right_ty.clone(),
+            })
         }
         BinaryOp::Eq | BinaryOp::NotEq => {
-            if same {
-                Type::Bool
+            let extern_eq = same && tc.extern_type_id(left_ty).is_some();
+            if same && !extern_eq {
+                Ok(Type::Bool)
+            } else if extern_eq {
+                Err(BinaryTypeFailure::InvalidOperand {
+                    op: op.to_string(),
+                    operand_type: right_ty.clone(),
+                })
             } else {
-                tc.push_error(TypeError::TypeMismatch {
-                    expected: left_ty,
-                    found: right_ty,
-                    span: bin.span,
-                });
-                Type::Bool
+                Err(BinaryTypeFailure::TypeMismatch {
+                    expected: left_ty.clone(),
+                    found: right_ty.clone(),
+                    fallback: Type::Bool,
+                })
             }
         }
         BinaryOp::LessThan
@@ -2106,91 +2239,126 @@ fn check_binary(bin: &BinaryNode, tc: &mut TypeChecker) -> Type {
         | BinaryOp::LessThanEq
         | BinaryOp::GreaterThanEq => {
             if left_ty.is_num() && same {
-                Type::Bool
+                Ok(Type::Bool)
             } else {
-                tc.push_error(TypeError::TypeMismatch {
-                    expected: left_ty,
-                    found: right_ty,
-                    span: bin.span,
-                });
-                Type::Bool
+                Err(BinaryTypeFailure::TypeMismatch {
+                    expected: left_ty.clone(),
+                    found: right_ty.clone(),
+                    fallback: Type::Bool,
+                })
             }
         }
         BinaryOp::And | BinaryOp::Or => {
             if left_ty.is_bool() && same {
-                Type::Bool
+                Ok(Type::Bool)
             } else {
-                tc.push_error(TypeError::TypeMismatch {
+                Err(BinaryTypeFailure::TypeMismatch {
                     expected: Type::Bool,
-                    found: left_ty,
-                    span: bin.span,
-                });
-                Type::Bool
+                    found: left_ty.clone(),
+                    fallback: Type::Bool,
+                })
             }
         }
         BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor | BinaryOp::Shl | BinaryOp::Shr => {
             if left_ty.is_int() && same {
-                Type::Int
+                Ok(Type::Int)
             } else {
-                tc.push_error(TypeError::TypeMismatch {
+                Err(BinaryTypeFailure::TypeMismatch {
                     expected: Type::Int,
-                    found: left_ty,
-                    span: bin.span,
-                });
-                Type::Int
+                    found: left_ty.clone(),
+                    fallback: Type::Int,
+                })
             }
         }
-        BinaryOp::Coalesce => {
+        BinaryOp::Coalesce => Err(BinaryTypeFailure::InvalidOperand {
+            op: op.to_string(),
+            operand_type: left_ty.clone(),
+        }),
+    }
+}
+
+fn emit_binary_failure(failure: BinaryTypeFailure, span: Span, tc: &mut TypeChecker) -> Type {
+    match failure {
+        BinaryTypeFailure::InvalidOperand { op, operand_type } => {
             tc.push_error(TypeError::InvalidOperand {
-                op: "??".to_string(),
-                operand_type: left_ty,
-                span: bin.span,
+                op,
+                operand_type,
+                span,
             });
             Type::Infer
+        }
+        BinaryTypeFailure::TypeMismatch {
+            expected,
+            found,
+            fallback,
+        } => {
+            tc.push_error(TypeError::TypeMismatch {
+                expected,
+                found,
+                span,
+            });
+            fallback
         }
     }
 }
 
-fn check_unary(unary: &UnaryNode, tc: &mut TypeChecker) -> Type {
-    let operand_ty = check_expr(&unary.node.expr, tc);
-    match unary.node.op {
+fn check_unary(expr_id: ExprId, unary: &UnaryNode, tc: &mut TypeChecker) -> CheckedType {
+    let operand = check_expr_checked(&unary.node.expr, tc);
+    match builtin_unary_type(unary.node.op, &operand.ty) {
+        Ok(ty) => checked_type(ty, tc),
+        Err(failure) => extern_ops::check_unary(expr_id, unary.node.op, &operand, tc)
+            .unwrap_or_else(|| checked_type(emit_unary_failure(failure, unary.span, tc), tc)),
+    }
+}
+
+#[derive(Debug)]
+struct UnaryTypeFailure {
+    op: String,
+    operand_type: Type,
+}
+
+fn builtin_unary_type(op: UnaryOp, operand_ty: &Type) -> Result<Type, UnaryTypeFailure> {
+    match op {
         UnaryOp::Neg => {
             if operand_ty.is_num() {
-                operand_ty
+                Ok(operand_ty.clone())
             } else {
-                tc.push_error(TypeError::InvalidOperand {
-                    op: "-".to_string(),
-                    operand_type: operand_ty,
-                    span: unary.span,
-                });
-                Type::Infer
+                Err(UnaryTypeFailure {
+                    op: op.to_string(),
+                    operand_type: operand_ty.clone(),
+                })
             }
         }
         UnaryOp::Not => {
             if operand_ty.is_bool() {
-                Type::Bool
+                Ok(Type::Bool)
             } else {
-                tc.push_error(TypeError::InvalidOperand {
-                    op: "not".to_string(),
-                    operand_type: operand_ty,
-                    span: unary.span,
-                });
-                Type::Infer
+                Err(UnaryTypeFailure {
+                    op: op.to_string(),
+                    operand_type: operand_ty.clone(),
+                })
             }
         }
         UnaryOp::BitNot => {
             if operand_ty.is_int() {
-                Type::Int
+                Ok(Type::Int)
             } else {
-                tc.push_error(TypeError::InvalidOperand {
-                    op: "~".to_string(),
-                    operand_type: operand_ty,
-                    span: unary.span,
-                });
-                Type::Infer
+                Err(UnaryTypeFailure {
+                    op: op.to_string(),
+                    operand_type: operand_ty.clone(),
+                })
             }
         }
     }
+}
+
+fn emit_unary_failure(failure: UnaryTypeFailure, span: Span, tc: &mut TypeChecker) -> Type {
+    tc.push_error(TypeError::InvalidOperand {
+        op: failure.op,
+        operand_type: failure.operand_type,
+        span,
+    });
+    Type::Infer
 }
 
 fn check_bool_condition(
@@ -2227,7 +2395,18 @@ fn check_if_checked_with_hint(
         return checked_void(tc);
     };
     let then = check_block_checked_with_hint(&if_node.node.then_block, expected.clone(), tc);
-    let else_checked = check_block_checked_with_hint(else_block, expected, tc);
+    let else_checked = check_block_checked_with_hint(else_block, expected.clone(), tc);
+    if let Some(expected) = expected {
+        let contains_extern_any = then.contains_extern_any || else_checked.contains_extern_any;
+        tc.expect_assignable(if_node.node.then_block.span, then.handle, expected.clone());
+        tc.expect_assignable(else_block.span, else_checked.handle, expected.clone());
+        tc.solve_constraints();
+        return CheckedType {
+            ty: tc.handle_type(&expected),
+            handle: expected,
+            contains_extern_any,
+        };
+    }
     join_checked(
         then,
         if_node.node.then_block.span,
@@ -2282,10 +2461,14 @@ fn check_array_literal_checked_with_hint(
         ArrayLen::Fixed(lit.node.elements.len()),
         tc,
     );
+    let mut contains_extern_any = false;
     for value in &lit.node.elements {
-        check_expected(value, elem.clone(), tc);
+        let checked = check_expected(value, elem.clone(), tc);
+        contains_extern_any |= checked.contains_extern_any;
     }
-    solve_and_checked_from_handle(expr, array, tc)
+    let mut checked = solve_and_checked_from_handle(expr, array, tc);
+    checked.contains_extern_any = contains_extern_any;
+    checked
 }
 
 fn check_array_fill_checked_with_hint(
@@ -2313,9 +2496,11 @@ fn check_array_fill_checked_with_hint(
             CollectionLiteralKind::Array,
         )
     });
-    check_expected(&fill.node.value, elem.clone(), tc);
+    let value = check_expected(&fill.node.value, elem.clone(), tc);
     let array = collection_literal_handle(kind, elem, len, tc);
-    solve_and_checked_from_handle(expr, array, tc)
+    let mut checked = solve_and_checked_from_handle(expr, array, tc);
+    checked.contains_extern_any = value.contains_extern_any;
+    checked
 }
 
 fn tuple_hints(
@@ -2341,11 +2526,15 @@ fn check_tuple_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let hints = tuple_hints(elems, expected.as_ref(), tc);
+    let mut contains_extern_any = false;
     for (elem, hint) in elems.iter().zip(&hints) {
-        check_expected(elem, hint.clone(), tc);
+        let checked = check_expected(elem, hint.clone(), tc);
+        contains_extern_any |= checked.contains_extern_any;
     }
     let tuple = tc.tuple_handle(hints);
-    solve_and_checked_from_handle(expr, tuple, tc)
+    let mut checked = solve_and_checked_from_handle(expr, tuple, tc);
+    checked.contains_extern_any = contains_extern_any;
+    checked
 }
 
 fn named_tuple_hints(
@@ -2379,8 +2568,10 @@ fn check_named_tuple_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let hints = named_tuple_hints(fields, expected.as_ref(), tc);
+    let mut contains_extern_any = false;
     for ((_, value), hint) in fields.iter().zip(&hints) {
-        check_expected(value, hint.clone(), tc);
+        let checked = check_expected(value, hint.clone(), tc);
+        contains_extern_any |= checked.contains_extern_any;
     }
     let fields = fields
         .iter()
@@ -2388,7 +2579,9 @@ fn check_named_tuple_checked_with_hint(
         .map(|((name, _), handle)| (*name, handle))
         .collect();
     let tuple = tc.named_tuple_handle(fields);
-    solve_and_checked_from_handle(expr, tuple, tc)
+    let mut checked = solve_and_checked_from_handle(expr, tuple, tc);
+    checked.contains_extern_any = contains_extern_any;
+    checked
 }
 
 struct NominalLiteralSolver {
@@ -2480,6 +2673,10 @@ fn check_struct_literal_checked_with_hint(
         return checked_from_type(expr, Type::Infer, tc);
     };
 
+    if key.kind == NominalKind::Extern {
+        return check_extern_struct_literal_checked(expr, lit, &key, expected, tc);
+    }
+
     let valid_literal_target = matches!(key.kind, NominalKind::Struct | NominalKind::DataRef);
     if !valid_literal_target {
         let kind = match key.kind {
@@ -2508,7 +2705,7 @@ fn check_struct_literal_checked_with_hint(
         return checked_from_type(expr, Type::Infer, tc);
     };
     let expected_ok = inf.bind_expected(&key, &agg.generics, expected_ty.as_ref(), lit.span, tc);
-    let fields_failed = check_nominal_fields(
+    let field_check = check_nominal_fields(
         &lit.node.fields,
         &agg.fields,
         nominal_type(&key),
@@ -2516,14 +2713,159 @@ fn check_struct_literal_checked_with_hint(
         &inf,
         tc,
     );
-    if !expected_ok || fields_failed {
+    if !expected_ok || field_check.failed {
         return checked_from_type(expr, Type::Infer, tc);
     }
     let Some(ty) = inf.finalize(&key, &agg.generics, lit.span, tc) else {
         return checked_from_type(expr, Type::Infer, tc);
     };
+    tc.reject_user_any_type(&ty, lit.span);
+    let handle = tc.type_handle(&ty);
+    let mut checked = solve_and_checked_from_handle(expr, handle, tc);
+    checked.contains_extern_any = field_check.contains_extern_any;
+    checked
+}
+
+fn check_extern_struct_literal_checked(
+    expr: &ExprNode,
+    lit: &StructLiteralNode,
+    key: &NominalKey,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let Some(owner) = tc.externs.type_by_nominal(key) else {
+        tc.push_error(TypeError::InvalidStructLiteral {
+            name: key.name,
+            kind: "extern".to_string(),
+            span: lit.span,
+        });
+        check_unknown_nominal_fields(&lit.node.fields, tc);
+        return checked_from_type(expr, Type::Infer, tc);
+    };
+
+    if !lit.node.generic_args.is_empty() {
+        tc.push_error(TypeError::GenericArity(ArityError::TypeArgs {
+            expected: 0,
+            found: lit.node.generic_args.len(),
+        }));
+        check_unknown_nominal_fields(&lit.node.fields, tc);
+        return checked_from_type(expr, Type::Infer, tc);
+    }
+
+    let Some(init) = tc.externs.init(owner).cloned() else {
+        tc.push_error(TypeError::InvalidStructLiteral {
+            name: key.name,
+            kind: "extern".to_string(),
+            span: lit.span,
+        });
+        check_unknown_nominal_fields(&lit.node.fields, tc);
+        return checked_from_type(expr, Type::Infer, tc);
+    };
+
+    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    if let Some(expected_ty) = expected_ty.as_ref()
+        && tc.decls.key_for_type(expected_ty).as_ref() == Some(key)
+    {
+        let expected = tc.type_handle(expected_ty);
+        let actual = tc.type_handle(&nominal_type(key));
+        tc.expect_equal(lit.span, actual, expected);
+    }
+
+    let fields_failed =
+        check_extern_literal_fields(&lit.node.fields, owner, &init.field_init, lit.span, tc);
+    if fields_failed {
+        return checked_from_type(expr, Type::Infer, tc);
+    }
+
+    tc.record_extern_use(expr.node.id, ExternUseTarget::Init(owner));
+    let ty = nominal_type(key);
     let handle = tc.type_handle(&ty);
     solve_and_checked_from_handle(expr, handle, tc)
+}
+
+fn check_extern_literal_fields(
+    fields: &[(Ident, ExprNode)],
+    owner: ExternTypeId,
+    explicit_init: &[Ident],
+    span: Span,
+    tc: &mut TypeChecker,
+) -> bool {
+    let owner_ty = nominal_type(&tc.extern_type(owner).nominal);
+    let mut seen = HashMap::new();
+    let mut failed = false;
+    for (name, value) in fields {
+        if seen.insert(*name, value.span).is_some() {
+            tc.push_error(TypeError::DuplicateField {
+                name: *name,
+                span: value.span,
+            });
+            failed = true;
+        }
+
+        let Some((_, field)) = tc.extern_field(owner, *name) else {
+            tc.push_error(TypeError::UnknownMember {
+                ty: owner_ty.clone(),
+                member: *name,
+                kind: MemberAccessKind::Field,
+                span: value.span,
+            });
+            check_expr_checked(value, tc);
+            failed = true;
+            continue;
+        };
+
+        let access = field.access;
+        let field_ty = field.ty.clone();
+        let allowed = if explicit_init.is_empty() {
+            !matches!(
+                access,
+                anvyx_externs::FieldAccess::ReadOnly { computed: true }
+                    | anvyx_externs::FieldAccess::ReadWrite { computed: true }
+            )
+        } else {
+            explicit_init.contains(name)
+        };
+        if !allowed {
+            tc.push_error(TypeError::ImmutableAssignment {
+                name: *name,
+                span: value.span,
+            });
+            failed = true;
+        }
+        let hint = tc.type_handle(&field_ty.ty);
+        let checked = check_expr_checked_with_hint(value, Some(hint), tc);
+        failed |= !extern_boundary::check_checked_value(value, &checked, &field_ty, tc);
+    }
+
+    for name in required_extern_literal_fields(owner, explicit_init, tc) {
+        if !seen.contains_key(&name) {
+            tc.push_error(TypeError::MissingField { name, span });
+            failed = true;
+        }
+    }
+    failed
+}
+
+fn required_extern_literal_fields(
+    owner: ExternTypeId,
+    explicit_init: &[Ident],
+    tc: &TypeChecker,
+) -> Vec<Ident> {
+    if !explicit_init.is_empty() {
+        return explicit_init.to_vec();
+    }
+    tc.extern_type(owner)
+        .fields
+        .iter()
+        .filter(|field| {
+            !matches!(
+                field.access,
+                anvyx_externs::FieldAccess::ReadOnly { computed: true }
+                    | anvyx_externs::FieldAccess::ReadWrite { computed: true }
+            )
+        })
+        .map(|field| field.name)
+        .collect()
 }
 
 fn check_inferred_enum_checked_with_hint(
@@ -2564,6 +2906,7 @@ fn check_inferred_enum_checked_with_hint(
         return checked_from_type(expr, Type::Infer, tc);
     }
 
+    let mut contains_extern_any = false;
     match (&variant, &node.node.args) {
         (VariantSchema::Unit, InferredEnumArgs::Unit) => {}
         (VariantSchema::Unit, args) => {
@@ -2582,7 +2925,8 @@ fn check_inferred_enum_checked_with_hint(
             let mut failed = false;
             for (arg, param) in args.iter().zip(params) {
                 let hint = inf.instantiate(param, tc);
-                check_expected(arg, hint, tc);
+                let checked = check_expected(arg, hint, tc);
+                contains_extern_any |= checked.contains_extern_any;
                 failed |= tc.solve_constraints();
             }
             if failed || inf.finalize(&key, &generics, node.span, tc).is_none() {
@@ -2593,9 +2937,10 @@ fn check_inferred_enum_checked_with_hint(
             return wrong_inferred_enum_args(expr, node, params.len(), args, tc);
         }
         (VariantSchema::Struct(fields), InferredEnumArgs::Struct(args)) => {
-            let fields_failed =
+            let field_check =
                 check_nominal_fields(args, fields, expected_ty.clone(), node.span, &inf, tc);
-            if fields_failed || inf.finalize(&key, &generics, node.span, tc).is_none() {
+            contains_extern_any |= field_check.contains_extern_any;
+            if field_check.failed || inf.finalize(&key, &generics, node.span, tc).is_none() {
                 return checked_from_type(expr, Type::Infer, tc);
             }
         }
@@ -2604,7 +2949,9 @@ fn check_inferred_enum_checked_with_hint(
         }
     }
 
-    solve_and_checked_from_handle(expr, expected, tc)
+    let mut checked = solve_and_checked_from_handle(expr, expected, tc);
+    checked.contains_extern_any = contains_extern_any;
+    checked
 }
 
 fn cannot_infer_inferred_enum(
@@ -2633,6 +2980,12 @@ fn wrong_inferred_enum_args(
     checked_from_type(expr, Type::Infer, tc)
 }
 
+#[derive(Default)]
+struct NominalFieldCheck {
+    failed: bool,
+    contains_extern_any: bool,
+}
+
 fn check_nominal_fields(
     fields: &[(Ident, ExprNode)],
     schema: &HashMap<Ident, FieldSchema>,
@@ -2640,9 +2993,9 @@ fn check_nominal_fields(
     span: Span,
     inf: &NominalLiteralSolver,
     tc: &mut TypeChecker,
-) -> bool {
+) -> NominalFieldCheck {
     let mut seen = HashMap::new();
-    let mut failed = false;
+    let mut check = NominalFieldCheck::default();
     for (name, value) in fields {
         if seen.insert(*name, value.span).is_some() {
             tc.push_error(TypeError::DuplicateField {
@@ -2654,8 +3007,9 @@ fn check_nominal_fields(
             Some(field) => {
                 let hint = inf.instantiate(&field.ty, tc);
                 let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
+                check.contains_extern_any |= checked.contains_extern_any;
                 tc.expect_assignable(value.span, checked.handle, hint);
-                failed |= tc.solve_constraints();
+                check.failed |= tc.solve_constraints();
             }
             None => {
                 tc.push_error(TypeError::UnknownMember {
@@ -2675,7 +3029,7 @@ fn check_nominal_fields(
             tc.push_error(TypeError::MissingField { name: *name, span });
         }
     }
-    failed
+    check
 }
 
 fn check_unknown_nominal_fields(fields: &[(Ident, ExprNode)], tc: &mut TypeChecker) {
@@ -2742,21 +3096,73 @@ fn resolve_struct_key(lit: &StructLiteralNode, tc: &mut TypeChecker) -> Option<N
     key
 }
 
-fn check_assign(assign: &AssignNode, tc: &mut TypeChecker) {
-    let target = check_expr_checked(&assign.node.target, tc);
-    let value = check_expr_checked_with_hint(&assign.node.value, Some(target.handle.clone()), tc);
-    if let ExprKind::Ident(name) = &assign.node.target.node.kind {
-        if let Some(info) = tc.lookup(*name) {
-            if !info.mutable {
-                tc.push_error(TypeError::ImmutableAssignment {
-                    name: *name,
-                    span: assign.node.target.span,
-                });
+fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
+    let target = check_place(&assign.node.target, tc);
+    if target.access != PlaceAccess::Mutable {
+        let name = assignment_target_name(&assign.node.target);
+        tc.push_error(TypeError::ImmutableAssignment {
+            name,
+            span: assign.node.target.span,
+        });
+    }
+
+    match assign_op_to_binary_op(assign.node.op) {
+        None => {
+            let value =
+                check_expr_checked_with_hint(&assign.node.value, Some(target.handle.clone()), tc);
+            if !target.accepts_extern_any() {
+                tc.reject_extern_any_escape(&value, assign.node.value.span);
             }
+            if !target.ty.is_void() && !value.ty.is_void() {
+                tc.expect_assignable(assign.node.value.span, value.handle, target.handle.clone());
+            }
+            place::record_write(assign.node.target.node.id, &target, tc);
+        }
+        Some(op) => {
+            let value = check_expr_checked(&assign.node.value, tc);
+            let target_value = CheckedType {
+                ty: target.ty.clone(),
+                handle: target.handle.clone(),
+                contains_extern_any: target.contains_extern_any,
+            };
+            let result = check_binary_checked(
+                expr_id,
+                op,
+                &assign.node.target,
+                target_value,
+                &assign.node.value,
+                value,
+                assign.span,
+                tc,
+            );
+            if !target.ty.is_void() && !result.ty.is_void() {
+                tc.expect_assignable(assign.span, result.handle, target.handle.clone());
+            }
+            place::record_compound_write(assign.node.target.node.id, &target, tc);
         }
     }
-    if !target.ty.is_void() && !value.ty.is_void() {
-        tc.expect_assignable(assign.node.value.span, value.handle, target.handle);
+}
+
+fn assignment_target_name(expr: &ExprNode) -> Ident {
+    match &expr.node.kind {
+        ExprKind::Ident(name) => *name,
+        ExprKind::Field(field) => field.node.field,
+        _ => Ident::new("<target>"),
+    }
+}
+
+fn assign_op_to_binary_op(op: AssignOp) -> Option<BinaryOp> {
+    match op {
+        AssignOp::Assign => None,
+        AssignOp::AddAssign => Some(BinaryOp::Add),
+        AssignOp::SubAssign => Some(BinaryOp::Sub),
+        AssignOp::MulAssign => Some(BinaryOp::Mul),
+        AssignOp::DivAssign => Some(BinaryOp::Div),
+        AssignOp::XorAssign => Some(BinaryOp::Xor),
+        AssignOp::BitAndAssign => Some(BinaryOp::BitAnd),
+        AssignOp::BitOrAssign => Some(BinaryOp::BitOr),
+        AssignOp::ShlAssign => Some(BinaryOp::Shl),
+        AssignOp::ShrAssign => Some(BinaryOp::Shr),
     }
 }
 
@@ -2957,8 +3363,10 @@ fn check_pattern(pattern: &PatternNode, expected: &Type, mutable: bool, tc: &mut
                 span: pattern.span,
             });
         }
-        Pattern::Struct { .. }
-        | Pattern::EnumUnit { .. }
+        Pattern::Struct { name, fields } => {
+            check_struct_pattern(*name, fields, pattern.span, expected, mutable, tc);
+        }
+        Pattern::EnumUnit { .. }
         | Pattern::EnumTuple { .. }
         | Pattern::EnumStruct { .. }
         | Pattern::InferredEnumUnit { .. }
@@ -2972,9 +3380,163 @@ fn check_pattern(pattern: &PatternNode, expected: &Type, mutable: bool, tc: &mut
     }
 }
 
+fn check_struct_pattern(
+    name: Ident,
+    fields: &[(Ident, PatternNode)],
+    span: Span,
+    expected: &Type,
+    mutable: bool,
+    tc: &mut TypeChecker,
+) {
+    let Some(key) = tc.resolve_visible_type_key(None, name) else {
+        tc.push_error(TypeError::UnknownType {
+            qualifier: None,
+            name,
+            span,
+        });
+        for (_, field) in fields {
+            check_pattern(field, &Type::Infer, mutable, tc);
+        }
+        return;
+    };
+
+    let expected_key = tc.decls.key_for_type(expected);
+    if expected_key.as_ref() != Some(&key) && !matches!(expected, Type::Infer) {
+        tc.push_error(TypeError::TypeMismatch {
+            expected: nominal_type(&key),
+            found: expected.clone(),
+            span,
+        });
+        return;
+    }
+
+    match key.kind {
+        NominalKind::Struct | NominalKind::DataRef => {
+            let Some(agg) = tc.decls.aggregate(&key).cloned() else {
+                return;
+            };
+            let field_tys = agg
+                .fields
+                .iter()
+                .map(|(name, field)| (*name, field.ty.clone()))
+                .collect();
+            check_struct_field_patterns(fields, nominal_type(&key), &field_tys, mutable, tc);
+        }
+        NominalKind::Extern => {
+            let Some(owner) = tc.externs.type_by_nominal(&key) else {
+                return;
+            };
+            let field_tys = tc
+                .extern_type(owner)
+                .fields
+                .iter()
+                .map(|field| (field.name, field.ty.ty.clone()))
+                .collect();
+            check_struct_field_patterns(fields, nominal_type(&key), &field_tys, mutable, tc);
+        }
+        NominalKind::Enum => {
+            tc.push_error(TypeError::UnsupportedPattern {
+                pattern: "Struct",
+                span,
+            });
+        }
+    }
+}
+
+fn check_struct_field_patterns(
+    fields: &[(Ident, PatternNode)],
+    owner_ty: Type,
+    field_tys: &HashMap<Ident, Type>,
+    mutable: bool,
+    tc: &mut TypeChecker,
+) {
+    let mut seen = HashSet::new();
+    for (name, pattern) in fields {
+        if !seen.insert(*name) {
+            tc.push_error(TypeError::DuplicateField {
+                name: *name,
+                span: pattern.span,
+            });
+            continue;
+        }
+        match field_tys.get(name) {
+            Some(ty) => check_pattern(pattern, ty, mutable, tc),
+            None => tc.push_error(TypeError::UnknownMember {
+                ty: owner_ty.clone(),
+                member: *name,
+                kind: MemberAccessKind::Field,
+                span: pattern.span,
+            }),
+        }
+    }
+}
+
+fn record_extern_pattern_reads(
+    pattern: &PatternNode,
+    expected: &Type,
+    site: ExprId,
+    tc: &mut TypeChecker,
+) {
+    match &pattern.node {
+        Pattern::Struct { fields, .. } => {
+            let Some(owner) = tc.extern_type_id(expected) else {
+                return;
+            };
+            for (name, subpattern) in fields {
+                let Some((field, decl)) = tc
+                    .extern_field(owner, *name)
+                    .map(|(id, decl)| (id, decl.clone()))
+                else {
+                    continue;
+                };
+                tc.record_extern_use(site, ExternUseTarget::FieldRead(field));
+                if decl.ty.contains_any {
+                    tc.push_error(TypeError::ExternAnyEscape {
+                        span: subpattern.span,
+                    });
+                }
+                record_extern_pattern_reads(subpattern, &decl.ty.ty, site, tc);
+            }
+        }
+        Pattern::Tuple(elems) => {
+            if let Type::Tuple(tys) = expected {
+                for (elem, ty) in elems.iter().zip(tys) {
+                    record_extern_pattern_reads(elem, ty, site, tc);
+                }
+            }
+        }
+        Pattern::NamedTuple(fields) => {
+            if let Type::NamedTuple(tys) = expected {
+                for ((_, pattern), (_, ty)) in fields.iter().zip(tys) {
+                    record_extern_pattern_reads(pattern, ty, site, tc);
+                }
+            }
+        }
+        Pattern::Optional(inner) => {
+            let inner_ty = expected.option_inner().unwrap_or(&Type::Infer);
+            record_extern_pattern_reads(inner, inner_ty, site, tc);
+        }
+        Pattern::Ident(_)
+        | Pattern::Wildcard
+        | Pattern::VarIdent(_)
+        | Pattern::Lit(_)
+        | Pattern::Nil
+        | Pattern::Range { .. }
+        | Pattern::Or(_)
+        | Pattern::Rest
+        | Pattern::EnumUnit { .. }
+        | Pattern::EnumTuple { .. }
+        | Pattern::EnumStruct { .. }
+        | Pattern::InferredEnumUnit { .. }
+        | Pattern::InferredEnumTuple { .. }
+        | Pattern::InferredEnumStruct { .. } => {}
+    }
+}
+
 fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
     let node = &while_let_node.node;
     let value_ty = check_expr(&node.value, tc);
+    record_extern_pattern_reads(&node.pattern, &value_ty, node.value.node.id, tc);
     tc.push_scope();
     check_pattern(&node.pattern, &value_ty, false, tc);
     tc.enter_loop();
@@ -2990,6 +3552,7 @@ fn check_if_let_checked_with_hint(
 ) -> CheckedType {
     let node = &if_let_node.node;
     let value = check_expr_checked(&node.value, tc);
+    record_extern_pattern_reads(&node.pattern, &value.ty, node.value.node.id, tc);
     tc.push_scope();
     check_pattern_from_handle(&node.pattern, value.handle, value.ty, false, tc);
     let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
@@ -3023,6 +3586,7 @@ fn check_match_checked_with_hint(
     let mut arms = Vec::with_capacity(node.arms.len());
     for arm in &node.arms {
         tc.push_scope();
+        record_extern_pattern_reads(&arm.node.pattern, &scrutinee.ty, node.scrutinee.node.id, tc);
         check_pattern_from_handle(
             &arm.node.pattern,
             scrutinee.handle.clone(),
@@ -3038,6 +3602,9 @@ fn check_match_checked_with_hint(
         return checked_void(tc);
     }
     let result = tc.fresh_temp_handle(arms[0].0);
+    let contains_extern_any = arms
+        .iter()
+        .any(|(_, arm)| !arm.ty.is_void() && arm.contains_extern_any);
     for (span, arm) in arms {
         if !arm.ty.is_void() {
             tc.expect_assignable(span, arm.handle, result.clone());
@@ -3046,6 +3613,7 @@ fn check_match_checked_with_hint(
     CheckedType {
         ty: tc.handle_type(&result),
         handle: result,
+        contains_extern_any,
     }
 }
 
@@ -3066,19 +3634,15 @@ pub(crate) struct CallTargetClosureFacts {
 
 pub(crate) fn call_target_closure_facts(target: &CallTarget) -> CallTargetClosureFacts {
     let mut facts = CallTargetClosureFacts::default();
-    match target {
-        CallTarget::Callable { args, .. } => {
-            for ty in &args.type_args {
-                let ty_facts = type_closure_facts(ty);
-                facts.contains_infer |= type_contains_infer(ty);
-                facts.contains_unresolved_ref |= type_contains_unresolved_ref(ty);
-                facts.contains_unresolved_const |= ty_facts.contains_unresolved_const;
-            }
-            for arg in &args.const_args {
-                facts.contains_infer |= const_term_contains_infer(arg);
-                facts.contains_unresolved_const |= matches!(arg, ConstTerm::Name(_));
-            }
-        }
+    for ty in &target.args.type_args {
+        let ty_facts = type_closure_facts(ty);
+        facts.contains_infer |= type_contains_infer(ty);
+        facts.contains_unresolved_ref |= type_contains_unresolved_ref(ty);
+        facts.contains_unresolved_const |= ty_facts.contains_unresolved_const;
+    }
+    for arg in &target.args.const_args {
+        facts.contains_infer |= const_term_contains_infer(arg);
+        facts.contains_unresolved_const |= matches!(arg, ConstTerm::Name(_));
     }
     facts
 }
@@ -3096,24 +3660,18 @@ fn push_extern_ty_closure_error(
 }
 
 fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarget, span: Span) {
-    let const_infer = match target {
-        CallTarget::Callable { args, .. } => args.const_args.iter().any(const_term_contains_infer),
-    };
+    let const_infer = target.args.const_args.iter().any(const_term_contains_infer);
     if !call_target_contains_infer(target)
         && !call_target_contains_unresolved_ref(target)
         && !const_infer
     {
         return;
     }
-    match target {
-        CallTarget::Callable { args, .. } => {
-            for ty in &args.type_args {
-                push_type_closure_error(errors, ty, span);
-            }
-            if const_infer {
-                errors.push(TypeError::CannotInferConst { span });
-            }
-        }
+    for ty in &target.args.type_args {
+        push_type_closure_error(errors, ty, span);
+    }
+    if const_infer {
+        errors.push(TypeError::CannotInferConst { span });
     }
 }
 
@@ -3134,8 +3692,4 @@ fn push_type_closure_error(errors: &mut Vec<TypeError>, ty: &Type, span: Span) {
 
 fn const_term_contains_infer(term: &ConstTerm) -> bool {
     matches!(term, ConstTerm::ArrayInfer | ConstTerm::Infer(_))
-}
-
-fn last_expr_id(block: &BlockNode) -> Option<ExprId> {
-    block.node.tail.as_ref().map(|e| e.node.id)
 }
