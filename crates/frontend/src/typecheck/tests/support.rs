@@ -27,6 +27,10 @@ pub(crate) fn assert_typecheck_closed(result: &typecheck::TypecheckResult) {
             !facts.contains_unresolved_const,
             "call target contains unresolved const: {target:?}"
         );
+        assert!(
+            !facts.contains_const_infer,
+            "call target contains inferred const: {target:?}"
+        );
     }
     result.externs().for_each_resolved_ty(|ty, _| {
         assert_closed_type(&ty.ty, "extern");

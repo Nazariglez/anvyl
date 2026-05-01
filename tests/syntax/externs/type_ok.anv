@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: success
+// @frontend: new
 
 extern type Sprite;
 extern fn create_sprite(path: string) -> Sprite;

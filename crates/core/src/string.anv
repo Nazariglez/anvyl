@@ -9,8 +9,8 @@ pub extend string {
     fn trim(self) -> string { str_trim(self) }
     fn trim_start(self) -> string { str_trim_start(self) }
     fn trim_end(self) -> string { str_trim_end(self) }
-    fn substring(self, start: int, len: int) -> Option<string> { str_substring(self, start, len) }
-    fn char_at(self, index: int) -> Option<string> { str_char_at(self, index) }
+    fn substring(self, start: int, len: int) -> string? { str_substring(self, start, len) }
+    fn char_at(self, index: int) -> string? { str_char_at(self, index) }
     fn split(self, sep: string) -> [string] { str_split(self, sep) }
     fn replace(self, from: string, to: string) -> string { str_replace(self, from, to) }
     fn is_empty(self) -> bool { self.len() == 0 }

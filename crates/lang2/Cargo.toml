@@ -6,5 +6,8 @@ edition.workspace = true
 [dependencies]
 anvyx-frontend = { path = "../frontend" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

@@ -1,11 +1,13 @@
 // @mode: check
 // @expect: success
+// @frontend: new
 
 extern type Vec2 {
     x: float;
     y: float;
     init;
     op Self == Self -> bool;
+    op Self != Self -> bool;
 }
 
 fn main() {

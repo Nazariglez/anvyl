@@ -444,7 +444,7 @@ mod tests {
     fn duplicate_raw_extern_identities_are_extern_errors() {
         assert_eq!(
             extern_messages("extern fn f() -> void; extern fn f() -> void;"),
-            ["duplicate extern function '<root>.f' declared in source root and source root"]
+            ["duplicate extern function 'f' declared in source root and source root"]
         );
     }
 
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(
             extern_messages("extern type T { op Self + int -> void; }"),
             [
-                "invalid extern descriptor from source root: invalid operator '+' on extern type '<root>.T': expected non-void return type, found 'void'"
+                "invalid extern descriptor from source root: invalid operator '+' on extern type 'T': expected non-void return type, found 'void'"
             ]
         );
     }

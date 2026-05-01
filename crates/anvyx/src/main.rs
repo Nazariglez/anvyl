@@ -2,6 +2,7 @@ mod build;
 mod check;
 mod clean;
 mod fmt;
+mod frontend_sources;
 mod init;
 mod manifest;
 mod progress;
@@ -182,12 +183,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let path = resolve_entry(file, manifest.as_ref())?;
 
             if new_frontend {
-                check::reject_unsupported_new_frontend_inputs(
-                    manifest.as_ref(),
-                    &lint,
-                    &feature,
-                    &cfg,
-                )?;
+                check::reject_new_frontend_inputs(manifest.as_ref(), &lint, &feature, &cfg)?;
                 progress::status("Checking", &format!("{}...", path.display()));
                 check::new_frontend_cmd(&path)?;
                 progress::status(

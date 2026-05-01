@@ -1,15 +1,9 @@
 use super::ids::*;
 pub use crate::ast::{BinaryOp, UnaryOp};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TypeArena {
     data: Vec<TypeData>,
-}
-
-impl Default for TypeArena {
-    fn default() -> Self {
-        Self { data: Vec::new() }
-    }
 }
 
 impl TypeArena {
@@ -40,7 +34,6 @@ impl TypeArena {
 pub enum TypeData {
     Int,
     Float,
-    Double,
     Bool,
     String,
     Void,
@@ -107,8 +100,7 @@ pub struct ConstData {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
     Int(i64),
-    Float(f32),
-    Double(f64),
+    Float(f64),
     Bool(bool),
     String(Box<str>),
     Nil,

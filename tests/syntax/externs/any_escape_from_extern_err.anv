@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
-// @skip: todo -> any_type_escape
-// @contains: cannot escape into ordinary user values
+// @frontend: new
+// @contains: extern 'any' value cannot escape an extern boundary
 
 extern fn identity(v: any) -> any;
 

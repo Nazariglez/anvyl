@@ -541,7 +541,7 @@ struct FinalizeCx<'a> {
     seen_consts: &'a mut HashSet<ConstInferVarId>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct Solver {
     next_type_var: u32,
     next_const_var: u32,
@@ -751,6 +751,17 @@ impl Solver {
 
     pub(super) fn add_handle_assignable(&mut self, span: Span, from: TypeHandle, to: TypeHandle) {
         self.add_assignable(span, from.0, to.0);
+    }
+
+    pub(super) fn type_assignable(&self, span: Span, from: &Type, to: &Type) -> bool {
+        let mut probe = self.clone();
+        probe
+            .constrain_tys_assignable(
+                span,
+                Ty::from_recovery_type(from),
+                Ty::from_recovery_type(to),
+            )
+            .is_ok()
     }
 
     pub(super) fn solve_pending(&mut self) -> Vec<SolverRelationError> {

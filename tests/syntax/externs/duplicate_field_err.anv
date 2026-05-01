@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate extern field 'Handle.id'
+
+extern type Handle {
+    id: int;
+    id: int;
+}
+
+fn main() {}

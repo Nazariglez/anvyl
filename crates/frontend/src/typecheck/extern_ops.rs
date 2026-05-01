@@ -21,7 +21,7 @@ pub(super) fn check_unary(
     Some(CheckedType {
         ty: ret.ty.clone(),
         handle: tc.type_handle(&ret.ty),
-        contains_extern_any: ret.contains_any,
+        contains_extern_any: ret.contains_any(),
     })
 }
 
@@ -49,6 +49,8 @@ pub(super) fn check_binary(
             right,
             &decl.signature.params[0].ty,
             &decl.signature.ret,
+            span,
+            tc,
             &mut rejected,
         ) {
             candidates.push(candidate);
@@ -65,6 +67,8 @@ pub(super) fn check_binary(
             left,
             &decl.signature.params[0].ty,
             &decl.signature.ret,
+            span,
+            tc,
             &mut rejected,
         ) {
             candidates.push(candidate);
@@ -88,9 +92,11 @@ fn binary_candidate<'a>(
     other: &'a CheckedType,
     param: &ResolvedExternTy,
     ret: &ResolvedExternTy,
+    span: Span,
+    tc: &TypeChecker,
     rejected: &mut Option<Type>,
 ) -> Option<BinaryCandidate<'a>> {
-    if !extern_boundary::type_fits_boundary(&other.ty, param) {
+    if !extern_boundary::type_fits_boundary(&other.ty, param, span, tc) {
         rejected.get_or_insert_with(|| other.ty.clone());
         return None;
     }
@@ -136,7 +142,7 @@ fn apply_binary_candidate(
     CheckedType {
         ty: candidate.ret.ty.clone(),
         handle: tc.type_handle(&candidate.ret.ty),
-        contains_extern_any: candidate.ret.contains_any,
+        contains_extern_any: candidate.ret.contains_any(),
     }
 }
 

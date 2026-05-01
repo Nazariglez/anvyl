@@ -4,9 +4,11 @@ use super::support::{
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
+    span::Span,
     typecheck::{
         ArityError, CallTarget, CallableId, ConstDiagnostic, GenericArgs, ModuleScope, TypeError,
-        const_term::ConstTerm,
+        call_target_closure_facts,
+        const_term::{ConstInferVarId, ConstTerm},
     },
 };
 
@@ -346,6 +348,39 @@ fn generic_const_unknown_name_arg_err() {
         "fn take<T, N: int>(xs: [T; N]) {} fn main(xs: [int; 3]) { take<int, N>(xs); }",
         |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("N")),
     );
+}
+
+#[test]
+fn call_target_facts_distinguish_const_infer() {
+    let facts = call_target_closure_facts(&CallTarget {
+        id: CallableId::function(ModuleScope::Root, Ident::new("take")),
+        args: GenericArgs {
+            type_args: vec![],
+            const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
+        },
+    });
+
+    assert!(!facts.contains_infer);
+    assert!(!facts.contains_unresolved_ref);
+    assert!(!facts.contains_unresolved_const);
+    assert!(facts.contains_const_infer);
+}
+
+#[test]
+fn call_target_const_infer_error() {
+    let target = CallTarget {
+        id: CallableId::function(ModuleScope::Root, Ident::new("take")),
+        args: GenericArgs {
+            type_args: vec![],
+            const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
+        },
+    };
+    let span = Span::new(1, 2);
+    let mut errors = vec![];
+
+    super::super::push_call_target_closure_error(&mut errors, &target, span);
+
+    assert_eq!(errors, vec![TypeError::CannotInferConst { span }]);
 }
 
 #[test]

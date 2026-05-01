@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate extern operator 'Vec2.+'
+
+extern type Vec2 {
+    op Self + Self -> Self;
+    op Self + Self -> Self;
+}
+
+fn main() {}

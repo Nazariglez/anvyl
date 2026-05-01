@@ -87,49 +87,17 @@ fn source_root(file: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::Path,
-        sync::atomic::{AtomicU64, Ordering},
-    };
-
     use anvyx_frontend::pipeline::CheckError as FrontendCheckError;
 
     use super::*;
 
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("anvyx-lang2-check-{}-{id}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self { path }
+    fn write(dir: &tempfile::TempDir, relative: &str, code: &str) -> PathBuf {
+        let file = dir.path().join(relative);
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).unwrap();
         }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-
-        fn write(&self, relative: &str, code: &str) -> PathBuf {
-            let file = self.path.join(relative);
-            if let Some(parent) = file.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(&file, code).unwrap();
-            file
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
+        fs::write(&file, code).unwrap();
+        file
     }
 
     fn path(segments: &[&str]) -> Vec<String> {
@@ -171,243 +139,267 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_file_input_rejects_empty_file_path() {
-        let error = CheckFileInput::new(PathBuf::new(), SourceBundle::empty()).unwrap_err();
+    mod input {
+        use super::*;
 
-        assert!(matches!(
-            error,
-            CheckError::InvalidInput(message)
-                if message.contains("main source path must not be empty")
-        ));
+        #[test]
+        fn rejects_empty_path() {
+            let error = CheckFileInput::new(PathBuf::new(), SourceBundle::empty()).unwrap_err();
+
+            assert!(matches!(
+                error,
+                CheckError::InvalidInput(message)
+                    if message.contains("main source path must not be empty")
+            ));
+        }
     }
 
-    #[test]
-    fn check_file_reads_main_file() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "fn main() {}");
+    mod file {
+        use super::*;
 
-        check_file(empty_input(main)).unwrap();
-    }
+        #[test]
+        fn reads_main() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "fn main() {}");
 
-    #[test]
-    fn check_file_reports_read_main_error() {
-        let temp = TempDir::new();
-        let missing = temp.path().join("missing.anv");
-        let error = unwrap_error(check_file(empty_input(missing.clone())));
+            check_file(empty_input(main)).unwrap();
+        }
 
-        assert!(matches!(
-            error,
-            CheckError::ReadMain { path, message } if path == missing && !message.is_empty()
-        ));
-    }
+        #[test]
+        fn reports_read_main_error() {
+            let temp = tempfile::tempdir().unwrap();
+            let missing = temp.path().join("missing.anv");
+            let error = unwrap_error(check_file(empty_input(missing.clone())));
 
-    #[test]
-    fn check_file_preserves_main_label_in_frontend_errors() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "fn main( {}");
-        let error = unwrap_error(check_file(empty_input(main.clone())));
+            assert!(matches!(
+                error,
+                CheckError::ReadMain { path, message } if path == missing && !message.is_empty()
+            ));
+        }
 
-        assert!(matches!(
-            error,
-            CheckError::Frontend(FrontendCheckError::Parse { label, .. })
-                if label == main.display().to_string()
-        ));
-    }
+        #[test]
+        fn preserves_main_label() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "fn main( {}");
+            let error = unwrap_error(check_file(empty_input(main.clone())));
 
-    #[test]
-    fn check_file_uses_core_prelude() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "fn main() { let x: int = prelude_value(); }");
-        let prelude = SourceText::new("fn prelude_value() -> int { 1 }", "<core>").unwrap();
-        let sources = bundle(Some(prelude), vec![], vec![], vec![]);
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Parse { label, .. })
+                    if label == main.display().to_string()
+            ));
+        }
 
-        check_file(input(main, sources)).unwrap();
-    }
+        #[test]
+        fn uses_core_prelude() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "fn main() { let x: int = prelude_value(); }",
+            );
+            let prelude = SourceText::new("fn prelude_value() -> int { 1 }", "<core>").unwrap();
+            let sources = bundle(Some(prelude), vec![], vec![], vec![]);
 
-    #[test]
-    fn check_file_preloads_core_modules_as_named_roots() {
-        let temp = TempDir::new();
-        let main = temp.write(
-            "main.anv",
-            "import core_helpers { value }; fn main() { let x: int = value(); }",
-        );
-        let sources = bundle(
-            None,
-            vec![core_module("core_helpers", "pub fn value() -> int { 1 }")],
-            vec![],
-            vec![],
-        );
+            check_file(input(main, sources)).unwrap();
+        }
 
-        check_file(input(main, sources)).unwrap();
-    }
+        #[test]
+        fn preloads_core_roots() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import core_helpers { value }; fn main() { let x: int = value(); }",
+            );
+            let sources = bundle(
+                None,
+                vec![core_module("core_helpers", "pub fn value() -> int { 1 }")],
+                vec![],
+                vec![],
+            );
 
-    #[test]
-    fn check_file_imports_sibling_module() {
-        let temp = TempDir::new();
-        let main = temp.write(
-            "main.anv",
-            "import helper { value }; fn main() { let x: int = value(); }",
-        );
-        temp.write("helper.anv", "pub fn value() -> int { 1 }");
+            check_file(input(main, sources)).unwrap();
+        }
 
-        check_file(empty_input(main)).unwrap();
-    }
+        #[test]
+        fn imports_sibling() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import helper { value }; fn main() { let x: int = value(); }",
+            );
+            write(&temp, "helper.anv", "pub fn value() -> int { 1 }");
 
-    #[test]
-    fn check_file_imports_nested_module() {
-        let temp = TempDir::new();
-        let main = temp.write(
-            "main.anv",
-            "import foo.bar { value }; fn main() { let x: int = value(); }",
-        );
-        temp.write("foo/bar.anv", "pub fn value() -> int { 2 }");
+            check_file(empty_input(main)).unwrap();
+        }
 
-        check_file(empty_input(main)).unwrap();
-    }
+        #[test]
+        fn imports_nested() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import foo.bar { value }; fn main() { let x: int = value(); }",
+            );
+            write(&temp, "foo/bar.anv", "pub fn value() -> int { 2 }");
 
-    #[test]
-    fn check_file_imports_std_module_from_source_bundle() {
-        let temp = TempDir::new();
-        let main = temp.write(
-            "main.anv",
-            "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
-        );
-        let sources = bundle(
-            None,
-            vec![],
-            vec![std_module(
-                &["std", "math"],
-                "pub fn sqrt(x: float) -> float { x }",
-                "<std.math>",
-            )],
-            vec![],
-        );
+            check_file(empty_input(main)).unwrap();
+        }
 
-        check_file(input(main, sources)).unwrap();
-    }
+        #[test]
+        fn imports_std_bundle() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
+            );
+            let sources = bundle(
+                None,
+                vec![],
+                vec![std_module(
+                    &["std", "math"],
+                    "pub fn sqrt(x: float) -> float { x }",
+                    "<std.math>",
+                )],
+                vec![],
+            );
 
-    #[test]
-    fn check_file_std_bundle_overrides_local_std_file() {
-        let temp = TempDir::new();
-        let main = temp.write(
-            "main.anv",
-            "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
-        );
-        temp.write("std/math.anv", "fn nope( {}");
-        let sources = bundle(
-            None,
-            vec![],
-            vec![std_module(
-                &["std", "math"],
-                "pub fn sqrt(x: float) -> float { x }",
-                "<std.math>",
-            )],
-            vec![],
-        );
+            check_file(input(main, sources)).unwrap();
+        }
 
-        check_file(input(main, sources)).unwrap();
-    }
+        #[test]
+        fn std_bundle_wins() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
+            );
+            write(&temp, "std/math.anv", "fn nope( {}");
+            let sources = bundle(
+                None,
+                vec![],
+                vec![std_module(
+                    &["std", "math"],
+                    "pub fn sqrt(x: float) -> float { x }",
+                    "<std.math>",
+                )],
+                vec![],
+            );
 
-    #[test]
-    fn check_file_unknown_std_module_does_not_use_local_std_file() {
-        let temp = TempDir::new();
-        let main = temp.write(
-            "main.anv",
-            "import std.missing { value }; fn main() { let x: int = value(); }",
-        );
-        temp.write("std/missing.anv", "pub fn value() -> int { 1 }");
-        let error = unwrap_error(check_file(empty_input(main)));
+            check_file(input(main, sources)).unwrap();
+        }
 
-        assert!(matches!(
-            error,
-            CheckError::Frontend(FrontendCheckError::Resolve { .. })
-        ));
-    }
+        #[test]
+        fn unknown_std_ignores_local_file() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import std.missing { value }; fn main() { let x: int = value(); }",
+            );
+            write(&temp, "std/missing.anv", "pub fn value() -> int { 1 }");
+            let error = unwrap_error(check_file(empty_input(main)));
 
-    #[test]
-    fn check_file_missing_local_import_is_frontend_resolve_error() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "import missing; fn main() {}");
-        let error = unwrap_error(check_file(empty_input(main)));
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Resolve { .. })
+            ));
+        }
 
-        assert!(matches!(
-            error,
-            CheckError::Frontend(FrontendCheckError::Resolve { .. })
-        ));
-    }
+        #[test]
+        fn missing_import_is_resolve_error() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "import missing; fn main() {}");
+            let error = unwrap_error(check_file(empty_input(main)));
 
-    #[test]
-    fn check_file_module_read_error_stays_lang2_error() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "import bad; fn main() {}");
-        let bad = temp.path().join("bad.anv");
-        fs::create_dir_all(&bad).unwrap();
-        let error = unwrap_error(check_file(empty_input(main)));
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Resolve { .. })
+            ));
+        }
 
-        assert!(matches!(
-            error,
-            CheckError::ReadModule { path, message } if path == bad && !message.is_empty()
-        ));
-    }
+        #[test]
+        fn module_read_error_stays_lang2() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "import bad; fn main() {}");
+            let bad = temp.path().join("bad.anv");
+            fs::create_dir_all(&bad).unwrap();
+            let error = unwrap_error(check_file(empty_input(main)));
 
-    #[test]
-    fn check_file_loaded_module_parse_error_keeps_parse_phase_and_file_label() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "import broken; fn main() {}");
-        let broken = temp.write("broken.anv", "fn nope( {}");
-        let error = unwrap_error(check_file(empty_input(main)));
+            assert!(matches!(
+                error,
+                CheckError::ReadModule { path, message } if path == bad && !message.is_empty()
+            ));
+        }
 
-        assert!(matches!(
-            error,
-            CheckError::Frontend(FrontendCheckError::Parse { label, .. })
-                if label == broken.display().to_string()
-        ));
-    }
+        #[test]
+        fn loaded_parse_label() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "import broken; fn main() {}");
+            let broken = write(&temp, "broken.anv", "fn nope( {}");
+            let error = unwrap_error(check_file(empty_input(main)));
 
-    #[test]
-    fn check_file_loaded_module_lex_error_keeps_lex_phase_and_file_label() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "import broken; fn main() {}");
-        let broken = temp.write("broken.anv", "fn main() { \"unterminated }");
-        let error = unwrap_error(check_file(empty_input(main)));
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Parse { label, .. })
+                    if label == broken.display().to_string()
+            ));
+        }
 
-        assert!(matches!(
-            error,
-            CheckError::Frontend(FrontendCheckError::Lex { label, .. })
-                if label == broken.display().to_string()
-        ));
-    }
+        #[test]
+        fn loaded_lex_label() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "import broken; fn main() {}");
+            let broken = write(&temp, "broken.anv", "fn main() { \"unterminated }");
+            let error = unwrap_error(check_file(empty_input(main)));
 
-    #[test]
-    fn check_file_loads_helper_like_files_as_normal_source() {
-        let temp = TempDir::new();
-        let main = temp.write(
-            "main.anv",
-            "import helper { value }; fn main() { let x: int = value(); }",
-        );
-        temp.write(
-            "helper.anv",
-            "// @mode: run\n// @expect_stdout: ignored by lang2\npub fn value() -> int { 1 }",
-        );
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Lex { label, .. })
+                    if label == broken.display().to_string()
+            ));
+        }
 
-        check_file(empty_input(main)).unwrap();
-    }
+        #[test]
+        fn helper_directives_are_source() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import helper { value }; fn main() { let x: int = value(); }",
+            );
+            write(
+                &temp,
+                "helper.anv",
+                "// @mode: run\n// @expect_stdout: ignored by lang2\npub fn value() -> int { 1 }",
+            );
 
-    #[test]
-    fn check_file_always_active_core_extend_is_visible_without_import() {
-        let temp = TempDir::new();
-        let main = temp.write("main.anv", "fn main() { let x: int = 1.plus_one(); }");
-        let sources = bundle(
-            None,
-            vec![core_module(
-                "core_int",
-                "pub extend int { fn plus_one(self) -> int { self + 1 } }",
-            )],
-            vec![],
-            vec![path(&["core_int"])],
-        );
+            check_file(empty_input(main)).unwrap();
+        }
 
-        check_file(input(main, sources)).unwrap();
+        #[test]
+        fn always_active_extend_visible() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "fn main() { let x: int = 1.plus_one(); }",
+            );
+            let sources = bundle(
+                None,
+                vec![core_module(
+                    "core_int",
+                    "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+                )],
+                vec![],
+                vec![path(&["core_int"])],
+            );
+
+            check_file(input(main, sources)).unwrap();
+        }
     }
 }

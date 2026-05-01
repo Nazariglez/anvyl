@@ -2,8 +2,8 @@ use anvyx_externs::ReceiverMode;
 
 use super::{
     CallTarget, CheckedType, ConstSubst, ExternUseTarget, GenericArgs, GenericParams,
-    MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, check_expr,
-    check_expr_checked_with_hint, checked_type,
+    MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, check_arg_count,
+    check_expr_checked, check_expr_checked_with_hint, checked_type,
     decls::{
         AggregateSchema, CallableKind, CallableParent, CallableRef, DeclarationIndex,
         ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, MethodSchema, ModuleScope, NominalKey,
@@ -12,22 +12,19 @@ use super::{
     extern_boundary,
     generic_bind::bind_prefix_generic_seeds,
     infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
-    place,
+    place::{self, PlaceUseFacts, PlaceValue},
 };
 use crate::{
     ast::{CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, Ident, Type},
     externs::catalog::{
-        ExternMethodRef, ExternStaticRef, ExternTypeId, ResolvedExternSignature, ResolvedExternTy,
+        ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
+        ResolvedExternTy,
     },
     span::Span,
 };
 
 pub(super) enum Subject {
-    Value {
-        ty: Type,
-        access: PlaceAccess,
-        contains_extern_any: bool,
-    },
+    Value(PlaceValue),
     NonAggregate(Type),
     Module(ModuleScope),
     Type(NominalKey),
@@ -39,6 +36,8 @@ pub(super) enum Subject {
         method_ref: ExternMethodRef,
         receiver: ReceiverMode,
         receiver_access: PlaceAccess,
+        receiver_place: Option<PlaceUseFacts>,
+        receiver_id: ExprId,
         name: Ident,
         signature: ResolvedExternSignature,
     },
@@ -103,20 +102,20 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
     match &expr.node.kind {
         ExprKind::Ident(name) => {
             if let Some((module, value_name, value)) = tc.lookup_named_value(*name) {
-                return Some(named_value_subject(&tc.decls, module, value_name, &value));
+                return Some(named_value_subject(tc, module, value_name, &value));
             }
             if let Some(info) = tc.lookup(*name).cloned() {
-                let ty = tc.solver.local_type_to_type(info.type_id);
+                let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
                 let access = if info.mutable {
                     PlaceAccess::Mutable
                 } else {
                     PlaceAccess::Immutable
                 };
-                return Some(Subject::Value {
-                    ty,
+                return Some(Subject::Value(PlaceValue {
+                    checked,
                     access,
-                    contains_extern_any: false,
-                });
+                    facts: Some(PlaceUseFacts::default()),
+                }));
             }
             if let Some(scope) = tc.lookup_module_alias(*name) {
                 return Some(Subject::Module(scope));
@@ -126,7 +125,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
             }
             None
         }
-        _ => Some(value_subject(check_expr(expr, tc))),
+        _ => Some(value_subject_checked(check_expr_checked(expr, tc))),
     }
 }
 
@@ -154,7 +153,7 @@ pub(super) fn check_postfix_chain(
         let next_is_call = matches!(chain.steps.get(i + 1), Some(PostfixStep::Call { .. }));
         subject = match step {
             PostfixStep::Field { node, id } => {
-                let subject = apply_field(&subject, node, *id, next_is_call, tc);
+                let subject = apply_field(&subject, node, next_is_call, tc);
                 tc.set_type(*id, subject_type(&subject), node.span);
                 subject
             }
@@ -165,10 +164,14 @@ pub(super) fn check_postfix_chain(
                 if matches!(subject, Subject::Error) {
                     Subject::Error
                 } else {
-                    value_subject_with_facts(checked.ty, checked.contains_extern_any)
+                    value_subject_checked(checked)
                 }
             }
         };
+    }
+
+    if let Subject::Value(value) = &subject {
+        place::record_value_read(expr.node.id, value, tc);
     }
 
     let ty = subject_type(&subject);
@@ -188,7 +191,7 @@ fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> 
             }
             PostfixStep::Call { node, id } => {
                 for arg in &node.node.args {
-                    check_expr(arg, tc);
+                    check_expr_checked(arg, tc);
                 }
                 tc.set_type(*id, Type::Infer, node.span);
             }
@@ -200,9 +203,8 @@ fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> 
 
 fn subject_type(subject: &Subject) -> Type {
     match subject {
-        Subject::Value { ty, .. }
-        | Subject::NonAggregate(ty)
-        | Subject::Callable { surface_ty: ty, .. } => ty.clone(),
+        Subject::Value(value) => value.checked.ty.clone(),
+        Subject::NonAggregate(ty) | Subject::Callable { surface_ty: ty, .. } => ty.clone(),
         Subject::ExternMethod { signature, .. } | Subject::ExternStatic { signature, .. } => {
             signature.to_func_type()
         }
@@ -212,24 +214,17 @@ fn subject_type(subject: &Subject) -> Type {
     }
 }
 
-fn value_subject(ty: Type) -> Subject {
-    value_subject_with_facts(ty, false)
+fn value_subject(ty: Type, tc: &TypeChecker) -> Subject {
+    value_subject_checked(checked_type(ty, tc))
 }
 
-fn value_subject_with_facts(ty: Type, contains_extern_any: bool) -> Subject {
-    Subject::Value {
-        ty,
-        access: PlaceAccess::NotPlace,
-        contains_extern_any,
-    }
+fn value_subject_checked(checked: CheckedType) -> Subject {
+    Subject::Value(PlaceValue::not_place(checked))
 }
 
 fn subject_contains_extern_any(subject: &Subject) -> bool {
     match subject {
-        Subject::Value {
-            contains_extern_any,
-            ..
-        } => *contains_extern_any,
+        Subject::Value(value) => value.checked.contains_extern_any,
         _ => false,
     }
 }
@@ -237,7 +232,6 @@ fn subject_contains_extern_any(subject: &Subject) -> bool {
 fn apply_field(
     subject: &Subject,
     field: &FieldAccessNode,
-    field_id: ExprId,
     next_is_call: bool,
     tc: &mut TypeChecker,
 ) -> Subject {
@@ -248,11 +242,12 @@ fn apply_field(
     };
 
     match subject {
-        Subject::Value { ty, access, .. } => apply_value_field(
-            ty.clone(),
-            *access,
+        Subject::Value(value) => apply_value_field(
+            value.checked.ty.clone(),
+            value.access,
+            value.facts.as_ref(),
+            field.node.target.node.id,
             field.node.field,
-            field_id,
             field.span,
             kind,
             tc,
@@ -297,7 +292,7 @@ fn aggregate_method_subject(
 }
 
 fn named_value_subject(
-    decls: &DeclarationIndex,
+    tc: &TypeChecker,
     module: ModuleScope,
     name: Ident,
     value: &ValueDecl,
@@ -307,12 +302,12 @@ fn named_value_subject(
         name,
         decl: value.clone(),
     };
-    match decls.callable_for_value(&resolved) {
+    match tc.decls.callable_for_value(&resolved) {
         Some(callee) => Subject::Callable {
             callee: Box::new(callee),
             surface_ty: value.ty().clone(),
         },
-        None => value_subject(value.ty().clone()),
+        None => value_subject(value.ty().clone(), tc),
     }
 }
 
@@ -369,8 +364,9 @@ fn unknown_enum_variant(
 fn apply_value_field(
     receiver: Type,
     receiver_access: PlaceAccess,
+    receiver_place: Option<&PlaceUseFacts>,
+    receiver_id: ExprId,
     name: Ident,
-    field_id: ExprId,
     span: Span,
     kind: MemberAccessKind,
     tc: &mut TypeChecker,
@@ -378,7 +374,19 @@ fn apply_value_field(
     let key = tc.decls.key_for_type(&receiver);
 
     if let Some(owner) = tc.extern_type_id(&receiver) {
-        return extern_value_member_subject(owner, name, field_id, receiver_access, span, kind, tc);
+        return extern_value_member_subject(
+            owner,
+            name,
+            receiver_access,
+            receiver_place,
+            receiver_id,
+            span,
+            kind,
+            tc,
+        );
+    }
+    if let Some(facts) = receiver_place {
+        place::record_facts_read(receiver_id, facts, tc);
     }
 
     if let Some(key) = key.as_ref()
@@ -389,7 +397,7 @@ fn apply_value_field(
     }
 
     if let Some(matched) = tc.find_extend_method(&receiver, name) {
-        return match extend_method_match_subject(&tc.decls, receiver, name, &matched) {
+        return match extend_method_match_subject(tc, receiver, name, &matched) {
             Ok(subject) => subject,
             Err(ExtendMethodError::Unbound(names)) => {
                 tc.push_unbound_generic_errors(names, span);
@@ -416,8 +424,9 @@ fn apply_value_field(
 fn extern_value_member_subject(
     owner: ExternTypeId,
     name: Ident,
-    field_id: ExprId,
     receiver_access: PlaceAccess,
+    receiver_place: Option<&PlaceUseFacts>,
+    receiver_id: ExprId,
     span: Span,
     kind: MemberAccessKind,
     tc: &mut TypeChecker,
@@ -431,13 +440,17 @@ fn extern_value_member_subject(
             let field_ref = field.field_ref;
             let access = field.access;
             let ty = field.decl.ty.ty.clone();
-            let contains_any = field.decl.ty.contains_any;
-            tc.record_extern_use(field_id, ExternUseTarget::FieldRead(field_ref));
-            Subject::Value {
-                ty,
+            let contains_any = field.decl.ty.contains_any();
+            let handle = tc.type_handle(&ty);
+            Subject::Value(PlaceValue::new(
+                CheckedType {
+                    ty,
+                    handle,
+                    contains_extern_any: contains_any,
+                },
                 access,
-                contains_extern_any: contains_any,
-            }
+                Some(PlaceUseFacts::for_extern_field(receiver_place, field_ref)),
+            ))
         }
         MemberAccessKind::Method => {
             let Some((method, decl)) = tc.externs.method(owner, name) else {
@@ -447,6 +460,8 @@ fn extern_value_member_subject(
                 method_ref: method,
                 receiver: decl.receiver,
                 receiver_access,
+                receiver_place: receiver_place.cloned(),
+                receiver_id,
                 name: decl.name,
                 signature: decl.signature.clone(),
             }
@@ -465,7 +480,7 @@ fn aggregate_field_subject(
         MemberAccessKind::Field => tc
             .decls
             .aggregate_field_type(receiver, name)
-            .map(value_subject)
+            .map(|ty| value_subject(ty, tc))
             .or_else(|| {
                 let method = agg.methods.get(&name)?;
                 Some(aggregate_method_subject(
@@ -496,7 +511,7 @@ enum ExtendMethodError {
 }
 
 fn extend_method_match_subject(
-    decls: &DeclarationIndex,
+    tc: &TypeChecker,
     receiver: Type,
     name: Ident,
     matched: &ExtendMethodMatch<'_>,
@@ -506,10 +521,15 @@ fn extend_method_match_subject(
             extend,
             method,
             owner_args: Ok(owner_args),
-        } => Ok(
-            extend_method_subject(decls, receiver, extend, name, method, owner_args.clone())
-                .unwrap_or_else(|| value_subject(Type::Infer)),
-        ),
+        } => Ok(extend_method_subject(
+            &tc.decls,
+            receiver,
+            extend,
+            name,
+            method,
+            owner_args.clone(),
+        )
+        .unwrap_or_else(|| value_subject(Type::Infer, tc))),
         ExtendMethodMatch::Match {
             owner_args: Err(unbound),
             ..
@@ -528,7 +548,7 @@ fn apply_module_field(
         return Subject::Module(module);
     }
     if let Some((module, value_name, decl)) = tc.exported_value_in_module(scope, name) {
-        return named_value_subject(&tc.decls, module, value_name, &decl);
+        return named_value_subject(tc, module, value_name, &decl);
     }
     if let Some(key) = tc.exported_type_in_module(scope, name) {
         return Subject::Type(key);
@@ -612,12 +632,16 @@ fn apply_call(
             method_ref,
             receiver,
             receiver_access,
+            receiver_place,
+            receiver_id,
             name,
             signature,
         } => check_extern_method_call(
             *method_ref,
             *receiver,
             *receiver_access,
+            receiver_place.as_ref(),
+            *receiver_id,
             *name,
             signature,
             call,
@@ -629,13 +653,16 @@ fn apply_call(
             static_ref,
             signature,
         } => check_extern_static_call(*static_ref, signature, call, call_id, expected, tc),
-        Subject::Value { ty, .. } => checked_type(call_value(ty.clone(), call, tc), tc),
+        Subject::Value(value) => {
+            place::record_value_read(call.node.func.node.id, value, tc);
+            checked_type(call_value(value.checked.ty.clone(), call, tc), tc)
+        }
         Subject::NonAggregate(_) | Subject::Module(_) | Subject::Type(_) => {
             checked_type(not_callable(subject_type(subject), call, tc), tc)
         }
         Subject::Error => {
             for arg in &call.node.args {
-                check_expr(arg, tc);
+                check_expr_checked(arg, tc);
             }
             checked_type(Type::Infer, tc)
         }
@@ -681,7 +708,7 @@ fn solve_generic_call_with(
     tc.substitute_checked(template_ret, &seeds.type_args, &seeds.const_args, call.span);
     if tc.errors.len() != error_count {
         for arg in &call.node.args {
-            check_expr(arg, tc);
+            check_expr_checked(arg, tc);
         }
         return None;
     }
@@ -865,7 +892,11 @@ fn check_extern_function_call(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let Some(id) = tc.extern_function_id(&callee.def.id) else {
+    let key = FunctionKey {
+        module: callee.def.id.module.clone(),
+        name: callee.def.id.name,
+    };
+    let Some(id) = tc.externs.function_by_key(&key) else {
         debug_assert!(false, "extern function declaration missing catalog target");
         tc.push_error(TypeError::NotCallable {
             ty: Type::Func {
@@ -875,7 +906,7 @@ fn check_extern_function_call(
             span: call.span,
         });
         for arg in &call.node.args {
-            check_expr(arg, tc);
+            check_expr_checked(arg, tc);
         }
         return checked_type(Type::Infer, tc);
     };
@@ -895,6 +926,8 @@ fn check_extern_method_call(
     method_ref: ExternMethodRef,
     receiver: ReceiverMode,
     receiver_access: PlaceAccess,
+    receiver_place: Option<&PlaceUseFacts>,
+    receiver_id: ExprId,
     name: Ident,
     signature: &ResolvedExternSignature,
     call: &CallNode,
@@ -902,11 +935,19 @@ fn check_extern_method_call(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    if receiver == ReceiverMode::Mutable && receiver_access != PlaceAccess::Mutable {
-        tc.push_error(TypeError::ImmutableAssignment {
-            name,
-            span: call.span,
-        });
+    match receiver {
+        ReceiverMode::Mutable => {
+            if let Some(error) = receiver_access.mut_borrow_error(name, call.span) {
+                tc.push_error(error);
+            } else if let Some(facts) = receiver_place {
+                place::record_facts_write(receiver_id, facts, tc);
+            }
+        }
+        ReceiverMode::Value | ReceiverMode::Shared => {
+            if let Some(facts) = receiver_place {
+                place::record_facts_read(receiver_id, facts, tc);
+            }
+        }
     }
     check_extern_call(
         ExternUseTarget::Method(method_ref),
@@ -950,7 +991,7 @@ fn check_extern_call(
             found: call.node.generic_args.len(),
         }));
         for arg in &call.node.args {
-            check_expr(arg, tc);
+            check_expr_checked(arg, tc);
         }
         return checked_type(Type::Infer, tc);
     }
@@ -964,7 +1005,7 @@ fn checked_extern_ret(ret: &ResolvedExternTy, tc: &TypeChecker) -> CheckedType {
     CheckedType {
         ty: ret.ty.clone(),
         handle: tc.type_handle(&ret.ty),
-        contains_extern_any: ret.contains_any,
+        contains_extern_any: ret.contains_any(),
     }
 }
 
@@ -1050,7 +1091,7 @@ fn not_callable(ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
         span: call.span,
     });
     for arg in &call.node.args {
-        check_expr(arg, tc);
+        check_expr_checked(arg, tc);
     }
     Type::Infer
 }
@@ -1109,25 +1150,4 @@ pub(super) fn check_args(
         .map(|param| tc.type_handle(&param.ty))
         .collect::<Vec<_>>();
     check_call_arg_handles(args, &param_handles, tc);
-}
-
-fn check_arg_count(
-    args: &[ExprNode],
-    expected: usize,
-    call_span: Span,
-    tc: &mut TypeChecker,
-) -> bool {
-    if args.len() == expected {
-        return true;
-    }
-
-    tc.push_error(TypeError::WrongArgCount {
-        expected,
-        found: args.len(),
-        span: call_span,
-    });
-    for arg in args {
-        check_expr(arg, tc);
-    }
-    false
 }

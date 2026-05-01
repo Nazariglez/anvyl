@@ -18,14 +18,6 @@ pub(crate) fn bare_type_name(ty: &Type) -> Option<Ident> {
     }
 }
 
-pub(crate) fn type_contains_unresolved_ref(ty: &Type) -> bool {
-    type_closure_facts(ty).first_unresolved.is_some()
-}
-
-pub(crate) fn type_contains_infer(ty: &Type) -> bool {
-    type_closure_facts(ty).contains_infer
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TypeClosureFacts {
     pub(crate) first_unresolved: Option<UnresolvedTypeRef>,

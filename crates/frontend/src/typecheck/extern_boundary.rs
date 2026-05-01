@@ -1,8 +1,8 @@
 use anvyx_externs::ParamFlow;
 
 use super::{
-    CheckedType, PlaceAccess, TypeChecker, TypeError, check_expr, check_expr_checked_with_hint,
-    check_place, infer::TypeHandle,
+    CheckedType, TypeChecker, check_arg_count, check_expr_checked_with_hint, check_place,
+    infer::TypeHandle,
 };
 use crate::{
     ast::{ExprNode, Ident, Type},
@@ -58,19 +58,17 @@ pub(super) fn check_arg_place(
     tc: &mut TypeChecker,
 ) -> bool {
     let checked = check_place(arg, tc);
-    let is_mutable = checked.access == PlaceAccess::Mutable;
+    let is_mutable = checked.value.access.can_mut_borrow();
     if !is_mutable {
-        tc.push_error(TypeError::ImmutableAssignment {
-            name: place_error_name(arg, param),
-            span: arg.span,
-        });
+        let name = place_error_name(arg, param);
+        if let Some(error) = checked.value.access.mut_borrow_error(name, arg.span) {
+            tc.push_error(error);
+        }
     }
-    super::place::record_write(arg.node.id, &checked, tc);
-    let checked = CheckedType {
-        ty: checked.ty,
-        handle: checked.handle,
-        contains_extern_any: checked.contains_extern_any,
-    };
+    if is_mutable {
+        super::place::record_write(arg.node.id, &checked, tc);
+    }
+    let checked = checked.into_checked();
     let value_ok = check_checked_value(arg, &checked, &param.ty, tc);
     is_mutable && value_ok
 }
@@ -81,7 +79,7 @@ pub(super) fn check_checked_value(
     boundary: &ResolvedExternTy,
     tc: &mut TypeChecker,
 ) -> bool {
-    let allows_any = boundary.contains_any;
+    let allows_any = boundary.contains_any();
     let any_ok = allows_any || !checked.contains_extern_any;
     if !any_ok {
         tc.reject_extern_any_escape(checked, expr.span);
@@ -93,29 +91,13 @@ pub(super) fn check_checked_value(
     any_ok && !failed
 }
 
-pub(super) fn type_fits_boundary(found: &Type, boundary: &ResolvedExternTy) -> bool {
-    type_fits_boundary_ty(found, &boundary.ty, boundary.contains_any)
-}
-
-fn check_arg_count(
-    args: &[ExprNode],
-    expected: usize,
-    call_span: Span,
-    tc: &mut TypeChecker,
+pub(super) fn type_fits_boundary(
+    found: &Type,
+    boundary: &ResolvedExternTy,
+    span: Span,
+    tc: &TypeChecker,
 ) -> bool {
-    if args.len() == expected {
-        return true;
-    }
-
-    tc.push_error(TypeError::WrongArgCount {
-        expected,
-        found: args.len(),
-        span: call_span,
-    });
-    for arg in args {
-        check_expr(arg, tc);
-    }
-    false
+    tc.solver.type_assignable(span, found, &boundary.ty)
 }
 
 fn place_error_name(arg: &ExprNode, param: &ResolvedExternParam) -> Ident {
@@ -123,14 +105,4 @@ fn place_error_name(arg: &ExprNode, param: &ResolvedExternParam) -> Ident {
         crate::ast::ExprKind::Ident(name) => *name,
         _ => param.name.unwrap_or_else(|| Ident::new("_")),
     }
-}
-
-fn type_fits_boundary_ty(found: &Type, expected: &Type, boundary_contains_any: bool) -> bool {
-    found == expected
-        || matches!(found, Type::Infer)
-        || matches!(expected, Type::Infer)
-        || boundary_contains_any && (matches!(found, Type::Any) || matches!(expected, Type::Any))
-        || expected.option_inner().is_some_and(|inner| {
-            !found.is_option() && type_fits_boundary_ty(found, inner, boundary_contains_any)
-        })
 }

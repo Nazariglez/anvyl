@@ -773,7 +773,7 @@ impl DeclarationIndex {
         !self.errors.is_empty()
     }
 
-    pub(crate) fn sync_extern_headers_from_catalog(&mut self, catalog: &ExternCatalog) {
+    pub(crate) fn sync_extern_headers(&mut self, catalog: &ExternCatalog) {
         for function in catalog.functions() {
             let decls = self
                 .modules
@@ -802,9 +802,6 @@ impl DeclarationIndex {
 
         let aggregate_keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
         for key in aggregate_keys {
-            if !self.should_finalize_module(&key.module) {
-                continue;
-            }
             let span = self.type_span_or_default(&key);
             let Some(schema) = self.aggregates.get_mut(&key) else {
                 continue;
@@ -852,9 +849,6 @@ impl DeclarationIndex {
 
         let enum_keys = self.enums.keys().cloned().collect::<Vec<_>>();
         for key in enum_keys {
-            if !self.should_finalize_module(&key.module) {
-                continue;
-            }
             let span = self.type_span_or_default(&key);
             let Some(schema) = self.enums.get_mut(&key) else {
                 continue;
@@ -895,9 +889,6 @@ impl DeclarationIndex {
 
         for index in 0..self.extends.len() {
             let origin = self.extends[index].origin.clone();
-            if !self.should_finalize_module(&origin) {
-                continue;
-            }
             let span = self.extends[index].span;
             let extend = &mut self.extends[index];
             let mut generics = generic_context(
@@ -934,9 +925,6 @@ impl DeclarationIndex {
 
         let module_keys = self.modules.keys().cloned().collect::<Vec<_>>();
         for module in module_keys {
-            if !self.should_finalize_module(&module) {
-                continue;
-            }
             let Some(decls) = self.modules.get_mut(&module) else {
                 continue;
             };
@@ -975,14 +963,6 @@ impl DeclarationIndex {
 
     fn type_span_or_default(&self, key: &NominalKey) -> Span {
         self.type_spans.get(key).copied().unwrap_or(Span::new(0, 0))
-    }
-
-    pub(crate) fn should_finalize_type_refs(&self, module: &ModuleScope) -> bool {
-        should_finalize_type_refs(module, &self.always_active_modules)
-    }
-
-    fn should_finalize_module(&self, module: &ModuleScope) -> bool {
-        self.should_finalize_type_refs(module)
     }
 
     fn sync_value_projections(&mut self) {
@@ -1410,7 +1390,13 @@ impl DeclarationIndex {
         qualifier: Option<Ident>,
         name: Ident,
     ) -> Option<NominalKey> {
-        resolve_visible_type_key_in(self, module, qualifier, name)
+        match qualifier {
+            Some(alias) => {
+                let target = self.imported_module(module, alias)?;
+                self.exported_type(&target, name)
+            }
+            None => self.visible_type(module, name),
+        }
     }
 
     pub(crate) fn imports_module(&self, module: &ModuleScope, imported: &ModuleScope) -> bool {
@@ -2165,55 +2151,6 @@ pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type
     .fold_type(ty)
 }
 
-trait VisibleTypeLookup {
-    fn imported_module_binding(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope>;
-    fn exported_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey>;
-    fn visible_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey>;
-}
-
-fn resolve_visible_type_key_in(
-    lookup: &impl VisibleTypeLookup,
-    module: &ModuleScope,
-    qualifier: Option<Ident>,
-    name: Ident,
-) -> Option<NominalKey> {
-    match qualifier {
-        Some(alias) => {
-            let target = lookup.imported_module_binding(module, alias)?;
-            lookup.exported_type_binding(&target, name)
-        }
-        None => lookup.visible_type_binding(module, name),
-    }
-}
-
-impl VisibleTypeLookup for DeclarationIndex {
-    fn imported_module_binding(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope> {
-        self.imported_module(module, name)
-    }
-
-    fn exported_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
-        self.exported_type(module, name)
-    }
-
-    fn visible_type_binding(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
-        self.visible_type(module, name)
-    }
-}
-
-pub(crate) fn should_finalize_type_refs(
-    scope: &ModuleScope,
-    always_active_modules: &HashSet<ModuleScope>,
-) -> bool {
-    // FIXME: temporary finding-16 until Phase 4 audits core/std source type refs
-    match scope {
-        ModuleScope::Root => true,
-        ModuleScope::Named(path) => {
-            !matches!(path.first_segment(), Some("core" | "std"))
-                && !always_active_modules.contains(scope)
-        }
-    }
-}
-
 fn generic_params(type_params: &[TypeParam], const_params: &[ConstParam]) -> GenericParams {
     GenericParams {
         type_params: type_params.to_vec(),
@@ -2343,7 +2280,7 @@ mod tests {
     use super::*;
     use crate::{
         ast::TypeVarId, lexer::tokenize, parser, resolve::ResolvedModule,
-        typecheck::type_ops::type_contains_unresolved_ref,
+        typecheck::type_ops::type_closure_facts,
     };
 
     fn ident(name: &str) -> Ident {
@@ -2473,7 +2410,7 @@ mod tests {
 
     fn assert_no_unresolved_nominal(ty: &Type) {
         assert!(
-            !type_contains_unresolved_ref(ty),
+            type_closure_facts(ty).first_unresolved.is_none(),
             "unresolved nominal survived: {ty:?}"
         );
     }

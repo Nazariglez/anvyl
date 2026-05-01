@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: success
+// @frontend: new
 
 extern fn add(a: int, b: int) -> int;
 extern fn tick();
@@ -7,6 +8,7 @@ extern fn greet(name: string) -> string;
 extern fn make_list(size: int) -> [int];
 extern fn make_map(key: string, value: int) -> [string: int];
 extern fn identity(v: any) -> any;
+extern fn accept_any(v: any);
 
 fn main() {
     let x = add(1, 2);
@@ -14,5 +16,5 @@ fn main() {
     let s = greet("world");
     let l: [int] = make_list(5);
     let m: [string: int] = make_map("a", 1);
-    let y: int = identity(42);
+    accept_any(identity(42));
 }

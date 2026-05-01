@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: no method named 'fly'
+// @frontend: new
+// @contains: Unknown method 'fly'
 
 extern type Point {
     x: float;

@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: Mismatched types
+// @frontend: new
+// @contains: Wrong number of arguments
 
 extern fn add(a: int, b: int) -> int;
 

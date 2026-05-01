@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate extern method 'Handle.get'
+
+extern type Handle {
+    fn get(self) -> int;
+    fn get(self) -> int;
+}
+
+fn main() {}

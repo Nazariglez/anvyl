@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: instance method
+// @frontend: new
+// @contains: Unknown method 'move_by'
 
 extern type Point {
     x: float;

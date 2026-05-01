@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: Mismatched types
+// @frontend: new
+// @contains: operator '+' cannot be applied
 
 extern type Vec2 {
     x: float;

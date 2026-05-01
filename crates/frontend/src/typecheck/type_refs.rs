@@ -60,7 +60,7 @@ impl GenericTypeContext {
     ) -> Result<Self, GenericParamError> {
         validate_generic_params(type_params, const_params)?;
         let mut ctx = Self::default();
-        ctx.extend_shadowing_params_unchecked(type_params, const_params);
+        ctx.extend_shadowing_unchecked(type_params, const_params);
         Ok(ctx)
     }
 
@@ -71,11 +71,11 @@ impl GenericTypeContext {
     ) -> Result<Self, GenericParamError> {
         validate_generic_params(type_params, const_params)?;
         let mut ctx = self.clone();
-        ctx.extend_shadowing_params_unchecked(type_params, const_params);
+        ctx.extend_shadowing_unchecked(type_params, const_params);
         Ok(ctx)
     }
 
-    fn extend_shadowing_params_unchecked(
+    fn extend_shadowing_unchecked(
         &mut self,
         type_params: &[TypeParam],
         const_params: &[ConstParam],

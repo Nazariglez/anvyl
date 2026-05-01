@@ -285,10 +285,7 @@ impl<'a> VerifyCx<'a> {
     }
 
     fn is_numeric_scalar_type(&self, ty: TypeId) -> bool {
-        matches!(
-            self.program.type_data(ty),
-            TypeData::Int | TypeData::Float | TypeData::Double
-        )
+        matches!(self.program.type_data(ty), TypeData::Int | TypeData::Float)
     }
 }
 
@@ -302,9 +299,6 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
         }
     }
 
-    for (id, _) in cx.program.modules.iter().enumerate() {
-        verify_module(cx, ModuleId::from_index(id));
-    }
     for (id, _) in cx.program.aggregates.iter().enumerate() {
         verify_aggregate(cx, AggregateId::from_index(id));
     }
@@ -320,10 +314,6 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     for (id, _) in cx.program.functions.iter().enumerate() {
         verify_function(cx, FunctionId::from_index(id));
     }
-}
-
-fn verify_module(_cx: &mut VerifyCx<'_>, _module_id: ModuleId) {
-    // TODO: will verify module-internal references here
 }
 
 fn verify_aggregate(cx: &mut VerifyCx<'_>, id: AggregateId) {
@@ -1210,7 +1200,6 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
     match data {
         TypeData::Int
         | TypeData::Float
-        | TypeData::Double
         | TypeData::Bool
         | TypeData::String
         | TypeData::Void

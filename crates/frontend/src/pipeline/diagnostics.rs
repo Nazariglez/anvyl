@@ -228,11 +228,11 @@ fn render_extern_provenance(provenance: &ExternProvenance) -> String {
 }
 
 fn render_raw_function_key(key: &RawExternFunctionKey) -> String {
-    format!("{}.{}", render_raw_scope(&key.module), key.name)
+    render_raw_scoped_name(&key.module, &key.name)
 }
 
 fn render_raw_type_key(key: &RawExternTypeKey) -> String {
-    format!("{}.{}", render_raw_scope(&key.module), key.name)
+    render_raw_scoped_name(&key.module, &key.name)
 }
 
 fn render_raw_member_key(key: &RawExternMemberKey) -> String {
@@ -243,10 +243,10 @@ fn render_raw_member_key(key: &RawExternMemberKey) -> String {
     )
 }
 
-fn render_raw_scope(scope: &RawExternScope) -> String {
+fn render_raw_scoped_name(scope: &RawExternScope, name: &str) -> String {
     match scope {
-        RawExternScope::Root => "<root>".to_string(),
-        RawExternScope::Named(path) => render_extern_module_path(path),
+        RawExternScope::Root => name.to_string(),
+        RawExternScope::Named(path) => format!("{}.{name}", render_extern_module_path(path)),
     }
 }
 
@@ -282,6 +282,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ExternAnyEscape { .. } => {
             "extern 'any' value cannot escape an extern boundary".to_string()
         }
+        TypeError::AnyOutsideExternBoundary { .. } => {
+            "any is only allowed in extern boundary signatures".to_string()
+        }
         TypeError::RecursiveInference { .. } => {
             "recursive type inference is not allowed".to_string()
         }
@@ -302,6 +305,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::DuplicateName { name, .. } => format!("name '{name}' is already declared"),
         TypeError::ImmutableAssignment { name, .. } => {
             format!("cannot assign to immutable value '{name}'")
+        }
+        TypeError::RequiresMutablePlace { name, .. } => {
+            format!("cannot mutably borrow non-storage place '{name}'")
         }
         TypeError::InvalidOperand {
             op, operand_type, ..
@@ -416,7 +422,7 @@ fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
         } => {
             let ty = module.as_ref().map_or_else(
                 || name.to_string(),
-                |module| format!("{}.{name}", render_module_scope(module)),
+                |module| render_scoped_name(module, *name),
             );
             (
                 context,
@@ -516,25 +522,53 @@ fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
 }
 
 fn render_extern_item(context: &ExternCatalogContext) -> String {
-    let module = render_module_scope(&context.module);
     match &context.item {
-        ExternContextItem::Function { name } => format!("extern function {module}.{name}"),
-        ExternContextItem::Type { name } => format!("extern type {module}.{name}"),
-        ExternContextItem::Field { ty, field } => format!("extern field {module}.{ty}.{field}"),
-        ExternContextItem::Init { ty } => format!("extern init {module}.{ty}"),
-        ExternContextItem::Method { ty, method } => {
-            format!("extern method {module}.{ty}.{method}")
-        }
-        ExternContextItem::Static { ty, method } => {
-            format!("extern static {module}.{ty}.{method}")
-        }
-        ExternContextItem::Operator { ty, op } => {
+        ExternContextItem::Function { name } => {
             format!(
-                "extern operator {module}.{ty}.{}",
-                render_extern_operator(*op)
+                "extern function {}",
+                render_scoped_name(&context.module, *name)
             )
         }
+        ExternContextItem::Type { name } => {
+            format!("extern type {}", render_scoped_name(&context.module, *name))
+        }
+        ExternContextItem::Field { ty, field } => {
+            format!(
+                "extern field {}",
+                render_scoped_member(&context.module, *ty, *field)
+            )
+        }
+        ExternContextItem::Init { ty } => {
+            format!("extern init {}", render_scoped_name(&context.module, *ty))
+        }
+        ExternContextItem::Method { ty, method } => {
+            format!(
+                "extern method {}",
+                render_scoped_member(&context.module, *ty, *method)
+            )
+        }
+        ExternContextItem::Static { ty, method } => {
+            format!(
+                "extern static {}",
+                render_scoped_member(&context.module, *ty, *method)
+            )
+        }
+        ExternContextItem::Operator { ty, op } => {
+            let owner = render_scoped_name(&context.module, *ty);
+            format!("extern operator {owner}.{}", render_extern_operator(*op))
+        }
     }
+}
+
+fn render_scoped_name(module: &ModuleScope, name: Ident) -> String {
+    match module {
+        ModuleScope::Root => name.to_string(),
+        ModuleScope::Named(path) => format!("{}.{name}", render_module_path(path)),
+    }
+}
+
+fn render_scoped_member(module: &ModuleScope, ty: Ident, member: Ident) -> String {
+    format!("{}.{}", render_scoped_name(module, ty), member)
 }
 
 fn render_member_access_kind(kind: MemberAccessKind) -> &'static str {
@@ -750,8 +784,10 @@ fn render_type_context(context: TypeContext) -> &'static str {
 }
 
 fn render_extern_type_key(key: &ExternTypeKey, raw_scope: Option<&RawExternScope>) -> String {
-    let module = raw_scope.map_or_else(|| render_extern_module_path(&key.module), render_raw_scope);
-    format!("{}.{}", module, key.name)
+    match raw_scope {
+        Some(scope) => render_raw_scoped_name(scope, &key.name),
+        None => format!("{}.{}", render_extern_module_path(&key.module), key.name),
+    }
 }
 
 fn render_extern_module_path(path: &ExternModulePath) -> String {
@@ -867,6 +903,19 @@ mod tests {
             },
             module: module_scope(module),
             item,
+        }
+    }
+
+    fn raw_path(path: &[&str]) -> ExternModulePath {
+        ExternModulePath {
+            segments: path.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn source_decl(module: RawExternScope) -> RawExternDecl {
+        RawExternDecl {
+            provenance: ExternProvenance::Source { module },
+            site: RawExternSite::default(),
         }
     }
 
@@ -1123,6 +1172,14 @@ mod tests {
                 }),
                 "Unknown struct 'shapes.Point'",
             ),
+            (
+                diagnose_type_error(&TypeError::AnyOutsideExternBoundary { span: span() }),
+                "any is only allowed in extern boundary signatures",
+            ),
+            (
+                diagnose_type_error(&TypeError::ExternAnyEscape { span: span() }),
+                "extern 'any' value cannot escape an extern boundary",
+            ),
         ];
 
         for (diagnostic, expected) in cases {
@@ -1276,6 +1333,66 @@ mod tests {
         for (diagnostic, expected) in cases {
             assert_msg(diagnostic, expected);
         }
+    }
+
+    #[test]
+    fn renders_root_extern_catalog_context_without_fake_module() {
+        let context = ExternCatalogContext {
+            provenance: ExternProvenance::Source {
+                module: RawExternScope::Root,
+            },
+            module: ModuleScope::Root,
+            item: ExternContextItem::Function {
+                name: ident("tick"),
+            },
+        };
+
+        assert_msg(
+            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+                context,
+                module: Some(ModuleScope::Root),
+                name: ident("Missing"),
+                site: RawExternSite::default(),
+            })),
+            "Unknown extern type 'Missing' in extern function tick from source root",
+        );
+    }
+
+    #[test]
+    fn renders_root_raw_identity_without_fake_module() {
+        let decl = source_decl(RawExternScope::Root);
+
+        assert_msg(
+            diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
+                key: RawExternIdentityKey::Function(RawExternFunctionKey {
+                    module: RawExternScope::Root,
+                    name: "tick".to_string(),
+                }),
+                first: decl.clone(),
+                duplicate: decl,
+            }),
+            "duplicate extern function 'tick' declared in source root and source root",
+        );
+    }
+
+    #[test]
+    fn renders_named_raw_member_identity() {
+        let decl = source_decl(RawExternScope::Named(raw_path(&["host"])));
+
+        assert_msg(
+            diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
+                key: RawExternIdentityKey::Member(RawExternMemberKey {
+                    owner: RawExternTypeKey {
+                        module: RawExternScope::Named(raw_path(&["host"])),
+                        name: "Handle".to_string(),
+                    },
+                    selector: anvyx_externs::ExternMemberSelector::Field("id".to_string()),
+                }),
+                first: decl.clone(),
+                duplicate: decl,
+            }),
+            "duplicate extern field 'host.Handle.id' declared in source module 'host' and source module 'host'",
+        );
     }
 
     #[test]

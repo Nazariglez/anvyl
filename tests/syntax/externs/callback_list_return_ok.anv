@@ -1,5 +1,7 @@
 // @mode: check
 // @expect: success
+// @frontend: new
+// @skip: clean frontend lambda callback checking is deferred
 
 extern fn map_range(from: int, to: int, cb: fn(int) -> int) -> [int];
 

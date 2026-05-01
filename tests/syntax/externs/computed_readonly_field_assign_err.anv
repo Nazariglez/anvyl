@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot assign to immutable value 'x'
+
+extern type Point {
+    computed x: int;
+    init;
+}
+
+fn main() {
+    var p = Point {};
+    p.x = 1;
+}

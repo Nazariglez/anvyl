@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Point {
+    computed var x: int;
+    init;
+}
+
+fn main() {
+    var p = Point {};
+    p.x = 1;
+}

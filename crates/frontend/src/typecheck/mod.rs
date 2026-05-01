@@ -12,7 +12,7 @@ use self::{
     },
     place::{PlaceAccess, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
-    type_ops::{TypeFolder, type_contains_infer, type_contains_unresolved_ref},
+    type_ops::TypeFolder,
     type_refs::{GenericParamError, GenericTypeContext},
 };
 pub(crate) use self::{
@@ -23,8 +23,8 @@ use crate::{
     externs::{
         RawExterns,
         catalog::{
-            ExternCatalog, ExternCatalogError, ExternField, ExternFieldRef, ExternFunctionId,
-            ExternType, ExternTypeId,
+            ExternCatalog, ExternCatalogError, ExternField, ExternFieldRef, ExternType,
+            ExternTypeId,
         },
     },
     resolve::{ModuleKey, ResolveResult},
@@ -108,6 +108,10 @@ pub(crate) enum TypeError {
         span: Span,
     },
     ImmutableAssignment {
+        name: Ident,
+        span: Span,
+    },
+    RequiresMutablePlace {
         name: Ident,
         span: Span,
     },
@@ -257,6 +261,9 @@ pub(crate) enum TypeError {
         span: Span,
     },
     ExternAnyEscape {
+        span: Span,
+    },
+    AnyOutsideExternBoundary {
         span: Span,
     },
     DuplicateGenericParam {
@@ -575,7 +582,11 @@ impl TypeChecker {
     }
 
     fn reject_extern_any_escape(&mut self, checked: &CheckedType, span: Span) {
-        if checked.contains_extern_any {
+        self.reject_extern_any_escape_fact(checked.contains_extern_any, span);
+    }
+
+    fn reject_extern_any_escape_fact(&mut self, contains_extern_any: bool, span: Span) {
+        if contains_extern_any {
             self.push_error(TypeError::ExternAnyEscape { span });
         }
     }
@@ -584,7 +595,7 @@ impl TypeChecker {
         if !type_closure_facts(ty).contains_any {
             return false;
         }
-        self.push_error(TypeError::ExternAnyEscape { span });
+        self.push_error(TypeError::AnyOutsideExternBoundary { span });
         true
     }
 
@@ -593,10 +604,6 @@ impl TypeChecker {
         (key.kind == NominalKind::Extern)
             .then(|| self.externs.type_by_nominal(&key))
             .flatten()
-    }
-
-    fn extern_function_id(&self, id: &CallableId) -> Option<ExternFunctionId> {
-        self.externs.function_by_callable(id)
     }
 
     fn extern_type(&self, owner: ExternTypeId) -> &ExternType {
@@ -1246,7 +1253,7 @@ pub(crate) fn check_with_modules(
             .map(TypeError::ExternCatalog)
             .collect::<Vec<_>>()
     })?;
-    decls.sync_extern_headers_from_catalog(&catalog);
+    decls.sync_extern_headers(&catalog);
 
     let mut tc = TypeChecker::new(decls, catalog);
     tc.collect_const_decls(ModuleScope::Root, program);
@@ -1448,6 +1455,15 @@ fn register_builtins(tc: &mut TypeChecker) {
 }
 
 fn register_declarations(program: &Program, tc: &mut TypeChecker) {
+    let extern_functions = tc
+        .externs
+        .functions_in_scope(&tc.current_module)
+        .map(|function| (function.key.name, function.signature.to_func_type()))
+        .collect::<Vec<_>>();
+    for (name, ty) in extern_functions {
+        tc.define(name, ty, false);
+    }
+
     for stmt in &program.stmts {
         match &stmt.node {
             Stmt::Func(func_node) => {
@@ -1459,17 +1475,7 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                 tc.define(func.name, func_ty, false);
             }
             Stmt::Aggregate(_) | Stmt::Enum(_) => {}
-            Stmt::ExternFunc(ext_node) => {
-                let ext = &ext_node.node;
-                let (_, _, ValueDecl::Func(sig)) = tc
-                    .current_module_value(ext.name)
-                    .expect("extern function declaration missing synced signature")
-                else {
-                    unreachable!("extern function declaration synced as non-function value")
-                };
-                tc.define(ext.name, sig.ty, false);
-            }
-            Stmt::ExternType(_) => {}
+            Stmt::ExternFunc(_) | Stmt::ExternType(_) => {}
             Stmt::Const(const_node) => {
                 let c = &const_node.node;
                 let ty = match &c.ty {
@@ -1505,7 +1511,7 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
             check_return(ret_node, tc);
         }
         Stmt::Expr(expr_node) => {
-            check_expr(expr_node, tc);
+            check_expr_checked(expr_node, tc);
         }
         Stmt::While(while_node) => {
             check_while(while_node, tc);
@@ -1864,10 +1870,6 @@ fn join_checked(
     }
 }
 
-fn check_block(block: &BlockNode, tc: &mut TypeChecker) -> Type {
-    check_block_checked(block, tc).ty
-}
-
 fn check_block_checked(block: &BlockNode, tc: &mut TypeChecker) -> CheckedType {
     check_block_checked_with_hint(block, None, tc)
 }
@@ -1964,10 +1966,6 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
     }
 }
 
-fn check_expr(expr: &ExprNode, tc: &mut TypeChecker) -> Type {
-    check_expr_checked(expr, tc).ty
-}
-
 fn check_expr_checked(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
     check_expr_checked_with_hint(expr, None, tc)
 }
@@ -2018,6 +2016,27 @@ fn check_expected(expr: &ExprNode, expected: TypeHandle, tc: &mut TypeChecker) -
     let checked = check_expr_checked_with_hint(expr, Some(expected.clone()), tc);
     tc.expect_assignable(expr.span, checked.handle.clone(), expected);
     checked
+}
+
+fn check_arg_count(
+    args: &[ExprNode],
+    expected: usize,
+    call_span: Span,
+    tc: &mut TypeChecker,
+) -> bool {
+    if args.len() == expected {
+        return true;
+    }
+
+    tc.push_error(TypeError::WrongArgCount {
+        expected,
+        found: args.len(),
+        span: call_span,
+    });
+    for arg in args {
+        check_expr_checked(arg, tc);
+    }
+    false
 }
 
 fn check_expr_checked_with_hint(
@@ -2096,12 +2115,8 @@ fn check_expr_checked_with_hint(
             check_assign(expr.node.id, assign_node, tc);
             checked_from_type(expr, Type::Void, tc)
         }
-        ExprKind::StructLiteral(lit) => {
-            check_struct_literal_checked_with_hint(expr, lit, expected, tc)
-        }
-        ExprKind::InferredEnum(node) => {
-            check_inferred_enum_checked_with_hint(expr, node, expected, tc)
-        }
+        ExprKind::StructLiteral(lit) => check_struct_lit_hint(expr, lit, expected, tc),
+        ExprKind::InferredEnum(node) => check_inferred_enum_hint(expr, node, expected, tc),
         ExprKind::Field(_) | ExprKind::Call(_) => {
             let chain = collect_postfix_chain(expr).expect("postfix chain");
             check_postfix_chain(&chain, expr, expected.as_ref(), tc)
@@ -2110,10 +2125,8 @@ fn check_expr_checked_with_hint(
         ExprKind::NamedTuple(fields) => {
             check_named_tuple_checked_with_hint(expr, fields, expected, tc)
         }
-        ExprKind::ArrayLiteral(lit) => {
-            check_array_literal_checked_with_hint(expr, lit, expected, tc)
-        }
-        ExprKind::ArrayFill(fill) => check_array_fill_checked_with_hint(expr, fill, expected, tc),
+        ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected, tc),
+        ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected, tc),
         ExprKind::IfLet(if_let_node) => checked_from_checked(
             expr,
             check_if_let_checked_with_hint(if_let_node, expected, tc),
@@ -2391,7 +2404,7 @@ fn check_if_checked_with_hint(
         tc,
     );
     let Some(else_block) = &if_node.node.else_block else {
-        check_block(&if_node.node.then_block, tc);
+        check_block_checked(&if_node.node.then_block, tc);
         return checked_void(tc);
     };
     let then = check_block_checked_with_hint(&if_node.node.then_block, expected.clone(), tc);
@@ -2447,7 +2460,7 @@ fn collection_literal_handle(
     }
 }
 
-fn check_array_literal_checked_with_hint(
+fn check_array_lit_hint(
     expr: &ExprNode,
     lit: &ArrayLiteralNode,
     expected: Option<TypeHandle>,
@@ -2471,7 +2484,7 @@ fn check_array_literal_checked_with_hint(
     checked
 }
 
-fn check_array_fill_checked_with_hint(
+fn check_array_fill_hint(
     expr: &ExprNode,
     fill: &ArrayFillNode,
     expected: Option<TypeHandle>,
@@ -2662,7 +2675,7 @@ impl NominalLiteralSolver {
     }
 }
 
-fn check_struct_literal_checked_with_hint(
+fn check_struct_lit_hint(
     expr: &ExprNode,
     lit: &StructLiteralNode,
     expected: Option<TypeHandle>,
@@ -2674,7 +2687,7 @@ fn check_struct_literal_checked_with_hint(
     };
 
     if key.kind == NominalKind::Extern {
-        return check_extern_struct_literal_checked(expr, lit, &key, expected, tc);
+        return check_extern_lit(expr, lit, &key, expected, tc);
     }
 
     let valid_literal_target = matches!(key.kind, NominalKind::Struct | NominalKind::DataRef);
@@ -2726,7 +2739,7 @@ fn check_struct_literal_checked_with_hint(
     checked
 }
 
-fn check_extern_struct_literal_checked(
+fn check_extern_lit(
     expr: &ExprNode,
     lit: &StructLiteralNode,
     key: &NominalKey,
@@ -2868,7 +2881,7 @@ fn required_extern_literal_fields(
         .collect()
 }
 
-fn check_inferred_enum_checked_with_hint(
+fn check_inferred_enum_hint(
     expr: &ExprNode,
     node: &InferredEnumNode,
     expected: Option<TypeHandle>,
@@ -2896,13 +2909,13 @@ fn check_inferred_enum_checked_with_hint(
             variant: node.node.variant,
             span: node.span,
         });
-        check_inferred_enum_args_without_hint(&node.node.args, tc);
+        check_inferred_enum_args(&node.node.args, tc);
         return checked_from_type(expr, Type::Infer, tc);
     };
 
     let inf = NominalLiteralSolver::without_args(&generics, node.span, tc);
     if !inf.bind_expected(&key, &generics, Some(&expected_ty), node.span, tc) {
-        check_inferred_enum_args_without_hint(&node.node.args, tc);
+        check_inferred_enum_args(&node.node.args, tc);
         return checked_from_type(expr, Type::Infer, tc);
     }
 
@@ -2960,7 +2973,7 @@ fn cannot_infer_inferred_enum(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     tc.push_error(TypeError::CannotInferType { span: node.span });
-    check_inferred_enum_args_without_hint(&node.node.args, tc);
+    check_inferred_enum_args(&node.node.args, tc);
     checked_from_type(expr, Type::Infer, tc)
 }
 
@@ -2976,7 +2989,7 @@ fn wrong_inferred_enum_args(
         found: inferred_enum_arg_count(args),
         span: node.span,
     });
-    check_inferred_enum_args_without_hint(args, tc);
+    check_inferred_enum_args(args, tc);
     checked_from_type(expr, Type::Infer, tc)
 }
 
@@ -3038,7 +3051,7 @@ fn check_unknown_nominal_fields(fields: &[(Ident, ExprNode)], tc: &mut TypeCheck
     }
 }
 
-fn check_inferred_enum_args_without_hint(args: &InferredEnumArgs, tc: &mut TypeChecker) {
+fn check_inferred_enum_args(args: &InferredEnumArgs, tc: &mut TypeChecker) {
     match args {
         InferredEnumArgs::Unit => {}
         InferredEnumArgs::Tuple(args) => check_exprs_without_hint(args, tc),
@@ -3098,7 +3111,7 @@ fn resolve_struct_key(lit: &StructLiteralNode, tc: &mut TypeChecker) -> Option<N
 
 fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
     let target = check_place(&assign.node.target, tc);
-    if target.access != PlaceAccess::Mutable {
+    if !target.value.access.can_assign() {
         let name = assignment_target_name(&assign.node.target);
         tc.push_error(TypeError::ImmutableAssignment {
             name,
@@ -3108,22 +3121,31 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
 
     match assign_op_to_binary_op(assign.node.op) {
         None => {
-            let value =
-                check_expr_checked_with_hint(&assign.node.value, Some(target.handle.clone()), tc);
+            let value = check_expr_checked_with_hint(
+                &assign.node.value,
+                Some(target.checked().handle.clone()),
+                tc,
+            );
             if !target.accepts_extern_any() {
                 tc.reject_extern_any_escape(&value, assign.node.value.span);
             }
-            if !target.ty.is_void() && !value.ty.is_void() {
-                tc.expect_assignable(assign.node.value.span, value.handle, target.handle.clone());
+            if !target.checked().ty.is_void() && !value.ty.is_void() {
+                tc.expect_assignable(
+                    assign.node.value.span,
+                    value.handle,
+                    target.checked().handle.clone(),
+                );
             }
-            place::record_write(assign.node.target.node.id, &target, tc);
+            if target.value.access.can_assign() {
+                place::record_write(assign.node.target.node.id, &target, tc);
+            }
         }
         Some(op) => {
             let value = check_expr_checked(&assign.node.value, tc);
             let target_value = CheckedType {
-                ty: target.ty.clone(),
-                handle: target.handle.clone(),
-                contains_extern_any: target.contains_extern_any,
+                ty: target.checked().ty.clone(),
+                handle: target.checked().handle.clone(),
+                contains_extern_any: target.checked().contains_extern_any,
             };
             let result = check_binary_checked(
                 expr_id,
@@ -3135,10 +3157,12 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
                 assign.span,
                 tc,
             );
-            if !target.ty.is_void() && !result.ty.is_void() {
-                tc.expect_assignable(assign.span, result.handle, target.handle.clone());
+            if !target.checked().ty.is_void() && !result.ty.is_void() {
+                tc.expect_assignable(assign.span, result.handle, target.checked().handle.clone());
             }
-            place::record_compound_write(assign.node.target.node.id, &target, tc);
+            if target.value.access.can_assign() {
+                place::record_compound_write(assign.node.target.node.id, &target, tc);
+            }
         }
     }
 }
@@ -3175,16 +3199,16 @@ fn check_while(while_node: &WhileNode, tc: &mut TypeChecker) {
         tc,
     );
     tc.enter_loop();
-    check_block(&while_node.node.body, tc);
+    check_block_checked(&while_node.node.body, tc);
     tc.exit_loop();
 }
 
 fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     let node = &for_node.node;
-    let iterable_ty = check_expr(&node.iterable, tc);
+    let iterable_ty = check_expr_checked(&node.iterable, tc).ty;
 
     if let Some(step) = &node.step {
-        check_expr(step, tc);
+        check_expr_checked(step, tc);
     }
 
     let item_ty = iterable_item_type(&iterable_ty).unwrap_or_else(|| {
@@ -3198,7 +3222,7 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     tc.push_scope();
     check_pattern(&node.pattern, &item_ty, false, tc);
     tc.enter_loop();
-    check_block(&node.body, tc);
+    check_block_checked(&node.body, tc);
     tc.exit_loop();
     tc.pop_scope();
 }
@@ -3490,11 +3514,7 @@ fn record_extern_pattern_reads(
                     continue;
                 };
                 tc.record_extern_use(site, ExternUseTarget::FieldRead(field));
-                if decl.ty.contains_any {
-                    tc.push_error(TypeError::ExternAnyEscape {
-                        span: subpattern.span,
-                    });
-                }
+                tc.reject_extern_any_escape_fact(decl.ty.contains_any(), subpattern.span);
                 record_extern_pattern_reads(subpattern, &decl.ty.ty, site, tc);
             }
         }
@@ -3535,12 +3555,12 @@ fn record_extern_pattern_reads(
 
 fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
     let node = &while_let_node.node;
-    let value_ty = check_expr(&node.value, tc);
+    let value_ty = check_expr_checked(&node.value, tc).ty;
     record_extern_pattern_reads(&node.pattern, &value_ty, node.value.node.id, tc);
     tc.push_scope();
     check_pattern(&node.pattern, &value_ty, false, tc);
     tc.enter_loop();
-    check_block(&node.body, tc);
+    check_block_checked(&node.body, tc);
     tc.exit_loop();
     tc.pop_scope();
 }
@@ -3617,32 +3637,28 @@ fn check_match_checked_with_hint(
     }
 }
 
-pub(crate) fn call_target_contains_infer(target: &CallTarget) -> bool {
-    call_target_closure_facts(target).contains_infer
-}
-
-pub(crate) fn call_target_contains_unresolved_ref(target: &CallTarget) -> bool {
-    call_target_closure_facts(target).contains_unresolved_ref
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CallTargetClosureFacts {
     pub(crate) contains_infer: bool,
     pub(crate) contains_unresolved_ref: bool,
     pub(crate) contains_unresolved_const: bool,
+    pub(crate) contains_const_infer: bool,
 }
 
 pub(crate) fn call_target_closure_facts(target: &CallTarget) -> CallTargetClosureFacts {
     let mut facts = CallTargetClosureFacts::default();
     for ty in &target.args.type_args {
         let ty_facts = type_closure_facts(ty);
-        facts.contains_infer |= type_contains_infer(ty);
-        facts.contains_unresolved_ref |= type_contains_unresolved_ref(ty);
+        facts.contains_infer |= ty_facts.contains_infer;
+        facts.contains_unresolved_ref |= ty_facts.first_unresolved.is_some();
         facts.contains_unresolved_const |= ty_facts.contains_unresolved_const;
     }
     for arg in &target.args.const_args {
-        facts.contains_infer |= const_term_contains_infer(arg);
-        facts.contains_unresolved_const |= matches!(arg, ConstTerm::Name(_));
+        match arg {
+            ConstTerm::Name(_) => facts.contains_unresolved_const = true,
+            ConstTerm::ArrayInfer | ConstTerm::Infer(_) => facts.contains_const_infer = true,
+            ConstTerm::Value(_) | ConstTerm::Param(_) => {}
+        }
     }
     facts
 }
@@ -3660,17 +3676,18 @@ fn push_extern_ty_closure_error(
 }
 
 fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarget, span: Span) {
-    let const_infer = target.args.const_args.iter().any(const_term_contains_infer);
-    if !call_target_contains_infer(target)
-        && !call_target_contains_unresolved_ref(target)
-        && !const_infer
+    let facts = call_target_closure_facts(target);
+    if !facts.contains_infer
+        && !facts.contains_unresolved_ref
+        && !facts.contains_unresolved_const
+        && !facts.contains_const_infer
     {
         return;
     }
     for ty in &target.args.type_args {
         push_type_closure_error(errors, ty, span);
     }
-    if const_infer {
+    if facts.contains_unresolved_const || facts.contains_const_infer {
         errors.push(TypeError::CannotInferConst { span });
     }
 }
@@ -3688,8 +3705,4 @@ fn push_type_closure_error(errors: &mut Vec<TypeError>, ty: &Type, span: Span) {
     } else if facts.contains_unresolved_const {
         errors.push(TypeError::CannotInferConst { span });
     }
-}
-
-fn const_term_contains_infer(term: &ConstTerm) -> bool {
-    matches!(term, ConstTerm::ArrayInfer | ConstTerm::Infer(_))
 }

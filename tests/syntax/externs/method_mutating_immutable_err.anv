@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: mutating method
+// @frontend: new
+// @contains: cannot assign to immutable value
 
 extern type Point {
     x: float;

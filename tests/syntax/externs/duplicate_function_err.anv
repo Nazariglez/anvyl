@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate extern function 'ping'
+
+extern fn ping();
+extern fn ping();
+
+fn main() {}

@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: not equatable
+// @frontend: new
+// @contains: operator '==' cannot be applied
 
 extern type Vec2 {
     x: float;

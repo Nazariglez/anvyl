@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: error
+// @frontend: new
 // @contains: Unknown field 'z'
 
 extern type Point {

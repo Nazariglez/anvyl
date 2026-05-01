@@ -2,15 +2,40 @@ use std::collections::HashMap;
 
 use crate::{ExternDecl, ExternHandler, ExternTypeDecl};
 
-fn format_params(out: &mut String, params: &[(&str, &str)]) {
+fn format_params(out: &mut String, params: &[(&str, &str)], clean: bool) {
     for (i, (pname, pty)) in params.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
         out.push_str(pname);
         out.push_str(": ");
-        out.push_str(pty);
+        format_type(out, pty, clean);
     }
+}
+
+fn format_type(out: &mut String, ty: &str, clean: bool) {
+    if clean {
+        out.push_str(&clean_type(ty));
+    } else {
+        out.push_str(ty);
+    }
+}
+
+fn clean_type(ty: &str) -> String {
+    let ty = ty.trim();
+    if let Some(inner) = ty
+        .strip_prefix("Option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        let inner = clean_type(inner);
+        if matches!(
+            inner.trim_end_matches('?'),
+            "any" | "bool" | "float" | "int" | "string"
+        ) {
+            return format!("{inner}?");
+        }
+    }
+    ty.to_string()
 }
 
 fn emit_doc(out: &mut String, doc: Option<&str>) {
@@ -38,6 +63,14 @@ pub struct StdModule {
 
 impl StdModule {
     pub fn full_anv_source(&self) -> String {
+        self.full_anv_source_inner(false)
+    }
+
+    pub fn full_clean_anv_source(&self) -> String {
+        self.full_anv_source_inner(true)
+    }
+
+    fn full_anv_source_inner(&self, clean: bool) -> String {
         let mut out = String::new();
         for ty in (self.type_exports)() {
             let has_members = ty.has_init
@@ -58,7 +91,7 @@ impl StdModule {
                     out.push_str("    ");
                     out.push_str(field.name);
                     out.push_str(": ");
-                    out.push_str(field.ty);
+                    format_type(&mut out, field.ty, clean);
                     out.push_str(";\n");
                 }
                 for method in &ty.methods {
@@ -75,12 +108,12 @@ impl StdModule {
                         out.push_str(", ");
                         out.push_str(pname);
                         out.push_str(": ");
-                        out.push_str(pty);
+                        format_type(&mut out, pty, clean);
                     }
                     out.push(')');
                     if method.ret != "void" {
                         out.push_str(" -> ");
-                        out.push_str(method.ret);
+                        format_type(&mut out, method.ret, clean);
                     }
                     out.push_str(";\n");
                 }
@@ -89,11 +122,11 @@ impl StdModule {
                     out.push_str("    fn ");
                     out.push_str(s.name);
                     out.push('(');
-                    format_params(&mut out, &s.params);
+                    format_params(&mut out, &s.params, clean);
                     out.push(')');
                     if s.ret != "void" {
                         out.push_str(" -> ");
-                        out.push_str(s.ret);
+                        format_type(&mut out, s.ret, clean);
                     }
                     out.push_str(";\n");
                 }
@@ -155,11 +188,11 @@ impl StdModule {
             out.push_str("extern fn ");
             out.push_str(decl.name);
             out.push('(');
-            format_params(&mut out, &decl.params);
+            format_params(&mut out, &decl.params, clean);
             out.push(')');
             if decl.ret != "void" {
                 out.push_str(" -> ");
-                out.push_str(decl.ret);
+                format_type(&mut out, decl.ret, clean);
             }
             out.push_str(";\n");
         }
@@ -381,5 +414,29 @@ extern type Vec2 {
 extern fn greet(name: string);
 ";
         assert_eq!(module.full_anv_source(), expected);
+    }
+
+    #[test]
+    fn clean_source_uses_postfix_option_boundary_types() {
+        let module = super::StdModule {
+            name: "test",
+            anv_source: "",
+            exports: || {
+                vec![ExternDecl {
+                    name: "get",
+                    params: vec![("key", "Option<string>")],
+                    ret: "Option<Option<int>>",
+                    doc: None,
+                }]
+            },
+            type_exports: || vec![],
+            handlers: || HashMap::new(),
+            init: None,
+        };
+
+        assert_eq!(
+            module.full_clean_anv_source(),
+            "extern fn get(key: string?) -> int??;\n"
+        );
     }
 }

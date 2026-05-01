@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs, path::Path};
 
-use anvyx_lang::{CompilationContext, LintConfig, LintLevel, StdModuleSource};
-use anvyx_lang2::{ModuleSource, SourceBundle, SourceText};
+use anvyx_lang::{CompilationContext, LintConfig, LintLevel};
+use anvyx_lang2::SourceBundle;
 
 use crate::{
     manifest::Manifest,
@@ -40,7 +40,7 @@ pub fn new_frontend_cmd(file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn reject_unsupported_new_frontend_inputs(
+pub fn reject_new_frontend_inputs(
     manifest: Option<&Manifest>,
     lint_overrides: &[String],
     features: &[String],
@@ -71,57 +71,12 @@ pub fn reject_unsupported_new_frontend_inputs(
 }
 
 fn new_frontend_source_bundle() -> Result<SourceBundle, String> {
-    let (std_sources, _) = collect_std();
-    let (core_prelude, core_sources, _) = collect_core();
-
-    source_bundle_from_collected_sources(core_prelude, core_sources, std_sources)
-}
-
-fn source_bundle_from_collected_sources(
-    core_prelude: String,
-    core_sources: HashMap<String, StdModuleSource>,
-    std_sources: HashMap<String, StdModuleSource>,
-) -> Result<SourceBundle, String> {
-    let prelude = SourceText::new(core_prelude, "<core>").map_err(|error| error.to_string())?;
-
-    let mut always_active_modules = vec![];
-    let core_modules = sorted_modules(core_sources)
-        .into_iter()
-        .map(|(name, source)| {
-            let path = vec![name.clone()];
-            let label = format!("<core.{name}>");
-            always_active_modules.push(path.clone());
-            ModuleSource::new(path, source.anv_source, label).map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let std_modules = sorted_modules(std_sources)
-        .into_iter()
-        .map(|(name, source)| {
-            let path = vec!["std".to_string(), name.clone()];
-            let label = format!("<std.{name}>");
-            ModuleSource::new(path, source.anv_source, label).map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    SourceBundle::new(
-        Some(prelude),
-        core_modules,
-        std_modules,
-        always_active_modules,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn sorted_modules(sources: HashMap<String, StdModuleSource>) -> Vec<(String, StdModuleSource)> {
-    let mut sources = sources.into_iter().collect::<Vec<_>>();
-    sources.sort_by(|left, right| left.0.cmp(&right.0));
-    sources
+    crate::frontend_sources::source_bundle()
 }
 
 #[cfg(test)]
 mod tests {
-    use anvyx_lang::LintConfig;
+    use anvyx_lang::{LintConfig, StdModuleSource};
 
     use super::*;
     use crate::manifest::{ExternEntry, Project};
@@ -163,145 +118,293 @@ mod tests {
         features: &[String],
         cfgs: &[String],
     ) -> String {
-        reject_unsupported_new_frontend_inputs(manifest, lint_overrides, features, cfgs)
+        reject_new_frontend_inputs(manifest, lint_overrides, features, cfgs)
             .expect_err("input should be unsupported")
     }
 
-    #[test]
-    fn new_frontend_bundle_maps_core_prelude() {
-        let bundle = source_bundle_from_collected_sources(
-            "fn p() {}".to_string(),
-            HashMap::new(),
-            HashMap::new(),
-        )
-        .unwrap();
-        let prelude = bundle.core_prelude().unwrap();
+    mod new_frontend {
+        use super::*;
 
-        assert_eq!(prelude.label(), "<core>");
-        assert_eq!(prelude.code(), "fn p() {}");
-    }
+        fn write(dir: &tempfile::TempDir, relative: &str, code: &str) -> std::path::PathBuf {
+            let file = dir.path().join(relative);
+            if let Some(parent) = file.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&file, code).unwrap();
+            file
+        }
 
-    #[test]
-    fn new_frontend_bundle_maps_core_modules() {
-        let bundle = source_bundle_from_collected_sources(
-            String::new(),
-            sources(&[("core_int", "extend int {}")]),
-            HashMap::new(),
-        )
-        .unwrap();
-        let modules = bundle.core_modules();
+        fn sorted_std_paths(bundle: &SourceBundle) -> Vec<Vec<String>> {
+            let mut paths = bundle
+                .std_modules()
+                .map(|module| module.path().to_vec())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        }
 
-        assert_eq!(modules.len(), 1);
-        assert_eq!(modules[0].path(), path(&["core_int"]));
-        assert_eq!(modules[0].label(), "<core.core_int>");
-        assert_eq!(modules[0].code(), "extend int {}");
-        assert_eq!(bundle.always_active_modules(), &[path(&["core_int"])]);
-    }
+        mod bundle {
+            use anvyx_lang2::{ModuleSource, SourceText};
 
-    #[test]
-    fn new_frontend_bundle_maps_std_modules_under_std_root() {
-        let bundle = source_bundle_from_collected_sources(
-            String::new(),
-            HashMap::new(),
-            sources(&[("math", "extern fn sin(x: double) -> double;")]),
-        )
-        .unwrap();
-        let module = bundle.std_module(&path(&["std", "math"])).unwrap();
+            use super::*;
 
-        assert_eq!(module.path(), path(&["std", "math"]));
-        assert_eq!(module.label(), "<std.math>");
-        assert_eq!(module.code(), "extern fn sin(x: double) -> double;");
-    }
+            fn bundle_from_sources(
+                core_prelude: String,
+                core_sources: HashMap<String, StdModuleSource>,
+                std_sources: HashMap<String, StdModuleSource>,
+            ) -> Result<SourceBundle, String> {
+                let prelude =
+                    SourceText::new(core_prelude, "<core>").map_err(|error| error.to_string())?;
 
-    #[test]
-    fn new_frontend_bundle_uses_deterministic_module_order() {
-        let bundle = source_bundle_from_collected_sources(
-            String::new(),
-            sources(&[
-                ("core_string", "extend string {}"),
-                ("core_int", "extend int {}"),
-            ]),
-            sources(&[("maps", ""), ("math", "")]),
-        )
-        .unwrap();
-        let core_paths = bundle
-            .core_modules()
-            .iter()
-            .map(|module| module.path().to_vec())
-            .collect::<Vec<_>>();
+                let mut always_active_modules = vec![];
+                let core_modules = sorted_modules(core_sources)
+                    .into_iter()
+                    .map(|(name, source)| {
+                        let path = vec![name.clone()];
+                        let label = format!("<core.{name}>");
+                        always_active_modules.push(path.clone());
+                        ModuleSource::new(path, source.anv_source, label)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
-        assert_eq!(core_paths, [path(&["core_int"]), path(&["core_string"])]);
-        assert_eq!(bundle.always_active_modules(), core_paths);
-    }
+                let std_modules = sorted_modules(std_sources)
+                    .into_iter()
+                    .map(|(name, source)| {
+                        let path = vec!["std".to_string(), name.clone()];
+                        let label = format!("<std.{name}>");
+                        ModuleSource::new(path, source.anv_source, label)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
-    #[test]
-    fn new_frontend_bundle_rejects_invalid_builtin_module_name() {
-        let error = source_bundle_from_collected_sources(
-            String::new(),
-            sources(&[("", "extend int {}")]),
-            HashMap::new(),
-        )
-        .expect_err("empty built-in module name should be invalid");
+                SourceBundle::new(
+                    Some(prelude),
+                    core_modules,
+                    std_modules,
+                    always_active_modules,
+                )
+                .map_err(|error| error.to_string())
+            }
 
-        assert!(error.contains("module path must not contain empty segments"));
-    }
+            fn sorted_modules(
+                sources: HashMap<String, StdModuleSource>,
+            ) -> Vec<(String, StdModuleSource)> {
+                let mut sources = sources.into_iter().collect::<Vec<_>>();
+                sources.sort_by(|left, right| left.0.cmp(&right.0));
+                sources
+            }
 
-    #[test]
-    fn new_frontend_rejects_feature_flags() {
-        let error = unsupported_error(None, &[], &["demo".to_string()], &[]);
+            #[test]
+            fn prelude() {
+                let bundle =
+                    bundle_from_sources("fn p() {}".to_string(), HashMap::new(), HashMap::new())
+                        .unwrap();
+                let prelude = bundle.core_prelude().unwrap();
 
-        assert_eq!(error, "--new-frontend does not support --feature yet");
-    }
+                assert_eq!(prelude.label(), "<core>");
+                assert_eq!(prelude.code(), "fn p() {}");
+            }
 
-    #[test]
-    fn new_frontend_rejects_cfg_flags() {
-        let error = unsupported_error(None, &[], &[], &["os=wasm".to_string()]);
+            #[test]
+            fn core_modules() {
+                let bundle = bundle_from_sources(
+                    String::new(),
+                    sources(&[("core_int", "extend int {}")]),
+                    HashMap::new(),
+                )
+                .unwrap();
+                let modules = bundle.core_modules();
 
-        assert_eq!(error, "--new-frontend does not support --cfg yet");
-    }
+                assert_eq!(modules.len(), 1);
+                assert_eq!(modules[0].path(), path(&["core_int"]));
+                assert_eq!(modules[0].label(), "<core.core_int>");
+                assert_eq!(modules[0].code(), "extend int {}");
+                assert_eq!(bundle.always_active_modules(), &[path(&["core_int"])]);
+            }
 
-    #[test]
-    fn new_frontend_rejects_lint_flags() {
-        let error = unsupported_error(None, &["internal_access=allow".to_string()], &[], &[]);
+            #[test]
+            fn std_root() {
+                let bundle = bundle_from_sources(
+                    String::new(),
+                    HashMap::new(),
+                    sources(&[("math", "extern fn sin(x: float) -> float;")]),
+                )
+                .unwrap();
+                let module = bundle.std_module(&path(&["std", "math"])).unwrap();
 
-        assert_eq!(error, "--new-frontend does not support --lint yet");
-    }
+                assert_eq!(module.path(), path(&["std", "math"]));
+                assert_eq!(module.label(), "<std.math>");
+                assert_eq!(module.code(), "extern fn sin(x: float) -> float;");
+            }
 
-    #[test]
-    fn new_frontend_rejects_manifest_lint_config() {
-        let mut manifest = plain_manifest();
-        manifest.lint.internal_access = LintLevel::Error;
+            #[test]
+            fn orders_modules() {
+                let bundle = bundle_from_sources(
+                    String::new(),
+                    sources(&[
+                        ("core_string", "extend string {}"),
+                        ("core_int", "extend int {}"),
+                    ]),
+                    sources(&[("maps", ""), ("math", "")]),
+                )
+                .unwrap();
+                let core_paths = bundle
+                    .core_modules()
+                    .iter()
+                    .map(|module| module.path().to_vec())
+                    .collect::<Vec<_>>();
 
-        let error = unsupported_error(Some(&manifest), &[], &[], &[]);
+                assert_eq!(core_paths, [path(&["core_int"]), path(&["core_string"])]);
+                assert_eq!(bundle.always_active_modules(), core_paths);
+            }
 
-        assert_eq!(
-            error,
-            "--new-frontend does not support lint configuration yet"
-        );
-    }
+            #[test]
+            fn rejects_bad_builtin_name() {
+                let error = bundle_from_sources(
+                    String::new(),
+                    sources(&[("", "extend int {}")]),
+                    HashMap::new(),
+                )
+                .expect_err("empty built-in module name should be invalid");
 
-    #[test]
-    fn new_frontend_rejects_manifest_externs() {
-        let mut manifest = plain_manifest();
-        manifest.externs.insert(
-            "engine".to_string(),
-            ExternEntry {
-                path: "externs/engine".to_string(),
-            },
-        );
+                assert!(error.contains("module path must not contain empty segments"));
+            }
 
-        let error = unsupported_error(Some(&manifest), &[], &[], &[]);
+            #[test]
+            fn clean_frontend_core_surface_is_explicit() {
+                let bundle = new_frontend_source_bundle().unwrap();
+                let core_paths = bundle
+                    .core_modules()
+                    .iter()
+                    .map(|module| module.path().to_vec())
+                    .collect::<Vec<_>>();
+                let expected = [
+                    path(&["core_float"]),
+                    path(&["core_int"]),
+                    path(&["core_string"]),
+                ];
 
-        assert_eq!(
-            error,
-            "--new-frontend does not support extern providers yet"
-        );
-    }
+                assert_eq!(core_paths, expected);
+                assert_eq!(bundle.always_active_modules(), expected);
+                let prelude = bundle.core_prelude().unwrap().code();
+                assert!(prelude.contains("enum Option<T>"));
+                assert!(prelude.contains("struct Range<T>"));
+            }
 
-    #[test]
-    fn new_frontend_accepts_plain_manifest_entry() {
-        let manifest = plain_manifest();
+            #[test]
+            fn clean_frontend_std_surface_is_explicit() {
+                let bundle = new_frontend_source_bundle().unwrap();
 
-        reject_unsupported_new_frontend_inputs(Some(&manifest), &[], &[], &[]).unwrap();
+                assert_eq!(sorted_std_paths(&bundle), [path(&["std", "mem"])]);
+            }
+
+            #[test]
+            fn clean_frontend_bundle_has_no_legacy_type_spellings() {
+                let bundle = new_frontend_source_bundle().unwrap();
+                let mut code = String::new();
+                code.push_str(bundle.core_prelude().unwrap().code());
+                for module in bundle.core_modules() {
+                    code.push_str(module.code());
+                }
+                for module in bundle.std_modules() {
+                    code.push_str(module.code());
+                }
+
+                assert!(!code.contains("double"));
+                assert!(!code.contains("PI_D"));
+                assert!(!code.contains("EPSILON_D"));
+                assert!(!code.contains("Option<string>"));
+                assert!(!code.contains("Option<int>"));
+                assert!(!code.contains("Option<float>"));
+                assert!(!code.contains("Option<bool>"));
+                assert!(!code.contains("Option<any>"));
+            }
+        }
+
+        mod integration {
+            use super::*;
+
+            #[test]
+            fn exposed_std_mem_is_importable() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(&temp, "main.anv", "import std.mem; fn main() {}");
+
+                new_frontend_cmd(&main).unwrap();
+            }
+
+            #[test]
+            fn unexposed_std_math_is_not_visible() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(&temp, "main.anv", "import std.math; fn main() {}");
+                let error = new_frontend_cmd(&main).expect_err("std.math should not be exposed");
+
+                assert!(error.contains("frontend resolve failed"));
+            }
+        }
+
+        mod unsupported {
+            use super::*;
+
+            #[test]
+            fn feature_flags() {
+                let error = unsupported_error(None, &[], &["demo".to_string()], &[]);
+
+                assert_eq!(error, "--new-frontend does not support --feature yet");
+            }
+
+            #[test]
+            fn cfg_flags() {
+                let error = unsupported_error(None, &[], &[], &["os=wasm".to_string()]);
+
+                assert_eq!(error, "--new-frontend does not support --cfg yet");
+            }
+
+            #[test]
+            fn lint_flags() {
+                let error =
+                    unsupported_error(None, &["internal_access=allow".to_string()], &[], &[]);
+
+                assert_eq!(error, "--new-frontend does not support --lint yet");
+            }
+
+            #[test]
+            fn manifest_lint() {
+                let mut manifest = plain_manifest();
+                manifest.lint.internal_access = LintLevel::Error;
+
+                let error = unsupported_error(Some(&manifest), &[], &[], &[]);
+
+                assert_eq!(
+                    error,
+                    "--new-frontend does not support lint configuration yet"
+                );
+            }
+
+            #[test]
+            fn manifest_externs() {
+                let mut manifest = plain_manifest();
+                manifest.externs.insert(
+                    "engine".to_string(),
+                    ExternEntry {
+                        path: "externs/engine".to_string(),
+                    },
+                );
+
+                let error = unsupported_error(Some(&manifest), &[], &[], &[]);
+
+                assert_eq!(
+                    error,
+                    "--new-frontend does not support extern providers yet"
+                );
+            }
+
+            #[test]
+            fn accepts_plain_manifest() {
+                let manifest = plain_manifest();
+
+                reject_new_frontend_inputs(Some(&manifest), &[], &[], &[]).unwrap();
+            }
+        }
     }
 }

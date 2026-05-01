@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: no field named 'z'
+// @frontend: new
+// @contains: Unknown field 'z'
 
 extern type Point {
     x: float;

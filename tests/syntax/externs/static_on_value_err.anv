@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: static method
+// @frontend: new
+// @contains: Unknown method 'new'
 
 extern type Point {
     x: float;

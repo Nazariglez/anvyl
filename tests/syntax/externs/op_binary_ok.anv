@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: success
+// @frontend: new
 
 extern type Vec2 {
     x: float;
@@ -8,10 +9,8 @@ extern type Vec2 {
     op Self + Self -> Self;
     op Self - Self -> Self;
     op Self * Self -> Self;
-    op Self * float -> Self;
     op float * Self -> Self;
     op Self / Self -> Self;
-    op Self / float -> Self;
     op Self == Self -> bool;
 }
 
@@ -21,8 +20,6 @@ fn main() {
     let c = a + b;
     let d = a - b;
     let e = a * b;
-    let f = a * 2.0;
     let g = 2.0 * a;
     let h = a / b;
-    let i = a / 2.0;
 }

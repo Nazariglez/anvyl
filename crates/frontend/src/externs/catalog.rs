@@ -16,9 +16,7 @@ use crate::{
         raw_module_scope,
     },
     resolve::ModulePath,
-    typecheck::{
-        CallableId, DeclarationIndex, ModuleScope, NominalKey, TypeRefError, type_closure_facts,
-    },
+    typecheck::{DeclarationIndex, ModuleScope, NominalKey, TypeRefError, type_closure_facts},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,7 +76,7 @@ pub(crate) struct TypeKey {
     pub(crate) name: Ident,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResolvedExternSignature {
     pub(crate) params: Vec<ResolvedExternParam>,
     pub(crate) ret: ResolvedExternTy,
@@ -116,7 +114,18 @@ impl ResolvedExternParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedExternTy {
     pub(crate) ty: Type,
-    pub(crate) contains_any: bool,
+}
+
+impl ResolvedExternTy {
+    pub(crate) fn contains_any(&self) -> bool {
+        type_closure_facts(&self.ty).contains_any
+    }
+}
+
+impl Default for ResolvedExternTy {
+    fn default() -> Self {
+        Self { ty: Type::Void }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -126,13 +135,21 @@ pub(crate) struct ExternCatalog {
     functions: Vec<ExternFunction>,
     functions_by_key: HashMap<FunctionKey, ExternFunctionId>,
     types_by_key: HashMap<TypeKey, ExternTypeId>,
-    functions_by_callable: HashMap<CallableId, ExternFunctionId>,
     types_by_nominal: HashMap<NominalKey, ExternTypeId>,
 }
 
 impl ExternCatalog {
     pub(crate) fn functions(&self) -> impl Iterator<Item = &ExternFunction> {
         self.functions.iter()
+    }
+
+    pub(crate) fn functions_in_scope<'a>(
+        &'a self,
+        scope: &'a ModuleScope,
+    ) -> impl Iterator<Item = &'a ExternFunction> {
+        self.functions
+            .iter()
+            .filter(move |function| &function.key.module == scope)
     }
 
     pub(crate) fn for_each_resolved_ty(
@@ -176,10 +193,6 @@ impl ExternCatalog {
 
     pub(crate) fn type_by_key(&self, key: &TypeKey) -> Option<ExternTypeId> {
         self.types_by_key.get(key).copied()
-    }
-
-    pub(crate) fn function_by_callable(&self, id: &CallableId) -> Option<ExternFunctionId> {
-        self.functions_by_callable.get(id).copied()
     }
 
     pub(crate) fn type_by_nominal(&self, key: &NominalKey) -> Option<ExternTypeId> {
@@ -254,13 +267,6 @@ fn debug_assert_consistent(catalog: &ExternCatalog) {
         for id in &module.functions {
             let function = catalog.function(*id);
             debug_assert_eq!(catalog.function_by_key(&function.key), Some(*id));
-            debug_assert_eq!(
-                catalog.function_by_callable(&CallableId::extern_function(
-                    function.key.module.clone(),
-                    function.key.name
-                )),
-                Some(*id)
-            );
         }
         for id in &module.types {
             let ty = catalog.ty(*id);
@@ -670,16 +676,13 @@ impl<'a> CatalogBuilder<'a> {
             };
             self.catalog.modules[module_id.0].functions.push(id);
             self.catalog.functions_by_key.insert(key.clone(), id);
-            self.catalog
-                .functions_by_callable
-                .insert(CallableId::extern_function(scope.clone(), name), id);
             self.catalog.functions.push(ExternFunction {
                 id,
                 key,
                 provenance: provenance.clone(),
                 site: raw_func.site,
                 doc: raw_func.decl.doc.clone(),
-                signature: empty_signature(),
+                signature: ResolvedExternSignature::default(),
                 effects: raw_func.decl.effects,
             });
         }
@@ -886,10 +889,8 @@ impl<'a> CatalogBuilder<'a> {
     }
 
     fn resolve_ty(&mut self, ctx: ResolveCtx<'_>, ty: &ExternTypeExpr) -> ResolvedExternTy {
-        let ty = self.resolve_ty_inner(ctx, ty);
         ResolvedExternTy {
-            contains_any: type_closure_facts(&ty).contains_any,
-            ty,
+            ty: self.resolve_ty_inner(ctx, ty),
         }
     }
 
@@ -1297,20 +1298,6 @@ fn invalid_type(
     }
 }
 
-fn empty_signature() -> ResolvedExternSignature {
-    ResolvedExternSignature {
-        params: vec![],
-        ret: empty_resolved_ty(),
-    }
-}
-
-fn empty_resolved_ty() -> ResolvedExternTy {
-    ResolvedExternTy {
-        ty: Type::Void,
-        contains_any: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use anvyx_externs::{
@@ -1327,7 +1314,7 @@ mod tests {
         lexer::tokenize,
         parser,
         resolve::{ModuleKey, ModulePath, ResolveResult, ResolvedModule},
-        typecheck::{CallableId, DeclarationIndex},
+        typecheck::DeclarationIndex,
     };
 
     #[derive(Default)]
@@ -1351,23 +1338,12 @@ mod tests {
             id
         }
 
-        fn function(
-            &mut self,
-            module: ExternModuleId,
-            key: FunctionKey,
-            callable: CallableId,
-        ) -> ExternFunctionId {
+        fn function(&mut self, module: ExternModuleId, key: FunctionKey) -> ExternFunctionId {
             let id = ExternFunctionId(self.catalog.functions.len());
             assert!(
                 self.catalog
                     .functions_by_key
                     .insert(key.clone(), id)
-                    .is_none()
-            );
-            assert!(
-                self.catalog
-                    .functions_by_callable
-                    .insert(callable, id)
                     .is_none()
             );
             self.catalog.modules[module.0].functions.push(id);
@@ -1377,7 +1353,7 @@ mod tests {
                 provenance: source_provenance(),
                 site: RawExternSite::default(),
                 doc: None,
-                signature: empty_signature(),
+                signature: ResolvedExternSignature::default(),
                 effects: ExternEffects::default(),
             });
             id
@@ -1457,7 +1433,7 @@ mod tests {
                 id,
                 name,
                 receiver: ReceiverMode::Shared,
-                signature: empty_signature(),
+                signature: ResolvedExternSignature::default(),
                 effects: ExternEffects::default(),
                 site: RawExternSite::default(),
                 doc: None,
@@ -1472,7 +1448,7 @@ mod tests {
             ty.statics.push(ExternStatic {
                 id,
                 name,
-                signature: empty_signature(),
+                signature: ResolvedExternSignature::default(),
                 effects: ExternEffects::default(),
                 site: RawExternSite::default(),
                 doc: None,
@@ -1487,7 +1463,7 @@ mod tests {
             ty.operators.push(ExternOperatorDecl {
                 id,
                 op,
-                signature: empty_signature(),
+                signature: ResolvedExternSignature::default(),
                 effects: ExternEffects::default(),
                 site: RawExternSite::default(),
             });
@@ -1501,22 +1477,8 @@ mod tests {
         }
     }
 
-    fn empty_signature() -> ResolvedExternSignature {
-        ResolvedExternSignature {
-            params: vec![],
-            ret: void_ty(),
-        }
-    }
-
-    fn void_ty() -> ResolvedExternTy {
-        resolved_ty(Type::Void)
-    }
-
     fn resolved_ty(ty: Type) -> ResolvedExternTy {
-        ResolvedExternTy {
-            contains_any: type_closure_facts(&ty).contains_any,
-            ty,
-        }
+        ResolvedExternTy { ty }
     }
 
     fn unresolved_ty(name: &str) -> ResolvedExternTy {
@@ -1654,918 +1616,997 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolved_type_visitor_covers_all_member_positions() {
-        let mut builder = CatalogBuilder::default();
-        let module = builder.module(ModuleScope::Root);
-        let function = builder.function(
-            module,
-            function_key(ModuleScope::Root, "free"),
-            CallableId::extern_function(ModuleScope::Root, ident("free")),
-        );
-        let owner = builder.ty(
-            module,
-            type_key(ModuleScope::Root, "Host"),
-            nominal(ModuleScope::Root, "Host"),
-        );
-        let field = builder.field(owner, ident("field"));
-        let method = builder.method(owner, ident("method"));
-        let static_method = builder.static_method(owner, ident("static_method"));
-        let operator = builder.operator(owner, ExternOperator::Unary(UnaryOp::Neg));
-        let mut catalog = builder.finish();
+    mod member_validation {
+        use super::*;
 
-        catalog.functions[function.0].signature = ResolvedExternSignature {
-            params: vec![ResolvedExternParam {
-                name: None,
-                ty: unresolved_ty("FreeParam"),
-                flow: ParamFlow::Value,
-            }],
-            ret: unresolved_ty("FreeRet"),
-        };
-        catalog.types[owner.0].fields[field.0].ty = unresolved_ty("Field");
-        catalog.types[owner.0].init = Some(ExternInit {
-            field_init: vec![],
-            site: RawExternSite::default(),
-        });
-        catalog.types[owner.0].methods[method.0].signature = ResolvedExternSignature {
-            params: vec![ResolvedExternParam {
-                name: None,
-                ty: unresolved_ty("MethodParam"),
-                flow: ParamFlow::Value,
-            }],
-            ret: unresolved_ty("MethodRet"),
-        };
-        catalog.types[owner.0].statics[static_method.0].signature = ResolvedExternSignature {
-            params: vec![],
-            ret: unresolved_ty("StaticRet"),
-        };
-        catalog.types[owner.0].operators[operator.0].signature = ResolvedExternSignature {
-            params: vec![ResolvedExternParam {
-                name: None,
-                ty: unresolved_ty("OperatorParam"),
-                flow: ParamFlow::Value,
-            }],
-            ret: unresolved_ty("OperatorRet"),
-        };
+        #[test]
+        fn visits_member_types() {
+            let mut builder = CatalogBuilder::default();
+            let module = builder.module(ModuleScope::Root);
+            let function = builder.function(module, function_key(ModuleScope::Root, "free"));
+            let owner = builder.ty(
+                module,
+                type_key(ModuleScope::Root, "Host"),
+                nominal(ModuleScope::Root, "Host"),
+            );
+            let field = builder.field(owner, ident("field"));
+            let method = builder.method(owner, ident("method"));
+            let static_method = builder.static_method(owner, ident("static_method"));
+            let operator = builder.operator(owner, ExternOperator::Unary(UnaryOp::Neg));
+            let mut catalog = builder.finish();
 
-        let mut names = vec![];
-        catalog.for_each_resolved_ty(|ty, _| {
-            if let Type::UnresolvedName(name) = ty.ty {
-                names.push(name.to_string());
-            }
-        });
-        names.sort();
+            catalog.functions[function.0].signature = ResolvedExternSignature {
+                params: vec![ResolvedExternParam {
+                    name: None,
+                    ty: unresolved_ty("FreeParam"),
+                    flow: ParamFlow::Value,
+                }],
+                ret: unresolved_ty("FreeRet"),
+            };
+            catalog.types[owner.0].fields[field.0].ty = unresolved_ty("Field");
+            catalog.types[owner.0].init = Some(ExternInit {
+                field_init: vec![],
+                site: RawExternSite::default(),
+            });
+            catalog.types[owner.0].methods[method.0].signature = ResolvedExternSignature {
+                params: vec![ResolvedExternParam {
+                    name: None,
+                    ty: unresolved_ty("MethodParam"),
+                    flow: ParamFlow::Value,
+                }],
+                ret: unresolved_ty("MethodRet"),
+            };
+            catalog.types[owner.0].statics[static_method.0].signature = ResolvedExternSignature {
+                params: vec![],
+                ret: unresolved_ty("StaticRet"),
+            };
+            catalog.types[owner.0].operators[operator.0].signature = ResolvedExternSignature {
+                params: vec![ResolvedExternParam {
+                    name: None,
+                    ty: unresolved_ty("OperatorParam"),
+                    flow: ParamFlow::Value,
+                }],
+                ret: unresolved_ty("OperatorRet"),
+            };
 
-        assert_eq!(
-            names,
-            [
-                "Field",
-                "FreeParam",
-                "FreeRet",
-                "MethodParam",
-                "MethodRet",
-                "OperatorParam",
-                "OperatorRet",
-                "StaticRet",
-            ]
-        );
+            let mut names = vec![];
+            catalog.for_each_resolved_ty(|ty, _| {
+                if let Type::UnresolvedName(name) = ty.ty {
+                    names.push(name.to_string());
+                }
+            });
+            names.sort();
+
+            assert_eq!(
+                names,
+                [
+                    "Field",
+                    "FreeParam",
+                    "FreeRet",
+                    "MethodParam",
+                    "MethodRet",
+                    "OperatorParam",
+                    "OperatorRet",
+                    "StaticRet",
+                ]
+            );
+        }
     }
 
-    #[test]
-    fn provider_unqualified_type_is_local() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["math"]),
-            types: vec![descriptor_type("Vec2")],
-            functions: vec![ExternFunctionDescriptor {
-                name: "len".to_string(),
-                doc: None,
-                signature: ext_signature(vec![ext_param("v", named("Vec2"))], named("Vec2")),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[], &raw);
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let function = catalog.function(
-            catalog
-                .function_by_key(&function_key(scope("math"), "len"))
-                .unwrap(),
-        );
+    mod resolution {
+        use super::*;
 
-        assert_eq!(
-            function.signature.params[0].ty.ty,
-            Type::nominal(
-                NominalKind::Extern,
-                ident("Vec2"),
-                vec![],
-                vec![],
-                Some(vec!["math".to_string()].into())
-            )
-        );
-        assert!(!function.signature.params[0].ty.contains_any);
-    }
+        #[test]
+        fn builds_mixed_sources() {
+            let mut raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![descriptor_type("Handle")],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "make".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![], named("Handle")),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            raw.append(source_raw(
+                "extern type Local { value: int; init; } extern fn use_local(x: Local) -> void;",
+                &[],
+            ));
+            let decls = decls(
+                "extern type Local { value: int; init; } extern fn use_local(x: Local) -> void;",
+                &[],
+                &raw,
+            );
+            let catalog = build_catalog(raw, &decls).unwrap();
 
-    #[test]
-    fn provider_absolute_type_uses_export() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["math"]),
-            types: vec![descriptor_type("Vec2")],
-            functions: vec![ExternFunctionDescriptor {
-                name: "make".to_string(),
-                doc: None,
-                signature: ext_signature(vec![], module_named(&["math"], "Vec2")),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[], &raw);
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let function = catalog.function(
-            catalog
-                .function_by_key(&function_key(scope("math"), "make"))
-                .unwrap(),
-        );
+            assert!(
+                catalog
+                    .type_by_key(&type_key(scope("host"), "Handle"))
+                    .is_some()
+            );
+            assert!(
+                catalog
+                    .function_by_key(&function_key(scope("host"), "make"))
+                    .is_some()
+            );
+            assert!(
+                catalog
+                    .type_by_key(&type_key(ModuleScope::Root, "Local"))
+                    .is_some()
+            );
+            assert!(
+                catalog
+                    .function_by_key(&function_key(ModuleScope::Root, "use_local"))
+                    .is_some()
+            );
+        }
 
-        assert!(matches!(function.signature.ret.ty, Type::Nominal(_)));
-    }
+        #[test]
+        fn provider_unqualified_type_is_local() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["math"]),
+                types: vec![descriptor_type("Vec2")],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "len".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![ext_param("v", named("Vec2"))], named("Vec2")),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let function = catalog.function(
+                catalog
+                    .function_by_key(&function_key(scope("math"), "len"))
+                    .unwrap(),
+            );
 
-    #[test]
-    fn provider_absolute_type_uses_source_export() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![],
-            functions: vec![ExternFunctionDescriptor {
-                name: "make".to_string(),
-                doc: None,
-                signature: ext_signature(vec![], module_named(&["geom"], "Point")),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[("geom", "pub struct Point { x: int }")], &raw);
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let function = catalog.function(
-            catalog
-                .function_by_key(&function_key(scope("host"), "make"))
-                .unwrap(),
-        );
+            assert_eq!(
+                function.signature.params[0].ty.ty,
+                Type::nominal(
+                    NominalKind::Extern,
+                    ident("Vec2"),
+                    vec![],
+                    vec![],
+                    Some(vec!["math".to_string()].into())
+                )
+            );
+            assert!(!function.signature.params[0].ty.contains_any());
+        }
 
-        assert_eq!(
-            function.signature.ret.ty,
-            Type::nominal(
-                NominalKind::Struct,
-                ident("Point"),
-                vec![],
-                vec![],
-                Some(vec!["geom".to_string()].into())
-            )
-        );
-    }
+        #[test]
+        fn provider_absolute_type_uses_export() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["math"]),
+                types: vec![descriptor_type("Vec2")],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "make".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![], module_named(&["math"], "Vec2")),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let function = catalog.function(
+                catalog
+                    .function_by_key(&function_key(scope("math"), "make"))
+                    .unwrap(),
+            );
 
-    #[test]
-    fn provider_unqualified_type_ignores_source_imports() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![],
-            functions: vec![ExternFunctionDescriptor {
-                name: "bad".to_string(),
-                doc: None,
-                signature: ext_signature(vec![], named("Point")),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls(
-            "",
-            &[
-                ("host", "import geom { Point };"),
-                ("geom", "pub struct Point { x: int }"),
-            ],
-            &raw,
-        );
-        let errors = build_catalog(raw, &decls).unwrap_err();
+            assert!(matches!(function.signature.ret.ty, Type::Nominal(_)));
+        }
 
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::UnknownType { name, .. }) if *name == ident("Point")
-        ));
-    }
+        #[test]
+        fn provider_absolute_type_uses_source_export() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "make".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![], module_named(&["geom"], "Point")),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[("geom", "pub struct Point { x: int }")], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let function = catalog.function(
+                catalog
+                    .function_by_key(&function_key(scope("host"), "make"))
+                    .unwrap(),
+            );
 
-    #[test]
-    fn provider_unqualified_type_uses_merged_source() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![],
-            functions: vec![ExternFunctionDescriptor {
-                name: "make".to_string(),
-                doc: None,
-                signature: ext_signature(vec![], named("Local")),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[("host", "pub struct Local { x: int }")], &raw);
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let function = catalog.function(
-            catalog
-                .function_by_key(&function_key(scope("host"), "make"))
-                .unwrap(),
-        );
+            assert_eq!(
+                function.signature.ret.ty,
+                Type::nominal(
+                    NominalKind::Struct,
+                    ident("Point"),
+                    vec![],
+                    vec![],
+                    Some(vec!["geom".to_string()].into())
+                )
+            );
+        }
 
-        assert_eq!(
-            function.signature.ret.ty,
-            Type::nominal(
-                NominalKind::Struct,
-                ident("Local"),
-                vec![],
-                vec![],
-                Some(vec!["host".to_string()].into())
-            )
-        );
-    }
+        #[test]
+        fn provider_local_ignores_imports() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "bad".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![], named("Point")),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls(
+                "",
+                &[
+                    ("host", "import geom { Point };"),
+                    ("geom", "pub struct Point { x: int }"),
+                ],
+                &raw,
+            );
+            let errors = build_catalog(raw, &decls).unwrap_err();
 
-    #[test]
-    fn source_rejects_absolute_provider_path() {
-        let raw = RawExterns {
-            groups: vec![crate::externs::raw::RawExternGroup {
-                provenance: ExternProvenance::Source {
-                    module: RawExternScope::Root,
-                },
-                modules: vec![RawExternModule {
-                    scope: RawExternScope::Root,
-                    types: vec![],
-                    functions: vec![RawExternFunction {
-                        decl: ExternFunctionDescriptor {
-                            name: "bad".to_string(),
-                            doc: None,
-                            signature: ext_signature(
-                                vec![],
-                                module_named(&["geom", "types"], "Point"),
-                            ),
-                            effects: ExternEffects::default(),
-                        },
-                        site: RawExternSite::default(),
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::UnknownType { name, .. }) if *name == ident("Point")
+            ));
+        }
+
+        #[test]
+        fn provider_local_uses_merged_source() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "make".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![], named("Local")),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[("host", "pub struct Local { x: int }")], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let function = catalog.function(
+                catalog
+                    .function_by_key(&function_key(scope("host"), "make"))
+                    .unwrap(),
+            );
+
+            assert_eq!(
+                function.signature.ret.ty,
+                Type::nominal(
+                    NominalKind::Struct,
+                    ident("Local"),
+                    vec![],
+                    vec![],
+                    Some(vec!["host".to_string()].into())
+                )
+            );
+        }
+
+        #[test]
+        fn source_rejects_absolute_provider_path() {
+            let raw = RawExterns {
+                groups: vec![crate::externs::raw::RawExternGroup {
+                    provenance: ExternProvenance::Source {
+                        module: RawExternScope::Root,
+                    },
+                    modules: vec![RawExternModule {
+                        scope: RawExternScope::Root,
+                        types: vec![],
+                        functions: vec![RawExternFunction {
+                            decl: ExternFunctionDescriptor {
+                                name: "bad".to_string(),
+                                doc: None,
+                                signature: ext_signature(
+                                    vec![],
+                                    module_named(&["geom", "types"], "Point"),
+                                ),
+                                effects: ExternEffects::default(),
+                            },
+                            site: RawExternSite::default(),
+                        }],
                     }],
                 }],
-            }],
-        };
-        let root = parse("");
-        let resolved = ResolveResult {
-            module_groups: vec![vec![ResolvedModule {
-                key: ModuleKey::Named(
-                    ModulePath::new(vec!["geom".to_string(), "types".to_string()]).unwrap(),
-                ),
-                program: parse("pub struct Point { x: int }"),
-            }]],
-        };
-        let decls = DeclarationIndex::from_root_and_modules(
-            &root,
-            &resolved,
-            std::collections::HashSet::default(),
-            &raw,
-        );
-        let errors = build_catalog(raw, &decls).unwrap_err();
+            };
+            let root = parse("");
+            let resolved = ResolveResult {
+                module_groups: vec![vec![ResolvedModule {
+                    key: ModuleKey::Named(
+                        ModulePath::new(vec!["geom".to_string(), "types".to_string()]).unwrap(),
+                    ),
+                    program: parse("pub struct Point { x: int }"),
+                }]],
+            };
+            let decls = DeclarationIndex::from_root_and_modules(
+                &root,
+                &resolved,
+                std::collections::HashSet::default(),
+                &raw,
+            );
+            let errors = build_catalog(raw, &decls).unwrap_err();
 
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::UnknownType {
-                name,
-                module: Some(ModuleScope::Named(module)),
-                ..
-            }) if *name == ident("Point") && module.segments() == ["geom", "types"]
-        ));
-    }
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::UnknownType {
+                    name,
+                    module: Some(ModuleScope::Named(module)),
+                    ..
+                }) if *name == ident("Point") && module.segments() == ["geom", "types"]
+            ));
+        }
 
-    #[test]
-    fn source_type_uses_import_alias() {
-        let raw = source_raw(
-            "import geom as g; extern fn make() -> g.Point;",
-            &[("geom", "pub struct Point { x: int }")],
-        );
-        let decls = decls(
-            "import geom as g; extern fn make() -> g.Point;",
-            &[("geom", "pub struct Point { x: int }")],
-            &raw,
-        );
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let function = catalog.function(
-            catalog
-                .function_by_key(&function_key(ModuleScope::Root, "make"))
-                .unwrap(),
-        );
-
-        assert_eq!(
-            function.signature.ret.ty,
-            Type::nominal(
-                NominalKind::Struct,
-                ident("Point"),
-                vec![],
-                vec![],
-                Some(vec!["geom".to_string()].into())
-            )
-        );
-    }
-
-    #[test]
-    fn self_resolves_in_members() {
-        let source = "extern type Handle { next: Self; init; fn same(self, other: Self) -> Self; fn make() -> Self; op Self + Self -> Self; op - Self -> Self; }";
-        let raw = source_raw(source, &[]);
-        let decls = decls(source, &[], &raw);
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let owner = catalog
-            .type_by_key(&type_key(ModuleScope::Root, "Handle"))
-            .unwrap();
-        let self_ty = Type::nominal(NominalKind::Extern, ident("Handle"), vec![], vec![], None);
-
-        assert_eq!(
-            catalog.field(owner, ident("next")).unwrap().1.ty.ty,
-            self_ty
-        );
-        assert!(catalog.init(owner).is_some());
-        assert_eq!(
-            catalog
-                .method(owner, ident("same"))
-                .unwrap()
-                .1
-                .signature
-                .params[0]
-                .ty
-                .ty,
-            self_ty
-        );
-        assert_eq!(
-            catalog
-                .method(owner, ident("same"))
-                .unwrap()
-                .1
-                .signature
-                .ret
-                .ty,
-            self_ty
-        );
-        assert_eq!(
-            catalog
-                .static_method(owner, ident("make"))
-                .unwrap()
-                .1
-                .signature
-                .ret
-                .ty,
-            self_ty
-        );
-        assert_eq!(
-            catalog
-                .binary_operator(owner, BinaryOp::Add, false)
-                .unwrap()
-                .1
-                .signature
-                .params[0]
-                .ty
-                .ty,
-            self_ty
-        );
-        assert_eq!(
-            catalog
-                .unary_operator(owner, UnaryOp::Neg)
-                .unwrap()
-                .1
-                .signature
-                .ret
-                .ty,
-            self_ty
-        );
-    }
-
-    #[test]
-    fn recursive_containers_and_any_resolve() {
-        let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-            params: vec![ExternTypeExpr::Any],
-            ret: Box::new(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))),
-            policy: CallbackPolicy {
-                escape: CallbackEscape::Escaping,
-                thread: CallbackThread::SameThread,
-            },
-        });
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![],
-            functions: vec![ExternFunctionDescriptor {
-                name: "use_cb".to_string(),
-                doc: None,
-                signature: ext_signature(
-                    vec![ext_param(
-                        "callbacks",
-                        ExternTypeExpr::List(Box::new(ExternTypeExpr::Map(
-                            Box::new(ExternTypeExpr::String),
-                            Box::new(callback),
-                        ))),
-                    )],
-                    ExternTypeExpr::Void,
-                ),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[], &raw);
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let param = &catalog
-            .function(
+        #[test]
+        fn source_type_uses_import_alias() {
+            let raw = source_raw(
+                "import geom as g; extern fn make() -> g.Point;",
+                &[("geom", "pub struct Point { x: int }")],
+            );
+            let decls = decls(
+                "import geom as g; extern fn make() -> g.Point;",
+                &[("geom", "pub struct Point { x: int }")],
+                &raw,
+            );
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let function = catalog.function(
                 catalog
-                    .function_by_key(&function_key(scope("host"), "use_cb"))
+                    .function_by_key(&function_key(ModuleScope::Root, "make"))
                     .unwrap(),
-            )
-            .signature
-            .params[0]
-            .ty;
+            );
 
-        assert!(param.contains_any);
-        let Type::List { elem } = &param.ty else {
-            panic!("expected list");
-        };
-        let Type::Map { value, .. } = elem.as_ref() else {
-            panic!("expected map");
-        };
-        let Type::Func { params, ret } = value.as_ref() else {
-            panic!("expected callback");
-        };
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0].ty, Type::Any);
-        assert_eq!(ret.as_ref(), &Type::option_of(Type::Int));
-    }
-
-    #[test]
-    fn unknown_provider_type_fails_catalog_build() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![],
-            functions: vec![ExternFunctionDescriptor {
-                name: "bad".to_string(),
-                doc: None,
-                signature: ext_signature(vec![], named("Missing")),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[], &raw);
-        let errors = build_catalog(raw, &decls).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::UnknownType { name, .. }) if *name == ident("Missing")
-        ));
-    }
-
-    #[test]
-    fn wrong_generic_arity_fails_catalog_build() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![],
-            functions: vec![ExternFunctionDescriptor {
-                name: "bad".to_string(),
-                doc: None,
-                signature: ext_signature(
+            assert_eq!(
+                function.signature.ret.ty,
+                Type::nominal(
+                    NominalKind::Struct,
+                    ident("Point"),
                     vec![],
-                    ExternTypeExpr::Named {
-                        module: None,
-                        name: "Box".to_string(),
-                        args: vec![],
-                    },
-                ),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[("host", "pub struct Box<T> { value: T }")], &raw);
-        let errors = build_catalog(raw, &decls).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::GenericArity { name, expected: 1, found: 0, .. })
-                if *name == ident("Box")
-        ));
-    }
-
-    #[test]
-    fn const_generic_target_rejects_type_descriptor_arg() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![],
-            functions: vec![ExternFunctionDescriptor {
-                name: "bad".to_string(),
-                doc: None,
-                signature: ext_signature(
                     vec![],
-                    ExternTypeExpr::Named {
-                        module: None,
-                        name: "ArrayBox".to_string(),
-                        args: vec![ExternTypeExpr::Int],
+                    Some(vec!["geom".to_string()].into())
+                )
+            );
+        }
+
+        #[test]
+        fn source_option_name_uses_visible_type_lookup() {
+            let source = "struct Option<T> { value: T } extern fn maybe() -> Option<int>;";
+            let raw = source_raw(source, &[]);
+            let decls = decls(source, &[], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let function = catalog.function(
+                catalog
+                    .function_by_key(&function_key(ModuleScope::Root, "maybe"))
+                    .unwrap(),
+            );
+
+            assert_eq!(
+                function.signature.ret.ty,
+                Type::nominal(
+                    NominalKind::Struct,
+                    ident("Option"),
+                    vec![Type::Int],
+                    vec![],
+                    None,
+                )
+            );
+        }
+
+        #[test]
+        fn self_resolves_in_members() {
+            let source = "extern type Handle { next: Self; init; fn same(self, other: Self) -> Self; fn make() -> Self; op Self + Self -> Self; op - Self -> Self; }";
+            let raw = source_raw(source, &[]);
+            let decls = decls(source, &[], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let owner = catalog
+                .type_by_key(&type_key(ModuleScope::Root, "Handle"))
+                .unwrap();
+            let self_ty = Type::nominal(NominalKind::Extern, ident("Handle"), vec![], vec![], None);
+
+            assert_eq!(
+                catalog.field(owner, ident("next")).unwrap().1.ty.ty,
+                self_ty
+            );
+            assert!(catalog.init(owner).is_some());
+            assert_eq!(
+                catalog
+                    .method(owner, ident("same"))
+                    .unwrap()
+                    .1
+                    .signature
+                    .params[0]
+                    .ty
+                    .ty,
+                self_ty
+            );
+            assert_eq!(
+                catalog
+                    .method(owner, ident("same"))
+                    .unwrap()
+                    .1
+                    .signature
+                    .ret
+                    .ty,
+                self_ty
+            );
+            assert_eq!(
+                catalog
+                    .static_method(owner, ident("make"))
+                    .unwrap()
+                    .1
+                    .signature
+                    .ret
+                    .ty,
+                self_ty
+            );
+            assert_eq!(
+                catalog
+                    .binary_operator(owner, BinaryOp::Add, false)
+                    .unwrap()
+                    .1
+                    .signature
+                    .params[0]
+                    .ty
+                    .ty,
+                self_ty
+            );
+            assert_eq!(
+                catalog
+                    .unary_operator(owner, UnaryOp::Neg)
+                    .unwrap()
+                    .1
+                    .signature
+                    .ret
+                    .ty,
+                self_ty
+            );
+        }
+
+        #[test]
+        fn recursive_containers_and_any_resolve() {
+            let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+                params: vec![ExternTypeExpr::Any],
+                ret: Box::new(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))),
+                policy: CallbackPolicy {
+                    escape: CallbackEscape::Escaping,
+                    thread: CallbackThread::SameThread,
+                },
+            });
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "use_cb".to_string(),
+                    doc: None,
+                    signature: ext_signature(
+                        vec![ext_param(
+                            "callbacks",
+                            ExternTypeExpr::List(Box::new(ExternTypeExpr::Map(
+                                Box::new(ExternTypeExpr::String),
+                                Box::new(callback),
+                            ))),
+                        )],
+                        ExternTypeExpr::Void,
+                    ),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let param = &catalog
+                .function(
+                    catalog
+                        .function_by_key(&function_key(scope("host"), "use_cb"))
+                        .unwrap(),
+                )
+                .signature
+                .params[0]
+                .ty;
+
+            assert!(param.contains_any());
+            let Type::List { elem } = &param.ty else {
+                panic!("expected list");
+            };
+            let Type::Map { value, .. } = elem.as_ref() else {
+                panic!("expected map");
+            };
+            let Type::Func { params, ret } = value.as_ref() else {
+                panic!("expected callback");
+            };
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0].ty, Type::Any);
+            assert_eq!(ret.as_ref(), &Type::option_of(Type::Int));
+        }
+    }
+
+    mod validation {
+        use super::*;
+
+        #[test]
+        fn unknown_provider_type_fails_catalog_build() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "bad".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![], named("Missing")),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[], &raw);
+            let errors = build_catalog(raw, &decls).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::UnknownType { name, .. }) if *name == ident("Missing")
+            ));
+        }
+
+        #[test]
+        fn wrong_generic_arity_fails_catalog_build() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "bad".to_string(),
+                    doc: None,
+                    signature: ext_signature(
+                        vec![],
+                        ExternTypeExpr::Named {
+                            module: None,
+                            name: "Box".to_string(),
+                            args: vec![],
+                        },
+                    ),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[("host", "pub struct Box<T> { value: T }")], &raw);
+            let errors = build_catalog(raw, &decls).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::GenericArity { name, expected: 1, found: 0, .. })
+                    if *name == ident("Box")
+            ));
+        }
+
+        #[test]
+        fn rejects_type_const_arg() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "bad".to_string(),
+                    doc: None,
+                    signature: ext_signature(
+                        vec![],
+                        ExternTypeExpr::Named {
+                            module: None,
+                            name: "ArrayBox".to_string(),
+                            args: vec![ExternTypeExpr::Int],
+                        },
+                    ),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls(
+                "",
+                &[("host", "pub struct ArrayBox<N: int> { value: [int; N] }")],
+                &raw,
+            );
+            let errors = build_catalog(raw, &decls).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::GenericArgKindMismatch { name, expected: "const", .. })
+                    if *name == ident("ArrayBox")
+            ));
+        }
+
+        #[test]
+        fn init_params_fail() {
+            let source = "extern type Handle { init(x: int); }";
+            let raw = source_raw(source, &[]);
+            let decls = decls(source, &[], &raw);
+            let errors = build_catalog(raw, &decls).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::UnsupportedInitParams {
+                    context: ExternCatalogContext {
+                        item: ExternContextItem::Init { ty, .. },
+                        ..
                     },
-                ),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls(
-            "",
-            &[("host", "pub struct ArrayBox<N: int> { value: [int; N] }")],
-            &raw,
-        );
-        let errors = build_catalog(raw, &decls).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::GenericArgKindMismatch { name, expected: "const", .. })
-                if *name == ident("ArrayBox")
-        ));
-    }
-
-    #[test]
-    fn init_params_fail() {
-        let source = "extern type Handle { init(x: int); }";
-        let raw = source_raw(source, &[]);
-        let decls = decls(source, &[], &raw);
-        let errors = build_catalog(raw, &decls).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::UnsupportedInitParams {
-                context: ExternCatalogContext {
-                    item: ExternContextItem::Init { ty, .. },
+                    count: 1,
                     ..
-                },
-                count: 1,
-                ..
-            }) if *ty == ident("Handle")
-        ));
-    }
+                }) if *ty == ident("Handle")
+            ));
+        }
 
-    #[test]
-    fn init_unknown_field_fails() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![ExternTypeDescriptor {
-                init: Some(ExternInitDescriptor {
-                    params: vec![],
-                    field_init: vec!["missing".to_string()],
-                }),
-                ..descriptor_type("Handle")
-            }],
-            functions: vec![],
-        });
-        let decls = decls("", &[], &raw);
-        let errors = build_catalog(raw, &decls).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::UnknownInitField {
-                context: ExternCatalogContext {
-                    item: ExternContextItem::Init { ty, .. },
-                    ..
-                },
-                field,
-                ..
-            }) if *ty == ident("Handle") && *field == ident("missing")
-        ));
-    }
-
-    #[test]
-    fn init_computed_field_fails() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![ExternTypeDescriptor {
-                fields: vec![ExternFieldDescriptor {
-                    name: "x".to_string(),
-                    ty: ExternTypeExpr::Int,
-                    access: FieldAccess::ReadOnly { computed: true },
-                    doc: None,
+        #[test]
+        fn init_unknown_field_fails() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    init: Some(ExternInitDescriptor {
+                        params: vec![],
+                        field_init: vec!["missing".to_string()],
+                    }),
+                    ..descriptor_type("Handle")
                 }],
-                init: Some(ExternInitDescriptor {
-                    params: vec![],
-                    field_init: vec!["x".to_string()],
-                }),
-                ..descriptor_type("Handle")
-            }],
-            functions: vec![],
-        });
-        let decls = decls("", &[], &raw);
-        let errors = build_catalog(raw, &decls).unwrap_err();
+                functions: vec![],
+            });
+            let decls = decls("", &[], &raw);
+            let errors = build_catalog(raw, &decls).unwrap_err();
 
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::ComputedInitField {
-                context: ExternCatalogContext {
-                    item: ExternContextItem::Init { ty, .. },
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::UnknownInitField {
+                    context: ExternCatalogContext {
+                        item: ExternContextItem::Init { ty, .. },
+                        ..
+                    },
+                    field,
                     ..
-                },
-                field,
-                ..
-            }) if *ty == ident("Handle") && *field == ident("x")
-        ));
-    }
+                }) if *ty == ident("Handle") && *field == ident("missing")
+            ));
+        }
 
-    #[test]
-    fn init_readonly_field_succeeds() {
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![ExternTypeDescriptor {
-                fields: vec![ExternFieldDescriptor {
-                    name: "x".to_string(),
-                    ty: ExternTypeExpr::Int,
-                    access: FieldAccess::ReadOnly { computed: false },
-                    doc: None,
+        #[test]
+        fn init_computed_field_fails() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![ExternFieldDescriptor {
+                        name: "x".to_string(),
+                        ty: ExternTypeExpr::Int,
+                        access: FieldAccess::ReadOnly { computed: true },
+                        doc: None,
+                    }],
+                    init: Some(ExternInitDescriptor {
+                        params: vec![],
+                        field_init: vec!["x".to_string()],
+                    }),
+                    ..descriptor_type("Handle")
                 }],
-                init: Some(ExternInitDescriptor {
-                    params: vec![],
-                    field_init: vec!["x".to_string()],
-                }),
-                ..descriptor_type("Handle")
-            }],
-            functions: vec![],
-        });
-        let decls = decls("", &[], &raw);
+                functions: vec![],
+            });
+            let decls = decls("", &[], &raw);
+            let errors = build_catalog(raw, &decls).unwrap_err();
 
-        assert!(build_catalog(raw, &decls).is_ok());
-    }
-
-    #[test]
-    fn comparison_operator_requires_bool() {
-        let mut builder = CatalogBuilder::default();
-        let module = builder.module(ModuleScope::Root);
-        let ty = builder.ty(
-            module,
-            type_key(ModuleScope::Root, "Vec2"),
-            nominal(ModuleScope::Root, "Vec2"),
-        );
-        let op = builder.operator(
-            ty,
-            ExternOperator::Binary {
-                op: BinaryOp::Eq,
-                self_on_right: false,
-            },
-        );
-        builder.operator_ret(ty, op, Type::Int);
-        let errors = validate_catalog(&builder.finish()).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::InvalidOperatorReturn {
-                context: ExternCatalogContext {
-                    item: ExternContextItem::Operator { ty, .. },
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::ComputedInitField {
+                    context: ExternCatalogContext {
+                        item: ExternContextItem::Init { ty, .. },
+                        ..
+                    },
+                    field,
                     ..
-                },
-                expected: OperatorReturn::Bool,
-                ..
-            }) if *ty == ident("Vec2")
-        ));
-    }
+                }) if *ty == ident("Handle") && *field == ident("x")
+            ));
+        }
 
-    #[test]
-    fn arithmetic_operator_rejects_void() {
-        let mut builder = CatalogBuilder::default();
-        let module = builder.module(ModuleScope::Root);
-        let ty = builder.ty(
-            module,
-            type_key(ModuleScope::Root, "Vec2"),
-            nominal(ModuleScope::Root, "Vec2"),
-        );
-        let op = builder.operator(ty, ExternOperator::Unary(UnaryOp::Neg));
-        builder.operator_ret(ty, op, Type::Void);
-        let errors = validate_catalog(&builder.finish()).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::InvalidOperatorReturn {
-                context: ExternCatalogContext {
-                    item: ExternContextItem::Operator { ty, .. },
-                    ..
-                },
-                expected: OperatorReturn::NonVoid,
-                ..
-            }) if *ty == ident("Vec2")
-        ));
-    }
-
-    #[test]
-    fn callback_with_nested_named_types_validates() {
-        let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-            params: vec![named("Handle")],
-            ret: Box::new(ExternTypeExpr::Option(Box::new(named("Handle")))),
-            policy: CallbackPolicy {
-                escape: CallbackEscape::NonEscaping,
-                thread: CallbackThread::SameThread,
-            },
-        });
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![descriptor_type("Handle")],
-            functions: vec![ExternFunctionDescriptor {
-                name: "listen".to_string(),
-                doc: None,
-                signature: ext_signature(vec![ext_param("cb", callback)], ExternTypeExpr::Void),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[], &raw);
-
-        assert!(build_catalog(raw, &decls).is_ok());
-    }
-
-    #[test]
-    fn unresolved_helper_type_fails_validation() {
-        let mut builder = CatalogBuilder::default();
-        let module = builder.module(ModuleScope::Root);
-        let ty = builder.ty(
-            module,
-            type_key(ModuleScope::Root, "Handle"),
-            nominal(ModuleScope::Root, "Handle"),
-        );
-        let field = builder.field(ty, ident("x"));
-        builder.field_ty(ty, field, Type::UnresolvedName(ident("Missing")));
-        let errors = validate_catalog(&builder.finish()).unwrap_err();
-
-        assert!(matches!(
-            errors.first(),
-            Some(ExternCatalogError::InvalidType {
-                reason: InvalidExternTypeReason::Unresolved,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn any_survives_catalog_validation() {
-        let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-            params: vec![ExternTypeExpr::Any],
-            ret: Box::new(ExternTypeExpr::Any),
-            policy: CallbackPolicy {
-                escape: CallbackEscape::Escaping,
-                thread: CallbackThread::SameThread,
-            },
-        });
-        let raw = provider_raw(ExternModuleDescriptor {
-            path: extern_module(&["host"]),
-            types: vec![ExternTypeDescriptor {
-                fields: vec![ExternFieldDescriptor {
-                    name: "value".to_string(),
-                    ty: ExternTypeExpr::Any,
-                    access: FieldAccess::ReadOnly { computed: false },
-                    doc: None,
+        #[test]
+        fn init_readonly_field_succeeds() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![ExternFieldDescriptor {
+                        name: "x".to_string(),
+                        ty: ExternTypeExpr::Int,
+                        access: FieldAccess::ReadOnly { computed: false },
+                        doc: None,
+                    }],
+                    init: Some(ExternInitDescriptor {
+                        params: vec![],
+                        field_init: vec!["x".to_string()],
+                    }),
+                    ..descriptor_type("Handle")
                 }],
-                ..descriptor_type("Box")
-            }],
-            functions: vec![ExternFunctionDescriptor {
-                name: "pass".to_string(),
-                doc: None,
-                signature: ext_signature(
-                    vec![
-                        ext_param("value", ExternTypeExpr::Any),
-                        ext_param("cb", callback),
-                    ],
-                    ExternTypeExpr::Any,
-                ),
-                effects: ExternEffects::default(),
-            }],
-        });
-        let decls = decls("", &[], &raw);
-        let catalog = build_catalog(raw, &decls).unwrap();
-        let function = catalog.function(
-            catalog
-                .function_by_key(&function_key(scope("host"), "pass"))
-                .unwrap(),
-        );
-        let ty = catalog.ty(catalog
-            .type_by_key(&type_key(scope("host"), "Box"))
-            .unwrap());
+                functions: vec![],
+            });
+            let decls = decls("", &[], &raw);
 
-        assert!(function.signature.params[0].ty.contains_any);
-        assert!(function.signature.params[1].ty.contains_any);
-        assert!(function.signature.ret.contains_any);
-        assert!(ty.fields[0].ty.contains_any);
+            assert!(build_catalog(raw, &decls).is_ok());
+        }
+
+        #[test]
+        fn comparison_operator_requires_bool() {
+            let mut builder = CatalogBuilder::default();
+            let module = builder.module(ModuleScope::Root);
+            let ty = builder.ty(
+                module,
+                type_key(ModuleScope::Root, "Vec2"),
+                nominal(ModuleScope::Root, "Vec2"),
+            );
+            let op = builder.operator(
+                ty,
+                ExternOperator::Binary {
+                    op: BinaryOp::Eq,
+                    self_on_right: false,
+                },
+            );
+            builder.operator_ret(ty, op, Type::Int);
+            let errors = validate_catalog(&builder.finish()).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::InvalidOperatorReturn {
+                    context: ExternCatalogContext {
+                        item: ExternContextItem::Operator { ty, .. },
+                        ..
+                    },
+                    expected: OperatorReturn::Bool,
+                    ..
+                }) if *ty == ident("Vec2")
+            ));
+        }
+
+        #[test]
+        fn arithmetic_operator_rejects_void() {
+            let mut builder = CatalogBuilder::default();
+            let module = builder.module(ModuleScope::Root);
+            let ty = builder.ty(
+                module,
+                type_key(ModuleScope::Root, "Vec2"),
+                nominal(ModuleScope::Root, "Vec2"),
+            );
+            let op = builder.operator(ty, ExternOperator::Unary(UnaryOp::Neg));
+            builder.operator_ret(ty, op, Type::Void);
+            let errors = validate_catalog(&builder.finish()).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::InvalidOperatorReturn {
+                    context: ExternCatalogContext {
+                        item: ExternContextItem::Operator { ty, .. },
+                        ..
+                    },
+                    expected: OperatorReturn::NonVoid,
+                    ..
+                }) if *ty == ident("Vec2")
+            ));
+        }
+
+        #[test]
+        fn nested_callback_names() {
+            let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+                params: vec![named("Handle")],
+                ret: Box::new(ExternTypeExpr::Option(Box::new(named("Handle")))),
+                policy: CallbackPolicy {
+                    escape: CallbackEscape::NonEscaping,
+                    thread: CallbackThread::SameThread,
+                },
+            });
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![descriptor_type("Handle")],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "listen".to_string(),
+                    doc: None,
+                    signature: ext_signature(vec![ext_param("cb", callback)], ExternTypeExpr::Void),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[], &raw);
+
+            assert!(build_catalog(raw, &decls).is_ok());
+        }
+
+        #[test]
+        fn unresolved_helper_type_fails_validation() {
+            let mut builder = CatalogBuilder::default();
+            let module = builder.module(ModuleScope::Root);
+            let ty = builder.ty(
+                module,
+                type_key(ModuleScope::Root, "Handle"),
+                nominal(ModuleScope::Root, "Handle"),
+            );
+            let field = builder.field(ty, ident("x"));
+            builder.field_ty(ty, field, Type::UnresolvedName(ident("Missing")));
+            let errors = validate_catalog(&builder.finish()).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::InvalidType {
+                    reason: InvalidExternTypeReason::Unresolved,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn any_survives_catalog_validation() {
+            let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+                params: vec![ExternTypeExpr::Any],
+                ret: Box::new(ExternTypeExpr::Any),
+                policy: CallbackPolicy {
+                    escape: CallbackEscape::Escaping,
+                    thread: CallbackThread::SameThread,
+                },
+            });
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![ExternFieldDescriptor {
+                        name: "value".to_string(),
+                        ty: ExternTypeExpr::Any,
+                        access: FieldAccess::ReadOnly { computed: false },
+                        doc: None,
+                    }],
+                    ..descriptor_type("Box")
+                }],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "pass".to_string(),
+                    doc: None,
+                    signature: ext_signature(
+                        vec![
+                            ext_param("value", ExternTypeExpr::Any),
+                            ext_param("cb", callback),
+                        ],
+                        ExternTypeExpr::Any,
+                    ),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let function = catalog.function(
+                catalog
+                    .function_by_key(&function_key(scope("host"), "pass"))
+                    .unwrap(),
+            );
+            let ty = catalog.ty(catalog
+                .type_by_key(&type_key(scope("host"), "Box"))
+                .unwrap());
+
+            assert!(function.signature.params[0].ty.contains_any());
+            assert!(function.signature.params[1].ty.contains_any());
+            assert!(function.signature.ret.contains_any());
+            assert!(ty.fields[0].ty.contains_any());
+        }
     }
 
-    #[test]
-    fn ids_retrieve_inserted_declarations() {
-        let mut builder = CatalogBuilder::default();
-        let module_scope = scope("math");
-        let module = builder.module(module_scope.clone());
-        let ty_key = type_key(module_scope.clone(), "Vec2");
-        let nominal = nominal(module_scope.clone(), "Vec2");
-        let ty = builder.ty(module, ty_key.clone(), nominal.clone());
-        let function_key = function_key(module_scope.clone(), "dot");
-        let callable = CallableId::extern_function(module_scope, ident("dot"));
-        let function = builder.function(module, function_key.clone(), callable.clone());
-        let catalog = builder.finish();
+    mod lookups {
+        use super::*;
 
-        assert_eq!(catalog.module(module).id, module);
-        assert_eq!(catalog.ty(ty).id, ty);
-        assert_eq!(catalog.function(function).id, function);
-        assert_eq!(catalog.module(module).types, vec![ty]);
-        assert_eq!(catalog.module(module).functions, vec![function]);
-        assert_eq!(catalog.type_by_key(&ty_key), Some(ty));
-        assert_eq!(catalog.type_by_nominal(&nominal), Some(ty));
-        assert_eq!(catalog.function_by_key(&function_key), Some(function));
-        assert_eq!(catalog.function_by_callable(&callable), Some(function));
-    }
+        #[test]
+        fn ids_retrieve_inserted_declarations() {
+            let mut builder = CatalogBuilder::default();
+            let module_scope = scope("math");
+            let module = builder.module(module_scope.clone());
+            let ty_key = type_key(module_scope.clone(), "Vec2");
+            let nominal = nominal(module_scope.clone(), "Vec2");
+            let ty = builder.ty(module, ty_key.clone(), nominal.clone());
+            let function_key = function_key(module_scope, "dot");
+            let function = builder.function(module, function_key.clone());
+            let catalog = builder.finish();
 
-    #[test]
-    fn member_names_use_separate_lookup_spaces() {
-        let mut builder = CatalogBuilder::default();
-        let module_scope = ModuleScope::Root;
-        let module = builder.module(module_scope.clone());
-        let ty = builder.ty(
-            module,
-            type_key(module_scope.clone(), "Vec2"),
-            nominal(module_scope, "Vec2"),
-        );
-        let name = ident("x");
-        let field = builder.field(ty, name);
-        let method = builder.method(ty, name);
-        let static_method = builder.static_method(ty, name);
-        builder.init(ty, vec![name]);
-        let catalog = builder.finish();
+            assert_eq!(catalog.module(module).id, module);
+            assert_eq!(catalog.ty(ty).id, ty);
+            assert_eq!(catalog.function(function).id, function);
+            assert_eq!(catalog.module(module).types, vec![ty]);
+            assert_eq!(catalog.module(module).functions, vec![function]);
+            assert_eq!(catalog.type_by_key(&ty_key), Some(ty));
+            assert_eq!(catalog.type_by_nominal(&nominal), Some(ty));
+            assert_eq!(catalog.function_by_key(&function_key), Some(function));
+        }
 
-        assert_eq!(
-            catalog.field(ty, name).map(|(field_ref, _)| field_ref.id),
-            Some(field)
-        );
-        assert_eq!(
-            catalog
-                .method(ty, name)
-                .map(|(method_ref, _)| method_ref.id),
-            Some(method)
-        );
-        assert_eq!(
-            catalog
-                .static_method(ty, name)
-                .map(|(static_ref, _)| static_ref.id),
-            Some(static_method)
-        );
-        assert_eq!(catalog.init(ty).unwrap().field_init, vec![name]);
-    }
+        #[test]
+        fn member_names_use_separate_lookup_spaces() {
+            let mut builder = CatalogBuilder::default();
+            let module_scope = ModuleScope::Root;
+            let module = builder.module(module_scope.clone());
+            let ty = builder.ty(
+                module,
+                type_key(module_scope.clone(), "Vec2"),
+                nominal(module_scope, "Vec2"),
+            );
+            let name = ident("x");
+            let field = builder.field(ty, name);
+            let method = builder.method(ty, name);
+            let static_method = builder.static_method(ty, name);
+            builder.init(ty, vec![name]);
+            let catalog = builder.finish();
 
-    #[test]
-    fn operator_kinds_are_distinct() {
-        let mut builder = CatalogBuilder::default();
-        let module_scope = ModuleScope::Root;
-        let module = builder.module(module_scope.clone());
-        let ty = builder.ty(
-            module,
-            type_key(module_scope.clone(), "Vec2"),
-            nominal(module_scope, "Vec2"),
-        );
-        let unary = builder.operator(ty, ExternOperator::Unary(UnaryOp::Neg));
-        let add_left = builder.operator(
-            ty,
-            ExternOperator::Binary {
-                op: BinaryOp::Add,
-                self_on_right: false,
-            },
-        );
-        let add_right = builder.operator(
-            ty,
-            ExternOperator::Binary {
-                op: BinaryOp::Add,
-                self_on_right: true,
-            },
-        );
-        let catalog = builder.finish();
+            assert_eq!(
+                catalog.field(ty, name).map(|(field_ref, _)| field_ref.id),
+                Some(field)
+            );
+            assert_eq!(
+                catalog
+                    .method(ty, name)
+                    .map(|(method_ref, _)| method_ref.id),
+                Some(method)
+            );
+            assert_eq!(
+                catalog
+                    .static_method(ty, name)
+                    .map(|(static_ref, _)| static_ref.id),
+                Some(static_method)
+            );
+            assert_eq!(catalog.init(ty).unwrap().field_init, vec![name]);
+        }
 
-        assert_eq!(
-            catalog
-                .unary_operator(ty, UnaryOp::Neg)
-                .map(|(operator_ref, _)| operator_ref.id),
-            Some(unary)
-        );
-        assert_eq!(
-            catalog
-                .binary_operator(ty, BinaryOp::Add, false)
-                .map(|(operator_ref, _)| operator_ref.id),
-            Some(add_left)
-        );
-        assert_eq!(
-            catalog
-                .binary_operator(ty, BinaryOp::Add, true)
-                .map(|(operator_ref, _)| operator_ref.id),
-            Some(add_right)
-        );
-    }
+        #[test]
+        fn operator_kinds_are_distinct() {
+            let mut builder = CatalogBuilder::default();
+            let module_scope = ModuleScope::Root;
+            let module = builder.module(module_scope.clone());
+            let ty = builder.ty(
+                module,
+                type_key(module_scope.clone(), "Vec2"),
+                nominal(module_scope, "Vec2"),
+            );
+            let unary = builder.operator(ty, ExternOperator::Unary(UnaryOp::Neg));
+            let add_left = builder.operator(
+                ty,
+                ExternOperator::Binary {
+                    op: BinaryOp::Add,
+                    self_on_right: false,
+                },
+            );
+            let add_right = builder.operator(
+                ty,
+                ExternOperator::Binary {
+                    op: BinaryOp::Add,
+                    self_on_right: true,
+                },
+            );
+            let catalog = builder.finish();
 
-    #[test]
-    fn missing_lookups_return_none() {
-        let mut builder = CatalogBuilder::default();
-        let module_scope = ModuleScope::Root;
-        let module = builder.module(module_scope.clone());
-        let ty = builder.ty(
-            module,
-            type_key(module_scope.clone(), "Vec2"),
-            nominal(module_scope, "Vec2"),
-        );
-        let catalog = builder.finish();
+            assert_eq!(
+                catalog
+                    .unary_operator(ty, UnaryOp::Neg)
+                    .map(|(operator_ref, _)| operator_ref.id),
+                Some(unary)
+            );
+            assert_eq!(
+                catalog
+                    .binary_operator(ty, BinaryOp::Add, false)
+                    .map(|(operator_ref, _)| operator_ref.id),
+                Some(add_left)
+            );
+            assert_eq!(
+                catalog
+                    .binary_operator(ty, BinaryOp::Add, true)
+                    .map(|(operator_ref, _)| operator_ref.id),
+                Some(add_right)
+            );
+        }
 
-        assert_eq!(
-            catalog.function_by_key(&function_key(ModuleScope::Root, "dot")),
-            None
-        );
-        assert_eq!(
-            catalog.type_by_key(&type_key(ModuleScope::Root, "Mat4")),
-            None
-        );
-        assert_eq!(catalog.field(ty, ident("x")), None);
-        assert_eq!(catalog.method(ty, ident("x")), None);
-        assert_eq!(catalog.static_method(ty, ident("x")), None);
-        assert!(catalog.init(ty).is_none());
-        assert_eq!(catalog.unary_operator(ty, UnaryOp::Neg), None);
-        assert_eq!(catalog.binary_operator(ty, BinaryOp::Add, false), None);
+        #[test]
+        fn missing_lookups_return_none() {
+            let mut builder = CatalogBuilder::default();
+            let module_scope = ModuleScope::Root;
+            let module = builder.module(module_scope.clone());
+            let ty = builder.ty(
+                module,
+                type_key(module_scope.clone(), "Vec2"),
+                nominal(module_scope, "Vec2"),
+            );
+            let catalog = builder.finish();
+
+            assert_eq!(
+                catalog.function_by_key(&function_key(ModuleScope::Root, "dot")),
+                None
+            );
+            assert_eq!(
+                catalog.type_by_key(&type_key(ModuleScope::Root, "Mat4")),
+                None
+            );
+            assert_eq!(catalog.field(ty, ident("x")), None);
+            assert_eq!(catalog.method(ty, ident("x")), None);
+            assert_eq!(catalog.static_method(ty, ident("x")), None);
+            assert!(catalog.init(ty).is_none());
+            assert_eq!(catalog.unary_operator(ty, UnaryOp::Neg), None);
+            assert_eq!(catalog.binary_operator(ty, BinaryOp::Add, false), None);
+        }
     }
 }
