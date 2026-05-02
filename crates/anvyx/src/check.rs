@@ -1,10 +1,10 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use anvyx_lang::{CompilationContext, LintConfig, LintLevel};
-use anvyx_lang2::SourceBundle;
+use anvyx_lang2::{PackageId as FrontendPackageId, SourceBundle};
 
 use crate::{
-    manifest::Manifest,
+    manifest::{Manifest, PackageGraph, PackageId},
     std_support::{collect_core, collect_std},
 };
 
@@ -34,10 +34,73 @@ pub fn cmd(
 
 pub fn new_frontend_cmd(file: &Path) -> Result<(), String> {
     let sources = new_frontend_source_bundle()?;
-    let input = anvyx_lang2::CheckFileInput::new(file.to_path_buf(), sources)
-        .map_err(|error| error.to_string())?;
-    anvyx_lang2::check_file(input).map_err(|error| error.to_string())?;
+    let manifest_path = Path::new("anvyx.toml");
+    if manifest_path.exists() {
+        let graph = crate::manifest::load_package_graph(manifest_path)?;
+        let input = package_check_input(&graph, file, sources)?;
+        anvyx_lang2::check_package(input).map_err(|error| error.to_string())?;
+    } else {
+        let input = anvyx_lang2::CheckFileInput::new(file.to_path_buf(), sources)
+            .map_err(|error| error.to_string())?;
+        anvyx_lang2::check_file(input).map_err(|error| error.to_string())?;
+    }
     Ok(())
+}
+
+fn package_check_input(
+    graph: &PackageGraph,
+    file: &Path,
+    sources: SourceBundle,
+) -> Result<anvyx_lang2::CheckPackageInput, String> {
+    let root = graph.root();
+    reject_outside_source_root(file, &root.source_root)?;
+    let root_id = frontend_package_id(&root.id);
+    let packages = graph
+        .packages()
+        .iter()
+        .map(|package| {
+            let dependencies = package
+                .dependencies
+                .iter()
+                .map(|(alias, id)| (alias.clone(), frontend_package_id(id)))
+                .collect();
+            anvyx_lang2::PackageSource::new(
+                frontend_package_id(&package.id),
+                package.entry.clone(),
+                package.source_root.clone(),
+                dependencies,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    anvyx_lang2::CheckPackageInput::new(root_id, file.to_path_buf(), packages, sources)
+        .map_err(|error| error.to_string())
+}
+
+fn reject_outside_source_root(file: &Path, source_root: &Path) -> Result<(), String> {
+    let file = file
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize '{}': {error}", file.display()))?;
+    let source_root = source_root.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize source root '{}': {error}",
+            source_root.display()
+        )
+    })?;
+    if file.starts_with(&source_root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "--new-frontend file override '{}' is outside package source root '{}'",
+            file.display(),
+            source_root.display()
+        ))
+    }
+}
+
+fn frontend_package_id(id: &PackageId) -> FrontendPackageId {
+    FrontendPackageId::new(id.manifest_path().display().to_string())
 }
 
 pub fn reject_new_frontend_inputs(
@@ -79,7 +142,7 @@ mod tests {
     use anvyx_lang::{LintConfig, StdModuleSource};
 
     use super::*;
-    use crate::manifest::{ExternEntry, Project};
+    use crate::manifest::{DependencyEntry, ExternEntry, Project};
 
     fn source(code: &str) -> StdModuleSource {
         StdModuleSource {
@@ -107,6 +170,7 @@ mod tests {
                 name: None,
                 entry: "main.anv".to_string(),
             },
+            dependencies: HashMap::new(),
             externs: HashMap::new(),
             lint: LintConfig::default(),
         }
@@ -326,20 +390,11 @@ mod tests {
             use super::*;
 
             #[test]
-            fn exposed_std_mem_is_importable() {
+            fn std_import_resolves_implicit_package() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "import std.mem; fn main() {}");
 
                 new_frontend_cmd(&main).unwrap();
-            }
-
-            #[test]
-            fn unexposed_std_math_is_not_visible() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(&temp, "main.anv", "import std.math; fn main() {}");
-                let error = new_frontend_cmd(&main).expect_err("std.math should not be exposed");
-
-                assert!(error.contains("frontend resolve failed"));
             }
         }
 
@@ -402,6 +457,19 @@ mod tests {
             #[test]
             fn accepts_plain_manifest() {
                 let manifest = plain_manifest();
+
+                reject_new_frontend_inputs(Some(&manifest), &[], &[], &[]).unwrap();
+            }
+
+            #[test]
+            fn accepts_manifest_dependencies() {
+                let mut manifest = plain_manifest();
+                manifest.dependencies.insert(
+                    "math".to_string(),
+                    DependencyEntry {
+                        path: "../math".to_string(),
+                    },
+                );
 
                 reject_new_frontend_inputs(Some(&manifest), &[], &[], &[]).unwrap();
             }

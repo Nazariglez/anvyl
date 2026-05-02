@@ -11,7 +11,7 @@ use crate::{
         self, BinaryOp, ExternFieldAccess, ExternFuncNode, ExternReceiverMode, ExternTypeMember,
         ExternTypeNode, ExternTypeRep, GenericArg, Mutability, Param, Program, Stmt, Type, UnaryOp,
     },
-    resolve::{ModuleKey, ResolveResult},
+    resolve::{ModuleId, PackageId, ResolveResult},
     span::Span,
 };
 
@@ -24,14 +24,19 @@ pub(crate) fn collect_source_externs(
 ) -> Result<RawExterns, Vec<ExternInputError>> {
     let mut groups = vec![];
     let mut errors = vec![];
-    collect_source_program(RawExternScope::Root, root, &mut groups, &mut errors);
+    collect_source_program(
+        RawExternScope::Module(resolved.root.clone()),
+        root,
+        &mut groups,
+        &mut errors,
+    );
 
     for module in resolved.module_groups.iter().flatten() {
-        let ModuleKey::Named(path) = &module.key else {
+        if module.key == resolved.root {
             continue;
-        };
+        }
         collect_source_program(
-            RawExternScope::Named(module_path_from_resolve(path)),
+            source_scope(&module.key),
             &module.program,
             &mut groups,
             &mut errors,
@@ -43,6 +48,17 @@ pub(crate) fn collect_source_externs(
     } else {
         Err(errors)
     }
+}
+
+fn source_scope(module: &ModuleId) -> RawExternScope {
+    if module.package() == &PackageId::synthetic_root()
+        && let Some(path) = module.named_path()
+    {
+        return RawExternScope::Named(ModulePath {
+            segments: path.segments().to_vec(),
+        });
+    }
+    RawExternScope::Module(module.clone())
 }
 
 fn collect_source_program(
@@ -82,12 +98,6 @@ fn collect_source_program(
             functions,
         }],
     });
-}
-
-fn module_path_from_resolve(path: &crate::resolve::ModulePath) -> ModulePath {
-    ModulePath {
-        segments: path.segments().to_vec(),
-    }
 }
 
 fn normalize_function(func: &ExternFuncNode) -> SourceResult<RawExternFunction> {
@@ -367,9 +377,13 @@ fn type_expr(ty: &Type, span: Span) -> SourceResult<ExternTypeExpr> {
             args: type_args(generic_args, span)?,
         }),
         Type::Nominal(nominal) if nominal.const_args.is_empty() => Ok(ExternTypeExpr::Named {
-            module: nominal.origin.as_ref().map(|path| ModulePath {
-                segments: path.iter().cloned().collect(),
-            }),
+            module: nominal
+                .origin
+                .as_ref()
+                .and_then(ast::ModuleOrigin::module_path)
+                .map(|path| ModulePath {
+                    segments: path.to_vec(),
+                }),
             name: nominal.name.to_string(),
             args: nominal
                 .type_args

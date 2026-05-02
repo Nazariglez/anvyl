@@ -256,6 +256,17 @@ pub fn tokenize(program: &str) -> Result<Vec<SpannedToken>, Vec<Rich<'_, char>>>
     lexer().parse(program).into_result()
 }
 
+pub fn is_source_ident(text: &str) -> bool {
+    let Ok(tokens) = tokenize(text) else {
+        return false;
+    };
+
+    matches!(
+        tokens.as_slice(),
+        [(Token::Ident(_), span)] if span.start == 0 && span.end == text.len()
+    )
+}
+
 type Extra<'src> = extra::Full<Rich<'src, char>, (), ()>;
 type LexErr<'src> = Rich<'src, char>;
 
@@ -1016,6 +1027,30 @@ mod tests {
 
     fn ident_tok(name: &str) -> Token {
         Token::Ident(ast::Ident(Intern::new(name.to_string())))
+    }
+
+    #[test]
+    fn is_source_ident_accepts_identifiers() {
+        for ident in ["math", "my_engine", "a1", "_internal"] {
+            assert!(is_source_ident(ident), "expected {ident:?} to be valid");
+        }
+    }
+
+    #[test]
+    fn is_source_ident_rejects_non_identifiers() {
+        for ident in [
+            "",
+            "fn",
+            "type",
+            "import",
+            "bad-name",
+            "math utils",
+            " math",
+            "math ",
+            "math // comment",
+        ] {
+            assert!(!is_source_ident(ident), "expected {ident:?} to be invalid");
+        }
     }
 
     fn str_text(s: &str) -> Token {

@@ -12,7 +12,7 @@ mod storage {
 
     use crate::{
         ast::{Ident, Program, Type},
-        resolve::ResolveResult,
+        resolve::{ModuleId, PackageId, ResolveResult},
         typecheck::{DeclarationIndex, LocalTypeId, TypeChecker},
     };
 
@@ -30,7 +30,10 @@ mod storage {
     fn local_type_cell_update() {
         let program = Program { stmts: vec![] };
         let resolved = ResolveResult {
+            root: ModuleId::root(PackageId::synthetic_root()),
             module_groups: vec![],
+            dependencies: std::collections::HashMap::new(),
+            system: crate::resolve::SystemPackages::default(),
         };
         let decls = DeclarationIndex::from_root_and_modules(
             &program,

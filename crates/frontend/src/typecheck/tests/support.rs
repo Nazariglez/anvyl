@@ -5,7 +5,7 @@ use crate::{
     externs,
     lexer::tokenize,
     parser,
-    resolve::{ModuleKey, ModulePath, ResolveResult, ResolvedModule},
+    resolve::{ModuleId, ModulePath, PackageId, ResolveResult, ResolvedModule},
     typecheck::{self, ModuleScope, TypeError},
 };
 
@@ -16,19 +16,19 @@ pub(crate) fn assert_typecheck_closed(result: &typecheck::TypecheckResult) {
     for target in result.calls().values() {
         let facts = typecheck::call_target_closure_facts(target);
         assert!(
-            !facts.contains_infer,
+            !facts.types.contains_infer,
             "call target contains inferred type: {target:?}"
         );
         assert!(
-            !facts.contains_unresolved_ref,
+            facts.types.first_unresolved.is_none(),
             "call target contains unresolved type ref: {target:?}"
         );
         assert!(
-            !facts.contains_unresolved_const,
+            !facts.contains_unresolved_const(),
             "call target contains unresolved const: {target:?}"
         );
         assert!(
-            !facts.contains_const_infer,
+            !facts.consts.contains_infer,
             "call target contains inferred const: {target:?}"
         );
     }
@@ -61,7 +61,10 @@ fn parse(source: &str) -> crate::ast::Program {
 pub(crate) fn check(source: &str) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
     let program = parse(source);
     let resolved = ResolveResult {
+        root: root_id(),
         module_groups: vec![],
+        dependencies: std::collections::HashMap::new(),
+        system: crate::resolve::SystemPackages::default(),
     };
     let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
     typecheck::check_with_modules(&program, &resolved, HashSet::new(), raw_externs)
@@ -94,21 +97,28 @@ pub(crate) fn check_named(
     check_with_active(root_source, modules, &[])
 }
 
+fn root_id() -> ModuleId {
+    ModuleId::root(PackageId::synthetic_root())
+}
+
 fn module_path(name: &str) -> ModulePath {
     ModulePath::new(name.split('.').map(str::to_string).collect()).unwrap()
 }
 
 fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
     ResolveResult {
+        root: root_id(),
         module_groups: vec![
             modules
                 .iter()
                 .map(|(name, source)| ResolvedModule {
-                    key: ModuleKey::Named(module_path(name)),
+                    key: ModuleId::named(PackageId::synthetic_root(), module_path(name)),
                     program: parse(source),
                 })
                 .collect(),
         ],
+        dependencies: std::collections::HashMap::new(),
+        system: crate::resolve::SystemPackages::default(),
     }
 }
 

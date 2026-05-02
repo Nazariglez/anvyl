@@ -182,7 +182,7 @@ mod tests {
         ast::{ConstArg, ConstParam, ConstValue, Ident, Program, TypeParam},
         lexer::tokenize,
         parser,
-        resolve::ResolveResult,
+        resolve::{ModuleId, PackageId, ResolveResult},
         typecheck::{DeclarationIndex, ModuleScope},
     };
 
@@ -245,7 +245,10 @@ mod tests {
     fn tc(source: &str) -> TypeChecker {
         let program = parse(source);
         let resolved = ResolveResult {
+            root: ModuleId::root(PackageId::synthetic_root()),
             module_groups: vec![],
+            dependencies: std::collections::HashMap::new(),
+            system: crate::resolve::SystemPackages::default(),
         };
         let decls = DeclarationIndex::from_root_and_modules(
             &program,

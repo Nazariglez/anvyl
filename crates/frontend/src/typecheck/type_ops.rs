@@ -107,7 +107,7 @@ pub(crate) trait TypeFolder {
                     .map(|(name, ty)| (*name, self.fold_type(ty)))
                     .collect(),
             ),
-            Type::Nominal(nominal) => Type::nominal(
+            Type::Nominal(nominal) => Type::nominal_with_origin(
                 nominal.kind,
                 nominal.name,
                 nominal

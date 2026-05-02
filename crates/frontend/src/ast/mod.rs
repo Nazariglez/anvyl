@@ -6,6 +6,24 @@ use crate::span::Spanned;
 
 pub type ModulePath = std::rc::Rc<[String]>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ModuleOrigin {
+    Module(ModulePath),
+    Package {
+        package: String,
+        path: Option<ModulePath>,
+    },
+}
+
+impl ModuleOrigin {
+    pub fn module_path(&self) -> Option<&[String]> {
+        match self {
+            Self::Module(path) => Some(path),
+            Self::Package { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Eq)]
 pub struct Ident(pub Intern<String>);
 
@@ -15,7 +33,7 @@ impl Ident {
     }
 
     pub fn as_str(&self) -> &str {
-        &*self.0
+        self.0.as_str()
     }
 }
 
@@ -174,7 +192,7 @@ pub struct NominalType {
     pub name: Ident,
     pub type_args: Vec<Type>,
     pub const_args: Vec<ConstArg>,
-    pub origin: Option<ModulePath>,
+    pub origin: Option<ModuleOrigin>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,45 +236,49 @@ pub enum Type {
 
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
-        use Type::*;
         match (self, other) {
-            (Infer, Infer)
-            | (Any, Any)
-            | (Int, Int)
-            | (Float, Float)
-            | (Bool, Bool)
-            | (String, String)
-            | (Void, Void) => true,
+            (Self::Infer, Self::Infer)
+            | (Self::Any, Self::Any)
+            | (Self::Int, Self::Int)
+            | (Self::Float, Self::Float)
+            | (Self::Bool, Self::Bool)
+            | (Self::String, Self::String)
+            | (Self::Void, Self::Void) => true,
             (
-                Func {
+                Self::Func {
                     params: p1,
                     ret: r1,
                 },
-                Func {
+                Self::Func {
                     params: p2,
                     ret: r2,
                 },
             ) => p1 == p2 && r1 == r2,
-            (Var(a), Var(b)) => a == b,
-            (UnresolvedName(a), UnresolvedName(b)) => a == b,
+            (Self::Var(a), Self::Var(b)) => a == b,
+            (Self::UnresolvedName(a), Self::UnresolvedName(b)) => a == b,
             (
-                UnresolvedNominal {
-                    qualifier: q1,
-                    name: n1,
-                    generic_args: g1,
+                Self::UnresolvedNominal {
+                    qualifier: qa,
+                    name: na,
+                    generic_args: ga,
                 },
-                UnresolvedNominal {
-                    qualifier: q2,
-                    name: n2,
-                    generic_args: g2,
+                Self::UnresolvedNominal {
+                    qualifier: qb,
+                    name: nb,
+                    generic_args: gb,
                 },
-            ) => q1 == q2 && n1 == n2 && g1 == g2,
-            (Tuple(a), Tuple(b)) => a == b,
-            (NamedTuple(a), NamedTuple(b)) => a == b,
-            (Nominal(a), Nominal(b)) => a == b,
-            (List { elem: a }, List { elem: b }) | (Slice { elem: a }, Slice { elem: b }) => a == b,
-            (Array { elem: e1, len: l1 }, Array { elem: e2, len: l2 }) => e1 == e2 && l1 == l2,
-            (Map { key: k1, value: v1 }, Map { key: k2, value: v2 }) => k1 == k2 && v1 == v2,
+            ) => qa == qb && na == nb && ga == gb,
+            (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (Self::NamedTuple(a), Self::NamedTuple(b)) => a == b,
+            (Self::Nominal(a), Self::Nominal(b)) => a == b,
+            (Self::List { elem: a }, Self::List { elem: b })
+            | (Self::Slice { elem: a }, Self::Slice { elem: b }) => a == b,
+            (Self::Array { elem: ea, len: la }, Self::Array { elem: eb, len: lb }) => {
+                ea == eb && la == lb
+            }
+            (Self::Map { key: ka, value: va }, Self::Map { key: kb, value: vb }) => {
+                ka == kb && va == vb
+            }
             _ => false,
         }
     }
@@ -314,6 +336,22 @@ impl Type {
         type_args: Vec<Type>,
         const_args: Vec<ConstArg>,
         origin: Option<ModulePath>,
+    ) -> Type {
+        Self::nominal_with_origin(
+            kind,
+            name,
+            type_args,
+            const_args,
+            origin.map(ModuleOrigin::Module),
+        )
+    }
+
+    pub fn nominal_with_origin(
+        kind: NominalKind,
+        name: Ident,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+        origin: Option<ModuleOrigin>,
     ) -> Type {
         if kind == NominalKind::Extern {
             debug_assert!(type_args.is_empty());
@@ -417,7 +455,7 @@ impl Type {
             name: nominal.name,
             type_args: &nominal.type_args,
             const_args: &nominal.const_args,
-            origin: nominal.origin.as_deref(),
+            origin: nominal.origin.as_ref().and_then(ModuleOrigin::module_path),
         })
     }
 }
@@ -465,16 +503,15 @@ fn fmt_generic_args(
 
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use Type::*;
         match self {
-            Infer => write!(f, "_"),
-            Any => write!(f, "any"),
-            Int => write!(f, "int"),
-            Float => write!(f, "float"),
-            Bool => write!(f, "bool"),
-            String => write!(f, "string"),
-            Void => write!(f, "void"),
-            Func { params, ret } => {
+            Self::Infer => write!(f, "_"),
+            Self::Any => write!(f, "any"),
+            Self::Int => write!(f, "int"),
+            Self::Float => write!(f, "float"),
+            Self::Bool => write!(f, "bool"),
+            Self::String => write!(f, "string"),
+            Self::Void => write!(f, "void"),
+            Self::Func { params, ret } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
@@ -486,14 +523,14 @@ impl Display for Type {
                     write!(f, "{p}")?;
                 }
                 write!(f, ")")?;
-                if !matches!(**ret, Void) {
+                if !matches!(**ret, Self::Void) {
                     write!(f, " -> {ret}")?;
                 }
                 Ok(())
             }
-            Var(id) => write!(f, "{id}"),
-            UnresolvedName(ident) => write!(f, "{ident}"),
-            UnresolvedNominal {
+            Self::Var(id) => write!(f, "{id}"),
+            Self::UnresolvedName(ident) => write!(f, "{ident}"),
+            Self::UnresolvedNominal {
                 qualifier,
                 name,
                 generic_args,
@@ -504,7 +541,7 @@ impl Display for Type {
                 write!(f, "{name}")?;
                 fmt_ordered_generic_args(f, generic_args)
             }
-            Tuple(elems) => {
+            Self::Tuple(elems) => {
                 write!(f, "(")?;
                 for (i, e) in elems.iter().enumerate() {
                     if i > 0 {
@@ -514,7 +551,7 @@ impl Display for Type {
                 }
                 write!(f, ")")
             }
-            NamedTuple(fields) => {
+            Self::NamedTuple(fields) => {
                 write!(f, "{{")?;
                 for (i, (n, t)) in fields.iter().enumerate() {
                     if i > 0 {
@@ -524,14 +561,14 @@ impl Display for Type {
                 }
                 write!(f, "}}")
             }
-            Nominal(nominal) => {
+            Self::Nominal(nominal) => {
                 write!(f, "{}", nominal.name)?;
                 fmt_generic_args(f, &nominal.type_args, &nominal.const_args)
             }
-            List { elem } => write!(f, "[{elem}]"),
-            Array { elem, len } => write!(f, "[{elem}; {len}]"),
-            Map { key, value } => write!(f, "[{key}: {value}]"),
-            Slice { elem } => write!(f, "[{elem}; _]"),
+            Self::List { elem } => write!(f, "[{elem}]"),
+            Self::Array { elem, len } => write!(f, "[{elem}; {len}]"),
+            Self::Map { key, value } => write!(f, "[{key}: {value}]"),
+            Self::Slice { elem } => write!(f, "[{elem}; _]"),
         }
     }
 }
@@ -609,32 +646,22 @@ pub enum FormatAlign {
     Center,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FormatSign {
+    #[default]
     Default,
     Always,
 }
 
-impl Default for FormatSign {
-    fn default() -> Self {
-        Self::Default
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FormatKind {
+    #[default]
     Default,
     Hex,
     HexUpper,
     Binary,
     Exp,
     ExpUpper,
-}
-
-impl Default for FormatKind {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -814,8 +841,76 @@ pub struct Method {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Import {
     pub visibility: Visibility,
-    pub path: Vec<Ident>,
+    pub target: ImportTarget,
     pub kind: ImportKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportTarget {
+    pub root: ImportRoot,
+    pub path: PackageModulePath,
+}
+
+impl ImportTarget {
+    pub fn local(path: Vec<Ident>) -> Self {
+        Self::named(ImportRoot::Local, path)
+    }
+
+    pub fn dependency(alias: Ident, path: Vec<Ident>) -> Self {
+        Self {
+            root: ImportRoot::Dependency(alias),
+            path: PackageModulePath::from_segments(path),
+        }
+    }
+
+    pub fn native_provider(path: Vec<Ident>) -> Self {
+        Self::named(ImportRoot::NativeProvider, path)
+    }
+
+    pub fn std(path: Vec<Ident>) -> Self {
+        Self {
+            root: ImportRoot::Std,
+            path: PackageModulePath::from_segments(path),
+        }
+    }
+
+    pub fn local_path(&self) -> Option<&[Ident]> {
+        match (&self.root, &self.path) {
+            (ImportRoot::Local, PackageModulePath::Named(path)) => Some(path),
+            _ => None,
+        }
+    }
+
+    fn named(root: ImportRoot, path: Vec<Ident>) -> Self {
+        Self {
+            root,
+            path: PackageModulePath::Named(path),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportRoot {
+    Local,
+    Dependency(Ident),
+    NativeProvider,
+    Std,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageModulePath {
+    Root,
+    Named(Vec<Ident>),
+}
+
+impl PackageModulePath {
+    fn from_segments(path: Vec<Ident>) -> Self {
+        if path.is_empty() {
+            Self::Root
+        } else {
+            Self::Named(path)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1469,8 +1564,8 @@ mod tests {
     };
 
     use super::{
-        AggregateKind, ConstArg, ConstParamId, ConstValue, GenericArg, Ident, ModulePath,
-        NominalKind, NominalType, Type,
+        AggregateKind, ConstArg, ConstParamId, ConstValue, GenericArg, Ident, ModuleOrigin,
+        ModulePath, NominalKind, NominalType, Type,
     };
 
     fn hash<T: Hash>(value: &T) -> u64 {
@@ -1594,7 +1689,7 @@ mod tests {
                 name: Ident::new("Foo"),
                 type_args: vec![Type::Int],
                 const_args: vec![ConstArg::Value(ConstValue::Int(1))],
-                origin: Some(origin("a")),
+                origin: Some(ModuleOrigin::Module(origin("a"))),
             })
         );
         assert!(Type::Int.as_nominal().is_none());

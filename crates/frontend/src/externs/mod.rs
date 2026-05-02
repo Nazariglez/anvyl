@@ -32,15 +32,15 @@ pub(crate) fn extern_module_scope(path: &anvyx_externs::ModulePath) -> ModuleSco
 
 pub(crate) fn raw_named_module_path(scope: &RawExternScope) -> Option<ResolveModulePath> {
     match scope {
-        RawExternScope::Root => None,
+        RawExternScope::Module(_) => None,
         RawExternScope::Named(path) => Some(extern_module_path(path)),
     }
 }
 
 pub(crate) fn raw_module_scope(scope: &RawExternScope) -> ModuleScope {
     match scope {
-        RawExternScope::Root => ModuleScope::Root,
         RawExternScope::Named(path) => extern_module_scope(path),
+        RawExternScope::Module(module) => ModuleScope::from_module_id(module),
     }
 }
 
@@ -68,7 +68,9 @@ mod tests {
         externs::raw::{RawExternGroup, RawExternModule, RawExternType},
         lexer::tokenize,
         parser,
-        resolve::{ModuleKey, ModulePath as ResolveModulePath, ResolveResult, ResolvedModule},
+        resolve::{
+            ModuleId, ModulePath as ResolveModulePath, PackageId, ResolveResult, ResolvedModule,
+        },
     };
 
     fn provider(name: &str, modules: Vec<ExternModuleDescriptor>) -> ProviderDescriptor {
@@ -107,9 +109,27 @@ mod tests {
         ResolveModulePath::new(path.iter().map(|segment| (*segment).to_string()).collect()).unwrap()
     }
 
+    fn root_id() -> ModuleId {
+        ModuleId::root(PackageId::synthetic_root())
+    }
+
+    fn raw_root_scope() -> RawExternScope {
+        RawExternScope::Module(root_id())
+    }
+
+    fn resolved_module(path: &[&str], source: &str) -> ResolvedModule {
+        ResolvedModule {
+            key: ModuleId::named(PackageId::synthetic_root(), resolve_path(path)),
+            program: parse(source),
+        }
+    }
+
     fn empty_resolved() -> ResolveResult {
         ResolveResult {
+            root: root_id(),
             module_groups: vec![],
+            dependencies: std::collections::HashMap::new(),
+            system: crate::resolve::SystemPackages::default(),
         }
     }
 
@@ -281,11 +301,11 @@ mod tests {
             assert_eq!(
                 raw.groups[0].provenance,
                 ExternProvenance::Source {
-                    module: RawExternScope::Root
+                    module: raw_root_scope()
                 }
             );
             let module = &raw.groups[0].modules[0];
-            assert_eq!(module.scope, RawExternScope::Root);
+            assert_eq!(module.scope, raw_root_scope());
             let function = &module.functions[0].decl;
             assert_eq!(function.name, "tick");
             assert_eq!(function.doc.as_deref(), Some("Ticks."));
@@ -301,10 +321,13 @@ mod tests {
         fn collects_named_function() {
             let root = parse("fn main() {}");
             let resolved = ResolveResult {
-                module_groups: vec![vec![ResolvedModule {
-                    key: ModuleKey::Named(resolve_path(&["math"])),
-                    program: parse("extern fn dot() -> float;"),
-                }]],
+                root: root_id(),
+                module_groups: vec![vec![resolved_module(
+                    &["math"],
+                    "extern fn dot() -> float;",
+                )]],
+                dependencies: std::collections::HashMap::new(),
+                system: crate::resolve::SystemPackages::default(),
             };
 
             let raw = collect_source_externs(&root, &resolved).unwrap();
@@ -321,6 +344,56 @@ mod tests {
                 RawExternScope::Named(module(&["math"]))
             );
             assert_eq!(raw.groups[0].modules[0].functions[0].decl.name, "dot");
+        }
+
+        #[test]
+        fn collects_package_root_function() {
+            let package = PackageId::new("dep");
+            let root = parse("extern fn tick() -> void;");
+            let resolved = ResolveResult {
+                root: ModuleId::root(package.clone()),
+                module_groups: vec![],
+                dependencies: std::collections::HashMap::new(),
+                system: crate::resolve::SystemPackages::default(),
+            };
+
+            let raw = collect_source_externs(&root, &resolved).unwrap();
+
+            let scope = RawExternScope::Module(ModuleId::root(package));
+            assert_eq!(
+                raw.groups[0].provenance,
+                ExternProvenance::Source {
+                    module: scope.clone()
+                }
+            );
+            assert_eq!(raw.groups[0].modules[0].scope, scope);
+            assert_eq!(raw.groups[0].modules[0].functions[0].decl.name, "tick");
+        }
+
+        #[test]
+        fn same_source_extern_path_in_different_packages_does_not_collide() {
+            let left = PackageId::new("left");
+            let right = PackageId::new("right");
+            let root = parse("fn main() {}");
+            let resolved = ResolveResult {
+                root: root_id(),
+                module_groups: vec![vec![
+                    ResolvedModule {
+                        key: ModuleId::named(left, resolve_path(&["math"])),
+                        program: parse("extern fn dot() -> void;"),
+                    },
+                    ResolvedModule {
+                        key: ModuleId::named(right, resolve_path(&["math"])),
+                        program: parse("extern fn dot() -> void;"),
+                    },
+                ]],
+                dependencies: std::collections::HashMap::new(),
+                system: crate::resolve::SystemPackages::default(),
+            };
+
+            let raw = collect_source_externs(&root, &resolved).unwrap();
+
+            validate_raw_identities(&raw).unwrap();
         }
 
         #[test]
@@ -785,10 +858,13 @@ mod tests {
             let source = collect_source_externs(
                 &parse("fn main() {}"),
                 &ResolveResult {
-                    module_groups: vec![vec![ResolvedModule {
-                        key: ModuleKey::Named(resolve_path(&["math"])),
-                        program: parse("extern fn dot() -> void;"),
-                    }]],
+                    root: root_id(),
+                    module_groups: vec![vec![resolved_module(
+                        &["math"],
+                        "extern fn dot() -> void;",
+                    )]],
+                    dependencies: std::collections::HashMap::new(),
+                    system: crate::resolve::SystemPackages::default(),
                 },
             )
             .unwrap();
@@ -821,10 +897,10 @@ mod tests {
             let source = collect_source_externs(
                 &parse("fn main() {}"),
                 &ResolveResult {
-                    module_groups: vec![vec![ResolvedModule {
-                        key: ModuleKey::Named(resolve_path(&["math"])),
-                        program: parse("extern type Vec2;"),
-                    }]],
+                    root: root_id(),
+                    module_groups: vec![vec![resolved_module(&["math"], "extern type Vec2;")]],
+                    dependencies: std::collections::HashMap::new(),
+                    system: crate::resolve::SystemPackages::default(),
                 },
             )
             .unwrap();

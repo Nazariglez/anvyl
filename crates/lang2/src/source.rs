@@ -1,14 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anvyx_frontend::{
-    pipeline::{
-        ModuleInput as FrontendModuleInput, Source as FrontendSource, SourceLoadError, SourceLoader,
-    },
-    resolve::ModulePath,
+    pipeline::{PackageSourceLoader, Source as FrontendSource, SourceLoadError},
+    resolve::{ModuleId, ModulePath, PackageId},
 };
 
 use crate::CheckError;
@@ -88,16 +86,9 @@ impl ModuleSource {
             label: self.label.clone(),
         }
     }
-
-    pub(crate) fn to_frontend_module(&self) -> FrontendModuleInput {
-        FrontendModuleInput {
-            path: self.path.clone(),
-            source: self.to_frontend_source(),
-        }
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceBundle {
     core_prelude: Option<SourceText>,
     core_modules: Vec<ModuleSource>,
@@ -172,15 +163,6 @@ impl SourceBundle {
         })
     }
 
-    pub fn empty() -> Self {
-        Self {
-            core_prelude: None,
-            core_modules: vec![],
-            std_modules: HashMap::new(),
-            always_active_modules: vec![],
-        }
-    }
-
     pub fn core_prelude(&self) -> Option<&SourceText> {
         self.core_prelude.as_ref()
     }
@@ -202,63 +184,176 @@ impl SourceBundle {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageSource {
+    id: PackageId,
+    entry: PathBuf,
+    source_root: PathBuf,
+    dependencies: HashMap<String, PackageId>,
+}
+
+impl PackageSource {
+    pub fn new(
+        id: PackageId,
+        entry: impl Into<PathBuf>,
+        source_root: impl Into<PathBuf>,
+        dependencies: HashMap<String, PackageId>,
+    ) -> Result<Self, CheckError> {
+        let entry = entry.into();
+        if entry.as_os_str().is_empty() {
+            return invalid_input("package entry path must not be empty");
+        }
+        let source_root = source_root.into();
+        if source_root.as_os_str().is_empty() {
+            return invalid_input("package source root must not be empty");
+        }
+        Ok(Self {
+            id,
+            entry,
+            source_root,
+            dependencies,
+        })
+    }
+
+    pub fn id(&self) -> &PackageId {
+        &self.id
+    }
+
+    pub fn entry(&self) -> &Path {
+        &self.entry
+    }
+
+    pub fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub fn dependencies(&self) -> &HashMap<String, PackageId> {
+        &self.dependencies
+    }
+}
+
+pub(crate) fn validate_reserved_source_roots(packages: &[PackageSource]) -> Result<(), CheckError> {
+    for package in packages {
+        validate_reserved_std_root(package)?;
+    }
+    Ok(())
+}
+
+fn validate_reserved_std_root(package: &PackageSource) -> Result<(), CheckError> {
+    let std_file = package.source_root.join("std.anv");
+    if std_file.is_file() {
+        return reserved_std_source(package, &std_file);
+    }
+
+    let std_dir = package.source_root.join("std");
+    if !std_dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(file) = first_anv_file(&std_dir)? {
+        return reserved_std_source(package, &file);
+    }
+    Ok(())
+}
+
+fn first_anv_file(root: &Path) -> Result<Option<PathBuf>, CheckError> {
+    for entry in fs::read_dir(root).map_err(|error| CheckError::ReadModule {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| CheckError::ReadModule {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(file) = first_anv_file(&path)? {
+                return Ok(Some(file));
+            }
+        } else if path.extension().is_some_and(|ext| ext == "anv") {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn reserved_std_source<T>(package: &PackageSource, path: &Path) -> Result<T, CheckError> {
+    invalid_input(format!(
+        "package '{}' uses reserved std source path '{}'",
+        package.id,
+        path.display()
+    ))
+}
+
 #[derive(Debug, Clone)]
-pub(crate) struct SourceEnvironment<'a> {
-    root: PathBuf,
+pub(crate) struct PackageSourceEnvironment<'a> {
+    source_roots: HashMap<PackageId, PathBuf>,
     sources: &'a SourceBundle,
 }
 
-impl<'a> SourceEnvironment<'a> {
-    pub(crate) fn new(root: impl Into<PathBuf>, sources: &'a SourceBundle) -> Self {
+impl<'a> PackageSourceEnvironment<'a> {
+    pub(crate) fn new(packages: &[PackageSource], sources: &'a SourceBundle) -> Self {
         Self {
-            root: root.into(),
+            source_roots: packages
+                .iter()
+                .map(|package| (package.id.clone(), package.source_root.clone()))
+                .collect(),
             sources,
         }
     }
 
-    fn load_source(&self, module_path: &ModulePath) -> Result<Option<FrontendSource>, CheckError> {
-        if module_path.first_segment() == Some("std") {
-            return Ok(self.load_std_source(module_path));
+    fn load_source(&self, module: &ModuleId) -> Result<Option<FrontendSource>, CheckError> {
+        let Some(path) = module.named_path() else {
+            return Ok(None);
+        };
+        if module.package() == &PackageId::std() {
+            return Ok(self.load_std_source(path));
         }
-
-        let file = self.local_module_file(module_path.segments());
-        match fs::read_to_string(&file) {
-            Ok(code) => SourceText::new(code, file.display().to_string())
-                .map(|source| Some(source.to_frontend_source())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(CheckError::ReadModule {
-                path: file,
-                message: error.to_string(),
-            }),
-        }
+        let Some(source_root) = self.source_roots.get(module.package()) else {
+            return Ok(None);
+        };
+        let file = module_file(source_root, path.segments());
+        read_module_file(file)
     }
 
     fn load_std_source(&self, module_path: &ModulePath) -> Option<FrontendSource> {
+        let mut path = vec!["std".to_string()];
+        path.extend(module_path.segments().iter().cloned());
         self.sources
-            .std_module(module_path.segments())
+            .std_module(&path)
             .map(ModuleSource::to_frontend_source)
-    }
-
-    fn local_module_file(&self, module_path: &[String]) -> PathBuf {
-        let mut file = self.root.clone();
-        for segment in module_path {
-            file.push(segment);
-        }
-        file.set_extension("anv");
-        file
     }
 }
 
-impl SourceLoader for SourceEnvironment<'_> {
+impl PackageSourceLoader for PackageSourceEnvironment<'_> {
     type FatalError = CheckError;
 
     fn load(
         &mut self,
-        module_path: &ModulePath,
+        module: &ModuleId,
     ) -> Result<Option<FrontendSource>, SourceLoadError<Self::FatalError>> {
-        self.load_source(module_path)
-            .map_err(SourceLoadError::Fatal)
+        self.load_source(module).map_err(SourceLoadError::Fatal)
     }
+}
+
+fn read_module_file(file: PathBuf) -> Result<Option<FrontendSource>, CheckError> {
+    match fs::read_to_string(&file) {
+        Ok(code) => SourceText::new(code, file.display().to_string())
+            .map(|source| Some(source.to_frontend_source())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CheckError::ReadModule {
+            path: file,
+            message: error.to_string(),
+        }),
+    }
+}
+
+fn module_file(root: &Path, module_path: &[String]) -> PathBuf {
+    let mut file = root.to_path_buf();
+    for segment in module_path {
+        file.push(segment);
+    }
+    file.set_extension("anv");
+    file
 }
 
 fn module_path(path: Vec<String>) -> Result<ModulePath, CheckError> {
@@ -307,14 +402,9 @@ fn invalid_input<T>(message: impl Into<String>) -> Result<T, CheckError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::Path,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::path::Path;
 
     use super::*;
-
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn path(segments: &[&str]) -> Vec<String> {
         segments
@@ -325,6 +415,29 @@ mod tests {
 
     fn module_path(segments: &[&str]) -> ModulePath {
         ModulePath::new(path(segments)).unwrap()
+    }
+
+    fn package_id() -> PackageId {
+        PackageId::synthetic_root()
+    }
+
+    fn module_id(segments: &[&str]) -> ModuleId {
+        ModuleId::named(package_id(), module_path(segments))
+    }
+
+    fn std_module_id(segments: &[&str]) -> ModuleId {
+        ModuleId::named(PackageId::std(), module_path(segments))
+    }
+
+    fn package_env<'a>(root: &Path, bundle: &'a SourceBundle) -> PackageSourceEnvironment<'a> {
+        let package = PackageSource::new(
+            package_id(),
+            root.join("main.anv"),
+            root.to_path_buf(),
+            HashMap::new(),
+        )
+        .unwrap();
+        PackageSourceEnvironment::new(&[package], bundle)
     }
 
     fn core(name: &str) -> ModuleSource {
@@ -351,43 +464,16 @@ mod tests {
         }
     }
 
-    struct TempDir {
-        path: PathBuf,
+    fn write(dir: &tempfile::TempDir, relative: &str, code: &str) {
+        let file = dir.path().join(relative);
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(file, code).unwrap();
     }
 
-    impl TempDir {
-        fn new() -> Self {
-            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "anvyx-lang2-source-env-{}-{id}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-
-        fn write(&self, relative: &str, code: &str) {
-            let file = self.path.join(relative);
-            if let Some(parent) = file.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(file, code).unwrap();
-        }
-
-        fn mkdir(&self, relative: &str) {
-            fs::create_dir_all(self.path.join(relative)).unwrap();
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
+    fn mkdir(dir: &tempfile::TempDir, relative: &str) {
+        fs::create_dir_all(dir.path().join(relative)).unwrap();
     }
 
     #[test]
@@ -575,7 +661,7 @@ mod tests {
 
     #[test]
     fn empty_bundle_has_no_sources() {
-        let bundle = SourceBundle::empty();
+        let bundle = SourceBundle::default();
 
         assert!(bundle.core_prelude().is_none());
         assert!(bundle.core_modules().is_empty());
@@ -593,13 +679,13 @@ mod tests {
     }
 
     #[test]
-    fn source_environment_loads_sibling_module() {
-        let temp = TempDir::new();
-        temp.write("helper.anv", "const VALUE = 1;");
-        let bundle = SourceBundle::empty();
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+    fn package_source_environment_loads_sibling_module() {
+        let temp = tempfile::tempdir().unwrap();
+        write(&temp, "helper.anv", "const VALUE = 1;");
+        let bundle = SourceBundle::default();
+        let env = package_env(temp.path(), &bundle);
 
-        let source = env.load_source(&module_path(&["helper"])).unwrap().unwrap();
+        let source = env.load_source(&module_id(&["helper"])).unwrap().unwrap();
 
         assert_eq!(source.code, "const VALUE = 1;");
         assert_eq!(
@@ -609,14 +695,14 @@ mod tests {
     }
 
     #[test]
-    fn source_environment_loads_nested_module() {
-        let temp = TempDir::new();
-        temp.write("foo/bar.anv", "const VALUE = 2;");
-        let bundle = SourceBundle::empty();
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+    fn package_source_environment_loads_nested_module() {
+        let temp = tempfile::tempdir().unwrap();
+        write(&temp, "foo/bar.anv", "const VALUE = 2;");
+        let bundle = SourceBundle::default();
+        let env = package_env(temp.path(), &bundle);
 
         let source = env
-            .load_source(&module_path(&["foo", "bar"]))
+            .load_source(&module_id(&["foo", "bar"]))
             .unwrap()
             .unwrap();
 
@@ -628,43 +714,39 @@ mod tests {
     }
 
     #[test]
-    fn source_environment_returns_none_for_missing_module() {
-        let temp = TempDir::new();
-        let bundle = SourceBundle::empty();
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+    fn package_source_environment_returns_none_for_missing_module() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = SourceBundle::default();
+        let env = package_env(temp.path(), &bundle);
 
+        assert!(env.load_source(&module_id(&["missing"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn package_source_environment_does_not_load_std_from_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        write(&temp, "std.anv", "const WRONG = 1;");
+        write(&temp, "std/math.anv", "const WRONG = 2;");
+        let bundle = SourceBundle::default();
+        let env = package_env(temp.path(), &bundle);
+
+        assert!(env.load_source(&std_module_id(&["std"])).unwrap().is_none());
         assert!(
-            env.load_source(&module_path(&["missing"]))
+            env.load_source(&std_module_id(&["math"]))
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn source_environment_does_not_load_std_from_filesystem() {
-        let temp = TempDir::new();
-        temp.write("std.anv", "const WRONG = 1;");
-        temp.write("std/math.anv", "const WRONG = 2;");
-        let bundle = SourceBundle::empty();
-        let env = SourceEnvironment::new(temp.path(), &bundle);
-
-        assert!(env.load_source(&module_path(&["std"])).unwrap().is_none());
-        assert!(
-            env.load_source(&module_path(&["std", "math"]))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn source_environment_reports_read_errors() {
-        let temp = TempDir::new();
-        temp.mkdir("bad.anv");
-        let bundle = SourceBundle::empty();
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+    fn package_source_environment_reports_read_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        mkdir(&temp, "bad.anv");
+        let bundle = SourceBundle::default();
+        let env = package_env(temp.path(), &bundle);
 
         let error = env
-            .load_source(&module_path(&["bad"]))
+            .load_source(&module_id(&["bad"]))
             .unwrap_err()
             .to_string();
 
@@ -673,13 +755,13 @@ mod tests {
     }
 
     #[test]
-    fn source_environment_loads_through_frontend_loader_trait() {
-        let temp = TempDir::new();
-        temp.write("helper.anv", "const VALUE = 1;");
-        let bundle = SourceBundle::empty();
-        let mut env = SourceEnvironment::new(temp.path(), &bundle);
+    fn package_source_environment_loads_through_frontend_loader_trait() {
+        let temp = tempfile::tempdir().unwrap();
+        write(&temp, "helper.anv", "const VALUE = 1;");
+        let bundle = SourceBundle::default();
+        let mut env = package_env(temp.path(), &bundle);
 
-        let source = SourceLoader::load(&mut env, &module_path(&["helper"]))
+        let source = PackageSourceLoader::load(&mut env, &module_id(&["helper"]))
             .unwrap()
             .unwrap();
 
@@ -691,36 +773,33 @@ mod tests {
     }
 
     #[test]
-    fn source_environment_loads_known_std_module() {
-        let temp = TempDir::new();
+    fn package_source_environment_loads_known_std_module() {
+        let temp = tempfile::tempdir().unwrap();
         let bundle = source_bundle(vec![std_source(
             &["std", "math"],
             "const PI = 3;",
             "<std.math>",
         )]);
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+        let env = package_env(temp.path(), &bundle);
 
-        let source = env
-            .load_source(&module_path(&["std", "math"]))
-            .unwrap()
-            .unwrap();
+        let source = env.load_source(&std_module_id(&["math"])).unwrap().unwrap();
 
         assert_eq!(source.code, "const PI = 3;");
         assert_eq!(source.label, "<std.math>");
     }
 
     #[test]
-    fn source_environment_loads_nested_std_module() {
-        let temp = TempDir::new();
+    fn package_source_environment_loads_nested_std_module() {
+        let temp = tempfile::tempdir().unwrap();
         let bundle = source_bundle(vec![std_source(
             &["std", "collections", "map"],
             "type Map;",
             "<std.collections.map>",
         )]);
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+        let env = package_env(temp.path(), &bundle);
 
         let source = env
-            .load_source(&module_path(&["std", "collections", "map"]))
+            .load_source(&std_module_id(&["collections", "map"]))
             .unwrap()
             .unwrap();
 
@@ -729,72 +808,69 @@ mod tests {
     }
 
     #[test]
-    fn source_environment_returns_none_for_unknown_std_module() {
-        let temp = TempDir::new();
+    fn package_source_environment_returns_none_for_unknown_std_module() {
+        let temp = tempfile::tempdir().unwrap();
         let bundle = source_bundle(vec![std_module("math")]);
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+        let env = package_env(temp.path(), &bundle);
 
         assert!(
-            env.load_source(&module_path(&["std", "unknown"]))
+            env.load_source(&std_module_id(&["unknown"]))
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn source_environment_returns_none_for_std_root() {
-        let temp = TempDir::new();
+    fn package_source_environment_returns_none_for_std_root() {
+        let temp = tempfile::tempdir().unwrap();
         let bundle = source_bundle(vec![std_module("math")]);
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+        let env = package_env(temp.path(), &bundle);
 
-        assert!(env.load_source(&module_path(&["std"])).unwrap().is_none());
+        assert!(env.load_source(&std_module_id(&["std"])).unwrap().is_none());
     }
 
     #[test]
-    fn source_environment_does_not_read_local_std_file_for_known_std_module() {
-        let temp = TempDir::new();
-        temp.write("std/math.anv", "const WRONG = 1;");
+    fn package_source_environment_does_not_read_local_std_file_for_known_std_module() {
+        let temp = tempfile::tempdir().unwrap();
+        write(&temp, "std/math.anv", "const WRONG = 1;");
         let bundle = source_bundle(vec![std_source(
             &["std", "math"],
             "const RIGHT = 1;",
             "<std.math>",
         )]);
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+        let env = package_env(temp.path(), &bundle);
 
-        let source = env
-            .load_source(&module_path(&["std", "math"]))
-            .unwrap()
-            .unwrap();
+        let source = env.load_source(&std_module_id(&["math"])).unwrap().unwrap();
 
         assert_eq!(source.code, "const RIGHT = 1;");
         assert_eq!(source.label, "<std.math>");
     }
 
     #[test]
-    fn source_environment_does_not_read_local_std_file_for_unknown_std_module() {
-        let temp = TempDir::new();
-        temp.write("std/missing.anv", "const WRONG = 1;");
-        let bundle = SourceBundle::empty();
-        let env = SourceEnvironment::new(temp.path(), &bundle);
+    fn package_source_environment_does_not_read_local_std_file_for_unknown_std_module() {
+        let temp = tempfile::tempdir().unwrap();
+        write(&temp, "std/missing.anv", "const WRONG = 1;");
+        let bundle = SourceBundle::default();
+        let env = package_env(temp.path(), &bundle);
 
         assert!(
-            env.load_source(&module_path(&["std", "missing"]))
+            env.load_source(&std_module_id(&["missing"]))
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn source_environment_loads_std_through_frontend_loader_trait() {
-        let temp = TempDir::new();
+    fn package_source_environment_loads_std_through_frontend_loader_trait() {
+        let temp = tempfile::tempdir().unwrap();
         let bundle = source_bundle(vec![std_source(
             &["std", "math"],
             "const PI = 3;",
             "<std.math>",
         )]);
-        let mut env = SourceEnvironment::new(temp.path(), &bundle);
+        let mut env = package_env(temp.path(), &bundle);
 
-        let source = SourceLoader::load(&mut env, &module_path(&["std", "math"]))
+        let source = PackageSourceLoader::load(&mut env, &std_module_id(&["math"]))
             .unwrap()
             .unwrap();
 

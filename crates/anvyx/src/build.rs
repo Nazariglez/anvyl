@@ -458,15 +458,24 @@ mod tests {
     use super::*;
     use crate::manifest::{ExternEntry, Manifest, Project};
 
-    fn manifest_no_externs() -> Manifest {
+    fn test_manifest(
+        name: Option<&str>,
+        entry: &str,
+        externs: HashMap<String, ExternEntry>,
+    ) -> Manifest {
         Manifest {
             project: Project {
-                name: None,
-                entry: "src/main.anv".into(),
+                name: name.map(str::to_string),
+                entry: entry.into(),
             },
-            externs: HashMap::new(),
+            dependencies: HashMap::new(),
+            externs,
             lint: anvyx_lang::LintConfig::default(),
         }
+    }
+
+    fn manifest_no_externs() -> Manifest {
+        test_manifest(None, "src/main.anv", HashMap::new())
     }
 
     fn manifest_one_extern() -> Manifest {
@@ -477,14 +486,7 @@ mod tests {
                 path: "my_externs/engine".into(),
             },
         );
-        Manifest {
-            project: Project {
-                name: None,
-                entry: "src/main.anv".into(),
-            },
-            externs,
-            lint: anvyx_lang::LintConfig::default(),
-        }
+        test_manifest(None, "src/main.anv", externs)
     }
 
     fn manifest_two_externs() -> Manifest {
@@ -501,14 +503,7 @@ mod tests {
                 path: "my_externs/audio".into(),
             },
         );
-        Manifest {
-            project: Project {
-                name: None,
-                entry: "src/main.anv".into(),
-            },
-            externs,
-            lint: anvyx_lang::LintConfig::default(),
-        }
+        test_manifest(None, "src/main.anv", externs)
     }
 
     #[test]
@@ -643,14 +638,7 @@ mod tests {
                 path: "does_not_exist".into(),
             },
         );
-        let manifest = Manifest {
-            project: Project {
-                name: None,
-                entry: "src/main.anv".into(),
-            },
-            externs,
-            lint: anvyx_lang::LintConfig::default(),
-        };
+        let manifest = test_manifest(None, "src/main.anv", externs);
 
         let result = generate_runner_crate(&tmp, &manifest);
 
@@ -941,14 +929,7 @@ mod tests {
 
     #[test]
     fn build_main_rs_hardcoded_entry() {
-        let manifest = Manifest {
-            project: Project {
-                name: None,
-                entry: "game/start.anv".into(),
-            },
-            externs: HashMap::new(),
-            lint: anvyx_lang::LintConfig::default(),
-        };
+        let manifest = test_manifest(None, "game/start.anv", HashMap::new());
         let output = generate_build_main_rs(&manifest, false);
 
         assert!(output.contains("const ENTRY_POINT: &str = \"game/start.anv\";"));
@@ -1048,14 +1029,7 @@ mod tests {
 
     #[test]
     fn resolve_project_name_from_manifest() {
-        let manifest = Manifest {
-            project: Project {
-                name: Some("my_game".into()),
-                entry: "src/main.anv".into(),
-            },
-            externs: HashMap::new(),
-            lint: anvyx_lang::LintConfig::default(),
-        };
+        let manifest = test_manifest(Some("my_game"), "src/main.anv", HashMap::new());
         assert_eq!(
             resolve_project_name(&manifest, Path::new("/any/path")),
             "my_game"
@@ -1064,14 +1038,7 @@ mod tests {
 
     #[test]
     fn resolve_project_name_from_directory() {
-        let manifest = Manifest {
-            project: Project {
-                name: None,
-                entry: "src/main.anv".into(),
-            },
-            externs: HashMap::new(),
-            lint: anvyx_lang::LintConfig::default(),
-        };
+        let manifest = test_manifest(None, "src/main.anv", HashMap::new());
         assert_eq!(
             resolve_project_name(&manifest, Path::new("/home/user/cool_project")),
             "cool_project"
@@ -1080,14 +1047,7 @@ mod tests {
 
     #[test]
     fn resolve_project_name_sanitizes() {
-        let manifest = Manifest {
-            project: Project {
-                name: Some("My Cool Game!".into()),
-                entry: "src/main.anv".into(),
-            },
-            externs: HashMap::new(),
-            lint: anvyx_lang::LintConfig::default(),
-        };
+        let manifest = test_manifest(Some("My Cool Game!"), "src/main.anv", HashMap::new());
         assert_eq!(
             resolve_project_name(&manifest, Path::new("/any/path")),
             "my-cool-game"
@@ -1096,14 +1056,7 @@ mod tests {
 
     #[test]
     fn resolve_project_name_fallback() {
-        let manifest = Manifest {
-            project: Project {
-                name: None,
-                entry: "src/main.anv".into(),
-            },
-            externs: HashMap::new(),
-            lint: anvyx_lang::LintConfig::default(),
-        };
+        let manifest = test_manifest(None, "src/main.anv", HashMap::new());
         assert_eq!(
             resolve_project_name(&manifest, Path::new("/")),
             "anvyx-project"
@@ -1279,14 +1232,7 @@ mod tests {
                 path: "./my_extern".into(),
             },
         );
-        let manifest = Manifest {
-            project: Project {
-                name: None,
-                entry: "src/main.anv".into(),
-            },
-            externs,
-            lint: LintConfig::default(),
-        };
+        let manifest = test_manifest(None, "src/main.anv", externs);
 
         bundle_sources(&tmp, &dist, &manifest).unwrap();
 

@@ -4,7 +4,7 @@ use anvyx_externs::{
     ExternStaticDescriptor, ModulePath, ProviderDescriptor, ProviderId,
 };
 
-use crate::span::Span;
+use crate::{resolve::ModuleId, span::Span};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternInputs {
@@ -36,8 +36,8 @@ pub(crate) enum ExternProvenance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum RawExternScope {
-    Root,
     Named(ModulePath),
+    Module(ModuleId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

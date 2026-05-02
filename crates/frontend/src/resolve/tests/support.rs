@@ -7,8 +7,8 @@ use crate::{
     ast::Program,
     lexer, parser,
     resolve::{
-        self, ModuleLoadError, ModuleLoader, ModulePath, PreloadedModule, ResolveError,
-        ResolveFailure, ResolveResult,
+        self, ModuleId, ModuleLoadError, ModuleLoader, ModulePath, PackageId, PackageInput,
+        PreloadedModule, ResolveError, ResolveFailure, ResolveResult,
     },
 };
 
@@ -17,8 +17,54 @@ pub fn parse_program(src: &str) -> Program {
     parser::parse_ast(&tokens).unwrap_or_else(|errs| panic!("failed to parse: {errs:?}"))
 }
 
-pub fn module_path(segments: Vec<&str>) -> ModulePath {
-    ModulePath::new(segments.into_iter().map(String::from).collect()).unwrap()
+pub fn package(name: &str) -> PackageId {
+    PackageId::new(name)
+}
+
+pub fn root_package() -> PackageId {
+    PackageId::synthetic_root()
+}
+
+pub fn module_path<I, S>(segments: I) -> ModulePath
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    ModulePath::new(
+        segments
+            .into_iter()
+            .map(|segment| segment.as_ref().to_string())
+            .collect(),
+    )
+    .unwrap()
+}
+
+pub fn module_id(package: &PackageId, segments: &[&str]) -> ModuleId {
+    ModuleId::named(package.clone(), module_path(segments))
+}
+
+pub fn root_id(package: &PackageId) -> ModuleId {
+    ModuleId::root(package.clone())
+}
+
+pub fn package_input(dependencies: &[(&str, PackageId)]) -> PackageInput {
+    PackageInput {
+        root: None,
+        dependencies: dependencies
+            .iter()
+            .map(|(alias, package)| ((*alias).to_string(), package.clone()))
+            .collect(),
+    }
+}
+
+pub fn package_root(source: &str, dependencies: &[(&str, PackageId)]) -> PackageInput {
+    PackageInput {
+        root: Some(parse_program(source)),
+        dependencies: dependencies
+            .iter()
+            .map(|(alias, package)| ((*alias).to_string(), package.clone()))
+            .collect(),
+    }
 }
 
 pub fn ignored_roots(roots: &[&str]) -> HashSet<String> {
@@ -27,43 +73,65 @@ pub fn ignored_roots(roots: &[&str]) -> HashSet<String> {
 
 #[derive(Default)]
 pub struct InMemoryLoader {
-    modules: HashMap<ModulePath, Program>,
-    missing: Vec<ModulePath>,
-    failures: HashMap<ModulePath, String>,
-    loads: Vec<ModulePath>,
+    modules: HashMap<ModuleId, Program>,
+    missing: Vec<ModuleId>,
+    failures: HashMap<ModuleId, String>,
+    loads: Vec<ModuleId>,
 }
 
 impl InMemoryLoader {
     pub fn add_source(&mut self, path: ModulePath, source: &str) {
+        let package = root_package();
+        self.add_package_source(&package, path, source);
+    }
+
+    pub fn add_package_source(&mut self, package: &PackageId, path: ModulePath, source: &str) {
         let program = parse_program(source);
-        self.modules.insert(path, program);
+        self.modules
+            .insert(ModuleId::named(package.clone(), path), program);
     }
 
     pub fn add_missing(&mut self, path: ModulePath) {
-        self.missing.push(path);
+        let package = root_package();
+        self.add_package_missing(&package, path);
+    }
+
+    pub fn add_package_missing(&mut self, package: &PackageId, path: ModulePath) {
+        self.missing.push(ModuleId::named(package.clone(), path));
     }
 
     pub fn add_failure(&mut self, path: ModulePath, msg: &str) {
-        self.failures.insert(path, msg.to_string());
+        let package = root_package();
+        self.add_package_failure(&package, path, msg);
+    }
+
+    pub fn add_package_failure(&mut self, package: &PackageId, path: ModulePath, msg: &str) {
+        self.failures
+            .insert(ModuleId::named(package.clone(), path), msg.to_string());
     }
 
     pub fn load_count(&self, path: &ModulePath) -> usize {
-        self.loads.iter().filter(|loaded| *loaded == path).count()
+        let package = root_package();
+        self.load_count_module(&ModuleId::named(package, path.clone()))
+    }
+
+    pub fn load_count_module(&self, module: &ModuleId) -> usize {
+        self.loads.iter().filter(|loaded| *loaded == module).count()
     }
 }
 
 impl ModuleLoader for InMemoryLoader {
     type FatalError = Infallible;
 
-    fn load(&mut self, path: &ModulePath) -> Result<Option<Program>, ModuleLoadError<Infallible>> {
-        self.loads.push(path.clone());
-        if let Some(msg) = self.failures.get(path) {
+    fn load(&mut self, module: &ModuleId) -> Result<Option<Program>, ModuleLoadError<Infallible>> {
+        self.loads.push(module.clone());
+        if let Some(msg) = self.failures.get(module) {
             return Err(ModuleLoadError::LoadFailed(msg.clone()));
         }
-        if self.missing.iter().any(|p| p == path) {
+        if self.missing.iter().any(|missing| missing == module) {
             return Ok(None);
         }
-        Ok(self.modules.get(path).cloned())
+        Ok(self.modules.get(module).cloned())
     }
 }
 
@@ -94,9 +162,27 @@ pub fn resolve_with_ignored(
     )
 }
 
+pub fn resolve_package(
+    root_package: PackageId,
+    source: &str,
+    packages: HashMap<PackageId, PackageInput>,
+    loader: &mut InMemoryLoader,
+) -> Result<ResolveResult, ResolveFailure<Infallible>> {
+    resolve::resolve_package_modules(
+        root_package,
+        parse_program(source),
+        &packages,
+        vec![],
+        loader,
+        &HashSet::new(),
+        &HashSet::new(),
+        resolve::SystemPackages::default(),
+    )
+}
+
 pub fn preloaded(path: &[&str], source: &str) -> PreloadedModule {
     PreloadedModule {
-        path: module_path(path.to_vec()),
+        module: module_id(&root_package(), path),
         program: parse_program(source),
     }
 }

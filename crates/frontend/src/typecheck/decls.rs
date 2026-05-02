@@ -11,11 +11,11 @@ use super::{
 use crate::{
     ast::{
         ArrayLen, ConstArg, ConstParam, ConstParamId, FuncParam, GenericArg, Ident, ImportItemKind,
-        ImportKind, MethodReceiver, Mutability, NominalKind, Param, Program, Stmt, StmtNode, Type,
-        TypeParam, VariantKind, Visibility,
+        ImportKind, MethodReceiver, ModuleOrigin, Mutability, NominalKind, Param, Program, Stmt,
+        StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     externs::{RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope},
-    resolve::{ModuleKey, ModulePath, ResolveResult},
+    resolve::{self, ModuleId, ModulePath, PackageId, ResolveResult},
     span::Span,
 };
 
@@ -23,13 +23,49 @@ use crate::{
 pub(crate) enum ModuleScope {
     Root,
     Named(ModulePath),
+    Package(ModuleId),
 }
 
 impl ModuleScope {
-    pub(crate) fn named_path(&self) -> Option<crate::ast::ModulePath> {
+    pub(crate) fn from_module_id(module: &ModuleId) -> Self {
+        if module.package() == &PackageId::synthetic_root() {
+            match module.named_path() {
+                Some(path) => Self::Named(path.clone()),
+                None => Self::Root,
+            }
+        } else {
+            Self::Package(module.clone())
+        }
+    }
+
+    fn nominal_origin(&self) -> Option<ModuleOrigin> {
         match self {
             ModuleScope::Root => None,
-            ModuleScope::Named(p) => Some(p.to_ast_path()),
+            ModuleScope::Named(path) => Some(ModuleOrigin::Module(path.to_ast_path())),
+            ModuleScope::Package(module) => Some(ModuleOrigin::Package {
+                package: module.package().as_str().to_string(),
+                path: module.named_path().map(ModulePath::to_ast_path),
+            }),
+        }
+    }
+
+    fn from_nominal_origin(origin: &ModuleOrigin) -> Self {
+        match origin {
+            ModuleOrigin::Module(path) => Self::Named(
+                ModulePath::new(path.iter().cloned().collect())
+                    .expect("AST validates nominal origin module paths"),
+            ),
+            ModuleOrigin::Package { package, path } => {
+                let package = PackageId::new(package.clone());
+                match path {
+                    Some(path) => Self::Package(ModuleId::named(
+                        package,
+                        ModulePath::new(path.iter().cloned().collect())
+                            .expect("nominal origin module path is valid"),
+                    )),
+                    None => Self::Package(ModuleId::root(package)),
+                }
+            }
         }
     }
 }
@@ -196,6 +232,21 @@ pub(crate) enum DeclError {
     },
 }
 
+fn module_id_for_scope(scope: &ModuleScope) -> ModuleId {
+    match scope {
+        ModuleScope::Root => ModuleId::root(PackageId::synthetic_root()),
+        ModuleScope::Named(path) => ModuleId::named(PackageId::synthetic_root(), path.clone()),
+        ModuleScope::Package(module) => module.clone(),
+    }
+}
+
+fn package_for_scope(scope: &ModuleScope) -> PackageId {
+    match scope {
+        ModuleScope::Package(module) => module.package().clone(),
+        ModuleScope::Root | ModuleScope::Named(_) => PackageId::synthetic_root(),
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DeclarationIndex {
     modules: HashMap<ModuleScope, ModuleDecls>,
@@ -245,6 +296,11 @@ struct ImportScopeBuilder {
 pub(crate) struct ImportScope {
     pub(crate) namespace: Namespace,
     pub(crate) active_modules: HashSet<ModuleScope>,
+}
+
+struct ImportTargetScope {
+    module: ModuleScope,
+    default_name: Ident,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -313,10 +369,10 @@ impl ImportScopeBuilder {
 
     fn seed_existing_origins(&mut self) {
         let namespace = self.namespace.clone();
-        self.seed_origins(&namespace, BindingOrigin::Local);
+        self.seed_origins(&namespace, &BindingOrigin::Local);
     }
 
-    fn seed_origins(&mut self, namespace: &Namespace, origin: BindingOrigin) {
+    fn seed_origins(&mut self, namespace: &Namespace, origin: &BindingOrigin) {
         self.origins.extend(
             namespace
                 .values
@@ -347,34 +403,24 @@ impl ImportScopeBuilder {
     fn apply_import(
         &mut self,
         kind: &ImportKind,
-        path: &ModulePath,
+        source: ModuleScope,
+        default_name: Ident,
         dep: Option<&ModuleDecls>,
         span: Span,
         validate_members: bool,
     ) {
-        let source = ModuleScope::Named(path.clone());
         match kind {
             ImportKind::Module => {
-                if let Some(alias) = path.segments().last() {
-                    self.insert_module(
-                        Ident::new(alias.as_str()),
-                        source.clone(),
-                        self.origin(source),
-                        span,
-                    );
-                }
+                self.insert_module(default_name, source.clone(), self.origin(source), span);
             }
             ImportKind::ModuleAs(alias) => {
                 self.insert_module(*alias, source.clone(), self.origin(source), span);
             }
             ImportKind::Selective(items) => {
                 for item in items {
-                    let target = item.alias.unwrap_or_else(|| match item.kind {
+                    let target = item.alias.unwrap_or(match item.kind {
                         ImportItemKind::Name(name) => name,
-                        ImportItemKind::SelfModule => path
-                            .segments()
-                            .last()
-                            .map_or_else(|| Ident::new(""), |segment| Ident::new(segment.as_str())),
+                        ImportItemKind::SelfModule => default_name,
                     });
                     match item.kind {
                         ImportItemKind::SelfModule => {
@@ -389,7 +435,7 @@ impl ImportScopeBuilder {
                             if let Some(dep) = dep {
                                 self.copy_named_members(
                                     dep,
-                                    source.clone(),
+                                    &source,
                                     name,
                                     target,
                                     span,
@@ -402,7 +448,7 @@ impl ImportScopeBuilder {
             }
             ImportKind::Wildcard => {
                 if let Some(dep) = dep {
-                    self.copy_wildcard_members(&dep.exports, source, span);
+                    self.copy_wildcard_members(&dep.exports, &source, span);
                 }
             }
         }
@@ -411,7 +457,7 @@ impl ImportScopeBuilder {
     fn copy_named_members(
         &mut self,
         dep: &ModuleDecls,
-        origin_module: ModuleScope,
+        origin_module: &ModuleScope,
         source_name: Ident,
         target_name: Ident,
         span: Span,
@@ -439,9 +485,9 @@ impl ImportScopeBuilder {
             return;
         }
         if dep.locals.contains_member(source_name) {
-            self.push_private_member(origin_module, source_name, span);
+            self.push_private_member(origin_module.clone(), source_name, span);
         } else {
-            self.push_missing_member(origin_module, source_name, span);
+            self.push_missing_member(origin_module.clone(), source_name, span);
         }
     }
 
@@ -466,7 +512,7 @@ impl ImportScopeBuilder {
     fn copy_wildcard_members(
         &mut self,
         source: &Namespace,
-        origin_module: ModuleScope,
+        origin_module: &ModuleScope,
         span: Span,
     ) {
         for (name, key) in &source.types {
@@ -741,11 +787,15 @@ impl DeclarationIndex {
         };
         let modules = Self::module_programs(root, resolved);
         for (scope, program) in &modules {
-            index.collect_module(program, scope.clone(), matches!(scope, ModuleScope::Root));
+            index.collect_module(
+                program,
+                scope.clone(),
+                Self::is_export_all_scope(scope, resolved),
+            );
         }
         index.collect_extern_headers(externs);
-        index.apply_public_import_reexports(&modules);
-        index.build_import_scopes(&modules);
+        index.apply_public_import_reexports(&modules, resolved);
+        index.build_import_scopes(&modules, resolved);
         index
     }
 
@@ -753,16 +803,26 @@ impl DeclarationIndex {
         root: &'a Program,
         resolved: &'a ResolveResult,
     ) -> Vec<(ModuleScope, &'a Program)> {
-        let mut modules = vec![(ModuleScope::Root, root)];
+        let mut modules = vec![(ModuleScope::from_module_id(&resolved.root), root)];
         for group in &resolved.module_groups {
             for module in group {
-                let ModuleKey::Named(path) = &module.key else {
+                if module.key == resolved.root {
                     continue;
-                };
-                modules.push((ModuleScope::Named(path.clone()), &module.program));
+                }
+                modules.push((ModuleScope::from_module_id(&module.key), &module.program));
             }
         }
         modules
+    }
+
+    fn is_export_all_scope(scope: &ModuleScope, resolved: &ResolveResult) -> bool {
+        if matches!(scope, ModuleScope::Root) {
+            return true;
+        }
+        let Some(core_package) = &resolved.system.core else {
+            return false;
+        };
+        matches!(scope, ModuleScope::Package(module) if module == &ModuleId::root(core_package.clone()))
     }
 
     pub(crate) fn errors(&self) -> &[DeclError] {
@@ -1269,7 +1329,66 @@ impl DeclarationIndex {
         self.modules.insert(scope, decls);
     }
 
-    fn apply_public_import_reexports(&mut self, modules: &[(ModuleScope, &Program)]) {
+    fn resolve_import_target(
+        &mut self,
+        current: &ModuleScope,
+        import: &crate::ast::Import,
+        span: Span,
+        resolved: &ResolveResult,
+    ) -> Option<ImportTargetScope> {
+        let mut errors = vec![];
+        let spanned = crate::span::Spanned::new(import.clone(), span);
+        let target = resolve::resolve_import_target(
+            &module_id_for_scope(current),
+            &spanned,
+            &resolved.dependencies,
+            resolved.system.std.as_ref(),
+            &mut errors,
+        )?;
+        let module = ModuleScope::from_module_id(&target.base);
+        if target.exported_path.is_empty() {
+            return Some(ImportTargetScope {
+                module,
+                default_name: target.default_name,
+            });
+        }
+        self.resolve_exported_module_path(current, module, &target.exported_path, span)
+    }
+
+    fn resolve_exported_module_path(
+        &mut self,
+        current: &ModuleScope,
+        mut module: ModuleScope,
+        path: &[Ident],
+        span: Span,
+    ) -> Option<ImportTargetScope> {
+        let mut default_name = None;
+        for segment in path {
+            default_name = Some(*segment);
+            match self.exported_module(&module, *segment) {
+                Some(next) => module = next,
+                None => {
+                    self.errors.push(DeclError::MissingImportMember {
+                        module: current.clone(),
+                        imported: module,
+                        name: *segment,
+                        span,
+                    });
+                    return None;
+                }
+            }
+        }
+        Some(ImportTargetScope {
+            module,
+            default_name: default_name.unwrap_or_else(|| Ident::new("")),
+        })
+    }
+
+    fn apply_public_import_reexports(
+        &mut self,
+        modules: &[(ModuleScope, &Program)],
+        resolved: &ResolveResult,
+    ) {
         for (scope, program) in modules {
             let Some(exports) = self.modules.get(scope).map(|decls| decls.exports.clone()) else {
                 continue;
@@ -1277,18 +1396,7 @@ impl DeclarationIndex {
 
             let mut builder =
                 ImportScopeBuilder::with_namespace(scope.clone(), exports, ImportMode::Reexport);
-            for stmt in &program.stmts {
-                let Stmt::Import(import) = &stmt.node else {
-                    continue;
-                };
-                if !matches!(import.node.visibility, Visibility::Public) {
-                    continue;
-                }
-                let path = ModulePath::from_idents(&import.node.path);
-                let dep_scope = ModuleScope::Named(path.clone());
-                let dep = self.modules.get(&dep_scope);
-                builder.apply_import(&import.node.kind, &path, dep, import.span, true);
-            }
+            self.apply_program_imports(scope, program, resolved, &mut builder);
 
             let (exports, errors) = builder.finish_namespace();
             self.errors.extend(errors);
@@ -1298,29 +1406,67 @@ impl DeclarationIndex {
         }
     }
 
-    fn build_import_scopes(&mut self, modules: &[(ModuleScope, &Program)]) {
+    fn build_import_scopes(
+        &mut self,
+        modules: &[(ModuleScope, &Program)],
+        resolved: &ResolveResult,
+    ) {
         for (scope, program) in modules {
             let mut builder = ImportScopeBuilder::new(scope.clone(), ImportMode::Import);
             if let Some(decls) = self.modules.get(scope) {
-                builder.seed_origins(&decls.locals, BindingOrigin::Local);
+                builder.seed_origins(&decls.locals, &BindingOrigin::Local);
             }
-            for stmt in &program.stmts {
-                let Stmt::Import(import) = &stmt.node else {
-                    continue;
-                };
-                let path = ModulePath::from_idents(&import.node.path);
-                let dep_scope = ModuleScope::Named(path.clone());
-                builder.active_modules.insert(dep_scope.clone());
-                let dep = self.modules.get(&dep_scope);
-                let validate_members = !matches!(import.node.visibility, Visibility::Public);
-                builder.apply_import(&import.node.kind, &path, dep, import.span, validate_members);
+            if let Some(core_package) = &resolved.system.core
+                && package_for_scope(scope) != *core_package
+            {
+                let core = ModuleScope::from_module_id(&ModuleId::root(core_package.clone()));
+                if let Some(decls) = self.modules.get(&core) {
+                    builder.copy_wildcard_members(&decls.exports, &core, Span::new(0, 0));
+                }
             }
+            self.apply_program_imports(scope, program, resolved, &mut builder);
             let (mut imports, errors) = builder.finish_import_scope();
             self.errors.extend(errors);
             imports.activate_imported_origins();
             if let Some(decls) = self.modules.get_mut(scope) {
                 decls.imports = imports;
             }
+        }
+    }
+
+    fn apply_program_imports(
+        &mut self,
+        scope: &ModuleScope,
+        program: &Program,
+        resolved: &ResolveResult,
+        builder: &mut ImportScopeBuilder,
+    ) {
+        for stmt in &program.stmts {
+            let Stmt::Import(import) = &stmt.node else {
+                continue;
+            };
+            let is_public = matches!(import.node.visibility, Visibility::Public);
+            if builder.mode == ImportMode::Reexport && !is_public {
+                continue;
+            }
+            let Some(target) =
+                self.resolve_import_target(scope, &import.node, import.span, resolved)
+            else {
+                continue;
+            };
+            if builder.mode == ImportMode::Import {
+                builder.active_modules.insert(target.module.clone());
+            }
+            let dep = self.modules.get(&target.module);
+            let validate_members = builder.mode == ImportMode::Reexport || !is_public;
+            builder.apply_import(
+                &import.node.kind,
+                target.module,
+                target.default_name,
+                dep,
+                import.span,
+                validate_members,
+            );
         }
     }
 
@@ -1410,6 +1556,7 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn set_const_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
+        let ty = Box::new(ty);
         for decls in self.modules.values_mut() {
             Self::set_namespace_const_type(&mut decls.locals, scope, name, &ty);
             Self::set_namespace_const_type(&mut decls.exports, scope, name, &ty);
@@ -1461,10 +1608,7 @@ impl DeclarationIndex {
             return None;
         };
         let scope = match &nominal.origin {
-            Some(origin) => ModuleScope::Named(
-                ModulePath::new(origin.iter().cloned().collect())
-                    .expect("AST validates module paths"),
-            ),
+            Some(origin) => ModuleScope::from_nominal_origin(origin),
             None => ModuleScope::Root,
         };
         self.local_type(&scope, nominal.name)
@@ -1533,6 +1677,9 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn callable_for_value(&self, value: &ResolvedValue) -> Option<CallableRef> {
+        if !self.modules.contains_key(&value.module) {
+            return None;
+        }
         let ValueDecl::Func(sig) = &value.decl else {
             return None;
         };
@@ -1572,6 +1719,7 @@ impl DeclarationIndex {
         method: &MethodSchema,
         receiver_ty: Option<Type>,
     ) -> CallableRef {
+        debug_assert!(self.aggregates.contains_key(&aggregate.key));
         let params = match receiver_ty.as_ref() {
             Some(receiver) => method
                 .params
@@ -1617,6 +1765,7 @@ impl DeclarationIndex {
         method: &ExtendMethodSchema,
         owner_args: GenericArgs,
     ) -> Option<CallableRef> {
+        debug_assert!(self.extends.iter().any(|schema| schema.id == extend.id));
         method.receiver?;
         let (type_subst, const_subst) = extend.generics.substitutions(&owner_args);
         let template_params = method
@@ -1796,7 +1945,7 @@ fn more_specific(a: &Type, b: &Type) -> bool {
     compare_specificity(a, b) == Specificity::MoreSpecific
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeRefError {
     Unknown {
         qualifier: Option<Ident>,
@@ -1882,7 +2031,7 @@ impl DeclarationIndex {
                 .map(|(name, ty)| Ok((*name, self.finalize_type_ref(module, generics, ty)?)))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Type::NamedTuple),
-            Type::Nominal(nominal) => Ok(Type::nominal(
+            Type::Nominal(nominal) => Ok(Type::nominal_with_origin(
                 nominal.kind,
                 nominal.name,
                 nominal
@@ -1893,7 +2042,7 @@ impl DeclarationIndex {
                 nominal
                     .const_args
                     .iter()
-                    .map(|arg| self.finalize_const_arg(generics, arg))
+                    .map(|arg| Self::finalize_const_arg(generics, arg))
                     .collect::<Result<_, _>>()?,
                 nominal.origin.clone(),
             )),
@@ -1905,7 +2054,7 @@ impl DeclarationIndex {
             }),
             Type::Array { elem, len } => Ok(Type::Array {
                 elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
-                len: self.finalize_array_len(generics, *len)?,
+                len: Self::finalize_array_len(generics, *len)?,
             }),
             Type::Map { key, value } => Ok(Type::Map {
                 key: Box::new(self.finalize_type_ref(module, generics, key)?),
@@ -1971,9 +2120,9 @@ impl DeclarationIndex {
         arg: &GenericArg,
     ) -> Result<ConstArg, TypeRefError> {
         match arg {
-            GenericArg::Const(arg) => self.finalize_const_arg(generics, arg),
+            GenericArg::Const(arg) => Self::finalize_const_arg(generics, arg),
             GenericArg::Type(ty) => match bare_type_name(ty) {
-                Some(name) => self.finalize_const_name_arg(generics, name),
+                Some(name) => Self::finalize_const_name_arg(generics, name),
                 None => {
                     let ty = self.finalize_type_ref(module, generics, ty)?;
                     match ty {
@@ -1992,28 +2141,26 @@ impl DeclarationIndex {
     }
 
     fn finalize_const_arg(
-        &self,
         generics: &GenericTypeContext,
         arg: &ConstArg,
     ) -> Result<ConstArg, TypeRefError> {
         match arg {
-            ConstArg::Name(name) => self.finalize_const_name_arg(generics, *name),
+            ConstArg::Name(name) => Self::finalize_const_name_arg(generics, *name),
             ConstArg::Value(_) | ConstArg::Param(_) => Ok(arg.clone()),
         }
     }
 
     fn finalize_const_name_arg(
-        &self,
         generics: &GenericTypeContext,
         name: Ident,
     ) -> Result<ConstArg, TypeRefError> {
-        Ok(self
-            .finalize_const_name(generics, name)?
-            .map_or(ConstArg::Name(name), ConstArg::Param))
+        Ok(
+            Self::finalize_const_name(generics, name)?
+                .map_or(ConstArg::Name(name), ConstArg::Param),
+        )
     }
 
     fn finalize_const_name(
-        &self,
         generics: &GenericTypeContext,
         name: Ident,
     ) -> Result<Option<ConstParamId>, TypeRefError> {
@@ -2027,13 +2174,11 @@ impl DeclarationIndex {
     }
 
     fn finalize_array_len(
-        &self,
         generics: &GenericTypeContext,
         len: ArrayLen,
     ) -> Result<ArrayLen, TypeRefError> {
         match len {
-            ArrayLen::Named(name) => Ok(self
-                .finalize_const_name(generics, name)?
+            ArrayLen::Named(name) => Ok(Self::finalize_const_name(generics, name)?
                 .map_or(ArrayLen::Named(name), ArrayLen::Param)),
             ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Param(_) => Ok(len),
         }
@@ -2260,12 +2405,12 @@ pub(crate) fn nominal_type_with_args(
     type_args: &[Type],
     const_args: &[ConstArg],
 ) -> Type {
-    Type::nominal(
+    Type::nominal_with_origin(
         key.kind,
         key.name,
         type_args.to_vec(),
         const_args.to_vec(),
-        key.module.named_path(),
+        key.module.nominal_origin(),
     )
 }
 
@@ -2279,7 +2424,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ast::TypeVarId, lexer::tokenize, parser, resolve::ResolvedModule,
+        ast::TypeVarId,
+        lexer::tokenize,
+        parser,
+        resolve::{ModuleId, PackageId, ResolvedModule},
         typecheck::type_ops::type_closure_facts,
     };
 
@@ -2296,17 +2444,27 @@ mod tests {
         ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
     }
 
+    fn root_id() -> ModuleId {
+        ModuleId::root(PackageId::synthetic_root())
+    }
+
     fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
         ResolveResult {
+            root: root_id(),
             module_groups: modules
                 .iter()
                 .map(|(name, source)| {
                     vec![ResolvedModule {
-                        key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()]).unwrap()),
+                        key: ModuleId::named(
+                            PackageId::synthetic_root(),
+                            ModulePath::new(vec![(*name).to_string()]).unwrap(),
+                        ),
                         program: parse(source),
                     }]
                 })
                 .collect(),
+            dependencies: HashMap::new(),
+            system: resolve::SystemPackages::default(),
         }
     }
 
@@ -2404,7 +2562,7 @@ mod tests {
         assert_eq!(nominal.name, ident(name));
         assert_eq!(
             nominal.origin,
-            module.map(|name| std::rc::Rc::from(vec![name.to_string()].into_boxed_slice()))
+            module.map(|name| ModuleOrigin::Module(std::rc::Rc::from(vec![name.to_string()])))
         );
     }
 

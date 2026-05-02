@@ -166,9 +166,33 @@ fn generic_params<'src>() -> BoxedParser<'src, GenericParams> {
         .boxed()
 }
 
+fn package_import_target(root: ast::Ident, path: Vec<ast::Ident>) -> Option<ast::ImportTarget> {
+    match root.as_str() {
+        "dep" => {
+            let (alias, path) = path.split_first().expect("dotted path is non-empty");
+            Some(ast::ImportTarget::dependency(
+                alias.to_owned(),
+                path.to_vec(),
+            ))
+        }
+        "ext" => Some(ast::ImportTarget::native_provider(path)),
+        _ => None,
+    }
+}
+
+fn local_or_std_import_target(path: Vec<ast::Ident>) -> ast::ImportTarget {
+    let (root, rest) = path.split_first().expect("dotted path is non-empty");
+    if root.as_str() == "std" {
+        ast::ImportTarget::std(rest.to_vec())
+    } else {
+        ast::ImportTarget::local(path)
+    }
+}
+
 pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
     let import_kw = select! { (Token::Keyword(Keyword::Import), _) => () };
     let dot = select! { (Token::Dot, _) => () };
+    let colon = select! { (Token::Colon, _) => () };
     let semicolon = select! { (Token::Semicolon, _) => () };
     let as_kw = select! { (Token::Keyword(Keyword::As), _) => () };
     let open_brace = select! { (Token::Open(Delimiter::Brace), _) => () };
@@ -176,12 +200,25 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
     let star = select! { (Token::Op(Op::Mul), _) => () };
     let comma = select! { (Token::Comma, _) => () };
 
-    let import_path = identifier()
+    let dotted_path = identifier()
         .then(dot.ignore_then(identifier()).repeated().collect::<Vec<_>>())
         .map(|(first, mut rest)| {
             rest.insert(0, first);
             rest
         });
+
+    let package_target = identifier()
+        .then_ignore(colon)
+        .then(dotted_path.clone())
+        .try_map(|(root, path), span| {
+            package_import_target(root, path).ok_or_else(|| {
+                Rich::custom(span, "only dep: and ext: import roots use colon syntax")
+            })
+        });
+
+    let local_or_std_target = dotted_path.map(local_or_std_import_target);
+
+    let import_target = package_target.or(local_or_std_target);
 
     let self_item = select! {
         (Token::Ident(i), _) if i.0.as_ref() == SELF_ITEM => ast::ImportItemKind::SelfModule
@@ -215,15 +252,15 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
 
     visibility()
         .then_ignore(import_kw)
-        .then(import_path)
+        .then(import_target)
         .then(import_tail)
-        .map_with(|((visibility, path), kind), e| {
+        .map_with(|((visibility, target), kind), e| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
             let node = Spanned::new(
                 ast::Import {
                     visibility,
-                    path,
+                    target,
                     kind,
                 },
                 span,
@@ -1630,7 +1667,7 @@ fn resolve_type_params_with_self(
                 const_param_map,
                 self_type,
             );
-            ast::Type::nominal(
+            ast::Type::nominal_with_origin(
                 nominal.kind,
                 nominal.name,
                 type_args,

@@ -1313,7 +1313,7 @@ mod tests {
         externs::RawExternScope,
         lexer::tokenize,
         parser,
-        resolve::{ModuleKey, ModulePath, ResolveResult, ResolvedModule},
+        resolve::{ModuleId, ModulePath, PackageId, ResolveResult, ResolvedModule},
         typecheck::DeclarationIndex,
     };
 
@@ -1487,8 +1487,12 @@ mod tests {
 
     fn source_provenance() -> ExternProvenance {
         ExternProvenance::Source {
-            module: RawExternScope::Root,
+            module: raw_root_scope(),
         }
+    }
+
+    fn raw_root_scope() -> RawExternScope {
+        RawExternScope::Module(ModuleId::root(PackageId::synthetic_root()))
     }
 
     fn ident(name: &str) -> Ident {
@@ -1526,17 +1530,31 @@ mod tests {
         parser::parse_ast(&tokens).expect("parse failed")
     }
 
+    fn root_id() -> ModuleId {
+        ModuleId::root(PackageId::synthetic_root())
+    }
+
+    fn resolved_module(path: ModulePath, source: &str) -> ResolvedModule {
+        ResolvedModule {
+            key: ModuleId::named(PackageId::synthetic_root(), path),
+            program: parse(source),
+        }
+    }
+
     fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
         ResolveResult {
+            root: root_id(),
             module_groups: modules
                 .iter()
                 .map(|(name, source)| {
-                    vec![ResolvedModule {
-                        key: ModuleKey::Named(ModulePath::new(vec![(*name).to_string()]).unwrap()),
-                        program: parse(source),
-                    }]
+                    vec![resolved_module(
+                        ModulePath::new(vec![(*name).to_string()]).unwrap(),
+                        source,
+                    )]
                 })
                 .collect(),
+            dependencies: HashMap::new(),
+            system: crate::resolve::SystemPackages::default(),
         }
     }
 
@@ -1894,10 +1912,10 @@ mod tests {
             let raw = RawExterns {
                 groups: vec![crate::externs::raw::RawExternGroup {
                     provenance: ExternProvenance::Source {
-                        module: RawExternScope::Root,
+                        module: raw_root_scope(),
                     },
                     modules: vec![RawExternModule {
-                        scope: RawExternScope::Root,
+                        scope: raw_root_scope(),
                         types: vec![],
                         functions: vec![RawExternFunction {
                             decl: ExternFunctionDescriptor {
@@ -1916,12 +1934,13 @@ mod tests {
             };
             let root = parse("");
             let resolved = ResolveResult {
-                module_groups: vec![vec![ResolvedModule {
-                    key: ModuleKey::Named(
-                        ModulePath::new(vec!["geom".to_string(), "types".to_string()]).unwrap(),
-                    ),
-                    program: parse("pub struct Point { x: int }"),
-                }]],
+                root: root_id(),
+                module_groups: vec![vec![resolved_module(
+                    ModulePath::new(vec!["geom".to_string(), "types".to_string()]).unwrap(),
+                    "pub struct Point { x: int }",
+                )]],
+                dependencies: HashMap::new(),
+                system: crate::resolve::SystemPackages::default(),
             };
             let decls = DeclarationIndex::from_root_and_modules(
                 &root,

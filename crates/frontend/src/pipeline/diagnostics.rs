@@ -5,7 +5,7 @@ use anvyx_externs::{
 use chumsky::error::{Rich, RichReason};
 
 use crate::{
-    ast::{ConstValue, Ident},
+    ast::{ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, Type},
     externs::{
         ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey,
         RawExternIdentityKey, RawExternMemberKey, RawExternScope, RawExternTypeKey,
@@ -15,7 +15,7 @@ use crate::{
         },
     },
     lexer::SpannedToken,
-    resolve::{ModulePath, ResolveError},
+    resolve::{ModuleId, ModulePath, PackageModulePath, ResolveError},
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, MemberAccessKind,
         ModuleScope, TypeError,
@@ -67,29 +67,31 @@ pub(super) fn diagnose_parse_error(error: &Rich<'_, SpannedToken>) -> Diagnostic
 
 pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
     let message = match error {
-        ResolveError::ModuleNotFound { path, .. } if path.first_segment() == Some("std") => {
-            format!(
-                "Unknown standard library module '{}'",
-                render_module_path(path)
-            )
-        }
-        ResolveError::ModuleNotFound { path, .. } => {
+        ResolveError::ModuleNotFound { module, .. } => {
             format!(
                 "Cannot find module file for module '{}'",
-                render_module_path(path)
+                render_module_id(module)
             )
         }
-        ResolveError::LoadFailed { path, message, .. } => {
+        ResolveError::LoadFailed {
+            module, message, ..
+        } => {
             format!(
                 "Cannot load module '{}': {message}",
-                render_module_path(path)
+                render_module_id(module)
             )
         }
-        ResolveError::DuplicatePreloadedModule { path } => {
+        ResolveError::DuplicatePreloadedModule { module } => {
             format!(
                 "module '{}' is preloaded more than once",
-                render_module_path(path)
+                render_module_id(module)
             )
+        }
+        ResolveError::UnknownDependency { alias, package, .. } => {
+            format!("package '{package}' has no dependency named '{alias}'")
+        }
+        ResolveError::UnsupportedImportRoot { root, .. } => {
+            format!("import root '{root}' is not supported yet")
         }
     };
     Diagnostic::error(message)
@@ -218,12 +220,12 @@ fn render_raw_decl(decl: &RawExternDecl) -> String {
 fn render_extern_provenance(provenance: &ExternProvenance) -> String {
     match provenance {
         ExternProvenance::Provider { provider } => format!("provider '{}'", provider.name),
-        ExternProvenance::Source { module } => match module {
-            RawExternScope::Root => "source root".to_string(),
-            RawExternScope::Named(path) => {
-                format!("source module '{}'", render_extern_module_path(path))
-            }
-        },
+        ExternProvenance::Source { module } if is_raw_root_scope(module) => {
+            "source root".to_string()
+        }
+        ExternProvenance::Source { module } => {
+            format!("source module '{}'", render_raw_scope(module))
+        }
     }
 }
 
@@ -245,9 +247,26 @@ fn render_raw_member_key(key: &RawExternMemberKey) -> String {
 
 fn render_raw_scoped_name(scope: &RawExternScope, name: &str) -> String {
     match scope {
-        RawExternScope::Root => name.to_string(),
         RawExternScope::Named(path) => format!("{}.{name}", render_extern_module_path(path)),
+        RawExternScope::Module(module) if is_root_module_id(module) => name.to_string(),
+        RawExternScope::Module(module) => format!("{}.{name}", render_module_id(module)),
     }
+}
+
+fn render_raw_scope(scope: &RawExternScope) -> String {
+    match scope {
+        RawExternScope::Named(path) => render_extern_module_path(path),
+        RawExternScope::Module(module) => render_module_id(module),
+    }
+}
+
+fn is_raw_root_scope(scope: &RawExternScope) -> bool {
+    matches!(scope, RawExternScope::Module(module) if is_root_module_id(module))
+}
+
+fn is_root_module_id(module: &ModuleId) -> bool {
+    module.package() == &crate::resolve::PackageId::synthetic_root()
+        && matches!(module.path(), PackageModulePath::Root)
 }
 
 fn render_extern_member_selector(selector: &anvyx_externs::ExternMemberSelector) -> String {
@@ -269,9 +288,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::UndefinedVariable { name, .. } => format!("Unknown variable '{name}'"),
         TypeError::TypeMismatch {
             expected, found, ..
-        } => {
-            format!("Mismatched types: expected '{expected}', found '{found}'")
-        }
+        } => render_type_mismatch(expected, found),
         TypeError::ConstMismatch {
             expected, found, ..
         } => format!(
@@ -410,6 +427,130 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("duplicate generic parameter '{name}'")
         }
     })
+}
+
+fn render_type_mismatch(expected: &Type, found: &Type) -> String {
+    let ambiguous = expected != found && expected.to_string() == found.to_string();
+    let expected = render_mismatch_type(expected, ambiguous);
+    let found = render_mismatch_type(found, ambiguous);
+    format!("Mismatched types: expected '{expected}', found '{found}'")
+}
+
+fn render_mismatch_type(ty: &Type, detailed: bool) -> String {
+    if !detailed {
+        return ty.to_string();
+    }
+    render_detailed_type(ty)
+}
+
+fn render_detailed_type(ty: &Type) -> String {
+    match ty {
+        Type::Func { params, ret } => render_detailed_func(params, ret),
+        Type::Tuple(elems) => render_wrapped_types("(", ")", elems),
+        Type::NamedTuple(fields) => {
+            let fields = fields
+                .iter()
+                .map(|(name, ty)| format!("{name}: {}", render_detailed_type(ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{fields}}}")
+        }
+        Type::Nominal(nominal) => {
+            let mut rendered = nominal.origin.as_ref().map_or_else(
+                || nominal.name.to_string(),
+                |origin| format!("{}.{}", render_nominal_origin(origin), nominal.name),
+            );
+            render_detailed_generic_args(&mut rendered, &nominal.type_args, &nominal.const_args);
+            rendered
+        }
+        Type::List { elem } => format!("[{}]", render_detailed_type(elem)),
+        Type::Array { elem, len } => format!("[{}; {len}]", render_detailed_type(elem)),
+        Type::Map { key, value } => format!(
+            "[{}: {}]",
+            render_detailed_type(key),
+            render_detailed_type(value)
+        ),
+        Type::Slice { elem } => format!("[{}; _]", render_detailed_type(elem)),
+        Type::UnresolvedNominal {
+            qualifier,
+            name,
+            generic_args,
+        } => {
+            let mut rendered = render_qualified_name(*qualifier, *name);
+            if !generic_args.is_empty() {
+                let args = generic_args
+                    .iter()
+                    .map(render_detailed_generic_arg)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                rendered.push('<');
+                rendered.push_str(&args);
+                rendered.push('>');
+            }
+            rendered
+        }
+        _ => ty.to_string(),
+    }
+}
+
+fn render_detailed_func(params: &[FuncParam], ret: &Type) -> String {
+    let params = params
+        .iter()
+        .map(|param| {
+            let ty = render_detailed_type(&param.ty);
+            if param.mutable {
+                format!("mut {ty}")
+            } else {
+                ty
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rendered = format!("fn({params})");
+    if !ret.is_void() {
+        rendered.push_str(" -> ");
+        rendered.push_str(&render_detailed_type(ret));
+    }
+    rendered
+}
+
+fn render_wrapped_types(open: &str, close: &str, elems: &[Type]) -> String {
+    let elems = elems
+        .iter()
+        .map(render_detailed_type)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{open}{elems}{close}")
+}
+
+fn render_detailed_generic_args(rendered: &mut String, types: &[Type], consts: &[ConstArg]) {
+    if types.is_empty() && consts.is_empty() {
+        return;
+    }
+    let mut args = types.iter().map(render_detailed_type).collect::<Vec<_>>();
+    args.extend(consts.iter().map(ToString::to_string));
+    rendered.push('<');
+    rendered.push_str(&args.join(", "));
+    rendered.push('>');
+}
+
+fn render_detailed_generic_arg(arg: &crate::ast::GenericArg) -> String {
+    match arg {
+        crate::ast::GenericArg::Type(ty) => render_detailed_type(ty),
+        crate::ast::GenericArg::Const(arg) => arg.to_string(),
+    }
+}
+
+fn render_nominal_origin(origin: &ModuleOrigin) -> String {
+    match origin {
+        ModuleOrigin::Module(path) => path.join("."),
+        ModuleOrigin::Package { package, path } => {
+            let path = path
+                .as_ref()
+                .map_or_else(|| "<root>".to_string(), |path| path.join("."));
+            format!("{package}:{path}")
+        }
+    }
 }
 
 fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
@@ -564,6 +705,7 @@ fn render_scoped_name(module: &ModuleScope, name: Ident) -> String {
     match module {
         ModuleScope::Root => name.to_string(),
         ModuleScope::Named(path) => format!("{}.{name}", render_module_path(path)),
+        ModuleScope::Package(module) => format!("{}.{name}", render_module_id(module)),
     }
 }
 
@@ -864,10 +1006,23 @@ fn render_module_path(path: &ModulePath) -> String {
     path.segments().join(".")
 }
 
+fn render_module_id(module: &ModuleId) -> String {
+    let path = match module.path() {
+        PackageModulePath::Root => "<root>".to_string(),
+        PackageModulePath::Named(path) => render_module_path(path),
+    };
+    if module.package() == &crate::resolve::PackageId::synthetic_root() {
+        path
+    } else {
+        format!("{}:{path}", module.package())
+    }
+}
+
 fn render_module_scope(scope: &ModuleScope) -> String {
     match scope {
         ModuleScope::Root => "<root>".to_string(),
         ModuleScope::Named(path) => render_module_path(path),
+        ModuleScope::Package(module) => render_module_id(module),
     }
 }
 
@@ -892,6 +1047,21 @@ mod tests {
         ModulePath::new(path.iter().map(ToString::to_string).collect()).unwrap()
     }
 
+    fn module_id(path: &[&str]) -> ModuleId {
+        ModuleId::named(
+            crate::resolve::PackageId::synthetic_root(),
+            module_path(path),
+        )
+    }
+
+    fn root_module_id() -> ModuleId {
+        ModuleId::root(crate::resolve::PackageId::synthetic_root())
+    }
+
+    fn raw_root_scope() -> RawExternScope {
+        RawExternScope::Module(root_module_id())
+    }
+
     fn module_scope(path: &[&str]) -> ModuleScope {
         ModuleScope::Named(module_path(path))
     }
@@ -899,7 +1069,7 @@ mod tests {
     fn catalog_context(module: &[&str], item: ExternContextItem) -> ExternCatalogContext {
         ExternCatalogContext {
             provenance: ExternProvenance::Source {
-                module: RawExternScope::Root,
+                module: raw_root_scope(),
             },
             module: module_scope(module),
             item,
@@ -950,21 +1120,14 @@ mod tests {
         let cases = [
             (
                 diagnose_resolve_error(&ResolveError::ModuleNotFound {
-                    path: module_path(&["foo", "bar"]),
+                    module: module_id(&["foo", "bar"]),
                     span: span(),
                 }),
                 "Cannot find module file for module 'foo.bar'",
             ),
             (
-                diagnose_resolve_error(&ResolveError::ModuleNotFound {
-                    path: module_path(&["std", "foo"]),
-                    span: span(),
-                }),
-                "Unknown standard library module 'std.foo'",
-            ),
-            (
                 diagnose_resolve_error(&ResolveError::LoadFailed {
-                    path: module_path(&["foo", "bar"]),
+                    module: module_id(&["foo", "bar"]),
                     span: span(),
                     message: "permission denied".to_string(),
                 }),
@@ -972,7 +1135,7 @@ mod tests {
             ),
             (
                 diagnose_resolve_error(&ResolveError::DuplicatePreloadedModule {
-                    path: module_path(&["core", "math"]),
+                    module: module_id(&["core", "math"]),
                 }),
                 "module 'core.math' is preloaded more than once",
             ),
@@ -1082,6 +1245,19 @@ mod tests {
         }
     }
 
+    fn package_nominal(package: &str, name: &str) -> Type {
+        Type::nominal_with_origin(
+            crate::ast::NominalKind::Struct,
+            ident(name),
+            vec![],
+            vec![],
+            Some(ModuleOrigin::Package {
+                package: package.to_string(),
+                path: None,
+            }),
+        )
+    }
+
     #[test]
     fn renders_type_errors() {
         let cases = [
@@ -1092,6 +1268,14 @@ mod tests {
                     span: span(),
                 }),
                 "Mismatched types: expected 'int', found 'bool'",
+            ),
+            (
+                diagnose_type_error(&TypeError::TypeMismatch {
+                    expected: package_nominal("left", "Vec2"),
+                    found: package_nominal("right", "Vec2"),
+                    span: span(),
+                }),
+                "Mismatched types: expected 'left:<root>.Vec2', found 'right:<root>.Vec2'",
             ),
             (
                 diagnose_type_error(&TypeError::UndefinedVariable {
@@ -1339,7 +1523,7 @@ mod tests {
     fn renders_root_extern_catalog_context_without_fake_module() {
         let context = ExternCatalogContext {
             provenance: ExternProvenance::Source {
-                module: RawExternScope::Root,
+                module: raw_root_scope(),
             },
             module: ModuleScope::Root,
             item: ExternContextItem::Function {
@@ -1360,12 +1544,12 @@ mod tests {
 
     #[test]
     fn renders_root_raw_identity_without_fake_module() {
-        let decl = source_decl(RawExternScope::Root);
+        let decl = source_decl(raw_root_scope());
 
         assert_msg(
             diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
                 key: RawExternIdentityKey::Function(RawExternFunctionKey {
-                    module: RawExternScope::Root,
+                    module: raw_root_scope(),
                     name: "tick".to_string(),
                 }),
                 first: decl.clone(),

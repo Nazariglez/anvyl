@@ -1,7 +1,7 @@
 // Lexer -> Parser -> Resolver -> Typechecker -> AIR lowering
 
 mod diagnostics;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub use diagnostics::Diagnostic;
 
@@ -14,7 +14,8 @@ use crate::{
     externs::{self, ExternInputs},
     lexer, parser,
     resolve::{
-        self, ModuleKey, ModuleLoadError, ModuleLoader, ModulePath, PreloadedModule, ResolveFailure,
+        self, ModuleId, ModuleLoadError, ModuleLoader, PackageId,
+        PackageInput as ResolvePackageInput, PreloadedModule, ResolveFailure, SystemPackages,
     },
     typecheck::{self, ModuleScope},
 };
@@ -26,9 +27,15 @@ pub struct Source {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleInput {
-    pub path: ModulePath,
+pub struct PackageModuleInput {
+    pub module: ModuleId,
     pub source: Source,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageSourceInput {
+    pub root: Option<Source>,
+    pub dependencies: HashMap<String, PackageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,20 +44,22 @@ pub enum SourceLoadError<E> {
     Fatal(E),
 }
 
-pub trait SourceLoader {
+pub trait PackageSourceLoader {
     type FatalError;
 
     fn load(
         &mut self,
-        module_path: &ModulePath,
+        module: &ModuleId,
     ) -> Result<Option<Source>, SourceLoadError<Self::FatalError>>;
 }
 
-pub struct ProgramInput<'a, L: SourceLoader> {
+pub struct PackageProgramInput<'a, L: PackageSourceLoader> {
+    pub root_package: PackageId,
     pub main: Source,
-    pub prelude: Option<Source>,
-    pub preloaded_modules: Vec<ModuleInput>,
-    pub always_active_modules: Vec<ModulePath>,
+    pub system: SystemPackages,
+    pub packages: HashMap<PackageId, PackageSourceInput>,
+    pub preloaded_modules: Vec<PackageModuleInput>,
+    pub always_active_modules: Vec<ModuleId>,
     pub source_loader: &'a mut L,
 }
 
@@ -84,32 +93,36 @@ pub enum CheckError<E = std::convert::Infallible> {
     Source(Box<E>),
 }
 
-pub fn check<L: SourceLoader>(
-    input: ProgramInput<'_, L>,
+pub fn check_packages<L: PackageSourceLoader>(
+    input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
 ) -> Result<CheckOk, CheckError<L::FatalError>> {
-    let mut root = parse_source(&input.main)?;
-    if let Some(prelude) = input.prelude {
-        prepend_prelude(&mut root, &prelude)?;
-    }
+    let root = parse_source(&input.main)?;
 
-    let preloaded_modules = parse_preloaded_modules(input.preloaded_modules)?;
+    let packages = parse_package_inputs(input.packages)?;
+    let preloaded_modules = parse_package_modules(input.preloaded_modules)?;
     let always_active_modules = input
         .always_active_modules
         .into_iter()
-        .map(module_scope)
+        .map(|module| ModuleScope::from_module_id(&module))
         .collect::<HashSet<_>>();
 
     let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
-    let external_modules = externs::raw_extern_module_paths(&raw_externs);
+    let external_modules = externs::raw_extern_module_paths(&raw_externs)
+        .into_iter()
+        .map(|path| ModuleId::named(input.root_package.clone(), path))
+        .collect::<HashSet<_>>();
 
     let mut loader = InputModuleLoader::new(input.source_loader);
-    let resolved = match resolve::resolve_modules(
+    let resolved = match resolve::resolve_package_modules(
+        input.root_package,
         root.clone(),
+        &packages,
         preloaded_modules,
         &mut loader,
         &HashSet::new(),
         &external_modules,
+        input.system.clone(),
     ) {
         Ok(resolved) => resolved,
         Err(ResolveFailure::Fatal(error)) => return Err(error),
@@ -145,14 +158,35 @@ fn extern_error<E>(errors: Vec<externs::ExternInputError>) -> CheckError<E> {
     }
 }
 
-fn parse_preloaded_modules<E>(
-    modules: Vec<ModuleInput>,
+fn parse_package_inputs<E>(
+    packages: HashMap<PackageId, PackageSourceInput>,
+) -> Result<HashMap<PackageId, ResolvePackageInput>, CheckError<E>> {
+    packages
+        .into_iter()
+        .map(|(id, package)| {
+            let root = package
+                .root
+                .map(|source| parse_source(&source))
+                .transpose()?;
+            Ok((
+                id,
+                ResolvePackageInput {
+                    root,
+                    dependencies: package.dependencies,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn parse_package_modules<E>(
+    modules: Vec<PackageModuleInput>,
 ) -> Result<Vec<PreloadedModule>, CheckError<E>> {
     modules
         .into_iter()
         .map(|module| {
             Ok(PreloadedModule {
-                path: module.path,
+                module: module.module,
                 program: parse_source(&module.source)?,
             })
         })
@@ -167,10 +201,7 @@ fn validate_always_active_modules<E>(
         .module_groups
         .iter()
         .flat_map(|group| group.iter())
-        .filter_map(|module| match &module.key {
-            ModuleKey::Root => None,
-            ModuleKey::Named(path) => Some(ModuleScope::Named(path.clone())),
-        })
+        .map(|module| ModuleScope::from_module_id(&module.key))
         .collect::<HashSet<_>>();
 
     let diagnostics = always_active_modules
@@ -186,13 +217,6 @@ fn validate_always_active_modules<E>(
     }
 }
 
-fn prepend_prelude<E>(program: &mut Program, prelude: &Source) -> Result<(), CheckError<E>> {
-    let mut prelude = parse_source(prelude)?;
-    prelude.stmts.append(&mut program.stmts);
-    *program = prelude;
-    Ok(())
-}
-
 fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
     let tokens = lexer::tokenize(&source.code).map_err(|errors| CheckError::Lex {
         label: source.label.clone(),
@@ -205,28 +229,24 @@ fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
     })
 }
 
-fn module_scope(path: ModulePath) -> ModuleScope {
-    ModuleScope::Named(path)
-}
-
-struct InputModuleLoader<'a, L: SourceLoader> {
+struct InputModuleLoader<'a, L: PackageSourceLoader> {
     loader: &'a mut L,
 }
 
-impl<'a, L: SourceLoader> InputModuleLoader<'a, L> {
+impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
     fn new(loader: &'a mut L) -> Self {
         Self { loader }
     }
 }
 
-impl<L: SourceLoader> ModuleLoader for InputModuleLoader<'_, L> {
+impl<L: PackageSourceLoader> ModuleLoader for InputModuleLoader<'_, L> {
     type FatalError = CheckError<L::FatalError>;
 
     fn load(
         &mut self,
-        path: &ModulePath,
+        module: &ModuleId,
     ) -> Result<Option<Program>, ModuleLoadError<Self::FatalError>> {
-        let source = match self.loader.load(path) {
+        let source = match self.loader.load(module) {
             Ok(Some(source)) => source,
             Ok(None) => return Ok(None),
             Err(SourceLoadError::LoadFailed(message)) => {
@@ -248,23 +268,31 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        CheckError, CheckOk, Diagnostic, FrontendConfig, ModuleInput, ProgramInput, Source,
-        SourceLoadError, SourceLoader, check as pipeline_check,
+        CheckError, CheckOk, Diagnostic, FrontendConfig, PackageModuleInput, PackageProgramInput,
+        PackageSourceInput, PackageSourceLoader, Source, SourceLoadError,
+        check_packages as pipeline_check,
     };
-    use crate::{externs::ExternInputs, resolve::ModulePath};
+    use crate::{
+        externs::ExternInputs,
+        resolve::{ModuleId, ModulePath, PackageId, SystemPackages},
+    };
 
     #[derive(Default)]
     struct TestLoader {
-        sources: HashMap<Vec<String>, Source>,
+        sources: HashMap<(PackageId, Vec<String>), Source>,
         failures: HashMap<Vec<String>, String>,
         loads: Vec<Vec<String>>,
     }
 
     impl TestLoader {
         fn source(&mut self, path: &[&str], code: &str) {
+            self.package_source(&root_package(), path, code);
+        }
+
+        fn package_source(&mut self, package: &PackageId, path: &[&str], code: &str) {
             let path = path.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             self.sources.insert(
-                path.clone(),
+                (package.clone(), path.clone()),
                 Source {
                     code: code.to_string(),
                     label: path.join("."),
@@ -280,18 +308,24 @@ mod tests {
         }
     }
 
-    impl SourceLoader for TestLoader {
+    impl PackageSourceLoader for TestLoader {
         type FatalError = std::convert::Infallible;
 
         fn load(
             &mut self,
-            module_path: &ModulePath,
+            module: &ModuleId,
         ) -> Result<Option<Source>, SourceLoadError<Self::FatalError>> {
-            self.loads.push(module_path.segments().to_vec());
-            if let Some(message) = self.failures.get(module_path.segments()) {
+            let Some(path) = module.named_path() else {
+                return Ok(None);
+            };
+            self.loads.push(path.segments().to_vec());
+            if let Some(message) = self.failures.get(path.segments()) {
                 return Err(SourceLoadError::LoadFailed(message.clone()));
             }
-            Ok(self.sources.get(module_path.segments()).cloned())
+            Ok(self
+                .sources
+                .get(&(module.package().clone(), path.segments().to_vec()))
+                .cloned())
         }
     }
 
@@ -306,28 +340,94 @@ mod tests {
         ModulePath::new(path.iter().map(|s| s.to_string()).collect()).unwrap()
     }
 
-    fn module(path: &[&str], code: &str) -> ModuleInput {
-        ModuleInput {
-            path: module_path(path),
+    fn root_package() -> PackageId {
+        PackageId::synthetic_root()
+    }
+
+    fn module_id(path: &[&str]) -> ModuleId {
+        ModuleId::named(root_package(), module_path(path))
+    }
+
+    fn module(path: &[&str], code: &str) -> PackageModuleInput {
+        PackageModuleInput {
+            module: module_id(path),
             source: source(code, &path.join(".")),
         }
     }
 
-    fn check<L: SourceLoader>(
-        input: ProgramInput<'_, L>,
+    fn input<'a, L: PackageSourceLoader>(
+        loader: &'a mut L,
+        main: Source,
+        prelude: Option<Source>,
+        preloaded_modules: Vec<PackageModuleInput>,
+        always_active_modules: Vec<ModulePath>,
+    ) -> PackageProgramInput<'a, L> {
+        let root_package = root_package();
+        let core_package = prelude.as_ref().map(|_| PackageId::core());
+        let mut packages = HashMap::from([(root_package.clone(), PackageSourceInput::default())]);
+        if let (Some(package), Some(root)) = (core_package.clone(), prelude) {
+            packages.insert(
+                package,
+                PackageSourceInput {
+                    root: Some(root),
+                    dependencies: HashMap::new(),
+                },
+            );
+        }
+        let mut preloaded_modules = preloaded_modules;
+        if let Some(package) = core_package.clone() {
+            if let Some(root) = packages
+                .get(&package)
+                .and_then(|package| package.root.clone())
+            {
+                preloaded_modules.push(PackageModuleInput {
+                    module: ModuleId::root(package),
+                    source: root,
+                });
+            }
+        }
+        PackageProgramInput {
+            root_package: root_package.clone(),
+            main,
+            system: SystemPackages {
+                core: core_package,
+                std: None,
+            },
+            packages,
+            preloaded_modules,
+            always_active_modules: always_active_modules
+                .into_iter()
+                .map(|path| ModuleId::named(root_package.clone(), path))
+                .collect(),
+            source_loader: loader,
+        }
+    }
+
+    fn package_input(root: &str, dependencies: &[(&str, PackageId)]) -> PackageSourceInput {
+        PackageSourceInput {
+            root: Some(source(root, "package.anv")),
+            dependencies: dependencies
+                .iter()
+                .map(|(alias, package)| ((*alias).to_string(), package.clone()))
+                .collect(),
+        }
+    }
+
+    fn check<L: PackageSourceLoader>(
+        input: PackageProgramInput<'_, L>,
     ) -> Result<CheckOk, CheckError<L::FatalError>> {
         pipeline_check(input, FrontendConfig::default())
     }
 
     fn check_source(source_code: &str) -> Result<CheckOk, CheckError> {
         let mut loader = TestLoader::default();
-        check(ProgramInput {
-            main: source(source_code, "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![],
-            always_active_modules: vec![],
-            source_loader: &mut loader,
-        })
+        check(input(
+            &mut loader,
+            source(source_code, "main.anv"),
+            None,
+            vec![],
+            vec![],
+        ))
     }
 
     fn extern_messages(source: &str) -> Vec<String> {
@@ -351,13 +451,13 @@ mod tests {
     fn accepts_valid_provider_descriptors() {
         let mut loader = TestLoader::default();
         pipeline_check(
-            ProgramInput {
-                main: source("fn main() {}", "main.anv"),
-                prelude: None,
-                preloaded_modules: vec![],
-                always_active_modules: vec![],
-                source_loader: &mut loader,
-            },
+            input(
+                &mut loader,
+                source("fn main() {}", "main.anv"),
+                None,
+                vec![],
+                vec![],
+            ),
             FrontendConfig {
                 externs: ExternInputs {
                     providers: vec![valid_provider_descriptor()],
@@ -371,13 +471,13 @@ mod tests {
     fn provider_only_module_import_resolves() {
         let mut loader = TestLoader::default();
         pipeline_check(
-            ProgramInput {
-                main: source("import math { dot }; fn main() {}", "main.anv"),
-                prelude: None,
-                preloaded_modules: vec![],
-                always_active_modules: vec![],
-                source_loader: &mut loader,
-            },
+            input(
+                &mut loader,
+                source("import math { dot }; fn main() {}", "main.anv"),
+                None,
+                vec![],
+                vec![],
+            ),
             FrontendConfig {
                 externs: ExternInputs {
                     providers: vec![valid_provider_descriptor()],
@@ -392,13 +492,13 @@ mod tests {
         let mut loader = TestLoader::default();
         loader.failure(&["math"], "disk error");
         let err = pipeline_check(
-            ProgramInput {
-                main: source("import math { dot }; fn main() {}", "main.anv"),
-                prelude: None,
-                preloaded_modules: vec![],
-                always_active_modules: vec![],
-                source_loader: &mut loader,
-            },
+            input(
+                &mut loader,
+                source("import math { dot }; fn main() {}", "main.anv"),
+                None,
+                vec![],
+                vec![],
+            ),
             FrontendConfig {
                 externs: ExternInputs {
                     providers: vec![valid_provider_descriptor()],
@@ -414,13 +514,13 @@ mod tests {
     fn invalid_provider_descriptor_is_extern_error() {
         let mut loader = TestLoader::default();
         let err = pipeline_check(
-            ProgramInput {
-                main: source("fn main() {}", "main.anv"),
-                prelude: None,
-                preloaded_modules: vec![],
-                always_active_modules: vec![],
-                source_loader: &mut loader,
-            },
+            input(
+                &mut loader,
+                source("fn main() {}", "main.anv"),
+                None,
+                vec![],
+                vec![],
+            ),
             FrontendConfig {
                 externs: ExternInputs {
                     providers: vec![invalid_provider_descriptor()],
@@ -454,13 +554,13 @@ mod tests {
         provider.provider.name = "other_math".to_string();
         let mut loader = TestLoader::default();
         let err = pipeline_check(
-            ProgramInput {
-                main: source("fn main() { missing; }", "main.anv"),
-                prelude: None,
-                preloaded_modules: vec![],
-                always_active_modules: vec![],
-                source_loader: &mut loader,
-            },
+            input(
+                &mut loader,
+                source("fn main() { missing; }", "main.anv"),
+                None,
+                vec![],
+                vec![],
+            ),
             FrontendConfig {
                 externs: ExternInputs {
                     providers: vec![valid_provider_descriptor(), provider],
@@ -576,13 +676,13 @@ mod tests {
     fn parse_errors_take_precedence_over_provider_errors() {
         let mut loader = TestLoader::default();
         let err = pipeline_check(
-            ProgramInput {
-                main: source("fn main( {}", "main.anv"),
-                prelude: None,
-                preloaded_modules: vec![],
-                always_active_modules: vec![],
-                source_loader: &mut loader,
-            },
+            input(
+                &mut loader,
+                source("fn main( {}", "main.anv"),
+                None,
+                vec![],
+                vec![],
+            ),
             FrontendConfig {
                 externs: ExternInputs {
                     providers: vec![invalid_provider_descriptor()],
@@ -693,42 +793,42 @@ mod tests {
     #[test]
     fn prelude_declarations_are_visible() {
         let mut loader = TestLoader::default();
-        check(ProgramInput {
-            main: source("fn main() { let x: int = prelude_value(); }", "main.anv"),
-            prelude: Some(source("fn prelude_value() -> int { 1 }", "<prelude>")),
-            preloaded_modules: vec![],
-            always_active_modules: vec![],
-            source_loader: &mut loader,
-        })
+        check(input(
+            &mut loader,
+            source("fn main() { let x: int = prelude_value(); }", "main.anv"),
+            Some(source("pub fn prelude_value() -> int { 1 }", "<prelude>")),
+            vec![],
+            vec![],
+        ))
         .unwrap();
     }
 
     #[test]
     fn always_active_extend_is_visible_without_import() {
         let mut loader = TestLoader::default();
-        check(ProgramInput {
-            main: source("fn main() { let x: int = 1.plus_one(); }", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![module(
+        check(input(
+            &mut loader,
+            source("fn main() { let x: int = 1.plus_one(); }", "main.anv"),
+            None,
+            vec![module(
                 &["core_int"],
                 "pub extend int { fn plus_one(self) -> int { self + 1 } }",
             )],
-            always_active_modules: vec![module_path(&["core_int"])],
-            source_loader: &mut loader,
-        })
+            vec![module_path(&["core_int"])],
+        ))
         .unwrap();
     }
 
     #[test]
     fn unresolved_always_active_module_is_resolve_error() {
         let mut loader = TestLoader::default();
-        let err = check(ProgramInput {
-            main: source("fn main() {}", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![],
-            always_active_modules: vec![module_path(&["missing", "helpers"])],
-            source_loader: &mut loader,
-        })
+        let err = check(input(
+            &mut loader,
+            source("fn main() {}", "main.anv"),
+            None,
+            vec![],
+            vec![module_path(&["missing", "helpers"])],
+        ))
         .unwrap_err();
         let CheckError::Resolve { diagnostics } = err else {
             panic!("expected resolve error");
@@ -742,13 +842,13 @@ mod tests {
     #[test]
     fn duplicate_preloaded_modules_are_resolve_errors() {
         let mut loader = TestLoader::default();
-        let err = check(ProgramInput {
-            main: source("fn main() {}", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![module(&["core_int"], ""), module(&["core_int"], "")],
-            always_active_modules: vec![],
-            source_loader: &mut loader,
-        })
+        let err = check(input(
+            &mut loader,
+            source("fn main() {}", "main.anv"),
+            None,
+            vec![module(&["core_int"], ""), module(&["core_int"], "")],
+            vec![],
+        ))
         .unwrap_err();
         let CheckError::Resolve { diagnostics } = err else {
             panic!("expected resolve error");
@@ -763,16 +863,16 @@ mod tests {
     #[test]
     fn ordinary_preloaded_extend_is_not_visible_without_import() {
         let mut loader = TestLoader::default();
-        let err = check(ProgramInput {
-            main: source("fn main() { let x: int = 1.plus_one(); }", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![module(
+        let err = check(input(
+            &mut loader,
+            source("fn main() { let x: int = 1.plus_one(); }", "main.anv"),
+            None,
+            vec![module(
                 &["core_int"],
                 "pub extend int { fn plus_one(self) -> int { self + 1 } }",
             )],
-            always_active_modules: vec![],
-            source_loader: &mut loader,
-        })
+            vec![],
+        ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Type { .. }));
     }
@@ -780,13 +880,13 @@ mod tests {
     #[test]
     fn always_active_module_names_are_not_imported() {
         let mut loader = TestLoader::default();
-        let err = check(ProgramInput {
-            main: source("fn main() { let x: int = hidden(); }", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![module(&["helpers"], "pub fn hidden() -> int { 1 }")],
-            always_active_modules: vec![module_path(&["helpers"])],
-            source_loader: &mut loader,
-        })
+        let err = check(input(
+            &mut loader,
+            source("fn main() { let x: int = hidden(); }", "main.anv"),
+            None,
+            vec![module(&["helpers"], "pub fn hidden() -> int { 1 }")],
+            vec![module_path(&["helpers"])],
+        ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Type { .. }));
     }
@@ -795,12 +895,36 @@ mod tests {
     fn local_import_resolved_through_loader() {
         let mut loader = TestLoader::default();
         loader.source(&["foo"], "pub fn bar() -> int { 1 }");
-        check(ProgramInput {
-            main: source(
+        check(input(
+            &mut loader,
+            source(
                 "import foo { bar }; fn main() { let x: int = bar(); }",
                 "main.anv",
             ),
-            prelude: None,
+            None,
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn dependency_import_uses_package_exports() {
+        let game = PackageId::new("game");
+        let math = PackageId::new("math");
+        let mut loader = TestLoader::default();
+
+        check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source(
+                "import dep:math { add }; fn main() { let x: int = add(); }",
+                "main.anv",
+            ),
+            system: SystemPackages::default(),
+            packages: HashMap::from([
+                (game.clone(), package_input("", &[("math", math.clone())])),
+                (math, package_input("pub fn add() -> int { 1 }", &[])),
+            ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
             source_loader: &mut loader,
@@ -809,33 +933,270 @@ mod tests {
     }
 
     #[test]
-    fn std_like_import_resolved_through_loader() {
+    fn private_core_root_declarations_are_preluded() {
         let mut loader = TestLoader::default();
-        loader.source(&["std", "math"], "pub fn sqrt(x: float) -> float { x }");
-        check(ProgramInput {
+        check(input(
+            &mut loader,
+            source("fn main() { let x: Option<int> = nil; }", "main.anv"),
+            Some(source("enum Option<T> { Some(T), None }", "<core>")),
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn core_root_is_not_preluded_into_core_modules() {
+        let core = PackageId::core();
+        let mut loader = TestLoader::default();
+        loader.package_source(&core, &["helper"], "pub fn leak(x: RootOnly) {}");
+
+        let err = check(PackageProgramInput {
+            root_package: core.clone(),
             main: source(
-                "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
-                "main.anv",
+                "struct RootOnly {} import helper { leak }; fn main() {}",
+                "<core>",
             ),
-            prelude: None,
+            system: SystemPackages {
+                core: Some(core.clone()),
+                std: None,
+            },
+            packages: HashMap::from([(core, PackageSourceInput::default())]),
+            preloaded_modules: vec![],
+            always_active_modules: vec![],
+            source_loader: &mut loader,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Type { .. }));
+    }
+
+    #[test]
+    fn dependency_private_module_is_not_importable() {
+        let game = PackageId::new("game");
+        let physics = PackageId::new("physics");
+        let mut loader = TestLoader::default();
+        loader.package_source(&physics, &["internals"], "pub struct Hidden {}");
+
+        let err = check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source("import dep:physics.internals { Hidden };", "main.anv"),
+            system: SystemPackages::default(),
+            packages: HashMap::from([
+                (
+                    game.clone(),
+                    package_input("", &[("physics", physics.clone())]),
+                ),
+                (physics, package_input("import internals { Hidden };", &[])),
+            ]),
+            preloaded_modules: vec![],
+            always_active_modules: vec![],
+            source_loader: &mut loader,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Type { .. }));
+    }
+
+    #[test]
+    fn dependency_module_reexport_controls_public_path() {
+        let game = PackageId::new("game");
+        let physics = PackageId::new("physics");
+        let mut loader = TestLoader::default();
+        loader.package_source(&physics, &["types"], "pub struct Vec2 {}");
+
+        check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source("import dep:physics.types { Vec2 };", "main.anv"),
+            system: SystemPackages::default(),
+            packages: HashMap::from([
+                (
+                    game.clone(),
+                    package_input("", &[("physics", physics.clone())]),
+                ),
+                (physics, package_input("pub import types;", &[])),
+            ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn dependency_root_source_extern_is_package_scoped() {
+        let game = PackageId::new("game");
+        let native = PackageId::new("native");
+        let mut loader = TestLoader::default();
+
+        check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source(
+                "import dep:native { tick }; fn main() { let x: int = tick(); }",
+                "main.anv",
+            ),
+            system: SystemPackages::default(),
+            packages: HashMap::from([
+                (
+                    game.clone(),
+                    package_input("", &[("native", native.clone())]),
+                ),
+                (native, package_input("extern fn tick() -> int;", &[])),
+            ]),
+            preloaded_modules: vec![],
+            always_active_modules: vec![],
+            source_loader: &mut loader,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn dependency_named_source_extern_is_package_scoped() {
+        let game = PackageId::new("game");
+        let native = PackageId::new("native");
+        let mut loader = TestLoader::default();
+        loader.package_source(&native, &["host"], "extern fn tick() -> int;");
+
+        check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source(
+                "import dep:native.host { tick }; fn main() { let x: int = tick(); }",
+                "main.anv",
+            ),
+            system: SystemPackages::default(),
+            packages: HashMap::from([
+                (
+                    game.clone(),
+                    package_input("", &[("native", native.clone())]),
+                ),
+                (native, package_input("pub import host;", &[])),
+            ]),
+            preloaded_modules: vec![],
+            always_active_modules: vec![],
+            source_loader: &mut loader,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn dependency_exported_module_self_alias_uses_shared_import_target() {
+        let game = PackageId::new("game");
+        let physics = PackageId::new("physics");
+        let mut loader = TestLoader::default();
+        loader.package_source(
+            &physics,
+            &["types"],
+            "pub struct Vec2 {} pub fn make() -> Vec2 { Vec2 {} }",
+        );
+
+        check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source(
+                "import dep:physics.types { self as types, Vec2 }; fn main() { let x: Vec2 = types.make(); }",
+                "main.anv",
+            ),
+            system: SystemPackages::default(),
+            packages: HashMap::from([
+                (
+                    game.clone(),
+                    package_input("", &[("physics", physics.clone())]),
+                ),
+                (physics, package_input("pub import types;", &[])),
+            ]),
+            preloaded_modules: vec![],
+            always_active_modules: vec![],
+            source_loader: &mut loader,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn std_import_uses_implicit_package() {
+        let game = root_package();
+        let std = PackageId::std();
+        let mut loader = TestLoader::default();
+        loader.package_source(&std, &["math"], "pub const PI: int = 3;");
+
+        check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source(
+                "import std.math { PI }; fn main() { let x: int = PI; }",
+                "main.anv",
+            ),
+            system: SystemPackages {
+                core: None,
+                std: Some(std.clone()),
+            },
+            packages: HashMap::from([
+                (game.clone(), PackageSourceInput::default()),
+                (std, package_input("pub import math;", &[])),
+            ]),
+            preloaded_modules: vec![],
+            always_active_modules: vec![],
+            source_loader: &mut loader,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn std_exported_module_self_alias_uses_shared_import_target() {
+        let game = root_package();
+        let std = PackageId::std();
+        let mut loader = TestLoader::default();
+        loader.package_source(&std, &["math"], "pub const PI: int = 3;");
+
+        check(PackageProgramInput {
+            root_package: game.clone(),
+            main: source(
+                "import std.math { self as math }; fn main() { let x: int = math.PI; }",
+                "main.anv",
+            ),
+            system: SystemPackages {
+                core: None,
+                std: Some(std.clone()),
+            },
+            packages: HashMap::from([
+                (game.clone(), PackageSourceInput::default()),
+                (std, package_input("pub import math;", &[])),
+            ]),
+            preloaded_modules: vec![],
+            always_active_modules: vec![],
+            source_loader: &mut loader,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn std_import_reports_unsupported_root() {
+        let mut loader = TestLoader::default();
+        let err = check(input(
+            &mut loader,
+            source(
+                "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
+                "main.anv",
+            ),
+            None,
+            vec![],
+            vec![],
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(err, CheckError::Resolve { diagnostics } if diagnostics[0].message() == "import root 'std' is not supported yet")
+        );
     }
 
     #[test]
     fn loaded_module_parse_error_keeps_parse_phase() {
         let mut loader = TestLoader::default();
         loader.source(&["broken"], "fn nope( {}");
-        let err = check(ProgramInput {
-            main: source("import broken; fn main() {}", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![],
-            always_active_modules: vec![],
-            source_loader: &mut loader,
-        })
+        let err = check(input(
+            &mut loader,
+            source("import broken; fn main() {}", "main.anv"),
+            None,
+            vec![],
+            vec![],
+        ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Parse { label, .. } if label == "broken"));
     }
@@ -844,13 +1205,13 @@ mod tests {
     fn loaded_module_lex_error_keeps_lex_phase() {
         let mut loader = TestLoader::default();
         loader.source(&["broken"], "fn main() { \"unterminated }");
-        let err = check(ProgramInput {
-            main: source("import broken; fn main() {}", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![],
-            always_active_modules: vec![],
-            source_loader: &mut loader,
-        })
+        let err = check(input(
+            &mut loader,
+            source("import broken; fn main() {}", "main.anv"),
+            None,
+            vec![],
+            vec![],
+        ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Lex { label, .. } if label == "broken"));
     }
@@ -859,13 +1220,13 @@ mod tests {
     fn loader_failure_stays_resolve_error() {
         let mut loader = TestLoader::default();
         loader.failure(&["broken"], "disk error");
-        let err = check(ProgramInput {
-            main: source("import broken; fn main() {}", "main.anv"),
-            prelude: None,
-            preloaded_modules: vec![],
-            always_active_modules: vec![],
-            source_loader: &mut loader,
-        })
+        let err = check(input(
+            &mut loader,
+            source("import broken; fn main() {}", "main.anv"),
+            None,
+            vec![],
+            vec![],
+        ))
         .unwrap_err();
         let CheckError::Resolve { diagnostics } = err else {
             panic!("expected resolve error");

@@ -19,7 +19,7 @@ use crate::{
     },
     lexer::tokenize,
     parser,
-    resolve::{ModuleKey, ModulePath, ResolveResult, ResolvedModule},
+    resolve::{ModuleId, ModulePath, PackageId, ResolveResult, ResolvedModule},
     typecheck::{self, ExternUseTarget, ModuleScope, TypeError},
 };
 
@@ -272,17 +272,24 @@ fn callback(params: Vec<ExternTypeExpr>, ret: ExternTypeExpr) -> ExternTypeExpr 
     })
 }
 
+fn root_id() -> ModuleId {
+    ModuleId::root(PackageId::synthetic_root())
+}
+
 fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
     ResolveResult {
+        root: root_id(),
         module_groups: vec![
             modules
                 .iter()
                 .map(|(name, source)| ResolvedModule {
-                    key: ModuleKey::Named(module_path(name)),
+                    key: ModuleId::named(PackageId::synthetic_root(), module_path(name)),
                     program: parse(source),
                 })
                 .collect(),
         ],
+        dependencies: std::collections::HashMap::new(),
+        system: crate::resolve::SystemPackages::default(),
     }
 }
 
@@ -2922,7 +2929,13 @@ mod named_modules {
 
         assert_eq!(nominal.kind, NominalKind::Extern);
         assert_eq!(nominal.name, Ident::new("Vec2"));
-        assert_eq!(nominal.origin.as_deref(), Some(origin.as_slice()));
+        assert_eq!(
+            nominal
+                .origin
+                .as_ref()
+                .and_then(crate::ast::ModuleOrigin::module_path),
+            Some(origin.as_slice())
+        );
         assert_typecheck_closed(&result);
     }
 

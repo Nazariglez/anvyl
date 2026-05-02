@@ -1,13 +1,20 @@
 use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
-use anvyx_frontend::pipeline::{self, FrontendConfig, ProgramInput, Source as FrontendSource};
+use anvyx_frontend::{
+    pipeline::{
+        self, FrontendConfig, PackageModuleInput, PackageProgramInput, PackageSourceInput,
+        Source as FrontendSource,
+    },
+    resolve::{ModuleId, PackageId, SystemPackages},
+};
 
 use crate::{
-    CheckError, CheckOk, CheckResult, ModuleSource, SourceBundle, SourceText,
-    source::SourceEnvironment,
+    CheckError, CheckOk, CheckResult, ModuleSource, PackageSource, SourceBundle, SourceText,
+    source::{PackageSourceEnvironment, validate_reserved_source_roots},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,32 +44,101 @@ impl CheckFileInput {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckPackageInput {
+    root_package: PackageId,
+    root_file: PathBuf,
+    packages: Vec<PackageSource>,
+    sources: SourceBundle,
+}
+
+impl CheckPackageInput {
+    pub fn new(
+        root_package: PackageId,
+        root_file: impl Into<PathBuf>,
+        packages: Vec<PackageSource>,
+        sources: SourceBundle,
+    ) -> Result<Self, CheckError> {
+        let root_file = root_file.into();
+        if root_file.as_os_str().is_empty() {
+            return Err(CheckError::InvalidInput(
+                "main source path must not be empty".to_string(),
+            ));
+        }
+        if !packages.iter().any(|package| package.id() == &root_package) {
+            return Err(CheckError::InvalidInput(format!(
+                "root package '{root_package}' is missing from package input"
+            )));
+        }
+        Ok(Self {
+            root_package,
+            root_file,
+            packages,
+            sources,
+        })
+    }
+}
+
 pub fn check_file(input: CheckFileInput) -> CheckResult {
     let CheckFileInput { file, sources } = input;
-    let code = read_main(&file)?;
-    let root = source_root(&file);
-    let mut source_loader = SourceEnvironment::new(root, &sources);
+    let root_package = PackageId::synthetic_root();
+    let package = PackageSource::new(
+        root_package.clone(),
+        file.clone(),
+        source_root(&file),
+        HashMap::new(),
+    )?;
+    check_package(CheckPackageInput::new(
+        root_package,
+        file,
+        vec![package],
+        sources,
+    )?)
+}
 
-    pipeline::check(
-        ProgramInput {
-            main: FrontendSource {
-                code,
-                label: file.display().to_string(),
+pub fn check_package(input: CheckPackageInput) -> CheckResult {
+    let CheckPackageInput {
+        root_package,
+        root_file,
+        packages,
+        sources,
+    } = input;
+    validate_reserved_source_roots(&packages)?;
+
+    let main = FrontendSource {
+        code: read_main(&root_file)?,
+        label: root_file.display().to_string(),
+    };
+    let std_tree = StdModuleTree::new(&sources);
+    let mut package_inputs: HashMap<PackageId, PackageSourceInput> = packages
+        .iter()
+        .map(|package| {
+            Ok((
+                package.id().clone(),
+                PackageSourceInput {
+                    root: package_root(package, &root_package)?,
+                    dependencies: package.dependencies().clone(),
+                },
+            ))
+        })
+        .collect::<Result<_, CheckError>>()?;
+    if let Some(core) = core_package_input(&sources) {
+        package_inputs.insert(PackageId::core(), core);
+    }
+    package_inputs.insert(PackageId::std(), std_package_input(&std_tree));
+    let mut source_loader = PackageSourceEnvironment::new(&packages, &sources);
+
+    pipeline::check_packages(
+        PackageProgramInput {
+            root_package: root_package.clone(),
+            main,
+            system: SystemPackages {
+                core: core_package(&sources),
+                std: Some(PackageId::std()),
             },
-            prelude: sources.core_prelude().map(SourceText::to_frontend_source),
-            preloaded_modules: sources
-                .core_modules()
-                .iter()
-                .map(ModuleSource::to_frontend_module)
-                .collect(),
-            always_active_modules: sources
-                .always_active_modules()
-                .iter()
-                .map(|path| {
-                    anvyx_frontend::resolve::ModulePath::new(path.clone())
-                        .expect("SourceBundle validates module paths")
-                })
-                .collect(),
+            packages: package_inputs,
+            preloaded_modules: preloaded_modules(&sources, &std_tree),
+            always_active_modules: always_active_modules(&sources),
             source_loader: &mut source_loader,
         },
         FrontendConfig::default(),
@@ -85,11 +161,165 @@ fn source_root(file: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+fn package_root(
+    package: &PackageSource,
+    root_package: &PackageId,
+) -> Result<Option<FrontendSource>, CheckError> {
+    if package.id() == root_package {
+        Ok(None)
+    } else {
+        Ok(Some(read_package_root(package)?.to_frontend_source()))
+    }
+}
+
+fn read_package_root(package: &PackageSource) -> Result<SourceText, CheckError> {
+    let code = read_main(package.entry())?;
+    SourceText::new(code, package.entry().display().to_string())
+}
+
+fn core_package(sources: &SourceBundle) -> Option<PackageId> {
+    (sources.core_prelude().is_some() || !sources.core_modules().is_empty()).then(PackageId::core)
+}
+
+fn core_package_input(sources: &SourceBundle) -> Option<PackageSourceInput> {
+    core_package(sources).map(|_| PackageSourceInput {
+        root: Some(
+            sources
+                .core_prelude()
+                .map_or_else(empty_core_source, SourceText::to_frontend_source),
+        ),
+        dependencies: HashMap::new(),
+    })
+}
+
+fn std_package_input(tree: &StdModuleTree) -> PackageSourceInput {
+    PackageSourceInput {
+        root: Some(FrontendSource {
+            code: tree.source(&[]),
+            label: "<std>".to_string(),
+        }),
+        dependencies: HashMap::new(),
+    }
+}
+
+fn empty_core_source() -> FrontendSource {
+    FrontendSource {
+        code: String::new(),
+        label: "<core>".to_string(),
+    }
+}
+
+fn preloaded_modules(sources: &SourceBundle, std_tree: &StdModuleTree) -> Vec<PackageModuleInput> {
+    let mut modules = vec![];
+    if let Some(core) = core_package_input(sources).and_then(|package| package.root) {
+        modules.push(PackageModuleInput {
+            module: ModuleId::root(PackageId::core()),
+            source: core,
+        });
+    }
+    modules.extend(
+        sources
+            .core_modules()
+            .iter()
+            .map(|module| PackageModuleInput {
+                module: ModuleId::named(PackageId::core(), module_path(module.path().to_vec())),
+                source: module.to_frontend_source(),
+            }),
+    );
+    modules.extend(std_package_modules(std_tree));
+    modules
+}
+
+fn std_package_modules(tree: &StdModuleTree<'_>) -> Vec<PackageModuleInput> {
+    let mut modules = vec![];
+    for module in &tree.modules {
+        modules.push(PackageModuleInput {
+            module: ModuleId::named(PackageId::std(), module_path(module.path()[1..].to_vec())),
+            source: module.to_frontend_source(),
+        });
+    }
+    for prefix in tree.prefixes() {
+        modules.push(PackageModuleInput {
+            module: ModuleId::named(PackageId::std(), module_path(prefix.clone())),
+            source: FrontendSource {
+                code: tree.source(&prefix),
+                label: format!("<std.{}>", prefix.join(".")),
+            },
+        });
+    }
+    modules
+}
+
+struct StdModuleTree<'a> {
+    modules: Vec<&'a ModuleSource>,
+    existing: HashSet<Vec<String>>,
+    children: BTreeMap<Vec<String>, BTreeSet<String>>,
+}
+
+impl<'a> StdModuleTree<'a> {
+    fn new(sources: &'a SourceBundle) -> Self {
+        let mut modules = vec![];
+        let mut existing = HashSet::new();
+        let mut children = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
+        for module in sources.std_modules() {
+            modules.push(module);
+            let path = &module.path()[1..];
+            existing.insert(path.to_vec());
+            for len in 0..path.len() {
+                children
+                    .entry(path[..len].to_vec())
+                    .or_default()
+                    .insert(path[len].clone());
+            }
+        }
+        Self {
+            modules,
+            existing,
+            children,
+        }
+    }
+
+    fn prefixes(&self) -> Vec<Vec<String>> {
+        self.children
+            .keys()
+            .filter(|path| !path.is_empty() && !self.existing.contains(*path))
+            .cloned()
+            .collect()
+    }
+
+    fn source(&self, prefix: &[String]) -> String {
+        self.children
+            .get(prefix)
+            .into_iter()
+            .flatten()
+            .map(|child| {
+                let mut path = prefix.to_vec();
+                path.push(child.clone());
+                format!("pub import {};", path.join("."))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn always_active_modules(sources: &SourceBundle) -> Vec<ModuleId> {
+    sources
+        .always_active_modules()
+        .iter()
+        .map(|path| ModuleId::named(PackageId::core(), module_path(path.clone())))
+        .collect()
+}
+
+fn module_path(path: Vec<String>) -> anvyx_frontend::resolve::ModulePath {
+    anvyx_frontend::resolve::ModulePath::new(path).expect("SourceBundle validates module paths")
+}
+
 #[cfg(test)]
 mod tests {
     use anvyx_frontend::pipeline::CheckError as FrontendCheckError;
 
     use super::*;
+    use crate::ModuleSource;
 
     fn write(dir: &tempfile::TempDir, relative: &str, code: &str) -> PathBuf {
         let file = dir.path().join(relative);
@@ -112,15 +342,15 @@ mod tests {
     }
 
     fn empty_input(file: PathBuf) -> CheckFileInput {
-        input(file, SourceBundle::empty())
-    }
-
-    fn std_module(segments: &[&str], code: &str, label: &str) -> ModuleSource {
-        ModuleSource::new(path(segments), code, label).unwrap()
+        input(file, SourceBundle::default())
     }
 
     fn core_module(name: &str, code: &str) -> ModuleSource {
         ModuleSource::new(path(&[name]), code, format!("<core.{name}>")).unwrap()
+    }
+
+    fn std_module(name: &str, code: &str) -> ModuleSource {
+        ModuleSource::new(path(&["std", name]), code, format!("<std.{name}>")).unwrap()
     }
 
     fn bundle(
@@ -139,17 +369,82 @@ mod tests {
         }
     }
 
+    fn package_source(
+        id: PackageId,
+        entry: PathBuf,
+        source_root: PathBuf,
+        dependencies: std::collections::HashMap<String, PackageId>,
+    ) -> PackageSource {
+        PackageSource::new(id, entry, source_root, dependencies).unwrap()
+    }
+
     mod input {
         use super::*;
 
         #[test]
         fn rejects_empty_path() {
-            let error = CheckFileInput::new(PathBuf::new(), SourceBundle::empty()).unwrap_err();
+            let error = CheckFileInput::new(PathBuf::new(), SourceBundle::default()).unwrap_err();
 
             assert!(matches!(
                 error,
                 CheckError::InvalidInput(message)
                     if message.contains("main source path must not be empty")
+            ));
+        }
+    }
+
+    mod package {
+        use super::*;
+
+        fn package_id(name: &str) -> PackageId {
+            PackageId::new(name)
+        }
+
+        #[test]
+        fn resolves_dependency_root_import() {
+            let temp = tempfile::tempdir().unwrap();
+            let game_main = write(&temp, "game/src/main.anv", "import dep:math; fn main() {}");
+            let math_root = write(&temp, "math/src/lib.anv", "pub fn add() -> int { 1 }");
+            let game = package_id("game");
+            let math = package_id("math");
+            let packages = vec![
+                package_source(
+                    game.clone(),
+                    game_main.clone(),
+                    temp.path().join("game/src"),
+                    std::collections::HashMap::from([("math".to_string(), math.clone())]),
+                ),
+                package_source(
+                    math,
+                    math_root,
+                    temp.path().join("math/src"),
+                    std::collections::HashMap::new(),
+                ),
+            ];
+            let input =
+                CheckPackageInput::new(game, game_main, packages, SourceBundle::default()).unwrap();
+
+            check_package(input).unwrap();
+        }
+
+        #[test]
+        fn unknown_dependency_alias_is_resolve_error() {
+            let temp = tempfile::tempdir().unwrap();
+            let game_main = write(&temp, "game/src/main.anv", "import dep:math; fn main() {}");
+            let game = package_id("game");
+            let packages = vec![package_source(
+                game.clone(),
+                game_main.clone(),
+                temp.path().join("game/src"),
+                std::collections::HashMap::new(),
+            )];
+            let input =
+                CheckPackageInput::new(game, game_main, packages, SourceBundle::default()).unwrap();
+            let error = unwrap_error(check_package(input));
+
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Resolve { .. })
             ));
         }
     }
@@ -198,7 +493,7 @@ mod tests {
                 "main.anv",
                 "fn main() { let x: int = prelude_value(); }",
             );
-            let prelude = SourceText::new("fn prelude_value() -> int { 1 }", "<core>").unwrap();
+            let prelude = SourceText::new("pub fn prelude_value() -> int { 1 }", "<core>").unwrap();
             let sources = bundle(Some(prelude), vec![], vec![], vec![]);
 
             check_file(input(main, sources)).unwrap();
@@ -207,19 +502,46 @@ mod tests {
         #[test]
         fn preloads_core_roots() {
             let temp = tempfile::tempdir().unwrap();
-            let main = write(
-                &temp,
-                "main.anv",
-                "import core_helpers { value }; fn main() { let x: int = value(); }",
-            );
+            let main = write(&temp, "main.anv", "fn main() { let x: int = value(); }");
+            let prelude = SourceText::new("pub import core_helpers { value };", "<core>").unwrap();
             let sources = bundle(
-                None,
+                Some(prelude),
                 vec![core_module("core_helpers", "pub fn value() -> int { 1 }")],
                 vec![],
                 vec![],
             );
 
             check_file(input(main, sources)).unwrap();
+        }
+
+        #[test]
+        fn rejects_reserved_std_file() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "fn main() {}");
+            write(&temp, "std.anv", "fn hidden() {}");
+            let error = unwrap_error(check_file(empty_input(main)));
+
+            assert!(matches!(
+                error,
+                CheckError::InvalidInput(message)
+                    if message.contains("reserved std source path")
+                        && message.contains("std.anv")
+            ));
+        }
+
+        #[test]
+        fn rejects_reserved_std_directory_source() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "fn main() {}");
+            write(&temp, "std/foo.anv", "fn hidden() {}");
+            let error = unwrap_error(check_file(empty_input(main)));
+
+            assert!(matches!(
+                error,
+                CheckError::InvalidInput(message)
+                    if message.contains("reserved std source path")
+                        && message.contains("std/foo.anv")
+            ));
         }
 
         #[test]
@@ -249,68 +571,6 @@ mod tests {
         }
 
         #[test]
-        fn imports_std_bundle() {
-            let temp = tempfile::tempdir().unwrap();
-            let main = write(
-                &temp,
-                "main.anv",
-                "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
-            );
-            let sources = bundle(
-                None,
-                vec![],
-                vec![std_module(
-                    &["std", "math"],
-                    "pub fn sqrt(x: float) -> float { x }",
-                    "<std.math>",
-                )],
-                vec![],
-            );
-
-            check_file(input(main, sources)).unwrap();
-        }
-
-        #[test]
-        fn std_bundle_wins() {
-            let temp = tempfile::tempdir().unwrap();
-            let main = write(
-                &temp,
-                "main.anv",
-                "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
-            );
-            write(&temp, "std/math.anv", "fn nope( {}");
-            let sources = bundle(
-                None,
-                vec![],
-                vec![std_module(
-                    &["std", "math"],
-                    "pub fn sqrt(x: float) -> float { x }",
-                    "<std.math>",
-                )],
-                vec![],
-            );
-
-            check_file(input(main, sources)).unwrap();
-        }
-
-        #[test]
-        fn unknown_std_ignores_local_file() {
-            let temp = tempfile::tempdir().unwrap();
-            let main = write(
-                &temp,
-                "main.anv",
-                "import std.missing { value }; fn main() { let x: int = value(); }",
-            );
-            write(&temp, "std/missing.anv", "pub fn value() -> int { 1 }");
-            let error = unwrap_error(check_file(empty_input(main)));
-
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Resolve { .. })
-            ));
-        }
-
-        #[test]
         fn missing_import_is_resolve_error() {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "import missing; fn main() {}");
@@ -320,6 +580,61 @@ mod tests {
                 error,
                 CheckError::Frontend(FrontendCheckError::Resolve { .. })
             ));
+        }
+
+        #[test]
+        fn imports_std_module() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import std.math { PI }; fn main() { let x: int = PI; }",
+            );
+            let sources = bundle(
+                None,
+                vec![],
+                vec![std_module("math", "pub const PI: int = 3;")],
+                vec![],
+            );
+
+            check_file(input(main, sources)).unwrap();
+        }
+
+        #[test]
+        fn std_is_not_preluded() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "fn main() { let x: int = PI; }");
+            let sources = bundle(
+                None,
+                vec![],
+                vec![std_module("math", "pub const PI: int = 3;")],
+                vec![],
+            );
+            let error = unwrap_error(check_file(input(main, sources)));
+
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Type { .. })
+            ));
+        }
+
+        #[test]
+        fn std_receives_core_prelude() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import std.math { value }; fn main() { let x: int = value(); }",
+            );
+            let prelude = SourceText::new("pub fn core_value() -> int { 1 }", "<core>").unwrap();
+            let sources = bundle(
+                Some(prelude),
+                vec![],
+                vec![std_module("math", "pub fn value() -> int { core_value() }")],
+                vec![],
+            );
+
+            check_file(input(main, sources)).unwrap();
         }
 
         #[test]

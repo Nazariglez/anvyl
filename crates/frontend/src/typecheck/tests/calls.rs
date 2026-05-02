@@ -360,10 +360,10 @@ fn call_target_facts_distinguish_const_infer() {
         },
     });
 
-    assert!(!facts.contains_infer);
-    assert!(!facts.contains_unresolved_ref);
-    assert!(!facts.contains_unresolved_const);
-    assert!(facts.contains_const_infer);
+    assert!(!facts.types.contains_infer);
+    assert!(facts.types.first_unresolved.is_none());
+    assert!(!facts.contains_unresolved_const());
+    assert!(facts.consts.contains_infer);
 }
 
 #[test]

@@ -51,8 +51,12 @@ fn module_descriptor(module: &RawExternModule) -> ExternModuleDescriptor {
 
 fn descriptor_path(scope: &RawExternScope) -> ModulePath {
     match scope {
-        RawExternScope::Root => ModulePath { segments: vec![] },
         RawExternScope::Named(path) => path.clone(),
+        RawExternScope::Module(module) => ModulePath {
+            segments: module
+                .named_path()
+                .map_or_else(Vec::new, |path| path.segments().to_vec()),
+        },
     }
 }
 

@@ -5,9 +5,9 @@ use super::support::{
     resolve_with_external, resolve_with_ignored, resolve_with_preloaded,
     resolve_with_preloaded_and_external,
 };
-use crate::resolve::{ModuleKey, ModulePath, ResolveError, ResolveResult};
+use crate::resolve::{ModuleId, ModulePath, PackageModulePath, ResolveError, ResolveResult};
 
-fn group_keys(result: &ResolveResult) -> Vec<Vec<ModuleKey>> {
+fn group_keys(result: &ResolveResult) -> Vec<Vec<ModuleId>> {
     result
         .module_groups
         .iter()
@@ -15,18 +15,31 @@ fn group_keys(result: &ResolveResult) -> Vec<Vec<ModuleKey>> {
         .collect()
 }
 
+fn is_named(key: &ModuleId, path: &[&str]) -> bool {
+    matches!(key.path(), PackageModulePath::Named(p) if p.segments() == path)
+}
+
+fn is_root(key: &ModuleId) -> bool {
+    matches!(key.path(), PackageModulePath::Root)
+}
+
 fn has_key(result: &ResolveResult, path: &[&str]) -> bool {
     group_keys(result)
         .into_iter()
         .flatten()
-        .any(|key| matches!(key, ModuleKey::Named(p) if p.segments() == path))
+        .any(|key| is_named(&key, path))
 }
 
 fn has_error(errors: &[ResolveError], path: &[&str]) -> bool {
     errors.iter().any(|e| match e {
-        ResolveError::ModuleNotFound { path: p, .. }
-        | ResolveError::LoadFailed { path: p, .. }
-        | ResolveError::DuplicatePreloadedModule { path: p } => p.segments() == path,
+        ResolveError::ModuleNotFound { module, .. }
+        | ResolveError::LoadFailed { module, .. }
+        | ResolveError::DuplicatePreloadedModule { module } => {
+            module.named_path().is_some_and(|p| p.segments() == path)
+        }
+        ResolveError::UnknownDependency { .. } | ResolveError::UnsupportedImportRoot { .. } => {
+            false
+        }
     })
 }
 
@@ -36,7 +49,7 @@ fn assert_module_path(src: &str, dep_src: &str, path: &[&str]) {
     let result = resolve(src, &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 2);
-    assert!(matches!(&keys[0][0], ModuleKey::Named(p) if p.segments() == path));
+    assert!(is_named(&keys[0][0], path));
 }
 
 #[test]
@@ -57,66 +70,63 @@ fn module_path_rejects_empty_segment() {
 #[test]
 fn single_import() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["foo"]), "");
+    loader.add_source(module_path(["foo"]), "");
     let result = resolve("import foo;", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 2, "should have 2 groups: foo, root");
-    assert!(matches!(&keys[0][0], ModuleKey::Named(p) if p.segments() == ["foo"]));
-    assert!(matches!(&keys[1][0], ModuleKey::Root));
+    assert!(is_named(&keys[0][0], &["foo"]));
+    assert!(is_root(&keys[1][0]));
 }
 
 #[test]
 fn chain() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["foo"]), "import bar;");
-    loader.add_source(module_path(vec!["bar"]), "");
+    loader.add_source(module_path(["foo"]), "import bar;");
+    loader.add_source(module_path(["bar"]), "");
     let result = resolve("import foo;", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 3, "bar, foo, root");
-    assert!(matches!(&keys[0][0], ModuleKey::Named(p) if p.segments() == ["bar"]));
-    assert!(matches!(&keys[1][0], ModuleKey::Named(p) if p.segments() == ["foo"]));
-    assert!(matches!(&keys[2][0], ModuleKey::Root));
+    assert!(is_named(&keys[0][0], &["bar"]));
+    assert!(is_named(&keys[1][0], &["foo"]));
+    assert!(is_root(&keys[2][0]));
 }
 
 #[test]
 fn shared_dep() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["a"]), "import c;");
-    loader.add_source(module_path(vec!["b"]), "import c;");
-    loader.add_source(module_path(vec!["c"]), "");
+    loader.add_source(module_path(["a"]), "import c;");
+    loader.add_source(module_path(["b"]), "import c;");
+    loader.add_source(module_path(["c"]), "");
     let result = resolve("import a; import b;", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 4, "c, a, b, root");
-    let c_count = keys
-        .iter()
-        .filter(|g| matches!(&g[0], ModuleKey::Named(p) if p.segments() == ["c"]))
-        .count();
+    let c_count = keys.iter().filter(|g| is_named(&g[0], &["c"])).count();
     assert_eq!(c_count, 1, "c appears once despite two imports");
-    assert!(matches!(&keys[3][0], ModuleKey::Root));
+    assert!(is_root(&keys[3][0]));
 }
 
 #[test]
 fn two_module_cycle() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["a"]), "import b;");
-    loader.add_source(module_path(vec!["b"]), "import a;");
+    loader.add_source(module_path(["a"]), "import b;");
+    loader.add_source(module_path(["b"]), "import a;");
     let result = resolve("import a;", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 2, "SCC of a,b, then root");
     assert_eq!(keys[0].len(), 2, "a and b in same cycle");
-    assert!(matches!(&keys[1][0], ModuleKey::Root));
+    assert!(is_root(&keys[1][0]));
 }
 
 #[test]
 fn self_cycle() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["a"]), "import a;");
+    loader.add_source(module_path(["a"]), "import a;");
     let result = resolve("import a;", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 2, "a (SCC), then root");
     assert_eq!(keys[0].len(), 1);
-    assert!(matches!(&keys[0][0], ModuleKey::Named(p) if p.segments() == ["a"]));
-    assert!(matches!(&keys[1][0], ModuleKey::Root));
+    assert!(is_named(&keys[0][0], &["a"]));
+    assert!(is_root(&keys[1][0]));
 }
 
 #[test]
@@ -126,13 +136,13 @@ fn ignored_root() {
     let result = resolve_with_ignored("import godot.math;", &mut loader, &ignored).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 1, "only root");
-    assert!(matches!(&keys[0][0], ModuleKey::Root));
+    assert!(is_root(&keys[0][0]));
 }
 
 #[test]
 fn mixed_real_and_ignored() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["foo"]), "");
+    loader.add_source(module_path(["foo"]), "");
     let ignored = ignored_roots(&["godot"]);
     let result =
         resolve_with_ignored("import foo; import godot.math;", &mut loader, &ignored).unwrap();
@@ -143,7 +153,7 @@ fn mixed_real_and_ignored() {
 #[test]
 fn missing_module() {
     let mut loader = InMemoryLoader::default();
-    loader.add_missing(module_path(vec!["missing"]));
+    loader.add_missing(module_path(["missing"]));
     let errors = resolve_errors(resolve("import missing;", &mut loader));
     assert!(has_error(&errors, &["missing"]));
 }
@@ -151,7 +161,7 @@ fn missing_module() {
 #[test]
 fn load_failure() {
     let mut loader = InMemoryLoader::default();
-    loader.add_failure(module_path(vec!["bad"]), "disk error");
+    loader.add_failure(module_path(["bad"]), "disk error");
     let errors = resolve_errors(resolve("import bad;", &mut loader));
     assert!(has_error(&errors, &["bad"]));
 }
@@ -159,7 +169,7 @@ fn load_failure() {
 #[test]
 fn external_module_import_resolves_without_source_module() {
     let mut loader = InMemoryLoader::default();
-    let path = module_path(vec!["host"]);
+    let path = module_path(["host"]);
     loader.add_missing(path.clone());
     let external_modules = HashSet::from([path.clone()]);
 
@@ -172,7 +182,7 @@ fn external_module_import_resolves_without_source_module() {
 #[test]
 fn missing_non_external_module_still_fails() {
     let mut loader = InMemoryLoader::default();
-    loader.add_missing(module_path(vec!["missing"]));
+    loader.add_missing(module_path(["missing"]));
     let errors = resolve_errors(resolve_with_external(
         "import missing;",
         &mut loader,
@@ -185,7 +195,7 @@ fn missing_non_external_module_still_fails() {
 #[test]
 fn preloaded_module_wins_over_external_fallback() {
     let mut loader = InMemoryLoader::default();
-    let path = module_path(vec!["host"]);
+    let path = module_path(["host"]);
     let external_modules = HashSet::from([path.clone()]);
 
     let result = resolve_with_preloaded_and_external(
@@ -203,7 +213,7 @@ fn preloaded_module_wins_over_external_fallback() {
 #[test]
 fn load_failure_beats_external_fallback() {
     let mut loader = InMemoryLoader::default();
-    let path = module_path(vec!["host"]);
+    let path = module_path(["host"]);
     loader.add_failure(path.clone(), "disk error");
     let external_modules = HashSet::from([path]);
 
@@ -215,15 +225,16 @@ fn load_failure_beats_external_fallback() {
 
     assert!(matches!(
         errors.as_slice(),
-        [ResolveError::LoadFailed { path, message, .. }]
-            if path.segments() == ["host"] && message == "disk error"
+        [ResolveError::LoadFailed { module, message, .. }]
+            if module.named_path().is_some_and(|path| path.segments() == ["host"])
+                && message == "disk error"
     ));
 }
 
 #[test]
 fn duplicate_imports() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["foo"]), "");
+    loader.add_source(module_path(["foo"]), "");
     let result = resolve("import foo; import foo;", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 2, "foo, root");
@@ -233,10 +244,10 @@ fn duplicate_imports() {
 #[test]
 fn nested_path() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["foo", "bar", "baz"]), "");
+    loader.add_source(module_path(["foo", "bar", "baz"]), "");
     let result = resolve("import foo.bar.baz;", &mut loader).unwrap();
     let keys = group_keys(&result);
-    assert!(matches!(&keys[0][0], ModuleKey::Named(p) if p.segments() == ["foo", "bar", "baz"]));
+    assert!(is_named(&keys[0][0], &["foo", "bar", "baz"]));
 }
 
 #[test]
@@ -255,7 +266,7 @@ fn root_in_result() {
     let result = resolve("", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 1);
-    assert!(matches!(&keys[0][0], ModuleKey::Root));
+    assert!(is_root(&keys[0][0]));
 }
 
 #[test]
@@ -264,7 +275,7 @@ fn root_with_decl() {
     let result = resolve("fn main() {}", &mut loader).unwrap();
     let keys = group_keys(&result);
     assert_eq!(keys.len(), 1);
-    assert!(matches!(&keys[0][0], ModuleKey::Root));
+    assert!(is_root(&keys[0][0]));
 }
 
 #[test]
@@ -298,7 +309,8 @@ fn preloaded_module_resolves_without_import() {
 
 #[test]
 fn duplicate_preloaded_module_is_resolve_error() {
-    let path = module_path(vec!["core_int"]);
+    let path = module_path(["core_int"]);
+    let module = ModuleId::named(crate::resolve::PackageId::synthetic_root(), path.clone());
     let mut loader = InMemoryLoader::default();
     let errors = resolve_errors(resolve_with_preloaded(
         "import core_int;",
@@ -308,7 +320,7 @@ fn duplicate_preloaded_module_is_resolve_error() {
 
     assert!(matches!(
         errors.as_slice(),
-        [ResolveError::DuplicatePreloadedModule { path: p }] if p == &path
+        [ResolveError::DuplicatePreloadedModule { module: found }] if found == &module
     ));
     assert_eq!(loader.load_count(&path), 0);
 }
@@ -316,7 +328,7 @@ fn duplicate_preloaded_module_is_resolve_error() {
 #[test]
 fn preloaded_module_imports_are_resolved() {
     let mut loader = InMemoryLoader::default();
-    loader.add_source(module_path(vec!["dep"]), "");
+    loader.add_source(module_path(["dep"]), "");
     let result = resolve_with_preloaded(
         "",
         vec![preloaded(&["core_int"], "import dep;")],
@@ -330,7 +342,7 @@ fn preloaded_module_imports_are_resolved() {
 
 #[test]
 fn root_import_of_preloaded_module_dedupes() {
-    let path = module_path(vec!["core_int"]);
+    let path = module_path(["core_int"]);
     let mut loader = InMemoryLoader::default();
     loader.add_source(path.clone(), "fn should_not_load() {}");
     let result = resolve_with_preloaded(
@@ -356,7 +368,7 @@ fn duplicate_preloaded_and_loaded_imports_appear_once() {
     let count = group_keys(&result)
         .into_iter()
         .flatten()
-        .filter(|key| matches!(key, ModuleKey::Named(p) if p.segments() == ["core_int"]))
+        .filter(|key| is_named(key, &["core_int"]))
         .count();
 
     assert_eq!(count, 1);
@@ -378,11 +390,7 @@ fn preloaded_cycle_is_one_scc() {
 
     assert!(keys.iter().any(|group| {
         group.len() == 2
-            && group
-                .iter()
-                .any(|key| matches!(key, ModuleKey::Named(p) if p.segments() == ["a"]))
-            && group
-                .iter()
-                .any(|key| matches!(key, ModuleKey::Named(p) if p.segments() == ["b"]))
+            && group.iter().any(|key| is_named(key, &["a"]))
+            && group.iter().any(|key| is_named(key, &["b"]))
     }));
 }

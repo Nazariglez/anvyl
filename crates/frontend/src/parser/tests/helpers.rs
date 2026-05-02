@@ -33,6 +33,29 @@ pub(super) fn parse_program(src: &str) -> ast::Program {
         .unwrap_or_else(|errs| panic!("failed to parse '{src}': {errs:?}"))
 }
 
+pub(super) fn first_import(src: &str) -> ast::Import {
+    let prog = parse_program(src);
+    let ast::Stmt::Import(node) = &prog.stmts[0].node else {
+        panic!("expected Import statement, found {:?}", prog.stmts[0].node);
+    };
+    node.node.clone()
+}
+
+pub(super) fn assert_named_path(path: &ast::PackageModulePath, expected: &[&str]) {
+    let ast::PackageModulePath::Named(path) = path else {
+        panic!("expected named path, found {path:?}");
+    };
+    assert_eq!(
+        path.iter().map(ast::Ident::as_str).collect::<Vec<_>>(),
+        expected
+    );
+}
+
+pub(super) fn assert_local_import(imp: &ast::Import, expected: &[&str]) {
+    assert_eq!(imp.target.root, ast::ImportRoot::Local);
+    assert_named_path(&imp.target.path, expected);
+}
+
 pub(super) fn parse_program_err(src: &str) {
     let Ok(tokens) = lexer::tokenize(src) else {
         return; // lex error is also acceptable

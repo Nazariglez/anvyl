@@ -27,7 +27,7 @@ use crate::{
             ExternTypeId,
         },
     },
-    resolve::{ModuleKey, ResolveResult},
+    resolve::ResolveResult,
     span::Span,
 };
 
@@ -1256,15 +1256,17 @@ pub(crate) fn check_with_modules(
     decls.sync_extern_headers(&catalog);
 
     let mut tc = TypeChecker::new(decls, catalog);
-    tc.collect_const_decls(ModuleScope::Root, program);
-    collect_callable_templates(ModuleScope::Root, program, &mut tc);
+    let root_scope = ModuleScope::from_module_id(&resolved.root);
+    tc.current_module = root_scope.clone();
+    tc.collect_const_decls(root_scope.clone(), program);
+    collect_callable_templates(root_scope.clone(), program, &mut tc);
 
     for group in &resolved.module_groups {
         for module in group {
-            let ModuleKey::Named(path) = &module.key else {
+            if module.key == resolved.root {
                 continue;
-            };
-            let scope = ModuleScope::Named(path.clone());
+            }
+            let scope = ModuleScope::from_module_id(&module.key);
             tc.module_programs
                 .insert(scope.clone(), Rc::new(module.program.clone()));
             tc.collect_const_decls(scope.clone(), &module.program);
@@ -1272,7 +1274,7 @@ pub(crate) fn check_with_modules(
         }
     }
 
-    tc.eval_module_consts(&ModuleScope::Root);
+    tc.eval_module_consts(&root_scope);
     tc.finalize_declarations();
     if !tc.errors.is_empty() {
         return Err(tc.errors);
@@ -1811,7 +1813,7 @@ fn with_source_module_scope<R>(
     let previous_module = std::mem::replace(&mut tc.current_module, module.clone());
     let ret = match module {
         ModuleScope::Root => with_global_scope(tc, f),
-        ModuleScope::Named(_) => {
+        ModuleScope::Named(_) | ModuleScope::Package(_) => {
             let scopes = std::mem::take(&mut tc.scopes);
             tc.scopes = vec![];
             push_source_scope(tc);
@@ -3637,26 +3639,43 @@ fn check_match_checked_with_hint(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CallTargetClosureFacts {
+    pub(crate) types: type_ops::TypeClosureFacts,
+    pub(crate) consts: ConstArgClosureFacts,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConstArgClosureFacts {
+    pub(crate) contains_unresolved: bool,
     pub(crate) contains_infer: bool,
-    pub(crate) contains_unresolved_ref: bool,
-    pub(crate) contains_unresolved_const: bool,
-    pub(crate) contains_const_infer: bool,
+}
+
+impl CallTargetClosureFacts {
+    pub(crate) fn contains_unresolved_const(&self) -> bool {
+        self.types.contains_unresolved_const || self.consts.contains_unresolved
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.types.contains_infer
+            && self.types.first_unresolved.is_none()
+            && !self.contains_unresolved_const()
+            && !self.consts.contains_infer
+    }
 }
 
 pub(crate) fn call_target_closure_facts(target: &CallTarget) -> CallTargetClosureFacts {
     let mut facts = CallTargetClosureFacts::default();
     for ty in &target.args.type_args {
         let ty_facts = type_closure_facts(ty);
-        facts.contains_infer |= ty_facts.contains_infer;
-        facts.contains_unresolved_ref |= ty_facts.first_unresolved.is_some();
-        facts.contains_unresolved_const |= ty_facts.contains_unresolved_const;
+        facts.types.contains_infer |= ty_facts.contains_infer;
+        facts.types.first_unresolved = facts.types.first_unresolved.or(ty_facts.first_unresolved);
+        facts.types.contains_unresolved_const |= ty_facts.contains_unresolved_const;
     }
     for arg in &target.args.const_args {
         match arg {
-            ConstTerm::Name(_) => facts.contains_unresolved_const = true,
-            ConstTerm::ArrayInfer | ConstTerm::Infer(_) => facts.contains_const_infer = true,
+            ConstTerm::Name(_) => facts.consts.contains_unresolved = true,
+            ConstTerm::ArrayInfer | ConstTerm::Infer(_) => facts.consts.contains_infer = true,
             ConstTerm::Value(_) | ConstTerm::Param(_) => {}
         }
     }
@@ -3677,17 +3696,13 @@ fn push_extern_ty_closure_error(
 
 fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarget, span: Span) {
     let facts = call_target_closure_facts(target);
-    if !facts.contains_infer
-        && !facts.contains_unresolved_ref
-        && !facts.contains_unresolved_const
-        && !facts.contains_const_infer
-    {
+    if facts.is_empty() {
         return;
     }
     for ty in &target.args.type_args {
         push_type_closure_error(errors, ty, span);
     }
-    if facts.contains_unresolved_const || facts.contains_const_infer {
+    if facts.contains_unresolved_const() || facts.consts.contains_infer {
         errors.push(TypeError::CannotInferConst { span });
     }
 }

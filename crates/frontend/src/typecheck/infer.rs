@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParamId, ExprId, FuncParam, GenericArg, Ident, ModulePath,
+        ArrayLen, ConstArg, ConstParamId, ExprId, FuncParam, GenericArg, Ident, ModuleOrigin,
         NominalKind, Type, TypeVarId,
     },
     span::Span,
@@ -70,7 +70,7 @@ struct TyNominal {
     name: Ident,
     type_args: Vec<Ty>,
     const_args: Vec<ConstTerm>,
-    origin: Option<ModulePath>,
+    origin: Option<ModuleOrigin>,
 }
 
 impl TyNominal {
@@ -157,7 +157,7 @@ impl Ty {
         name: Ident,
         type_args: Vec<Self>,
         const_args: Vec<ConstTerm>,
-        origin: Option<ModulePath>,
+        origin: Option<ModuleOrigin>,
     ) -> Self {
         Self::Nominal(TyNominal {
             kind,
@@ -173,7 +173,7 @@ impl Ty {
         name: Ident,
         type_args: &[Type],
         const_args: &[ConstArg],
-        origin: Option<&ModulePath>,
+        origin: Option<&ModuleOrigin>,
     ) -> Self {
         let (type_args, const_args) = Self::from_recovery_nominal_args(type_args, const_args);
         Self::nominal(kind, name, type_args, const_args, origin.cloned())
@@ -182,7 +182,7 @@ impl Ty {
     fn try_nominal_to_no_infer(nominal: &TyNominal) -> Option<Type> {
         let (type_args, const_args) =
             Self::try_nominal_args_to_no_infer(&nominal.type_args, &nominal.const_args)?;
-        Some(Type::nominal(
+        Some(Type::nominal_with_origin(
             nominal.kind,
             nominal.name,
             type_args,
@@ -905,7 +905,7 @@ impl Solver {
         name: Ident,
         type_args: &[Type],
         const_args: &[ConstArg],
-        origin: Option<&ModulePath>,
+        origin: Option<&ModuleOrigin>,
         vars: &GenericSolverVars,
     ) -> Ty {
         Ty::nominal(
@@ -1086,16 +1086,8 @@ impl Solver {
         &self.temp_types[id.0 as usize]
     }
 
-    fn set_temp_type(&mut self, id: TempTypeId, ty: Ty) {
-        self.temp_types[id.0 as usize] = ty;
-    }
-
     fn expr_type(&self, id: ExprId) -> Option<&Ty> {
         self.expr_types.get(&id).map(|(_, ty)| ty)
-    }
-
-    fn expr_span(&self, id: ExprId) -> Option<Span> {
-        self.expr_types.get(&id).map(|(span, _)| *span)
     }
 
     fn set_expr_type(&mut self, id: ExprId, span: Span, ty: Ty) {
@@ -1903,7 +1895,7 @@ impl Solver {
     fn finalize_nominal(&self, nominal: TyNominal, cx: &mut FinalizeCx<'_>) -> Type {
         let type_args = self.finalize_tys(nominal.type_args, cx);
         match self.finalize_const_args(nominal.const_args, cx) {
-            Some(const_args) => Type::nominal(
+            Some(const_args) => Type::nominal_with_origin(
                 nominal.kind,
                 nominal.name,
                 type_args,
@@ -2058,12 +2050,13 @@ mod tests {
         Ident::new(name)
     }
 
-    fn origin(parts: &[&str]) -> ModulePath {
-        parts
-            .iter()
-            .map(|part| (*part).to_string())
-            .collect::<Vec<_>>()
-            .into()
+    fn origin(parts: &[&str]) -> ModuleOrigin {
+        ModuleOrigin::Module(std::rc::Rc::from(
+            parts
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect::<Vec<_>>(),
+        ))
     }
 
     fn span(start: usize, end: usize) -> Span {
@@ -2326,21 +2319,21 @@ mod tests {
             ConstArg::Name(ident("CAP")),
             ConstArg::Param(const_param(9)),
         ];
-        assert_roundtrip(Type::nominal(
+        assert_roundtrip(Type::nominal_with_origin(
             NominalKind::Struct,
             ident("FixedBuf"),
             type_args.clone(),
             const_args.clone(),
             Some(origin(&["gamekit", "mem"])),
         ));
-        assert_roundtrip(Type::nominal(
+        assert_roundtrip(Type::nominal_with_origin(
             NominalKind::DataRef,
             ident("Handle"),
             type_args.clone(),
             const_args.clone(),
             Some(origin(&["gamekit", "mem"])),
         ));
-        assert_roundtrip(Type::nominal(
+        assert_roundtrip(Type::nominal_with_origin(
             NominalKind::Enum,
             ident("Option"),
             type_args,
@@ -2365,7 +2358,7 @@ mod tests {
 
     #[test]
     fn roundtrip_externs() {
-        assert_roundtrip(Type::nominal(
+        assert_roundtrip(Type::nominal_with_origin(
             NominalKind::Extern,
             ident("Texture"),
             vec![],
@@ -2377,7 +2370,7 @@ mod tests {
     #[test]
     fn nominals_enter_solver_as_nominal() {
         let origin = Some(origin(&["gamekit", "mem"]));
-        let ty = Type::nominal(
+        let ty = Type::nominal_with_origin(
             NominalKind::Struct,
             ident("FixedBuf"),
             vec![Type::Int],
@@ -2394,7 +2387,7 @@ mod tests {
         ));
         assert_eq!(
             solver_ty.try_to_type_no_infer(),
-            Some(Type::nominal(
+            Some(Type::nominal_with_origin(
                 NominalKind::Struct,
                 ident("FixedBuf"),
                 vec![Type::Int],
@@ -2407,7 +2400,7 @@ mod tests {
     #[test]
     fn externs_enter_solver_as_nominal() {
         let origin = Some(origin(&["gamekit", "gfx"]));
-        let ty = Type::nominal(
+        let ty = Type::nominal_with_origin(
             NominalKind::Extern,
             ident("Texture"),
             vec![],
@@ -2424,7 +2417,7 @@ mod tests {
         ));
         assert_eq!(
             solver_ty.try_to_type_no_infer(),
-            Some(Type::nominal(
+            Some(Type::nominal_with_origin(
                 NominalKind::Extern,
                 ident("Texture"),
                 vec![],
@@ -2465,12 +2458,14 @@ mod tests {
     fn cell_refs() {
         let mut solver = Solver::default();
         let local = solver.alloc_local(Ty::Int);
-        let temp = solver.alloc_temp(Ty::Bool);
+        let temp = solver.alloc_temp(Ty::Void);
         let expr = ExprId(42);
         solver.set_expr_type(expr, span(20, 21), Ty::String);
         solver.set_local_type(local, Ty::Float);
-        solver.set_temp_type(temp, Ty::Void);
-        assert_eq!(solver.expr_span(expr), Some(span(20, 21)));
+        assert_eq!(
+            solver.expr_types.get(&expr).map(|(span, _)| *span),
+            Some(span(20, 21))
+        );
         assert_eq!(solver.resolve_ref(&TypeRef::local(local)), Ty::Float);
         assert_eq!(solver.resolve_ref(&TypeRef::temp(temp)), Ty::Void);
         assert_eq!(solver.resolve_ref(&TypeRef::expr(expr)), Ty::String);

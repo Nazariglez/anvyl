@@ -1,16 +1,8 @@
-use super::helpers::{parse_program, parse_program_err};
+use super::helpers::{assert_local_import, first_import, parse_program, parse_program_err};
 use crate::ast::{self, ImportItemKind, ImportKind};
 
 fn ident_str(ident: &ast::Ident) -> &str {
     ident.0.as_ref()
-}
-
-fn first_import(src: &str) -> ast::Import {
-    let prog = parse_program(src);
-    let ast::Stmt::Import(node) = &prog.stmts[0].node else {
-        panic!("expected Import statement, found {:?}", prog.stmts[0].node);
-    };
-    node.node.clone()
 }
 
 fn selective_items(src: &str) -> Vec<ast::ImportItem> {
@@ -24,35 +16,28 @@ fn selective_items(src: &str) -> Vec<ast::ImportItem> {
 #[test]
 fn single_seg() {
     let imp = first_import("import foo;");
-    assert_eq!(imp.path.len(), 1);
-    assert_eq!(ident_str(&imp.path[0]), "foo");
+    assert_local_import(&imp, &["foo"]);
     assert_eq!(imp.kind, ImportKind::Module);
 }
 
 #[test]
 fn two_seg() {
     let imp = first_import("import foo.bar;");
-    assert_eq!(imp.path.len(), 2);
-    assert_eq!(ident_str(&imp.path[0]), "foo");
-    assert_eq!(ident_str(&imp.path[1]), "bar");
+    assert_local_import(&imp, &["foo", "bar"]);
     assert_eq!(imp.kind, ImportKind::Module);
 }
 
 #[test]
 fn three_seg() {
     let imp = first_import("import foo.bar.baz;");
-    assert_eq!(imp.path.len(), 3);
-    assert_eq!(ident_str(&imp.path[0]), "foo");
-    assert_eq!(ident_str(&imp.path[1]), "bar");
-    assert_eq!(ident_str(&imp.path[2]), "baz");
+    assert_local_import(&imp, &["foo", "bar", "baz"]);
     assert_eq!(imp.kind, ImportKind::Module);
 }
 
 #[test]
 fn single_seg_alias() {
     let imp = first_import("import foo as f;");
-    assert_eq!(imp.path.len(), 1);
-    assert_eq!(ident_str(&imp.path[0]), "foo");
+    assert_local_import(&imp, &["foo"]);
     let ImportKind::ModuleAs(alias) = &imp.kind else {
         panic!("expected ModuleAs, found {:?}", imp.kind);
     };
@@ -62,9 +47,7 @@ fn single_seg_alias() {
 #[test]
 fn multi_seg_alias() {
     let imp = first_import("import foo.bar as b;");
-    assert_eq!(imp.path.len(), 2);
-    assert_eq!(ident_str(&imp.path[0]), "foo");
-    assert_eq!(ident_str(&imp.path[1]), "bar");
+    assert_local_import(&imp, &["foo", "bar"]);
     let ImportKind::ModuleAs(alias) = &imp.kind else {
         panic!("expected ModuleAs, found {:?}", imp.kind);
     };
@@ -152,8 +135,7 @@ fn selective_self_trailing() {
 #[test]
 fn wildcard() {
     let imp = first_import("import foo { * };");
-    assert_eq!(imp.path.len(), 1);
-    assert_eq!(ident_str(&imp.path[0]), "foo");
+    assert_local_import(&imp, &["foo"]);
     assert_eq!(imp.kind, ImportKind::Wildcard);
 }
 
