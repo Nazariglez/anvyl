@@ -1,7 +1,7 @@
 mod printer;
 mod trivia;
 
-use anvyx_lang::{lexer, parser};
+use anvyx_frontend::{lexer, parser};
 use chumsky::error::{Rich, RichPattern};
 
 pub enum FormatError {
@@ -95,11 +95,20 @@ pub fn format_source(source: &str) -> Result<String, FormatError> {
 mod tests {
     use super::*;
 
+    fn assert_fmt(source: &str, expected: &str) {
+        let formatted = format_source(source).expect("format failed");
+        assert_eq!(formatted, expected);
+    }
+
+    fn formatted_program(source: &str) -> anvyx_frontend::ast::Program {
+        let formatted = format_source(source).expect("format failed");
+        let tokens = lexer::tokenize(&formatted).expect("lex failed");
+        parser::parse_ast(&tokens).expect("parse failed")
+    }
+
     #[test]
     fn simple_roundtrip() {
-        let source = "fn main() {}";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("fn main()"));
+        assert_fmt("fn main() {}", "fn main() {}\n");
     }
 
     #[test]
@@ -113,9 +122,139 @@ mod tests {
 
     #[test]
     fn empty_source() {
-        let source = "";
-        let formatted = format_source(source).expect("format failed");
-        assert_eq!(formatted, "\n");
+        assert_fmt("", "\n");
+    }
+
+    #[test]
+    fn exact_function() {
+        assert_fmt(
+            "fn add(a:int,b:int)->int{a+b}",
+            "fn add(a: int, b: int) -> int { a + b }\n",
+        );
+    }
+
+    #[test]
+    fn exact_aggregate_method() {
+        assert_fmt(
+            "struct Counter { value: int, fn get(self) -> int { self.value } }",
+            "struct Counter {\n    value: int,\n\n    fn get(self) -> int { self.value }\n}\n",
+        );
+    }
+
+    #[test]
+    fn exact_if_expression() {
+        assert_fmt(
+            "fn f(x: bool) -> int { if x { 1 } else { 2 } }",
+            "fn f(x: bool) -> int {\n    if x {\n        1\n    } else {\n        2\n    }\n}\n",
+        );
+    }
+
+    #[test]
+    fn exact_frontend_imports() {
+        assert_fmt(
+            "import ext:mem { collect_cycles };",
+            "import ext:mem { collect_cycles };\n",
+        );
+        assert_fmt(
+            "pub import pkg:math.vec { self as vec, Vec2 };",
+            "pub import pkg:math.vec { self as vec, Vec2 };\n",
+        );
+        assert_fmt("import ..foo.bar;", "import ..foo.bar;\n");
+    }
+
+    #[test]
+    fn exact_frontend_types_and_struct_literals() {
+        assert_fmt("fn f(x: Box<int>) {}", "fn f(x: Box<int>) {}\n");
+        assert_fmt(
+            "fn f() { Box<int> { value: 1 }; }",
+            "fn f() {\n    Box<int> { value: 1 };\n}\n",
+        );
+    }
+
+    #[test]
+    fn exact_frontend_extern_members() {
+        assert_fmt(
+            "extern type T { init; let ro: int; var rw: int; computed cached: int; computed var live: int; fn a(self); fn b(shared self); fn c(var self); }",
+            "extern type T {\n    init;\n    let ro: int;\n    var rw: int;\n    computed cached: int;\n    computed var live: int;\n    fn a(self);\n    fn b(shared self);\n    fn c(var self);\n}\n",
+        );
+    }
+
+    #[test]
+    fn exact_frontend_methods_and_ternary() {
+        assert_fmt(
+            "struct S { fn make() -> S { S {} } fn get(self) -> int { 0 } }",
+            "struct S {\n    fn make() -> S { S {} }\n    fn get(self) -> int { 0 }\n}\n",
+        );
+        assert_fmt(
+            "extend int { fn abs(self) -> int { self } }",
+            "extend int {\n    fn abs(self) -> int { self }\n}\n",
+        );
+        assert_fmt(
+            "fn f(cond: bool) -> int { cond ? 1 + 2 : 3 * 4 }",
+            "fn f(cond: bool) -> int { cond ? 1 + 2 : 3 * 4 }\n",
+        );
+        assert_fmt(
+            "fn f(a: bool, b: bool) -> int { (a ? 1 : 2) + (b ? 3 : 4) }",
+            "fn f(a: bool, b: bool) -> int { (a ? 1 : 2) + (b ? 3 : 4) }\n",
+        );
+        assert_fmt(
+            "fn f(cond: bool) -> int { (cond ? a : b)() }",
+            "fn f(cond: bool) -> int { (cond ? a : b)() }\n",
+        );
+        assert_fmt(
+            "fn f(cond: bool) -> int { (cond ? a : b).x }",
+            "fn f(cond: bool) -> int { (cond ? a : b).x }\n",
+        );
+        assert_fmt(
+            "fn f(a: bool, b: bool) -> int { a ? b ? 1 : 2 : 3 }",
+            "fn f(a: bool, b: bool) -> int { a ? (b ? 1 : 2) : 3 }\n",
+        );
+        assert_fmt(
+            "fn f(a: bool, b: bool) -> int { (a ? 1 : 2) ? 3 : 4 }",
+            "fn f(a: bool, b: bool) -> int { (a ? 1 : 2) ? 3 : 4 }\n",
+        );
+        assert_fmt(
+            "fn f(a: bool, b: bool) -> int { a ? 1 : b ? 2 : 3 }",
+            "fn f(a: bool, b: bool) -> int { a ? 1 : b ? 2 : 3 }\n",
+        );
+        assert_fmt(
+            "fn f(cond: bool) -> string { f\"{(cond ? 1 : 2)}\" }",
+            "fn f(cond: bool) -> string { f\"{(cond ? 1 : 2)}\" }\n",
+        );
+        assert_fmt(
+            "fn f(cond: bool) -> string { f\"{(cond ? 1 : 2):04}\" }",
+            "fn f(cond: bool) -> string { f\"{(cond ? 1 : 2):04}\" }\n",
+        );
+    }
+
+    #[test]
+    fn formatted_ternary_reparses_as_ternary() {
+        let program = formatted_program("fn f(cond: bool) -> int { cond ? 1 : 2 }");
+        let anvyx_frontend::ast::Stmt::Func(func) = &program.stmts[0].node else {
+            panic!("expected function");
+        };
+        let Some(tail) = &func.node.body.node.tail else {
+            panic!("expected tail");
+        };
+        assert!(matches!(
+            tail.node.kind,
+            anvyx_frontend::ast::ExprKind::Ternary(_)
+        ));
+    }
+
+    #[test]
+    fn formatted_if_reparses_as_if() {
+        let program = formatted_program("fn f(cond: bool) -> int { if cond { 1 } else { 2 } }");
+        let anvyx_frontend::ast::Stmt::Func(func) = &program.stmts[0].node else {
+            panic!("expected function");
+        };
+        let Some(tail) = &func.node.body.node.tail else {
+            panic!("expected tail");
+        };
+        assert!(matches!(
+            tail.node.kind,
+            anvyx_frontend::ast::ExprKind::If(_)
+        ));
     }
 
     #[test]
@@ -219,8 +358,8 @@ mod tests {
         let source = "extern type Point {\n    x: float;\n    y: float;\n    fn distance(self, other: Point) -> float;\n}";
         let formatted = format_source(source).expect("format failed");
         assert!(formatted.contains("extern type Point {"));
-        assert!(formatted.contains("    x: float;"));
-        assert!(formatted.contains("    y: float;"));
+        assert!(formatted.contains("    var x: float;"));
+        assert!(formatted.contains("    var y: float;"));
         assert!(formatted.contains("    fn distance(self, other: Point) -> float;"));
         assert!(formatted.contains('}'));
     }
@@ -230,7 +369,7 @@ mod tests {
         let source = "extern type Vec2 {\n    init;\n    x: float;\n    y: float;\n}";
         let formatted = format_source(source).expect("format failed");
         assert!(formatted.contains("    init;"));
-        assert!(formatted.contains("    x: float;"));
+        assert!(formatted.contains("    var x: float;"));
     }
 
     // --- import formatting ---
@@ -941,13 +1080,6 @@ mod tests {
         let source = "fn f() -> float { 3.14 }";
         let formatted = format_source(source).expect("format failed");
         assert!(formatted.contains("3.14"));
-    }
-
-    #[test]
-    fn float_literal_suffix() {
-        let source = "fn f() -> float { 4.0f }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("4.0f"));
     }
 
     // -------------------------------------------------------------------------

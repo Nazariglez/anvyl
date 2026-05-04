@@ -1,33 +1,39 @@
-use anvyx_lang::ast;
+use anvyx_frontend::ast;
 
 use super::{Printer, escape_string};
 
+const ASSIGN_PREC: u8 = 1;
+const TERNARY_PREC: u8 = 2;
+const LOGICAL_OR_PREC: u8 = 3;
+const POSTFIX_PREC: u8 = 17;
+
 fn binary_op_precedence(op: ast::BinaryOp) -> u8 {
     match op {
-        ast::BinaryOp::Mul | ast::BinaryOp::Div | ast::BinaryOp::Rem => 13,
-        ast::BinaryOp::Add | ast::BinaryOp::Sub => 12,
-        ast::BinaryOp::Shl | ast::BinaryOp::Shr => 10,
+        ast::BinaryOp::Mul | ast::BinaryOp::Div | ast::BinaryOp::Rem => 14,
+        ast::BinaryOp::Add | ast::BinaryOp::Sub => 13,
+        ast::BinaryOp::Shl | ast::BinaryOp::Shr => 11,
         ast::BinaryOp::LessThan
         | ast::BinaryOp::GreaterThan
         | ast::BinaryOp::LessThanEq
-        | ast::BinaryOp::GreaterThanEq => 9,
-        ast::BinaryOp::Eq | ast::BinaryOp::NotEq => 8,
-        ast::BinaryOp::BitAnd => 7,
-        ast::BinaryOp::Xor => 6,
-        ast::BinaryOp::BitOr => 5,
-        ast::BinaryOp::And => 4,
-        ast::BinaryOp::Coalesce => 3,
-        ast::BinaryOp::Or => 2,
+        | ast::BinaryOp::GreaterThanEq => 10,
+        ast::BinaryOp::Eq | ast::BinaryOp::NotEq => 9,
+        ast::BinaryOp::BitAnd => 8,
+        ast::BinaryOp::Xor => 7,
+        ast::BinaryOp::BitOr => 6,
+        ast::BinaryOp::And => 5,
+        ast::BinaryOp::Coalesce => 4,
+        ast::BinaryOp::Or => LOGICAL_OR_PREC,
     }
 }
 
 fn expr_precedence(expr: &ast::Expr) -> Option<u8> {
     match &expr.kind {
         ast::ExprKind::Binary(node) => Some(binary_op_precedence(node.node.op)),
-        ast::ExprKind::Range(_) => Some(11),
-        ast::ExprKind::Cast(_) => Some(14),
-        ast::ExprKind::Unary(_) => Some(15),
-        ast::ExprKind::Assign(_) => Some(1),
+        ast::ExprKind::Range(_) => Some(12),
+        ast::ExprKind::Cast(_) => Some(15),
+        ast::ExprKind::Unary(_) => Some(16),
+        ast::ExprKind::Ternary(_) => Some(TERNARY_PREC),
+        ast::ExprKind::Assign(_) => Some(ASSIGN_PREC),
         _ => None,
     }
 }
@@ -87,7 +93,7 @@ impl Printer<'_> {
 
             ast::ExprKind::Unary(node) => {
                 self.write_fmt(node.node.op);
-                self.format_expr_prec(&node.node.expr.node, 15, false);
+                self.format_expr_prec(&node.node.expr.node, 16, false);
             }
 
             ast::ExprKind::Assign(node) => {
@@ -101,25 +107,26 @@ impl Printer<'_> {
             ast::ExprKind::Call(node) => self.format_call(&node.node),
 
             ast::ExprKind::Field(node) => {
-                self.format_expr(&node.node.target.node);
+                self.format_expr_prec(&node.node.target.node, POSTFIX_PREC, false);
                 self.write(if node.node.safe { "?." } else { "." });
                 self.write_fmt(node.node.field);
             }
 
             ast::ExprKind::TupleIndex(node) => {
-                self.format_expr(&node.node.target.node);
+                self.format_expr_prec(&node.node.target.node, POSTFIX_PREC, false);
                 self.write(".");
                 self.write_fmt(node.node.index);
             }
 
             ast::ExprKind::Index(node) => {
-                self.format_expr(&node.node.target.node);
+                self.format_expr_prec(&node.node.target.node, POSTFIX_PREC, false);
                 self.write(if node.node.safe { "?[" } else { "[" });
                 self.format_expr(&node.node.index.node);
                 self.write("]");
             }
 
             ast::ExprKind::If(node) => self.format_if(&node.node),
+            ast::ExprKind::Ternary(node) => self.format_ternary(&node.node),
             ast::ExprKind::IfLet(node) => self.format_if_let(&node.node),
             ast::ExprKind::Match(node) => self.format_match(&node.node),
 
@@ -173,24 +180,24 @@ impl Printer<'_> {
                     end,
                     inclusive,
                 } => {
-                    self.format_expr_prec(&start.node, 11, false);
+                    self.format_expr_prec(&start.node, 12, false);
                     self.write(if *inclusive { "..=" } else { ".." });
-                    self.format_expr_prec(&end.node, 11, true);
+                    self.format_expr_prec(&end.node, 12, true);
                 }
                 ast::Range::From { start } => {
-                    self.format_expr_prec(&start.node, 11, false);
+                    self.format_expr_prec(&start.node, 12, false);
                     self.write("..");
                 }
                 ast::Range::To { end, inclusive } => {
                     self.write(if *inclusive { "..=" } else { ".." });
-                    self.format_expr_prec(&end.node, 11, true);
+                    self.format_expr_prec(&end.node, 12, true);
                 }
             },
 
             ast::ExprKind::StringInterp(parts) => self.format_string_interp(parts),
 
             ast::ExprKind::Cast(node) => {
-                self.format_expr_prec(&node.node.expr.node, 14, false);
+                self.format_expr_prec(&node.node.expr.node, 15, false);
                 self.write(" as ");
                 self.format_type(&node.node.target);
             }
@@ -208,12 +215,12 @@ impl Printer<'_> {
     }
 
     fn format_call(&mut self, call: &ast::Call) {
-        self.format_expr(&call.func.node);
+        self.format_expr_prec(&call.func.node, POSTFIX_PREC, false);
         if call.safe {
             self.write("?");
         }
-        if !call.type_args.is_empty() {
-            self.format_type_args(&call.type_args);
+        if !call.generic_args.is_empty() {
+            self.format_generic_args(&call.generic_args);
         }
         if call.args.is_empty() {
             self.write("()");
@@ -229,6 +236,34 @@ impl Printer<'_> {
         self.format_block_expanded(&if_node.then_block);
         if let Some(else_block) = &if_node.else_block {
             self.format_else_branch(else_block);
+        }
+    }
+
+    fn format_ternary_part(&mut self, expr: &ast::Expr, force_parens: bool) {
+        if force_parens {
+            self.write("(");
+            self.format_expr(expr);
+            self.write(")");
+        } else {
+            self.format_expr_prec(expr, TERNARY_PREC, false);
+        }
+    }
+
+    fn format_ternary(&mut self, ternary: &ast::Ternary) {
+        self.format_ternary_part(
+            &ternary.cond.node,
+            matches!(ternary.cond.node.kind, ast::ExprKind::Ternary(_)),
+        );
+        self.write(" ? ");
+        self.format_ternary_part(
+            &ternary.then_expr.node,
+            matches!(ternary.then_expr.node.kind, ast::ExprKind::Ternary(_)),
+        );
+        self.write(" : ");
+        if matches!(ternary.else_expr.node.kind, ast::ExprKind::Ternary(_)) {
+            self.format_expr(&ternary.else_expr.node);
+        } else {
+            self.format_expr_prec(&ternary.else_expr.node, TERNARY_PREC, true);
         }
     }
 
@@ -367,7 +402,14 @@ impl Printer<'_> {
                 ast::StringPart::Text(s) => self.write(&escape_string(s)),
                 ast::StringPart::Expr(expr, spec) => {
                     self.write("{");
+                    let parens = matches!(expr.node.kind, ast::ExprKind::Ternary(_));
+                    if parens {
+                        self.write("(");
+                    }
                     self.format_expr(&expr.node);
+                    if parens {
+                        self.write(")");
+                    }
                     if let Some(spec) = spec {
                         self.write(":");
                         self.format_format_spec(&spec.node);
@@ -439,6 +481,9 @@ impl Printer<'_> {
             self.write(".");
         }
         self.write_fmt(sl.name);
+        if !sl.generic_args.is_empty() {
+            self.format_generic_args(&sl.generic_args);
+        }
         if sl.fields.is_empty() {
             self.write(" {}");
             return;

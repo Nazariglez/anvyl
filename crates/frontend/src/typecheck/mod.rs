@@ -124,10 +124,17 @@ pub(crate) enum TypeError {
         expected: Type,
         span: Span,
     },
+    IfWithoutElseValue {
+        span: Span,
+    },
     UnusedValue {
         span: Span,
     },
     IfConditionNotBool {
+        found: Type,
+        span: Span,
+    },
+    TernaryConditionNotBool {
         found: Type,
         span: Span,
     },
@@ -1359,7 +1366,7 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                     !agg.type_params.is_empty() || !agg.const_params.is_empty();
                 for method in &agg.methods {
                     let method_is_generic =
-                        !method.type_params.is_empty() || !method.const_params.is_empty();
+                        !method.sig.type_params.is_empty() || !method.sig.const_params.is_empty();
                     if !aggregate_is_generic && !method_is_generic {
                         continue;
                     }
@@ -1367,21 +1374,21 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                         tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
                     let generics = tc.extended_generic_context(
                         &owner_generics,
-                        &method.type_params,
-                        &method.const_params,
+                        &method.sig.type_params,
+                        &method.sig.const_params,
                         agg_node.span,
                     );
                     tc.store_callable_template(
                         CallableId::aggregate_method(
                             owner.clone(),
-                            method.name,
-                            method.receiver.is_some(),
+                            method.sig.name,
+                            method.sig.receiver.is_some(),
                         ),
                         CallableTemplate {
                             span: agg_node.span,
-                            receiver: method.receiver,
+                            receiver: method.sig.receiver,
                             generics,
-                            params: method.params.clone(),
+                            params: method.sig.params.clone(),
                             body: method.body.clone(),
                         },
                     );
@@ -1399,12 +1406,9 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                 }
                 for method_node in &extend.methods {
                     let method = &method_node.node;
-                    let Some((self_param, params)) = method.params.split_first() else {
+                    let Some(receiver) = method.sig.receiver else {
+                        debug_assert!(false, "extend method parser requires a receiver");
                         continue;
-                    };
-                    let receiver = match self_param.mutability {
-                        Mutability::Mutable => MethodReceiver::Var,
-                        Mutability::Immutable => MethodReceiver::Value,
                     };
                     let generics = tc.generic_context(
                         &extend.type_params,
@@ -1412,12 +1416,12 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                         extend_node.span,
                     );
                     tc.store_callable_template(
-                        CallableId::extend_method(extend_id.clone(), method.name),
+                        CallableId::extend_method(extend_id.clone(), method.sig.name),
                         CallableTemplate {
                             span: extend_node.span,
                             receiver: Some(receiver),
                             generics,
-                            params: params.to_vec(),
+                            params: method.sig.params.clone(),
                             body: method.body.clone(),
                         },
                     );
@@ -1581,13 +1585,11 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
     let self_ty = tc.resolve_type_for_tc_at(&extend.ty, extend_node.span);
     for method_node in &extend.methods {
         let method = &method_node.node;
-        let Some((self_param, params)) = method.params.split_first() else {
+        let Some(receiver) = method.sig.receiver else {
+            debug_assert!(false, "extend method parser requires a receiver");
             continue;
         };
-        let receiver = match self_param.mutability {
-            Mutability::Mutable => MethodReceiver::Var,
-            Mutability::Immutable => MethodReceiver::Value,
-        };
+        let params = &method.sig.params;
         let param_types: Vec<_> = params
             .iter()
             .map(|param| {
@@ -1597,7 +1599,7 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
                 )
             })
             .collect();
-        let ret_ty = tc.resolve_type_for_tc_at(&method.ret, method_node.span);
+        let ret_ty = tc.resolve_type_for_tc_at(&method.sig.ret, method_node.span);
         check_func_body(
             Some((receiver, self_ty.clone())),
             params,
@@ -1856,9 +1858,25 @@ fn join_checked(
     right_span: Span,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let either_void = left.ty.is_void() || right.ty.is_void();
-    if either_void {
-        return checked_void(tc);
+    match (left.ty.is_void(), right.ty.is_void()) {
+        (true, true) => return checked_void(tc),
+        (true, false) => {
+            tc.push_error(TypeError::TypeMismatch {
+                expected: right.ty,
+                found: Type::Void,
+                span: left_span,
+            });
+            return checked_void(tc);
+        }
+        (false, true) => {
+            tc.push_error(TypeError::TypeMismatch {
+                expected: left.ty,
+                found: Type::Void,
+                span: right_span,
+            });
+            return checked_void(tc);
+        }
+        (false, false) => {}
     }
     let result = tc.fresh_temp_handle(right_span);
     let contains_extern_any = left.contains_extern_any || right.contains_extern_any;
@@ -1901,14 +1919,14 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
             let value =
-                check_expr_checked_with_hint(&binding.value, Some(annot_handle.clone()), tc);
+                check_value_expr_checked_with_hint(&binding.value, Some(annot_handle.clone()), tc);
             tc.reject_extern_any_escape(&value, binding.value.span);
             tc.expect_assignable(binding_node.span, value.handle, annot_handle);
             record_extern_pattern_reads(&binding.pattern, &annot_ty, binding.value.node.id, tc);
             check_pattern(&binding.pattern, &annot_ty, mutable, tc);
         }
         None => {
-            let value = check_expr_checked(&binding.value, tc);
+            let value = check_value_expr_checked_with_hint(&binding.value, None, tc);
             tc.reject_extern_any_escape(&value, binding.value.span);
             tc.reject_user_any_type(&value.ty, binding_node.span);
             record_extern_pattern_reads(&binding.pattern, &value.ty, binding.value.node.id, tc);
@@ -1951,11 +1969,11 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
     if let Some(expr) = &ret.value {
         if let Some(expected_ty) = tc.return_type().cloned() {
             let expected = tc.type_handle(&expected_ty);
-            let actual = check_expr_checked_with_hint(expr, Some(expected.clone()), tc);
+            let actual = check_value_expr_checked_with_hint(expr, Some(expected.clone()), tc);
             tc.reject_extern_any_escape(&actual, expr.span);
             tc.expect_assignable(ret_node.span, actual.handle, expected);
         } else {
-            let actual = check_expr_checked(expr, tc);
+            let actual = check_value_expr_checked_with_hint(expr, None, tc);
             tc.reject_extern_any_escape(&actual, expr.span);
         }
     } else if let Some(expected_ty) = tc.return_type().cloned()
@@ -1970,6 +1988,24 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
 
 fn check_expr_checked(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
     check_expr_checked_with_hint(expr, None, tc)
+}
+
+fn reject_if_without_else_value(expr: &ExprNode, tc: &mut TypeChecker) {
+    if let ExprKind::If(node) = &expr.node.kind
+        && node.node.else_block.is_none()
+    {
+        tc.push_error(TypeError::IfWithoutElseValue { span: expr.span });
+    }
+}
+
+pub(in crate::typecheck) fn check_value_expr_checked_with_hint(
+    expr: &ExprNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let checked = check_expr_checked_with_hint(expr, expected, tc);
+    reject_if_without_else_value(expr, tc);
+    checked
 }
 
 fn checked_from_type(expr: &ExprNode, ty: Type, tc: &mut TypeChecker) -> CheckedType {
@@ -2015,9 +2051,28 @@ fn solve_and_checked_from_handle(
 }
 
 fn check_expected(expr: &ExprNode, expected: TypeHandle, tc: &mut TypeChecker) -> CheckedType {
-    let checked = check_expr_checked_with_hint(expr, Some(expected.clone()), tc);
+    let checked = check_value_expr_checked_with_hint(expr, Some(expected.clone()), tc);
     tc.expect_assignable(expr.span, checked.handle.clone(), expected);
     checked
+}
+
+pub(in crate::typecheck) fn validate_const_expr_type(
+    expr: &ExprNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> Result<Type, TypeError> {
+    let error_count = tc.errors.len();
+    let checked = check_value_expr_checked_with_hint(expr, expected.clone(), tc);
+    if let Some(expected) = expected {
+        tc.expect_assignable(expr.span, checked.handle, expected);
+        tc.solve_constraints();
+    }
+    if tc.errors.len() == error_count {
+        return Ok(checked.ty);
+    }
+    let error = tc.errors[error_count].clone();
+    tc.errors.truncate(error_count);
+    Err(error)
 }
 
 fn check_arg_count(
@@ -2113,6 +2168,11 @@ fn check_expr_checked_with_hint(
         ExprKind::If(if_node) => {
             checked_from_checked(expr, check_if_checked_with_hint(if_node, expected, tc), tc)
         }
+        ExprKind::Ternary(ternary_node) => checked_from_checked(
+            expr,
+            check_ternary_checked_with_hint(ternary_node, expected, tc),
+            tc,
+        ),
         ExprKind::Assign(assign_node) => {
             check_assign(expr.node.id, assign_node, tc);
             checked_from_type(expr, Type::Void, tc)
@@ -2139,7 +2199,14 @@ fn check_expr_checked_with_hint(
             check_match_checked_with_hint(match_node, expected, tc),
             tc,
         ),
-        _ => checked_from_type(expr, Type::Void, tc),
+        ExprKind::Range(_)
+        | ExprKind::MapLiteral(_)
+        | ExprKind::Index(_)
+        | ExprKind::TupleIndex(_)
+        | ExprKind::StringInterp(_)
+        | ExprKind::Cast(_)
+        | ExprKind::Lambda(_)
+        | ExprKind::IntrinsicCall(_) => checked_from_type(expr, Type::Void, tc),
     }
 }
 
@@ -2376,12 +2443,22 @@ fn emit_unary_failure(failure: UnaryTypeFailure, span: Span, tc: &mut TypeChecke
     Type::Infer
 }
 
-fn check_bool_condition(
-    cond: CheckedType,
-    span: Span,
-    error: impl FnOnce(Type, Span) -> TypeError,
-    tc: &mut TypeChecker,
-) {
+#[derive(Clone, Copy)]
+enum ConditionKind {
+    If,
+    Ternary,
+    While,
+}
+
+fn condition_not_bool(kind: ConditionKind, found: Type, span: Span) -> TypeError {
+    match kind {
+        ConditionKind::If => TypeError::IfConditionNotBool { found, span },
+        ConditionKind::Ternary => TypeError::TernaryConditionNotBool { found, span },
+        ConditionKind::While => TypeError::WhileConditionNotBool { found, span },
+    }
+}
+
+fn check_bool_condition(kind: ConditionKind, cond: CheckedType, span: Span, tc: &mut TypeChecker) {
     if cond.ty.is_bool() {
         return;
     }
@@ -2389,8 +2466,31 @@ fn check_bool_condition(
         let bool_handle = tc.type_handle(&Type::Bool);
         tc.expect_assignable(span, cond.handle, bool_handle);
     } else {
-        tc.push_error(error(cond.ty, span));
+        tc.push_error(condition_not_bool(kind, cond.ty, span));
     }
+}
+
+fn join_branches_with_hint(
+    expected: Option<TypeHandle>,
+    left: CheckedType,
+    left_span: Span,
+    right: CheckedType,
+    right_span: Span,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if let Some(expected) = expected {
+        let contains_extern_any = left.contains_extern_any || right.contains_extern_any;
+        tc.expect_assignable(left_span, left.handle, expected.clone());
+        tc.expect_assignable(right_span, right.handle, expected.clone());
+        tc.solve_constraints();
+        return CheckedType {
+            ty: tc.handle_type(&expected),
+            handle: expected,
+            contains_extern_any,
+        };
+    }
+
+    join_checked(left, left_span, right, right_span, tc)
 }
 
 fn check_if_checked_with_hint(
@@ -2399,34 +2499,39 @@ fn check_if_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let cond = check_expr_checked(&if_node.node.cond, tc);
-    check_bool_condition(
-        cond,
-        if_node.node.cond.span,
-        |found, span| TypeError::IfConditionNotBool { found, span },
-        tc,
-    );
+    check_bool_condition(ConditionKind::If, cond, if_node.node.cond.span, tc);
     let Some(else_block) = &if_node.node.else_block else {
         check_block_checked(&if_node.node.then_block, tc);
         return checked_void(tc);
     };
     let then = check_block_checked_with_hint(&if_node.node.then_block, expected.clone(), tc);
     let else_checked = check_block_checked_with_hint(else_block, expected.clone(), tc);
-    if let Some(expected) = expected {
-        let contains_extern_any = then.contains_extern_any || else_checked.contains_extern_any;
-        tc.expect_assignable(if_node.node.then_block.span, then.handle, expected.clone());
-        tc.expect_assignable(else_block.span, else_checked.handle, expected.clone());
-        tc.solve_constraints();
-        return CheckedType {
-            ty: tc.handle_type(&expected),
-            handle: expected,
-            contains_extern_any,
-        };
-    }
-    join_checked(
+    join_branches_with_hint(
+        expected,
         then,
         if_node.node.then_block.span,
         else_checked,
         else_block.span,
+        tc,
+    )
+}
+
+fn check_ternary_checked_with_hint(
+    ternary_node: &TernaryNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let node = &ternary_node.node;
+    let cond = check_expr_checked(&node.cond, tc);
+    check_bool_condition(ConditionKind::Ternary, cond, node.cond.span, tc);
+    let then = check_value_expr_checked_with_hint(&node.then_expr, expected.clone(), tc);
+    let else_checked = check_value_expr_checked_with_hint(&node.else_expr, expected.clone(), tc);
+    join_branches_with_hint(
+        expected,
+        then,
+        node.then_expr.span,
+        else_checked,
+        node.else_expr.span,
         tc,
     )
 }
@@ -3194,12 +3299,7 @@ fn assign_op_to_binary_op(op: AssignOp) -> Option<BinaryOp> {
 
 fn check_while(while_node: &WhileNode, tc: &mut TypeChecker) {
     let cond = check_expr_checked(&while_node.node.cond, tc);
-    check_bool_condition(
-        cond,
-        while_node.node.cond.span,
-        |found, span| TypeError::WhileConditionNotBool { found, span },
-        tc,
-    );
+    check_bool_condition(ConditionKind::While, cond, while_node.node.cond.span, tc);
     tc.enter_loop();
     check_block_checked(&while_node.node.body, tc);
     tc.exit_loop();

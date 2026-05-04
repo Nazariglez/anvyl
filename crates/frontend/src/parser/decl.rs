@@ -718,27 +718,15 @@ fn extern_method_params<'src>(
 }
 
 fn extern_self_param<'src>() -> BoxedParser<'src, ast::ExternReceiverMode> {
-    let value_self = extern_self_ident().to(ast::ExternReceiverMode::Value);
+    let value_self = self_ident().to(ast::ExternReceiverMode::Value);
     let shared_self = contextual_ident("shared")
-        .ignore_then(extern_self_ident())
+        .ignore_then(self_ident())
         .to(ast::ExternReceiverMode::Shared);
     let mutable_self = select! { (Token::Keyword(Keyword::Var), _) => () }
-        .ignore_then(extern_self_ident())
+        .ignore_then(self_ident())
         .to(ast::ExternReceiverMode::Mutable);
 
     choice((shared_self, mutable_self, value_self)).boxed()
-}
-
-fn extern_self_ident<'src>() -> BoxedParser<'src, ()> {
-    identifier()
-        .try_map(|ident, span| {
-            if ident.0.as_ref() == SELF_ITEM {
-                Ok(())
-            } else {
-                Err(Rich::custom(span, "expected 'self'"))
-            }
-        })
-        .boxed()
 }
 
 fn extern_method_param_list<'src>(
@@ -878,85 +866,85 @@ fn struct_field<'src>(
         .boxed()
 }
 
+#[derive(Clone, Copy)]
+enum MethodSigPolicy {
+    Aggregate,
+    Extend,
+}
+
 fn struct_method<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::Method> {
     let tail_expr = expression(stmt.clone());
     annotations()
         .then(doc_comment_block())
-        .then_ignore(select! {
-            (Token::Keyword(Keyword::Fn), _) => (),
-        })
-        .then(identifier())
-        .then(generic_params())
-        .then(method_params(stmt.clone()))
-        .then(return_type())
+        .then(method_sig(stmt.clone(), MethodSigPolicy::Aggregate))
         .then(block_stmt(stmt, tail_expr))
-        .map_with(
-            |((((((annots, doc), name), gp), (receiver, _, params)), ret), body), e| {
-                let s = e.span();
-                let GenericParams {
-                    type_params: method_type_params,
-                    const_params: method_const_params,
-                } = gp;
-
-                let type_param_map: HashMap<ast::Ident, ast::TypeVarId> = method_type_params
-                    .iter()
-                    .map(|tp| (tp.name, tp.id))
-                    .collect();
-                let const_param_map: HashMap<ast::Ident, ast::ConstParamId> = method_const_params
-                    .iter()
-                    .map(|cp| (cp.name, cp.id))
-                    .collect();
-
-                let resolved_params = params
-                    .into_iter()
-                    .map(|p| {
-                        let ty = resolve_type_params(&p.ty, &type_param_map, &const_param_map);
-                        ast::Param {
-                            mutability: p.mutability,
-                            name: p.name,
-                            ty,
-                            default: p.default,
-                            cast_accept: p.cast_accept,
-                        }
-                    })
-                    .collect();
-
-                let resolved_ret = match ret {
-                    Some(ty) => resolve_type_params(&ty, &type_param_map, &const_param_map),
-                    None => ast::Type::Void,
-                };
-
-                ast::Method {
-                    annotations: annots,
-                    doc,
-                    name,
-                    visibility: ast::Visibility::Private,
-                    type_params: method_type_params,
-                    const_params: method_const_params,
-                    receiver,
-                    params: resolved_params,
-                    ret: resolved_ret,
-                    body: Spanned::new(body.node, Span::new(s.start, s.end)),
-                }
-            },
-        )
+        .map_with(|(((annots, doc), sig), body), e| {
+            let s = e.span();
+            ast::Method {
+                annotations: annots,
+                doc,
+                visibility: ast::Visibility::Private,
+                sig,
+                body: Spanned::new(body.node, Span::new(s.start, s.end)),
+            }
+        })
         .labelled("method")
         .as_context()
         .boxed()
 }
 
+fn method_sig<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+    policy: MethodSigPolicy,
+) -> BoxedParser<'src, ast::MethodSig> {
+    let name = match policy {
+        MethodSigPolicy::Aggregate => identifier().boxed(),
+        MethodSigPolicy::Extend => field_name_ident().boxed(),
+    };
+
+    select! { (Token::Keyword(Keyword::Fn), _) => () }
+        .ignore_then(name)
+        .then(generic_params())
+        .then(method_params(stmt))
+        .then(return_type())
+        .validate(
+            move |(((name, gp), (receiver, params)), ret), extra, emitter| {
+                let GenericParams {
+                    type_params,
+                    const_params,
+                } = gp;
+                if matches!(policy, MethodSigPolicy::Extend) {
+                    if receiver.is_none() {
+                        emitter.emit(Rich::custom(
+                            extra.span(),
+                            "extend methods must have 'self' or 'var self' receiver",
+                        ));
+                    }
+                    if !type_params.is_empty() || !const_params.is_empty() {
+                        emitter.emit(Rich::custom(
+                            extra.span(),
+                            "extend methods cannot declare method-level generics yet",
+                        ));
+                    }
+                }
+                ast::MethodSig {
+                    name,
+                    type_params,
+                    const_params,
+                    receiver,
+                    params,
+                    ret: ret.unwrap_or(ast::Type::Void),
+                }
+            },
+        )
+        .boxed()
+}
+
 fn method_params<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
-) -> BoxedParser<
-    'src,
-    (
-        Option<ast::MethodReceiver>,
-        Option<ast::Type>,
-        Vec<ast::Param>,
-    ),
-> {
+) -> BoxedParser<'src, (Option<ast::MethodReceiver>, Vec<ast::Param>)> {
     select! {
         (Token::Open(Delimiter::Parent), _) => (),
     }
@@ -971,52 +959,61 @@ fn method_params<'src>(
     .boxed()
 }
 
-fn self_param<'src>() -> BoxedParser<'src, (ast::MethodReceiver, Option<ast::Type>)> {
-    let var_kw = select! {
-        (Token::Keyword(Keyword::Var), _) => (),
-    }
-    .or_not();
+fn method_self_param<'src>() -> BoxedParser<'src, ast::MethodReceiver> {
+    let value_self = self_ident().to(ast::MethodReceiver::Value);
+    let mutable_self = select! { (Token::Keyword(Keyword::Var), _) => () }
+        .ignore_then(self_ident())
+        .to(ast::MethodReceiver::Var);
 
-    var_kw
-        .then(identifier().try_map(|ident, span| {
-            if ident.0.as_ref() == SELF_ITEM {
-                Ok(())
-            } else {
-                Err(Rich::custom(span, "expected 'self'"))
-            }
-        }))
+    choice((mutable_self, value_self))
         .then(
             select! { (Token::Colon, _) => () }
                 .ignore_then(type_ident())
                 .or_not(),
         )
-        .map(|((var_opt, ()), annotation)| {
-            let receiver = match var_opt {
-                Some(()) => ast::MethodReceiver::Var,
-                None => ast::MethodReceiver::Value,
-            };
-            (receiver, annotation)
+        .validate(|(receiver, annotation), extra, emitter| {
+            if annotation.is_some() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "method receiver must not have a type annotation",
+                ));
+            }
+            receiver
+        })
+        .boxed()
+}
+
+fn self_ident<'src>() -> BoxedParser<'src, ()> {
+    identifier()
+        .try_map(|ident, span| {
+            if ident.0.as_ref() == SELF_ITEM {
+                Ok(())
+            } else {
+                Err(Rich::custom(span, "expected 'self'"))
+            }
         })
         .boxed()
 }
 
 fn method_param_list<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
-) -> BoxedParser<
-    'src,
-    (
-        Option<ast::MethodReceiver>,
-        Option<ast::Type>,
-        Vec<ast::Param>,
-    ),
-> {
+) -> BoxedParser<'src, (Option<ast::MethodReceiver>, Vec<ast::Param>)> {
     let regular_params = param(stmt)
         .separated_by(select! { (Token::Comma, _) => () })
         .allow_trailing()
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+        .validate(|params, extra, emitter| {
+            if params.iter().any(|param| param.name.0.as_ref() == SELF_ITEM) {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "method receiver must be first and must be 'self' or 'var self' without a type annotation",
+                ));
+            }
+            params
+        });
 
     choice((
-        self_param()
+        method_self_param()
             .then(
                 select! { (Token::Comma, _) => () }
                     .ignore_then(
@@ -1028,8 +1025,8 @@ fn method_param_list<'src>(
                     .or_not()
                     .map(Option::unwrap_or_default),
             )
-            .map(|((receiver, annotation), params)| (Some(receiver), annotation, params)),
-        regular_params.map(|params| (None, None, params)),
+            .map(|(receiver, params)| (Some(receiver), params)),
+        regular_params.map(|params| (None, params)),
     ))
     .boxed()
 }
@@ -1106,14 +1103,15 @@ fn aggregate_declaration<'src>(
                 .map(|m| {
                     let mut combined_type_param_map = struct_type_param_map.clone();
                     let mut combined_const_param_map = struct_const_param_map.clone();
-                    for tp in &m.type_params {
+                    for tp in &m.sig.type_params {
                         combined_type_param_map.insert(tp.name, tp.id);
                     }
-                    for cp in &m.const_params {
+                    for cp in &m.sig.const_params {
                         combined_const_param_map.insert(cp.name, cp.id);
                     }
 
                     let resolved_params = m
+                        .sig
                         .params
                         .iter()
                         .map(|p| ast::Param {
@@ -1131,7 +1129,7 @@ fn aggregate_declaration<'src>(
                         .collect();
 
                     let resolved_ret = resolve_type_params_with_self(
-                        &m.ret,
+                        &m.sig.ret,
                         &combined_type_param_map,
                         &combined_const_param_map,
                         Some(&self_type),
@@ -1140,13 +1138,15 @@ fn aggregate_declaration<'src>(
                     ast::Method {
                         annotations: m.annotations,
                         doc: m.doc,
-                        name: m.name,
                         visibility: m.visibility,
-                        type_params: m.type_params,
-                        const_params: m.const_params,
-                        receiver: m.receiver,
-                        params: resolved_params,
-                        ret: resolved_ret,
+                        sig: ast::MethodSig {
+                            name: m.sig.name,
+                            type_params: m.sig.type_params,
+                            const_params: m.sig.const_params,
+                            receiver: m.sig.receiver,
+                            params: resolved_params,
+                            ret: resolved_ret,
+                        },
                         body: m.body,
                     }
                 })
@@ -1331,51 +1331,20 @@ fn extend_method<'src>(
     let tail_expr = expression(stmt.clone());
     annotations()
         .then(doc_comment_block())
-        .then(
-            select! {
-                (Token::Keyword(Keyword::Fn), _) => (),
-            }
-            .ignore_then(field_name_ident())
-            .then(method_params(stmt.clone()))
-            .then(return_type())
-            .then(block_stmt(stmt, tail_expr)),
-        )
-        .validate(
-            |((annots, doc), (((name, (receiver, self_annotation, params)), ret), body)),
-             extra,
-             emitter| {
-                let s = extra.span();
-                if self_annotation.is_some() {
-                    emitter.emit(Rich::custom(
-                        s,
-                        "'self' must not have a type annotation in extend methods — the type is determined by the extend block",
-                    ));
-                }
-                let self_param = receiver.map(|r| ast::Param {
-                    mutability: match r {
-                        ast::MethodReceiver::Var => ast::Mutability::Mutable,
-                        ast::MethodReceiver::Value => ast::Mutability::Immutable,
-                    },
-                    name: ast::Ident(internment::Intern::new(SELF_ITEM.to_string())),
-                    ty: ast::Type::Infer,
-                    default: None,
-                    cast_accept: false,
-                });
-                let all_params: Vec<ast::Param> = self_param.into_iter().chain(params).collect();
-                let ret_ty = ret.unwrap_or(ast::Type::Void);
-                Spanned::new(
-                    ast::ExtendMethod {
-                        annotations: annots,
-                        doc,
-                        name,
-                        params: all_params,
-                        ret: ret_ty,
-                        body: Spanned::new(body.node, Span::new(s.start, s.end)),
-                    },
-                    Span::new(s.start, s.end),
-                )
-            },
-        )
+        .then(method_sig(stmt.clone(), MethodSigPolicy::Extend))
+        .then(block_stmt(stmt, tail_expr))
+        .map_with(|(((annots, doc), sig), body), e| {
+            let s = e.span();
+            Spanned::new(
+                ast::ExtendMethod {
+                    annotations: annots,
+                    doc,
+                    sig,
+                    body: Spanned::new(body.node, Span::new(s.start, s.end)),
+                },
+                Span::new(s.start, s.end),
+            )
+        })
         .labelled("extend method")
         .as_context()
         .boxed()

@@ -392,9 +392,15 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::MissingReturn { expected, .. } => {
             format!("Mismatched types: expected '{expected}', found 'void'")
         }
+        TypeError::IfWithoutElseValue { .. } => {
+            "if expression used as value must have an else branch".to_string()
+        }
         TypeError::UnusedValue { .. } => "unused value".to_string(),
         TypeError::IfConditionNotBool { found, .. } => {
             format!("Condition of if expression must be bool: found '{found}'")
+        }
+        TypeError::TernaryConditionNotBool { found, .. } => {
+            format!("Condition of ternary expression must be bool: found '{found}'")
         }
         TypeError::WhileConditionNotBool { found, .. } => {
             format!("Condition of while must be bool: found '{found}'")

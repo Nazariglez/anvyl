@@ -1,7 +1,7 @@
 use anvyx_externs::ParamFlow;
 
 use super::{
-    CheckedType, TypeChecker, check_arg_count, check_expr_checked_with_hint, check_place,
+    CheckedType, TypeChecker, check_arg_count, check_place, check_value_expr_checked_with_hint,
     infer::TypeHandle,
 };
 use crate::{
@@ -48,7 +48,7 @@ pub(super) fn check_arg_expr(
     tc: &mut TypeChecker,
 ) -> bool {
     let expected = tc.type_handle(&param.ty.ty);
-    let checked = check_expr_checked_with_hint(arg, Some(expected), tc);
+    let checked = check_value_expr_checked_with_hint(arg, Some(expected), tc);
     check_checked_value(arg, &checked, &param.ty, tc)
 }
 

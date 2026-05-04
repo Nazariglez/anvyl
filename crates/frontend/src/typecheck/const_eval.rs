@@ -97,12 +97,10 @@ impl TypeChecker {
             ExprKind::Lit(lit) => self.eval_const_lit(lit, expr.span),
             ExprKind::Ident(name) => {
                 self.eval_visible_const(*name, expr.span)
-                    .unwrap_or_else(|| {
-                        Err(TypeError::UnknownConst {
-                            name: *name,
-                            span: expr.span,
-                        })
-                    })
+                    .unwrap_or(Err(TypeError::UnknownConst {
+                        name: *name,
+                        span: expr.span,
+                    }))
             }
             ExprKind::Unary(node) => {
                 let value = self.eval_const_expr(&node.node.expr)?;
@@ -148,6 +146,18 @@ impl TypeChecker {
                 }
             },
             ExprKind::Cast(node) => self.eval_const_cast(node),
+            ExprKind::Ternary(node) => {
+                let cond = self.eval_const_expr(&node.node.cond)?;
+                match cond {
+                    ConstValue::Bool(true) => self.eval_const_expr(&node.node.then_expr),
+                    ConstValue::Bool(false) => self.eval_const_expr(&node.node.else_expr),
+                    other => Err(TypeError::InvalidOperand {
+                        op: "?:".to_string(),
+                        operand_type: const_type(&other),
+                        span: node.node.cond.span,
+                    }),
+                }
+            }
             ExprKind::StringInterp(parts) => self.eval_const_string_interp(parts, expr.span),
             ExprKind::Field(node) => self.eval_const_field(node, expr.span),
             _ => Err(TypeError::NonConstExpression { span: expr.span }),
@@ -241,24 +251,26 @@ impl TypeChecker {
 
         let previous_module = std::mem::replace(&mut self.current_module, module.clone());
         let saved_scopes = (previous_module != module).then(|| std::mem::take(&mut self.scopes));
-        let result = self.eval_const_expr(&value_expr).and_then(|value| {
-            let value_ty = const_type(&value);
-            match ty {
-                Some(annot) => {
-                    let expected = self.resolve_type_for_tc(&annot);
-                    if expected == value_ty {
-                        Ok((value, expected))
-                    } else {
-                        Err(TypeError::ConstTypeMismatch {
+        let expected_ty = ty.as_ref().map(|annot| self.resolve_type_for_tc(annot));
+        let expected_handle = expected_ty.as_ref().map(|ty| self.type_handle(ty));
+        let result = match super::validate_const_expr_type(&value_expr, expected_handle, self) {
+            Ok(_) => match self.eval_const_expr(&value_expr) {
+                Ok(value) => {
+                    let value_ty = const_type(&value);
+                    match expected_ty {
+                        Some(expected) if expected == value_ty => Ok((value, expected)),
+                        Some(expected) => Err(TypeError::ConstTypeMismatch {
                             expected,
                             found: value_ty,
                             span: decl_span,
-                        })
+                        }),
+                        None => Ok((value, value_ty)),
                     }
                 }
-                None => Ok((value, value_ty)),
-            }
-        });
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        };
         if let Some(scopes) = saved_scopes {
             self.scopes = scopes;
         }
@@ -339,7 +351,7 @@ impl TypeChecker {
             match part {
                 StringPart::Text(text) => out.push_str(text),
                 StringPart::Expr(expr, _) => {
-                    out.push_str(&const_string(&self.eval_const_expr(expr)?))
+                    out.push_str(&const_string(&self.eval_const_expr(expr)?));
                 }
             }
         }

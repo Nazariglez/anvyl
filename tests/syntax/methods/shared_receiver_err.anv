@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: shared
+
+struct S {
+    fn f(shared self) {}
+}

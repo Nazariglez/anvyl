@@ -1306,34 +1306,17 @@ fn ternary_expr<'src>(
     lower
         .foldl(ternary_suffix.repeated(), |cond, (then_expr, else_expr)| {
             let span = Span::new(cond.span.start, else_expr.span.end);
-
-            let then_block = Spanned::new(
-                ast::Block {
-                    stmts: vec![],
-                    tail: Some(Box::new(then_expr.clone())),
-                },
-                then_expr.span,
-            );
-
-            let else_block = Spanned::new(
-                ast::Block {
-                    stmts: vec![],
-                    tail: Some(Box::new(else_expr.clone())),
-                },
-                else_expr.span,
-            );
-
-            let if_node = Spanned::new(
-                ast::If {
+            let ternary = Spanned::new(
+                ast::Ternary {
                     cond: Box::new(cond),
-                    then_block,
-                    else_block: Some(else_block),
+                    then_expr: Box::new(then_expr),
+                    else_expr: Box::new(else_expr),
                 },
                 span,
             );
 
             let expr_id = new_expr_id();
-            let expr = ast::Expr::new(ast::ExprKind::If(if_node), expr_id);
+            let expr = ast::Expr::new(ast::ExprKind::Ternary(ternary), expr_id);
             Spanned::new(expr, span)
         })
         .labelled("ternary")

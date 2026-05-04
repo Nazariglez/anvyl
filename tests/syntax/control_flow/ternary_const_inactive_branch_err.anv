@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variable
+
+const X = true ? 1 : MISSING;

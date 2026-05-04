@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Write};
 
-use anvyx_lang::{ast, lexer::SpannedToken, span::Span};
+use anvyx_frontend::{ast, lexer::SpannedToken, span::Span};
 
 use super::trivia::{TriviaItem, TriviaKind};
 
@@ -324,18 +324,13 @@ impl<'a> Printer<'a> {
     fn format_lit(&mut self, lit: &ast::Lit) {
         match lit {
             ast::Lit::Int(n) => self.write_fmt(n),
-            ast::Lit::Float { value, suffix } => {
+            ast::Lit::Float(value) => {
                 let s = value.to_string();
                 if value.is_finite() && !s.contains('.') {
                     self.write(&s);
                     self.write(".0");
                 } else {
                     self.write(&s);
-                }
-                match suffix {
-                    Some(ast::FloatSuffix::F) => self.write("f"),
-                    Some(ast::FloatSuffix::D) => self.write("d"),
-                    None => {}
                 }
             }
             ast::Lit::Bool(b) => self.write(if *b { "true" } else { "false" }),

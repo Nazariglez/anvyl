@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: type annotation
+
+struct S {
+    fn f(self: S) {}
+}

@@ -1166,12 +1166,15 @@ impl DeclarationIndex {
                     let mut methods = HashMap::new();
                     for method in &agg.methods {
                         methods.insert(
-                            method.name,
+                            method.sig.name,
                             MethodSchema {
-                                generics: generic_params(&method.type_params, &method.const_params),
-                                receiver: method.receiver,
-                                params: resolve_func_params(&method.params),
-                                ret: method.ret.clone(),
+                                generics: generic_params(
+                                    &method.sig.type_params,
+                                    &method.sig.const_params,
+                                ),
+                                receiver: method.sig.receiver,
+                                params: resolve_func_params(&method.sig.params),
+                                ret: method.sig.ret.clone(),
                             },
                         );
                     }
@@ -1271,23 +1274,14 @@ impl DeclarationIndex {
                     let mut methods = HashMap::new();
                     for method_node in &ext.methods {
                         let m = &method_node.node;
-                        let (receiver, params) = m.params.split_first().map_or(
-                            (None, &[][..]),
-                            |(self_param, params)| {
-                                let receiver = match self_param.mutability {
-                                    Mutability::Mutable => MethodReceiver::Var,
-                                    Mutability::Immutable => MethodReceiver::Value,
-                                };
-                                (Some(receiver), params)
-                            },
-                        );
+                        debug_assert!(m.sig.receiver.is_some());
                         methods.insert(
-                            m.name,
+                            m.sig.name,
                             ExtendMethodSchema {
-                                receiver,
-                                generics: GenericParams::default(),
-                                params: resolve_func_params(params),
-                                ret: m.ret.clone(),
+                                receiver: m.sig.receiver,
+                                generics: generic_params(&m.sig.type_params, &m.sig.const_params),
+                                params: resolve_func_params(&m.sig.params),
+                                ret: m.sig.ret.clone(),
                             },
                         );
                     }

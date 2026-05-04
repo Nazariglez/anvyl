@@ -1,4 +1,4 @@
-use anvyx_lang::{lexer::SpannedToken, span::Span};
+use anvyx_frontend::{lexer::SpannedToken, span::Span};
 
 pub struct TriviaItem {
     pub kind: TriviaKind,
@@ -89,7 +89,7 @@ fn scan_gap(source: &str, start: usize, end: usize, items: &mut Vec<TriviaItem>)
 
 #[cfg(test)]
 mod tests {
-    use anvyx_lang::lexer;
+    use anvyx_frontend::lexer;
 
     use super::*;
 

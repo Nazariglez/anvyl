@@ -56,6 +56,22 @@ pub(super) fn assert_local_import(imp: &ast::Import, ascend: usize, expected: &[
     assert_named_path(&imp.target.path, expected);
 }
 
+pub(super) fn parse_expr_err(src: &str) {
+    let Ok(tokens) = lexer::tokenize(src) else {
+        return;
+    };
+    let stmt_parser = statement();
+    let expr_parser = expression(stmt_parser.clone()).then_ignore(end());
+    let mut state = SimpleState(ParserState::default());
+    let result = expr_parser
+        .parse_with_state(&tokens, &mut state)
+        .into_result();
+    assert!(
+        result.is_err(),
+        "expected parse error for '{src}' but it succeeded"
+    );
+}
+
 pub(super) fn parse_program_err(src: &str) {
     let Ok(tokens) = lexer::tokenize(src) else {
         return; // lex error is also acceptable

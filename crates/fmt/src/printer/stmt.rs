@@ -1,4 +1,4 @@
-use anvyx_lang::ast;
+use anvyx_frontend::ast;
 
 use super::Printer;
 

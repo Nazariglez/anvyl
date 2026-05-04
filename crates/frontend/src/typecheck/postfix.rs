@@ -3,7 +3,7 @@ use anvyx_externs::ReceiverMode;
 use super::{
     CallTarget, CheckedType, ConstSubst, ExternUseTarget, GenericArgs, GenericParams,
     MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, check_arg_count,
-    check_expr_checked, check_expr_checked_with_hint, checked_type,
+    check_expr_checked, checked_type,
     decls::{
         AggregateSchema, CallableKind, CallableParent, CallableRef, DeclarationIndex,
         ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, MethodSchema, ModuleScope, NominalKey,
@@ -763,7 +763,7 @@ fn instantiate_param_handles(
 fn check_call_arg_handles(args: &[ExprNode], params: &[TypeHandle], tc: &mut TypeChecker) -> bool {
     let mut failed = false;
     for (arg, param) in args.iter().zip(params) {
-        let checked = check_expr_checked_with_hint(arg, Some(param.clone()), tc);
+        let checked = super::check_value_expr_checked_with_hint(arg, Some(param.clone()), tc);
         tc.reject_extern_any_escape(&checked, arg.span);
         tc.expect_assignable(arg.span, checked.handle, param.clone());
         failed |= tc.solve_constraints();

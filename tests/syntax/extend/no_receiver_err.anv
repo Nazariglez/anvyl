@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: must have 'self'
+
+extend int {
+    fn f() -> int { 0 }
+}

@@ -1,6 +1,6 @@
 use super::support::{
     assert_err, assert_err_count, assert_single_error, assert_ty, assert_ty_mods, assert_ty_named,
-    assert_typecheck_closed, check, check_mods, check_named,
+    assert_typecheck_closed, check, check_mods, check_named, errors,
 };
 use crate::{
     ast::{ArrayLen, ConstArg, ConstValue, FuncParam, GenericArg, Ident, NominalKind, Type},
@@ -102,6 +102,46 @@ mod constraints {
     #[test]
     fn branch_join_mismatch() {
         assert_err_count("fn main(cond: bool) { if cond { 1 } else { \"x\" }; }", 1);
+    }
+
+    #[test]
+    fn ternary_join_same_type() {
+        assert_ty("fn main(cond: bool) { cond ? 1 : 2; }", Type::Int);
+    }
+
+    #[test]
+    fn ternary_condition_must_be_bool() {
+        assert_single_error("fn main() { 1 ? 2 : 3; }", |err| {
+            matches!(err, TypeError::TernaryConditionNotBool { .. })
+        });
+    }
+
+    #[test]
+    fn ternary_branch_mismatch() {
+        assert_err_count("fn main(cond: bool) { cond ? 1 : \"x\"; }", 1);
+    }
+
+    #[test]
+    fn ternary_tail_expression() {
+        assert_ty("fn f(cond: bool) -> int { cond ? 1 : 2 }", Type::Int);
+    }
+
+    #[test]
+    fn ternary_nil_uses_binding_context() {
+        assert_ty(
+            "fn main(cond: bool) { let x: int? = cond ? nil : 1; x; }",
+            Type::option_of(Type::Int),
+        );
+    }
+
+    #[test]
+    fn annotated_if_without_else_value() {
+        let errors = errors("fn main() { let x: int = if true { 1 }; }");
+        assert!(
+            errors
+                .iter()
+                .any(|err| matches!(err, TypeError::IfWithoutElseValue { .. }))
+        );
     }
 
     #[test]
@@ -354,6 +394,20 @@ mod consts {
     #[test]
     fn non_const_initializer_err() {
         assert_err("fn f() -> int { 1 } const X = f(); fn main() { X; }");
+    }
+
+    #[test]
+    fn ternary_branch_type_mismatch_err() {
+        assert_single_error("const X = true ? 1 : \"x\"; fn main() { X; }", |err| {
+            matches!(err, TypeError::TypeMismatch { .. })
+        });
+    }
+
+    #[test]
+    fn ternary_checks_inactive_branch_err() {
+        assert_single_error("const X = true ? 1 : MISSING; fn main() { X; }", |err| {
+            matches!(err, TypeError::UndefinedVariable { .. })
+        });
     }
 }
 

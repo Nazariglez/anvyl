@@ -1,6 +1,17 @@
 use super::helpers::*;
 use crate::ast;
 
+fn expect_ternary(expr: &ast::ExprNode) -> (&ast::ExprNode, &ast::ExprNode, &ast::ExprNode) {
+    match &expr.node.kind {
+        ast::ExprKind::Ternary(node) => (
+            node.node.cond.as_ref(),
+            node.node.then_expr.as_ref(),
+            node.node.else_expr.as_ref(),
+        ),
+        other => panic!("expected ternary, found {other:?}"),
+    }
+}
+
 #[test]
 fn mul_add_prec() {
     let expr = parse_expr("1 + 2 * 3");
@@ -60,6 +71,41 @@ fn and_or_prec() {
     expect_ident(and_left, "a");
     expect_ident(and_right, "b");
     expect_ident(right, "c");
+}
+
+#[test]
+fn ternary_shape() {
+    let expr = parse_expr("cond ? a : b");
+    let (cond, then_expr, else_expr) = expect_ternary(&expr);
+    expect_ident(cond, "cond");
+    expect_ident(then_expr, "a");
+    expect_ident(else_expr, "b");
+}
+
+#[test]
+fn ternary_precedence() {
+    let expr = parse_expr("a || b ? c + d : e * f");
+    let (cond, then_expr, else_expr) = expect_ternary(&expr);
+    expect_binary(cond, ast::BinaryOp::Or);
+    expect_binary(then_expr, ast::BinaryOp::Add);
+    expect_binary(else_expr, ast::BinaryOp::Mul);
+}
+
+#[test]
+fn nested_ternary() {
+    let expr = parse_expr("a ? b : c ? d : e");
+    let (cond, then_expr, else_expr) = expect_ternary(&expr);
+    expect_ident(cond, "a");
+    expect_ident(then_expr, "b");
+    let (nested_cond, nested_then, nested_else) = expect_ternary(else_expr);
+    expect_ident(nested_cond, "c");
+    expect_ident(nested_then, "d");
+    expect_ident(nested_else, "e");
+}
+
+#[test]
+fn ternary_missing_colon_fails() {
+    parse_expr_err("a ? b");
 }
 
 #[test]

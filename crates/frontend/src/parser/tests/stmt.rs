@@ -349,17 +349,45 @@ fn trailing_comma_params() {
     assert_eq!(params[1].mutability, Mutability::Mutable);
 }
 
-#[test]
-fn var_self() {
-    let prog = parse_program("struct S { fn m(var self) {} }");
+fn parse_aggregate_method(source: &str) -> ast::Method {
+    let mut prog = parse_program(source);
     assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::Aggregate(struct_node) = &prog.stmts[0].node else {
+    let ast::Stmt::Aggregate(struct_node) = prog.stmts.pop().unwrap().node else {
         panic!("expected Aggregate");
     };
-    let methods = &struct_node.node.methods;
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0].receiver, Some(MethodReceiver::Var));
-    assert_eq!(methods[0].name.0.as_ref(), "m");
+    assert_eq!(struct_node.node.methods.len(), 1);
+    struct_node.node.methods.into_iter().next().unwrap()
+}
+
+fn parse_extend_method(source: &str) -> ast::ExtendMethod {
+    let mut prog = parse_program(source);
+    assert_eq!(prog.stmts.len(), 1);
+    let ast::Stmt::Extend(extend_node) = prog.stmts.pop().unwrap().node else {
+        panic!("expected Extend");
+    };
+    assert_eq!(extend_node.node.methods.len(), 1);
+    extend_node.node.methods.into_iter().next().unwrap().node
+}
+
+#[test]
+fn value_self() {
+    let method = parse_aggregate_method("struct S { fn m(self) {} }");
+    assert_eq!(method.sig.receiver, Some(MethodReceiver::Value));
+    assert_eq!(method.sig.name.0.as_ref(), "m");
+}
+
+#[test]
+fn var_self() {
+    let method = parse_aggregate_method("struct S { fn m(var self) {} }");
+    assert_eq!(method.sig.receiver, Some(MethodReceiver::Var));
+    assert_eq!(method.sig.name.0.as_ref(), "m");
+}
+
+#[test]
+fn aggregate_static_method() {
+    let method = parse_aggregate_method("struct S { fn make() -> S { S {} } }");
+    assert_eq!(method.sig.receiver, None);
+    assert!(method.sig.params.is_empty());
 }
 
 #[test]
@@ -371,10 +399,10 @@ fn method_trailing_comma() {
     };
     let methods = &struct_node.node.methods;
     assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0].receiver, Some(MethodReceiver::Var));
-    assert_eq!(methods[0].params.len(), 1);
-    assert_eq!(methods[0].params[0].name.0.as_ref(), "x");
-    assert_eq!(methods[0].params[0].ty, Type::Int);
+    assert_eq!(methods[0].sig.receiver, Some(MethodReceiver::Var));
+    assert_eq!(methods[0].sig.params.len(), 1);
+    assert_eq!(methods[0].sig.params[0].name.0.as_ref(), "x");
+    assert_eq!(methods[0].sig.params[0].ty, Type::Int);
 }
 
 #[test]
@@ -386,8 +414,50 @@ fn method_self_trailing_comma() {
     };
     let methods = &struct_node.node.methods;
     assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0].receiver, Some(MethodReceiver::Value));
-    assert!(methods[0].params.is_empty());
+    assert_eq!(methods[0].sig.receiver, Some(MethodReceiver::Value));
+    assert!(methods[0].sig.params.is_empty());
+}
+
+#[test]
+fn aggregate_invalid_receivers_fail() {
+    for source in [
+        "struct S { fn m(self: Self) {} }",
+        "struct S { fn m(var self: Self) {} }",
+        "struct S { fn m(shared self) {} }",
+        "struct S { fn m(x: int, self) {} }",
+        "struct S { fn m(x: int, var self) {} }",
+        "struct S { fn m(x: int, self: Self) {} }",
+        "struct S { fn m(self: int) {} }",
+    ] {
+        parse_program_err(source);
+    }
+}
+
+#[test]
+fn extend_value_self() {
+    let method = parse_extend_method("extend int { fn abs(self) -> int { self } }");
+    assert_eq!(method.sig.receiver, Some(MethodReceiver::Value));
+    assert!(method.sig.params.is_empty());
+}
+
+#[test]
+fn extend_var_self() {
+    let method = parse_extend_method("extend int { fn reset(var self) {} }");
+    assert_eq!(method.sig.receiver, Some(MethodReceiver::Var));
+    assert!(method.sig.params.is_empty());
+}
+
+#[test]
+fn extend_invalid_receivers_fail() {
+    for source in [
+        "extend int { fn m() {} }",
+        "extend int { fn m(self: int) {} }",
+        "extend int { fn m(var self: int) {} }",
+        "extend int { fn m(shared self) {} }",
+        "extend int { fn m(x: int, self) {} }",
+    ] {
+        parse_program_err(source);
+    }
 }
 
 mod externs {

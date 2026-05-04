@@ -833,16 +833,21 @@ pub struct StructDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Method {
-    pub annotations: Vec<AnnotationNode>,
-    pub doc: Option<String>,
+pub struct MethodSig {
     pub name: Ident,
-    pub visibility: Visibility,
     pub type_params: Vec<TypeParam>,
     pub const_params: Vec<ConstParam>,
     pub receiver: Option<MethodReceiver>,
     pub params: Vec<Param>,
     pub ret: Type,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Method {
+    pub annotations: Vec<AnnotationNode>,
+    pub doc: Option<String>,
+    pub visibility: Visibility,
+    pub sig: MethodSig,
     pub body: BlockNode,
 }
 
@@ -965,9 +970,7 @@ pub enum AnnotationArgs {
 pub struct ExtendMethod {
     pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
-    pub name: Ident,
-    pub params: Vec<Param>,
-    pub ret: Type,
+    pub sig: MethodSig,
     pub body: BlockNode,
 }
 
@@ -1026,6 +1029,13 @@ pub struct If {
     pub cond: Box<ExprNode>,
     pub then_block: BlockNode,
     pub else_block: Option<BlockNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ternary {
+    pub cond: Box<ExprNode>,
+    pub then_expr: Box<ExprNode>,
+    pub else_expr: Box<ExprNode>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1293,6 +1303,7 @@ pub enum ExprKind {
     Unary(UnaryNode),
     Assign(AssignNode),
     If(IfNode),
+    Ternary(TernaryNode),
     IfLet(IfLetNode),
     Tuple(Vec<ExprNode>),
     NamedTuple(Vec<(Ident, ExprNode)>),
@@ -1323,6 +1334,7 @@ impl ExprKind {
             Self::Unary(_) => "Unary",
             Self::Assign(_) => "Assign",
             Self::If(_) => "If",
+            Self::Ternary(_) => "Ternary",
             Self::IfLet(_) => "if let",
             Self::Tuple(_) => "Tuple",
             Self::NamedTuple(_) => "NamedTuple",
@@ -1531,6 +1543,7 @@ pub type CallNode = Spanned<Call>;
 pub type AssignNode = Spanned<Assign>;
 pub type ReturnNode = Spanned<Return>;
 pub type IfNode = Spanned<If>;
+pub type TernaryNode = Spanned<Ternary>;
 pub type IfLetNode = Spanned<IfLet>;
 pub type LetElseNode = Spanned<LetElse>;
 pub type TupleIndexNode = Spanned<TupleIndex>;

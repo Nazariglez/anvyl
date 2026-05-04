@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn pick(cond: bool, a: int, b: int) -> int {
+    cond ? a : b
+}
+
+fn main() {
+    let x: int = pick(true, 1, 2);
+    let y: string = false ? "left" : "right";
+}

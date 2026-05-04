@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Condition of ternary expression must be bool
+
+fn main() {
+    let x = 1 ? 2 : 3;
+}

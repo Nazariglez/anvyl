@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: has no method
+// @contains: Unknown method
 
 struct Foo {
     x: int,

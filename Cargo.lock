@@ -121,7 +121,7 @@ version = "0.1.0"
 name = "anvyx-fmt"
 version = "0.1.0"
 dependencies = [
- "anvyx-lang",
+ "anvyx-frontend",
  "chumsky",
 ]
 

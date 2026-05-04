@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Mismatched types
+
+const X = true ? 1 : "x";
