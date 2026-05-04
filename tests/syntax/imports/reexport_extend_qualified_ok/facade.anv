@@ -1,0 +1,4 @@
+// @helper
+
+pub import a;
+pub import b;

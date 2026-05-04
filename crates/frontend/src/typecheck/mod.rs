@@ -765,9 +765,7 @@ impl TypeChecker {
     }
 
     fn extend_visible(&self, origin: &ModuleScope) -> bool {
-        origin == &self.current_module
-            || self.decls.always_active_module(origin)
-            || self.imports_module(origin)
+        origin == &self.current_module || self.imports_module(origin)
     }
 
     fn find_extend_method(&self, receiver: &Type, name: Ident) -> Option<ExtendMethodMatch<'_>> {
@@ -1238,11 +1236,9 @@ impl TypeChecker {
 pub(crate) fn check_with_modules(
     program: &Program,
     resolved: &ResolveResult,
-    always_active_modules: HashSet<ModuleScope>,
     externs: RawExterns,
 ) -> Result<TypecheckResult, Vec<TypeError>> {
-    let mut decls =
-        DeclarationIndex::from_root_and_modules(program, resolved, always_active_modules, &externs);
+    let mut decls = DeclarationIndex::from_root_and_modules(program, resolved, &externs);
     if decls.has_errors() {
         return Err(decl_errors(decls.errors()));
     }

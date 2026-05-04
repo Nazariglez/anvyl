@@ -198,13 +198,7 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
     let star = select! { (Token::Op(Op::Mul), _) => () };
     let comma = select! { (Token::Comma, _) => () };
 
-    // FIXME: keywords should not be supprted here, we need to remove this hack and use other names for core modules
-    let import_segment = identifier().or(select! {
-        (Token::Keyword(Keyword::Int), _) => ast::Ident::new("int"),
-        (Token::Keyword(Keyword::Float), _) => ast::Ident::new("float"),
-        (Token::Keyword(Keyword::String), _) => ast::Ident::new("string"),
-        (Token::Keyword(Keyword::Bool), _) => ast::Ident::new("bool"),
-    });
+    let import_segment = identifier();
 
     let dotted_path = import_segment
         .clone()

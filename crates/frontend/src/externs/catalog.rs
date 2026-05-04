@@ -1600,12 +1600,7 @@ mod tests {
     fn decls(root: &str, modules: &[(&str, &str)], raw: &RawExterns) -> DeclarationIndex {
         let root = parse(root);
         let resolved = resolved_modules(&root, modules);
-        DeclarationIndex::from_root_and_modules(
-            &root,
-            &resolved,
-            std::collections::HashSet::default(),
-            raw,
-        )
+        DeclarationIndex::from_root_and_modules(&root, &resolved, raw)
     }
 
     fn extern_module(path: &[&str]) -> ExternModulePath {
@@ -1971,12 +1966,7 @@ mod tests {
             let root = parse("");
             let resolved =
                 resolved_modules(&root, &[("geom.types", "pub struct Point { x: int }")]);
-            let decls = DeclarationIndex::from_root_and_modules(
-                &root,
-                &resolved,
-                std::collections::HashSet::default(),
-                &raw,
-            );
+            let decls = DeclarationIndex::from_root_and_modules(&root, &resolved, &raw);
             let errors = build_catalog(raw, &decls).unwrap_err();
 
             assert!(matches!(

@@ -197,3 +197,11 @@ fn err_interior_range() {
     parse_program_err("import my..mod;");
     parse_program_err("import my.mod..file;");
 }
+
+#[test]
+fn err_keyword_path_segment() {
+    parse_program_err("import int;");
+    parse_program_err("import float;");
+    parse_program_err("import string;");
+    parse_program_err("import bool;");
+}

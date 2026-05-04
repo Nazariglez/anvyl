@@ -108,10 +108,6 @@ fn catalog_binary_operator(
         .0
 }
 
-fn module_path(path: &str) -> ModulePath {
-    ModulePath::new(path.split('.').map(str::to_string).collect()).unwrap()
-}
-
 fn scope(path: &[&str]) -> ModuleScope {
     ModuleScope::Named(
         ModulePath::new(path.iter().map(|segment| (*segment).to_string()).collect()).unwrap(),
@@ -281,13 +277,12 @@ fn check_with_provider(
     root_source: &str,
     provider: ProviderDescriptor,
 ) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
-    check_named_with_provider(root_source, &[], &[], provider)
+    check_named_with_provider(root_source, &[], provider)
 }
 
 fn check_named_with_provider(
     root_source: &str,
     modules: &[(&str, &str)],
-    always_active: &[&str],
     provider: ProviderDescriptor,
 ) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
     let root = parse(root_source);
@@ -302,11 +297,7 @@ fn check_named_with_provider(
     let resolved = resolved_modules_with_external(&root, modules, &external_modules);
     let mut raw = externs::collect_source_externs(&root, &resolved).expect("valid source externs");
     raw.append(provider_raw);
-    let always_active_modules = always_active
-        .iter()
-        .map(|name| ModuleScope::Named(module_path(name)))
-        .collect();
-    typecheck::check_with_modules(&root, &resolved, always_active_modules, raw)
+    typecheck::check_with_modules(&root, &resolved, raw)
 }
 
 mod result {
@@ -2581,7 +2572,6 @@ mod provider_imports {
             fn use_it(v: Vec2) { take(v); }
             ",
             &[("other", "pub struct Vec2 { x: int }")],
-            &[],
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
                 types: vec![extern_type("Vec2")],
@@ -2612,7 +2602,6 @@ mod provider_imports {
             fn use_it() { source_tick(); provider_tick(); }
             ",
             &[("api", "extern fn source_tick();")],
-            &[],
             provider(ExternModuleDescriptor {
                 path: extern_path(&["api"]),
                 types: vec![],
@@ -2639,7 +2628,6 @@ mod provider_imports {
         let Err(errors) = check_named_with_provider(
             "import api { tick }; import ext:api { tick }; fn use_it() { tick(); }",
             &[("api", "extern fn tick();")],
-            &[],
             provider(ExternModuleDescriptor {
                 path: extern_path(&["api"]),
                 types: vec![],
@@ -2658,18 +2646,17 @@ mod provider_imports {
     }
 
     #[test]
-    fn always_active_not_visible() {
+    fn provider_extern_not_visible_without_import() {
         let Err(errors) = check_named_with_provider(
             "fn use_it() { tick(); }",
-            &[("host", "pub fn ordinary() -> int { 1 }")],
-            &["host"],
+            &[],
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
                 types: vec![],
                 functions: vec![function("tick", vec![], ExternTypeExpr::Void)],
             }),
         ) else {
-            panic!("always-active provider extern should not be visible without import");
+            panic!("provider extern should not be visible without import");
         };
 
         assert!(

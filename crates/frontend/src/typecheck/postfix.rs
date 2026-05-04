@@ -1,7 +1,7 @@
 use anvyx_externs::ReceiverMode;
 
 use super::{
-    CallTarget, CheckedType, ConstSubst, ExternUseTarget, GenericArgs, GenericParams,
+    CallForm, CallTarget, CheckedType, ConstSubst, ExternUseTarget, GenericArgs, GenericParams,
     MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, check_arg_count,
     check_expr_checked, checked_type,
     decls::{
@@ -15,7 +15,9 @@ use super::{
     place::{self, PlaceUseFacts, PlaceValue},
 };
 use crate::{
-    ast::{CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, Ident, Type},
+    ast::{
+        CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg, Ident, Type,
+    },
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
         ResolvedExternTy,
@@ -28,6 +30,11 @@ pub(super) enum Subject {
     NonAggregate(Type),
     Module(ModuleScope),
     Type(NominalKey),
+    QualifiedExtend {
+        module: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
     Callable {
         callee: Box<CallableRef>,
         surface_ty: Type,
@@ -210,6 +217,7 @@ fn subject_type(subject: &Subject) -> Type {
         }
         Subject::Module(_) => Type::Void,
         Subject::Type(key) => nominal_type(key),
+        Subject::QualifiedExtend { .. } => Type::Infer,
         Subject::Error => Type::Infer,
     }
 }
@@ -252,10 +260,11 @@ fn apply_field(
             kind,
             tc,
         ),
-        Subject::Module(scope) => apply_module_field(scope, field.node.field, field.span, tc),
+        Subject::Module(scope) => apply_module_field(scope, field.node.field, field.span, kind, tc),
         Subject::Type(key) => apply_type_field(key, field.node.field, field.span, kind, tc),
         Subject::NonAggregate(_)
         | Subject::Callable { .. }
+        | Subject::QualifiedExtend { .. }
         | Subject::ExternMethod { .. }
         | Subject::ExternStatic { .. } => {
             field_access_on_non_aggregate(subject, field.node.field, kind, field.span, tc)
@@ -542,6 +551,7 @@ fn apply_module_field(
     scope: &ModuleScope,
     name: Ident,
     span: Span,
+    kind: MemberAccessKind,
     tc: &mut TypeChecker,
 ) -> Subject {
     if let Some(module) = tc.exported_module_in_module(scope, name) {
@@ -552,6 +562,13 @@ fn apply_module_field(
     }
     if let Some(key) = tc.exported_type_in_module(scope, name) {
         return Subject::Type(key);
+    }
+    if kind == MemberAccessKind::Method && tc.decls.module_surface_has_extend_method(scope, name) {
+        return Subject::QualifiedExtend {
+            module: scope.clone(),
+            name,
+            span,
+        };
     }
     tc.push_error(TypeError::UndefinedModuleMember {
         module: scope.clone(),
@@ -628,6 +645,9 @@ fn apply_call(
         Subject::Callable { callee, .. } => {
             check_callable_call(callee, call, call_id, expected, tc)
         }
+        Subject::QualifiedExtend { module, name, span } => {
+            check_qualified_extend_call(module, *name, *span, call, call_id, expected, tc)
+        }
         Subject::ExternMethod {
             method_ref,
             receiver,
@@ -637,13 +657,15 @@ fn apply_call(
             name,
             signature,
         } => check_extern_method_call(
-            *method_ref,
-            *receiver,
-            *receiver_access,
-            receiver_place.as_ref(),
-            *receiver_id,
-            *name,
-            signature,
+            ExternMethodCall {
+                method_ref: *method_ref,
+                receiver: *receiver,
+                receiver_access: *receiver_access,
+                receiver_place: receiver_place.as_ref(),
+                receiver_id: *receiver_id,
+                name: *name,
+                signature,
+            },
             call,
             call_id,
             expected,
@@ -679,6 +701,16 @@ fn call_value(callee_ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
     }
 }
 
+struct ExternMethodCall<'a> {
+    method_ref: ExternMethodRef,
+    receiver: ReceiverMode,
+    receiver_access: PlaceAccess,
+    receiver_place: Option<&'a PlaceUseFacts>,
+    receiver_id: ExprId,
+    name: Ident,
+    signature: &'a ResolvedExternSignature,
+}
+
 struct GenericCallInstantiation {
     args: GenericArgs,
     type_subst: TypeSubst,
@@ -692,36 +724,37 @@ fn solve_generic_call_with(
     seeds: &GenericSolverSeeds,
     template_params: &[FuncParam],
     template_ret: &Type,
-    call: &CallNode,
+    args: &[ExprNode],
+    call_span: Span,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
     add_constraints: impl FnOnce(&GenericSolverVars, &mut TypeChecker),
 ) -> Option<GenericCallInstantiation> {
-    if !check_arg_count(&call.node.args, template_params.len(), call.span, tc) {
+    if !check_arg_count(args, template_params.len(), call_span, tc) {
         return None;
     }
 
     let error_count = tc.errors.len();
     for param in template_params {
-        tc.substitute_checked(&param.ty, &seeds.type_args, &seeds.const_args, call.span);
+        tc.substitute_checked(&param.ty, &seeds.type_args, &seeds.const_args, call_span);
     }
-    tc.substitute_checked(template_ret, &seeds.type_args, &seeds.const_args, call.span);
+    tc.substitute_checked(template_ret, &seeds.type_args, &seeds.const_args, call_span);
     if tc.errors.len() != error_count {
-        for arg in &call.node.args {
+        for arg in args {
             check_expr_checked(arg, tc);
         }
         return None;
     }
 
-    let vars = tc.solver.generic_solver_vars(generics, seeds, call.span);
+    let vars = tc.solver.generic_solver_vars(generics, seeds, call_span);
     add_constraints(&vars, tc);
     let mut failed = tc.solve_constraints();
 
     let param_handles = instantiate_param_handles(template_params, &vars, tc);
     let ret_handle = tc.solver.instantiate_generic_type(template_ret, &vars);
 
-    failed |= check_call_arg_handles(&call.node.args, &param_handles, tc);
-    failed |= constrain_expected_return(call.span, ret_handle, expected, tc);
+    failed |= check_call_arg_handles(args, &param_handles, tc);
+    failed |= constrain_expected_return(call_span, ret_handle, expected, tc);
 
     if failed {
         return None;
@@ -730,15 +763,15 @@ fn solve_generic_call_with(
     let args = match tc.solver.finalize_generic_args(generics, &vars) {
         Ok(args) => args,
         Err(unbound) => {
-            tc.push_unbound_generic_errors(unbound, call.span);
+            tc.push_unbound_generic_errors(unbound, call_span);
             return None;
         }
     };
 
     let (type_subst, const_subst) = generics.substitutions(&args);
     let concrete_params =
-        substitute_params_checked(template_params, &type_subst, &const_subst, call.span, tc);
-    let ret = tc.substitute_checked(template_ret, &type_subst, &const_subst, call.span);
+        substitute_params_checked(template_params, &type_subst, &const_subst, call_span, tc);
+    let ret = tc.substitute_checked(template_ret, &type_subst, &const_subst, call_span);
 
     Some(GenericCallInstantiation {
         args,
@@ -814,13 +847,31 @@ fn check_callable_call(
     if callee.def.id.kind == CallableKind::ExternFunction {
         return check_extern_function_call(callee, call, call_id, expected, tc);
     }
-
-    let Some(mut seeds) = bind_prefix_generic_seeds(
-        tc,
-        syntactic_generics(callee),
+    check_callable_call_with_args(
+        callee,
+        &call.node.args,
         &call.node.generic_args,
         call.span,
-    ) else {
+        call_id,
+        CallForm::Normal,
+        expected,
+        tc,
+    )
+}
+
+fn check_callable_call_with_args(
+    callee: &CallableRef,
+    args: &[ExprNode],
+    generic_args: &[GenericArg],
+    call_span: Span,
+    call_id: ExprId,
+    form: CallForm,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let Some(mut seeds) =
+        bind_prefix_generic_seeds(tc, syntactic_generics(callee), generic_args, call_span)
+    else {
         return checked_type(Type::Infer, tc);
     };
     seed_owner_args(
@@ -836,10 +887,11 @@ fn check_callable_call(
         &seeds,
         &callee.def.sig.params,
         &callee.def.sig.ret,
-        call,
+        args,
+        call_span,
         expected,
         tc,
-        |vars, tc| constrain_callable_owner(callee, vars, call.span, tc),
+        |vars, tc| constrain_callable_owner(callee, vars, call_span, tc),
     ) else {
         return checked_type(Type::Infer, tc);
     };
@@ -875,14 +927,102 @@ fn check_callable_call(
         const_bindings,
         tc,
     );
-    tc.record_call(
-        call_id,
-        CallTarget {
-            id: callee.def.id.clone(),
-            args,
-        },
-    );
+    let id = callee.def.id.clone();
+    let target = match form {
+        CallForm::Normal => CallTarget::new(id, args),
+        CallForm::QualifiedExtend { receiver } => CallTarget::qualified_extend(id, args, receiver),
+    };
+    tc.record_call(call_id, target);
     checked_type(ret, tc)
+}
+
+fn check_qualified_extend_call(
+    module: &ModuleScope,
+    name: Ident,
+    span: Span,
+    call: &CallNode,
+    call_id: ExprId,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let Some((receiver_expr, args)) = call.node.args.split_first() else {
+        tc.push_error(TypeError::WrongArgCount {
+            expected: 1,
+            found: 0,
+            span: call.span,
+        });
+        return checked_type(Type::Infer, tc);
+    };
+
+    let receiver = check_expr_checked(receiver_expr, tc);
+    tc.reject_extern_any_escape(&receiver, receiver_expr.span);
+
+    let Some(matched) = tc
+        .decls
+        .find_extend_method_in_module_surface(module, &receiver.ty, name)
+    else {
+        tc.push_error(TypeError::UnknownMember {
+            ty: receiver.ty,
+            member: name,
+            kind: MemberAccessKind::Method,
+            span,
+        });
+        return check_unhinted_args(args, tc);
+    };
+
+    let (extend, method, owner_args) = match matched {
+        ExtendMethodMatch::Match {
+            extend,
+            method,
+            owner_args: Ok(owner_args),
+        } => (extend, method, owner_args),
+        ExtendMethodMatch::Match {
+            owner_args: Err(unbound),
+            ..
+        } => {
+            tc.push_unbound_generic_errors(unbound, span);
+            return check_unhinted_args(args, tc);
+        }
+        ExtendMethodMatch::Ambiguous => {
+            tc.push_error(TypeError::AmbiguousExtendMethod {
+                receiver: receiver.ty,
+                name,
+                span,
+            });
+            return check_unhinted_args(args, tc);
+        }
+    };
+
+    let Some(callee) =
+        tc.decls
+            .callable_for_extend_method(receiver.ty, extend, name, method, owner_args)
+    else {
+        return checked_type(Type::Infer, tc);
+    };
+    tc.set_type(
+        call.node.func.node.id,
+        func_type(&callee.def.sig.params, &callee.def.sig.ret),
+        call.node.func.span,
+    );
+    check_callable_call_with_args(
+        &callee,
+        args,
+        &call.node.generic_args,
+        call.span,
+        call_id,
+        CallForm::QualifiedExtend {
+            receiver: receiver_expr.node.id,
+        },
+        expected,
+        tc,
+    )
+}
+
+fn check_unhinted_args(args: &[ExprNode], tc: &mut TypeChecker) -> CheckedType {
+    for arg in args {
+        check_expr_checked(arg, tc);
+    }
+    checked_type(Type::Infer, tc)
 }
 
 fn check_extern_function_call(
@@ -923,35 +1063,32 @@ fn check_extern_function_call(
 }
 
 fn check_extern_method_call(
-    method_ref: ExternMethodRef,
-    receiver: ReceiverMode,
-    receiver_access: PlaceAccess,
-    receiver_place: Option<&PlaceUseFacts>,
-    receiver_id: ExprId,
-    name: Ident,
-    signature: &ResolvedExternSignature,
+    method: ExternMethodCall<'_>,
     call: &CallNode,
     call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    match receiver {
+    match method.receiver {
         ReceiverMode::Mutable => {
-            if let Some(error) = receiver_access.mut_borrow_error(name, call.span) {
+            if let Some(error) = method
+                .receiver_access
+                .mut_borrow_error(method.name, call.span)
+            {
                 tc.push_error(error);
-            } else if let Some(facts) = receiver_place {
-                place::record_facts_write(receiver_id, facts, tc);
+            } else if let Some(facts) = method.receiver_place {
+                place::record_facts_write(method.receiver_id, facts, tc);
             }
         }
         ReceiverMode::Value | ReceiverMode::Shared => {
-            if let Some(facts) = receiver_place {
-                place::record_facts_read(receiver_id, facts, tc);
+            if let Some(facts) = method.receiver_place {
+                place::record_facts_read(method.receiver_id, facts, tc);
             }
         }
     }
     check_extern_call(
-        ExternUseTarget::Method(method_ref),
-        signature,
+        ExternUseTarget::Method(method.method_ref),
+        method.signature,
         call,
         call_id,
         expected,

@@ -1,0 +1,7 @@
+// @helper
+
+pub fn keep() {}
+
+pub extend int {
+    fn plus_one(self) -> int { self + 1 }
+}

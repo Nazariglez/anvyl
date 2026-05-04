@@ -1,10 +1,10 @@
-use super::support::{assert_ty_mods, assert_ty_named, check, check_active, check_named};
+use super::support::{assert_ty_mods, assert_ty_named, check, check_named};
 use crate::{
     ast::{Ident, NominalKind, Type},
     resolve::ModulePath,
     typecheck::{
         CallTarget, GenericArgs, TypeError, TypecheckResult,
-        decls::{BindingNamespace, BindingOrigin, CallableId, DeclError, ModuleScope},
+        decls::{BindingNamespace, BindingOrigin, CallableId, DeclError, ExtendId, ModuleScope},
     },
 };
 
@@ -519,16 +519,16 @@ fn reexport_alias_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget {
-            id: CallableId::function(
+        &CallTarget::new(
+            CallableId::function(
                 ModuleScope::Named(ModulePath::new(vec!["tools".to_string()]).unwrap()),
                 Ident::new("id"),
             ),
-            args: GenericArgs {
+            GenericArgs {
                 type_args: vec![Type::Int],
                 const_args: vec![],
-            },
-        }
+            }
+        )
     );
 }
 
@@ -905,14 +905,14 @@ fn rejects_enum_then_extern_type_name() {
 }
 
 #[test]
-fn nested_active_module_scope() {
-    let root = "fn use_it() -> int { 1.plus_one() }";
+fn nested_imported_extend_visible() {
+    let root = "import core.int_ext; fn use_it() -> int { 1.plus_one() }";
     let modules = [(
         "core.int_ext",
         "pub extend int { fn plus_one(self) -> int { self + 1 } }",
     )];
 
-    check_active(root, &modules, &["core.int_ext"]).unwrap();
+    check_named(root, &modules).unwrap();
 }
 
 #[test]
@@ -1047,28 +1047,28 @@ fn qualified_reexport_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget {
-            id: CallableId::function(
+        &CallTarget::new(
+            CallableId::function(
                 ModuleScope::Named(ModulePath::new(vec!["tools".to_string()]).unwrap()),
                 Ident::new("id"),
             ),
-            args: GenericArgs {
+            GenericArgs {
                 type_args: vec![Type::Int],
                 const_args: vec![],
-            },
-        }
+            }
+        )
     );
 }
 
 #[test]
-fn active_extend_visible() {
-    let root = "fn use_it() -> int { 1.plus_one() }";
+fn imported_extend_visible() {
+    let root = "import core_int; fn use_it() -> int { 1.plus_one() }";
     let modules = [(
         "core_int",
         "pub extend int { fn plus_one(self) -> int { self + 1 } }",
     )];
 
-    check_active(root, &modules, &["core_int"]).unwrap();
+    check_named(root, &modules).unwrap();
 }
 
 #[test]
@@ -1079,15 +1079,7 @@ fn ordinary_extend_not_visible() {
         "pub extend int { fn plus_one(self) -> int { self + 1 } }",
     )];
 
-    assert!(check_active(root, &modules, &[]).is_err());
-}
-
-#[test]
-fn active_names_not_imported() {
-    let root = "fn use_it() -> int { hidden() }";
-    let modules = [("helpers", "pub fn hidden() -> int { 1 }")];
-
-    assert!(check_active(root, &modules, &["helpers"]).is_err());
+    assert!(check_named(root, &modules).is_err());
 }
 
 #[test]
@@ -1098,5 +1090,224 @@ fn import_keeps_extend_visible() {
         "pub extend int { fn plus_one(self) -> int { self + 1 } }",
     )];
 
-    check_active(root, &modules, &[]).unwrap();
+    check_named(root, &modules).unwrap();
+}
+
+#[test]
+fn reexport_module_forwards_extend() {
+    let root = "
+        import facade;
+        fn use_it() -> int { 1.plus_one() }
+    ";
+    let modules = [
+        ("facade", "pub import ints;"),
+        (
+            "ints",
+            "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+        ),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn reexport_selective_forwards_extend() {
+    let root = "
+        import facade { keep };
+        fn use_it() -> int { keep(); 1.plus_one() }
+    ";
+    let modules = [
+        ("facade", "pub import ints { keep };"),
+        (
+            "ints",
+            "pub fn keep() {} pub extend int { fn plus_one(self) -> int { self + 1 } }",
+        ),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn reexport_wildcard_forwards_extension_only_module() {
+    let root = "
+        import facade;
+        fn use_it() -> int { 1.plus_one() }
+    ";
+    let modules = [
+        ("facade", "pub import ints { * };"),
+        (
+            "ints",
+            "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+        ),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn private_import_does_not_forward_extend() {
+    let root = "
+        import facade;
+        fn use_it() -> int { 1.plus_one() }
+    ";
+    let modules = [
+        ("facade", "import ints;"),
+        (
+            "ints",
+            "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+        ),
+    ];
+
+    assert!(check_named(root, &modules).is_err());
+}
+
+#[test]
+fn transitive_reexport_forwards_extend() {
+    let root = "
+        import api;
+        fn use_it() -> int { 1.plus_one() }
+    ";
+    let modules = [
+        ("api", "pub import prelude;"),
+        ("prelude", "pub import ints;"),
+        (
+            "ints",
+            "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+        ),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn public_import_cycle_closes_extension_surface() {
+    let root = "
+        import a;
+        fn use_it() -> int { 1.from_b() }
+    ";
+    let modules = [
+        ("a", "pub import b;"),
+        (
+            "b",
+            "pub import a; pub extend int { fn from_b(self) -> int { self } }",
+        ),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn qualified_extend_call_disambiguates_reexported_modules() {
+    let root = "
+        import facade;
+        fn use_it() -> int { facade.a.pick(1) + facade.b.pick(1) }
+    ";
+    let modules = [
+        ("facade", "pub import a; pub import b;"),
+        ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+        ("b", "pub extend int { fn pick(self) -> int { 2 } }"),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn qualified_extend_call_uses_alias() {
+    let root = "
+        import facade;
+        fn use_it() -> int { facade.left.pick(1) }
+    ";
+    let modules = [
+        ("facade", "pub import a as left;"),
+        ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn hidden_provider_conflict_stays_ambiguous() {
+    let root = "
+        import facade;
+        fn use_it() -> int { 1.pick() }
+    ";
+    let modules = [
+        ("facade", "pub import a { * }; pub import b { * };"),
+        ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+        ("b", "pub extend int { fn pick(self) -> int { 2 } }"),
+    ];
+
+    expect_single_error(
+        check_named(root, &modules),
+        |error| matches!(error, TypeError::AmbiguousExtendMethod { name, .. } if *name == Ident::new("pick")),
+    );
+}
+
+#[test]
+fn qualified_extend_call_target_preserves_provider() {
+    let root = "
+        import facade;
+        fn use_it() -> int { facade.a.pick(1) }
+    ";
+    let modules = [
+        ("facade", "pub import a;"),
+        ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+    ];
+
+    let result = check_named(root, &modules).expect("typecheck failed");
+    let target = result.calls().values().next().expect("missing call target");
+    assert_qualified_pick_target(target, "a");
+}
+
+#[test]
+fn barrel_qualified_extend_call_target_preserves_provider() {
+    let root = "
+        import facade;
+        fn use_it() -> int { facade.pick(1) }
+    ";
+    let modules = [
+        ("facade", "pub import a { * };"),
+        ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+    ];
+
+    let result = check_named(root, &modules).expect("typecheck failed");
+    let target = result.calls().values().next().expect("missing call target");
+    assert_qualified_pick_target(target, "a");
+}
+
+#[test]
+fn reexported_extend_ambiguity_is_call_site_error() {
+    let root = "
+        import facade;
+        fn use_it() -> int { 1.pick() }
+    ";
+    let modules = [
+        ("facade", "pub import a; pub import b;"),
+        ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+        ("b", "pub extend int { fn pick(self) -> int { 2 } }"),
+    ];
+
+    expect_single_error(
+        check_named(root, &modules),
+        |error| matches!(error, TypeError::AmbiguousExtendMethod { name, .. } if *name == Ident::new("pick")),
+    );
+}
+
+fn assert_qualified_pick_target(target: &CallTarget, module: &str) {
+    assert_eq!(target.id, pick_id(module));
+    assert_eq!(target.args, GenericArgs::default());
+    assert!(matches!(
+        target.form,
+        crate::typecheck::CallForm::QualifiedExtend { .. }
+    ));
+}
+
+fn pick_id(module: &str) -> CallableId {
+    CallableId::extend_method(
+        ExtendId {
+            module: ModuleScope::Named(ModulePath::new(vec![module.to_string()]).unwrap()),
+            index: 0,
+        },
+        Ident::new("pick"),
+    )
 }

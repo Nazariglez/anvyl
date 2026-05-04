@@ -1,2 +1,5 @@
+pub import core_int { * };
+pub import core_float { * };
+pub import core_string { * };
 pub import option { * };
 pub import range { * };

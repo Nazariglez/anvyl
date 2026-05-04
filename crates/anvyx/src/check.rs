@@ -213,13 +213,11 @@ mod tests {
                 let prelude =
                     SourceText::new(core_prelude, "<core>").map_err(|error| error.to_string())?;
 
-                let mut always_active_modules = vec![];
                 let core_modules = sorted_modules(core_sources)
                     .into_iter()
                     .map(|(name, source)| {
                         let path = vec![name.clone()];
                         let label = format!("<core.{name}>");
-                        always_active_modules.push(path.clone());
                         ModuleSource::new(path, source.anv_source, label)
                             .map_err(|error| error.to_string())
                     })
@@ -247,8 +245,7 @@ mod tests {
                 )
                 .map_err(|error| error.to_string())?;
 
-                SourceBundle::new(Some(core), Some(std), always_active_modules)
-                    .map_err(|error| error.to_string())
+                Ok(SourceBundle::new(Some(core), Some(std)))
             }
 
             fn sorted_modules(
@@ -274,17 +271,16 @@ mod tests {
             fn core_modules() {
                 let bundle = bundle_from_sources(
                     String::new(),
-                    sources(&[("int", "extend int {}")]),
+                    sources(&[("core_int", "extend int {}")]),
                     HashMap::new(),
                 )
                 .unwrap();
                 let modules = bundle.core().unwrap().modules();
 
                 assert_eq!(modules.len(), 1);
-                assert_eq!(modules[0].path(), path(&["int"]));
-                assert_eq!(modules[0].label(), "<core.int>");
+                assert_eq!(modules[0].path(), path(&["core_int"]));
+                assert_eq!(modules[0].label(), "<core.core_int>");
                 assert_eq!(modules[0].code(), "extend int {}");
-                assert_eq!(bundle.core_always_active(), &[path(&["int"])]);
             }
 
             #[test]
@@ -306,7 +302,10 @@ mod tests {
             fn orders_modules() {
                 let bundle = bundle_from_sources(
                     String::new(),
-                    sources(&[("string", "extend string {}"), ("int", "extend int {}")]),
+                    sources(&[
+                        ("core_string", "extend string {}"),
+                        ("core_int", "extend int {}"),
+                    ]),
                     sources(&[("maps", ""), ("math", "")]),
                 )
                 .unwrap();
@@ -318,8 +317,7 @@ mod tests {
                     .map(|module| module.path().to_vec())
                     .collect::<Vec<_>>();
 
-                assert_eq!(core_paths, [path(&["int"]), path(&["string"])]);
-                assert_eq!(bundle.core_always_active(), core_paths);
+                assert_eq!(core_paths, [path(&["core_int"]), path(&["core_string"])]);
             }
 
             #[test]
@@ -346,17 +344,16 @@ mod tests {
                 let expected = [
                     path(&["option"]),
                     path(&["range"]),
-                    path(&["int"]),
-                    path(&["float"]),
-                    path(&["string"]),
+                    path(&["core_int"]),
+                    path(&["core_float"]),
+                    path(&["core_string"]),
                 ];
 
                 assert_eq!(core.root().label(), "crates/core2/src/lib.anv");
                 assert_eq!(core_paths, expected);
-                assert_eq!(
-                    bundle.core_always_active(),
-                    &[path(&["int"]), path(&["float"]), path(&["string"])]
-                );
+                assert!(core.root().code().contains("pub import core_int { * };"));
+                assert!(core.root().code().contains("pub import core_float { * };"));
+                assert!(core.root().code().contains("pub import core_string { * };"));
                 assert!(core.root().code().contains("pub import option { * };"));
                 assert!(core.root().code().contains("pub import range { * };"));
             }
@@ -388,6 +385,9 @@ mod tests {
                 assert!(!code.contains("Option<float>"));
                 assert!(!code.contains("Option<bool>"));
                 assert!(!code.contains("Option<any>"));
+                assert!(!code.contains("import ext:int"));
+                assert!(!code.contains("import ext:float"));
+                assert!(!code.contains("import ext:string"));
             }
 
             #[test]
@@ -425,9 +425,9 @@ mod tests {
                     [
                         path(&["option"]),
                         path(&["range"]),
-                        path(&["int"]),
-                        path(&["float"]),
-                        path(&["string"]),
+                        path(&["core_int"]),
+                        path(&["core_float"]),
+                        path(&["core_string"]),
                     ]
                 );
                 assert_eq!(sorted_std_paths(&bundle), [path(&["mem"])]);
@@ -478,7 +478,7 @@ mod tests {
             }
 
             #[test]
-            fn core_primitive_extensions_are_always_active() {
+            fn core_primitive_extensions_are_forwarded_by_core_root() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(
                     &temp,
@@ -496,6 +496,15 @@ mod tests {
                 let error = new_frontend_cmd(&main).unwrap_err();
 
                 assert!(error.contains("int_abs"));
+            }
+
+            #[test]
+            fn core_primitive_wrapper_modules_are_not_preluded() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(&temp, "main.anv", "fn main() { core_int.abs(1); }");
+                let error = new_frontend_cmd(&main).unwrap_err();
+
+                assert!(error.contains("core_int"));
             }
 
             #[test]
@@ -580,6 +589,26 @@ mod tests {
                 write(&temp, "game/src/helper.anv", "pub fn local() -> int { 1 }");
                 write(&temp, "game/outside.anv", "pub fn escaped() -> int { 1 }");
                 write(&temp, "math/src/lib.anv", "pub fn add() -> int { 1 }");
+
+                check_manifest_file(&temp, &main).unwrap();
+            }
+
+            #[test]
+            fn package_root_reexport_forwards_extend() {
+                let temp = tempfile::tempdir().unwrap();
+                write_manifest(&temp, "game", "src/main.anv", &[("helpers", "../helpers")]);
+                write_manifest(&temp, "helpers", "src/lib.anv", &[]);
+                let main = write(
+                    &temp,
+                    "game/src/main.anv",
+                    "import pkg:helpers; fn main() { let x: string = \"hi\".shout(); }",
+                );
+                write(&temp, "helpers/src/lib.anv", "pub import strings;");
+                write(
+                    &temp,
+                    "helpers/src/strings.anv",
+                    "pub extend string { fn shout(self) -> string { self } }",
+                );
 
                 check_manifest_file(&temp, &main).unwrap();
             }

@@ -193,7 +193,6 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
             },
             packages,
             preloaded_modules: preloaded_modules(&sources),
-            always_active_modules: always_active_modules(&sources),
             source_loader: &mut source_loader,
         },
         FrontendConfig {
@@ -303,14 +302,6 @@ fn preload_system_package(
     }));
 }
 
-fn always_active_modules(sources: &SourceBundle) -> Vec<ModuleId> {
-    sources
-        .core_always_active()
-        .iter()
-        .map(|path| ModuleId::named(PackageId::core(), module_path(path.clone())))
-        .collect()
-}
-
 fn module_path(path: Vec<String>) -> anvyx_frontend::resolve::ModulePath {
     anvyx_frontend::resolve::ModulePath::new(path).expect("SourceBundle validates module paths")
 }
@@ -371,7 +362,6 @@ mod tests {
         prelude: Option<SourceText>,
         core_modules: Vec<ModuleSource>,
         std_modules: Vec<ModuleSource>,
-        always_active_modules: Vec<Vec<String>>,
     ) -> SourceBundle {
         let core = (prelude.is_some() || !core_modules.is_empty()).then(|| {
             system(
@@ -380,7 +370,7 @@ mod tests {
             )
         });
         let std = (!std_modules.is_empty()).then(|| system(std_root(&std_modules), std_modules));
-        SourceBundle::new(core, std, always_active_modules).unwrap()
+        SourceBundle::new(core, std)
     }
 
     fn unwrap_error(result: CheckResult) -> CheckError {
@@ -569,7 +559,7 @@ mod tests {
                 "fn main() { let x: int = prelude_value(); }",
             );
             let prelude = SourceText::new("pub fn prelude_value() -> int { 1 }", "<core>").unwrap();
-            let sources = bundle(Some(prelude), vec![], vec![], vec![]);
+            let sources = bundle(Some(prelude), vec![], vec![]);
 
             check_file(input(main, sources)).unwrap();
         }
@@ -582,7 +572,6 @@ mod tests {
             let sources = bundle(
                 Some(prelude),
                 vec![core_module("core_helpers", "pub fn value() -> int { 1 }")],
-                vec![],
                 vec![],
             );
 
@@ -743,7 +732,6 @@ mod tests {
                 None,
                 vec![],
                 vec![std_module("math", "pub const PI: int = 3;")],
-                vec![],
             );
 
             check_file(input(main, sources)).unwrap();
@@ -769,7 +757,6 @@ mod tests {
                 None,
                 vec![],
                 vec![std_module("math", "pub const PI: int = 3;")],
-                vec![],
             );
             let error = unwrap_error(check_file(input(main, sources)));
 
@@ -792,7 +779,6 @@ mod tests {
                 Some(prelude),
                 vec![],
                 vec![std_module("math", "pub fn value() -> int { core_value() }")],
-                vec![],
             );
 
             check_file(input(main, sources)).unwrap();
@@ -861,21 +847,21 @@ mod tests {
         }
 
         #[test]
-        fn always_active_extend_visible() {
+        fn core_root_reexported_extend_visible() {
             let temp = tempfile::tempdir().unwrap();
             let main = write(
                 &temp,
                 "main.anv",
                 "fn main() { let x: int = 1.plus_one(); }",
             );
+            let prelude = SourceText::new("pub import core_int { * };", "<core>").unwrap();
             let sources = bundle(
-                None,
+                Some(prelude),
                 vec![core_module(
-                    "int",
+                    "core_int",
                     "pub extend int { fn plus_one(self) -> int { self + 1 } }",
                 )],
                 vec![],
-                vec![path(&["int"])],
             );
 
             check_file(input(main, sources)).unwrap();

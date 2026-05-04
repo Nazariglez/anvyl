@@ -22,24 +22,21 @@ pub const MODULES: &[SourceFile] = &[
         code: include_str!("range.anv"),
     },
     SourceFile {
-        path: &["int"],
-        label: "crates/core2/src/int.anv",
-        code: include_str!("int.anv"),
+        path: &["core_int"],
+        label: "crates/core2/src/core_int.anv",
+        code: include_str!("core_int.anv"),
     },
     SourceFile {
-        path: &["float"],
-        label: "crates/core2/src/float.anv",
-        code: include_str!("float.anv"),
+        path: &["core_float"],
+        label: "crates/core2/src/core_float.anv",
+        code: include_str!("core_float.anv"),
     },
     SourceFile {
-        path: &["string"],
-        label: "crates/core2/src/string.anv",
-        code: include_str!("string.anv"),
+        path: &["core_string"],
+        label: "crates/core2/src/core_string.anv",
+        code: include_str!("core_string.anv"),
     },
 ];
-
-// FIXME: we need a way to re-export extend blocks without this tricks
-pub const ALWAYS_ACTIVE: &[&[&str]] = &[&["int"], &["float"], &["string"]];
 
 pub fn provider_descriptors() -> Vec<anvyx_externs::ProviderDescriptor> {
     vec![int_provider(), float_provider(), string_provider()]
@@ -48,7 +45,7 @@ pub fn provider_descriptors() -> Vec<anvyx_externs::ProviderDescriptor> {
 fn int_provider() -> anvyx_externs::ProviderDescriptor {
     anvyx_lang::provider_descriptor!(
         provider = "core_int",
-        module = "int",
+        module = "core_int",
         fn int_abs(x: int) -> int;,
         fn int_min(a: int, b: int) -> int;,
         fn int_max(a: int, b: int) -> int;,
@@ -59,7 +56,7 @@ fn int_provider() -> anvyx_externs::ProviderDescriptor {
 fn float_provider() -> anvyx_externs::ProviderDescriptor {
     anvyx_lang::provider_descriptor!(
         provider = "core_float",
-        module = "float",
+        module = "core_float",
         fn float_sin(x: float) -> float;,
         fn float_cos(x: float) -> float;,
         fn float_tan(x: float) -> float;,
@@ -89,7 +86,7 @@ fn float_provider() -> anvyx_externs::ProviderDescriptor {
 fn string_provider() -> anvyx_externs::ProviderDescriptor {
     anvyx_lang::provider_descriptor!(
         provider = "core_string",
-        module = "string",
+        module = "core_string",
         fn str_len(s: string) -> int;
         fn str_contains(s: string, sub: string) -> bool;
         fn str_starts_with(s: string, prefix: string) -> bool;
@@ -119,11 +116,14 @@ mod tests {
     fn root_metadata() {
         assert_eq!(ROOT.path, &[] as &[&str]);
         assert_eq!(ROOT.label, "crates/core2/src/lib.anv");
+        assert!(ROOT.code.contains("pub import core_int { * };"));
+        assert!(ROOT.code.contains("pub import core_float { * };"));
+        assert!(ROOT.code.contains("pub import core_string { * };"));
         assert!(ROOT.code.contains("pub import option { * };"));
         assert!(ROOT.code.contains("pub import range { * };"));
-        assert!(!ROOT.code.contains("int"));
-        assert!(!ROOT.code.contains("float"));
-        assert!(!ROOT.code.contains("string"));
+        assert!(!ROOT.code.contains("pub import core_int;"));
+        assert!(!ROOT.code.contains("pub import core_float;"));
+        assert!(!ROOT.code.contains("pub import core_string;"));
     }
 
     #[test]
@@ -133,23 +133,15 @@ mod tests {
             vec![
                 &["option"][..],
                 &["range"],
-                &["int"],
-                &["float"],
-                &["string"]
+                &["core_int"],
+                &["core_float"],
+                &["core_string"]
             ]
         );
         for module in MODULES {
             assert!(module.label.starts_with("crates/core2/src/"));
             assert!(module.label.ends_with(".anv"));
             assert!(!module.path.is_empty());
-        }
-    }
-
-    #[test]
-    fn always_active_modules() {
-        assert_eq!(ALWAYS_ACTIVE, &[&["int"][..], &["float"], &["string"]]);
-        for path in ALWAYS_ACTIVE {
-            assert!(MODULES.iter().any(|module| module.path == *path));
         }
     }
 
@@ -167,24 +159,27 @@ mod tests {
     }
 
     #[test]
-    fn extension_helpers_are_not_reexported_by_root() {
-        assert!(!ROOT.code.contains("pub import int"));
-        assert!(!ROOT.code.contains("pub import float"));
-        assert!(!ROOT.code.contains("pub import string"));
+    fn extension_helpers_are_not_module_reexported_by_root() {
+        assert!(!ROOT.code.contains("pub import core_int;"));
+        assert!(!ROOT.code.contains("pub import core_float;"));
+        assert!(!ROOT.code.contains("pub import core_string;"));
     }
 
     #[test]
     fn extension_modules_use_private_provider_imports() {
         let code = MODULES
             .iter()
-            .filter(|module| matches!(module.path, ["int"] | ["float"] | ["string"]))
+            .filter(|module| matches!(module.path, ["core_int"] | ["core_float"] | ["core_string"]))
             .map(|module| module.code)
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(code.contains("import ext:int"));
-        assert!(code.contains("import ext:float"));
-        assert!(code.contains("import ext:string"));
+        assert!(code.contains("import ext:core_int"));
+        assert!(code.contains("import ext:core_float"));
+        assert!(code.contains("import ext:core_string"));
+        assert!(!code.contains("import ext:int"));
+        assert!(!code.contains("import ext:float"));
+        assert!(!code.contains("import ext:string"));
         assert!(!code.contains(&["extern fn ", "int_"].concat()));
         assert!(!code.contains(&["extern fn ", "float_"].concat()));
         assert!(!code.contains(&["extern fn ", "str_"].concat()));
@@ -198,7 +193,10 @@ mod tests {
             .map(|provider| provider.modules[0].path.segments.as_slice())
             .collect::<Vec<_>>();
 
-        assert_eq!(modules, [&["int"][..], &["float"], &["string"]]);
+        assert_eq!(
+            modules,
+            [&["core_int"][..], &["core_float"], &["core_string"]]
+        );
         assert_eq!(providers[0].modules[0].functions[0].name, "int_abs");
     }
 }

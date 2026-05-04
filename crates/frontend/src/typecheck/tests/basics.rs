@@ -8,8 +8,6 @@ use crate::{
 };
 
 mod storage {
-    use std::collections::HashSet;
-
     use crate::{
         ast::{Ident, Program, Type},
         test_support::empty_resolved,
@@ -33,7 +31,6 @@ mod storage {
         let decls = DeclarationIndex::from_root_and_modules(
             &program,
             &resolved,
-            HashSet::new(),
             &crate::externs::RawExterns::default(),
         );
         let mut tc = TypeChecker::new(decls, crate::externs::catalog::ExternCatalog::default());

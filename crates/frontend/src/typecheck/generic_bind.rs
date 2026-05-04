@@ -175,8 +175,6 @@ impl ExplicitGenericBinder for TypeCheckerGenericBinder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
     use crate::{
         ast::{ConstArg, ConstParam, ConstValue, Ident, Program, TypeParam},
@@ -248,7 +246,6 @@ mod tests {
         let decls = DeclarationIndex::from_root_and_modules(
             &program,
             &resolved,
-            HashSet::new(),
             &crate::externs::RawExterns::default(),
         );
         let mut tc = TypeChecker::new(decls, crate::externs::catalog::ExternCatalog::default());

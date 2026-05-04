@@ -136,52 +136,17 @@ impl SystemPackageSource {
     pub fn providers(&self) -> &[anvyx_externs::ProviderDescriptor] {
         &self.providers
     }
-
-    fn contains_module(&self, path: &[String]) -> bool {
-        self.module(path).is_some()
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceBundle {
     core: Option<SystemPackageSource>,
     std: Option<SystemPackageSource>,
-    core_always_active: Vec<Vec<String>>,
 }
 
 impl SourceBundle {
-    pub fn new(
-        core: Option<SystemPackageSource>,
-        std: Option<SystemPackageSource>,
-        core_always_active: Vec<Vec<String>>,
-    ) -> Result<Self, CheckError> {
-        let mut active_paths = HashSet::new();
-        for path in &core_always_active {
-            validate_path(path)?;
-            insert_unique_path(
-                &mut active_paths,
-                path,
-                "duplicate always-active module path",
-            )?;
-            let Some(core) = &core else {
-                return invalid_input(format!(
-                    "always-active module requires a core package: {}",
-                    display_path(path)
-                ));
-            };
-            if !core.contains_module(path) {
-                return invalid_input(format!(
-                    "always-active module must refer to a core module: {}",
-                    display_path(path)
-                ));
-            }
-        }
-
-        Ok(Self {
-            core,
-            std,
-            core_always_active,
-        })
+    pub fn new(core: Option<SystemPackageSource>, std: Option<SystemPackageSource>) -> Self {
+        Self { core, std }
     }
 
     pub fn core(&self) -> Option<&SystemPackageSource> {
@@ -190,10 +155,6 @@ impl SourceBundle {
 
     pub fn std(&self) -> Option<&SystemPackageSource> {
         self.std.as_ref()
-    }
-
-    pub fn core_always_active(&self) -> &[Vec<String>] {
-        &self.core_always_active
     }
 
     pub fn system_module(&self, package: &PackageId, path: &[String]) -> Option<&ModuleSource> {
@@ -524,10 +485,6 @@ fn module_path(path: Vec<String>) -> Result<ModulePath, CheckError> {
     ModulePath::new(path).map_err(|error| CheckError::InvalidInput(error.to_string()))
 }
 
-fn validate_path(path: &[String]) -> Result<(), CheckError> {
-    module_path(path.to_vec()).map(|_| ())
-}
-
 fn validate_label(label: &str, name: &str) -> Result<(), CheckError> {
     if label.trim().is_empty() {
         return invalid_input(format!("{name} must not be empty"));
@@ -629,7 +586,7 @@ mod tests {
     }
 
     fn source_bundle(std_modules: Vec<ModuleSource>) -> SourceBundle {
-        SourceBundle::new(None, Some(system("<std>", std_modules)), vec![]).unwrap()
+        SourceBundle::new(None, Some(system("<std>", std_modules)))
     }
 
     fn invalid_message<T>(result: Result<T, CheckError>) -> String {
@@ -709,9 +666,7 @@ mod tests {
         let bundle = SourceBundle::new(
             Some(system("<core>", vec![core("math")])),
             Some(system("<std>", vec![std_module("math")])),
-            vec![],
-        )
-        .unwrap();
+        );
 
         assert_eq!(bundle.core().unwrap().modules().len(), 1);
         assert_eq!(bundle.std().unwrap().modules().len(), 1);
@@ -731,71 +686,10 @@ mod tests {
                 "<std>",
                 vec![std_module("math"), std_module("maps")],
             )),
-            vec![path(&["int"])],
-        )
-        .unwrap();
+        );
 
         assert_eq!(bundle.core().unwrap().modules().len(), 2);
         assert_eq!(bundle.std().unwrap().modules().len(), 2);
-        assert_eq!(bundle.core_always_active(), &[path(&["int"])]);
-    }
-
-    #[test]
-    fn source_bundle_rejects_empty_always_active_path() {
-        let message = invalid_message(SourceBundle::new(
-            Some(system("<core>", vec![core("int")])),
-            None,
-            vec![vec![]],
-        ));
-        assert!(message.contains("must not be empty"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_empty_always_active_segment() {
-        let message = invalid_message(SourceBundle::new(
-            Some(system("<core>", vec![core("int")])),
-            None,
-            vec![path(&["int", ""])],
-        ));
-        assert!(message.contains("empty segments"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_duplicate_always_active_paths() {
-        let message = invalid_message(SourceBundle::new(
-            Some(system("<core>", vec![core("int")])),
-            None,
-            vec![path(&["int"]), path(&["int"])],
-        ));
-        assert!(message.contains("duplicate always-active"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_always_active_without_core() {
-        let message = invalid_message(SourceBundle::new(None, None, vec![path(&["int"])]));
-        assert!(message.contains("requires a core package"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_always_active_missing_from_core_modules() {
-        let message = invalid_message(SourceBundle::new(
-            Some(system("<core>", vec![core("int")])),
-            None,
-            vec![path(&["helpers"])],
-        ));
-        assert!(message.contains("refer to a core module"));
-    }
-
-    #[test]
-    fn source_bundle_accepts_always_active_core_module() {
-        let bundle = SourceBundle::new(
-            Some(system("<core>", vec![core("int")])),
-            None,
-            vec![path(&["int"])],
-        )
-        .unwrap();
-
-        assert_eq!(bundle.core_always_active(), &[path(&["int"])]);
     }
 
     #[test]
@@ -804,7 +698,6 @@ mod tests {
 
         assert!(bundle.core().is_none());
         assert!(bundle.std().is_none());
-        assert!(bundle.core_always_active().is_empty());
     }
 
     #[test]
@@ -1226,9 +1119,7 @@ mod tests {
         let bundle = SourceBundle::new(
             Some(SystemPackageSource::new(prelude.clone(), vec![core.clone()]).unwrap()),
             Some(SystemPackageSource::new(root("<std>"), vec![std.clone()]).unwrap()),
-            vec![path(&["int"])],
-        )
-        .unwrap();
+        );
 
         assert_eq!(bundle.core().unwrap().root(), &prelude);
         assert_eq!(bundle.core().unwrap().modules(), &[core]);

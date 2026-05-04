@@ -1,4 +1,4 @@
-import ext:string {
+import ext:core_string {
     str_len,
     str_contains,
     str_starts_with,

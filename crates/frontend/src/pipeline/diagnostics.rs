@@ -140,13 +140,6 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
     Diagnostic::error(message)
 }
 
-pub(super) fn diagnose_unresolved_always_active_module(module: &ModuleScope) -> Diagnostic {
-    Diagnostic::error(format!(
-        "always-active module was not resolved: {}",
-        render_module_scope(module)
-    ))
-}
-
 pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnostic {
     let message = match error {
         ExternInputError::InvalidProviderDescriptor {

@@ -1,12 +1,10 @@
 use anvyx_lang2::{ModuleSource, SourceBundle, SourceText, SystemPackageSource};
 
 pub(crate) fn source_bundle() -> Result<SourceBundle, String> {
-    SourceBundle::new(
+    Ok(SourceBundle::new(
         Some(core_package()?),
         Some(std_package()?),
-        core_always_active(),
-    )
-    .map_err(|error| error.to_string())
+    ))
 }
 
 fn core_package() -> Result<SystemPackageSource, String> {
@@ -31,13 +29,6 @@ fn std_package() -> Result<SystemPackageSource, String> {
         anvyx_stdlib2::provider_descriptors(),
     )
     .map_err(|error| error.to_string())
-}
-
-fn core_always_active() -> Vec<Vec<String>> {
-    anvyx_core2::ALWAYS_ACTIVE
-        .iter()
-        .map(|path| path.iter().map(|segment| (*segment).to_string()).collect())
-        .collect()
 }
 
 fn core_source_text(source: &anvyx_core2::SourceFile) -> Result<SourceText, String> {

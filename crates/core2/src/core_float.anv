@@ -1,4 +1,4 @@
-import ext:float {
+import ext:core_float {
     float_sin,
     float_cos,
     float_tan,

@@ -46,11 +46,16 @@ fn parses_native_provider_import() {
 }
 
 #[test]
-fn parses_native_provider_keyword_module() {
-    let imp = first_import("import ext:int { int_abs };");
+fn parses_native_provider_primitive_module() {
+    let imp = first_import("import ext:core_int { int_abs };");
 
     assert_eq!(imp.target.root, ImportRoot::NativeProvider);
-    assert_named_path(&imp.target.path, &["int"]);
+    assert_named_path(&imp.target.path, &["core_int"]);
+}
+
+#[test]
+fn rejects_native_provider_keyword_module() {
+    parse_program_err("import ext:int { int_abs };");
 }
 
 #[test]

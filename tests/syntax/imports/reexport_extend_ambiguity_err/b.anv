@@ -1,0 +1,5 @@
+// @helper
+
+pub extend int {
+    fn pick(self) -> int { 2 }
+}

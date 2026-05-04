@@ -1,4 +1,4 @@
-import ext:int { int_abs, int_min, int_max, int_clamp };
+import ext:core_int { int_abs, int_min, int_max, int_clamp };
 
 pub extend int {
     /// Absolute value.

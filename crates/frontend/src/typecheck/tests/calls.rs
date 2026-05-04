@@ -88,13 +88,13 @@ fn generic_fn_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget {
-            id: CallableId::function(ModuleScope::Root, Ident::new("id")),
-            args: GenericArgs {
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("id")),
+            GenericArgs {
                 type_args: vec![Type::Int],
                 const_args: vec![],
-            },
-        }
+            }
+        )
     );
 }
 
@@ -107,13 +107,13 @@ fn explicit_prefix_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget {
-            id: CallableId::function(ModuleScope::Root, Ident::new("make")),
-            args: GenericArgs {
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("make")),
+            GenericArgs {
                 type_args: vec![Type::Int, Type::String],
                 const_args: vec![],
-            },
-        }
+            }
+        )
     );
 }
 
@@ -253,13 +253,13 @@ fn const_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget {
-            id: CallableId::function(ModuleScope::Root, Ident::new("len")),
-            args: GenericArgs {
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("len")),
+            GenericArgs {
                 type_args: vec![Type::Int],
                 const_args: vec![ConstTerm::from_usize(3)],
-            },
-        }
+            }
+        )
     );
 }
 
@@ -297,13 +297,13 @@ fn generic_const_call_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget {
-            id: CallableId::function(ModuleScope::Root, Ident::new("len")),
-            args: GenericArgs {
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("len")),
+            GenericArgs {
                 type_args: vec![Type::Int],
                 const_args: vec![ConstTerm::from_usize(3)],
-            },
-        }
+            }
+        )
     );
 }
 
@@ -316,13 +316,13 @@ fn generic_const_named_target() {
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
-        &CallTarget {
-            id: CallableId::function(ModuleScope::Root, Ident::new("len")),
-            args: GenericArgs {
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("len")),
+            GenericArgs {
                 type_args: vec![Type::Int],
                 const_args: vec![ConstTerm::from_usize(3)],
-            },
-        }
+            }
+        )
     );
 }
 
@@ -352,13 +352,13 @@ fn generic_const_unknown_name_arg_err() {
 
 #[test]
 fn call_target_facts_distinguish_const_infer() {
-    let facts = call_target_closure_facts(&CallTarget {
-        id: CallableId::function(ModuleScope::Root, Ident::new("take")),
-        args: GenericArgs {
+    let facts = call_target_closure_facts(&CallTarget::new(
+        CallableId::function(ModuleScope::Root, Ident::new("take")),
+        GenericArgs {
             type_args: vec![],
             const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
         },
-    });
+    ));
 
     assert!(!facts.types.contains_infer);
     assert!(facts.types.first_unresolved.is_none());
@@ -368,13 +368,13 @@ fn call_target_facts_distinguish_const_infer() {
 
 #[test]
 fn call_target_const_infer_error() {
-    let target = CallTarget {
-        id: CallableId::function(ModuleScope::Root, Ident::new("take")),
-        args: GenericArgs {
+    let target = CallTarget::new(
+        CallableId::function(ModuleScope::Root, Ident::new("take")),
+        GenericArgs {
             type_args: vec![],
             const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
         },
-    };
+    );
     let span = Span::new(1, 2);
     let mut errors = vec![];
 

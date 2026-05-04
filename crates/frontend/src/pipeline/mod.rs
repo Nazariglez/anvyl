@@ -10,7 +10,7 @@ pub use diagnostics::Diagnostic;
 
 use self::diagnostics::{
     diagnose_extern_input_error, diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error,
-    diagnose_type_error, diagnose_unresolved_always_active_module,
+    diagnose_type_error,
 };
 use crate::{
     ast::Program,
@@ -21,7 +21,7 @@ use crate::{
         ModuleLoader, PackageId, PackageInput as ResolvePackageInput, PackageKind, PreloadedModule,
         ResolveFailure, SystemPackages,
     },
-    typecheck::{self, ModuleScope},
+    typecheck,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +77,6 @@ pub struct PackageProgramInput<'a, L: PackageSourceLoader> {
     pub system: SystemPackages,
     pub packages: HashMap<PackageId, PackageSourceInput>,
     pub preloaded_modules: Vec<PackageModuleInput>,
-    pub always_active_modules: Vec<ModuleId>,
     pub source_loader: &'a mut L,
 }
 
@@ -119,11 +118,6 @@ pub fn check_packages<L: PackageSourceLoader>(
 
     let packages = parse_package_inputs(input.packages)?;
     let preloaded_modules = parse_package_modules(input.preloaded_modules)?;
-    let always_active_modules = input
-        .always_active_modules
-        .into_iter()
-        .map(|module| ModuleScope::from_module_id(&module))
-        .collect::<HashSet<_>>();
 
     let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
     let external_modules = externs::raw_extern_module_ids(&raw_externs);
@@ -159,18 +153,17 @@ pub fn check_packages<L: PackageSourceLoader>(
         }
     };
 
-    validate_always_active_modules(&resolved, &always_active_modules)?;
-
     let source_externs =
         externs::collect_source_externs(&root.program, &resolved).map_err(extern_error)?;
     raw_externs.append(source_externs);
     externs::validate_raw_shapes(&raw_externs).map_err(extern_error)?;
     externs::validate_raw_identities(&raw_externs).map_err(extern_error)?;
 
-    typecheck::check_with_modules(&root.program, &resolved, always_active_modules, raw_externs)
-        .map_err(|errors| CheckError::Type {
+    typecheck::check_with_modules(&root.program, &resolved, raw_externs).map_err(|errors| {
+        CheckError::Type {
             diagnostics: errors.iter().map(diagnose_type_error).collect(),
-        })?;
+        }
+    })?;
 
     Ok(CheckOk)
 }
@@ -222,30 +215,6 @@ fn parse_package_modules<E>(
             })
         })
         .collect()
-}
-
-fn validate_always_active_modules<E>(
-    resolved: &resolve::ResolveResult,
-    always_active_modules: &HashSet<ModuleScope>,
-) -> Result<(), CheckError<E>> {
-    let resolved_modules = resolved
-        .module_groups
-        .iter()
-        .flat_map(|group| group.iter())
-        .map(|module| ModuleScope::from_module_id(&module.key))
-        .collect::<HashSet<_>>();
-
-    let diagnostics = always_active_modules
-        .iter()
-        .filter(|module| !resolved_modules.contains(module))
-        .map(diagnose_unresolved_always_active_module)
-        .collect::<Vec<_>>();
-
-    if diagnostics.is_empty() {
-        Ok(())
-    } else {
-        Err(CheckError::Resolve { diagnostics })
-    }
 }
 
 fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
@@ -441,6 +410,13 @@ mod tests {
         }
     }
 
+    fn core_module(path: &[&str], code: &str) -> PackageModuleInput {
+        PackageModuleInput {
+            module: ModuleId::named(PackageId::core(), module_path(path)),
+            source: source(code, &format!("core.{}", path.join("."))),
+        }
+    }
+
     fn root_source(package: &PackageId, code: &str, label: &str) -> PackageModuleInput {
         PackageModuleInput {
             module: ModuleId::root(package.clone()),
@@ -453,7 +429,6 @@ mod tests {
         main: Source,
         prelude: Option<Source>,
         preloaded_modules: Vec<PackageModuleInput>,
-        always_active_modules: Vec<ModulePath>,
     ) -> PackageProgramInput<'_, L> {
         let root_package = root_package();
         let core_package = prelude.as_ref().map(|_| PackageId::core());
@@ -492,10 +467,6 @@ mod tests {
             },
             packages,
             preloaded_modules,
-            always_active_modules: always_active_modules
-                .into_iter()
-                .map(|path| ModuleId::named(root_package.clone(), path))
-                .collect(),
             source_loader: loader,
         }
     }
@@ -543,7 +514,6 @@ mod tests {
             source(source_code, "main.anv"),
             None,
             vec![],
-            vec![],
         ))
     }
 
@@ -573,7 +543,6 @@ mod tests {
                 source("fn main() {}", "main.anv"),
                 None,
                 vec![],
-                vec![],
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor()]),
@@ -590,7 +559,6 @@ mod tests {
                 &mut loader,
                 source("import math { dot }; fn main() {}", "main.anv"),
                 None,
-                vec![],
                 vec![],
             ),
             FrontendConfig {
@@ -613,7 +581,6 @@ mod tests {
                     "main.anv",
                 ),
                 None,
-                vec![],
                 vec![],
             ),
             FrontendConfig {
@@ -649,7 +616,6 @@ mod tests {
                     (host.clone(), native_package_input(&[])),
                 ]),
                 preloaded_modules: vec![],
-                always_active_modules: vec![],
                 source_loader: &mut loader,
             },
             FrontendConfig {
@@ -681,7 +647,6 @@ mod tests {
                     (host.clone(), native_package_input(&[])),
                 ]),
                 preloaded_modules: vec![],
-                always_active_modules: vec![],
                 source_loader: &mut loader,
             },
             FrontendConfig {
@@ -719,7 +684,6 @@ mod tests {
                     (math.clone(), package_input(&math, "", &[])),
                 ]),
                 preloaded_modules: vec![],
-                always_active_modules: vec![],
                 source_loader: &mut loader,
             },
             FrontendConfig {
@@ -760,7 +724,6 @@ mod tests {
                     ),
                 ]),
                 preloaded_modules: vec![],
-                always_active_modules: vec![],
                 source_loader: &mut loader,
             },
             FrontendConfig {
@@ -799,7 +762,6 @@ mod tests {
                     ),
                 ]),
                 preloaded_modules: vec![],
-                always_active_modules: vec![],
                 source_loader: &mut loader,
             },
             FrontendConfig {
@@ -817,7 +779,6 @@ mod tests {
                 &mut loader,
                 source("import ext:audio; fn main() {}", "main.anv"),
                 None,
-                vec![],
                 vec![],
             ),
             FrontendConfig {
@@ -839,7 +800,6 @@ mod tests {
                 source("import math { dot }; fn main() {}", "main.anv"),
                 None,
                 vec![],
-                vec![],
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor()]),
@@ -858,7 +818,6 @@ mod tests {
                 &mut loader,
                 source("fn main() {}", "main.anv"),
                 None,
-                vec![],
                 vec![],
             ),
             FrontendConfig {
@@ -896,7 +855,6 @@ mod tests {
                 &mut loader,
                 source("fn main() { missing; }", "main.anv"),
                 None,
-                vec![],
                 vec![],
             ),
             FrontendConfig {
@@ -1012,13 +970,7 @@ mod tests {
     fn parse_errors_take_precedence_over_provider_errors() {
         let mut loader = TestLoader::default();
         let err = pipeline_check(
-            input(
-                &mut loader,
-                source("fn main( {}", "main.anv"),
-                None,
-                vec![],
-                vec![],
-            ),
+            input(&mut loader, source("fn main( {}", "main.anv"), None, vec![]),
             FrontendConfig {
                 externs: extern_inputs(vec![invalid_provider_descriptor()]),
             },
@@ -1132,45 +1084,42 @@ mod tests {
             source("fn main() { let x: int = prelude_value(); }", "main.anv"),
             Some(source("pub fn prelude_value() -> int { 1 }", "<prelude>")),
             vec![],
-            vec![],
         ))
         .unwrap();
     }
 
     #[test]
-    fn always_active_extend_is_visible_without_import() {
+    fn core_root_reexported_extend_is_visible_without_import() {
         let mut loader = TestLoader::default();
         check(input(
             &mut loader,
             source("fn main() { let x: int = 1.plus_one(); }", "main.anv"),
-            None,
-            vec![module(
+            Some(source("pub import core_int { * };", "<core>")),
+            vec![core_module(
                 &["core_int"],
                 "pub extend int { fn plus_one(self) -> int { self + 1 } }",
             )],
-            vec![module_path(&["core_int"])],
         ))
         .unwrap();
     }
 
     #[test]
-    fn unresolved_always_active_module_is_resolve_error() {
+    fn core_root_wildcard_reexport_does_not_import_module_name() {
         let mut loader = TestLoader::default();
         let err = check(input(
             &mut loader,
-            source("fn main() {}", "main.anv"),
-            None,
-            vec![],
-            vec![module_path(&["missing", "helpers"])],
+            source(
+                "fn main() { let x: int = core_int.plus_one(1); }",
+                "main.anv",
+            ),
+            Some(source("pub import core_int { * };", "<core>")),
+            vec![core_module(
+                &["core_int"],
+                "pub extend int { fn plus_one(self) -> int { self + 1 } }",
+            )],
         ))
         .unwrap_err();
-        let CheckError::Resolve { diagnostics } = err else {
-            panic!("expected resolve error");
-        };
-        assert_eq!(
-            diagnostic_messages(&diagnostics),
-            ["always-active module was not resolved: missing.helpers"]
-        );
+        assert!(matches!(err, CheckError::Type { .. }));
     }
 
     #[test]
@@ -1181,7 +1130,6 @@ mod tests {
             source("fn main() {}", "main.anv"),
             None,
             vec![module(&["core_int"], ""), module(&["core_int"], "")],
-            vec![],
         ))
         .unwrap_err();
         let CheckError::Resolve { diagnostics } = err else {
@@ -1205,21 +1153,19 @@ mod tests {
                 &["core_int"],
                 "pub extend int { fn plus_one(self) -> int { self + 1 } }",
             )],
-            vec![],
         ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Type { .. }));
     }
 
     #[test]
-    fn always_active_module_names_are_not_imported() {
+    fn preloaded_module_names_are_not_imported() {
         let mut loader = TestLoader::default();
         let err = check(input(
             &mut loader,
             source("fn main() { let x: int = hidden(); }", "main.anv"),
             None,
             vec![module(&["helpers"], "pub fn hidden() -> int { 1 }")],
-            vec![module_path(&["helpers"])],
         ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Type { .. }));
@@ -1236,7 +1182,6 @@ mod tests {
                 "main.anv",
             ),
             None,
-            vec![],
             vec![],
         ))
         .unwrap();
@@ -1267,7 +1212,6 @@ mod tests {
                 ),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
@@ -1280,7 +1224,6 @@ mod tests {
             &mut loader,
             source("fn main() { let x: Option<int> = nil; }", "main.anv"),
             Some(source("enum Option<T> { Some(T), None }", "<core>")),
-            vec![],
             vec![],
         ))
         .unwrap();
@@ -1305,7 +1248,6 @@ mod tests {
             },
             packages: HashMap::from([(core, PackageSourceInput::default())]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap_err();
@@ -1339,7 +1281,6 @@ mod tests {
                 ),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap_err();
@@ -1369,7 +1310,6 @@ mod tests {
                 ),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
@@ -1400,7 +1340,6 @@ mod tests {
                 ),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
@@ -1432,7 +1371,6 @@ mod tests {
                 ),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
@@ -1465,7 +1403,6 @@ mod tests {
                 (physics.clone(), package_input(&physics, "pub import types;", &[])),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
@@ -1494,7 +1431,6 @@ mod tests {
                 (std.clone(), package_input(&std, "pub import math;", &[])),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
@@ -1523,7 +1459,6 @@ mod tests {
                 (std.clone(), package_input(&std, "pub import math;", &[])),
             ]),
             preloaded_modules: vec![],
-            always_active_modules: vec![],
             source_loader: &mut loader,
         })
         .unwrap();
@@ -1539,7 +1474,6 @@ mod tests {
                 "main.anv",
             ),
             None,
-            vec![],
             vec![],
         ))
         .unwrap_err();
@@ -1558,7 +1492,6 @@ mod tests {
             source("import broken; fn main() {}", "main.anv"),
             None,
             vec![],
-            vec![],
         ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Parse { label, .. } if label == "broken"));
@@ -1573,7 +1506,6 @@ mod tests {
             source("import broken; fn main() {}", "main.anv"),
             None,
             vec![],
-            vec![],
         ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Lex { label, .. } if label == "broken"));
@@ -1587,7 +1519,6 @@ mod tests {
             &mut loader,
             source("import broken; fn main() {}", "main.anv"),
             None,
-            vec![],
             vec![],
         ))
         .unwrap_err();

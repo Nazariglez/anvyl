@@ -1,10 +1,8 @@
-use std::collections::HashSet;
-
 use crate::{
     ast::Type,
     externs,
-    test_support::{empty_resolved, module_path, parse_program, resolved_modules},
-    typecheck::{self, ModuleScope, TypeError},
+    test_support::{empty_resolved, parse_program, resolved_modules},
+    typecheck::{self, TypeError},
 };
 
 pub(crate) fn assert_typecheck_closed(result: &typecheck::TypecheckResult) {
@@ -55,7 +53,7 @@ pub(crate) fn check(source: &str) -> Result<typecheck::TypecheckResult, Vec<Type
     let program = parse_program(source);
     let resolved = empty_resolved();
     let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
-    typecheck::check_with_modules(&program, &resolved, HashSet::new(), raw_externs)
+    typecheck::check_with_modules(&program, &resolved, raw_externs)
 }
 
 pub(crate) fn errors(source: &str) -> Vec<TypeError> {
@@ -82,30 +80,10 @@ pub(crate) fn check_named(
     root_source: &str,
     modules: &[(&str, &str)],
 ) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
-    check_with_active(root_source, modules, &[])
-}
-
-pub(crate) fn check_active(
-    root_source: &str,
-    modules: &[(&str, &str)],
-    always_active: &[&str],
-) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
-    check_with_active(root_source, modules, always_active)
-}
-
-fn check_with_active(
-    root_source: &str,
-    modules: &[(&str, &str)],
-    always_active: &[&str],
-) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
     let root = parse_program(root_source);
     let resolved = resolved_modules(&root, modules);
-    let always_active_modules = always_active
-        .iter()
-        .map(|name| ModuleScope::Named(module_path(name)))
-        .collect();
     let raw_externs = externs::collect_source_externs(&root, &resolved).unwrap();
-    typecheck::check_with_modules(&root, &resolved, always_active_modules, raw_externs)
+    typecheck::check_with_modules(&root, &resolved, raw_externs)
 }
 
 fn last_expr_type(result: &typecheck::TypecheckResult) -> Option<Type> {

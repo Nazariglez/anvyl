@@ -285,7 +285,6 @@ pub(crate) struct DeclarationIndex {
     extends: Vec<ExtendSchema>,
     value_spans: HashMap<(ModuleScope, Ident), Span>,
     type_spans: HashMap<NominalKey, Span>,
-    always_active_modules: HashSet<ModuleScope>,
     errors: Vec<DeclError>,
 }
 
@@ -337,6 +336,7 @@ struct ImportTargetScope {
 pub(crate) struct ModuleDecls {
     locals: Namespace,
     exports: ModuleExports,
+    exported_active_modules: HashSet<ModuleScope>,
     imports: ImportScope,
 }
 
@@ -671,8 +671,8 @@ impl ImportScopeBuilder {
         )
     }
 
-    fn finish_namespace(self) -> (Namespace, Vec<DeclError>) {
-        (self.namespace, self.errors)
+    fn finish_reexport_scope(self) -> (Namespace, HashSet<ModuleScope>, Vec<DeclError>) {
+        (self.namespace, self.active_modules, self.errors)
     }
 }
 
@@ -808,13 +808,9 @@ impl DeclarationIndex {
     pub(crate) fn from_root_and_modules(
         root: &Program,
         resolved: &ResolveResult,
-        always_active: HashSet<ModuleScope>,
         externs: &RawExterns,
     ) -> Self {
-        let mut index = Self {
-            always_active_modules: always_active,
-            ..Self::default()
-        };
+        let mut index = Self::default();
         let modules = Self::module_programs(root, resolved);
         for (scope, program) in &modules {
             index.collect_module(
@@ -825,6 +821,7 @@ impl DeclarationIndex {
         }
         index.collect_extern_headers(externs);
         index.apply_public_import_reexports(&modules, resolved);
+        index.close_exported_active_modules();
         index.build_import_scopes(&modules, resolved);
         index
     }
@@ -1421,11 +1418,58 @@ impl DeclarationIndex {
                 ImportScopeBuilder::with_namespace(scope.clone(), exports, ImportMode::Reexport);
             self.apply_program_imports(scope, program, resolved, &mut builder);
 
-            let (exports, errors) = builder.finish_namespace();
+            let (exports, active_modules, errors) = builder.finish_reexport_scope();
             self.errors.extend(errors);
             if let Some(decls) = self.modules.get_mut(scope) {
                 decls.exports = exports;
+                decls.exported_active_modules = active_modules;
             }
+        }
+    }
+
+    fn close_exported_active_modules(&mut self) {
+        loop {
+            let snapshot = self
+                .modules
+                .iter()
+                .map(|(module, decls)| (module.clone(), decls.exported_active_modules.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut changed = false;
+
+            for (module, decls) in &mut self.modules {
+                let owner = module.clone();
+                let direct = decls
+                    .exported_active_modules
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for active in direct {
+                    let Some(surface) = snapshot.get(&active) else {
+                        continue;
+                    };
+                    for exported in surface {
+                        if exported == &owner {
+                            continue;
+                        }
+                        changed |= decls.exported_active_modules.insert(exported.clone());
+                    }
+                }
+                decls.exported_active_modules.remove(&owner);
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn expand_active_modules(&self, active_modules: &mut HashSet<ModuleScope>) {
+        let roots = active_modules.iter().cloned().collect::<Vec<_>>();
+        for module in roots {
+            let Some(decls) = self.modules.get(&module) else {
+                continue;
+            };
+            active_modules.extend(decls.exported_active_modules.iter().cloned());
         }
     }
 
@@ -1439,22 +1483,36 @@ impl DeclarationIndex {
             if let Some(decls) = self.modules.get(scope) {
                 builder.seed_origins(&decls.locals, &BindingOrigin::Local);
             }
-            if let Some(core_package) = &resolved.system.core
-                && package_for_scope(scope) != *core_package
-            {
-                let core = ModuleScope::from_module_id(&ModuleId::root(core_package.clone()));
-                if let Some(decls) = self.modules.get(&core) {
-                    builder.copy_wildcard_members(&decls.exports, &core, Span::new(0, 0));
-                }
-            }
+            self.apply_core_prelude_import(scope, resolved, &mut builder);
             self.apply_program_imports(scope, program, resolved, &mut builder);
             let (mut imports, errors) = builder.finish_import_scope();
             self.errors.extend(errors);
             imports.activate_imported_origins();
+            self.expand_active_modules(&mut imports.active_modules);
             if let Some(decls) = self.modules.get_mut(scope) {
                 decls.imports = imports;
             }
         }
+    }
+
+    fn apply_core_prelude_import(
+        &self,
+        scope: &ModuleScope,
+        resolved: &ResolveResult,
+        builder: &mut ImportScopeBuilder,
+    ) {
+        let Some(core_package) = &resolved.system.core else {
+            return;
+        };
+        if package_for_scope(scope) == *core_package {
+            return;
+        }
+        let core = ModuleScope::from_module_id(&ModuleId::root(core_package.clone()));
+        let Some(decls) = self.modules.get(&core) else {
+            return;
+        };
+        builder.copy_wildcard_members(&decls.exports, &core, Span::new(0, 0));
+        builder.active_modules.insert(core);
     }
 
     fn apply_program_imports(
@@ -1480,9 +1538,7 @@ impl DeclarationIndex {
             else {
                 continue;
             };
-            if builder.mode == ImportMode::Import {
-                builder.active_modules.insert(target.module.clone());
-            }
+            builder.active_modules.insert(target.module.clone());
             let dep = self.modules.get(&target.module);
             let validate_members = builder.mode == ImportMode::Reexport || !is_public;
             builder.apply_import(
@@ -1577,10 +1633,6 @@ impl DeclarationIndex {
             .is_some_and(|decls| decls.imports.active_modules.contains(imported))
     }
 
-    pub(crate) fn always_active_module(&self, module: &ModuleScope) -> bool {
-        self.always_active_modules.contains(module)
-    }
-
     pub(crate) fn set_const_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
         let ty = Box::new(ty);
         for decls in self.modules.values_mut() {
@@ -1654,6 +1706,35 @@ impl DeclarationIndex {
 
     pub(crate) fn extends(&self) -> impl Iterator<Item = &ExtendSchema> {
         self.extends.iter()
+    }
+
+    fn module_surface_contains(&self, module: &ModuleScope, origin: &ModuleScope) -> bool {
+        module == origin
+            || self
+                .modules
+                .get(module)
+                .is_some_and(|decls| decls.exported_active_modules.contains(origin))
+    }
+
+    pub(crate) fn module_surface_has_extend_method(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> bool {
+        self.extends().any(|ext| {
+            ext.methods.contains_key(&name) && self.module_surface_contains(module, &ext.origin)
+        })
+    }
+
+    pub(crate) fn find_extend_method_in_module_surface(
+        &self,
+        module: &ModuleScope,
+        receiver: &Type,
+        name: Ident,
+    ) -> Option<ExtendMethodMatch<'_>> {
+        self.find_extend_method(receiver, name, |ext| {
+            self.module_surface_contains(module, &ext.origin)
+        })
     }
 
     pub(crate) fn find_extend_method<F>(
@@ -2468,14 +2549,14 @@ mod tests {
         let root = parse(root);
         let resolved = resolved_modules(&root, modules);
         let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
-        DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new(), &externs)
+        DeclarationIndex::from_root_and_modules(&root, &resolved, &externs)
     }
 
     fn checked_index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
         let root = parse(root);
         let resolved = resolved_modules(&root, modules);
         let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
-        super::super::check_with_modules(&root, &resolved, HashSet::new(), externs)
+        super::super::check_with_modules(&root, &resolved, externs)
             .expect("typecheck failed")
             .decls()
             .clone()
@@ -2500,7 +2581,7 @@ mod tests {
         .unwrap();
         let external_modules = crate::externs::raw_extern_module_ids(&raw);
         let resolved = resolved_modules_with_external(&root, modules, &external_modules);
-        DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new(), &raw)
+        DeclarationIndex::from_root_and_modules(&root, &resolved, &raw)
     }
 
     fn provider_with_module(module: ExternModuleDescriptor) -> ProviderDescriptor {

@@ -474,17 +474,17 @@ mod method_calls {
         let target = result.calls().values().next().expect("missing call target");
         assert_eq!(
             target,
-            &CallTarget {
-                id: CallableId::aggregate_method(
+            &CallTarget::new(
+                CallableId::aggregate_method(
                     root_key(NominalKind::Struct, owner),
                     Ident::new(name),
                     is_instance,
                 ),
-                args: GenericArgs {
+                GenericArgs {
                     type_args,
                     const_args: vec![],
-                },
-            }
+                }
+            )
         );
     }
 
@@ -879,19 +879,19 @@ mod extend_calls {
         let target = result.calls().values().next().expect("missing call target");
         assert_eq!(
             target,
-            &CallTarget {
-                id: CallableId::extend_method(
+            &CallTarget::new(
+                CallableId::extend_method(
                     ExtendId {
                         module: ModuleScope::Root,
                         index,
                     },
                     Ident::new(name),
                 ),
-                args: GenericArgs {
+                GenericArgs {
                     type_args,
                     const_args: vec![],
-                },
-            }
+                }
+            )
         );
     }
 
