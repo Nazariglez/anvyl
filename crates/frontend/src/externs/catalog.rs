@@ -8,14 +8,14 @@ use anvyx_externs::{
 use crate::{
     ast::{FuncParam, Ident, NominalKind, Type},
     externs::{
-        extern_module_scope,
+        extern_module_path, extern_module_scope,
         raw::{
             ExternProvenance, RawExternFunction, RawExternModule, RawExternOperator, RawExternSite,
             RawExternStatic, RawExternType, RawExterns,
         },
         raw_module_scope,
     },
-    resolve::ModulePath,
+    resolve::{ModuleId, ModulePath},
     typecheck::{DeclarationIndex, ModuleScope, NominalKey, TypeRefError, type_closure_facts},
 };
 
@@ -953,7 +953,7 @@ impl<'a> CatalogBuilder<'a> {
         let Some(key) = key else {
             self.errors.push(ExternCatalogError::UnknownType {
                 context: ctx.context.clone(),
-                module: module.map(extern_module_scope),
+                module: module.map(|module| missing_type_module(ctx.scope, ctx.context, module)),
                 name,
                 site: ctx.site,
             });
@@ -974,8 +974,17 @@ impl<'a> CatalogBuilder<'a> {
         name: Ident,
     ) -> Option<NominalKey> {
         match module {
-            Some(module) => self.decls.exported_type(&extern_module_scope(module), name),
-            None => self.decls.local_type(scope, name),
+            Some(module) => self
+                .decls
+                .exported_type(&provider_module_scope(scope, module), name)
+                .or_else(|| {
+                    self.decls
+                        .exported_type(&provider_source_module_scope(scope, module), name)
+                }),
+            None => self.decls.local_type(scope, name).or_else(|| {
+                self.decls
+                    .local_type(&provider_source_current_scope(scope)?, name)
+            }),
         }
     }
 
@@ -1044,6 +1053,51 @@ impl<'a> CatalogBuilder<'a> {
             }
         }
     }
+}
+
+fn missing_type_module(
+    scope: &ModuleScope,
+    context: &ExternCatalogContext,
+    module: &anvyx_externs::ModulePath,
+) -> ModuleScope {
+    match context.provenance {
+        ExternProvenance::Provider { .. } => provider_module_scope(scope, module),
+        ExternProvenance::Source { .. } => extern_module_scope(module),
+    }
+}
+
+fn provider_module_scope(scope: &ModuleScope, module: &anvyx_externs::ModulePath) -> ModuleScope {
+    let path = extern_module_path(module);
+    match scope {
+        ModuleScope::Package(current) => {
+            ModuleScope::from_module_id(&ModuleId::provider(current.package().clone(), path))
+        }
+        ModuleScope::Root | ModuleScope::Named(_) => ModuleScope::Named(path),
+    }
+}
+
+fn provider_source_module_scope(
+    scope: &ModuleScope,
+    module: &anvyx_externs::ModulePath,
+) -> ModuleScope {
+    let path = extern_module_path(module);
+    match scope {
+        ModuleScope::Package(current) => {
+            ModuleScope::from_module_id(&ModuleId::named(current.package().clone(), path))
+        }
+        ModuleScope::Root | ModuleScope::Named(_) => ModuleScope::Named(path),
+    }
+}
+
+fn provider_source_current_scope(scope: &ModuleScope) -> Option<ModuleScope> {
+    let ModuleScope::Package(current) = scope else {
+        return None;
+    };
+    let path = current.provider_path()?.clone();
+    Some(ModuleScope::from_module_id(&ModuleId::named(
+        current.package().clone(),
+        path,
+    )))
 }
 
 fn validate_catalog(catalog: &ExternCatalog) -> Result<(), Vec<ExternCatalogError>> {
@@ -1309,8 +1363,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        ast::{Ident, NominalKind, Program},
+        ast::{Ident, ModuleOrigin, NominalKind, Program},
         externs::RawExternScope,
+        resolve::PackageId,
         test_support::{parse_program, resolved_modules, root_id},
         typecheck::DeclarationIndex,
     };
@@ -1501,6 +1556,13 @@ mod tests {
         ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
     }
 
+    fn provider_scope(name: &str) -> ModuleScope {
+        ModuleScope::from_module_id(&ModuleId::provider(
+            PackageId::synthetic_root(),
+            ModulePath::new(vec![name.to_string()]).unwrap(),
+        ))
+    }
+
     fn function_key(module: ModuleScope, name: &str) -> FunctionKey {
         FunctionKey {
             module,
@@ -1521,6 +1583,19 @@ mod tests {
             kind: NominalKind::Extern,
             name: ident(name),
         }
+    }
+
+    fn provider_nominal(module: &str, name: &str) -> Type {
+        Type::nominal_with_origin(
+            NominalKind::Extern,
+            ident(name),
+            vec![],
+            vec![],
+            Some(ModuleOrigin::Provider {
+                package: PackageId::synthetic_root().to_string(),
+                path: vec![module.to_string()].into(),
+            }),
+        )
     }
 
     fn parse(source: &str) -> Program {
@@ -1546,11 +1621,14 @@ mod tests {
 
     fn provider_raw(module: ExternModuleDescriptor) -> RawExterns {
         crate::externs::ingest_providers(crate::externs::ExternInputs {
-            providers: vec![ProviderDescriptor {
-                provider: ProviderId {
-                    name: "host".to_string(),
-                },
-                modules: vec![module],
+            packages: vec![crate::externs::PackageExternInputs {
+                package: PackageId::synthetic_root(),
+                providers: vec![ProviderDescriptor {
+                    provider: ProviderId {
+                        name: "host".to_string(),
+                    },
+                    modules: vec![module],
+                }],
             }],
         })
         .unwrap()
@@ -1708,12 +1786,12 @@ mod tests {
 
             assert!(
                 catalog
-                    .type_by_key(&type_key(scope("host"), "Handle"))
+                    .type_by_key(&type_key(provider_scope("host"), "Handle"))
                     .is_some()
             );
             assert!(
                 catalog
-                    .function_by_key(&function_key(scope("host"), "make"))
+                    .function_by_key(&function_key(provider_scope("host"), "make"))
                     .is_some()
             );
             assert!(
@@ -1744,19 +1822,13 @@ mod tests {
             let catalog = build_catalog(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
-                    .function_by_key(&function_key(scope("math"), "len"))
+                    .function_by_key(&function_key(provider_scope("math"), "len"))
                     .unwrap(),
             );
 
             assert_eq!(
                 function.signature.params[0].ty.ty,
-                Type::nominal(
-                    NominalKind::Extern,
-                    ident("Vec2"),
-                    vec![],
-                    vec![],
-                    Some(vec!["math".to_string()].into())
-                )
+                provider_nominal("math", "Vec2")
             );
             assert!(!function.signature.params[0].ty.contains_any());
         }
@@ -1777,7 +1849,7 @@ mod tests {
             let catalog = build_catalog(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
-                    .function_by_key(&function_key(scope("math"), "make"))
+                    .function_by_key(&function_key(provider_scope("math"), "make"))
                     .unwrap(),
             );
 
@@ -1800,7 +1872,7 @@ mod tests {
             let catalog = build_catalog(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
-                    .function_by_key(&function_key(scope("host"), "make"))
+                    .function_by_key(&function_key(provider_scope("host"), "make"))
                     .unwrap(),
             );
 
@@ -1860,7 +1932,7 @@ mod tests {
             let catalog = build_catalog(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
-                    .function_by_key(&function_key(scope("host"), "make"))
+                    .function_by_key(&function_key(provider_scope("host"), "make"))
                     .unwrap(),
             );
 
@@ -2080,7 +2152,7 @@ mod tests {
             let param = &catalog
                 .function(
                     catalog
-                        .function_by_key(&function_key(scope("host"), "use_cb"))
+                        .function_by_key(&function_key(provider_scope("host"), "use_cb"))
                         .unwrap(),
                 )
                 .signature
@@ -2440,11 +2512,11 @@ mod tests {
             let catalog = build_catalog(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
-                    .function_by_key(&function_key(scope("host"), "pass"))
+                    .function_by_key(&function_key(provider_scope("host"), "pass"))
                     .unwrap(),
             );
             let ty = catalog.ty(catalog
-                .type_by_key(&type_key(scope("host"), "Box"))
+                .type_by_key(&type_key(provider_scope("host"), "Box"))
                 .unwrap());
 
             assert!(function.signature.params[0].ty.contains_any());

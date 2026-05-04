@@ -1,7 +1,9 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use anvyx_lang::{CompilationContext, LintConfig, LintLevel};
-use anvyx_lang2::{PackageId as FrontendPackageId, SourceBundle};
+use anvyx_lang2::{
+    CheckFileInput, CheckPackageInput, PackageId as FrontendPackageId, PackageSource, SourceBundle,
+};
 
 use crate::{
     manifest::{Manifest, PackageGraph, PackageId},
@@ -40,8 +42,8 @@ pub fn new_frontend_cmd(file: &Path) -> Result<(), String> {
         let input = package_check_input(&graph, file, sources)?;
         anvyx_lang2::check_package(input).map_err(|error| error.to_string())?;
     } else {
-        let input = anvyx_lang2::CheckFileInput::new(file.to_path_buf(), sources)
-            .map_err(|error| error.to_string())?;
+        let input =
+            CheckFileInput::new(file.to_path_buf(), sources).map_err(|error| error.to_string())?;
         anvyx_lang2::check_file(input).map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -51,7 +53,7 @@ fn package_check_input(
     graph: &PackageGraph,
     file: &Path,
     sources: SourceBundle,
-) -> Result<anvyx_lang2::CheckPackageInput, String> {
+) -> Result<CheckPackageInput, String> {
     let root = graph.root();
     let root_id = frontend_package_id(&root.id);
     let packages = graph
@@ -63,17 +65,27 @@ fn package_check_input(
                 .iter()
                 .map(|(alias, id)| (alias.clone(), frontend_package_id(id)))
                 .collect();
-            anvyx_lang2::PackageSource::new(
-                frontend_package_id(&package.id),
-                package.entry.clone(),
-                package.source_root.clone(),
-                dependencies,
-            )
-            .map_err(|error| error.to_string())
+            match (&package.entry, &package.source_root) {
+                (Some(entry), Some(source_root)) => PackageSource::new(
+                    frontend_package_id(&package.id),
+                    entry.clone(),
+                    source_root.clone(),
+                    dependencies,
+                )
+                .map_err(|error| error.to_string()),
+                (None, None) => Ok(PackageSource::native_only(
+                    frontend_package_id(&package.id),
+                    dependencies,
+                )),
+                _ => Err(format!(
+                    "package {} has inconsistent source entry/source root state",
+                    package.id
+                )),
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    anvyx_lang2::CheckPackageInput::new(root_id, file.to_path_buf(), packages, sources)
+    CheckPackageInput::new(root_id, file.to_path_buf(), packages, sources)
         .map_err(|error| error.to_string())
 }
 
@@ -146,7 +158,7 @@ mod tests {
         Manifest {
             project: Project {
                 name: None,
-                entry: "main.anv".to_string(),
+                entry: Some("main.anv".to_string()),
             },
             dependencies: HashMap::new(),
             externs: HashMap::new(),
@@ -178,7 +190,10 @@ mod tests {
 
         fn sorted_std_paths(bundle: &SourceBundle) -> Vec<Vec<String>> {
             let mut paths = bundle
-                .std_modules()
+                .std()
+                .unwrap()
+                .modules()
+                .iter()
                 .map(|module| module.path().to_vec())
                 .collect::<Vec<_>>();
             paths.sort();
@@ -186,7 +201,7 @@ mod tests {
         }
 
         mod bundle {
-            use anvyx_lang2::{ModuleSource, SourceText};
+            use anvyx_lang2::{ModuleSource, SourceText, SystemPackageSource};
 
             use super::*;
 
@@ -213,20 +228,27 @@ mod tests {
                 let std_modules = sorted_modules(std_sources)
                     .into_iter()
                     .map(|(name, source)| {
-                        let path = vec!["std".to_string(), name.clone()];
+                        let path = vec![name.clone()];
                         let label = format!("<std.{name}>");
                         ModuleSource::new(path, source.anv_source, label)
                             .map_err(|error| error.to_string())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-
-                SourceBundle::new(
-                    Some(prelude),
-                    core_modules,
+                let std_root = std_modules
+                    .iter()
+                    .map(|module| format!("pub import {};", module.path().join(".")))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let core = SystemPackageSource::new(prelude, core_modules)
+                    .map_err(|error| error.to_string())?;
+                let std = SystemPackageSource::new(
+                    SourceText::new(std_root, "<std>").map_err(|error| error.to_string())?,
                     std_modules,
-                    always_active_modules,
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+
+                SourceBundle::new(Some(core), Some(std), always_active_modules)
+                    .map_err(|error| error.to_string())
             }
 
             fn sorted_modules(
@@ -242,7 +264,7 @@ mod tests {
                 let bundle =
                     bundle_from_sources("fn p() {}".to_string(), HashMap::new(), HashMap::new())
                         .unwrap();
-                let prelude = bundle.core_prelude().unwrap();
+                let prelude = bundle.core().unwrap().root();
 
                 assert_eq!(prelude.label(), "<core>");
                 assert_eq!(prelude.code(), "fn p() {}");
@@ -252,17 +274,17 @@ mod tests {
             fn core_modules() {
                 let bundle = bundle_from_sources(
                     String::new(),
-                    sources(&[("core_int", "extend int {}")]),
+                    sources(&[("int", "extend int {}")]),
                     HashMap::new(),
                 )
                 .unwrap();
-                let modules = bundle.core_modules();
+                let modules = bundle.core().unwrap().modules();
 
                 assert_eq!(modules.len(), 1);
-                assert_eq!(modules[0].path(), path(&["core_int"]));
-                assert_eq!(modules[0].label(), "<core.core_int>");
+                assert_eq!(modules[0].path(), path(&["int"]));
+                assert_eq!(modules[0].label(), "<core.int>");
                 assert_eq!(modules[0].code(), "extend int {}");
-                assert_eq!(bundle.always_active_modules(), &[path(&["core_int"])]);
+                assert_eq!(bundle.core_always_active(), &[path(&["int"])]);
             }
 
             #[test]
@@ -273,9 +295,9 @@ mod tests {
                     sources(&[("math", "extern fn sin(x: float) -> float;")]),
                 )
                 .unwrap();
-                let module = bundle.std_module(&path(&["std", "math"])).unwrap();
+                let module = bundle.std().unwrap().module(&path(&["math"])).unwrap();
 
-                assert_eq!(module.path(), path(&["std", "math"]));
+                assert_eq!(module.path(), path(&["math"]));
                 assert_eq!(module.label(), "<std.math>");
                 assert_eq!(module.code(), "extern fn sin(x: float) -> float;");
             }
@@ -284,21 +306,20 @@ mod tests {
             fn orders_modules() {
                 let bundle = bundle_from_sources(
                     String::new(),
-                    sources(&[
-                        ("core_string", "extend string {}"),
-                        ("core_int", "extend int {}"),
-                    ]),
+                    sources(&[("string", "extend string {}"), ("int", "extend int {}")]),
                     sources(&[("maps", ""), ("math", "")]),
                 )
                 .unwrap();
                 let core_paths = bundle
-                    .core_modules()
+                    .core()
+                    .unwrap()
+                    .modules()
                     .iter()
                     .map(|module| module.path().to_vec())
                     .collect::<Vec<_>>();
 
-                assert_eq!(core_paths, [path(&["core_int"]), path(&["core_string"])]);
-                assert_eq!(bundle.always_active_modules(), core_paths);
+                assert_eq!(core_paths, [path(&["int"]), path(&["string"])]);
+                assert_eq!(bundle.core_always_active(), core_paths);
             }
 
             #[test]
@@ -316,40 +337,46 @@ mod tests {
             #[test]
             fn clean_frontend_core_surface_is_explicit() {
                 let bundle = new_frontend_source_bundle().unwrap();
-                let core_paths = bundle
-                    .core_modules()
+                let core = bundle.core().unwrap();
+                let core_paths = core
+                    .modules()
                     .iter()
                     .map(|module| module.path().to_vec())
                     .collect::<Vec<_>>();
                 let expected = [
-                    path(&["core_float"]),
-                    path(&["core_int"]),
-                    path(&["core_string"]),
+                    path(&["option"]),
+                    path(&["range"]),
+                    path(&["int"]),
+                    path(&["float"]),
+                    path(&["string"]),
                 ];
 
+                assert_eq!(core.root().label(), "crates/core2/src/lib.anv");
                 assert_eq!(core_paths, expected);
-                assert_eq!(bundle.always_active_modules(), expected);
-                let prelude = bundle.core_prelude().unwrap().code();
-                assert!(prelude.contains("enum Option<T>"));
-                assert!(prelude.contains("struct Range<T>"));
+                assert_eq!(
+                    bundle.core_always_active(),
+                    &[path(&["int"]), path(&["float"]), path(&["string"])]
+                );
+                assert!(core.root().code().contains("pub import option { * };"));
+                assert!(core.root().code().contains("pub import range { * };"));
             }
 
             #[test]
             fn clean_frontend_std_surface_is_explicit() {
                 let bundle = new_frontend_source_bundle().unwrap();
 
-                assert_eq!(sorted_std_paths(&bundle), [path(&["std", "mem"])]);
+                assert_eq!(sorted_std_paths(&bundle), [path(&["mem"])]);
             }
 
             #[test]
             fn clean_frontend_bundle_has_no_legacy_type_spellings() {
                 let bundle = new_frontend_source_bundle().unwrap();
                 let mut code = String::new();
-                code.push_str(bundle.core_prelude().unwrap().code());
-                for module in bundle.core_modules() {
+                code.push_str(bundle.core().unwrap().root().code());
+                for module in bundle.core().unwrap().modules() {
                     code.push_str(module.code());
                 }
-                for module in bundle.std_modules() {
+                for module in bundle.std().unwrap().modules() {
                     code.push_str(module.code());
                 }
 
@@ -361,6 +388,49 @@ mod tests {
                 assert!(!code.contains("Option<float>"));
                 assert!(!code.contains("Option<bool>"));
                 assert!(!code.contains("Option<any>"));
+            }
+
+            #[test]
+            fn target_system_package_shape() {
+                let bundle = new_frontend_source_bundle().unwrap();
+
+                assert_eq!(
+                    bundle.core().unwrap().root().label(),
+                    "crates/core2/src/lib.anv"
+                );
+                assert_eq!(
+                    bundle
+                        .std()
+                        .unwrap()
+                        .module(&path(&["mem"]))
+                        .unwrap()
+                        .label(),
+                    "crates/stdlib2/src/mem.anv"
+                );
+            }
+
+            #[test]
+            fn target_adapter_paths_removed() {
+                let bundle = new_frontend_source_bundle().unwrap();
+                let core_paths = bundle
+                    .core()
+                    .unwrap()
+                    .modules()
+                    .iter()
+                    .map(|module| module.path().to_vec())
+                    .collect::<Vec<_>>();
+
+                assert_eq!(
+                    core_paths,
+                    [
+                        path(&["option"]),
+                        path(&["range"]),
+                        path(&["int"]),
+                        path(&["float"]),
+                        path(&["string"]),
+                    ]
+                );
+                assert_eq!(sorted_std_paths(&bundle), [path(&["mem"])]);
             }
         }
 
@@ -396,9 +466,89 @@ mod tests {
             }
 
             #[test]
+            fn core_prelude_nominals_are_visible_without_import() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(
+                    &temp,
+                    "main.anv",
+                    "fn takes_option(x: Option<int>) {} fn takes_ranges(a: Range<int>, b: RangeFrom<int>) {}",
+                );
+
+                new_frontend_cmd(&main).unwrap();
+            }
+
+            #[test]
+            fn core_primitive_extensions_are_always_active() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(
+                    &temp,
+                    "main.anv",
+                    "fn main() { let a: int = (-1).abs(); let b: float = 4.0.sqrt(); let c: int = \"abc\".len(); }",
+                );
+
+                new_frontend_cmd(&main).unwrap();
+            }
+
+            #[test]
+            fn core_helper_externs_are_not_visible_to_user_modules() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(&temp, "main.anv", "fn main() { int_abs(1); }");
+                let error = new_frontend_cmd(&main).unwrap_err();
+
+                assert!(error.contains("int_abs"));
+            }
+
+            #[test]
             fn std_import_resolves_implicit_package() {
                 let temp = tempfile::tempdir().unwrap();
-                let main = write(&temp, "main.anv", "import std:mem; fn main() {}");
+                let main = write(
+                    &temp,
+                    "main.anv",
+                    "import std:mem; fn main() { mem.collect_cycles(); }",
+                );
+
+                new_frontend_cmd(&main).unwrap();
+            }
+
+            #[test]
+            fn std_selective_import_resolves_implicit_package() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(
+                    &temp,
+                    "main.anv",
+                    "import std:mem { collect_cycles }; fn main() { collect_cycles(); }",
+                );
+
+                new_frontend_cmd(&main).unwrap();
+            }
+
+            #[test]
+            fn std_declarations_are_not_preluded() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(&temp, "main.anv", "fn main() { collect_cycles(); }");
+                let error = new_frontend_cmd(&main).unwrap_err();
+
+                assert!(error.contains("collect_cycles"));
+            }
+
+            #[test]
+            fn old_std_dot_import_is_local_source_syntax() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(&temp, "main.anv", "import std.mem; fn main() {}");
+                let error = new_frontend_cmd(&main).unwrap_err();
+
+                assert!(error.contains("std/mem.anv") || error.contains("std\\mem.anv"));
+            }
+
+            #[test]
+            fn local_std_path_does_not_affect_std_colon_import() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(
+                    &temp,
+                    "main.anv",
+                    "import std.mem { local }; import std:mem { collect_cycles }; fn main() { local(); collect_cycles(); }",
+                );
+                write(&temp, "std/mem.anv", "pub fn local() {}");
 
                 new_frontend_cmd(&main).unwrap();
             }

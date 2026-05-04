@@ -1,0 +1,12 @@
+import ext:int { int_abs, int_min, int_max, int_clamp };
+
+pub extend int {
+    /// Absolute value.
+    fn abs(self) -> int { int_abs(self) }
+    /// Returns the smaller of self and other.
+    fn min(self, other: int) -> int { int_min(self, other) }
+    /// Returns the larger of self and other.
+    fn max(self, other: int) -> int { int_max(self, other) }
+    /// Clamps self between lo and hi.
+    fn clamp(self, lo: int, hi: int) -> int { int_clamp(self, lo, hi) }
+}

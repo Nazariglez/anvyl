@@ -258,8 +258,13 @@ fn generate_build_main_rs(manifest: &Manifest, release: bool) -> String {
         "anvyx_lang::Profile::Debug"
     };
     let entries = sorted_extern_names(manifest);
+    let entry = manifest
+        .project
+        .entry
+        .as_deref()
+        .expect("build requires project.entry");
     BUILD_TEMPLATE
-        .replace("%ENTRY_POINT%", &manifest.project.entry)
+        .replace("%ENTRY_POINT%", entry)
         .replace("%RUNTIME_INIT%", RUNTIME_INIT)
         .replace(
             "%METADATA_CONSTS%",
@@ -370,12 +375,14 @@ pub fn bundle_sources(
 
     walk_and_copy_anv(project_root, project_root, dist_dir, &skip_dirs)?;
 
-    let entry_in_dist = dist_dir.join(&manifest.project.entry);
+    let Some(entry) = manifest.project.entry.as_deref() else {
+        return Err("project.entry is required to bundle sources".to_string());
+    };
+    let entry_in_dist = dist_dir.join(entry);
     if !entry_in_dist.exists() {
         return Err(format!(
-            "Entry point '{}' not found in bundled sources. \
-            Check project.entry in anvyx.toml.",
-            manifest.project.entry
+            "Entry point '{entry}' not found in bundled sources. \
+            Check project.entry in anvyx.toml."
         ));
     }
 
@@ -466,7 +473,7 @@ mod tests {
         Manifest {
             project: Project {
                 name: name.map(str::to_string),
-                entry: entry.into(),
+                entry: Some(entry.into()),
             },
             dependencies: HashMap::new(),
             externs,

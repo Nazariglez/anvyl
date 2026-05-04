@@ -9,7 +9,7 @@ use anvyx_frontend::{
         PackageModuleInput, PackageSourceLoader, Source as FrontendSource, SourceLoad,
         SourceLoadError,
     },
-    resolve::{LocalSourceRequest, ModuleId, ModulePath, PackageId, SourceFileId},
+    resolve::{LocalSourceRequest, ModuleId, ModulePath, PackageId, PackageKind, SourceFileId},
 };
 
 use crate::CheckError;
@@ -91,66 +91,85 @@ impl ModuleSource {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPackageSource {
+    root: SourceText,
+    modules: Vec<ModuleSource>,
+    providers: Vec<anvyx_externs::ProviderDescriptor>,
+}
+
+impl SystemPackageSource {
+    pub fn new(root: SourceText, modules: Vec<ModuleSource>) -> Result<Self, CheckError> {
+        let mut paths = HashSet::new();
+        for module in &modules {
+            insert_unique_path(&mut paths, module.path(), "duplicate system module path")?;
+        }
+        Ok(Self {
+            root,
+            modules,
+            providers: vec![],
+        })
+    }
+
+    pub fn with_providers(
+        root: SourceText,
+        modules: Vec<ModuleSource>,
+        providers: Vec<anvyx_externs::ProviderDescriptor>,
+    ) -> Result<Self, CheckError> {
+        let mut source = Self::new(root, modules)?;
+        source.providers = providers;
+        Ok(source)
+    }
+
+    pub fn root(&self) -> &SourceText {
+        &self.root
+    }
+
+    pub fn module(&self, path: &[String]) -> Option<&ModuleSource> {
+        self.modules.iter().find(|module| module.path() == path)
+    }
+
+    pub fn modules(&self) -> &[ModuleSource] {
+        &self.modules
+    }
+
+    pub fn providers(&self) -> &[anvyx_externs::ProviderDescriptor] {
+        &self.providers
+    }
+
+    fn contains_module(&self, path: &[String]) -> bool {
+        self.module(path).is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceBundle {
-    core_prelude: Option<SourceText>,
-    core_modules: Vec<ModuleSource>,
-    std_modules: HashMap<Vec<String>, ModuleSource>,
-    always_active_modules: Vec<Vec<String>>,
+    core: Option<SystemPackageSource>,
+    std: Option<SystemPackageSource>,
+    core_always_active: Vec<Vec<String>>,
 }
 
 impl SourceBundle {
     pub fn new(
-        core_prelude: Option<SourceText>,
-        core_modules: Vec<ModuleSource>,
-        std_modules: Vec<ModuleSource>,
-        always_active_modules: Vec<Vec<String>>,
+        core: Option<SystemPackageSource>,
+        std: Option<SystemPackageSource>,
+        core_always_active: Vec<Vec<String>>,
     ) -> Result<Self, CheckError> {
-        let mut module_paths = HashSet::new();
-        for module in core_modules.iter().chain(&std_modules) {
-            insert_unique_path(&mut module_paths, module.path(), "duplicate module path")?;
-        }
-
-        let mut core_paths = HashSet::new();
-        for module in &core_modules {
-            if path_starts_with(module.path(), "std") {
-                return invalid_input(format!(
-                    "core module path must not start with std: {}",
-                    display_path(module.path())
-                ));
-            }
-            core_paths.insert(module.path().to_vec());
-        }
-
-        let mut std_by_path = HashMap::new();
-        for module in std_modules {
-            if !path_starts_with(module.path(), "std") {
-                return invalid_input(format!(
-                    "std module path must start with std: {}",
-                    display_path(module.path())
-                ));
-            }
-            if module.path().len() == 1 {
-                return invalid_input("std module path must include a module name after std: std");
-            }
-            std_by_path.insert(module.path().to_vec(), module);
-        }
-
         let mut active_paths = HashSet::new();
-        for path in &always_active_modules {
+        for path in &core_always_active {
             validate_path(path)?;
-            if path_starts_with(path, "std") {
-                return invalid_input(format!(
-                    "always-active module must not be a std module: {}",
-                    display_path(path)
-                ));
-            }
             insert_unique_path(
                 &mut active_paths,
                 path,
                 "duplicate always-active module path",
             )?;
-            if !core_paths.contains(path) {
+            let Some(core) = &core else {
+                return invalid_input(format!(
+                    "always-active module requires a core package: {}",
+                    display_path(path)
+                ));
+            };
+            if !core.contains_module(path) {
                 return invalid_input(format!(
                     "always-active module must refer to a core module: {}",
                     display_path(path)
@@ -159,40 +178,42 @@ impl SourceBundle {
         }
 
         Ok(Self {
-            core_prelude,
-            core_modules,
-            std_modules: std_by_path,
-            always_active_modules,
+            core,
+            std,
+            core_always_active,
         })
     }
 
-    pub fn core_prelude(&self) -> Option<&SourceText> {
-        self.core_prelude.as_ref()
+    pub fn core(&self) -> Option<&SystemPackageSource> {
+        self.core.as_ref()
     }
 
-    pub fn core_modules(&self) -> &[ModuleSource] {
-        &self.core_modules
+    pub fn std(&self) -> Option<&SystemPackageSource> {
+        self.std.as_ref()
     }
 
-    pub fn std_module(&self, path: &[String]) -> Option<&ModuleSource> {
-        self.std_modules.get(path)
+    pub fn core_always_active(&self) -> &[Vec<String>] {
+        &self.core_always_active
     }
 
-    pub fn std_modules(&self) -> impl Iterator<Item = &ModuleSource> {
-        self.std_modules.values()
-    }
-
-    pub fn always_active_modules(&self) -> &[Vec<String>] {
-        &self.always_active_modules
+    pub fn system_module(&self, package: &PackageId, path: &[String]) -> Option<&ModuleSource> {
+        if package == &PackageId::core() {
+            self.core()?.module(path)
+        } else if package == &PackageId::std() {
+            self.std()?.module(path)
+        } else {
+            None
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageSource {
     id: PackageId,
-    entry: PathBuf,
-    source_root: PathBuf,
+    entry: Option<PathBuf>,
+    source_root: Option<PathBuf>,
     dependencies: HashMap<String, PackageId>,
+    kind: PackageKind,
 }
 
 impl PackageSource {
@@ -212,26 +233,41 @@ impl PackageSource {
         }
         Ok(Self {
             id,
-            entry,
-            source_root,
+            entry: Some(entry),
+            source_root: Some(source_root),
             dependencies,
+            kind: PackageKind::Source,
         })
+    }
+
+    pub fn native_only(id: PackageId, dependencies: HashMap<String, PackageId>) -> Self {
+        Self {
+            id,
+            entry: None,
+            source_root: None,
+            dependencies,
+            kind: PackageKind::NativeOnly,
+        }
     }
 
     pub fn id(&self) -> &PackageId {
         &self.id
     }
 
-    pub fn entry(&self) -> &Path {
-        &self.entry
+    pub fn entry(&self) -> Option<&Path> {
+        self.entry.as_deref()
     }
 
-    pub fn source_root(&self) -> &Path {
-        &self.source_root
+    pub fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
     }
 
     pub fn dependencies(&self) -> &HashMap<String, PackageId> {
         &self.dependencies
+    }
+
+    pub fn kind(&self) -> PackageKind {
+        self.kind
     }
 }
 
@@ -266,17 +302,21 @@ impl SourceOwnership {
     pub(crate) fn new(packages: &[PackageSource]) -> Result<Self, CheckError> {
         let roots = packages
             .iter()
-            .map(|package| {
-                let canonical_root = fs::canonicalize(package.source_root()).map_err(|error| {
+            .filter_map(|package| {
+                package
+                    .source_root()
+                    .map(|source_root| (package.id(), source_root))
+            })
+            .map(|(package, source_root)| {
+                let canonical_root = fs::canonicalize(source_root).map_err(|error| {
                     CheckError::InvalidInput(format!(
-                        "failed to canonicalize package '{}' source root '{}': {error}",
-                        package.id(),
-                        package.source_root().display()
+                        "failed to canonicalize package '{package}' source root '{}': {error}",
+                        source_root.display()
                     ))
                 })?;
                 Ok(SourceRoot {
-                    package: package.id().clone(),
-                    root: package.source_root().to_path_buf(),
+                    package: package.clone(),
+                    root: source_root.to_path_buf(),
                     canonical_root,
                 })
             })
@@ -354,26 +394,20 @@ impl<'a> PackageSourceEnvironment<'a> {
         let Some(path) = module.named_path() else {
             return Ok(None);
         };
-        if module.package() == &PackageId::std() {
-            return Ok(self.load_std_source(path));
+        if let Some(source) = self
+            .sources
+            .system_module(module.package(), path.segments())
+        {
+            return Ok(Some(PackageModuleInput {
+                module: module.clone(),
+                source: source.to_frontend_source(),
+            }));
         }
         let Some(source_root) = self.ownership.source_root(module.package()) else {
             return Ok(None);
         };
         let file = module_file(source_root, path.segments());
         self.read_module_file(file)
-    }
-
-    fn load_std_source(&self, module_path: &ModulePath) -> Option<PackageModuleInput> {
-        let mut path = vec!["std".to_string()];
-        path.extend(module_path.segments().iter().cloned());
-        self.sources
-            .std_module(&path)
-            .map(ModuleSource::to_frontend_source)
-            .map(|source| PackageModuleInput {
-                module: ModuleId::named(PackageId::std(), module_path.clone()),
-                source,
-            })
     }
 
     fn read_module_file(
@@ -514,10 +548,6 @@ fn insert_unique_path(
     Ok(())
 }
 
-fn path_starts_with(path: &[String], segment: &str) -> bool {
-    path.first().is_some_and(|first| first == segment)
-}
-
 fn display_path(path: &[String]) -> String {
     if path.is_empty() {
         "<empty>".to_string()
@@ -583,15 +613,23 @@ mod tests {
     }
 
     fn std_module(name: &str) -> ModuleSource {
-        ModuleSource::new(path(&["std", name]), "", format!("<std.{name}>")).unwrap()
+        ModuleSource::new(path(&[name]), "", format!("<std.{name}>")).unwrap()
     }
 
     fn std_source(segments: &[&str], code: &str, label: &str) -> ModuleSource {
         ModuleSource::new(path(segments), code, label).unwrap()
     }
 
+    fn root(label: &str) -> SourceText {
+        SourceText::new("", label).unwrap()
+    }
+
+    fn system(label: &str, modules: Vec<ModuleSource>) -> SystemPackageSource {
+        SystemPackageSource::new(root(label), modules).unwrap()
+    }
+
     fn source_bundle(std_modules: Vec<ModuleSource>) -> SourceBundle {
-        SourceBundle::new(None, vec![], std_modules, vec![]).unwrap()
+        SourceBundle::new(None, Some(system("<std>", std_modules)), vec![]).unwrap()
     }
 
     fn invalid_message<T>(result: Result<T, CheckError>) -> String {
@@ -657,95 +695,56 @@ mod tests {
     }
 
     #[test]
-    fn source_bundle_rejects_duplicate_core_paths() {
-        let message = invalid_message(SourceBundle::new(
-            None,
-            vec![core("core_int"), core("core_int")],
-            vec![],
-            vec![],
+    fn system_package_rejects_duplicate_paths() {
+        let message = invalid_message(SystemPackageSource::new(
+            root("<core>"),
+            vec![core("int"), core("int")],
         ));
-        assert!(message.contains("duplicate module path"));
-        assert!(message.contains("core_int"));
+        assert!(message.contains("duplicate system module path"));
+        assert!(message.contains("int"));
     }
 
     #[test]
-    fn source_bundle_rejects_duplicate_std_paths() {
-        let message = invalid_message(SourceBundle::new(
-            None,
-            vec![],
-            vec![std_module("math"), std_module("math")],
-            vec![],
-        ));
-        assert!(message.contains("duplicate module path"));
-        assert!(message.contains("std.math"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_duplicate_paths_across_core_and_std() {
-        let core_std = ModuleSource::new(path(&["std", "math"]), "", "<core>").unwrap();
-        let message = invalid_message(SourceBundle::new(
-            None,
-            vec![core_std],
-            vec![std_module("math")],
-            vec![],
-        ));
-        assert!(message.contains("duplicate module path"));
-        assert!(message.contains("std.math"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_duplicate_always_active_paths() {
-        let message = invalid_message(SourceBundle::new(
-            None,
-            vec![core("core_int")],
-            vec![],
-            vec![path(&["core_int"]), path(&["core_int"])],
-        ));
-        assert!(message.contains("duplicate always-active"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_std_module_without_std_root() {
-        let message = invalid_message(SourceBundle::new(None, vec![], vec![core("math")], vec![]));
-        assert!(message.contains("std module path must start with std"));
-        assert!(message.contains("math"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_bare_std_module_path() {
-        let std_root = ModuleSource::new(path(&["std"]), "", "<std>").unwrap();
-        let message = invalid_message(SourceBundle::new(None, vec![], vec![std_root], vec![]));
-        assert!(message.contains("include a module name"));
-    }
-
-    #[test]
-    fn source_bundle_rejects_core_module_under_std_root() {
-        let core_std = ModuleSource::new(path(&["std", "core_int"]), "", "<core>").unwrap();
-        let message = invalid_message(SourceBundle::new(None, vec![core_std], vec![], vec![]));
-        assert!(message.contains("core module path must not start with std"));
-    }
-
-    #[test]
-    fn source_bundle_accepts_core_and_std_modules() {
+    fn source_bundle_allows_same_path_in_core_and_std() {
         let bundle = SourceBundle::new(
-            Some(SourceText::new("core prelude", "<core>").unwrap()),
-            vec![core("core_int"), core("core_string")],
-            vec![std_module("math"), std_module("maps")],
-            vec![path(&["core_int"])],
+            Some(system("<core>", vec![core("math")])),
+            Some(system("<std>", vec![std_module("math")])),
+            vec![],
         )
         .unwrap();
 
-        assert_eq!(bundle.core_modules().len(), 2);
-        assert_eq!(bundle.std_modules().count(), 2);
-        assert_eq!(bundle.always_active_modules(), &[path(&["core_int"])]);
+        assert_eq!(bundle.core().unwrap().modules().len(), 1);
+        assert_eq!(bundle.std().unwrap().modules().len(), 1);
+    }
+
+    #[test]
+    fn source_bundle_accepts_core_and_std_packages() {
+        let bundle = SourceBundle::new(
+            Some(
+                SystemPackageSource::new(
+                    SourceText::new("core prelude", "<core>").unwrap(),
+                    vec![core("int"), core("string")],
+                )
+                .unwrap(),
+            ),
+            Some(system(
+                "<std>",
+                vec![std_module("math"), std_module("maps")],
+            )),
+            vec![path(&["int"])],
+        )
+        .unwrap();
+
+        assert_eq!(bundle.core().unwrap().modules().len(), 2);
+        assert_eq!(bundle.std().unwrap().modules().len(), 2);
+        assert_eq!(bundle.core_always_active(), &[path(&["int"])]);
     }
 
     #[test]
     fn source_bundle_rejects_empty_always_active_path() {
         let message = invalid_message(SourceBundle::new(
+            Some(system("<core>", vec![core("int")])),
             None,
-            vec![core("core_int")],
-            vec![],
             vec![vec![]],
         ));
         assert!(message.contains("must not be empty"));
@@ -754,31 +753,34 @@ mod tests {
     #[test]
     fn source_bundle_rejects_empty_always_active_segment() {
         let message = invalid_message(SourceBundle::new(
+            Some(system("<core>", vec![core("int")])),
             None,
-            vec![core("core_int")],
-            vec![],
-            vec![path(&["core_int", ""])],
+            vec![path(&["int", ""])],
         ));
         assert!(message.contains("empty segments"));
     }
 
     #[test]
-    fn source_bundle_rejects_always_active_std_module() {
+    fn source_bundle_rejects_duplicate_always_active_paths() {
         let message = invalid_message(SourceBundle::new(
+            Some(system("<core>", vec![core("int")])),
             None,
-            vec![core("core_int")],
-            vec![std_module("math")],
-            vec![path(&["std", "math"])],
+            vec![path(&["int"]), path(&["int"])],
         ));
-        assert!(message.contains("must not be a std module"));
+        assert!(message.contains("duplicate always-active"));
+    }
+
+    #[test]
+    fn source_bundle_rejects_always_active_without_core() {
+        let message = invalid_message(SourceBundle::new(None, None, vec![path(&["int"])]));
+        assert!(message.contains("requires a core package"));
     }
 
     #[test]
     fn source_bundle_rejects_always_active_missing_from_core_modules() {
         let message = invalid_message(SourceBundle::new(
+            Some(system("<core>", vec![core("int")])),
             None,
-            vec![core("core_int")],
-            vec![],
             vec![path(&["helpers"])],
         ));
         assert!(message.contains("refer to a core module"));
@@ -787,33 +789,37 @@ mod tests {
     #[test]
     fn source_bundle_accepts_always_active_core_module() {
         let bundle = SourceBundle::new(
+            Some(system("<core>", vec![core("int")])),
             None,
-            vec![core("core_int")],
-            vec![],
-            vec![path(&["core_int"])],
+            vec![path(&["int"])],
         )
         .unwrap();
 
-        assert_eq!(bundle.always_active_modules(), &[path(&["core_int"])]);
+        assert_eq!(bundle.core_always_active(), &[path(&["int"])]);
     }
 
     #[test]
     fn empty_bundle_has_no_sources() {
         let bundle = SourceBundle::default();
 
-        assert!(bundle.core_prelude().is_none());
-        assert!(bundle.core_modules().is_empty());
-        assert_eq!(bundle.std_modules().count(), 0);
-        assert!(bundle.always_active_modules().is_empty());
+        assert!(bundle.core().is_none());
+        assert!(bundle.std().is_none());
+        assert!(bundle.core_always_active().is_empty());
     }
 
     #[test]
-    fn std_module_lookup_uses_logical_path() {
-        let bundle = SourceBundle::new(None, vec![], vec![std_module("math")], vec![]).unwrap();
-        let module = bundle.std_module(&path(&["std", "math"])).unwrap();
+    fn std_module_lookup_uses_package_local_path() {
+        let bundle = source_bundle(vec![std_module("math")]);
+        let module = bundle.std().unwrap().module(&path(&["math"])).unwrap();
 
         assert_eq!(module.label(), "<std.math>");
-        assert!(bundle.std_module(&path(&["math"])).is_none());
+        assert!(
+            bundle
+                .std()
+                .unwrap()
+                .module(&path(&["std", "math"]))
+                .is_none()
+        );
     }
 
     mod ownership {
@@ -837,6 +843,17 @@ mod tests {
                 ownership.source_owner(&file).unwrap(),
                 SourceOwner::Package(PackageId::new("game"))
             );
+        }
+
+        #[test]
+        fn ignores_native_only_packages() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "src/main.anv", "fn main() {}");
+            let package = PackageSource::native_only(PackageId::new("host"), HashMap::new());
+            let ownership = SourceOwnership::new(&[package]).unwrap();
+            let file = canonical_source_file(&temp.path().join("src/main.anv")).unwrap();
+
+            assert_eq!(ownership.source_owner(&file).unwrap(), SourceOwner::None);
         }
 
         #[test]
@@ -1101,11 +1118,7 @@ mod tests {
         #[test]
         fn loads_known_std_module() {
             let temp = tempfile::tempdir().unwrap();
-            let bundle = source_bundle(vec![std_source(
-                &["std", "math"],
-                "const PI = 3;",
-                "<std.math>",
-            )]);
+            let bundle = source_bundle(vec![std_source(&["math"], "const PI = 3;", "<std.math>")]);
             let mut env = package_env(temp.path(), &bundle);
 
             let source = env.load_source(&std_module_id(&["math"])).unwrap().unwrap();
@@ -1118,7 +1131,7 @@ mod tests {
         fn loads_nested_std_module() {
             let temp = tempfile::tempdir().unwrap();
             let bundle = source_bundle(vec![std_source(
-                &["std", "collections", "map"],
+                &["collections", "map"],
                 "type Map;",
                 "<std.collections.map>",
             )]);
@@ -1152,7 +1165,11 @@ mod tests {
             let bundle = source_bundle(vec![std_module("math")]);
             let mut env = package_env(temp.path(), &bundle);
 
-            assert!(env.load_source(&std_module_id(&["std"])).unwrap().is_none());
+            assert!(
+                env.load_source(&ModuleId::root(PackageId::std()))
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[test]
@@ -1160,7 +1177,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             write(&temp, "std/math.anv", "const WRONG = 1;");
             let bundle = source_bundle(vec![std_source(
-                &["std", "math"],
+                &["math"],
                 "const RIGHT = 1;",
                 "<std.math>",
             )]);
@@ -1189,11 +1206,7 @@ mod tests {
         #[test]
         fn loads_std_through_trait() {
             let temp = tempfile::tempdir().unwrap();
-            let bundle = source_bundle(vec![std_source(
-                &["std", "math"],
-                "const PI = 3;",
-                "<std.math>",
-            )]);
+            let bundle = source_bundle(vec![std_source(&["math"], "const PI = 3;", "<std.math>")]);
             let mut env = package_env(temp.path(), &bundle);
 
             let source = PackageSourceLoader::load(&mut env, &std_module_id(&["math"]))
@@ -1208,19 +1221,17 @@ mod tests {
     #[test]
     fn getters_return_original_source_text() {
         let prelude = SourceText::new("type int;", "<core>").unwrap();
-        let core =
-            ModuleSource::new(path(&["core_int"]), "extend int {}", "<core.core_int>").unwrap();
-        let std = ModuleSource::new(path(&["std", "math"]), "fn min() {}", "<std.math>").unwrap();
+        let core = ModuleSource::new(path(&["int"]), "extend int {}", "<core.int>").unwrap();
+        let std = ModuleSource::new(path(&["math"]), "fn min() {}", "<std.math>").unwrap();
         let bundle = SourceBundle::new(
-            Some(prelude.clone()),
-            vec![core.clone()],
-            vec![std.clone()],
-            vec![path(&["core_int"])],
+            Some(SystemPackageSource::new(prelude.clone(), vec![core.clone()]).unwrap()),
+            Some(SystemPackageSource::new(root("<std>"), vec![std.clone()]).unwrap()),
+            vec![path(&["int"])],
         )
         .unwrap();
 
-        assert_eq!(bundle.core_prelude(), Some(&prelude));
-        assert_eq!(bundle.core_modules(), &[core]);
-        assert_eq!(bundle.std_module(&path(&["std", "math"])), Some(&std));
+        assert_eq!(bundle.core().unwrap().root(), &prelude);
+        assert_eq!(bundle.core().unwrap().modules(), &[core]);
+        assert_eq!(bundle.std().unwrap().module(&path(&["math"])), Some(&std));
     }
 }

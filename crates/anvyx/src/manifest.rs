@@ -27,7 +27,7 @@ impl Manifest {
 #[derive(Debug, Deserialize)]
 pub struct Project {
     pub name: Option<String>,
-    pub entry: String,
+    pub entry: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,8 +75,8 @@ impl std::fmt::Display for PackageId {
 #[derive(Debug, Clone)]
 pub struct PackageNode {
     pub id: PackageId,
-    pub entry: PathBuf,
-    pub source_root: PathBuf,
+    pub entry: Option<PathBuf>,
+    pub source_root: Option<PathBuf>,
     pub dependencies: HashMap<String, PackageId>,
 }
 
@@ -144,12 +144,19 @@ impl PackageGraphLoader {
             .expect("canonical manifest path has a parent")
             .to_path_buf();
         let dependencies = self.load_dependencies(id, &dir, &manifest)?;
-        let entry = dir.join(&manifest.project.entry);
-        let source_root = entry
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        let entry = manifest.project.entry.as_ref().map(|entry| dir.join(entry));
+        if entry.is_none() && !dir.join("Cargo.toml").is_file() {
+            return Err(format!(
+                "package {id} has no project.entry and no Cargo.toml native marker"
+            ));
+        }
+        let source_root = entry.as_ref().map(|entry| {
+            entry
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        });
         self.packages.push(PackageNode {
             id: id.clone(),
             entry,
@@ -266,7 +273,7 @@ mod tests {
 
         assert!(manifest.externs.is_empty());
         assert!(!manifest.has_externs());
-        assert_eq!(manifest.project.entry, "src/main.anv");
+        assert_eq!(manifest.project.entry.as_deref(), Some("src/main.anv"));
     }
 
     #[test]
@@ -425,6 +432,22 @@ mod tests {
             self.write_raw_manifest(package, &manifest);
         }
 
+        fn write_native_package(&self, package: &str, deps: &[(&str, &str)]) {
+            let mut manifest = "[project]\nname = \"native\"\n".to_string();
+            if !deps.is_empty() {
+                manifest.push_str("\n[dependencies]\n");
+                for (alias, path) in deps {
+                    writeln!(manifest, "{alias} = {{ path = \"{path}\" }}").unwrap();
+                }
+            }
+            self.write_raw_manifest(package, &manifest);
+            fs::write(
+                self.root.path().join(package).join("Cargo.toml"),
+                "[package]\nname = \"native\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+        }
+
         fn write_raw_manifest(&self, package: &str, contents: &str) {
             let dir = self.root.path().join(package);
             fs::create_dir_all(&dir).unwrap();
@@ -446,6 +469,19 @@ mod tests {
             error.contains(contains),
             "expected error to contain {contains:?}, got {error:?}"
         );
+    }
+
+    #[test]
+    fn parse_native_only_manifest_allows_missing_entry() {
+        let manifest = parse(
+            r#"
+            [project]
+            name = "host"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.project.entry, None);
     }
 
     #[test]
@@ -492,6 +528,35 @@ mod tests {
         fixture.write_package("game", &[("missing", "../missing")]);
 
         validate_err(fixture.manifest("game"), "anvyx.toml");
+    }
+
+    #[test]
+    fn native_only_dependency_with_cargo_marker_is_allowed() {
+        let fixture = PackageFixture::default();
+        fixture.write_package("game", &[("host", "../host")]);
+        fixture.write_native_package("host", &[]);
+
+        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
+        let host = graph
+            .packages()
+            .iter()
+            .find(|package| package.dependencies.is_empty() && package.entry.is_none())
+            .unwrap();
+        assert!(host.source_root.is_none());
+    }
+
+    #[test]
+    fn package_without_entry_or_native_marker_is_rejected() {
+        let fixture = PackageFixture::default();
+        fixture.write_raw_manifest(
+            "host",
+            r#"
+            [project]
+            name = "host"
+            "#,
+        );
+
+        validate_err(fixture.manifest("host"), "no project.entry");
     }
 
     #[test]

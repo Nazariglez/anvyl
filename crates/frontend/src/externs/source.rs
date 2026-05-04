@@ -11,7 +11,7 @@ use crate::{
         self, BinaryOp, ExternFieldAccess, ExternFuncNode, ExternReceiverMode, ExternTypeMember,
         ExternTypeNode, ExternTypeRep, GenericArg, Mutability, Param, Program, Stmt, Type, UnaryOp,
     },
-    resolve::{ModuleId, PackageId, ResolveResult},
+    resolve::{ModuleId, ResolveResult},
     span::Span,
 };
 
@@ -51,13 +51,6 @@ pub(crate) fn collect_source_externs(
 }
 
 fn source_scope(module: &ModuleId) -> RawExternScope {
-    if module.package_context() == Some(&PackageId::synthetic_root())
-        && let Some(path) = module.named_path()
-    {
-        return RawExternScope::Named(ModulePath {
-            segments: path.segments().to_vec(),
-        });
-    }
     RawExternScope::Module(module.clone())
 }
 

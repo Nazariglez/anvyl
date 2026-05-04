@@ -11,12 +11,12 @@ pub(crate) use identity::validate_raw_identities;
 pub(crate) use providers::ingest_providers;
 #[cfg(test)]
 use providers::normalize_type;
-pub use raw::ExternInputs;
 pub(crate) use raw::{
     ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey, RawExternIdentityKey,
     RawExternMemberKey, RawExternModule, RawExternScope, RawExternSite, RawExternTypeKey,
     RawExterns, UnsupportedSourceKind, UnsupportedSourceParamReason,
 };
+pub use raw::{ExternInputs, PackageExternInputs};
 pub(crate) use shape::validate_raw_shapes;
 pub(crate) use source::collect_source_externs;
 
@@ -30,25 +30,19 @@ pub(crate) fn extern_module_scope(path: &anvyx_externs::ModulePath) -> ModuleSco
     ModuleScope::Named(extern_module_path(path))
 }
 
-pub(crate) fn raw_named_module_path(scope: &RawExternScope) -> Option<ResolveModulePath> {
-    match scope {
-        RawExternScope::Module(_) => None,
-        RawExternScope::Named(path) => Some(extern_module_path(path)),
-    }
-}
-
 pub(crate) fn raw_module_scope(scope: &RawExternScope) -> ModuleScope {
     match scope {
-        RawExternScope::Named(path) => extern_module_scope(path),
         RawExternScope::Module(module) => ModuleScope::from_module_id(module),
     }
 }
 
-pub(crate) fn raw_extern_module_paths(raw: &RawExterns) -> HashSet<ResolveModulePath> {
+pub(crate) fn raw_extern_module_ids(raw: &RawExterns) -> HashSet<crate::resolve::ModuleId> {
     raw.groups
         .iter()
         .flat_map(|group| &group.modules)
-        .filter_map(|module| raw_named_module_path(&module.scope))
+        .map(|module| match &module.scope {
+            RawExternScope::Module(module) => module.clone(),
+        })
         .collect()
 }
 #[cfg(test)]
@@ -65,7 +59,7 @@ mod tests {
     use super::*;
     use crate::{
         ast::Program,
-        externs::raw::{RawExternGroup, RawExternModule, RawExternType},
+        externs::raw::{RawExternFunction, RawExternGroup, RawExternModule, RawExternType},
         resolve::{
             ModuleId, ModulePath as ResolveModulePath, PackageId, ResolveResult, ResolvedModule,
         },
@@ -78,6 +72,15 @@ mod tests {
                 name: name.to_string(),
             },
             modules,
+        }
+    }
+
+    fn provider_inputs(providers: Vec<ProviderDescriptor>) -> ExternInputs {
+        ExternInputs {
+            packages: vec![PackageExternInputs {
+                package: PackageId::synthetic_root(),
+                providers,
+            }],
         }
     }
 
@@ -161,12 +164,16 @@ mod tests {
         RawExterns {
             groups: vec![RawExternGroup {
                 provenance: ExternProvenance::Provider {
+                    package: PackageId::synthetic_root(),
                     provider: ProviderId {
                         name: "p".to_string(),
                     },
                 },
                 modules: vec![RawExternModule {
-                    scope: RawExternScope::Named(module(&["math"])),
+                    scope: RawExternScope::Module(ModuleId::provider(
+                        PackageId::synthetic_root(),
+                        resolve_path(&["math"]),
+                    )),
                     types: types.into_iter().map(normalize_type).collect(),
                     functions: vec![],
                 }],
@@ -189,30 +196,28 @@ mod tests {
 
         #[test]
         fn ingests_valid() {
-            let providers = ExternInputs {
-                providers: vec![provider(
-                    "math",
-                    vec![ExternModuleDescriptor {
-                        path: module(&["math"]),
-                        types: vec![ExternTypeDescriptor {
-                            name: "Vec2".to_string(),
-                            doc: Some("vector".to_string()),
-                            rep: ExternRep::Inline,
-                            fields: vec![],
-                            init: None,
-                            methods: vec![],
-                            statics: vec![],
-                            operators: vec![],
-                        }],
-                        functions: vec![ExternFunctionDescriptor {
-                            name: "dot".to_string(),
-                            doc: Some("dot product".to_string()),
-                            signature: signature(vec![], ExternTypeExpr::Float),
-                            effects: ExternEffects::default(),
-                        }],
+            let providers = provider_inputs(vec![provider(
+                "math",
+                vec![ExternModuleDescriptor {
+                    path: module(&["math"]),
+                    types: vec![ExternTypeDescriptor {
+                        name: "Vec2".to_string(),
+                        doc: Some("vector".to_string()),
+                        rep: ExternRep::Inline,
+                        fields: vec![],
+                        init: None,
+                        methods: vec![],
+                        statics: vec![],
+                        operators: vec![],
                     }],
-                )],
-            };
+                    functions: vec![ExternFunctionDescriptor {
+                        name: "dot".to_string(),
+                        doc: Some("dot product".to_string()),
+                        signature: signature(vec![], ExternTypeExpr::Float),
+                        effects: ExternEffects::default(),
+                    }],
+                }],
+            )]);
 
             let raw = ingest_providers(providers).unwrap();
 
@@ -220,6 +225,7 @@ mod tests {
             assert_eq!(
                 raw.groups[0].provenance,
                 ExternProvenance::Provider {
+                    package: PackageId::synthetic_root(),
                     provider: ProviderId {
                         name: "math".to_string()
                     }
@@ -227,7 +233,10 @@ mod tests {
             );
             assert_eq!(
                 raw.groups[0].modules[0].scope,
-                RawExternScope::Named(module(&["math"]))
+                RawExternScope::Module(ModuleId::provider(
+                    PackageId::synthetic_root(),
+                    resolve_path(&["math"])
+                ))
             );
             assert_eq!(raw.groups[0].modules[0].types[0].name, "Vec2");
             assert_eq!(raw.groups[0].modules[0].functions[0].decl.name, "dot");
@@ -236,29 +245,27 @@ mod tests {
 
         #[test]
         fn rejects_invalid() {
-            let providers = ExternInputs {
-                providers: vec![provider(
-                    "math",
-                    vec![ExternModuleDescriptor {
-                        path: module(&["math"]),
-                        types: vec![],
-                        functions: vec![
-                            ExternFunctionDescriptor {
-                                name: "dot".to_string(),
-                                doc: None,
-                                signature: signature(vec![], ExternTypeExpr::Float),
-                                effects: ExternEffects::default(),
-                            },
-                            ExternFunctionDescriptor {
-                                name: "dot".to_string(),
-                                doc: None,
-                                signature: signature(vec![], ExternTypeExpr::Float),
-                                effects: ExternEffects::default(),
-                            },
-                        ],
-                    }],
-                )],
-            };
+            let providers = provider_inputs(vec![provider(
+                "math",
+                vec![ExternModuleDescriptor {
+                    path: module(&["math"]),
+                    types: vec![],
+                    functions: vec![
+                        ExternFunctionDescriptor {
+                            name: "dot".to_string(),
+                            doc: None,
+                            signature: signature(vec![], ExternTypeExpr::Float),
+                            effects: ExternEffects::default(),
+                        },
+                        ExternFunctionDescriptor {
+                            name: "dot".to_string(),
+                            doc: None,
+                            signature: signature(vec![], ExternTypeExpr::Float),
+                            effects: ExternEffects::default(),
+                        },
+                    ],
+                }],
+            )]);
 
             let errors = ingest_providers(providers).unwrap_err();
 
@@ -266,6 +273,7 @@ mod tests {
             assert_eq!(
                 errors[0],
                 ExternInputError::InvalidProviderDescriptor {
+                    package: PackageId::synthetic_root(),
                     provider: ProviderId {
                         name: "math".to_string()
                     },
@@ -275,6 +283,69 @@ mod tests {
                     }
                 }
             );
+        }
+
+        #[test]
+        fn rejects_duplicate_provider_modules_in_one_package() {
+            let errors = ingest_providers(provider_inputs(vec![
+                provider(
+                    "left",
+                    vec![ExternModuleDescriptor {
+                        path: module(&["audio"]),
+                        types: vec![],
+                        functions: vec![function("play")],
+                    }],
+                ),
+                provider(
+                    "right",
+                    vec![ExternModuleDescriptor {
+                        path: module(&["audio"]),
+                        types: vec![],
+                        functions: vec![function("stop")],
+                    }],
+                ),
+            ]))
+            .unwrap_err();
+
+            assert!(matches!(
+                &errors[0],
+                ExternInputError::DuplicateProviderModule { package, module, .. }
+                    if package == &PackageId::synthetic_root() && module == &self::module(&["audio"])
+            ));
+        }
+
+        #[test]
+        fn allows_same_provider_module_in_different_packages() {
+            let inputs = ExternInputs {
+                packages: vec![
+                    PackageExternInputs {
+                        package: PackageId::new("left"),
+                        providers: vec![provider(
+                            "host",
+                            vec![ExternModuleDescriptor {
+                                path: module(&["audio"]),
+                                types: vec![],
+                                functions: vec![function("play")],
+                            }],
+                        )],
+                    },
+                    PackageExternInputs {
+                        package: PackageId::new("right"),
+                        providers: vec![provider(
+                            "host",
+                            vec![ExternModuleDescriptor {
+                                path: module(&["audio"]),
+                                types: vec![],
+                                functions: vec![function("play")],
+                            }],
+                        )],
+                    },
+                ],
+            };
+
+            let raw = ingest_providers(inputs).unwrap();
+
+            assert_eq!(raw.groups.len(), 2);
         }
     }
 
@@ -314,16 +385,17 @@ mod tests {
             let raw = collect_source_externs(&root, &resolved).unwrap();
 
             assert_eq!(raw.groups.len(), 1);
+            let scope = RawExternScope::Module(ModuleId::named(
+                PackageId::synthetic_root(),
+                resolve_path(&["math"]),
+            ));
             assert_eq!(
                 raw.groups[0].provenance,
                 ExternProvenance::Source {
-                    module: RawExternScope::Named(module(&["math"]))
+                    module: scope.clone()
                 }
             );
-            assert_eq!(
-                raw.groups[0].modules[0].scope,
-                RawExternScope::Named(module(&["math"]))
-            );
+            assert_eq!(raw.groups[0].modules[0].scope, scope);
             assert_eq!(raw.groups[0].modules[0].functions[0].decl.name, "dot");
         }
 
@@ -742,29 +814,44 @@ mod tests {
     mod identity {
         use super::*;
 
+        fn provider_module(
+            package: PackageId,
+            functions: Vec<ExternFunctionDescriptor>,
+            types: Vec<ExternTypeDescriptor>,
+        ) -> RawExternGroup {
+            RawExternGroup {
+                provenance: ExternProvenance::Provider {
+                    package: package.clone(),
+                    provider: ProviderId {
+                        name: "p".to_string(),
+                    },
+                },
+                modules: vec![RawExternModule {
+                    scope: RawExternScope::Module(ModuleId::provider(
+                        package,
+                        resolve_path(&["math"]),
+                    )),
+                    types: types.into_iter().map(normalize_type).collect(),
+                    functions: functions
+                        .into_iter()
+                        .map(|decl| RawExternFunction {
+                            decl,
+                            site: RawExternSite::default(),
+                        })
+                        .collect(),
+                }],
+            }
+        }
+
         #[test]
         fn rejects_duplicate_provider_functions() {
-            let mut raw = ingest_providers(ExternInputs {
-                providers: vec![
-                    provider(
-                        "a",
-                        vec![ExternModuleDescriptor {
-                            path: module(&["math"]),
-                            types: vec![],
-                            functions: vec![function("dot")],
-                        }],
-                    ),
-                    provider(
-                        "b",
-                        vec![ExternModuleDescriptor {
-                            path: module(&["math"]),
-                            types: vec![],
-                            functions: vec![function("dot")],
-                        }],
-                    ),
+            let package = PackageId::new("pkg");
+            let raw = RawExterns {
+                groups: vec![
+                    provider_module(package.clone(), vec![function("dot")], vec![]),
+                    provider_module(package, vec![function("dot")], vec![]),
                 ],
-            })
-            .unwrap();
+            };
 
             let errors = validate_raw_identities(&raw).unwrap_err();
 
@@ -775,33 +862,29 @@ mod tests {
                     ..
                 }
             ));
-            raw.groups[1].modules[0].functions[0].decl.name = "cross".to_string();
+        }
+
+        #[test]
+        fn provider_identities_are_package_scoped() {
+            let raw = RawExterns {
+                groups: vec![
+                    provider_module(PackageId::new("left"), vec![function("dot")], vec![]),
+                    provider_module(PackageId::new("right"), vec![function("dot")], vec![]),
+                ],
+            };
+
             validate_raw_identities(&raw).unwrap();
         }
 
         #[test]
         fn rejects_duplicate_provider_types() {
-            let raw = ingest_providers(ExternInputs {
-                providers: vec![
-                    provider(
-                        "a",
-                        vec![ExternModuleDescriptor {
-                            path: module(&["math"]),
-                            types: vec![extern_type("Vec2")],
-                            functions: vec![],
-                        }],
-                    ),
-                    provider(
-                        "b",
-                        vec![ExternModuleDescriptor {
-                            path: module(&["math"]),
-                            types: vec![extern_type("Vec2")],
-                            functions: vec![],
-                        }],
-                    ),
+            let package = PackageId::new("pkg");
+            let raw = RawExterns {
+                groups: vec![
+                    provider_module(package.clone(), vec![], vec![extern_type("Vec2")]),
+                    provider_module(package, vec![], vec![extern_type("Vec2")]),
                 ],
-            })
-            .unwrap();
+            };
 
             let errors = validate_raw_identities(&raw).unwrap_err();
 
@@ -815,57 +898,20 @@ mod tests {
         }
 
         #[test]
-        fn rejects_function_conflict() {
-            let mut raw = ingest_providers(ExternInputs {
-                providers: vec![provider(
-                    "math_provider",
-                    vec![ExternModuleDescriptor {
-                        path: module(&["math"]),
-                        types: vec![],
-                        functions: vec![function("dot")],
-                    }],
-                )],
-            })
+        fn source_and_provider_modules_with_same_path_do_not_collide() {
+            let mut raw = ingest_providers(provider_inputs(vec![provider(
+                "math_provider",
+                vec![ExternModuleDescriptor {
+                    path: module(&["math"]),
+                    types: vec![extern_type("Vec2")],
+                    functions: vec![function("dot")],
+                }],
+            )]))
             .unwrap();
-            let source = collect_modules(&[("math", "extern fn dot() -> void;")]);
+            let source = collect_modules(&[("math", "extern fn dot() -> void; extern type Vec2;")]);
             raw.append(source);
 
-            let errors = validate_raw_identities(&raw).unwrap_err();
-
-            assert!(matches!(
-                errors[0],
-                ExternInputError::DuplicateRawIdentity {
-                    key: RawExternIdentityKey::Function(_),
-                    ..
-                }
-            ));
-        }
-
-        #[test]
-        fn rejects_type_conflict() {
-            let mut raw = ingest_providers(ExternInputs {
-                providers: vec![provider(
-                    "math_provider",
-                    vec![ExternModuleDescriptor {
-                        path: module(&["math"]),
-                        types: vec![extern_type("Vec2")],
-                        functions: vec![],
-                    }],
-                )],
-            })
-            .unwrap();
-            let source = collect_modules(&[("math", "extern type Vec2;")]);
-            raw.append(source);
-
-            let errors = validate_raw_identities(&raw).unwrap_err();
-
-            assert!(matches!(
-                errors[0],
-                ExternInputError::DuplicateRawIdentity {
-                    key: RawExternIdentityKey::Type(_),
-                    ..
-                }
-            ));
+            validate_raw_identities(&raw).unwrap();
         }
 
         #[test]
@@ -1035,26 +1081,24 @@ mod tests {
 
         #[test]
         fn accepts_same_names_in_different_scopes() {
-            let mut raw = ingest_providers(ExternInputs {
-                providers: vec![
-                    provider(
-                        "a",
-                        vec![ExternModuleDescriptor {
-                            path: module(&["a"]),
-                            types: vec![extern_type("T")],
-                            functions: vec![function("f")],
-                        }],
-                    ),
-                    provider(
-                        "b",
-                        vec![ExternModuleDescriptor {
-                            path: module(&["b"]),
-                            types: vec![extern_type("T")],
-                            functions: vec![function("f")],
-                        }],
-                    ),
-                ],
-            })
+            let mut raw = ingest_providers(provider_inputs(vec![
+                provider(
+                    "a",
+                    vec![ExternModuleDescriptor {
+                        path: module(&["a"]),
+                        types: vec![extern_type("T")],
+                        functions: vec![function("f")],
+                    }],
+                ),
+                provider(
+                    "b",
+                    vec![ExternModuleDescriptor {
+                        path: module(&["b"]),
+                        types: vec![extern_type("T")],
+                        functions: vec![function("f")],
+                    }],
+                ),
+            ]))
             .unwrap();
             raw.append(
                 collect_source_externs(
@@ -1077,64 +1121,62 @@ mod tests {
                     thread: CallbackThread::SameThread,
                 },
             });
-            let providers = ExternInputs {
-                providers: vec![provider(
-                    "gfx",
-                    vec![ExternModuleDescriptor {
-                        path: module(&["gfx"]),
-                        functions: vec![],
-                        types: vec![ExternTypeDescriptor {
-                            name: "Sprite".to_string(),
-                            doc: Some("sprite".to_string()),
-                            rep: ExternRep::Shared,
-                            fields: vec![ExternFieldDescriptor {
-                                name: "x".to_string(),
-                                ty: ExternTypeExpr::Float,
-                                access: FieldAccess::ReadWrite { computed: true },
-                                doc: Some("x pos".to_string()),
-                            }],
-                            init: Some(ExternInitDescriptor {
-                                params: vec![],
-                                field_init: vec!["x".to_string()],
-                            }),
-                            methods: vec![ExternMethodDescriptor {
-                                name: "move".to_string(),
-                                doc: Some("move sprite".to_string()),
-                                receiver: ReceiverMode::Mutable,
-                                signature: signature(
-                                    vec![ExternParam {
-                                        name: Some("dx".to_string()),
-                                        ty: ExternTypeExpr::Float,
-                                        flow: ParamFlow::Borrow,
-                                    }],
-                                    ExternTypeExpr::Void,
-                                ),
-                                effects: ExternEffects { fallible: true },
-                            }],
-                            statics: vec![ExternStaticDescriptor {
-                                name: "load".to_string(),
-                                doc: Some("load sprite".to_string()),
-                                signature: signature(
-                                    vec![param("path", ExternTypeExpr::String)],
-                                    callback,
-                                ),
-                                effects: ExternEffects { fallible: true },
-                            }],
-                            operators: vec![ExternOperatorDescriptor {
-                                op: ExternOperator::Binary {
-                                    op: BinaryOp::Add,
-                                    self_on_right: true,
-                                },
-                                signature: signature(
-                                    vec![param("other", ExternTypeExpr::Int)],
-                                    ExternTypeExpr::Int,
-                                ),
-                                effects: ExternEffects::default(),
-                            }],
+            let providers = provider_inputs(vec![provider(
+                "gfx",
+                vec![ExternModuleDescriptor {
+                    path: module(&["gfx"]),
+                    functions: vec![],
+                    types: vec![ExternTypeDescriptor {
+                        name: "Sprite".to_string(),
+                        doc: Some("sprite".to_string()),
+                        rep: ExternRep::Shared,
+                        fields: vec![ExternFieldDescriptor {
+                            name: "x".to_string(),
+                            ty: ExternTypeExpr::Float,
+                            access: FieldAccess::ReadWrite { computed: true },
+                            doc: Some("x pos".to_string()),
+                        }],
+                        init: Some(ExternInitDescriptor {
+                            params: vec![],
+                            field_init: vec!["x".to_string()],
+                        }),
+                        methods: vec![ExternMethodDescriptor {
+                            name: "move".to_string(),
+                            doc: Some("move sprite".to_string()),
+                            receiver: ReceiverMode::Mutable,
+                            signature: signature(
+                                vec![ExternParam {
+                                    name: Some("dx".to_string()),
+                                    ty: ExternTypeExpr::Float,
+                                    flow: ParamFlow::Borrow,
+                                }],
+                                ExternTypeExpr::Void,
+                            ),
+                            effects: ExternEffects { fallible: true },
+                        }],
+                        statics: vec![ExternStaticDescriptor {
+                            name: "load".to_string(),
+                            doc: Some("load sprite".to_string()),
+                            signature: signature(
+                                vec![param("path", ExternTypeExpr::String)],
+                                callback,
+                            ),
+                            effects: ExternEffects { fallible: true },
+                        }],
+                        operators: vec![ExternOperatorDescriptor {
+                            op: ExternOperator::Binary {
+                                op: BinaryOp::Add,
+                                self_on_right: true,
+                            },
+                            signature: signature(
+                                vec![param("other", ExternTypeExpr::Int)],
+                                ExternTypeExpr::Int,
+                            ),
+                            effects: ExternEffects::default(),
                         }],
                     }],
-                )],
-            };
+                }],
+            )]);
 
             let raw = ingest_providers(providers).unwrap();
             let ty = &raw.groups[0].modules[0].types[0];

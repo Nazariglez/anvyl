@@ -23,7 +23,7 @@ pub(crate) mod ir_meta;
 pub mod metadata;
 pub mod prelude_enums;
 
-pub use anvyx_macros::{export_fn, export_methods, export_type, provider};
+pub use anvyx_macros::{export_fn, export_methods, export_type, provider, provider_descriptor};
 pub use diagnostic::{
     CompileOutput, CompileResult, DiagnosticFile, DiagnosticLabel, DiagnosticReport, RunError,
     RunOutput, Severity,

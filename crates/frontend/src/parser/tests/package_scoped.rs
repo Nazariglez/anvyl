@@ -46,6 +46,14 @@ fn parses_native_provider_import() {
 }
 
 #[test]
+fn parses_native_provider_keyword_module() {
+    let imp = first_import("import ext:int { int_abs };");
+
+    assert_eq!(imp.target.root, ImportRoot::NativeProvider);
+    assert_named_path(&imp.target.path, &["int"]);
+}
+
+#[test]
 fn parses_native_provider_wildcard_reexport() {
     let imp = first_import("pub import ext:core { * };");
 

@@ -4,6 +4,7 @@ mod export_methods;
 mod export_type;
 mod naming;
 mod provider;
+mod provider_descriptor;
 mod type_map;
 mod util;
 
@@ -42,4 +43,9 @@ pub fn export_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn provider(input: TokenStream) -> TokenStream {
     provider::expand(input.into()).into()
+}
+
+#[proc_macro]
+pub fn provider_descriptor(input: TokenStream) -> TokenStream {
+    provider_descriptor::expand(input.into()).into()
 }

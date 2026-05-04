@@ -8,6 +8,12 @@ use crate::{resolve::ModuleId, span::Span};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternInputs {
+    pub packages: Vec<PackageExternInputs>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageExternInputs {
+    pub package: crate::resolve::PackageId,
     pub providers: Vec<ProviderDescriptor>,
 }
 
@@ -30,13 +36,17 @@ pub(crate) struct RawExternGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExternProvenance {
-    Provider { provider: ProviderId },
-    Source { module: RawExternScope },
+    Provider {
+        package: crate::resolve::PackageId,
+        provider: ProviderId,
+    },
+    Source {
+        module: RawExternScope,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum RawExternScope {
-    Named(ModulePath),
     Module(ModuleId),
 }
 
@@ -122,8 +132,15 @@ pub(crate) struct RawExternOperator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExternInputError {
     InvalidProviderDescriptor {
+        package: crate::resolve::PackageId,
         provider: ProviderId,
         error: ExternDescriptorError,
+    },
+    DuplicateProviderModule {
+        package: crate::resolve::PackageId,
+        module: ModulePath,
+        first: ProviderId,
+        duplicate: ProviderId,
     },
     InvalidRawDescriptor {
         decl: RawExternDecl,

@@ -17,13 +17,17 @@ pub enum ModuleOrigin {
         package: String,
         path: Option<ModulePath>,
     },
+    Provider {
+        package: String,
+        path: ModulePath,
+    },
 }
 
 impl ModuleOrigin {
     pub fn module_path(&self) -> Option<&[String]> {
         match self {
             Self::Module(path) => Some(path),
-            Self::SourceFile { .. } | Self::Package { .. } => None,
+            Self::SourceFile { .. } | Self::Package { .. } | Self::Provider { .. } => None,
         }
     }
 }

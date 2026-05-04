@@ -1,0 +1,1 @@
+pub import ext:mem { collect_cycles, auto_collect, managed_count };

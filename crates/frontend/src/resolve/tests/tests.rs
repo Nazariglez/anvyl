@@ -40,6 +40,10 @@ fn has_error(errors: &[ResolveError], path: &[&str]) -> bool {
         ResolveError::UnknownDependency { .. }
         | ResolveError::PackageImportUnavailable { .. }
         | ResolveError::UnsupportedImportRoot { .. }
+        | ResolveError::NativeProviderUnavailable { .. }
+        | ResolveError::UnknownNativeProviderModule { .. }
+        | ResolveError::UnknownNativeDepProviderModule { .. }
+        | ResolveError::NativeOnlyPkgRootImport { .. }
         | ResolveError::SourceImportNotFound { .. } => false,
     })
 }
@@ -168,16 +172,48 @@ fn load_failure() {
 }
 
 #[test]
-fn external_module_import_resolves_without_source_module() {
+fn external_module_does_not_make_local_import_resolve() {
     let mut loader = InMemoryLoader::default();
     let path = module_path(["host"]);
     loader.add_missing(path.clone());
     let external_modules = HashSet::from([path.clone()]);
 
-    let result = resolve_with_external("import host;", &mut loader, &external_modules).unwrap();
+    let errors = resolve_errors(resolve_with_external(
+        "import host;",
+        &mut loader,
+        &external_modules,
+    ));
+
+    assert!(has_error(&errors, &["host"]));
+    assert_eq!(loader.load_count(&path), 1);
+}
+
+#[test]
+fn ext_provider_module_resolves_without_source_load() {
+    let mut loader = InMemoryLoader::default();
+    let path = module_path(["host"]);
+    let external_modules = HashSet::from([path.clone()]);
+
+    let result = resolve_with_external("import ext:host;", &mut loader, &external_modules).unwrap();
 
     assert!(!has_key(&result, &["host"]));
-    assert_eq!(loader.load_count(&path), 1);
+    assert_eq!(loader.load_count(&path), 0);
+}
+
+#[test]
+fn unknown_ext_provider_module_fails() {
+    let mut loader = InMemoryLoader::default();
+    let errors = resolve_errors(resolve_with_external(
+        "import ext:missing;",
+        &mut loader,
+        &HashSet::new(),
+    ));
+
+    assert!(matches!(
+        errors.as_slice(),
+        [ResolveError::UnknownNativeProviderModule { module, .. }]
+            if module.segments() == ["missing"]
+    ));
 }
 
 #[test]
@@ -194,7 +230,7 @@ fn missing_non_external_module_still_fails() {
 }
 
 #[test]
-fn preloaded_module_wins_over_external_fallback() {
+fn preloaded_module_wins_over_missing_source() {
     let mut loader = InMemoryLoader::default();
     let path = module_path(["host"]);
     let external_modules = HashSet::from([path.clone()]);
@@ -212,7 +248,7 @@ fn preloaded_module_wins_over_external_fallback() {
 }
 
 #[test]
-fn load_failure_beats_external_fallback() {
+fn load_failure_is_reported_with_external_module() {
     let mut loader = InMemoryLoader::default();
     let path = module_path(["host"]);
     loader.add_failure(path.clone(), "disk error");

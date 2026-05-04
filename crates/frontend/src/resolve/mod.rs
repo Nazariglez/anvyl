@@ -173,6 +173,7 @@ impl std::error::Error for SourceFileIdError {}
 pub enum PackageModulePath {
     Root,
     Named(ModulePath),
+    Provider(ModulePath),
     Source(SourceFileId),
 }
 
@@ -180,6 +181,20 @@ impl PackageModulePath {
     pub fn named_path(&self) -> Option<&ModulePath> {
         match self {
             Self::Named(path) => Some(path),
+            Self::Root | Self::Provider(_) | Self::Source(_) => None,
+        }
+    }
+
+    pub fn provider_path(&self) -> Option<&ModulePath> {
+        match self {
+            Self::Provider(path) => Some(path),
+            Self::Root | Self::Named(_) | Self::Source(_) => None,
+        }
+    }
+
+    pub fn module_path(&self) -> Option<&ModulePath> {
+        match self {
+            Self::Named(path) | Self::Provider(path) => Some(path),
             Self::Root | Self::Source(_) => None,
         }
     }
@@ -187,7 +202,7 @@ impl PackageModulePath {
     pub fn source_file(&self) -> Option<&SourceFileId> {
         match self {
             Self::Source(file) => Some(file),
-            Self::Root | Self::Named(_) => None,
+            Self::Root | Self::Named(_) | Self::Provider(_) => None,
         }
     }
 }
@@ -210,6 +225,13 @@ impl ModuleId {
         Self {
             package: Some(package),
             path: PackageModulePath::Named(path),
+        }
+    }
+
+    pub fn provider(package: PackageId, path: ModulePath) -> Self {
+        Self {
+            package: Some(package),
+            path: PackageModulePath::Provider(path),
         }
     }
 
@@ -244,6 +266,14 @@ impl ModuleId {
 
     pub fn named_path(&self) -> Option<&ModulePath> {
         self.path.named_path()
+    }
+
+    pub fn provider_path(&self) -> Option<&ModulePath> {
+        self.path.provider_path()
+    }
+
+    pub fn module_path(&self) -> Option<&ModulePath> {
+        self.path.module_path()
     }
 
     pub fn source_file(&self) -> Option<&SourceFileId> {
@@ -308,10 +338,18 @@ pub struct PreloadedModule {
     pub program: Program,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PackageKind {
+    #[default]
+    Source,
+    NativeOnly,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PackageInput {
     pub root: Option<LoadedModule>,
     pub dependencies: HashMap<String, PackageId>,
+    pub kind: PackageKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,11 +365,18 @@ pub enum LocalSourceLoad {
     Missing { candidate: Option<PathBuf> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedImportBaseKind {
+    Source,
+    Provider,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedImportTarget {
     pub(crate) base: ModuleId,
     pub(crate) exported_path: Vec<Ident>,
     pub(crate) default_name: Ident,
+    pub(crate) base_kind: ResolvedImportBaseKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +411,26 @@ pub enum ResolveError {
     },
     UnsupportedImportRoot {
         root: &'static str,
+        span: Span,
+    },
+    NativeProviderUnavailable {
+        package: Option<PackageId>,
+        span: Span,
+    },
+    UnknownNativeProviderModule {
+        package: PackageId,
+        module: ModulePath,
+        span: Span,
+    },
+    UnknownNativeDepProviderModule {
+        package: PackageId,
+        alias: String,
+        module: ModulePath,
+        span: Span,
+    },
+    NativeOnlyPkgRootImport {
+        package: PackageId,
+        alias: String,
         span: Span,
     },
 }
@@ -410,7 +475,7 @@ pub fn resolve_modules<L: ModuleLoader>(
     let external_modules = external_modules
         .iter()
         .cloned()
-        .map(|path| ModuleId::named(root_package.clone(), path))
+        .map(|path| ModuleId::provider(root_package.clone(), path))
         .collect::<HashSet<_>>();
     let root = LoadedModule {
         module: ModuleId::root(root_package),
@@ -547,7 +612,7 @@ impl<L: ModuleLoader> Resolver<'_, L> {
                 continue;
             };
             edges.push(target.clone());
-            self.resolve_import_base(target.base, import.span);
+            self.resolve_import_base(&target, import.span);
         }
         self.import_edges.insert(key.clone(), edges);
 
@@ -569,8 +634,10 @@ impl<L: ModuleLoader> Resolver<'_, L> {
         resolve_import_target(
             current,
             import,
+            self.packages,
             self.dependencies,
             self.std_package,
+            self.external_modules,
             &mut self.errors,
         )
     }
@@ -597,6 +664,7 @@ impl<L: ModuleLoader> Resolver<'_, L> {
                     base: module,
                     exported_path: vec![],
                     default_name,
+                    base_kind: ResolvedImportBaseKind::Source,
                 })
             }
             Ok(LocalSourceLoad::Missing { candidate }) => {
@@ -623,7 +691,19 @@ impl<L: ModuleLoader> Resolver<'_, L> {
         }
     }
 
-    fn resolve_import_base(&mut self, import_key: ModuleId, span: Span) {
+    fn resolve_import_base(&mut self, target: &ResolvedImportTarget, span: Span) {
+        let import_key = target.base.clone();
+        if target.base_kind == ResolvedImportBaseKind::Provider {
+            if self.external_modules.contains(&import_key) {
+                self.loaded.insert(import_key);
+            } else {
+                self.errors.push(ResolveError::ModuleNotFound {
+                    module: import_key,
+                    span,
+                });
+            }
+            return;
+        }
         if import_key.is_ignored(self.ignored_roots) || self.loaded.contains(&import_key) {
             return;
         }
@@ -665,9 +745,6 @@ impl<L: ModuleLoader> Resolver<'_, L> {
                 self.module_aliases
                     .insert(import_key.clone(), loaded.module.clone());
                 self.resolve_module(loaded.module, loaded.program);
-            }
-            Ok(None) if self.external_modules.contains(&import_key) => {
-                self.loaded.insert(import_key);
             }
             Ok(None) => {
                 self.errors.push(ResolveError::ModuleNotFound {
@@ -729,16 +806,26 @@ fn build_dependency_groups(
 pub(crate) fn resolve_import_target(
     current: &ModuleId,
     import: &Spanned<ast::Import>,
+    packages: &HashMap<PackageId, PackageInput>,
     dependencies: &HashMap<PackageId, HashMap<String, PackageId>>,
     std_package: Option<&PackageId>,
+    external_modules: &HashSet<ModuleId>,
     errors: &mut Vec<ResolveError>,
 ) -> Option<ResolvedImportTarget> {
     match &import.node.target.root {
         ast::ImportRoot::Local { .. } => local_import_target(current, import),
-        ast::ImportRoot::Package(alias) => {
-            dependency_import_target(current, import, *alias, dependencies, errors)
+        ast::ImportRoot::Package(alias) => dependency_import_target(
+            current,
+            import,
+            *alias,
+            packages,
+            dependencies,
+            external_modules,
+            errors,
+        ),
+        ast::ImportRoot::NativeProvider => {
+            native_provider_import_target(current, import, external_modules, errors)
         }
-        ast::ImportRoot::NativeProvider => unsupported_import_root("ext", import, errors),
         ast::ImportRoot::Std => std_import_target(std_package, import, errors),
     }
 }
@@ -766,6 +853,7 @@ fn local_import_target(
         default_name: path_default_name(&path),
         base: ModuleId::named(package, path),
         exported_path: vec![],
+        base_kind: ResolvedImportBaseKind::Source,
     })
 }
 
@@ -773,7 +861,9 @@ fn dependency_import_target(
     current: &ModuleId,
     import: &Spanned<ast::Import>,
     alias: Ident,
+    packages: &HashMap<PackageId, PackageInput>,
     dependencies: &HashMap<PackageId, HashMap<String, PackageId>>,
+    provider_modules: &HashSet<ModuleId>,
     errors: &mut Vec<ResolveError>,
 ) -> Option<ResolvedImportTarget> {
     let Some(package) = current.package_context() else {
@@ -799,10 +889,80 @@ fn dependency_import_target(
     };
 
     let exported_path = target_path_idents(&import.node.target.path);
+    if packages
+        .get(&dependency)
+        .is_some_and(|package| package.kind == PackageKind::NativeOnly)
+    {
+        if exported_path.is_empty() {
+            errors.push(ResolveError::NativeOnlyPkgRootImport {
+                package: dependency,
+                alias: alias.to_string(),
+                span: import.span,
+            });
+            return None;
+        }
+        let path = ModulePath::from_idents(&exported_path);
+        let module = ModuleId::provider(dependency.clone(), path.clone());
+        if !provider_modules.contains(&module) {
+            errors.push(ResolveError::UnknownNativeDepProviderModule {
+                package: dependency,
+                alias: alias.to_string(),
+                module: path,
+                span: import.span,
+            });
+            return None;
+        }
+        return Some(ResolvedImportTarget {
+            base: module,
+            default_name: exported_path.last().copied().unwrap_or(alias),
+            exported_path: vec![],
+            base_kind: ResolvedImportBaseKind::Provider,
+        });
+    }
+
     Some(ResolvedImportTarget {
         base: ModuleId::root(dependency),
         default_name: exported_path.last().copied().unwrap_or(alias),
         exported_path,
+        base_kind: ResolvedImportBaseKind::Source,
+    })
+}
+
+fn native_provider_import_target(
+    current: &ModuleId,
+    import: &Spanned<ast::Import>,
+    provider_modules: &HashSet<ModuleId>,
+    errors: &mut Vec<ResolveError>,
+) -> Option<ResolvedImportTarget> {
+    let Some(package) = current.package_context().cloned() else {
+        errors.push(ResolveError::NativeProviderUnavailable {
+            package: None,
+            span: import.span,
+        });
+        return None;
+    };
+    let ast::PackageModulePath::Named(path) = &import.node.target.path else {
+        errors.push(ResolveError::NativeProviderUnavailable {
+            package: Some(package),
+            span: import.span,
+        });
+        return None;
+    };
+    let path = ModulePath::from_idents(path);
+    let module = ModuleId::provider(package.clone(), path.clone());
+    if !provider_modules.contains(&module) {
+        errors.push(ResolveError::UnknownNativeProviderModule {
+            package,
+            module: path,
+            span: import.span,
+        });
+        return None;
+    }
+    Some(ResolvedImportTarget {
+        default_name: path_default_name(&path),
+        base: module,
+        exported_path: vec![],
+        base_kind: ResolvedImportBaseKind::Provider,
     })
 }
 
@@ -822,6 +982,7 @@ fn std_import_target(
             .copied()
             .unwrap_or_else(|| Ident::new("std")),
         exported_path,
+        base_kind: ResolvedImportBaseKind::Source,
     })
 }
 

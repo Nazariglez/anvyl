@@ -8,7 +8,8 @@ use crate::{
     lexer, parser,
     resolve::{
         self, LoadedModule, ModuleId, ModuleLoadError, ModuleLoader, ModulePath, PackageId,
-        PackageInput, PreloadedModule, ResolveError, ResolveFailure, ResolveResult, SourceFileId,
+        PackageInput, PackageKind, PreloadedModule, ResolveError, ResolveFailure, ResolveResult,
+        SourceFileId,
     },
 };
 
@@ -43,6 +44,10 @@ pub fn module_id(package: &PackageId, segments: &[&str]) -> ModuleId {
     ModuleId::named(package.clone(), module_path(segments))
 }
 
+pub fn provider_id(package: &PackageId, segments: &[&str]) -> ModuleId {
+    ModuleId::provider(package.clone(), module_path(segments))
+}
+
 pub fn root_id(package: &PackageId) -> ModuleId {
     ModuleId::root(package.clone())
 }
@@ -52,12 +57,21 @@ pub fn source_id(package: &PackageId, path: &str) -> ModuleId {
 }
 
 pub fn package_input(dependencies: &[(&str, PackageId)]) -> PackageInput {
+    package_input_with_kind(dependencies, PackageKind::Source)
+}
+
+pub fn native_package_input(dependencies: &[(&str, PackageId)]) -> PackageInput {
+    package_input_with_kind(dependencies, PackageKind::NativeOnly)
+}
+
+fn package_input_with_kind(dependencies: &[(&str, PackageId)], kind: PackageKind) -> PackageInput {
     PackageInput {
         root: None,
         dependencies: dependencies
             .iter()
             .map(|(alias, package)| ((*alias).to_string(), package.clone()))
             .collect(),
+        kind,
     }
 }
 
@@ -75,6 +89,7 @@ pub fn package_root(
             .iter()
             .map(|(alias, package)| ((*alias).to_string(), package.clone()))
             .collect(),
+        kind: PackageKind::Source,
     }
 }
 

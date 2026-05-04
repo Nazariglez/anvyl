@@ -114,6 +114,28 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
         ResolveError::UnsupportedImportRoot { root, .. } => {
             format!("import root '{root}' is not supported yet")
         }
+        ResolveError::NativeProviderUnavailable { package, .. } => match package {
+            Some(package) => format!("package '{package}' has no native provider modules"),
+            None => "native provider imports require a package context".to_string(),
+        },
+        ResolveError::UnknownNativeProviderModule {
+            package, module, ..
+        } => format!(
+            "package '{package}' has no native provider module '{}'",
+            render_module_path(module)
+        ),
+        ResolveError::UnknownNativeDepProviderModule {
+            package,
+            alias,
+            module,
+            ..
+        } => format!(
+            "native-only dependency '{alias}' ({package}) has no native provider module '{}'",
+            render_module_path(module)
+        ),
+        ResolveError::NativeOnlyPkgRootImport { package, alias, .. } => {
+            format!("native-only dependency '{alias}' ({package}) has no source root to import")
+        }
     };
     Diagnostic::error(message)
 }
@@ -127,10 +149,27 @@ pub(super) fn diagnose_unresolved_always_active_module(module: &ModuleScope) -> 
 
 pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnostic {
     let message = match error {
-        ExternInputError::InvalidProviderDescriptor { provider, error } => format!(
-            "invalid extern descriptor from provider '{}': {}",
+        ExternInputError::InvalidProviderDescriptor {
+            package,
+            provider,
+            error,
+        } => format!(
+            "invalid extern descriptor from provider '{}' in package '{}': {}",
             provider.name,
+            package,
             render_extern_descriptor_error(error, None)
+        ),
+        ExternInputError::DuplicateProviderModule {
+            package,
+            module,
+            first,
+            duplicate,
+        } => format!(
+            "duplicate provider module '{}' in package '{}' declared by providers '{}' and '{}'",
+            render_extern_module_path(module),
+            package,
+            first.name,
+            duplicate.name
         ),
         ExternInputError::InvalidRawDescriptor { decl, scope, error } => format!(
             "invalid extern descriptor from {}: {}",
@@ -240,7 +279,9 @@ fn render_raw_decl(decl: &RawExternDecl) -> String {
 
 fn render_extern_provenance(provenance: &ExternProvenance) -> String {
     match provenance {
-        ExternProvenance::Provider { provider } => format!("provider '{}'", provider.name),
+        ExternProvenance::Provider { package, provider } => {
+            format!("provider '{}' in package '{}'", provider.name, package)
+        }
         ExternProvenance::Source { module } if is_raw_root_scope(module) => {
             "source root".to_string()
         }
@@ -268,7 +309,6 @@ fn render_raw_member_key(key: &RawExternMemberKey) -> String {
 
 fn render_raw_scoped_name(scope: &RawExternScope, name: &str) -> String {
     match scope {
-        RawExternScope::Named(path) => format!("{}.{name}", render_extern_module_path(path)),
         RawExternScope::Module(module) if is_root_module_id(module) => name.to_string(),
         RawExternScope::Module(module) => format!("{}.{name}", render_module_id(module)),
     }
@@ -276,7 +316,6 @@ fn render_raw_scoped_name(scope: &RawExternScope, name: &str) -> String {
 
 fn render_raw_scope(scope: &RawExternScope) -> String {
     match scope {
-        RawExternScope::Named(path) => render_extern_module_path(path),
         RawExternScope::Module(module) => render_module_id(module),
     }
 }
@@ -572,6 +611,7 @@ fn render_nominal_origin(origin: &ModuleOrigin) -> String {
                 .map_or_else(|| "<root>".to_string(), |path| path.join("."));
             format!("{package}:{path}")
         }
+        ModuleOrigin::Provider { package, path } => format!("{package}:ext:{}", path.join(".")),
     }
 }
 
@@ -1032,6 +1072,7 @@ fn render_module_id(module: &ModuleId) -> String {
     let path = match module.path() {
         PackageModulePath::Root => "<root>".to_string(),
         PackageModulePath::Named(path) => render_module_path(path),
+        PackageModulePath::Provider(path) => format!("ext:{}", render_module_path(path)),
         PackageModulePath::Source(file) => file.to_string(),
     };
     match module.package_context() {
@@ -1094,12 +1135,6 @@ mod tests {
             },
             module: module_scope(module),
             item,
-        }
-    }
-
-    fn raw_path(path: &[&str]) -> ExternModulePath {
-        ExternModulePath {
-            segments: path.iter().map(ToString::to_string).collect(),
         }
     }
 
@@ -1582,13 +1617,14 @@ mod tests {
 
     #[test]
     fn renders_named_raw_member_identity() {
-        let decl = source_decl(RawExternScope::Named(raw_path(&["host"])));
+        let module = RawExternScope::Module(module_id(&["host"]));
+        let decl = source_decl(module.clone());
 
         assert_msg(
             diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
                 key: RawExternIdentityKey::Member(RawExternMemberKey {
                     owner: RawExternTypeKey {
-                        module: RawExternScope::Named(raw_path(&["host"])),
+                        module,
                         name: "Handle".to_string(),
                     },
                     selector: anvyx_externs::ExternMemberSelector::Field("id".to_string()),
@@ -1608,6 +1644,7 @@ mod tests {
         };
         let descriptor =
             diagnose_extern_input_error(&ExternInputError::InvalidProviderDescriptor {
+                package: PackageId::synthetic_root(),
                 provider: anvyx_externs::ProviderId {
                     name: "host".to_string(),
                 },
@@ -1640,7 +1677,7 @@ mod tests {
 
         assert_msg(
             descriptor,
-            "invalid extern descriptor from provider 'host': invalid operator '==' on extern type 'math.Vec2': expected bool return type, found 'int'",
+            "invalid extern descriptor from provider 'host' in package '<root>': invalid operator '==' on extern type 'math.Vec2': expected bool return type, found 'int'",
         );
         assert_msg(
             catalog,

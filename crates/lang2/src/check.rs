@@ -1,19 +1,20 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use anvyx_frontend::{
+    externs::{ExternInputs, PackageExternInputs},
     pipeline::{
         self, FrontendConfig, PackageModuleInput, PackageProgramInput, PackageSourceInput,
         Source as FrontendSource,
     },
-    resolve::{ModuleId, PackageId, SystemPackages},
+    resolve::{ModuleId, PackageId, PackageKind, SystemPackages},
 };
 
 use crate::{
-    CheckError, CheckOk, CheckResult, ModuleSource, PackageSource, SourceBundle, SourceText,
+    CheckError, CheckOk, CheckResult, PackageSource, SourceBundle, SourceText,
     source::{PackageSourceEnvironment, SourceOwnership, canonical_source_file},
 };
 
@@ -65,9 +66,17 @@ impl CheckPackageInput {
                 "main source path must not be empty".to_string(),
             ));
         }
-        if !packages.iter().any(|package| package.id() == &root_package) {
+        let Some(root) = packages
+            .iter()
+            .find(|package| package.id() == &root_package)
+        else {
             return Err(CheckError::InvalidInput(format!(
                 "root package '{root_package}' is missing from package input"
+            )));
+        };
+        if root.kind() == PackageKind::NativeOnly {
+            return Err(CheckError::InvalidInput(format!(
+                "root package '{root_package}' has no source entry to check"
             )));
         }
         Ok(Self {
@@ -131,6 +140,7 @@ pub fn check_package(input: CheckPackageInput) -> CheckResult {
                 PackageSourceInput {
                     root,
                     dependencies: package.dependencies().clone(),
+                    kind: package.kind(),
                 },
             ))
         })
@@ -164,11 +174,12 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
         ownership,
         sources,
     } = input;
-    let std_tree = StdModuleTree::new(&sources);
-    if let Some(core) = core_package_input(&sources) {
+    if let Some(core) = system_package_input(PackageId::core(), sources.core()) {
         packages.insert(PackageId::core(), core);
     }
-    packages.insert(PackageId::std(), std_package_input(&std_tree));
+    if let Some(std) = system_package_input(PackageId::std(), sources.std()) {
+        packages.insert(PackageId::std(), std);
+    }
     let mut source_loader = PackageSourceEnvironment::new(ownership, &sources);
     source_loader.cache_sources(cached_sources);
 
@@ -177,15 +188,17 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
             root_package,
             main,
             system: SystemPackages {
-                core: core_package(&sources),
-                std: Some(PackageId::std()),
+                core: sources.core().map(|_| PackageId::core()),
+                std: sources.std().map(|_| PackageId::std()),
             },
             packages,
-            preloaded_modules: preloaded_modules(&sources, &std_tree),
+            preloaded_modules: preloaded_modules(&sources),
             always_active_modules: always_active_modules(&sources),
             source_loader: &mut source_loader,
         },
-        FrontendConfig::default(),
+        FrontendConfig {
+            externs: system_externs(&sources),
+        },
     )?;
 
     Ok(CheckOk)
@@ -203,10 +216,16 @@ fn package_root(
     root_package: &PackageId,
     ownership: &SourceOwnership,
 ) -> Result<Option<PackageModuleInput>, CheckError> {
-    if package.id() == root_package {
+    if package.id() == root_package || package.kind() == PackageKind::NativeOnly {
         return Ok(None);
     }
-    let (owner, source_file) = ownership.validate_root_file(package.entry())?;
+    let Some(entry) = package.entry() else {
+        return Err(CheckError::InvalidInput(format!(
+            "source package '{}' is missing an entry path",
+            package.id()
+        )));
+    };
+    let (owner, source_file) = ownership.validate_root_file(entry)?;
     Ok(Some(PackageModuleInput {
         module: ModuleId::source(owner, source_file),
         source: read_package_root(package)?.to_frontend_source(),
@@ -214,139 +233,79 @@ fn package_root(
 }
 
 fn read_package_root(package: &PackageSource) -> Result<SourceText, CheckError> {
-    let code = read_main(package.entry())?;
-    SourceText::new(code, package.entry().display().to_string())
+    let Some(entry) = package.entry() else {
+        return Err(CheckError::InvalidInput(format!(
+            "source package '{}' is missing an entry path",
+            package.id()
+        )));
+    };
+    let code = read_main(entry)?;
+    SourceText::new(code, entry.display().to_string())
 }
 
-fn core_package(sources: &SourceBundle) -> Option<PackageId> {
-    (sources.core_prelude().is_some() || !sources.core_modules().is_empty()).then(PackageId::core)
+fn system_externs(sources: &SourceBundle) -> ExternInputs {
+    let mut packages = vec![];
+    if let Some(core) = sources.core()
+        && !core.providers().is_empty()
+    {
+        packages.push(PackageExternInputs {
+            package: PackageId::core(),
+            providers: core.providers().to_vec(),
+        });
+    }
+    if let Some(std) = sources.std()
+        && !std.providers().is_empty()
+    {
+        packages.push(PackageExternInputs {
+            package: PackageId::std(),
+            providers: std.providers().to_vec(),
+        });
+    }
+    ExternInputs { packages }
 }
 
-fn core_package_input(sources: &SourceBundle) -> Option<PackageSourceInput> {
-    core_package(sources).map(|_| PackageSourceInput {
+fn system_package_input(
+    package: PackageId,
+    source: Option<&crate::SystemPackageSource>,
+) -> Option<PackageSourceInput> {
+    source.map(|source| PackageSourceInput {
         root: Some(PackageModuleInput {
-            module: ModuleId::root(PackageId::core()),
-            source: sources
-                .core_prelude()
-                .map_or_else(empty_core_source, SourceText::to_frontend_source),
+            module: ModuleId::root(package),
+            source: source.root().to_frontend_source(),
         }),
         dependencies: HashMap::new(),
+        kind: PackageKind::Source,
     })
 }
 
-fn std_package_input(tree: &StdModuleTree) -> PackageSourceInput {
-    PackageSourceInput {
-        root: Some(PackageModuleInput {
-            module: ModuleId::root(PackageId::std()),
-            source: FrontendSource {
-                code: tree.source(&[]),
-                label: "<std>".to_string(),
-            },
-        }),
-        dependencies: HashMap::new(),
-    }
-}
-
-fn empty_core_source() -> FrontendSource {
-    FrontendSource {
-        code: String::new(),
-        label: "<core>".to_string(),
-    }
-}
-
-fn preloaded_modules(sources: &SourceBundle, std_tree: &StdModuleTree) -> Vec<PackageModuleInput> {
+fn preloaded_modules(sources: &SourceBundle) -> Vec<PackageModuleInput> {
     let mut modules = vec![];
-    if let Some(core) = core_package_input(sources).and_then(|package| package.root) {
-        modules.push(core);
-    }
-    modules.extend(
-        sources
-            .core_modules()
-            .iter()
-            .map(|module| PackageModuleInput {
-                module: ModuleId::named(PackageId::core(), module_path(module.path().to_vec())),
-                source: module.to_frontend_source(),
-            }),
-    );
-    modules.extend(std_package_modules(std_tree));
+    preload_system_package(&mut modules, PackageId::core(), sources.core());
+    preload_system_package(&mut modules, PackageId::std(), sources.std());
     modules
 }
 
-fn std_package_modules(tree: &StdModuleTree<'_>) -> Vec<PackageModuleInput> {
-    let mut modules = vec![];
-    for module in &tree.modules {
-        modules.push(PackageModuleInput {
-            module: ModuleId::named(PackageId::std(), module_path(module.path()[1..].to_vec())),
-            source: module.to_frontend_source(),
-        });
-    }
-    for prefix in tree.prefixes() {
-        modules.push(PackageModuleInput {
-            module: ModuleId::named(PackageId::std(), module_path(prefix.clone())),
-            source: FrontendSource {
-                code: tree.source(&prefix),
-                label: format!("<std.{}>", prefix.join(".")),
-            },
-        });
-    }
-    modules
-}
-
-struct StdModuleTree<'a> {
-    modules: Vec<&'a ModuleSource>,
-    existing: HashSet<Vec<String>>,
-    children: BTreeMap<Vec<String>, BTreeSet<String>>,
-}
-
-impl<'a> StdModuleTree<'a> {
-    fn new(sources: &'a SourceBundle) -> Self {
-        let mut modules = vec![];
-        let mut existing = HashSet::new();
-        let mut children = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
-        for module in sources.std_modules() {
-            modules.push(module);
-            let path = &module.path()[1..];
-            existing.insert(path.to_vec());
-            for len in 0..path.len() {
-                children
-                    .entry(path[..len].to_vec())
-                    .or_default()
-                    .insert(path[len].clone());
-            }
-        }
-        Self {
-            modules,
-            existing,
-            children,
-        }
-    }
-
-    fn prefixes(&self) -> Vec<Vec<String>> {
-        self.children
-            .keys()
-            .filter(|path| !path.is_empty() && !self.existing.contains(*path))
-            .cloned()
-            .collect()
-    }
-
-    fn source(&self, prefix: &[String]) -> String {
-        self.children
-            .get(prefix)
-            .into_iter()
-            .flatten()
-            .map(|child| {
-                let mut path = prefix.to_vec();
-                path.push(child.clone());
-                format!("pub import {};", path.join("."))
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+fn preload_system_package(
+    modules: &mut Vec<PackageModuleInput>,
+    package: PackageId,
+    source: Option<&crate::SystemPackageSource>,
+) {
+    let Some(source) = source else {
+        return;
+    };
+    modules.push(PackageModuleInput {
+        module: ModuleId::root(package.clone()),
+        source: source.root().to_frontend_source(),
+    });
+    modules.extend(source.modules().iter().map(|module| PackageModuleInput {
+        module: ModuleId::named(package.clone(), module_path(module.path().to_vec())),
+        source: module.to_frontend_source(),
+    }));
 }
 
 fn always_active_modules(sources: &SourceBundle) -> Vec<ModuleId> {
     sources
-        .always_active_modules()
+        .core_always_active()
         .iter()
         .map(|path| ModuleId::named(PackageId::core(), module_path(path.clone())))
         .collect()
@@ -361,7 +320,7 @@ mod tests {
     use anvyx_frontend::pipeline::CheckError as FrontendCheckError;
 
     use super::*;
-    use crate::ModuleSource;
+    use crate::{ModuleSource, SystemPackageSource};
 
     fn write(dir: &tempfile::TempDir, relative: &str, code: &str) -> PathBuf {
         let file = dir.path().join(relative);
@@ -392,7 +351,20 @@ mod tests {
     }
 
     fn std_module(name: &str, code: &str) -> ModuleSource {
-        ModuleSource::new(path(&["std", name]), code, format!("<std.{name}>")).unwrap()
+        ModuleSource::new(path(&[name]), code, format!("<std.{name}>")).unwrap()
+    }
+
+    fn system(root: SourceText, modules: Vec<ModuleSource>) -> SystemPackageSource {
+        SystemPackageSource::new(root, modules).unwrap()
+    }
+
+    fn std_root(modules: &[ModuleSource]) -> SourceText {
+        let code = modules
+            .iter()
+            .map(|module| format!("pub import {};", module.path().join(".")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        SourceText::new(code, "<std>").unwrap()
     }
 
     fn bundle(
@@ -401,7 +373,14 @@ mod tests {
         std_modules: Vec<ModuleSource>,
         always_active_modules: Vec<Vec<String>>,
     ) -> SourceBundle {
-        SourceBundle::new(prelude, core_modules, std_modules, always_active_modules).unwrap()
+        let core = (prelude.is_some() || !core_modules.is_empty()).then(|| {
+            system(
+                prelude.unwrap_or_else(|| SourceText::new("", "<core>").unwrap()),
+                core_modules,
+            )
+        });
+        let std = (!std_modules.is_empty()).then(|| system(std_root(&std_modules), std_modules));
+        SourceBundle::new(core, std, always_active_modules).unwrap()
     }
 
     fn unwrap_error(result: CheckResult) -> CheckError {
@@ -467,6 +446,23 @@ mod tests {
                 CheckPackageInput::new(game, game_main, packages, SourceBundle::default()).unwrap();
 
             check_package(input).unwrap();
+        }
+
+        #[test]
+        fn native_only_root_package_is_rejected() {
+            let temp = tempfile::tempdir().unwrap();
+            let game_main = write(&temp, "game/src/main.anv", "fn main() {}");
+            let game = package_id("game");
+            let packages = vec![PackageSource::native_only(game.clone(), HashMap::new())];
+            let error =
+                CheckPackageInput::new(game.clone(), game_main, packages, SourceBundle::default())
+                    .unwrap_err();
+
+            assert!(matches!(
+                error,
+                CheckError::InvalidInput(message)
+                    if message.contains("has no source entry") && message.contains("game")
+            ));
         }
 
         #[test]
@@ -754,6 +750,18 @@ mod tests {
         }
 
         #[test]
+        fn default_bundle_has_no_std_package() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "import std:math; fn main() {}");
+            let error = unwrap_error(check_file(empty_input(main)));
+
+            assert!(matches!(
+                error,
+                CheckError::Frontend(FrontendCheckError::Resolve { .. })
+            ));
+        }
+
+        #[test]
         fn std_is_not_preluded() {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "fn main() { let x: int = PI; }");
@@ -863,11 +871,11 @@ mod tests {
             let sources = bundle(
                 None,
                 vec![core_module(
-                    "core_int",
+                    "int",
                     "pub extend int { fn plus_one(self) -> int { self + 1 } }",
                 )],
                 vec![],
-                vec![path(&["core_int"])],
+                vec![path(&["int"])],
             );
 
             check_file(input(main, sources)).unwrap();

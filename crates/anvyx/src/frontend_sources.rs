@@ -1,88 +1,63 @@
-use anvyx_lang::StdModule;
-use anvyx_lang2::{ModuleSource, SourceBundle, SourceText};
-
-// FIXME: remove this transitional adapter as soon as core/std expose clean-frontend-native sources or descriptors.
-// The clean frontend should not filter or canonicalize old `StdModule::full_anv_source()` strings.
-const CLEAN_CORE_PRELUDE_MODULES: &[&str] = &["core_option", "core_range"];
-const CLEAN_CORE_MODULES: &[&str] = &["core_float", "core_int", "core_string"];
-const CLEAN_STD_MODULES: &[&str] = &["mem"];
+use anvyx_lang2::{ModuleSource, SourceBundle, SourceText, SystemPackageSource};
 
 pub(crate) fn source_bundle() -> Result<SourceBundle, String> {
-    let (prelude, core_modules) = core_sources()?;
-
     SourceBundle::new(
-        Some(prelude),
-        core_modules,
-        std_sources()?,
-        active_core_paths(),
+        Some(core_package()?),
+        Some(std_package()?),
+        core_always_active(),
     )
     .map_err(|error| error.to_string())
 }
 
-fn core_sources() -> Result<(SourceText, Vec<ModuleSource>), String> {
-    let core = anvyx_core::core_modules();
-    let mut prelude = String::new();
-    for name in CLEAN_CORE_PRELUDE_MODULES {
-        prelude.push_str(&module_named(&core, name)?.full_clean_anv_source());
-        prelude.push('\n');
-    }
-
-    let modules = CLEAN_CORE_MODULES
-        .iter()
-        .map(|name| core_module_source(module_named(&core, name)?))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok((text(prelude, "<core>")?, modules))
+fn core_package() -> Result<SystemPackageSource, String> {
+    SystemPackageSource::with_providers(
+        core_source_text(&anvyx_core2::ROOT)?,
+        anvyx_core2::MODULES
+            .iter()
+            .map(core_module_source)
+            .collect::<Result<Vec<_>, _>>()?,
+        anvyx_core2::provider_descriptors(),
+    )
+    .map_err(|error| error.to_string())
 }
 
-fn std_sources() -> Result<Vec<ModuleSource>, String> {
-    let std = anvyx_std::std_modules();
-    CLEAN_STD_MODULES
+fn std_package() -> Result<SystemPackageSource, String> {
+    SystemPackageSource::with_providers(
+        std_source_text(&anvyx_stdlib2::ROOT)?,
+        anvyx_stdlib2::MODULES
+            .iter()
+            .map(std_module_source)
+            .collect::<Result<Vec<_>, _>>()?,
+        anvyx_stdlib2::provider_descriptors(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn core_always_active() -> Vec<Vec<String>> {
+    anvyx_core2::ALWAYS_ACTIVE
         .iter()
-        .map(|name| std_module_source(module_named(&std, name)?))
+        .map(|path| path.iter().map(|segment| (*segment).to_string()).collect())
         .collect()
 }
 
-fn active_core_paths() -> Vec<Vec<String>> {
-    CLEAN_CORE_MODULES
-        .iter()
-        .map(|name| vec![(*name).to_string()])
-        .collect()
+fn core_source_text(source: &anvyx_core2::SourceFile) -> Result<SourceText, String> {
+    SourceText::new(source.code, source.label).map_err(|error| error.to_string())
 }
 
-fn core_module_source(module: &StdModule) -> Result<ModuleSource, String> {
-    module_source(
-        vec![module.name.to_string()],
-        module.full_clean_anv_source(),
-        format!("<core.{}>", module.name),
-    )
+fn std_source_text(source: &anvyx_stdlib2::SourceFile) -> Result<SourceText, String> {
+    SourceText::new(source.code, source.label).map_err(|error| error.to_string())
 }
 
-fn std_module_source(module: &StdModule) -> Result<ModuleSource, String> {
-    module_source(
-        vec!["std".to_string(), module.name.to_string()],
-        module.full_clean_anv_source(),
-        format!("<std.{}>", module.name),
-    )
+fn core_module_source(source: &anvyx_core2::SourceFile) -> Result<ModuleSource, String> {
+    ModuleSource::new(path(source.path), source.code, source.label)
+        .map_err(|error| error.to_string())
 }
 
-fn module_named<'a>(modules: &'a [StdModule], name: &str) -> Result<&'a StdModule, String> {
-    let mut matches = modules.iter().filter(|module| module.name == name);
-    let Some(module) = matches.next() else {
-        return Err(format!("clean frontend source module '{name}' is missing"));
-    };
-    if matches.next().is_some() {
-        return Err(format!(
-            "clean frontend source module '{name}' is duplicated"
-        ));
-    }
-    Ok(module)
+fn std_module_source(source: &anvyx_stdlib2::SourceFile) -> Result<ModuleSource, String> {
+    ModuleSource::new(path(source.path), source.code, source.label)
+        .map_err(|error| error.to_string())
 }
 
-fn text(code: String, label: &str) -> Result<SourceText, String> {
-    SourceText::new(code, label).map_err(|error| error.to_string())
-}
-
-fn module_source(path: Vec<String>, code: String, label: String) -> Result<ModuleSource, String> {
-    ModuleSource::new(path, code, label).map_err(|error| error.to_string())
+fn path(path: &[&str]) -> Vec<String> {
+    path.iter().map(|segment| (*segment).to_string()).collect()
 }

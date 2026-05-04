@@ -9,16 +9,16 @@ use anvyx_externs::{
 
 use super::support::{assert_typecheck_closed, check, check_named};
 use crate::{
-    ast::{ExprId, Ident, NominalKind, Program, Type},
+    ast::{ExprId, Ident, ModuleOrigin, NominalKind, Program, Type},
     externs::{
-        self, ExternInputs,
+        self, ExternInputs, PackageExternInputs,
         catalog::{
             ExternCatalogContext, ExternCatalogError, ExternContextItem, ExternFieldRef,
             ExternMethodRef, ExternOperatorRef, ExternStaticRef, ExternTypeId,
         },
     },
-    resolve::ModulePath,
-    test_support::{parse_program, resolved_modules},
+    resolve::{ModuleId, ModulePath, PackageId},
+    test_support::{parse_program, resolved_modules_with_external},
     typecheck::{self, ExternUseTarget, ModuleScope, TypeError},
 };
 
@@ -116,6 +116,13 @@ fn scope(path: &[&str]) -> ModuleScope {
     ModuleScope::Named(
         ModulePath::new(path.iter().map(|segment| (*segment).to_string()).collect()).unwrap(),
     )
+}
+
+fn provider_scope(path: &[&str]) -> ModuleScope {
+    ModuleScope::from_module_id(&ModuleId::provider(
+        PackageId::synthetic_root(),
+        ModulePath::new(path.iter().map(|segment| (*segment).to_string()).collect()).unwrap(),
+    ))
 }
 
 fn function(name: &str, params: Vec<ExternParam>, ret: ExternTypeExpr) -> ExternFunctionDescriptor {
@@ -284,14 +291,17 @@ fn check_named_with_provider(
     provider: ProviderDescriptor,
 ) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
     let root = parse(root_source);
-    let resolved = resolved_modules(&root, modules);
-    let mut raw = externs::collect_source_externs(&root, &resolved).expect("valid source externs");
-    raw.append(
-        externs::ingest_providers(ExternInputs {
+    let provider_raw = externs::ingest_providers(ExternInputs {
+        packages: vec![PackageExternInputs {
+            package: PackageId::synthetic_root(),
             providers: vec![provider],
-        })
-        .expect("valid provider"),
-    );
+        }],
+    })
+    .expect("valid provider");
+    let external_modules = externs::raw_extern_module_ids(&provider_raw);
+    let resolved = resolved_modules_with_external(&root, modules, &external_modules);
+    let mut raw = externs::collect_source_externs(&root, &resolved).expect("valid source externs");
+    raw.append(provider_raw);
     let always_active_modules = always_active
         .iter()
         .map(|name| ModuleScope::Named(module_path(name)))
@@ -766,7 +776,7 @@ mod any {
     fn provider_flows_to_boundary() {
         check_with_provider(
             r"
-            import host { get, put };
+            import ext:host { get, put };
             fn main() { put(get()); }
             ",
             provider(ExternModuleDescriptor {
@@ -922,7 +932,7 @@ mod callbacks {
     fn provider_metadata_checks_fn_value() {
         let result = check_with_provider(
             r"
-            import host { apply };
+            import ext:host { apply };
             fn double(x: int) -> int { x * 2 }
             fn main() { apply(5, double); }
             ",
@@ -945,7 +955,7 @@ mod callbacks {
         .expect("typecheck failed");
         let id = result
             .externs()
-            .function_by_key(&function_key(scope(&["host"]), "apply"))
+            .function_by_key(&function_key(provider_scope(&["host"]), "apply"))
             .expect("extern function");
         let function = result.externs().function(id);
         assert!(matches!(
@@ -960,7 +970,7 @@ mod callbacks {
     fn provider_checks_nested_return() {
         let Err(errors) = check_with_provider(
             r#"
-            import host { collect };
+            import ext:host { collect };
             fn wrong(x: int) -> [string] { ["bad"] }
             fn main() { collect(wrong); }
             "#,
@@ -1034,7 +1044,7 @@ mod fields {
     fn provider_records_read() {
         let result = check_with_provider(
             r"
-            import host { Point };
+            import ext:host { Point };
             fn read(p: Point) -> float { p.x }
             ",
             provider(ExternModuleDescriptor {
@@ -1049,7 +1059,7 @@ mod fields {
         .expect("typecheck failed");
         let owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Point"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
             .expect("extern type");
         let (field, _) = result
             .externs()
@@ -1082,7 +1092,7 @@ mod fields {
     fn provider_write_mut_receiver() {
         let result = check_with_provider(
             r"
-            import host { Point };
+            import ext:host { Point };
             fn write(var p: Point) { p.x = 2.0; }
             ",
             provider(ExternModuleDescriptor {
@@ -1097,7 +1107,7 @@ mod fields {
         .expect("typecheck failed");
         let owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Point"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
             .expect("extern type");
         let (field, _) = result
             .externs()
@@ -1111,7 +1121,7 @@ mod fields {
     fn provider_rejects_immutable_receiver() {
         let Err(errors) = check_with_provider(
             r"
-            import host { Point };
+            import ext:host { Point };
             fn write(p: Point) { p.x = 2.0; }
             ",
             provider(ExternModuleDescriptor {
@@ -1137,7 +1147,7 @@ mod fields {
     fn provider_rejects_readonly_write() {
         let Err(errors) = check_with_provider(
             r"
-            import host { Point };
+            import ext:host { Point };
             fn write(var p: Point) { p.x = 2.0; }
             ",
             provider(ExternModuleDescriptor {
@@ -1487,7 +1497,7 @@ mod methods {
     fn provider_new_returns_owner() {
         let result = check_with_provider(
             r"
-            import host { Point };
+            import ext:host { Point };
             fn make() -> Point { Point.new(1.0, 2.0) }
             ",
             provider(ExternModuleDescriptor {
@@ -1513,7 +1523,7 @@ mod methods {
         .expect("typecheck failed");
         let owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Point"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
             .expect("extern type");
         let (method, _) = result
             .externs()
@@ -1749,7 +1759,7 @@ mod methods {
     fn provider_targets() {
         let result = check_with_provider(
             r"
-            import host { Point };
+            import ext:host { Point };
             fn len(p: Point) -> float { p.len() }
             fn make() -> Point { Point.origin() }
             ",
@@ -1771,7 +1781,7 @@ mod methods {
         .expect("typecheck failed");
         let owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Point"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
             .expect("extern type");
         let (method, _) = result
             .externs()
@@ -2356,7 +2366,7 @@ mod provider_imports {
     fn provider_records_binary() {
         let result = check_with_provider(
             r"
-            import host { Vec2 };
+            import ext:host { Vec2 };
             fn add(a: Vec2, b: Vec2) -> Vec2 { a + b }
             ",
             provider(ExternModuleDescriptor {
@@ -2378,7 +2388,7 @@ mod provider_imports {
         .expect("typecheck failed");
         let owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Vec2"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Vec2"))
             .expect("extern type");
         let (operator, _) = result
             .externs()
@@ -2408,12 +2418,12 @@ mod provider_imports {
 
         assert!(
             catalog
-                .function_by_key(&function_key(scope(&["host"]), "tick"))
+                .function_by_key(&function_key(provider_scope(&["host"]), "tick"))
                 .is_some()
         );
         assert!(
             catalog
-                .type_by_key(&type_key(scope(&["host"]), "Handle"))
+                .type_by_key(&type_key(provider_scope(&["host"]), "Handle"))
                 .is_some()
         );
         assert_typecheck_closed(&result);
@@ -2423,7 +2433,7 @@ mod provider_imports {
     fn share_identity() {
         let result = check_with_provider(
             r"
-            import host { Handle, tick };
+            import ext:host { Handle, tick };
             fn use_it(handle: Handle) { tick(handle); }
             ",
             provider(ExternModuleDescriptor {
@@ -2438,8 +2448,8 @@ mod provider_imports {
         )
         .expect("typecheck failed");
 
-        let function_key = function_key(scope(&["host"]), "tick");
-        let type_key = type_key(scope(&["host"]), "Handle");
+        let function_key = function_key(provider_scope(&["host"]), "tick");
+        let type_key = type_key(provider_scope(&["host"]), "Handle");
         let function = result
             .externs()
             .function(result.externs().function_by_key(&function_key).unwrap());
@@ -2459,7 +2469,7 @@ mod provider_imports {
             .expect("callable extern function");
         assert_eq!(
             callable.def.id,
-            typecheck::CallableId::extern_function(scope(&["host"]), Ident::new("tick"))
+            typecheck::CallableId::extern_function(provider_scope(&["host"]), Ident::new("tick"))
         );
         assert_eq!(
             result
@@ -2480,7 +2490,7 @@ mod provider_imports {
     fn imported_type_members_record_uses() {
         let result = check_with_provider(
             r"
-            import host { Point };
+            import ext:host { Point };
             fn use_it(var p: Point) -> float {
                 let q = Point { x: 1.0, y: 2.0 };
                 p.x = q.y;
@@ -2526,7 +2536,7 @@ mod provider_imports {
         .expect("typecheck failed");
         let owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Point"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
             .expect("extern type");
         let (x_field, _) = result
             .externs()
@@ -2567,7 +2577,7 @@ mod provider_imports {
     fn local_type_ignores_alias() {
         let Err(errors) = check_named_with_provider(
             r"
-            import host { take };
+            import ext:host { take };
             import other { Vec2 };
             fn use_it(v: Vec2) { take(v); }
             ",
@@ -2598,7 +2608,8 @@ mod provider_imports {
     fn shares_module_without_conflict() {
         let result = check_named_with_provider(
             r"
-            import api { source_tick, provider_tick };
+            import api { source_tick };
+            import ext:api { provider_tick };
             fn use_it() { source_tick(); provider_tick(); }
             ",
             &[("api", "extern fn source_tick();")],
@@ -2616,7 +2627,7 @@ mod provider_imports {
             .expect("source extern function");
         let provider_tick = result
             .externs()
-            .function_by_key(&function_key(scope(&["api"]), "provider_tick"))
+            .function_by_key(&function_key(provider_scope(&["api"]), "provider_tick"))
             .expect("provider extern function");
 
         assert_use(&result, ExternUseTarget::Function(source_tick));
@@ -2627,7 +2638,7 @@ mod provider_imports {
     #[test]
     fn same_name_conflicts() {
         let Err(errors) = check_named_with_provider(
-            "import api { tick }; fn use_it() { tick(); }",
+            "import api { tick }; import ext:api { tick }; fn use_it() { tick(); }",
             &[("api", "extern fn tick();")],
             &[],
             provider(ExternModuleDescriptor {
@@ -2678,7 +2689,7 @@ mod mut_borrow {
     fn accepts_local() {
         let result = check_with_provider(
             r"
-            import host { touch };
+            import ext:host { touch };
             fn use_it() { var x = 1; touch(x); }
             ",
             touch_provider(vec![], ExternTypeExpr::Int),
@@ -2686,7 +2697,7 @@ mod mut_borrow {
         .expect("typecheck failed");
         let id = result
             .externs()
-            .function_by_key(&function_key(scope(&["host"]), "touch"))
+            .function_by_key(&function_key(provider_scope(&["host"]), "touch"))
             .expect("provider extern function");
 
         assert_use(&result, ExternUseTarget::Function(id));
@@ -2697,7 +2708,7 @@ mod mut_borrow {
     fn rejects_immutable_local() {
         let Err(errors) = check_with_provider(
             r"
-            import host { touch };
+            import ext:host { touch };
             fn use_it() { let x = 1; touch(x); }
             ",
             touch_provider(vec![], ExternTypeExpr::Int),
@@ -2715,7 +2726,7 @@ mod mut_borrow {
     fn rejects_rvalue() {
         let errors = expect_type_errors(check_with_provider(
             r"
-            import host { touch };
+            import ext:host { touch };
             fn use_it() { touch(1); }
             ",
             touch_provider(vec![], ExternTypeExpr::Int),
@@ -2730,7 +2741,7 @@ mod mut_borrow {
     fn rejects_readonly_field() {
         let errors = expect_type_errors(check_with_provider(
             r"
-            import host { Point, touch };
+            import ext:host { Point, touch };
             fn use_it(var p: Point) { touch(p.x); }
             ",
             touch_provider(
@@ -2755,7 +2766,7 @@ mod mut_borrow {
     fn rejects_computed_field() {
         let errors = expect_type_errors(check_with_provider(
             r"
-            import host { Point, touch };
+            import ext:host { Point, touch };
             fn use_it(var p: Point) { touch(p.x); }
             ",
             touch_provider(
@@ -2780,7 +2791,7 @@ mod mut_borrow {
     fn rejects_immutable_nested_field() {
         let errors = expect_type_errors(check_with_provider(
             r"
-            import host { Parent, touch };
+            import ext:host { Parent, touch };
             fn use_it(p: Parent) { touch(p.child.x); }
             ",
             touch_provider(nested_field_types(), ExternTypeExpr::Float),
@@ -2795,7 +2806,7 @@ mod mut_borrow {
     fn accepts_nested_field() {
         let result = check_with_provider(
             r"
-            import host { Parent, touch };
+            import ext:host { Parent, touch };
             fn use_it(var p: Parent) { touch(p.child.x); }
             ",
             touch_provider(nested_field_types(), ExternTypeExpr::Float),
@@ -2803,11 +2814,11 @@ mod mut_borrow {
         .expect("typecheck failed");
         let parent_owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Parent"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Parent"))
             .expect("parent extern type");
         let child_owner = result
             .externs()
-            .type_by_key(&type_key(scope(&["host"]), "Child"))
+            .type_by_key(&type_key(provider_scope(&["host"]), "Child"))
             .expect("child extern type");
         let (child_field, _) = result
             .externs()
@@ -2830,7 +2841,7 @@ mod named_modules {
     fn same_provider_name_uses_imported_target() {
         let result = check_with_provider(
             r"
-            import right { tick };
+            import ext:right { tick };
             fn use_it() { tick(2); }
             ",
             provider_with_modules(vec![
@@ -2857,7 +2868,7 @@ mod named_modules {
         .expect("typecheck failed");
         let right = result
             .externs()
-            .function_by_key(&function_key(scope(&["right"]), "tick"))
+            .function_by_key(&function_key(provider_scope(&["right"]), "tick"))
             .expect("right extern function");
 
         assert_use(&result, ExternUseTarget::Function(right));
@@ -2868,8 +2879,8 @@ mod named_modules {
     fn absolute_type_drives_call() {
         let result = check_with_provider(
             r"
-            import host { take };
-            import math.types { Vec2 };
+            import ext:host { take };
+            import ext:math.types { Vec2 };
             fn use_it(v: Vec2) { take(v); }
             ",
             provider_with_modules(vec![
@@ -2902,16 +2913,14 @@ mod named_modules {
 
         let param = &callable.def.sig.params[0];
         let nominal = param.ty.as_nominal().expect("extern nominal param");
-        let origin = vec!["math".to_string(), "types".to_string()];
-
         assert_eq!(nominal.kind, NominalKind::Extern);
         assert_eq!(nominal.name, Ident::new("Vec2"));
         assert_eq!(
-            nominal
-                .origin
-                .as_ref()
-                .and_then(crate::ast::ModuleOrigin::module_path),
-            Some(origin.as_slice())
+            nominal.origin,
+            Some(ModuleOrigin::Provider {
+                package: PackageId::synthetic_root().to_string(),
+                path: vec!["math".to_string(), "types".to_string()].into(),
+            })
         );
         assert_typecheck_closed(&result);
     }
@@ -2920,8 +2929,8 @@ mod named_modules {
     fn absolute_type_rejects_other_module() {
         let Err(errors) = check_with_provider(
             r"
-            import host { take };
-            import other { Vec2 as OtherVec2 };
+            import ext:host { take };
+            import ext:other { Vec2 as OtherVec2 };
             fn use_it(v: OtherVec2) { take(v); }
             ",
             provider_with_modules(vec![

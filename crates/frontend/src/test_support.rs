@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{Program, Stmt},
@@ -33,8 +33,19 @@ pub(crate) fn empty_resolved() -> ResolveResult {
 }
 
 pub(crate) fn resolved_modules(root: &Program, modules: &[(&str, &str)]) -> ResolveResult {
+    resolved_modules_with_external(root, modules, &HashSet::new())
+}
+
+pub(crate) fn resolved_modules_with_external(
+    root: &Program,
+    modules: &[(&str, &str)],
+    external_modules: &HashSet<ModuleId>,
+) -> ResolveResult {
     let mut import_edges = HashMap::new();
-    import_edges.insert(root_id(), import_targets(&root_id(), root));
+    import_edges.insert(
+        root_id(),
+        import_targets(&root_id(), root, external_modules),
+    );
 
     let module_groups = vec![
         modules
@@ -42,7 +53,10 @@ pub(crate) fn resolved_modules(root: &Program, modules: &[(&str, &str)]) -> Reso
             .map(|(name, source)| {
                 let key = ModuleId::named(PackageId::synthetic_root(), module_path(name));
                 let program = parse_program(source);
-                import_edges.insert(key.clone(), import_targets(&key, &program));
+                import_edges.insert(
+                    key.clone(),
+                    import_targets(&key, &program, external_modules),
+                );
                 ResolvedModule { key, program }
             })
             .collect(),
@@ -58,7 +72,11 @@ pub(crate) fn resolved_modules(root: &Program, modules: &[(&str, &str)]) -> Reso
     }
 }
 
-fn import_targets(module: &ModuleId, program: &Program) -> Vec<ResolvedImportTarget> {
+fn import_targets(
+    module: &ModuleId,
+    program: &Program,
+    external_modules: &HashSet<ModuleId>,
+) -> Vec<ResolvedImportTarget> {
     let mut errors = vec![];
     program
         .stmts
@@ -68,7 +86,15 @@ fn import_targets(module: &ModuleId, program: &Program) -> Vec<ResolvedImportTar
             _ => None,
         })
         .filter_map(|import| {
-            resolve::resolve_import_target(module, import, &HashMap::new(), None, &mut errors)
+            resolve::resolve_import_target(
+                module,
+                import,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                external_modules,
+                &mut errors,
+            )
         })
         .collect()
 }

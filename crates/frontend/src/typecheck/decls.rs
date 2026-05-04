@@ -15,7 +15,7 @@ use crate::{
         StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     externs::{RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope},
-    resolve::{ModuleId, ModulePath, PackageId, ResolveResult, SourceFileId},
+    resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveResult, SourceFileId},
     span::Span,
 };
 
@@ -28,33 +28,38 @@ pub(crate) enum ModuleScope {
 
 impl ModuleScope {
     pub(crate) fn from_module_id(module: &ModuleId) -> Self {
-        if module.source_file().is_some() {
-            return Self::Package(module.clone());
-        }
         if module.package_context() == Some(&PackageId::synthetic_root()) {
-            match module.named_path() {
-                Some(path) => Self::Named(path.clone()),
-                None => Self::Root,
+            match module.path() {
+                PackageModulePath::Root => return Self::Root,
+                PackageModulePath::Named(path) => return Self::Named(path.clone()),
+                PackageModulePath::Provider(_) | PackageModulePath::Source(_) => {}
             }
-        } else {
-            Self::Package(module.clone())
         }
+        Self::Package(module.clone())
     }
 
     fn nominal_origin(&self) -> Option<ModuleOrigin> {
         match self {
             ModuleScope::Root => None,
             ModuleScope::Named(path) => Some(ModuleOrigin::Module(path.to_ast_path())),
-            ModuleScope::Package(module) => match module.source_file() {
-                Some(file) => Some(ModuleOrigin::SourceFile {
+            ModuleScope::Package(module) => match module.path() {
+                PackageModulePath::Source(file) => Some(ModuleOrigin::SourceFile {
                     package: module
                         .package_context()
                         .map(|package| package.as_str().to_string()),
                     path: file.to_string(),
                 }),
-                None => Some(ModuleOrigin::Package {
+                PackageModulePath::Provider(path) => Some(ModuleOrigin::Provider {
                     package: module.package().as_str().to_string(),
-                    path: module.named_path().map(ModulePath::to_ast_path),
+                    path: path.to_ast_path(),
+                }),
+                PackageModulePath::Root => Some(ModuleOrigin::Package {
+                    package: module.package().as_str().to_string(),
+                    path: None,
+                }),
+                PackageModulePath::Named(path) => Some(ModuleOrigin::Package {
+                    package: module.package().as_str().to_string(),
+                    path: Some(path.to_ast_path()),
                 }),
             },
         }
@@ -83,6 +88,11 @@ impl ModuleScope {
                     None => Self::Package(ModuleId::root(package)),
                 }
             }
+            ModuleOrigin::Provider { package, path } => Self::Package(ModuleId::provider(
+                PackageId::new(package.clone()),
+                ModulePath::new(path.iter().cloned().collect())
+                    .expect("provider origin module path is valid"),
+            )),
         }
     }
 }
@@ -2447,7 +2457,7 @@ mod tests {
     use super::*;
     use crate::{
         ast::TypeVarId,
-        test_support::{parse_program, resolved_modules},
+        test_support::{parse_program, resolved_modules, resolved_modules_with_external},
         typecheck::type_ops::type_closure_facts,
     };
 
@@ -2461,6 +2471,13 @@ mod tests {
 
     fn scope(name: &str) -> ModuleScope {
         ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
+    }
+
+    fn provider_scope(name: &str) -> ModuleScope {
+        ModuleScope::from_module_id(&ModuleId::provider(
+            PackageId::synthetic_root(),
+            ModulePath::new(vec![name.to_string()]).unwrap(),
+        ))
     }
 
     fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
@@ -2490,11 +2507,15 @@ mod tests {
         provider: ProviderDescriptor,
     ) -> DeclarationIndex {
         let root = parse(root);
-        let resolved = resolved_modules(&root, modules);
         let raw = crate::externs::ingest_providers(crate::externs::ExternInputs {
-            providers: vec![provider],
+            packages: vec![crate::externs::PackageExternInputs {
+                package: PackageId::synthetic_root(),
+                providers: vec![provider],
+            }],
         })
         .unwrap();
+        let external_modules = crate::externs::raw_extern_module_ids(&raw);
+        let resolved = resolved_modules_with_external(&root, modules, &external_modules);
         DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new(), &raw)
     }
 
@@ -2975,14 +2996,14 @@ mod tests {
     #[test]
     fn provider_extern_headers_are_visible_through_imports() {
         let index = provider_index(
-            "import host { Handle, load }; import host { * };",
+            "import ext:host { Handle, load }; import ext:host { * };",
             provider_with_module(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![extern_type("Handle")],
                 functions: vec![extern_fn("load")],
             }),
         );
-        let host = scope("host");
+        let host = provider_scope("host");
         let ty = index
             .imported_type(&ModuleScope::Root, ident("Handle"))
             .expect("missing provider type import");
@@ -2992,7 +3013,7 @@ mod tests {
 
         assert_eq!(ty.module, host);
         assert_eq!(ty.kind, NominalKind::Extern);
-        assert_eq!(value.module, scope("host"));
+        assert_eq!(value.module, provider_scope("host"));
         assert!(matches!(
             value.decl,
             ValueDecl::Func(FuncSig {
@@ -3005,7 +3026,7 @@ mod tests {
     #[test]
     fn provider_module_import_creates_alias() {
         let index = provider_index(
-            "import host;",
+            "import ext:host;",
             provider_with_module(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![extern_type("Handle")],
@@ -3015,14 +3036,14 @@ mod tests {
 
         assert_eq!(
             index.imported_module(&ModuleScope::Root, ident("host")),
-            Some(scope("host"))
+            Some(provider_scope("host"))
         );
     }
 
     #[test]
     fn provider_members_are_not_module_values() {
         let index = provider_index(
-            "import host { * };",
+            "import ext:host { * };",
             provider_with_module(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![ExternTypeDescriptor {
@@ -3046,39 +3067,33 @@ mod tests {
     }
 
     #[test]
-    fn provider_extern_type_conflicts_with_source_type() {
+    fn provider_externs_do_not_conflict_with_same_path_source_decls() {
         let index = provider_index_with_modules(
             "",
-            &[("host", "pub struct Handle { id: int }")],
+            &[(
+                "host",
+                "pub struct Handle { id: int } pub fn load() -> float { 0.0 }",
+            )],
             provider_with_module(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![extern_type("Handle")],
-                functions: vec![],
-            }),
-        );
-
-        assert!(matches!(
-            index.errors().first(),
-            Some(DeclError::DuplicateType { name, .. }) if *name == ident("Handle")
-        ));
-    }
-
-    #[test]
-    fn provider_extern_function_conflicts_with_source_function() {
-        let index = provider_index_with_modules(
-            "",
-            &[("host", "pub fn load() -> float { 0.0 }")],
-            provider_with_module(ExternModuleDescriptor {
-                path: extern_module(&["host"]),
-                types: vec![],
                 functions: vec![extern_fn("load")],
             }),
         );
 
-        assert!(matches!(
-            index.errors().first(),
-            Some(DeclError::DuplicateValue { name, .. }) if *name == ident("load")
-        ));
+        assert!(index.errors().is_empty());
+        assert!(index.local_type(&scope("host"), ident("Handle")).is_some());
+        assert!(
+            index
+                .local_type(&provider_scope("host"), ident("Handle"))
+                .is_some()
+        );
+        assert!(index.local_value(&scope("host"), ident("load")).is_some());
+        assert!(
+            index
+                .local_value(&provider_scope("host"), ident("load"))
+                .is_some()
+        );
     }
 
     #[test]

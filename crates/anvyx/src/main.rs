@@ -260,7 +260,12 @@ fn resolve_entry(file: Option<PathBuf>, manifest: Option<&Manifest>) -> Result<P
     } else {
         let m =
             manifest.ok_or("No file provided and no anvyx.toml found in the current directory")?;
-        Ok(PathBuf::from(&m.project.entry))
+        let entry = m
+            .project
+            .entry
+            .as_deref()
+            .ok_or("No file provided and project.entry is missing from anvyx.toml")?;
+        Ok(PathBuf::from(entry))
     }
 }
 

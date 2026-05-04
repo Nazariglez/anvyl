@@ -72,10 +72,13 @@ name = "anvyx"
 version = "0.1.0"
 dependencies = [
  "anvyx-core",
+ "anvyx-core2",
+ "anvyx-externs",
  "anvyx-fmt",
  "anvyx-lang",
  "anvyx-lang2",
  "anvyx-std",
+ "anvyx-stdlib2",
  "clap",
  "console",
  "indicatif",
@@ -100,6 +103,14 @@ version = "0.1.0"
 dependencies = [
  "anvyx-lang",
  "anvyx-macros",
+]
+
+[[package]]
+name = "anvyx-core2"
+version = "0.1.0"
+dependencies = [
+ "anvyx-externs",
+ "anvyx-lang",
 ]
 
 [[package]]
@@ -144,6 +155,7 @@ dependencies = [
 name = "anvyx-lang2"
 version = "0.1.0"
 dependencies = [
+ "anvyx-externs",
  "anvyx-frontend",
  "tempfile",
 ]
@@ -169,6 +181,14 @@ dependencies = [
  "anvyx-lang",
  "anvyx-runtime",
  "glam",
+]
+
+[[package]]
+name = "anvyx-stdlib2"
+version = "0.1.0"
+dependencies = [
+ "anvyx-externs",
+ "anvyx-lang",
 ]
 
 [[package]]

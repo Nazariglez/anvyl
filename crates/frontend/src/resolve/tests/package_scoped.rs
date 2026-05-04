@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::support::{
-    InMemoryLoader, module_id, module_path, package, package_input, package_root, parse_program,
-    resolve_errors, resolve_package, root_id, source_id,
+    InMemoryLoader, module_id, module_path, native_package_input, package, package_input,
+    package_root, parse_program, provider_id, resolve_errors, resolve_package, root_id, source_id,
 };
 use crate::{
     resolve::{
@@ -269,6 +269,78 @@ fn missing_local_module_reports_current_package() {
 }
 
 #[test]
+fn native_only_dependency_provider_import_resolves() {
+    let game = package("game");
+    let host = package("host");
+    let mut loader = InMemoryLoader::default();
+    let provider_modules = HashSet::from([provider_id(&host, &["audio"])]);
+    let result = crate::resolve::resolve_package_modules(
+        LoadedModule {
+            module: root_id(&game),
+            program: parse_program("import pkg:host.audio { play };"),
+        },
+        &packages([
+            (game.clone(), package_input(&[("host", host.clone())])),
+            (host.clone(), native_package_input(&[])),
+        ]),
+        vec![],
+        &mut loader,
+        &HashSet::new(),
+        &provider_modules,
+        crate::resolve::SystemPackages::default(),
+    )
+    .unwrap();
+
+    let target = result.import_target(&root_id(&game), 0).unwrap();
+    assert_eq!(target.base, provider_id(&host, &["audio"]));
+    assert_eq!(loader.load_count_module(&module_id(&host, &["audio"])), 0);
+}
+
+#[test]
+fn native_only_dependency_root_import_fails() {
+    let game = package("game");
+    let host = package("host");
+    let mut loader = InMemoryLoader::default();
+    let errors = resolve_errors(resolve_package(
+        game.clone(),
+        "import pkg:host;",
+        packages([
+            (game, package_input(&[("host", host.clone())])),
+            (host.clone(), native_package_input(&[])),
+        ]),
+        &mut loader,
+    ));
+
+    assert!(matches!(
+        errors.as_slice(),
+        [ResolveError::NativeOnlyPkgRootImport { package, alias, .. }]
+            if package == &host && alias == "host"
+    ));
+}
+
+#[test]
+fn unknown_native_only_dependency_provider_module_fails() {
+    let game = package("game");
+    let host = package("host");
+    let mut loader = InMemoryLoader::default();
+    let errors = resolve_errors(resolve_package(
+        game.clone(),
+        "import pkg:host.audio;",
+        packages([
+            (game, package_input(&[("host", host.clone())])),
+            (host.clone(), native_package_input(&[])),
+        ]),
+        &mut loader,
+    ));
+
+    assert!(matches!(
+        errors.as_slice(),
+        [ResolveError::UnknownNativeDepProviderModule { package, alias, module, .. }]
+            if package == &host && alias == "host" && module.segments() == ["audio"]
+    ));
+}
+
+#[test]
 fn root_imports_resolve() {
     let game = package("game");
     let math = package("math");
@@ -308,6 +380,7 @@ fn root_aliases_source_entry() {
                         program: parse_program(""),
                     }),
                     dependencies: HashMap::new(),
+                    kind: crate::resolve::PackageKind::Source,
                 },
             ),
         ]),

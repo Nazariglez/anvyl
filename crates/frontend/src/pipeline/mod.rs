@@ -18,7 +18,7 @@ use crate::{
     lexer, parser,
     resolve::{
         self, LoadedModule, LocalSourceLoad, LocalSourceRequest, ModuleId, ModuleLoadError,
-        ModuleLoader, PackageId, PackageInput as ResolvePackageInput, PreloadedModule,
+        ModuleLoader, PackageId, PackageInput as ResolvePackageInput, PackageKind, PreloadedModule,
         ResolveFailure, SystemPackages,
     },
     typecheck::{self, ModuleScope},
@@ -40,6 +40,7 @@ pub struct PackageModuleInput {
 pub struct PackageSourceInput {
     pub root: Option<PackageModuleInput>,
     pub dependencies: HashMap<String, PackageId>,
+    pub kind: PackageKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,10 +126,7 @@ pub fn check_packages<L: PackageSourceLoader>(
         .collect::<HashSet<_>>();
 
     let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
-    let external_modules = externs::raw_extern_module_paths(&raw_externs)
-        .into_iter()
-        .map(|path| ModuleId::named(input.root_package.clone(), path))
-        .collect::<HashSet<_>>();
+    let external_modules = externs::raw_extern_module_ids(&raw_externs);
 
     let mut loader = InputModuleLoader::new(input.source_loader);
     loader.cache_loaded(root.clone());
@@ -198,6 +196,7 @@ fn parse_package_inputs<E>(
                 ResolvePackageInput {
                     root,
                     dependencies: package.dependencies,
+                    kind: package.kind,
                 },
             ))
         })
@@ -343,8 +342,8 @@ mod tests {
         check_packages as pipeline_check,
     };
     use crate::{
-        externs::ExternInputs,
-        resolve::{ModuleId, ModulePath, PackageId, SystemPackages},
+        externs::{ExternInputs, PackageExternInputs},
+        resolve::{ModuleId, ModulePath, PackageId, PackageKind, SystemPackages},
     };
 
     #[derive(Default)]
@@ -422,6 +421,19 @@ mod tests {
         ModuleId::named(root_package(), module_path(path))
     }
 
+    fn extern_inputs(providers: Vec<anvyx_externs::ProviderDescriptor>) -> ExternInputs {
+        package_extern_inputs(root_package(), providers)
+    }
+
+    fn package_extern_inputs(
+        package: PackageId,
+        providers: Vec<anvyx_externs::ProviderDescriptor>,
+    ) -> ExternInputs {
+        ExternInputs {
+            packages: vec![PackageExternInputs { package, providers }],
+        }
+    }
+
     fn module(path: &[&str], code: &str) -> PackageModuleInput {
         PackageModuleInput {
             module: module_id(path),
@@ -455,6 +467,7 @@ mod tests {
                         source: root,
                     }),
                     dependencies: HashMap::new(),
+                    kind: PackageKind::Source,
                 },
             );
         }
@@ -497,11 +510,24 @@ mod tests {
                 module: ModuleId::root(package.clone()),
                 source: source(root, "package.anv"),
             }),
-            dependencies: dependencies
-                .iter()
-                .map(|(alias, package)| ((*alias).to_string(), package.clone()))
-                .collect(),
+            dependencies: dependency_map(dependencies),
+            kind: PackageKind::Source,
         }
+    }
+
+    fn native_package_input(dependencies: &[(&str, PackageId)]) -> PackageSourceInput {
+        PackageSourceInput {
+            root: None,
+            dependencies: dependency_map(dependencies),
+            kind: PackageKind::NativeOnly,
+        }
+    }
+
+    fn dependency_map(dependencies: &[(&str, PackageId)]) -> HashMap<String, PackageId> {
+        dependencies
+            .iter()
+            .map(|(alias, package)| ((*alias).to_string(), package.clone()))
+            .collect()
     }
 
     fn check<L: PackageSourceLoader>(
@@ -550,18 +576,16 @@ mod tests {
                 vec![],
             ),
             FrontendConfig {
-                externs: ExternInputs {
-                    providers: vec![valid_provider_descriptor()],
-                },
+                externs: extern_inputs(vec![valid_provider_descriptor()]),
             },
         )
         .unwrap();
     }
 
     #[test]
-    fn provider_only_module_import_resolves() {
+    fn provider_only_module_import_does_not_resolve() {
         let mut loader = TestLoader::default();
-        pipeline_check(
+        let err = pipeline_check(
             input(
                 &mut loader,
                 source("import math { dot }; fn main() {}", "main.anv"),
@@ -570,12 +594,239 @@ mod tests {
                 vec![],
             ),
             FrontendConfig {
-                externs: ExternInputs {
-                    providers: vec![valid_provider_descriptor()],
-                },
+                externs: extern_inputs(vec![valid_provider_descriptor()]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Resolve { .. }));
+    }
+
+    #[test]
+    fn ext_import_resolves_provider_module() {
+        let mut loader = TestLoader::default();
+        pipeline_check(
+            input(
+                &mut loader,
+                source(
+                    "import ext:math { dot }; fn main() { let x: float = dot(); }",
+                    "main.anv",
+                ),
+                None,
+                vec![],
+                vec![],
+            ),
+            FrontendConfig {
+                externs: extern_inputs(vec![valid_provider_descriptor()]),
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn native_only_dependency_provider_import_typechecks() {
+        let game = PackageId::new("game");
+        let host = PackageId::new("host");
+        let mut loader = TestLoader::default();
+        pipeline_check(
+            PackageProgramInput {
+                root_package: game.clone(),
+                main: root_source(
+                    &game,
+                    "import pkg:host.math { dot }; fn main() { let x: float = dot(); }",
+                    "main.anv",
+                ),
+                system: SystemPackages::default(),
+                packages: HashMap::from([
+                    (
+                        game.clone(),
+                        PackageSourceInput {
+                            root: None,
+                            dependencies: dependency_map(&[("host", host.clone())]),
+                            kind: PackageKind::Source,
+                        },
+                    ),
+                    (host.clone(), native_package_input(&[])),
+                ]),
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: package_extern_inputs(host, vec![valid_provider_descriptor()]),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_only_dependency_root_import_is_resolve_error() {
+        let game = PackageId::new("game");
+        let host = PackageId::new("host");
+        let mut loader = TestLoader::default();
+        let err = pipeline_check(
+            PackageProgramInput {
+                root_package: game.clone(),
+                main: root_source(&game, "import pkg:host; fn main() {}", "main.anv"),
+                system: SystemPackages::default(),
+                packages: HashMap::from([
+                    (
+                        game.clone(),
+                        PackageSourceInput {
+                            root: None,
+                            dependencies: dependency_map(&[("host", host.clone())]),
+                            kind: PackageKind::Source,
+                        },
+                    ),
+                    (host.clone(), native_package_input(&[])),
+                ]),
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: package_extern_inputs(host, vec![valid_provider_descriptor()]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Resolve { .. }));
+    }
+
+    #[test]
+    fn source_native_dependency_provider_is_hidden_without_reexport() {
+        let game = PackageId::new("game");
+        let math = PackageId::new("math");
+        let mut loader = TestLoader::default();
+        let err = pipeline_check(
+            PackageProgramInput {
+                root_package: game.clone(),
+                main: root_source(
+                    &game,
+                    "import pkg:math.math { dot }; fn main() { let x: float = dot(); }",
+                    "main.anv",
+                ),
+                system: SystemPackages::default(),
+                packages: HashMap::from([
+                    (
+                        game.clone(),
+                        PackageSourceInput {
+                            root: None,
+                            dependencies: dependency_map(&[("math", math.clone())]),
+                            kind: PackageKind::Source,
+                        },
+                    ),
+                    (math.clone(), package_input(&math, "", &[])),
+                ]),
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: package_extern_inputs(math, vec![valid_provider_descriptor()]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Type { .. }));
+    }
+
+    #[test]
+    fn source_native_dependency_provider_module_reexport_typechecks() {
+        let game = PackageId::new("game");
+        let math = PackageId::new("math");
+        let mut loader = TestLoader::default();
+        pipeline_check(
+            PackageProgramInput {
+                root_package: game.clone(),
+                main: root_source(
+                    &game,
+                    "import pkg:math.math { dot }; fn main() { let x: float = dot(); }",
+                    "main.anv",
+                ),
+                system: SystemPackages::default(),
+                packages: HashMap::from([
+                    (
+                        game.clone(),
+                        PackageSourceInput {
+                            root: None,
+                            dependencies: dependency_map(&[("math", math.clone())]),
+                            kind: PackageKind::Source,
+                        },
+                    ),
+                    (
+                        math.clone(),
+                        package_input(&math, "pub import ext:math;", &[]),
+                    ),
+                ]),
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: package_extern_inputs(math, vec![valid_provider_descriptor()]),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn source_native_dependency_provider_member_reexport_typechecks() {
+        let game = PackageId::new("game");
+        let math = PackageId::new("math");
+        let mut loader = TestLoader::default();
+        pipeline_check(
+            PackageProgramInput {
+                root_package: game.clone(),
+                main: root_source(
+                    &game,
+                    "import pkg:math { dot }; fn main() { let x: float = dot(); }",
+                    "main.anv",
+                ),
+                system: SystemPackages::default(),
+                packages: HashMap::from([
+                    (
+                        game.clone(),
+                        PackageSourceInput {
+                            root: None,
+                            dependencies: dependency_map(&[("math", math.clone())]),
+                            kind: PackageKind::Source,
+                        },
+                    ),
+                    (
+                        math.clone(),
+                        package_input(&math, "pub import ext:math { dot };", &[]),
+                    ),
+                ]),
+                preloaded_modules: vec![],
+                always_active_modules: vec![],
+                source_loader: &mut loader,
+            },
+            FrontendConfig {
+                externs: package_extern_inputs(math, vec![valid_provider_descriptor()]),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unknown_ext_module_is_resolve_error() {
+        let mut loader = TestLoader::default();
+        let err = pipeline_check(
+            input(
+                &mut loader,
+                source("import ext:audio; fn main() {}", "main.anv"),
+                None,
+                vec![],
+                vec![],
+            ),
+            FrontendConfig {
+                externs: extern_inputs(vec![valid_provider_descriptor()]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CheckError::Resolve { .. }));
     }
 
     #[test]
@@ -591,9 +842,7 @@ mod tests {
                 vec![],
             ),
             FrontendConfig {
-                externs: ExternInputs {
-                    providers: vec![valid_provider_descriptor()],
-                },
+                externs: extern_inputs(vec![valid_provider_descriptor()]),
             },
         )
         .unwrap_err();
@@ -613,9 +862,7 @@ mod tests {
                 vec![],
             ),
             FrontendConfig {
-                externs: ExternInputs {
-                    providers: vec![invalid_provider_descriptor()],
-                },
+                externs: extern_inputs(vec![invalid_provider_descriptor()]),
             },
         )
         .unwrap_err();
@@ -626,7 +873,7 @@ mod tests {
         assert_eq!(
             diagnostic_messages(&diagnostics),
             [
-                "invalid extern descriptor from provider 'math': duplicate function 'dot' in module 'math'"
+                "invalid extern descriptor from provider 'math' in package '<root>': duplicate function 'dot' in module 'math'"
             ]
         );
     }
@@ -653,9 +900,7 @@ mod tests {
                 vec![],
             ),
             FrontendConfig {
-                externs: ExternInputs {
-                    providers: vec![valid_provider_descriptor(), provider],
-                },
+                externs: extern_inputs(vec![valid_provider_descriptor(), provider]),
             },
         )
         .unwrap_err();
@@ -666,7 +911,7 @@ mod tests {
         assert_eq!(
             diagnostic_messages(&diagnostics),
             [
-                "duplicate extern function 'math.dot' declared in provider 'math' and provider 'other_math'"
+                "duplicate provider module 'math' in package '<root>' declared by providers 'math' and 'other_math'"
             ]
         );
     }
@@ -775,9 +1020,7 @@ mod tests {
                 vec![],
             ),
             FrontendConfig {
-                externs: ExternInputs {
-                    providers: vec![invalid_provider_descriptor()],
-                },
+                externs: extern_inputs(vec![invalid_provider_descriptor()]),
             },
         )
         .unwrap_err();
