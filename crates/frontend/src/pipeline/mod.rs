@@ -1,7 +1,10 @@
 // Lexer -> Parser -> Resolver -> Typechecker -> AIR lowering
 
 mod diagnostics;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 pub use diagnostics::Diagnostic;
 
@@ -14,8 +17,9 @@ use crate::{
     externs::{self, ExternInputs},
     lexer, parser,
     resolve::{
-        self, ModuleId, ModuleLoadError, ModuleLoader, PackageId,
-        PackageInput as ResolvePackageInput, PreloadedModule, ResolveFailure, SystemPackages,
+        self, LoadedModule, LocalSourceLoad, LocalSourceRequest, ModuleId, ModuleLoadError,
+        ModuleLoader, PackageId, PackageInput as ResolvePackageInput, PreloadedModule,
+        ResolveFailure, SystemPackages,
     },
     typecheck::{self, ModuleScope},
 };
@@ -34,7 +38,7 @@ pub struct PackageModuleInput {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackageSourceInput {
-    pub root: Option<Source>,
+    pub root: Option<PackageModuleInput>,
     pub dependencies: HashMap<String, PackageId>,
 }
 
@@ -44,18 +48,31 @@ pub enum SourceLoadError<E> {
     Fatal(E),
 }
 
+#[derive(Debug, Clone)]
+pub enum SourceLoad {
+    Loaded(PackageModuleInput),
+    Missing { candidate: Option<PathBuf> },
+}
+
 pub trait PackageSourceLoader {
     type FatalError;
 
     fn load(
         &mut self,
         module: &ModuleId,
-    ) -> Result<Option<Source>, SourceLoadError<Self::FatalError>>;
+    ) -> Result<Option<PackageModuleInput>, SourceLoadError<Self::FatalError>>;
+
+    fn load_local_source(
+        &mut self,
+        _request: &LocalSourceRequest,
+    ) -> Result<SourceLoad, SourceLoadError<Self::FatalError>> {
+        Ok(SourceLoad::Missing { candidate: None })
+    }
 }
 
 pub struct PackageProgramInput<'a, L: PackageSourceLoader> {
     pub root_package: PackageId,
-    pub main: Source,
+    pub main: PackageModuleInput,
     pub system: SystemPackages,
     pub packages: HashMap<PackageId, PackageSourceInput>,
     pub preloaded_modules: Vec<PackageModuleInput>,
@@ -97,7 +114,7 @@ pub fn check_packages<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
 ) -> Result<CheckOk, CheckError<L::FatalError>> {
-    let root = parse_source(&input.main)?;
+    let root = parse_package_module(input.main)?;
 
     let packages = parse_package_inputs(input.packages)?;
     let preloaded_modules = parse_package_modules(input.preloaded_modules)?;
@@ -114,8 +131,19 @@ pub fn check_packages<L: PackageSourceLoader>(
         .collect::<HashSet<_>>();
 
     let mut loader = InputModuleLoader::new(input.source_loader);
+    loader.cache_loaded(root.clone());
+    for package in packages.values() {
+        if let Some(root) = &package.root {
+            loader.cache_loaded(root.clone());
+        }
+    }
+    for module in &preloaded_modules {
+        loader.cache_loaded(LoadedModule {
+            module: module.module.clone(),
+            program: module.program.clone(),
+        });
+    }
     let resolved = match resolve::resolve_package_modules(
-        input.root_package,
         root.clone(),
         &packages,
         preloaded_modules,
@@ -135,16 +163,16 @@ pub fn check_packages<L: PackageSourceLoader>(
 
     validate_always_active_modules(&resolved, &always_active_modules)?;
 
-    let source_externs = externs::collect_source_externs(&root, &resolved).map_err(extern_error)?;
+    let source_externs =
+        externs::collect_source_externs(&root.program, &resolved).map_err(extern_error)?;
     raw_externs.append(source_externs);
     externs::validate_raw_shapes(&raw_externs).map_err(extern_error)?;
     externs::validate_raw_identities(&raw_externs).map_err(extern_error)?;
 
-    typecheck::check_with_modules(&root, &resolved, always_active_modules, raw_externs).map_err(
-        |errors| CheckError::Type {
+    typecheck::check_with_modules(&root.program, &resolved, always_active_modules, raw_externs)
+        .map_err(|errors| CheckError::Type {
             diagnostics: errors.iter().map(diagnose_type_error).collect(),
-        },
-    )?;
+        })?;
 
     Ok(CheckOk)
 }
@@ -164,10 +192,7 @@ fn parse_package_inputs<E>(
     packages
         .into_iter()
         .map(|(id, package)| {
-            let root = package
-                .root
-                .map(|source| parse_source(&source))
-                .transpose()?;
+            let root = package.root.map(parse_package_module).transpose()?;
             Ok((
                 id,
                 ResolvePackageInput {
@@ -177,6 +202,13 @@ fn parse_package_inputs<E>(
             ))
         })
         .collect()
+}
+
+fn parse_package_module<E>(module: PackageModuleInput) -> Result<LoadedModule, CheckError<E>> {
+    Ok(LoadedModule {
+        module: module.module,
+        program: parse_source(&module.source)?,
+    })
 }
 
 fn parse_package_modules<E>(
@@ -231,11 +263,40 @@ fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
 
 struct InputModuleLoader<'a, L: PackageSourceLoader> {
     loader: &'a mut L,
+    parsed: HashMap<ModuleId, LoadedModule>,
 }
 
 impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
     fn new(loader: &'a mut L) -> Self {
-        Self { loader }
+        Self {
+            loader,
+            parsed: HashMap::new(),
+        }
+    }
+
+    fn cache_loaded(&mut self, module: LoadedModule) {
+        self.parsed.insert(module.module.clone(), module);
+    }
+
+    fn parse_loaded(
+        &mut self,
+        module: PackageModuleInput,
+    ) -> Result<LoadedModule, ModuleLoadError<CheckError<L::FatalError>>> {
+        if let Some(loaded) = self.parsed.get(&module.module) {
+            return Ok(loaded.clone());
+        }
+        let loaded = parse_package_module(module).map_err(ModuleLoadError::Fatal)?;
+        self.cache_loaded(loaded.clone());
+        Ok(loaded)
+    }
+}
+
+fn module_load_error<E>(error: SourceLoadError<E>) -> ModuleLoadError<CheckError<E>> {
+    match error {
+        SourceLoadError::LoadFailed(message) => ModuleLoadError::LoadFailed(message),
+        SourceLoadError::Fatal(error) => {
+            ModuleLoadError::Fatal(CheckError::Source(Box::new(error)))
+        }
     }
 }
 
@@ -245,21 +306,30 @@ impl<L: PackageSourceLoader> ModuleLoader for InputModuleLoader<'_, L> {
     fn load(
         &mut self,
         module: &ModuleId,
-    ) -> Result<Option<Program>, ModuleLoadError<Self::FatalError>> {
-        let source = match self.loader.load(module) {
-            Ok(Some(source)) => source,
-            Ok(None) => return Ok(None),
-            Err(SourceLoadError::LoadFailed(message)) => {
-                return Err(ModuleLoadError::LoadFailed(message));
-            }
-            Err(SourceLoadError::Fatal(error)) => {
-                return Err(ModuleLoadError::Fatal(CheckError::Source(Box::new(error))));
+    ) -> Result<Option<LoadedModule>, ModuleLoadError<Self::FatalError>> {
+        let Some(loaded) = self.loader.load(module).map_err(module_load_error)? else {
+            return Ok(None);
+        };
+
+        self.parse_loaded(loaded).map(Some)
+    }
+
+    fn load_local_source(
+        &mut self,
+        request: &LocalSourceRequest,
+    ) -> Result<LocalSourceLoad, ModuleLoadError<Self::FatalError>> {
+        let loaded = match self
+            .loader
+            .load_local_source(request)
+            .map_err(module_load_error)?
+        {
+            SourceLoad::Loaded(loaded) => loaded,
+            SourceLoad::Missing { candidate } => {
+                return Ok(LocalSourceLoad::Missing { candidate });
             }
         };
 
-        parse_source(&source)
-            .map(Some)
-            .map_err(ModuleLoadError::Fatal)
+        self.parse_loaded(loaded).map(LocalSourceLoad::Loaded)
     }
 }
 
@@ -290,7 +360,7 @@ mod tests {
         }
 
         fn package_source(&mut self, package: &PackageId, path: &[&str], code: &str) {
-            let path = path.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let path = path.iter().map(ToString::to_string).collect::<Vec<_>>();
             self.sources.insert(
                 (package.clone(), path.clone()),
                 Source {
@@ -302,7 +372,7 @@ mod tests {
 
         fn failure(&mut self, path: &[&str], message: &str) {
             self.failures.insert(
-                path.iter().map(|s| s.to_string()).collect(),
+                path.iter().map(ToString::to_string).collect(),
                 message.to_string(),
             );
         }
@@ -314,7 +384,7 @@ mod tests {
         fn load(
             &mut self,
             module: &ModuleId,
-        ) -> Result<Option<Source>, SourceLoadError<Self::FatalError>> {
+        ) -> Result<Option<PackageModuleInput>, SourceLoadError<Self::FatalError>> {
             let Some(path) = module.named_path() else {
                 return Ok(None);
             };
@@ -325,7 +395,11 @@ mod tests {
             Ok(self
                 .sources
                 .get(&(module.package().clone(), path.segments().to_vec()))
-                .cloned())
+                .cloned()
+                .map(|source| PackageModuleInput {
+                    module: module.clone(),
+                    source,
+                }))
         }
     }
 
@@ -337,7 +411,7 @@ mod tests {
     }
 
     fn module_path(path: &[&str]) -> ModulePath {
-        ModulePath::new(path.iter().map(|s| s.to_string()).collect()).unwrap()
+        ModulePath::new(path.iter().map(ToString::to_string).collect()).unwrap()
     }
 
     fn root_package() -> PackageId {
@@ -355,21 +429,31 @@ mod tests {
         }
     }
 
-    fn input<'a, L: PackageSourceLoader>(
-        loader: &'a mut L,
+    fn root_source(package: &PackageId, code: &str, label: &str) -> PackageModuleInput {
+        PackageModuleInput {
+            module: ModuleId::root(package.clone()),
+            source: source(code, label),
+        }
+    }
+
+    fn input<L: PackageSourceLoader>(
+        loader: &mut L,
         main: Source,
         prelude: Option<Source>,
         preloaded_modules: Vec<PackageModuleInput>,
         always_active_modules: Vec<ModulePath>,
-    ) -> PackageProgramInput<'a, L> {
+    ) -> PackageProgramInput<'_, L> {
         let root_package = root_package();
         let core_package = prelude.as_ref().map(|_| PackageId::core());
         let mut packages = HashMap::from([(root_package.clone(), PackageSourceInput::default())]);
         if let (Some(package), Some(root)) = (core_package.clone(), prelude) {
             packages.insert(
-                package,
+                package.clone(),
                 PackageSourceInput {
-                    root: Some(root),
+                    root: Some(PackageModuleInput {
+                        module: ModuleId::root(package),
+                        source: root,
+                    }),
                     dependencies: HashMap::new(),
                 },
             );
@@ -380,15 +464,15 @@ mod tests {
                 .get(&package)
                 .and_then(|package| package.root.clone())
             {
-                preloaded_modules.push(PackageModuleInput {
-                    module: ModuleId::root(package),
-                    source: root,
-                });
+                preloaded_modules.push(root);
             }
         }
         PackageProgramInput {
             root_package: root_package.clone(),
-            main,
+            main: PackageModuleInput {
+                module: ModuleId::root(root_package.clone()),
+                source: main,
+            },
             system: SystemPackages {
                 core: core_package,
                 std: None,
@@ -403,9 +487,16 @@ mod tests {
         }
     }
 
-    fn package_input(root: &str, dependencies: &[(&str, PackageId)]) -> PackageSourceInput {
+    fn package_input(
+        package: &PackageId,
+        root: &str,
+        dependencies: &[(&str, PackageId)],
+    ) -> PackageSourceInput {
         PackageSourceInput {
-            root: Some(source(root, "package.anv")),
+            root: Some(PackageModuleInput {
+                module: ModuleId::root(package.clone()),
+                source: source(root, "package.anv"),
+            }),
             dependencies: dependencies
                 .iter()
                 .map(|(alias, package)| ((*alias).to_string(), package.clone()))
@@ -601,7 +692,7 @@ mod tests {
     #[test]
     fn source_extern_new_forms_reach_typechecking() {
         check_source(
-            r#"
+            r"
             extern type Vec2 rep inline {
                 init;
                 x: float;
@@ -620,7 +711,7 @@ mod tests {
             }
             extern type Rect;
             fn main() {}
-            "#,
+            ",
         )
         .unwrap();
     }
@@ -916,14 +1007,21 @@ mod tests {
 
         check(PackageProgramInput {
             root_package: game.clone(),
-            main: source(
-                "import dep:math { add }; fn main() { let x: int = add(); }",
+            main: root_source(
+                &game,
+                "import pkg:math { add }; fn main() { let x: int = add(); }",
                 "main.anv",
             ),
             system: SystemPackages::default(),
             packages: HashMap::from([
-                (game.clone(), package_input("", &[("math", math.clone())])),
-                (math, package_input("pub fn add() -> int { 1 }", &[])),
+                (
+                    game.clone(),
+                    package_input(&game, "", &[("math", math.clone())]),
+                ),
+                (
+                    math.clone(),
+                    package_input(&math, "pub fn add() -> int { 1 }", &[]),
+                ),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -953,7 +1051,8 @@ mod tests {
 
         let err = check(PackageProgramInput {
             root_package: core.clone(),
-            main: source(
+            main: root_source(
+                &core,
                 "struct RootOnly {} import helper { leak }; fn main() {}",
                 "<core>",
             ),
@@ -980,14 +1079,21 @@ mod tests {
 
         let err = check(PackageProgramInput {
             root_package: game.clone(),
-            main: source("import dep:physics.internals { Hidden };", "main.anv"),
+            main: root_source(
+                &game,
+                "import pkg:physics.internals { Hidden };",
+                "main.anv",
+            ),
             system: SystemPackages::default(),
             packages: HashMap::from([
                 (
                     game.clone(),
-                    package_input("", &[("physics", physics.clone())]),
+                    package_input(&game, "", &[("physics", physics.clone())]),
                 ),
-                (physics, package_input("import internals { Hidden };", &[])),
+                (
+                    physics.clone(),
+                    package_input(&physics, "import internals { Hidden };", &[]),
+                ),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -1007,14 +1113,17 @@ mod tests {
 
         check(PackageProgramInput {
             root_package: game.clone(),
-            main: source("import dep:physics.types { Vec2 };", "main.anv"),
+            main: root_source(&game, "import pkg:physics.types { Vec2 };", "main.anv"),
             system: SystemPackages::default(),
             packages: HashMap::from([
                 (
                     game.clone(),
-                    package_input("", &[("physics", physics.clone())]),
+                    package_input(&game, "", &[("physics", physics.clone())]),
                 ),
-                (physics, package_input("pub import types;", &[])),
+                (
+                    physics.clone(),
+                    package_input(&physics, "pub import types;", &[]),
+                ),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -1031,17 +1140,21 @@ mod tests {
 
         check(PackageProgramInput {
             root_package: game.clone(),
-            main: source(
-                "import dep:native { tick }; fn main() { let x: int = tick(); }",
+            main: root_source(
+                &game,
+                "import pkg:native { tick }; fn main() { let x: int = tick(); }",
                 "main.anv",
             ),
             system: SystemPackages::default(),
             packages: HashMap::from([
                 (
                     game.clone(),
-                    package_input("", &[("native", native.clone())]),
+                    package_input(&game, "", &[("native", native.clone())]),
                 ),
-                (native, package_input("extern fn tick() -> int;", &[])),
+                (
+                    native.clone(),
+                    package_input(&native, "extern fn tick() -> int;", &[]),
+                ),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -1059,17 +1172,21 @@ mod tests {
 
         check(PackageProgramInput {
             root_package: game.clone(),
-            main: source(
-                "import dep:native.host { tick }; fn main() { let x: int = tick(); }",
+            main: root_source(
+                &game,
+                "import pkg:native.host { tick }; fn main() { let x: int = tick(); }",
                 "main.anv",
             ),
             system: SystemPackages::default(),
             packages: HashMap::from([
                 (
                     game.clone(),
-                    package_input("", &[("native", native.clone())]),
+                    package_input(&game, "", &[("native", native.clone())]),
                 ),
-                (native, package_input("pub import host;", &[])),
+                (
+                    native.clone(),
+                    package_input(&native, "pub import host;", &[]),
+                ),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -1091,17 +1208,18 @@ mod tests {
 
         check(PackageProgramInput {
             root_package: game.clone(),
-            main: source(
-                "import dep:physics.types { self as types, Vec2 }; fn main() { let x: Vec2 = types.make(); }",
+            main: root_source(
+                &game,
+                "import pkg:physics.types { self as types, Vec2 }; fn main() { let x: Vec2 = types.make(); }",
                 "main.anv",
             ),
             system: SystemPackages::default(),
             packages: HashMap::from([
                 (
                     game.clone(),
-                    package_input("", &[("physics", physics.clone())]),
+                    package_input(&game, "", &[("physics", physics.clone())]),
                 ),
-                (physics, package_input("pub import types;", &[])),
+                (physics.clone(), package_input(&physics, "pub import types;", &[])),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -1119,8 +1237,9 @@ mod tests {
 
         check(PackageProgramInput {
             root_package: game.clone(),
-            main: source(
-                "import std.math { PI }; fn main() { let x: int = PI; }",
+            main: root_source(
+                &game,
+                "import std:math { PI }; fn main() { let x: int = PI; }",
                 "main.anv",
             ),
             system: SystemPackages {
@@ -1129,7 +1248,7 @@ mod tests {
             },
             packages: HashMap::from([
                 (game.clone(), PackageSourceInput::default()),
-                (std, package_input("pub import math;", &[])),
+                (std.clone(), package_input(&std, "pub import math;", &[])),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -1147,8 +1266,9 @@ mod tests {
 
         check(PackageProgramInput {
             root_package: game.clone(),
-            main: source(
-                "import std.math { self as math }; fn main() { let x: int = math.PI; }",
+            main: root_source(
+                &game,
+                "import std:math { self as math }; fn main() { let x: int = math.PI; }",
                 "main.anv",
             ),
             system: SystemPackages {
@@ -1157,7 +1277,7 @@ mod tests {
             },
             packages: HashMap::from([
                 (game.clone(), PackageSourceInput::default()),
-                (std, package_input("pub import math;", &[])),
+                (std.clone(), package_input(&std, "pub import math;", &[])),
             ]),
             preloaded_modules: vec![],
             always_active_modules: vec![],
@@ -1172,7 +1292,7 @@ mod tests {
         let err = check(input(
             &mut loader,
             source(
-                "import std.math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
+                "import std:math { sqrt }; fn main() { let x: float = sqrt(4.0); }",
                 "main.anv",
             ),
             None,

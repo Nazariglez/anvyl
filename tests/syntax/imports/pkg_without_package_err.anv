@@ -1,0 +1,8 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: has no package dependency named 'math'
+
+import pkg:math;
+
+fn main() {}

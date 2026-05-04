@@ -37,9 +37,10 @@ fn has_error(errors: &[ResolveError], path: &[&str]) -> bool {
         | ResolveError::DuplicatePreloadedModule { module } => {
             module.named_path().is_some_and(|p| p.segments() == path)
         }
-        ResolveError::UnknownDependency { .. } | ResolveError::UnsupportedImportRoot { .. } => {
-            false
-        }
+        ResolveError::UnknownDependency { .. }
+        | ResolveError::PackageImportUnavailable { .. }
+        | ResolveError::UnsupportedImportRoot { .. }
+        | ResolveError::SourceImportNotFound { .. } => false,
     })
 }
 
@@ -60,7 +61,7 @@ fn module_path_rejects_empty_path() {
 
 #[test]
 fn module_path_rejects_empty_segment() {
-    let error = ModulePath::new(vec!["foo".into(), "".into(), "bar".into()]).unwrap_err();
+    let error = ModulePath::new(vec!["foo".into(), String::new(), "bar".into()]).unwrap_err();
     assert_eq!(
         error.message(),
         "module path must not contain empty segments: foo..bar"

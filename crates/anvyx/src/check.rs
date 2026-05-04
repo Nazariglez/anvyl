@@ -53,7 +53,6 @@ fn package_check_input(
     sources: SourceBundle,
 ) -> Result<anvyx_lang2::CheckPackageInput, String> {
     let root = graph.root();
-    reject_outside_source_root(file, &root.source_root)?;
     let root_id = frontend_package_id(&root.id);
     let packages = graph
         .packages()
@@ -76,27 +75,6 @@ fn package_check_input(
 
     anvyx_lang2::CheckPackageInput::new(root_id, file.to_path_buf(), packages, sources)
         .map_err(|error| error.to_string())
-}
-
-fn reject_outside_source_root(file: &Path, source_root: &Path) -> Result<(), String> {
-    let file = file
-        .canonicalize()
-        .map_err(|error| format!("failed to canonicalize '{}': {error}", file.display()))?;
-    let source_root = source_root.canonicalize().map_err(|error| {
-        format!(
-            "failed to canonicalize source root '{}': {error}",
-            source_root.display()
-        )
-    })?;
-    if file.starts_with(&source_root) {
-        Ok(())
-    } else {
-        Err(format!(
-            "--new-frontend file override '{}' is outside package source root '{}'",
-            file.display(),
-            source_root.display()
-        ))
-    }
 }
 
 fn frontend_package_id(id: &PackageId) -> FrontendPackageId {
@@ -186,7 +164,7 @@ mod tests {
             .expect_err("input should be unsupported")
     }
 
-    mod new_frontend {
+    mod frontend {
         use super::*;
 
         fn write(dir: &tempfile::TempDir, relative: &str, code: &str) -> std::path::PathBuf {
@@ -387,14 +365,96 @@ mod tests {
         }
 
         mod integration {
+            use std::fmt::Write as _;
+
             use super::*;
+
+            fn write_manifest(
+                dir: &tempfile::TempDir,
+                package: &str,
+                entry: &str,
+                deps: &[(&str, &str)],
+            ) {
+                let mut manifest = format!("[project]\nentry = \"{entry}\"\n");
+                if !deps.is_empty() {
+                    manifest.push_str("\n[dependencies]\n");
+                    for (alias, path) in deps {
+                        writeln!(manifest, "{alias} = {{ path = \"{path}\" }}").unwrap();
+                    }
+                }
+                write(dir, &format!("{package}/anvyx.toml"), &manifest);
+            }
+
+            fn check_manifest_file(dir: &tempfile::TempDir, file: &Path) -> Result<(), String> {
+                let graph =
+                    crate::manifest::load_package_graph(&dir.path().join("game/anvyx.toml"))?;
+                let sources = new_frontend_source_bundle()?;
+                let input = package_check_input(&graph, file, sources)?;
+                anvyx_lang2::check_package(input)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
 
             #[test]
             fn std_import_resolves_implicit_package() {
                 let temp = tempfile::tempdir().unwrap();
-                let main = write(&temp, "main.anv", "import std.mem; fn main() {}");
+                let main = write(&temp, "main.anv", "import std:mem; fn main() {}");
 
                 new_frontend_cmd(&main).unwrap();
+            }
+
+            #[test]
+            fn script_relative_imports_work() {
+                let temp = tempfile::tempdir().unwrap();
+                let main = write(
+                    &temp,
+                    "src/ui/main.anv",
+                    "import helper { value as a }; import .helper { value as b }; import ..common { value as c }; fn main() { let x: int = a() + b() + c(); }",
+                );
+                write(&temp, "src/ui/helper.anv", "pub fn value() -> int { 1 }");
+                write(&temp, "src/common.anv", "pub fn value() -> int { 1 }");
+
+                new_frontend_cmd(&main).unwrap();
+            }
+
+            #[test]
+            fn pkg_std_and_relative_imports() {
+                let temp = tempfile::tempdir().unwrap();
+                write_manifest(&temp, "game", "src/main.anv", &[("math", "../math")]);
+                write_manifest(&temp, "math", "src/lib.anv", &[]);
+                let main = write(
+                    &temp,
+                    "game/src/main.anv",
+                    "import helper { local }; import .helper { local as local2 }; import ..outside { escaped }; import pkg:math { add }; import std:mem; fn main() { let x: int = local() + local2() + escaped() + add(); }",
+                );
+                write(&temp, "game/src/helper.anv", "pub fn local() -> int { 1 }");
+                write(&temp, "game/outside.anv", "pub fn escaped() -> int { 1 }");
+                write(&temp, "math/src/lib.anv", "pub fn add() -> int { 1 }");
+
+                check_manifest_file(&temp, &main).unwrap();
+            }
+
+            #[test]
+            fn outside_override_rejected() {
+                let temp = tempfile::tempdir().unwrap();
+                write_manifest(&temp, "game", "src/main.anv", &[]);
+                write(&temp, "game/src/main.anv", "fn main() {}");
+                let outside = write(&temp, "game/outside.anv", "fn main() {}");
+                let error = check_manifest_file(&temp, &outside).unwrap_err();
+
+                assert!(error.contains("outside every loaded package source root"));
+            }
+
+            #[test]
+            fn old_dep_root_fails() {
+                let temp = tempfile::tempdir().unwrap();
+                write_manifest(&temp, "game", "src/main.anv", &[]);
+                let main = write(&temp, "game/src/main.anv", "import dep:math; fn main() {}");
+                let error = check_manifest_file(&temp, &main).unwrap_err();
+
+                assert!(
+                    error.contains("Unexpected token ':'") || error.contains("import declaration")
+                );
             }
         }
 

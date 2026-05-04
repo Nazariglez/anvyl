@@ -1,0 +1,8 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: Cannot find source import 'std.nonexistent'
+
+import std.nonexistent;
+
+fn main() {}

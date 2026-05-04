@@ -1,13 +1,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyAliasError {
     Invalid,
-    ReservedStd,
 }
 
 pub fn validate_dependency_alias(alias: &str) -> Result<(), DependencyAliasError> {
-    if alias == "std" {
-        return Err(DependencyAliasError::ReservedStd);
-    }
     if is_normalized_alias(alias) && anvyx_frontend::lexer::is_source_ident(alias) {
         return Ok(());
     }
@@ -29,7 +25,7 @@ mod tests {
 
     #[test]
     fn dependency_alias_accepts_normalized_identifiers() {
-        for alias in ["math", "my_engine", "math2"] {
+        for alias in ["math", "my_engine", "math2", "std"] {
             assert_eq!(validate_dependency_alias(alias), Ok(()));
         }
     }
@@ -42,13 +38,5 @@ mod tests {
                 Err(DependencyAliasError::Invalid)
             );
         }
-    }
-
-    #[test]
-    fn dependency_alias_rejects_reserved_std() {
-        assert_eq!(
-            validate_dependency_alias("std"),
-            Err(DependencyAliasError::ReservedStd)
-        );
     }
 }

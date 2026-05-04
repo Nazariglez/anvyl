@@ -1311,9 +1311,7 @@ mod tests {
     use crate::{
         ast::{Ident, NominalKind, Program},
         externs::RawExternScope,
-        lexer::tokenize,
-        parser,
-        resolve::{ModuleId, ModulePath, PackageId, ResolveResult, ResolvedModule},
+        test_support::{parse_program, resolved_modules, root_id},
         typecheck::DeclarationIndex,
     };
 
@@ -1492,7 +1490,7 @@ mod tests {
     }
 
     fn raw_root_scope() -> RawExternScope {
-        RawExternScope::Module(ModuleId::root(PackageId::synthetic_root()))
+        RawExternScope::Module(root_id())
     }
 
     fn ident(name: &str) -> Ident {
@@ -1526,41 +1524,12 @@ mod tests {
     }
 
     fn parse(source: &str) -> Program {
-        let tokens = tokenize(source).expect("tokenize failed");
-        parser::parse_ast(&tokens).expect("parse failed")
-    }
-
-    fn root_id() -> ModuleId {
-        ModuleId::root(PackageId::synthetic_root())
-    }
-
-    fn resolved_module(path: ModulePath, source: &str) -> ResolvedModule {
-        ResolvedModule {
-            key: ModuleId::named(PackageId::synthetic_root(), path),
-            program: parse(source),
-        }
-    }
-
-    fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
-        ResolveResult {
-            root: root_id(),
-            module_groups: modules
-                .iter()
-                .map(|(name, source)| {
-                    vec![resolved_module(
-                        ModulePath::new(vec![(*name).to_string()]).unwrap(),
-                        source,
-                    )]
-                })
-                .collect(),
-            dependencies: HashMap::new(),
-            system: crate::resolve::SystemPackages::default(),
-        }
+        parse_program(source)
     }
 
     fn decls(root: &str, modules: &[(&str, &str)], raw: &RawExterns) -> DeclarationIndex {
         let root = parse(root);
-        let resolved = resolved_modules(modules);
+        let resolved = resolved_modules(&root, modules);
         DeclarationIndex::from_root_and_modules(
             &root,
             &resolved,
@@ -1589,7 +1558,7 @@ mod tests {
 
     fn source_raw(root: &str, modules: &[(&str, &str)]) -> RawExterns {
         let root = parse(root);
-        let resolved = resolved_modules(modules);
+        let resolved = resolved_modules(&root, modules);
         crate::externs::collect_source_externs(&root, &resolved).unwrap()
     }
 
@@ -1933,15 +1902,8 @@ mod tests {
                 }],
             };
             let root = parse("");
-            let resolved = ResolveResult {
-                root: root_id(),
-                module_groups: vec![vec![resolved_module(
-                    ModulePath::new(vec!["geom".to_string(), "types".to_string()]).unwrap(),
-                    "pub struct Point { x: int }",
-                )]],
-                dependencies: HashMap::new(),
-                system: crate::resolve::SystemPackages::default(),
-            };
+            let resolved =
+                resolved_modules(&root, &[("geom.types", "pub struct Point { x: int }")]);
             let decls = DeclarationIndex::from_root_and_modules(
                 &root,
                 &resolved,

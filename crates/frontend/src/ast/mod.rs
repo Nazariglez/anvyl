@@ -9,6 +9,10 @@ pub type ModulePath = std::rc::Rc<[String]>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModuleOrigin {
     Module(ModulePath),
+    SourceFile {
+        package: Option<String>,
+        path: String,
+    },
     Package {
         package: String,
         path: Option<ModulePath>,
@@ -19,7 +23,7 @@ impl ModuleOrigin {
     pub fn module_path(&self) -> Option<&[String]> {
         match self {
             Self::Module(path) => Some(path),
-            Self::Package { .. } => None,
+            Self::SourceFile { .. } | Self::Package { .. } => None,
         }
     }
 }
@@ -852,13 +856,13 @@ pub struct ImportTarget {
 }
 
 impl ImportTarget {
-    pub fn local(path: Vec<Ident>) -> Self {
-        Self::named(ImportRoot::Local, path)
+    pub fn local(ascend: usize, path: Vec<Ident>) -> Self {
+        Self::named(ImportRoot::Local { ascend }, path)
     }
 
-    pub fn dependency(alias: Ident, path: Vec<Ident>) -> Self {
+    pub fn package(alias: Ident, path: Vec<Ident>) -> Self {
         Self {
-            root: ImportRoot::Dependency(alias),
+            root: ImportRoot::Package(alias),
             path: PackageModulePath::from_segments(path),
         }
     }
@@ -868,15 +872,12 @@ impl ImportTarget {
     }
 
     pub fn std(path: Vec<Ident>) -> Self {
-        Self {
-            root: ImportRoot::Std,
-            path: PackageModulePath::from_segments(path),
-        }
+        Self::named(ImportRoot::Std, path)
     }
 
-    pub fn local_path(&self) -> Option<&[Ident]> {
+    pub fn local_path(&self) -> Option<(usize, &[Ident])> {
         match (&self.root, &self.path) {
-            (ImportRoot::Local, PackageModulePath::Named(path)) => Some(path),
+            (ImportRoot::Local { ascend }, PackageModulePath::Named(path)) => Some((*ascend, path)),
             _ => None,
         }
     }
@@ -891,8 +892,8 @@ impl ImportTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportRoot {
-    Local,
-    Dependency(Ident),
+    Local { ascend: usize },
+    Package(Ident),
     NativeProvider,
     Std,
 }

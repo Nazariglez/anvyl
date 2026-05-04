@@ -1,10 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::support::{
-    InMemoryLoader, module_id, module_path, package, package_input, package_root, resolve_errors,
-    resolve_package, root_id,
+    InMemoryLoader, module_id, module_path, package, package_input, package_root, parse_program,
+    resolve_errors, resolve_package, root_id, source_id,
 };
-use crate::resolve::{PackageId, PackageInput, PackageModulePath, ResolveError, ResolveResult};
+use crate::{
+    resolve::{
+        LoadedModule, ModuleId, PackageId, PackageInput, PackageModulePath, ResolveError,
+        ResolveResult, SourceFileId,
+    },
+    span::Span,
+};
 
 fn packages<const N: usize>(
     entries: [(PackageId, PackageInput); N],
@@ -25,6 +31,14 @@ fn has_root(result: &ResolveResult, package: &PackageId) -> bool {
     })
 }
 
+fn has_source(result: &ResolveResult, module_id: &ModuleId) -> bool {
+    result
+        .module_groups
+        .iter()
+        .flatten()
+        .any(|module| &module.key == module_id)
+}
+
 #[test]
 fn bare_import_is_local_even_when_dependency_alias_matches() {
     let game = package("game");
@@ -36,7 +50,7 @@ fn bare_import_is_local_even_when_dependency_alias_matches() {
         "import math;",
         packages([
             (game.clone(), package_input(&[("math", math.clone())])),
-            (math.clone(), package_root("", &[])),
+            (math.clone(), package_root(&math, "", &[])),
         ]),
         &mut loader,
     )
@@ -47,16 +61,16 @@ fn bare_import_is_local_even_when_dependency_alias_matches() {
 }
 
 #[test]
-fn dependency_import_uses_direct_alias() {
+fn pkg_import_uses_direct_alias() {
     let game = package("game");
     let math = package("math");
     let mut loader = InMemoryLoader::default();
     let result = resolve_package(
         game.clone(),
-        "import dep:math;",
+        "import pkg:math;",
         packages([
             (game, package_input(&[("math", math.clone())])),
-            (math.clone(), package_root("", &[])),
+            (math.clone(), package_root(&math, "", &[])),
         ]),
         &mut loader,
     )
@@ -71,7 +85,7 @@ fn unknown_dependency_alias_is_rejected() {
     let mut loader = InMemoryLoader::default();
     let errors = resolve_errors(resolve_package(
         game.clone(),
-        "import dep:math;",
+        "import pkg:math;",
         packages([(game.clone(), PackageInput::default())]),
         &mut loader,
     ));
@@ -93,14 +107,17 @@ fn same_module_path_in_different_packages_does_not_collide() {
     loader.add_package_source(&render, module_path(["math"]), "");
     let result = resolve_package(
         game.clone(),
-        "import dep:audio.math; import dep:render.math;",
+        "import pkg:audio.math; import pkg:render.math;",
         packages([
             (
                 game,
                 package_input(&[("audio", audio.clone()), ("render", render.clone())]),
             ),
-            (audio.clone(), package_root("pub import math;", &[])),
-            (render.clone(), package_root("pub import math;", &[])),
+            (audio.clone(), package_root(&audio, "pub import math;", &[])),
+            (
+                render.clone(),
+                package_root(&render, "pub import math;", &[]),
+            ),
         ]),
         &mut loader,
     )
@@ -119,10 +136,10 @@ fn duplicate_local_imports_load_once_per_package() {
     loader.add_package_source(&math, module_path(["util"]), "");
     let result = resolve_package(
         game.clone(),
-        "import util; import util; import dep:math.util; import dep:math.util;",
+        "import util; import util; import pkg:math.util; import pkg:math.util;",
         packages([
             (game.clone(), package_input(&[("math", math.clone())])),
-            (math.clone(), package_root("pub import util;", &[])),
+            (math.clone(), package_root(&math, "pub import util;", &[])),
         ]),
         &mut loader,
     )
@@ -135,12 +152,44 @@ fn duplicate_local_imports_load_once_per_package() {
 }
 
 #[test]
-fn no_manifest_synthetic_package_cannot_use_dep() {
+fn duplicate_spans_keep_edges() {
+    let game = package("game");
+    let mut loader = InMemoryLoader::default();
+    loader.add_package_source(&game, module_path(["a"]), "");
+    loader.add_package_source(&game, module_path(["b"]), "");
+    let mut program = parse_program("import a; import b;");
+    for stmt in &mut program.stmts {
+        if let crate::ast::Stmt::Import(import) = &mut stmt.node {
+            import.span = Span::new(0, 0);
+        }
+    }
+    let result = crate::resolve::resolve_package_modules(
+        LoadedModule {
+            module: root_id(&game),
+            program,
+        },
+        &packages([(game.clone(), PackageInput::default())]),
+        vec![],
+        &mut loader,
+        &HashSet::new(),
+        &HashSet::new(),
+        crate::resolve::SystemPackages::default(),
+    )
+    .unwrap();
+    let edges = result.import_edges.get(&root_id(&game)).unwrap();
+
+    assert_eq!(edges.len(), 2);
+    assert_eq!(edges[0].base, module_id(&game, &["a"]));
+    assert_eq!(edges[1].base, module_id(&game, &["b"]));
+}
+
+#[test]
+fn pkg_needs_context() {
     let game = PackageId::synthetic_root();
     let mut loader = InMemoryLoader::default();
     let errors = resolve_errors(resolve_package(
         game.clone(),
-        "import dep:math;",
+        "import pkg:math;",
         packages([(game.clone(), PackageInput::default())]),
         &mut loader,
     ));
@@ -149,6 +198,30 @@ fn no_manifest_synthetic_package_cannot_use_dep() {
         errors.as_slice(),
         [ResolveError::UnknownDependency { package, alias, .. }]
             if package == &game && alias == "math"
+    ));
+}
+
+#[test]
+fn source_without_package_rejects_pkg() {
+    let file = SourceFileId::new("/tmp/no-package/main.anv").unwrap();
+    let mut loader = InMemoryLoader::default();
+    let errors = resolve_errors(crate::resolve::resolve_package_modules(
+        LoadedModule {
+            module: ModuleId::source_without_package(file.clone()),
+            program: parse_program("import pkg:math;"),
+        },
+        &HashMap::new(),
+        vec![],
+        &mut loader,
+        &HashSet::new(),
+        &HashSet::new(),
+        crate::resolve::SystemPackages::default(),
+    ));
+
+    assert!(matches!(
+        errors.as_slice(),
+        [ResolveError::PackageImportUnavailable { file: found, alias, .. }]
+            if found == &file && alias == "math"
     ));
 }
 
@@ -165,7 +238,7 @@ fn local_import_chain_stays_package_local() {
         "import a;",
         packages([
             (game.clone(), package_input(&[("b", math.clone())])),
-            (math.clone(), package_root("", &[])),
+            (math.clone(), package_root(&math, "", &[])),
         ]),
         &mut loader,
     )
@@ -196,17 +269,17 @@ fn missing_local_module_reports_current_package() {
 }
 
 #[test]
-fn dependency_root_import_resolves_package_root_imports() {
+fn root_imports_resolve() {
     let game = package("game");
     let math = package("math");
     let mut loader = InMemoryLoader::default();
     loader.add_package_source(&math, module_path(["helpers"]), "");
     let result = resolve_package(
         game.clone(),
-        "import dep:math;",
+        "import pkg:math;",
         packages([
             (game, package_input(&[("math", math.clone())])),
-            (math.clone(), package_root("import helpers;", &[])),
+            (math.clone(), package_root(&math, "import helpers;", &[])),
         ]),
         &mut loader,
     )
@@ -214,6 +287,36 @@ fn dependency_root_import_resolves_package_root_imports() {
 
     assert!(has_root(&result, &math));
     assert!(has_module(&result, &math, &["helpers"]));
+}
+
+#[test]
+fn root_aliases_source_entry() {
+    let game = package("game");
+    let math = package("math");
+    let math_source = source_id(&math, "/canonical/math/src/lib.anv");
+    let mut loader = InMemoryLoader::default();
+    let result = resolve_package(
+        game.clone(),
+        "import pkg:math;",
+        packages([
+            (game, package_input(&[("math", math.clone())])),
+            (
+                math.clone(),
+                PackageInput {
+                    root: Some(LoadedModule {
+                        module: math_source.clone(),
+                        program: parse_program(""),
+                    }),
+                    dependencies: HashMap::new(),
+                },
+            ),
+        ]),
+        &mut loader,
+    )
+    .unwrap();
+
+    assert!(has_source(&result, &math_source));
+    assert_eq!(result.canonical_module(&root_id(&math)), &math_source);
 }
 
 #[test]

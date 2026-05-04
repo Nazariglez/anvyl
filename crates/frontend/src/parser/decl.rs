@@ -166,32 +166,30 @@ fn generic_params<'src>() -> BoxedParser<'src, GenericParams> {
         .boxed()
 }
 
-fn package_import_target(root: ast::Ident, path: Vec<ast::Ident>) -> Option<ast::ImportTarget> {
+fn colon_import_target(root: ast::Ident, path: Vec<ast::Ident>) -> Option<ast::ImportTarget> {
     match root.as_str() {
-        "dep" => {
+        "pkg" => {
             let (alias, path) = path.split_first().expect("dotted path is non-empty");
-            Some(ast::ImportTarget::dependency(
-                alias.to_owned(),
-                path.to_vec(),
-            ))
+            Some(ast::ImportTarget::package(alias.to_owned(), path.to_vec()))
         }
+        "std" => Some(ast::ImportTarget::std(path)),
         "ext" => Some(ast::ImportTarget::native_provider(path)),
         _ => None,
     }
 }
 
-fn local_or_std_import_target(path: Vec<ast::Ident>) -> ast::ImportTarget {
-    let (root, rest) = path.split_first().expect("dotted path is non-empty");
-    if root.as_str() == "std" {
-        ast::ImportTarget::std(rest.to_vec())
-    } else {
-        ast::ImportTarget::local(path)
-    }
+fn local_import_target(dot_count: usize, path: Vec<ast::Ident>) -> ast::ImportTarget {
+    let ascend = dot_count.saturating_sub(1);
+    ast::ImportTarget::local(ascend, path)
 }
 
 pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
     let import_kw = select! { (Token::Keyword(Keyword::Import), _) => () };
     let dot = select! { (Token::Dot, _) => () };
+    let leading_dot = select! {
+        (Token::Dot, _) => 1,
+        (Token::Range, _) => 2,
+    };
     let colon = select! { (Token::Colon, _) => () };
     let semicolon = select! { (Token::Semicolon, _) => () };
     let as_kw = select! { (Token::Keyword(Keyword::As), _) => () };
@@ -207,18 +205,25 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
             rest
         });
 
-    let package_target = identifier()
+    let colon_target = identifier()
         .then_ignore(colon)
         .then(dotted_path.clone())
         .try_map(|(root, path), span| {
-            package_import_target(root, path).ok_or_else(|| {
-                Rich::custom(span, "only dep: and ext: import roots use colon syntax")
+            colon_import_target(root, path).ok_or_else(|| {
+                Rich::custom(
+                    span,
+                    "only pkg:, std:, and ext: import roots use colon syntax",
+                )
             })
         });
 
-    let local_or_std_target = dotted_path.map(local_or_std_import_target);
+    let local_target = empty()
+        .to(0usize)
+        .foldl(leading_dot.repeated(), |count, dot| count + dot)
+        .then(dotted_path)
+        .map(|(dot_count, path)| local_import_target(dot_count, path));
 
-    let import_target = package_target.or(local_or_std_target);
+    let import_target = colon_target.or(local_target);
 
     let self_item = select! {
         (Token::Ident(i), _) if i.0.as_ref() == SELF_ITEM => ast::ImportItemKind::SelfModule
@@ -495,7 +500,7 @@ fn extern_type_body<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, (Vec<ast::ExternTypeMember>, Option<ast::ExternInit>)> {
     enum BodyItem {
-        Member(ast::ExternTypeMember),
+        Member(Box<ast::ExternTypeMember>),
         Init(ast::ExternInit),
     }
 
@@ -508,7 +513,7 @@ fn extern_type_body<'src>(
                 params: params.unwrap_or_default(),
             })
         });
-    let member_item = extern_type_member(stmt).map(BodyItem::Member);
+    let member_item = extern_type_member(stmt).map(Box::new).map(BodyItem::Member);
 
     select! { (Token::Open(Delimiter::Brace), _) => () }
         .ignore_then(
@@ -522,7 +527,7 @@ fn extern_type_body<'src>(
             let mut init = None;
             for item in items {
                 match item {
-                    BodyItem::Member(member) => members.push(member),
+                    BodyItem::Member(member) => members.push(*member),
                     BodyItem::Init(next_init) => {
                         if init.is_some() {
                             emitter.emit(Rich::custom(

@@ -16,28 +16,56 @@ fn selective_items(src: &str) -> Vec<ast::ImportItem> {
 #[test]
 fn single_seg() {
     let imp = first_import("import foo;");
-    assert_local_import(&imp, &["foo"]);
+    assert_local_import(&imp, 0, &["foo"]);
+    assert_eq!(imp.kind, ImportKind::Module);
+}
+
+#[test]
+fn explicit_current_folder() {
+    let imp = first_import("import .helper;");
+    assert_local_import(&imp, 0, &["helper"]);
+    assert_eq!(imp.kind, ImportKind::Module);
+}
+
+#[test]
+fn parent_folder() {
+    let imp = first_import("import ..common;");
+    assert_local_import(&imp, 1, &["common"]);
+    assert_eq!(imp.kind, ImportKind::Module);
+}
+
+#[test]
+fn grandparent_selective() {
+    let imp = first_import("import ...shared.types { Id };");
+    assert_local_import(&imp, 2, &["shared", "types"]);
+    assert!(matches!(imp.kind, ImportKind::Selective(_)));
+}
+
+#[test]
+fn deeper_parent_folder() {
+    let imp = first_import("import ....too.high;");
+    assert_local_import(&imp, 3, &["too", "high"]);
     assert_eq!(imp.kind, ImportKind::Module);
 }
 
 #[test]
 fn two_seg() {
     let imp = first_import("import foo.bar;");
-    assert_local_import(&imp, &["foo", "bar"]);
+    assert_local_import(&imp, 0, &["foo", "bar"]);
     assert_eq!(imp.kind, ImportKind::Module);
 }
 
 #[test]
 fn three_seg() {
     let imp = first_import("import foo.bar.baz;");
-    assert_local_import(&imp, &["foo", "bar", "baz"]);
+    assert_local_import(&imp, 0, &["foo", "bar", "baz"]);
     assert_eq!(imp.kind, ImportKind::Module);
 }
 
 #[test]
 fn single_seg_alias() {
     let imp = first_import("import foo as f;");
-    assert_local_import(&imp, &["foo"]);
+    assert_local_import(&imp, 0, &["foo"]);
     let ImportKind::ModuleAs(alias) = &imp.kind else {
         panic!("expected ModuleAs, found {:?}", imp.kind);
     };
@@ -47,7 +75,7 @@ fn single_seg_alias() {
 #[test]
 fn multi_seg_alias() {
     let imp = first_import("import foo.bar as b;");
-    assert_local_import(&imp, &["foo", "bar"]);
+    assert_local_import(&imp, 0, &["foo", "bar"]);
     let ImportKind::ModuleAs(alias) = &imp.kind else {
         panic!("expected ModuleAs, found {:?}", imp.kind);
     };
@@ -135,7 +163,7 @@ fn selective_self_trailing() {
 #[test]
 fn wildcard() {
     let imp = first_import("import foo { * };");
-    assert_local_import(&imp, &["foo"]);
+    assert_local_import(&imp, 0, &["foo"]);
     assert_eq!(imp.kind, ImportKind::Wildcard);
 }
 
@@ -162,4 +190,10 @@ fn err_trailing_dot() {
 #[test]
 fn err_empty_braces() {
     parse_program_err("import foo { };");
+}
+
+#[test]
+fn err_interior_range() {
+    parse_program_err("import my..mod;");
+    parse_program_err("import my.mod..file;");
 }

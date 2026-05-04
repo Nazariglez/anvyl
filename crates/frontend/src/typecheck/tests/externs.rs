@@ -17,15 +17,13 @@ use crate::{
             ExternMethodRef, ExternOperatorRef, ExternStaticRef, ExternTypeId,
         },
     },
-    lexer::tokenize,
-    parser,
-    resolve::{ModuleId, ModulePath, PackageId, ResolveResult, ResolvedModule},
+    resolve::ModulePath,
+    test_support::{parse_program, resolved_modules},
     typecheck::{self, ExternUseTarget, ModuleScope, TypeError},
 };
 
 fn parse(source: &str) -> Program {
-    let tokens = tokenize(source).expect("tokenize failed");
-    parser::parse_ast(&tokens).expect("parse failed")
+    parse_program(source)
 }
 
 fn extern_path(segments: &[&str]) -> ExternModulePath {
@@ -272,27 +270,6 @@ fn callback(params: Vec<ExternTypeExpr>, ret: ExternTypeExpr) -> ExternTypeExpr 
     })
 }
 
-fn root_id() -> ModuleId {
-    ModuleId::root(PackageId::synthetic_root())
-}
-
-fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
-    ResolveResult {
-        root: root_id(),
-        module_groups: vec![
-            modules
-                .iter()
-                .map(|(name, source)| ResolvedModule {
-                    key: ModuleId::named(PackageId::synthetic_root(), module_path(name)),
-                    program: parse(source),
-                })
-                .collect(),
-        ],
-        dependencies: std::collections::HashMap::new(),
-        system: crate::resolve::SystemPackages::default(),
-    }
-}
-
 fn check_with_provider(
     root_source: &str,
     provider: ProviderDescriptor,
@@ -307,7 +284,7 @@ fn check_named_with_provider(
     provider: ProviderDescriptor,
 ) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
     let root = parse(root_source);
-    let resolved = resolved_modules(modules);
+    let resolved = resolved_modules(&root, modules);
     let mut raw = externs::collect_source_externs(&root, &resolved).expect("valid source externs");
     raw.append(
         externs::ingest_providers(ExternInputs {

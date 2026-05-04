@@ -15,7 +15,7 @@ use crate::{
         StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     externs::{RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope},
-    resolve::{self, ModuleId, ModulePath, PackageId, ResolveResult},
+    resolve::{ModuleId, ModulePath, PackageId, ResolveResult, SourceFileId},
     span::Span,
 };
 
@@ -28,7 +28,10 @@ pub(crate) enum ModuleScope {
 
 impl ModuleScope {
     pub(crate) fn from_module_id(module: &ModuleId) -> Self {
-        if module.package() == &PackageId::synthetic_root() {
+        if module.source_file().is_some() {
+            return Self::Package(module.clone());
+        }
+        if module.package_context() == Some(&PackageId::synthetic_root()) {
             match module.named_path() {
                 Some(path) => Self::Named(path.clone()),
                 None => Self::Root,
@@ -42,10 +45,18 @@ impl ModuleScope {
         match self {
             ModuleScope::Root => None,
             ModuleScope::Named(path) => Some(ModuleOrigin::Module(path.to_ast_path())),
-            ModuleScope::Package(module) => Some(ModuleOrigin::Package {
-                package: module.package().as_str().to_string(),
-                path: module.named_path().map(ModulePath::to_ast_path),
-            }),
+            ModuleScope::Package(module) => match module.source_file() {
+                Some(file) => Some(ModuleOrigin::SourceFile {
+                    package: module
+                        .package_context()
+                        .map(|package| package.as_str().to_string()),
+                    path: file.to_string(),
+                }),
+                None => Some(ModuleOrigin::Package {
+                    package: module.package().as_str().to_string(),
+                    path: module.named_path().map(ModulePath::to_ast_path),
+                }),
+            },
         }
     }
 
@@ -55,6 +66,12 @@ impl ModuleScope {
                 ModulePath::new(path.iter().cloned().collect())
                     .expect("AST validates nominal origin module paths"),
             ),
+            ModuleOrigin::SourceFile { package, path } => {
+                Self::Package(ModuleId::source_with_context(
+                    package.clone().map(PackageId::new),
+                    SourceFileId::new(path).expect("source origin path is absolute"),
+                ))
+            }
             ModuleOrigin::Package { package, path } => {
                 let package = PackageId::new(package.clone());
                 match path {
@@ -242,7 +259,10 @@ fn module_id_for_scope(scope: &ModuleScope) -> ModuleId {
 
 fn package_for_scope(scope: &ModuleScope) -> PackageId {
     match scope {
-        ModuleScope::Package(module) => module.package().clone(),
+        ModuleScope::Package(module) => module
+            .package_context()
+            .cloned()
+            .unwrap_or_else(PackageId::synthetic_root),
         ModuleScope::Root | ModuleScope::Named(_) => PackageId::synthetic_root(),
     }
 }
@@ -816,7 +836,7 @@ impl DeclarationIndex {
     }
 
     fn is_export_all_scope(scope: &ModuleScope, resolved: &ResolveResult) -> bool {
-        if matches!(scope, ModuleScope::Root) {
+        if scope == &ModuleScope::from_module_id(&resolved.root) {
             return true;
         }
         let Some(core_package) = &resolved.system.core else {
@@ -1332,20 +1352,19 @@ impl DeclarationIndex {
     fn resolve_import_target(
         &mut self,
         current: &ModuleScope,
-        import: &crate::ast::Import,
+        ordinal: usize,
         span: Span,
         resolved: &ResolveResult,
     ) -> Option<ImportTargetScope> {
-        let mut errors = vec![];
-        let spanned = crate::span::Spanned::new(import.clone(), span);
-        let target = resolve::resolve_import_target(
-            &module_id_for_scope(current),
-            &spanned,
-            &resolved.dependencies,
-            resolved.system.std.as_ref(),
-            &mut errors,
-        )?;
-        let module = ModuleScope::from_module_id(&target.base);
+        let current_module = module_id_for_scope(current);
+        let Some(target) = resolved.import_target(&current_module, ordinal).cloned() else {
+            debug_assert!(
+                false,
+                "missing resolved import edge for module {current_module:?} import {ordinal}"
+            );
+            return None;
+        };
+        let module = ModuleScope::from_module_id(resolved.canonical_module(&target.base));
         if target.exported_path.is_empty() {
             return Some(ImportTargetScope {
                 module,
@@ -1441,16 +1460,19 @@ impl DeclarationIndex {
         resolved: &ResolveResult,
         builder: &mut ImportScopeBuilder,
     ) {
+        let mut ordinal = 0;
         for stmt in &program.stmts {
             let Stmt::Import(import) = &stmt.node else {
                 continue;
             };
+            let import_ordinal = ordinal;
+            ordinal += 1;
             let is_public = matches!(import.node.visibility, Visibility::Public);
             if builder.mode == ImportMode::Reexport && !is_public {
                 continue;
             }
             let Some(target) =
-                self.resolve_import_target(scope, &import.node, import.span, resolved)
+                self.resolve_import_target(scope, import_ordinal, import.span, resolved)
             else {
                 continue;
             };
@@ -2425,9 +2447,7 @@ mod tests {
     use super::*;
     use crate::{
         ast::TypeVarId,
-        lexer::tokenize,
-        parser,
-        resolve::{ModuleId, PackageId, ResolvedModule},
+        test_support::{parse_program, resolved_modules},
         typecheck::type_ops::type_closure_facts,
     };
 
@@ -2436,48 +2456,23 @@ mod tests {
     }
 
     fn parse(source: &str) -> Program {
-        let tokens = tokenize(source).expect("lexer error");
-        parser::parse_ast(&tokens).expect("parse error")
+        parse_program(source)
     }
 
     fn scope(name: &str) -> ModuleScope {
         ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
     }
 
-    fn root_id() -> ModuleId {
-        ModuleId::root(PackageId::synthetic_root())
-    }
-
-    fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
-        ResolveResult {
-            root: root_id(),
-            module_groups: modules
-                .iter()
-                .map(|(name, source)| {
-                    vec![ResolvedModule {
-                        key: ModuleId::named(
-                            PackageId::synthetic_root(),
-                            ModulePath::new(vec![(*name).to_string()]).unwrap(),
-                        ),
-                        program: parse(source),
-                    }]
-                })
-                .collect(),
-            dependencies: HashMap::new(),
-            system: resolve::SystemPackages::default(),
-        }
-    }
-
     fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
         let root = parse(root);
-        let resolved = resolved_modules(modules);
+        let resolved = resolved_modules(&root, modules);
         let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
         DeclarationIndex::from_root_and_modules(&root, &resolved, HashSet::new(), &externs)
     }
 
     fn checked_index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
         let root = parse(root);
-        let resolved = resolved_modules(modules);
+        let resolved = resolved_modules(&root, modules);
         let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
         super::super::check_with_modules(&root, &resolved, HashSet::new(), externs)
             .expect("typecheck failed")
@@ -2495,7 +2490,7 @@ mod tests {
         provider: ProviderDescriptor,
     ) -> DeclarationIndex {
         let root = parse(root);
-        let resolved = resolved_modules(modules);
+        let resolved = resolved_modules(&root, modules);
         let raw = crate::externs::ingest_providers(crate::externs::ExternInputs {
             providers: vec![provider],
         })

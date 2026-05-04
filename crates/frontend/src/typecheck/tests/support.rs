@@ -3,9 +3,7 @@ use std::collections::HashSet;
 use crate::{
     ast::Type,
     externs,
-    lexer::tokenize,
-    parser,
-    resolve::{ModuleId, ModulePath, PackageId, ResolveResult, ResolvedModule},
+    test_support::{empty_resolved, module_path, parse_program, resolved_modules},
     typecheck::{self, ModuleScope, TypeError},
 };
 
@@ -53,19 +51,9 @@ fn assert_closed_type(ty: &Type, label: &str) {
     );
 }
 
-fn parse(source: &str) -> crate::ast::Program {
-    let tokens = tokenize(source).expect("lexer error");
-    parser::parse_ast(&tokens).expect("parse error")
-}
-
 pub(crate) fn check(source: &str) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
-    let program = parse(source);
-    let resolved = ResolveResult {
-        root: root_id(),
-        module_groups: vec![],
-        dependencies: std::collections::HashMap::new(),
-        system: crate::resolve::SystemPackages::default(),
-    };
+    let program = parse_program(source);
+    let resolved = empty_resolved();
     let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
     typecheck::check_with_modules(&program, &resolved, HashSet::new(), raw_externs)
 }
@@ -97,31 +85,6 @@ pub(crate) fn check_named(
     check_with_active(root_source, modules, &[])
 }
 
-fn root_id() -> ModuleId {
-    ModuleId::root(PackageId::synthetic_root())
-}
-
-fn module_path(name: &str) -> ModulePath {
-    ModulePath::new(name.split('.').map(str::to_string).collect()).unwrap()
-}
-
-fn resolved_modules(modules: &[(&str, &str)]) -> ResolveResult {
-    ResolveResult {
-        root: root_id(),
-        module_groups: vec![
-            modules
-                .iter()
-                .map(|(name, source)| ResolvedModule {
-                    key: ModuleId::named(PackageId::synthetic_root(), module_path(name)),
-                    program: parse(source),
-                })
-                .collect(),
-        ],
-        dependencies: std::collections::HashMap::new(),
-        system: crate::resolve::SystemPackages::default(),
-    }
-}
-
 pub(crate) fn check_active(
     root_source: &str,
     modules: &[(&str, &str)],
@@ -135,8 +98,8 @@ fn check_with_active(
     modules: &[(&str, &str)],
     always_active: &[&str],
 ) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
-    let root = parse(root_source);
-    let resolved = resolved_modules(modules);
+    let root = parse_program(root_source);
+    let resolved = resolved_modules(&root, modules);
     let always_active_modules = always_active
         .iter()
         .map(|name| ModuleScope::Named(module_path(name)))

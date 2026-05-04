@@ -1,0 +1,5 @@
+// @helper
+
+pub fn nested() -> int {
+    3
+}

@@ -1,0 +1,9 @@
+// @helper
+
+pub struct Token {}
+
+pub fn make() -> Token {
+    Token {}
+}
+
+pub fn accept(t: Token) {}

@@ -51,7 +51,7 @@ pub(crate) fn collect_source_externs(
 }
 
 fn source_scope(module: &ModuleId) -> RawExternScope {
-    if module.package() == &PackageId::synthetic_root()
+    if module.package_context() == Some(&PackageId::synthetic_root())
         && let Some(path) = module.named_path()
     {
         return RawExternScope::Named(ModulePath {

@@ -51,8 +51,8 @@ pub(super) fn assert_named_path(path: &ast::PackageModulePath, expected: &[&str]
     );
 }
 
-pub(super) fn assert_local_import(imp: &ast::Import, expected: &[&str]) {
-    assert_eq!(imp.target.root, ast::ImportRoot::Local);
+pub(super) fn assert_local_import(imp: &ast::Import, ascend: usize, expected: &[&str]) {
+    assert_eq!(imp.target.root, ast::ImportRoot::Local { ascend });
     assert_named_path(&imp.target.path, expected);
 }
 

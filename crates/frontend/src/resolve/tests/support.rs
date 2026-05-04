@@ -7,8 +7,8 @@ use crate::{
     ast::Program,
     lexer, parser,
     resolve::{
-        self, ModuleId, ModuleLoadError, ModuleLoader, ModulePath, PackageId, PackageInput,
-        PreloadedModule, ResolveError, ResolveFailure, ResolveResult,
+        self, LoadedModule, ModuleId, ModuleLoadError, ModuleLoader, ModulePath, PackageId,
+        PackageInput, PreloadedModule, ResolveError, ResolveFailure, ResolveResult, SourceFileId,
     },
 };
 
@@ -33,7 +33,7 @@ where
     ModulePath::new(
         segments
             .into_iter()
-            .map(|segment| segment.as_ref().to_string())
+            .map(|segment| segment.as_ref().to_owned())
             .collect(),
     )
     .unwrap()
@@ -47,6 +47,10 @@ pub fn root_id(package: &PackageId) -> ModuleId {
     ModuleId::root(package.clone())
 }
 
+pub fn source_id(package: &PackageId, path: &str) -> ModuleId {
+    ModuleId::source(package.clone(), SourceFileId::new(path).unwrap())
+}
+
 pub fn package_input(dependencies: &[(&str, PackageId)]) -> PackageInput {
     PackageInput {
         root: None,
@@ -57,9 +61,16 @@ pub fn package_input(dependencies: &[(&str, PackageId)]) -> PackageInput {
     }
 }
 
-pub fn package_root(source: &str, dependencies: &[(&str, PackageId)]) -> PackageInput {
+pub fn package_root(
+    package: &PackageId,
+    source: &str,
+    dependencies: &[(&str, PackageId)],
+) -> PackageInput {
     PackageInput {
-        root: Some(parse_program(source)),
+        root: Some(LoadedModule {
+            module: ModuleId::root(package.clone()),
+            program: parse_program(source),
+        }),
         dependencies: dependencies
             .iter()
             .map(|(alias, package)| ((*alias).to_string(), package.clone()))
@@ -68,7 +79,7 @@ pub fn package_root(source: &str, dependencies: &[(&str, PackageId)]) -> Package
 }
 
 pub fn ignored_roots(roots: &[&str]) -> HashSet<String> {
-    roots.iter().map(|s| s.to_string()).collect()
+    roots.iter().map(ToString::to_string).collect()
 }
 
 #[derive(Default)]
@@ -123,7 +134,10 @@ impl InMemoryLoader {
 impl ModuleLoader for InMemoryLoader {
     type FatalError = Infallible;
 
-    fn load(&mut self, module: &ModuleId) -> Result<Option<Program>, ModuleLoadError<Infallible>> {
+    fn load(
+        &mut self,
+        module: &ModuleId,
+    ) -> Result<Option<LoadedModule>, ModuleLoadError<Infallible>> {
         self.loads.push(module.clone());
         if let Some(msg) = self.failures.get(module) {
             return Err(ModuleLoadError::LoadFailed(msg.clone()));
@@ -131,7 +145,14 @@ impl ModuleLoader for InMemoryLoader {
         if self.missing.iter().any(|missing| missing == module) {
             return Ok(None);
         }
-        Ok(self.modules.get(module).cloned())
+        Ok(self
+            .modules
+            .get(module)
+            .cloned()
+            .map(|program| LoadedModule {
+                module: module.clone(),
+                program,
+            }))
     }
 }
 
@@ -169,8 +190,10 @@ pub fn resolve_package(
     loader: &mut InMemoryLoader,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_package_modules(
-        root_package,
-        parse_program(source),
+        LoadedModule {
+            module: ModuleId::root(root_package),
+            program: parse_program(source),
+        },
         &packages,
         vec![],
         loader,

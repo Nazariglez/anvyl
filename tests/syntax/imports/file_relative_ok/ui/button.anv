@@ -1,0 +1,14 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+import helper { Token as TokenA, make as make_a };
+import .helper { Token as TokenB, accept as accept_b };
+import sub.widget { nested };
+import ..common { parent };
+
+fn main() {
+    let t: TokenB = make_a();
+    accept_b(t);
+    let x: int = parent() + nested();
+}

@@ -1,0 +1,5 @@
+// @helper
+
+pub fn parent() -> int {
+    2
+}

@@ -15,7 +15,7 @@ use crate::{
         },
     },
     lexer::SpannedToken,
-    resolve::{ModuleId, ModulePath, PackageModulePath, ResolveError},
+    resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError},
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, MemberAccessKind,
         ModuleScope, TypeError,
@@ -73,6 +73,24 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
                 render_module_id(module)
             )
         }
+        ResolveError::SourceImportNotFound {
+            importer,
+            path,
+            candidate,
+            ..
+        } => match candidate {
+            Some(candidate) => format!(
+                "Cannot find source import '{}' from '{}' at '{}'",
+                render_module_path(path),
+                importer,
+                candidate.display()
+            ),
+            None => format!(
+                "Cannot find source import '{}' from '{}'",
+                render_module_path(path),
+                importer
+            ),
+        },
         ResolveError::LoadFailed {
             module, message, ..
         } => {
@@ -89,6 +107,9 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
         }
         ResolveError::UnknownDependency { alias, package, .. } => {
             format!("package '{package}' has no dependency named '{alias}'")
+        }
+        ResolveError::PackageImportUnavailable { file, alias, .. } => {
+            format!("source file '{file}' has no package dependency named '{alias}'")
         }
         ResolveError::UnsupportedImportRoot { root, .. } => {
             format!("import root '{root}' is not supported yet")
@@ -265,7 +286,7 @@ fn is_raw_root_scope(scope: &RawExternScope) -> bool {
 }
 
 fn is_root_module_id(module: &ModuleId) -> bool {
-    module.package() == &crate::resolve::PackageId::synthetic_root()
+    module.package_context() == Some(&PackageId::synthetic_root())
         && matches!(module.path(), PackageModulePath::Root)
 }
 
@@ -544,6 +565,7 @@ fn render_detailed_generic_arg(arg: &crate::ast::GenericArg) -> String {
 fn render_nominal_origin(origin: &ModuleOrigin) -> String {
     match origin {
         ModuleOrigin::Module(path) => path.join("."),
+        ModuleOrigin::SourceFile { path, .. } => path.clone(),
         ModuleOrigin::Package { package, path } => {
             let path = path
                 .as_ref()
@@ -1010,11 +1032,13 @@ fn render_module_id(module: &ModuleId) -> String {
     let path = match module.path() {
         PackageModulePath::Root => "<root>".to_string(),
         PackageModulePath::Named(path) => render_module_path(path),
+        PackageModulePath::Source(file) => file.to_string(),
     };
-    if module.package() == &crate::resolve::PackageId::synthetic_root() {
-        path
-    } else {
-        format!("{}:{path}", module.package())
+    match module.package_context() {
+        Some(package) if package != &PackageId::synthetic_root() => {
+            format!("{package}:{path}")
+        }
+        _ => path,
     }
 }
 
@@ -1048,14 +1072,11 @@ mod tests {
     }
 
     fn module_id(path: &[&str]) -> ModuleId {
-        ModuleId::named(
-            crate::resolve::PackageId::synthetic_root(),
-            module_path(path),
-        )
+        ModuleId::named(PackageId::synthetic_root(), module_path(path))
     }
 
     fn root_module_id() -> ModuleId {
-        ModuleId::root(crate::resolve::PackageId::synthetic_root())
+        ModuleId::root(PackageId::synthetic_root())
     }
 
     fn raw_root_scope() -> RawExternScope {

@@ -5,8 +5,11 @@ use std::{
 };
 
 use anvyx_frontend::{
-    pipeline::{PackageSourceLoader, Source as FrontendSource, SourceLoadError},
-    resolve::{ModuleId, ModulePath, PackageId},
+    pipeline::{
+        PackageModuleInput, PackageSourceLoader, Source as FrontendSource, SourceLoad,
+        SourceLoadError,
+    },
+    resolve::{LocalSourceRequest, ModuleId, ModulePath, PackageId, SourceFileId},
 };
 
 use crate::CheckError;
@@ -232,95 +235,186 @@ impl PackageSource {
     }
 }
 
-pub(crate) fn validate_reserved_source_roots(packages: &[PackageSource]) -> Result<(), CheckError> {
-    for package in packages {
-        validate_reserved_std_root(package)?;
-    }
-    Ok(())
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceOwner {
+    Package(PackageId),
+    None,
 }
 
-fn validate_reserved_std_root(package: &PackageSource) -> Result<(), CheckError> {
-    let std_file = package.source_root.join("std.anv");
-    if std_file.is_file() {
-        return reserved_std_source(package, &std_file);
-    }
-
-    let std_dir = package.source_root.join("std");
-    if !std_dir.is_dir() {
-        return Ok(());
-    }
-    if let Some(file) = first_anv_file(&std_dir)? {
-        return reserved_std_source(package, &file);
-    }
-    Ok(())
-}
-
-fn first_anv_file(root: &Path) -> Result<Option<PathBuf>, CheckError> {
-    for entry in fs::read_dir(root).map_err(|error| CheckError::ReadModule {
-        path: root.to_path_buf(),
-        message: error.to_string(),
-    })? {
-        let entry = entry.map_err(|error| CheckError::ReadModule {
-            path: root.to_path_buf(),
-            message: error.to_string(),
-        })?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(file) = first_anv_file(&path)? {
-                return Ok(Some(file));
-            }
-        } else if path.extension().is_some_and(|ext| ext == "anv") {
-            return Ok(Some(path));
+impl SourceOwner {
+    fn package_context(&self) -> Option<&PackageId> {
+        match self {
+            Self::Package(package) => Some(package),
+            Self::None => None,
         }
     }
-    Ok(None)
 }
 
-fn reserved_std_source<T>(package: &PackageSource, path: &Path) -> Result<T, CheckError> {
-    invalid_input(format!(
-        "package '{}' uses reserved std source path '{}'",
-        package.id,
-        path.display()
-    ))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceRoot {
+    package: PackageId,
+    root: PathBuf,
+    canonical_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceOwnership {
+    roots: Vec<SourceRoot>,
+}
+
+impl SourceOwnership {
+    pub(crate) fn new(packages: &[PackageSource]) -> Result<Self, CheckError> {
+        let roots = packages
+            .iter()
+            .map(|package| {
+                let canonical_root = fs::canonicalize(package.source_root()).map_err(|error| {
+                    CheckError::InvalidInput(format!(
+                        "failed to canonicalize package '{}' source root '{}': {error}",
+                        package.id(),
+                        package.source_root().display()
+                    ))
+                })?;
+                Ok(SourceRoot {
+                    package: package.id().clone(),
+                    root: package.source_root().to_path_buf(),
+                    canonical_root,
+                })
+            })
+            .collect::<Result<_, CheckError>>()?;
+        Ok(Self { roots })
+    }
+
+    fn source_owner(&self, file: &SourceFileId) -> Result<SourceOwner, CheckError> {
+        let owners = self
+            .roots
+            .iter()
+            .filter(|root| file.path().starts_with(&root.canonical_root))
+            .collect::<Vec<_>>();
+        match owners.as_slice() {
+            [] => Ok(SourceOwner::None),
+            [owner] => Ok(SourceOwner::Package(owner.package.clone())),
+            _ => Err(CheckError::InvalidInput(format!(
+                "source file '{}' is owned by multiple package source roots: {}",
+                file,
+                owners
+                    .iter()
+                    .map(|root| format!("{} ({})", root.package, root.canonical_root.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    pub(crate) fn validate_root_file(
+        &self,
+        file: &Path,
+    ) -> Result<(PackageId, SourceFileId), CheckError> {
+        let source_file = canonical_source_file(file)?;
+        match self.source_owner(&source_file)? {
+            SourceOwner::Package(package) => Ok((package, source_file)),
+            SourceOwner::None => Err(CheckError::InvalidInput(format!(
+                "--new-frontend file override '{source_file}' is outside every loaded package source root"
+            ))),
+        }
+    }
+
+    fn source_root(&self, package: &PackageId) -> Option<&Path> {
+        self.roots
+            .iter()
+            .find(|root| &root.package == package)
+            .map(|root| root.root.as_path())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PackageSourceEnvironment<'a> {
-    source_roots: HashMap<PackageId, PathBuf>,
+    ownership: SourceOwnership,
     sources: &'a SourceBundle,
+    source_cache: HashMap<SourceFileId, PackageModuleInput>,
 }
 
 impl<'a> PackageSourceEnvironment<'a> {
-    pub(crate) fn new(packages: &[PackageSource], sources: &'a SourceBundle) -> Self {
+    pub(crate) fn new(ownership: SourceOwnership, sources: &'a SourceBundle) -> Self {
         Self {
-            source_roots: packages
-                .iter()
-                .map(|package| (package.id.clone(), package.source_root.clone()))
-                .collect(),
+            ownership,
             sources,
+            source_cache: HashMap::new(),
         }
     }
 
-    fn load_source(&self, module: &ModuleId) -> Result<Option<FrontendSource>, CheckError> {
+    pub(crate) fn cache_sources(&mut self, sources: impl IntoIterator<Item = PackageModuleInput>) {
+        for source in sources {
+            if let Some(file) = source.module.source_file() {
+                self.source_cache.insert(file.clone(), source);
+            }
+        }
+    }
+
+    fn load_source(&mut self, module: &ModuleId) -> Result<Option<PackageModuleInput>, CheckError> {
         let Some(path) = module.named_path() else {
             return Ok(None);
         };
         if module.package() == &PackageId::std() {
             return Ok(self.load_std_source(path));
         }
-        let Some(source_root) = self.source_roots.get(module.package()) else {
+        let Some(source_root) = self.ownership.source_root(module.package()) else {
             return Ok(None);
         };
         let file = module_file(source_root, path.segments());
-        read_module_file(file)
+        self.read_module_file(file)
     }
 
-    fn load_std_source(&self, module_path: &ModulePath) -> Option<FrontendSource> {
+    fn load_std_source(&self, module_path: &ModulePath) -> Option<PackageModuleInput> {
         let mut path = vec!["std".to_string()];
         path.extend(module_path.segments().iter().cloned());
         self.sources
             .std_module(&path)
             .map(ModuleSource::to_frontend_source)
+            .map(|source| PackageModuleInput {
+                module: ModuleId::named(PackageId::std(), module_path.clone()),
+                source,
+            })
+    }
+
+    fn read_module_file(
+        &mut self,
+        file: PathBuf,
+    ) -> Result<Option<PackageModuleInput>, CheckError> {
+        let source_file = match fs::canonicalize(&file) {
+            Ok(canonical) => SourceFileId::new(canonical)
+                .map_err(|error| CheckError::InvalidInput(error.to_string()))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CheckError::ReadModule {
+                    path: file,
+                    message: error.to_string(),
+                });
+            }
+        };
+        if let Some(source) = self.source_cache.get(&source_file) {
+            return Ok(Some(source.clone()));
+        }
+        match fs::read_to_string(&file) {
+            Ok(code) => {
+                let owner = self.ownership.source_owner(&source_file)?;
+                let source = SourceText::new(code, file.display().to_string()).map(|source| {
+                    PackageModuleInput {
+                        module: ModuleId::source_with_context(
+                            owner.package_context().cloned(),
+                            source_file.clone(),
+                        ),
+                        source: source.to_frontend_source(),
+                    }
+                })?;
+                self.source_cache.insert(source_file, source.clone());
+                Ok(Some(source))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CheckError::ReadModule {
+                path: file,
+                message: error.to_string(),
+            }),
+        }
     }
 }
 
@@ -330,21 +424,57 @@ impl PackageSourceLoader for PackageSourceEnvironment<'_> {
     fn load(
         &mut self,
         module: &ModuleId,
-    ) -> Result<Option<FrontendSource>, SourceLoadError<Self::FatalError>> {
+    ) -> Result<Option<PackageModuleInput>, SourceLoadError<Self::FatalError>> {
         self.load_source(module).map_err(SourceLoadError::Fatal)
+    }
+
+    fn load_local_source(
+        &mut self,
+        request: &LocalSourceRequest,
+    ) -> Result<SourceLoad, SourceLoadError<Self::FatalError>> {
+        let file = local_source_file(request).map_err(SourceLoadError::Fatal)?;
+        self.read_module_file(file.clone())
+            .map(|source| match source {
+                Some(source) => SourceLoad::Loaded(source),
+                None => SourceLoad::Missing {
+                    candidate: Some(file),
+                },
+            })
+            .map_err(SourceLoadError::Fatal)
     }
 }
 
-fn read_module_file(file: PathBuf) -> Result<Option<FrontendSource>, CheckError> {
-    match fs::read_to_string(&file) {
-        Ok(code) => SourceText::new(code, file.display().to_string())
-            .map(|source| Some(source.to_frontend_source())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(CheckError::ReadModule {
-            path: file,
-            message: error.to_string(),
-        }),
+fn local_source_file(request: &LocalSourceRequest) -> Result<PathBuf, CheckError> {
+    let Some(mut dir) = request.importer.path().parent().map(Path::to_path_buf) else {
+        return Err(CheckError::InvalidInput(format!(
+            "source file '{}' has no parent directory",
+            request.importer
+        )));
+    };
+    for _ in 0..request.ascend {
+        if !dir.pop() {
+            return Err(CheckError::InvalidInput(format!(
+                "source import '{}' from '{}' ascends above filesystem root",
+                display_path(request.path.segments()),
+                request.importer
+            )));
+        }
     }
+    for segment in request.path.segments() {
+        dir.push(segment);
+    }
+    dir.set_extension("anv");
+    Ok(dir)
+}
+
+pub(crate) fn canonical_source_file(path: &Path) -> Result<SourceFileId, CheckError> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        CheckError::InvalidInput(format!(
+            "failed to canonicalize source file '{}': {error}",
+            path.display()
+        ))
+    })?;
+    SourceFileId::new(canonical).map_err(|error| CheckError::InvalidInput(error.to_string()))
 }
 
 fn module_file(root: &Path, module_path: &[String]) -> PathBuf {
@@ -437,7 +567,15 @@ mod tests {
             HashMap::new(),
         )
         .unwrap();
-        PackageSourceEnvironment::new(&[package], bundle)
+        let ownership = SourceOwnership::new(&[package]).unwrap();
+        PackageSourceEnvironment::new(ownership, bundle)
+    }
+
+    fn loaded_source(load: SourceLoad) -> PackageModuleInput {
+        let SourceLoad::Loaded(source) = load else {
+            panic!("expected loaded source");
+        };
+        source
     }
 
     fn core(name: &str) -> ModuleSource {
@@ -678,204 +816,393 @@ mod tests {
         assert!(bundle.std_module(&path(&["math"])).is_none());
     }
 
-    #[test]
-    fn package_source_environment_loads_sibling_module() {
-        let temp = tempfile::tempdir().unwrap();
-        write(&temp, "helper.anv", "const VALUE = 1;");
-        let bundle = SourceBundle::default();
-        let env = package_env(temp.path(), &bundle);
+    mod ownership {
+        use super::*;
 
-        let source = env.load_source(&module_id(&["helper"])).unwrap().unwrap();
-
-        assert_eq!(source.code, "const VALUE = 1;");
-        assert_eq!(
-            source.label,
-            temp.path().join("helper.anv").display().to_string()
-        );
-    }
-
-    #[test]
-    fn package_source_environment_loads_nested_module() {
-        let temp = tempfile::tempdir().unwrap();
-        write(&temp, "foo/bar.anv", "const VALUE = 2;");
-        let bundle = SourceBundle::default();
-        let env = package_env(temp.path(), &bundle);
-
-        let source = env
-            .load_source(&module_id(&["foo", "bar"]))
-            .unwrap()
+        #[test]
+        fn finds_owner() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "src/main.anv", "fn main() {}");
+            let package = PackageSource::new(
+                PackageId::new("game"),
+                temp.path().join("src/main.anv"),
+                temp.path().join("src"),
+                HashMap::new(),
+            )
             .unwrap();
+            let ownership = SourceOwnership::new(&[package]).unwrap();
+            let file = canonical_source_file(&temp.path().join("src/main.anv")).unwrap();
 
-        assert_eq!(source.code, "const VALUE = 2;");
-        assert_eq!(
-            source.label,
-            temp.path().join("foo/bar.anv").display().to_string()
-        );
+            assert_eq!(
+                ownership.source_owner(&file).unwrap(),
+                SourceOwner::Package(PackageId::new("game"))
+            );
+        }
+
+        #[test]
+        fn reports_no_owner() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "src/main.anv", "fn main() {}");
+            write(&temp, "outside.anv", "fn outside() {}");
+            let package = PackageSource::new(
+                PackageId::new("game"),
+                temp.path().join("src/main.anv"),
+                temp.path().join("src"),
+                HashMap::new(),
+            )
+            .unwrap();
+            let ownership = SourceOwnership::new(&[package]).unwrap();
+            let file = canonical_source_file(&temp.path().join("outside.anv")).unwrap();
+
+            assert_eq!(ownership.source_owner(&file).unwrap(), SourceOwner::None);
+        }
+
+        #[test]
+        fn rejects_ambiguous_roots() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "root/nested/main.anv", "fn main() {}");
+            let outer = PackageSource::new(
+                PackageId::new("outer"),
+                temp.path().join("root/main.anv"),
+                temp.path().join("root"),
+                HashMap::new(),
+            )
+            .unwrap();
+            let inner = PackageSource::new(
+                PackageId::new("inner"),
+                temp.path().join("root/nested/main.anv"),
+                temp.path().join("root/nested"),
+                HashMap::new(),
+            )
+            .unwrap();
+            let ownership = SourceOwnership::new(&[outer, inner]).unwrap();
+            let file = canonical_source_file(&temp.path().join("root/nested/main.anv")).unwrap();
+            let message = invalid_message(ownership.source_owner(&file));
+
+            assert!(message.contains("owned by multiple package source roots"));
+            assert!(message.contains("outer"));
+            assert!(message.contains("inner"));
+        }
+
+        #[test]
+        fn rejects_outside_override() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "src/main.anv", "fn main() {}");
+            write(&temp, "outside.anv", "fn main() {}");
+            let package = PackageSource::new(
+                PackageId::new("game"),
+                temp.path().join("src/main.anv"),
+                temp.path().join("src"),
+                HashMap::new(),
+            )
+            .unwrap();
+            let ownership = SourceOwnership::new(&[package]).unwrap();
+            let message =
+                invalid_message(ownership.validate_root_file(&temp.path().join("outside.anv")));
+
+            assert!(message.contains("outside every loaded package source root"));
+        }
     }
 
-    #[test]
-    fn package_source_environment_returns_none_for_missing_module() {
-        let temp = tempfile::tempdir().unwrap();
-        let bundle = SourceBundle::default();
-        let env = package_env(temp.path(), &bundle);
+    mod env {
+        use super::*;
 
-        assert!(env.load_source(&module_id(&["missing"])).unwrap().is_none());
-    }
+        #[test]
+        fn loads_sibling() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "helper.anv", "const VALUE = 1;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(temp.path(), &bundle);
 
-    #[test]
-    fn package_source_environment_does_not_load_std_from_filesystem() {
-        let temp = tempfile::tempdir().unwrap();
-        write(&temp, "std.anv", "const WRONG = 1;");
-        write(&temp, "std/math.anv", "const WRONG = 2;");
-        let bundle = SourceBundle::default();
-        let env = package_env(temp.path(), &bundle);
+            let source = env.load_source(&module_id(&["helper"])).unwrap().unwrap();
+            let file = temp.path().join("helper.anv");
 
-        assert!(env.load_source(&std_module_id(&["std"])).unwrap().is_none());
-        assert!(
-            env.load_source(&std_module_id(&["math"]))
+            assert_eq!(source.module.package(), &package_id());
+            assert_eq!(
+                source.module.source_file().unwrap().path(),
+                fs::canonicalize(&file).unwrap()
+            );
+            assert_eq!(source.source.code, "const VALUE = 1;");
+            assert_eq!(source.source.label, file.display().to_string());
+        }
+
+        #[test]
+        fn loads_nested() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "foo/bar.anv", "const VALUE = 2;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(temp.path(), &bundle);
+
+            let source = env
+                .load_source(&module_id(&["foo", "bar"]))
                 .unwrap()
-                .is_none()
-        );
-    }
+                .unwrap();
 
-    #[test]
-    fn package_source_environment_reports_read_errors() {
-        let temp = tempfile::tempdir().unwrap();
-        mkdir(&temp, "bad.anv");
-        let bundle = SourceBundle::default();
-        let env = package_env(temp.path(), &bundle);
+            let file = temp.path().join("foo/bar.anv");
 
-        let error = env
-            .load_source(&module_id(&["bad"]))
-            .unwrap_err()
-            .to_string();
+            assert_eq!(source.module.package(), &package_id());
+            assert_eq!(
+                source.module.source_file().unwrap().path(),
+                fs::canonicalize(&file).unwrap()
+            );
+            assert_eq!(source.source.code, "const VALUE = 2;");
+            assert_eq!(source.source.label, file.display().to_string());
+        }
 
-        assert!(error.contains("failed to read module source"));
-        assert!(error.contains("bad.anv"));
-    }
+        #[test]
+        fn loads_current_relative() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "src/ui/button.anv", "import helper;");
+            write(&temp, "src/ui/helper.anv", "const VALUE = 1;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(&temp.path().join("src"), &bundle);
+            let importer = canonical_source_file(&temp.path().join("src/ui/button.anv")).unwrap();
 
-    #[test]
-    fn package_source_environment_loads_through_frontend_loader_trait() {
-        let temp = tempfile::tempdir().unwrap();
-        write(&temp, "helper.anv", "const VALUE = 1;");
-        let bundle = SourceBundle::default();
-        let mut env = package_env(temp.path(), &bundle);
+            let source = loaded_source(
+                PackageSourceLoader::load_local_source(
+                    &mut env,
+                    &LocalSourceRequest {
+                        importer,
+                        ascend: 0,
+                        path: module_path(&["helper"]),
+                    },
+                )
+                .unwrap(),
+            );
 
-        let source = PackageSourceLoader::load(&mut env, &module_id(&["helper"]))
-            .unwrap()
-            .unwrap();
+            assert_eq!(source.source.code, "const VALUE = 1;");
+            assert_eq!(
+                source.module.source_file().unwrap().path(),
+                fs::canonicalize(temp.path().join("src/ui/helper.anv")).unwrap()
+            );
+        }
 
-        assert_eq!(source.code, "const VALUE = 1;");
-        assert_eq!(
-            source.label,
-            temp.path().join("helper.anv").display().to_string()
-        );
-    }
+        #[test]
+        fn loads_parent_relative() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "src/ui/button.anv", "import ..common;");
+            write(&temp, "src/common.anv", "const VALUE = 1;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(&temp.path().join("src"), &bundle);
+            let importer = canonical_source_file(&temp.path().join("src/ui/button.anv")).unwrap();
 
-    #[test]
-    fn package_source_environment_loads_known_std_module() {
-        let temp = tempfile::tempdir().unwrap();
-        let bundle = source_bundle(vec![std_source(
-            &["std", "math"],
-            "const PI = 3;",
-            "<std.math>",
-        )]);
-        let env = package_env(temp.path(), &bundle);
+            let source = loaded_source(
+                PackageSourceLoader::load_local_source(
+                    &mut env,
+                    &LocalSourceRequest {
+                        importer,
+                        ascend: 1,
+                        path: module_path(&["common"]),
+                    },
+                )
+                .unwrap(),
+            );
 
-        let source = env.load_source(&std_module_id(&["math"])).unwrap().unwrap();
+            assert_eq!(source.source.code, "const VALUE = 1;");
+            assert_eq!(
+                source.module.source_file().unwrap().path(),
+                fs::canonicalize(temp.path().join("src/common.anv")).unwrap()
+            );
+        }
 
-        assert_eq!(source.code, "const PI = 3;");
-        assert_eq!(source.label, "<std.math>");
-    }
+        #[test]
+        fn caches_equivalent_sources() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "src/ui/button.anv", "import helper; import .helper;");
+            write(&temp, "src/ui/helper.anv", "const VALUE = 1;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(&temp.path().join("src"), &bundle);
+            let importer = canonical_source_file(&temp.path().join("src/ui/button.anv")).unwrap();
+            let request = LocalSourceRequest {
+                importer: importer.clone(),
+                ascend: 0,
+                path: module_path(&["helper"]),
+            };
 
-    #[test]
-    fn package_source_environment_loads_nested_std_module() {
-        let temp = tempfile::tempdir().unwrap();
-        let bundle = source_bundle(vec![std_source(
-            &["std", "collections", "map"],
-            "type Map;",
-            "<std.collections.map>",
-        )]);
-        let env = package_env(temp.path(), &bundle);
+            let first =
+                loaded_source(PackageSourceLoader::load_local_source(&mut env, &request).unwrap());
+            fs::write(temp.path().join("src/ui/helper.anv"), "const VALUE = 2;").unwrap();
+            let second = loaded_source(
+                PackageSourceLoader::load_local_source(
+                    &mut env,
+                    &LocalSourceRequest {
+                        importer,
+                        ascend: 0,
+                        path: module_path(&["helper"]),
+                    },
+                )
+                .unwrap(),
+            );
 
-        let source = env
-            .load_source(&std_module_id(&["collections", "map"]))
-            .unwrap()
-            .unwrap();
+            assert_eq!(first.source.code, "const VALUE = 1;");
+            assert_eq!(second.source.code, "const VALUE = 1;");
+            assert_eq!(first.module, second.module);
+        }
 
-        assert_eq!(source.code, "type Map;");
-        assert_eq!(source.label, "<std.collections.map>");
-    }
+        #[test]
+        fn missing_module_returns_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bundle = SourceBundle::default();
+            let mut env = package_env(temp.path(), &bundle);
 
-    #[test]
-    fn package_source_environment_returns_none_for_unknown_std_module() {
-        let temp = tempfile::tempdir().unwrap();
-        let bundle = source_bundle(vec![std_module("math")]);
-        let env = package_env(temp.path(), &bundle);
+            assert!(env.load_source(&module_id(&["missing"])).unwrap().is_none());
+        }
 
-        assert!(
-            env.load_source(&std_module_id(&["unknown"]))
+        #[test]
+        fn std_does_not_use_filesystem() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "std.anv", "const WRONG = 1;");
+            write(&temp, "std/math.anv", "const WRONG = 2;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(temp.path(), &bundle);
+
+            assert!(env.load_source(&std_module_id(&["std"])).unwrap().is_none());
+            assert!(
+                env.load_source(&std_module_id(&["math"]))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn reports_read_errors() {
+            let temp = tempfile::tempdir().unwrap();
+            mkdir(&temp, "bad.anv");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(temp.path(), &bundle);
+
+            let error = env
+                .load_source(&module_id(&["bad"]))
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("failed to read module source"));
+            assert!(error.contains("bad.anv"));
+        }
+
+        #[test]
+        fn loads_through_trait() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "helper.anv", "const VALUE = 1;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(temp.path(), &bundle);
+
+            let source = PackageSourceLoader::load(&mut env, &module_id(&["helper"]))
                 .unwrap()
-                .is_none()
-        );
-    }
+                .unwrap();
 
-    #[test]
-    fn package_source_environment_returns_none_for_std_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let bundle = source_bundle(vec![std_module("math")]);
-        let env = package_env(temp.path(), &bundle);
+            assert_eq!(source.source.code, "const VALUE = 1;");
+            assert_eq!(
+                source.source.label,
+                temp.path().join("helper.anv").display().to_string()
+            );
+        }
 
-        assert!(env.load_source(&std_module_id(&["std"])).unwrap().is_none());
-    }
+        #[test]
+        fn loads_known_std_module() {
+            let temp = tempfile::tempdir().unwrap();
+            let bundle = source_bundle(vec![std_source(
+                &["std", "math"],
+                "const PI = 3;",
+                "<std.math>",
+            )]);
+            let mut env = package_env(temp.path(), &bundle);
 
-    #[test]
-    fn package_source_environment_does_not_read_local_std_file_for_known_std_module() {
-        let temp = tempfile::tempdir().unwrap();
-        write(&temp, "std/math.anv", "const WRONG = 1;");
-        let bundle = source_bundle(vec![std_source(
-            &["std", "math"],
-            "const RIGHT = 1;",
-            "<std.math>",
-        )]);
-        let env = package_env(temp.path(), &bundle);
+            let source = env.load_source(&std_module_id(&["math"])).unwrap().unwrap();
 
-        let source = env.load_source(&std_module_id(&["math"])).unwrap().unwrap();
+            assert_eq!(source.source.code, "const PI = 3;");
+            assert_eq!(source.source.label, "<std.math>");
+        }
 
-        assert_eq!(source.code, "const RIGHT = 1;");
-        assert_eq!(source.label, "<std.math>");
-    }
+        #[test]
+        fn loads_nested_std_module() {
+            let temp = tempfile::tempdir().unwrap();
+            let bundle = source_bundle(vec![std_source(
+                &["std", "collections", "map"],
+                "type Map;",
+                "<std.collections.map>",
+            )]);
+            let mut env = package_env(temp.path(), &bundle);
 
-    #[test]
-    fn package_source_environment_does_not_read_local_std_file_for_unknown_std_module() {
-        let temp = tempfile::tempdir().unwrap();
-        write(&temp, "std/missing.anv", "const WRONG = 1;");
-        let bundle = SourceBundle::default();
-        let env = package_env(temp.path(), &bundle);
-
-        assert!(
-            env.load_source(&std_module_id(&["missing"]))
+            let source = env
+                .load_source(&std_module_id(&["collections", "map"]))
                 .unwrap()
-                .is_none()
-        );
-    }
+                .unwrap();
 
-    #[test]
-    fn package_source_environment_loads_std_through_frontend_loader_trait() {
-        let temp = tempfile::tempdir().unwrap();
-        let bundle = source_bundle(vec![std_source(
-            &["std", "math"],
-            "const PI = 3;",
-            "<std.math>",
-        )]);
-        let mut env = package_env(temp.path(), &bundle);
+            assert_eq!(source.source.code, "type Map;");
+            assert_eq!(source.source.label, "<std.collections.map>");
+        }
 
-        let source = PackageSourceLoader::load(&mut env, &std_module_id(&["math"]))
-            .unwrap()
-            .unwrap();
+        #[test]
+        fn unknown_std_returns_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bundle = source_bundle(vec![std_module("math")]);
+            let mut env = package_env(temp.path(), &bundle);
 
-        assert_eq!(source.code, "const PI = 3;");
-        assert_eq!(source.label, "<std.math>");
+            assert!(
+                env.load_source(&std_module_id(&["unknown"]))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn std_root_returns_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bundle = source_bundle(vec![std_module("math")]);
+            let mut env = package_env(temp.path(), &bundle);
+
+            assert!(env.load_source(&std_module_id(&["std"])).unwrap().is_none());
+        }
+
+        #[test]
+        fn known_std_ignores_local_file() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "std/math.anv", "const WRONG = 1;");
+            let bundle = source_bundle(vec![std_source(
+                &["std", "math"],
+                "const RIGHT = 1;",
+                "<std.math>",
+            )]);
+            let mut env = package_env(temp.path(), &bundle);
+
+            let source = env.load_source(&std_module_id(&["math"])).unwrap().unwrap();
+
+            assert_eq!(source.source.code, "const RIGHT = 1;");
+            assert_eq!(source.source.label, "<std.math>");
+        }
+
+        #[test]
+        fn unknown_std_ignores_local_file() {
+            let temp = tempfile::tempdir().unwrap();
+            write(&temp, "std/missing.anv", "const WRONG = 1;");
+            let bundle = SourceBundle::default();
+            let mut env = package_env(temp.path(), &bundle);
+
+            assert!(
+                env.load_source(&std_module_id(&["missing"]))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn loads_std_through_trait() {
+            let temp = tempfile::tempdir().unwrap();
+            let bundle = source_bundle(vec![std_source(
+                &["std", "math"],
+                "const PI = 3;",
+                "<std.math>",
+            )]);
+            let mut env = package_env(temp.path(), &bundle);
+
+            let source = PackageSourceLoader::load(&mut env, &std_module_id(&["math"]))
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(source.source.code, "const PI = 3;");
+            assert_eq!(source.source.label, "<std.math>");
+        }
     }
 
     #[test]

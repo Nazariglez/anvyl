@@ -234,9 +234,6 @@ fn dependency_package_id(
 fn validate_dependency_alias(alias: &str, package: &PackageId) -> Result<(), String> {
     match anvyx_lang2::validate_dependency_alias(alias) {
         Ok(()) => Ok(()),
-        Err(anvyx_lang2::DependencyAliasError::ReservedStd) => Err(format!(
-            "package {package} uses reserved dependency alias `std`"
-        )),
         Err(anvyx_lang2::DependencyAliasError::Invalid) => Err(format!(
             "package {package} uses invalid dependency alias `{alias}`"
         )),
@@ -245,6 +242,12 @@ fn validate_dependency_alias(alias: &str, package: &PackageId) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fmt::Write as _,
+        fs,
+        path::{Path, PathBuf},
+    };
+
     use super::*;
 
     fn parse(toml: &str) -> Result<Manifest, String> {
@@ -410,13 +413,13 @@ mod tests {
         fn write_named_package(&self, package: &str, name: Option<&str>, deps: &[(&str, &str)]) {
             let mut manifest = "[project]\n".to_string();
             if let Some(name) = name {
-                manifest.push_str(&format!("name = \"{name}\"\n"));
+                writeln!(manifest, "name = \"{name}\"").unwrap();
             }
             manifest.push_str("entry = \"src/lib.anv\"\n");
             if !deps.is_empty() {
                 manifest.push_str("\n[dependencies]\n");
                 for (alias, path) in deps {
-                    manifest.push_str(&format!("{alias} = {{ path = \"{path}\" }}\n"));
+                    writeln!(manifest, "{alias} = {{ path = \"{path}\" }}").unwrap();
                 }
             }
             self.write_raw_manifest(package, &manifest);
@@ -424,20 +427,20 @@ mod tests {
 
         fn write_raw_manifest(&self, package: &str, contents: &str) {
             let dir = self.root.path().join(package);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("anvyx.toml"), contents).unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("anvyx.toml"), contents).unwrap();
         }
 
-        fn manifest(&self, package: &str) -> std::path::PathBuf {
+        fn manifest(&self, package: &str) -> PathBuf {
             self.root.path().join(package).join("anvyx.toml")
         }
     }
 
-    fn validate_ok(path: impl AsRef<std::path::Path>) {
+    fn validate_ok(path: impl AsRef<Path>) {
         load_package_graph(path.as_ref()).unwrap();
     }
 
-    fn validate_err(path: impl AsRef<std::path::Path>, contains: &str) {
+    fn validate_err(path: impl AsRef<Path>, contains: &str) {
         let error = load_package_graph(path.as_ref()).expect_err("package graph should fail");
         assert!(
             error.contains(contains),
@@ -567,12 +570,12 @@ mod tests {
     }
 
     #[test]
-    fn std_dependency_alias_is_reserved() {
+    fn std_dependency_alias_is_allowed() {
         let fixture = PackageFixture::default();
         fixture.write_package("game", &[("std", "../fake_std")]);
         fixture.write_package("fake_std", &[]);
 
-        validate_err(fixture.manifest("game"), "std");
+        validate_ok(fixture.manifest("game"));
     }
 
     #[test]

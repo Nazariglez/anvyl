@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+import std { local };
+import std.foo { nested };
+import std:mem;
+
+fn main() {
+    let x: int = local() + nested();
+}
