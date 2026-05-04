@@ -588,7 +588,6 @@ mod any {
             extern fn get() -> any;
             fn main() {
                 let tuple = (get(), get());
-                let named = (left: get(), right: get());
             }
             ",
         ));

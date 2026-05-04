@@ -416,13 +416,8 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         } => {
             format!("tuple pattern arity mismatch: expected {expected}, found {found}")
         }
-        TypeError::NamedPatternOnPositional { .. } => {
-            "named tuple pattern cannot match positional tuple".to_string()
-        }
-        TypeError::TuplePatternLabelMismatch {
-            expected, found, ..
-        } => {
-            format!("tuple pattern label mismatch: expected '{expected}', found '{found}'")
+        TypeError::TuplePatternOnNonTuple { ty, .. } => {
+            format!("cannot destructure non-tuple type '{ty}'")
         }
         TypeError::OrPatternUnsupported { .. } => "or-patterns are not supported".to_string(),
         TypeError::EmptyMatch { .. } => "match expression must have at least one arm".to_string(),
@@ -435,6 +430,12 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         } => {
             let kind = render_member_access_kind(*kind);
             format!("Unknown {kind} '{member}' for type '{ty}'")
+        }
+        TypeError::TupleIndexOnNonTuple { ty, index, .. } => {
+            format!("cannot index non-tuple type with .{index}: found '{ty}'")
+        }
+        TypeError::TupleIndexOutOfBounds { index, len, .. } => {
+            format!("tuple index {index} is out of bounds for tuple of length {len}")
         }
         TypeError::UndefinedModuleMember { module, name, .. } => {
             format!(
@@ -513,14 +514,6 @@ fn render_detailed_type(ty: &Type) -> String {
     match ty {
         Type::Func { params, ret } => render_detailed_func(params, ret),
         Type::Tuple(elems) => render_wrapped_types("(", ")", elems),
-        Type::NamedTuple(fields) => {
-            let fields = fields
-                .iter()
-                .map(|(name, ty)| format!("{name}: {}", render_detailed_type(ty)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{{{fields}}}")
-        }
         Type::Nominal(nominal) => {
             let mut rendered = nominal.origin.as_ref().map_or_else(
                 || nominal.name.to_string(),

@@ -134,14 +134,6 @@ impl Printer<'_> {
                 self.format_comma_list("(", ")", exprs, |p, e| p.format_expr(&e.node));
             }
 
-            ast::ExprKind::NamedTuple(fields) => {
-                self.format_comma_list("(", ")", fields, |p, (name, e)| {
-                    p.write_fmt(name);
-                    p.write(": ");
-                    p.format_expr(&e.node);
-                });
-            }
-
             ast::ExprKind::StructLiteral(node) => self.format_struct_literal_expr(&node.node),
 
             ast::ExprKind::ArrayLiteral(node) => {

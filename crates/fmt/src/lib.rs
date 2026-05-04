@@ -681,13 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn let_named_tuple_pattern() {
-        let source = "fn f() { let (x: a, y: b) = get(); }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("let (x: a, y: b) ="));
-    }
-
-    #[test]
     fn let_wildcard() {
         let source = "fn f() { let _ = 5; }";
         let formatted = format_source(source).expect("format failed");

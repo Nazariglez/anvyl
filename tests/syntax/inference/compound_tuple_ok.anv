@@ -13,14 +13,6 @@ fn both<T, U>(pair: (T, U)) -> T {
     pair.0
 }
 
-fn get_val<T>(t: (val: T, extra: int)) -> T {
-    t.val
-}
-
-fn get_both<T, U>(t: (first: T, second: U)) -> U {
-    t.second
-}
-
 fn main() {
     let a = fst(("hello", 42));
     let _: string = a;
@@ -30,13 +22,4 @@ fn main() {
 
     let c = both(("hi", 99));
     let _: string = c;
-
-    let d = get_val((val: "hello", extra: 10));
-    let _: string = d;
-
-    let e = get_val((val: true, extra: 0));
-    let _: bool = e;
-
-    let f = get_both((first: 42, second: "world"));
-    let _: string = f;
 }

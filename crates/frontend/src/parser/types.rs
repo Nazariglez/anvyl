@@ -205,7 +205,19 @@ fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
 
 enum TupleTypeElem {
     Pos(Type),
-    Labeled(ast::Ident, Type),
+    Labelled(Type),
+}
+
+impl TupleTypeElem {
+    fn is_labelled(&self) -> bool {
+        matches!(self, Self::Labelled(_))
+    }
+
+    fn into_type(self) -> Type {
+        match self {
+            Self::Pos(ty) | Self::Labelled(ty) => ty,
+        }
+    }
 }
 
 fn paren_or_tuple_type<'src>(type_parser: impl AnvParser<'src, Type>) -> BoxedParser<'src, Type> {
@@ -214,13 +226,13 @@ fn paren_or_tuple_type<'src>(type_parser: impl AnvParser<'src, Type>) -> BoxedPa
     let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
     let colon = select! { (Token::Colon, _) => () };
 
-    let labeled_elem = identifier()
+    let labelled_elem = identifier()
         .then_ignore(colon)
-        .then(type_parser.clone())
-        .map(|(name, ty)| TupleTypeElem::Labeled(name, ty));
+        .ignore_then(type_parser.clone())
+        .map(TupleTypeElem::Labelled);
 
     let pos_elem = type_parser.map(TupleTypeElem::Pos);
-    let elem = choice((labeled_elem, pos_elem));
+    let elem = choice((labelled_elem, pos_elem));
 
     let first_elem = elem.clone();
     let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
@@ -232,54 +244,31 @@ fn paren_or_tuple_type<'src>(type_parser: impl AnvParser<'src, Type>) -> BoxedPa
         .then_ignore(close_paren)
         .validate(|((first, rest), trailing_comma), e, emitter| {
             let s = e.span();
+            let has_label = first.as_ref().is_some_and(TupleTypeElem::is_labelled)
+                || rest.iter().any(TupleTypeElem::is_labelled);
+
+            if has_label {
+                emitter.emit(Rich::custom(
+                    s,
+                    "labels are not allowed in tuple types; use a struct for field names",
+                ));
+                return Type::Void;
+            }
+
+            let first = first.map(TupleTypeElem::into_type);
+            let rest = rest.into_iter().map(TupleTypeElem::into_type).collect();
 
             match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
                 TupleShapeResult::Empty => {
                     emitter.emit(Rich::custom(s, "empty tuples are not supported"));
                     Type::Void
                 }
-                TupleShapeResult::OneTupleError(elem) => {
+                TupleShapeResult::OneTupleError(ty) => {
                     emitter.emit(Rich::custom(s, "1-tuples are not supported"));
-                    match elem {
-                        TupleTypeElem::Pos(ty) | TupleTypeElem::Labeled(_, ty) => ty,
-                    }
+                    ty
                 }
-                TupleShapeResult::Grouped(elem) => match elem {
-                    TupleTypeElem::Pos(ty) | TupleTypeElem::Labeled(_, ty) => ty,
-                },
-                TupleShapeResult::Tuple(elems) => {
-                    let all_pos = elems.iter().all(|e| matches!(e, TupleTypeElem::Pos(_)));
-                    let all_labeled = elems
-                        .iter()
-                        .all(|e| matches!(e, TupleTypeElem::Labeled(_, _)));
-
-                    if all_pos {
-                        let types: Vec<Type> = elems
-                            .into_iter()
-                            .map(|e| match e {
-                                TupleTypeElem::Pos(ty) | TupleTypeElem::Labeled(_, ty) => ty,
-                            })
-                            .collect();
-                        return Type::Tuple(types);
-                    }
-
-                    if all_labeled {
-                        let fields: Vec<(ast::Ident, Type)> = elems
-                            .into_iter()
-                            .map(|e| match e {
-                                TupleTypeElem::Labeled(name, ty) => (name, ty),
-                                TupleTypeElem::Pos(_) => unreachable!(),
-                            })
-                            .collect();
-                        return Type::NamedTuple(fields);
-                    }
-
-                    emitter.emit(Rich::custom(
-                        s,
-                        "cannot mix labeled and unlabeled elements in tuple type",
-                    ));
-                    Type::Void
-                }
+                TupleShapeResult::Grouped(ty) => ty,
+                TupleShapeResult::Tuple(types) => Type::Tuple(types),
                 TupleShapeResult::UnexpectedComma => {
                     emitter.emit(Rich::custom(s, "unexpected comma"));
                     Type::Void

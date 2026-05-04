@@ -1,3 +1,4 @@
+// @frontend: default
 // @mode: run
 // @expect: success
 // @match-begin

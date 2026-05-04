@@ -775,3 +775,13 @@ fn intrinsic_unknown() {
     let args = expect_intrinsic_call(&expr, "unknown");
     assert_eq!(args.len(), 1);
 }
+
+#[test]
+fn rejects_labelled_tuple_literal() {
+    parse_expr_err("(a: 1, b: 2)");
+}
+
+#[test]
+fn rejects_single_labelled_tuple_literal() {
+    parse_expr_err("(a: 1)");
+}

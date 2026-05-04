@@ -105,7 +105,6 @@ enum Ty {
         generic_args: Vec<TyGenericArg>,
     },
     Tuple(Vec<Ty>),
-    NamedTuple(Vec<(Ident, Ty)>),
     Nominal(TyNominal),
     List {
         elem: Box<Ty>,
@@ -238,12 +237,6 @@ impl Ty {
                     .collect(),
             },
             Type::Tuple(elems) => Self::Tuple(elems.iter().map(Self::from_recovery_type).collect()),
-            Type::NamedTuple(fields) => Self::NamedTuple(
-                fields
-                    .iter()
-                    .map(|(name, ty)| (*name, Self::from_recovery_type(ty)))
-                    .collect(),
-            ),
             Type::Nominal(nominal) => {
                 if nominal.kind == NominalKind::Extern {
                     debug_assert!(nominal.type_args.is_empty());
@@ -309,12 +302,6 @@ impl Ty {
                 elems
                     .iter()
                     .map(Ty::try_to_type_no_infer)
-                    .collect::<Option<Vec<_>>>()?,
-            )),
-            Self::NamedTuple(fields) => Some(Type::NamedTuple(
-                fields
-                    .iter()
-                    .map(|(name, ty)| Some((*name, ty.try_to_type_no_infer()?)))
                     .collect::<Option<Vec<_>>>()?,
             )),
             Self::Nominal(nominal) => Self::try_nominal_to_no_infer(nominal),
@@ -519,14 +506,6 @@ impl SolveError {
             span,
         )
     }
-
-    fn named_tuple_label_mismatch(expected: (Ident, Ty), found: (Ident, Ty), span: Span) -> Self {
-        Self::type_mismatch(
-            Ty::NamedTuple(vec![expected]),
-            Ty::NamedTuple(vec![found]),
-            span,
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -698,14 +677,6 @@ impl Solver {
         self.temp_handle(Ty::Tuple(elems))
     }
 
-    pub(super) fn named_tuple_handle(&mut self, fields: Vec<(Ident, TypeHandle)>) -> TypeHandle {
-        let fields = fields
-            .into_iter()
-            .map(|(name, handle)| (name, self.resolve_ref(&handle.0)))
-            .collect();
-        self.temp_handle(Ty::NamedTuple(fields))
-    }
-
     pub(super) fn nil_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
         let ty = self.fresh_nil_type(span);
         self.set_expr_handle(id, span, ty)
@@ -860,12 +831,6 @@ impl Solver {
                 elems
                     .iter()
                     .map(|ty| self.instantiate_type_template(ty, vars))
-                    .collect(),
-            ),
-            Type::NamedTuple(fields) => Ty::NamedTuple(
-                fields
-                    .iter()
-                    .map(|(name, ty)| (*name, self.instantiate_type_template(ty, vars)))
                     .collect(),
             ),
             Type::Nominal(nominal) => {
@@ -1131,30 +1096,6 @@ impl Solver {
             .collect()
     }
 
-    fn relate_named_tuple_fields(
-        &mut self,
-        span: Span,
-        expected: Vec<(Ident, Ty)>,
-        found: Vec<(Ident, Ty)>,
-        relation: TyRelation,
-    ) -> Result<Vec<(Ident, Ty)>, SolveError> {
-        expected
-            .into_iter()
-            .zip(found)
-            .map(|((expected_name, expected_ty), (found_name, found_ty))| {
-                if expected_name != found_name {
-                    let expected = (expected_name, expected_ty);
-                    let found = (found_name, found_ty);
-                    return Err(SolveError::named_tuple_label_mismatch(
-                        expected, found, span,
-                    ));
-                }
-                let ty = self.relate_tys(span, expected_ty, found_ty, relation)?;
-                Ok((expected_name, ty))
-            })
-            .collect()
-    }
-
     fn unify_func_invariant(
         &mut self,
         span: Span,
@@ -1268,15 +1209,6 @@ impl Solver {
                     TyRelation::Equal,
                 )?))
             }
-            (Ty::NamedTuple(fields), Ty::NamedTuple(found_fields)) => {
-                self.ensure_arity(fields.len(), found_fields.len(), expected, found, span)?;
-                Ok(Ty::NamedTuple(self.relate_named_tuple_fields(
-                    span,
-                    fields,
-                    found_fields,
-                    TyRelation::Equal,
-                )?))
-            }
             (Ty::List { elem }, Ty::List { elem: found_elem }) => Ok(Ty::List {
                 elem: self.relate_boxed(span, *elem, *found_elem, TyRelation::Equal)?,
             }),
@@ -1361,15 +1293,6 @@ impl Solver {
                     span,
                     to_elems,
                     elems,
-                    TyRelation::Assignable,
-                )?))
-            }
-            (Ty::NamedTuple(fields), Ty::NamedTuple(to_fields)) => {
-                self.ensure_arity(to_fields.len(), fields.len(), expected, found, span)?;
-                Ok(Ty::NamedTuple(self.relate_named_tuple_fields(
-                    span,
-                    to_fields,
-                    fields,
                     TyRelation::Assignable,
                 )?))
             }
@@ -1710,12 +1633,6 @@ impl Solver {
                     .collect(),
             },
             Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|ty| self.resolve_ty(ty)).collect()),
-            Ty::NamedTuple(fields) => Ty::NamedTuple(
-                fields
-                    .iter()
-                    .map(|(name, ty)| (*name, self.resolve_ty(ty)))
-                    .collect(),
-            ),
             Ty::Nominal(nominal) => self.resolve_nominal(nominal),
             Ty::List { elem } => Ty::List {
                 elem: Box::new(self.resolve_ty(elem)),
@@ -1772,7 +1689,6 @@ impl Solver {
                 })
             }
             Ty::Tuple(elems) => elems.iter().any(|ty| self.type_occurs_in_ty(var, ty)),
-            Ty::NamedTuple(fields) => fields.iter().any(|(_, ty)| self.type_occurs_in_ty(var, ty)),
             Ty::Nominal(nominal) => nominal
                 .type_args
                 .iter()
@@ -1860,12 +1776,6 @@ impl Solver {
                 elems
                     .into_iter()
                     .map(|ty| self.finalize_ty_inner(&ty, cx))
-                    .collect(),
-            ),
-            Ty::NamedTuple(fields) => Type::NamedTuple(
-                fields
-                    .into_iter()
-                    .map(|(name, ty)| (name, self.finalize_ty_inner(&ty, cx)))
                     .collect(),
             ),
             Ty::Nominal(nominal) => self.finalize_nominal(nominal, cx),
@@ -2299,10 +2209,6 @@ mod tests {
     #[test]
     fn roundtrip_tuples() {
         assert_roundtrip(Type::Tuple(vec![Type::Int, option(Type::String)]));
-        assert_roundtrip(Type::NamedTuple(vec![
-            (ident("x"), Type::Int),
-            (ident("y"), option(Type::Bool)),
-        ]));
     }
 
     #[test]
@@ -2746,19 +2652,6 @@ mod tests {
             .expect("tuple should unify");
         assert_eq!(solver.resolve_ty(&Ty::Infer(a)), Ty::Int);
         assert_eq!(solver.resolve_ty(&Ty::Infer(b)), Ty::String);
-    }
-
-    #[test]
-    fn equal_named_tuple_label_mismatch() {
-        let mut solver = Solver::default();
-        assert!(matches!(
-            solver.unify_equal(
-                span(1, 2),
-                ty_ref(Ty::NamedTuple(vec![(ident("x"), Ty::Int)])),
-                ty_ref(Ty::NamedTuple(vec![(ident("y"), Ty::Int)])),
-            ),
-            Err(SolveError::TypeMismatch { .. })
-        ));
     }
 
     #[test]

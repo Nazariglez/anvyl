@@ -1599,8 +1599,7 @@ fn resolve_type_params_with_self(
     self_type: Option<&ast::Type>,
 ) -> ast::Type {
     use ast::Type::{
-        Array, Func, List, Map, NamedTuple, Nominal, Slice, Tuple, UnresolvedName,
-        UnresolvedNominal, Var,
+        Array, Func, List, Map, Nominal, Slice, Tuple, UnresolvedName, UnresolvedNominal, Var,
     };
     match ty {
         UnresolvedName(ident) => {
@@ -1693,24 +1692,6 @@ fn resolve_type_params_with_self(
                 })
                 .collect::<Vec<_>>();
             Tuple(resolved_elements)
-        }
-
-        NamedTuple(fields) => {
-            let resolved_fields: Vec<_> = fields
-                .iter()
-                .map(|(name, ty)| {
-                    (
-                        *name,
-                        resolve_type_params_with_self(
-                            ty,
-                            type_param_map,
-                            const_param_map,
-                            self_type,
-                        ),
-                    )
-                })
-                .collect();
-            NamedTuple(resolved_fields)
         }
         Array { elem, len } => {
             let resolved_len = match len {

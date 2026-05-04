@@ -1068,28 +1068,6 @@ mod tuples {
     }
 
     #[test]
-    fn named_context() {
-        assert_ty(
-            "fn main() { let x: (a: int, b: int?) = (a: 1, b: nil); x; }",
-            Type::NamedTuple(vec![
-                (Ident::new("a"), Type::Int),
-                (Ident::new("b"), Type::option_of(Type::Int)),
-            ]),
-        );
-    }
-
-    #[test]
-    fn named_branch_context() {
-        assert_ty(
-            "fn main(cond: bool) { let x: (a: int, b: int?) = if cond { (a: 1, b: nil) } else { (a: 2, b: 3) }; x; }",
-            Type::NamedTuple(vec![
-                (Ident::new("a"), Type::Int),
-                (Ident::new("b"), Type::option_of(Type::Int)),
-            ]),
-        );
-    }
-
-    #[test]
     fn tuple_mismatch_err() {
         assert_err_count("fn main() { let x: (int, string) = (1, 2); }", 1);
     }
@@ -1097,11 +1075,6 @@ mod tuples {
     #[test]
     fn tuple_arity_err() {
         assert_err_count("fn main() { let x: (int, int?) = (1, 2, 3); }", 1);
-    }
-
-    #[test]
-    fn named_tuple_label_err() {
-        assert_err_count("fn main() { let x: (a: int, b: int) = (a: 1, c: 2); }", 1);
     }
 
     #[test]

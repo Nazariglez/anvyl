@@ -794,7 +794,19 @@ fn cond_atom_expr<'src>(
 
 enum TupleExprElem {
     Pos(ast::ExprNode),
-    Labeled(ast::Ident, ast::ExprNode),
+    Labelled(ast::ExprNode),
+}
+
+impl TupleExprElem {
+    fn is_labelled(&self) -> bool {
+        matches!(self, Self::Labelled(_))
+    }
+
+    fn into_expr(self) -> ast::ExprNode {
+        match self {
+            Self::Pos(expr) | Self::Labelled(expr) => expr,
+        }
+    }
 }
 
 fn grouped_or_tuple_expr<'src>(
@@ -805,13 +817,13 @@ fn grouped_or_tuple_expr<'src>(
     let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
     let colon = select! { (Token::Colon, _) => () };
 
-    let labeled_elem = identifier()
+    let labelled_elem = identifier()
         .then_ignore(colon)
-        .then(expr.clone())
-        .map(|(name, e)| TupleExprElem::Labeled(name, e));
+        .ignore_then(expr.clone())
+        .map(TupleExprElem::Labelled);
 
     let pos_elem = expr.map(TupleExprElem::Pos);
-    let elem = choice((labeled_elem, pos_elem));
+    let elem = choice((labelled_elem, pos_elem));
 
     let first_elem = elem.clone();
     let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
@@ -825,63 +837,39 @@ fn grouped_or_tuple_expr<'src>(
             let s = e.span();
             let span = Span::new(s.start, s.end);
             let expr_id = new_expr_id();
+            let dummy_expr = || ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
+
+            let has_label = first.as_ref().is_some_and(TupleExprElem::is_labelled)
+                || rest.iter().any(TupleExprElem::is_labelled);
+
+            if has_label {
+                emitter.emit(Rich::custom(
+                    s,
+                    "labels are not allowed in tuple literals; use a struct literal or positional tuple",
+                ));
+                return Spanned::new(dummy_expr(), span);
+            }
+
+            let first = first.map(TupleExprElem::into_expr);
+            let rest = rest.into_iter().map(TupleExprElem::into_expr).collect();
 
             match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
                 TupleShapeResult::Empty => {
                     emitter.emit(Rich::custom(s, "empty tuples are not supported"));
-                    let dummy = ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
-                    Spanned::new(dummy, span)
+                    Spanned::new(dummy_expr(), span)
                 }
-                TupleShapeResult::OneTupleError(elem) => {
+                TupleShapeResult::OneTupleError(expr) => {
                     emitter.emit(Rich::custom(s, "1-tuples are not supported"));
-                    match elem {
-                        TupleExprElem::Pos(e) | TupleExprElem::Labeled(_, e) => e,
-                    }
+                    expr
                 }
-                TupleShapeResult::Grouped(elem) => match elem {
-                    TupleExprElem::Pos(e) | TupleExprElem::Labeled(_, e) => e,
-                },
-                TupleShapeResult::Tuple(elems) => {
-                    let all_pos = elems.iter().all(|e| matches!(e, TupleExprElem::Pos(_)));
-                    let all_labeled = elems
-                        .iter()
-                        .all(|e| matches!(e, TupleExprElem::Labeled(_, _)));
-
-                    if all_pos {
-                        let exprs: Vec<ast::ExprNode> = elems
-                            .into_iter()
-                            .map(|e| match e {
-                                TupleExprElem::Pos(expr) | TupleExprElem::Labeled(_, expr) => expr,
-                            })
-                            .collect();
-                        let tuple_expr = ast::Expr::new(ast::ExprKind::Tuple(exprs), expr_id);
-                        return Spanned::new(tuple_expr, span);
-                    }
-
-                    if all_labeled {
-                        let fields: Vec<(ast::Ident, ast::ExprNode)> = elems
-                            .into_iter()
-                            .map(|e| match e {
-                                TupleExprElem::Labeled(name, expr) => (name, expr),
-                                TupleExprElem::Pos(_) => unreachable!(),
-                            })
-                            .collect();
-                        let named_tuple_expr =
-                            ast::Expr::new(ast::ExprKind::NamedTuple(fields), expr_id);
-                        return Spanned::new(named_tuple_expr, span);
-                    }
-
-                    emitter.emit(Rich::custom(
-                        s,
-                        "cannot mix labeled and unlabeled elements in tuple literal",
-                    ));
-                    let dummy = ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
-                    Spanned::new(dummy, span)
+                TupleShapeResult::Grouped(expr) => expr,
+                TupleShapeResult::Tuple(exprs) => {
+                    let tuple_expr = ast::Expr::new(ast::ExprKind::Tuple(exprs), expr_id);
+                    Spanned::new(tuple_expr, span)
                 }
                 TupleShapeResult::UnexpectedComma => {
                     emitter.emit(Rich::custom(s, "unexpected comma"));
-                    let dummy = ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
-                    Spanned::new(dummy, span)
+                    Spanned::new(dummy_expr(), span)
                 }
             }
         })

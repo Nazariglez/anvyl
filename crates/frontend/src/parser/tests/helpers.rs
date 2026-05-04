@@ -84,6 +84,21 @@ pub(super) fn parse_program_err(src: &str) {
     );
 }
 
+pub(super) fn parse_type_err(src: &str) {
+    let Ok(tokens) = lexer::tokenize(src) else {
+        return;
+    };
+    let mut state = SimpleState(ParserState::default());
+    let result = type_ident()
+        .then_ignore(end())
+        .parse_with_state(&tokens, &mut state)
+        .into_result();
+    assert!(
+        result.is_err(),
+        "expected parse error for '{src}' but it succeeded"
+    );
+}
+
 pub(super) fn parse_type(src: &str) -> ast::Type {
     let tokens = lexer::tokenize(src)
         .unwrap_or_else(|errs| panic!("failed to tokenize type '{src}': {errs:?}"));

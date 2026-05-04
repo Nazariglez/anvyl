@@ -27,18 +27,6 @@ impl Printer<'_> {
                 }
             }
             ast::Pattern::Tuple(pats) => self.format_tuple_pattern_args(pats),
-            ast::Pattern::NamedTuple(fields) => {
-                self.write("(");
-                for (i, (name, p)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.write_fmt(name);
-                    self.write(": ");
-                    self.format_pattern(&p.node);
-                }
-                self.write(")");
-            }
             ast::Pattern::Struct { name, fields } => {
                 self.write_fmt(name);
                 self.format_struct_pattern_args(fields, false);

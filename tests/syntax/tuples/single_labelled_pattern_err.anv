@@ -1,0 +1,9 @@
+// @frontend: new
+// @mode: check
+// @expect: error
+// @contains: labels are not allowed in tuple patterns
+
+fn main() {
+    let p = 1;
+    let (x: a) = p;
+}

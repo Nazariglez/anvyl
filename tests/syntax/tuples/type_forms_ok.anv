@@ -7,7 +7,4 @@ fn main() {
     let nested: ((int, int), string) = ((1, 2), "ok");
     let maybe_pair: (int, int)? = (10, 20);
     let maybe_par_2: (int, string)? = nil;
-
-    let point: (x: int, y: int) = (x: 10, y: 20);
-    let rect: (w: int, h: int) = (w: 100, h: 200);
 }

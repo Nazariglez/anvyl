@@ -1,9 +1,0 @@
-// @mode: check
-// @expect: error
-// @contains: has no named fields
-
-fn main() {
-    let t = (10, 20);
-    let x = t.x;
-}
-

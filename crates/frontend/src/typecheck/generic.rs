@@ -124,12 +124,6 @@ fn covers_type<'a>(general: &Type, specific: &'a Type, cover: &mut Cover<'a>) ->
                 && covers_type(ret, specific_ret, cover)
         }
         (Type::Tuple(a), Type::Tuple(b)) => covers_types(a, b, cover),
-        (Type::NamedTuple(a), Type::NamedTuple(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b)
-                    .all(|((an, at), (bn, bt))| an == bn && covers_type(at, bt, cover))
-        }
         (Type::Nominal(a), Type::Nominal(b)) => {
             a.kind == b.kind
                 && a.name == b.name

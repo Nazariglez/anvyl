@@ -1,0 +1,8 @@
+// @frontend: new
+// @mode: check
+// @expect: error
+// @contains: labels are not allowed in tuple types
+
+fn main() {
+    let p: (x: int) = 1;
+}

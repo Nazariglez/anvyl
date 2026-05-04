@@ -935,3 +935,13 @@ fn tuple_idx_compound() {
     let target = expect_tuple_index(&assign_node.node.target, 1);
     expect_ident(target, "pair");
 }
+
+#[test]
+fn rejects_labelled_tuple_pattern() {
+    parse_program_err("fn f(p: (int, int)) { let (a: x, b: y) = p; }");
+}
+
+#[test]
+fn rejects_single_labelled_tuple_pattern() {
+    parse_program_err("fn f(p: int) { let (a: x) = p; }");
+}

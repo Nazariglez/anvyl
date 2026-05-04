@@ -2052,11 +2052,6 @@ impl DeclarationIndex {
                 .map(|ty| self.finalize_type_ref(module, generics, ty))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Type::Tuple),
-            Type::NamedTuple(fields) => fields
-                .iter()
-                .map(|(name, ty)| Ok((*name, self.finalize_type_ref(module, generics, ty)?)))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Type::NamedTuple),
             Type::Nominal(nominal) => Ok(Type::nominal_with_origin(
                 nominal.kind,
                 nominal.name,
@@ -2360,11 +2355,6 @@ fn collect_implicit_extend_generics(
         }
         Type::Tuple(elems) => {
             for ty in elems {
-                collect_implicit_extend_generics(ty, generics, false);
-            }
-        }
-        Type::NamedTuple(fields) => {
-            for (_, ty) in fields {
                 collect_implicit_extend_generics(ty, generics, false);
             }
         }

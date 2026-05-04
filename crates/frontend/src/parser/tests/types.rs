@@ -1,4 +1,4 @@
-use super::helpers::{expect_nominal, parse_param_type, parse_program, parse_type};
+use super::helpers::{expect_nominal, parse_param_type, parse_program, parse_type, parse_type_err};
 use crate::ast;
 
 #[test]
@@ -414,4 +414,14 @@ fn nested_args() {
         inner_args[1],
         ast::GenericArg::Const(ast::ConstArg::Value(ast::ConstValue::Int(3)))
     );
+}
+
+#[test]
+fn rejects_labelled_tuple_type() {
+    parse_type_err("(a: int, b: int)");
+}
+
+#[test]
+fn rejects_single_labelled_tuple_type() {
+    parse_type_err("(a: int)");
 }

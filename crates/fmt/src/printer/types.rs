@@ -84,18 +84,6 @@ impl Printer<'_> {
                 }
                 self.write(")");
             }
-            ast::Type::NamedTuple(fields) => {
-                self.write("(");
-                for (i, (name, ty)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.write_fmt(name);
-                    self.write(": ");
-                    self.format_type(ty);
-                }
-                self.write(")");
-            }
             ast::Type::List { elem } => {
                 self.write("[");
                 self.format_type(elem);

@@ -1315,11 +1315,6 @@ fn validate_void_positions(
                 validate_void_positions(context, elem, TypePosition::Nested, site, errors);
             }
         }
-        Type::NamedTuple(fields) => {
-            for (_, field) in fields {
-                validate_void_positions(context, field, TypePosition::Nested, site, errors);
-            }
-        }
         Type::Nominal(nominal) => {
             for arg in &nominal.type_args {
                 validate_void_positions(context, arg, TypePosition::Nested, site, errors);

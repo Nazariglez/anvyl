@@ -224,7 +224,6 @@ pub enum Type {
         generic_args: Vec<GenericArg>,
     },
     Tuple(Vec<Type>),
-    NamedTuple(Vec<(Ident, Type)>),
     Nominal(NominalType),
     List {
         elem: Box<Type>,
@@ -277,7 +276,6 @@ impl PartialEq for Type {
                 },
             ) => qa == qb && na == nb && ga == gb,
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
-            (Self::NamedTuple(a), Self::NamedTuple(b)) => a == b,
             (Self::Nominal(a), Self::Nominal(b)) => a == b,
             (Self::List { elem: a }, Self::List { elem: b })
             | (Self::Slice { elem: a }, Self::Slice { elem: b }) => a == b,
@@ -314,7 +312,6 @@ impl std::hash::Hash for Type {
                 generic_args.hash(state);
             }
             Type::Tuple(elems) => elems.hash(state),
-            Type::NamedTuple(fields) => fields.hash(state),
             Type::Nominal(nominal) => nominal.hash(state),
             Type::List { elem } | Type::Slice { elem } => elem.hash(state),
             Type::Array { elem, len } => {
@@ -558,16 +555,6 @@ impl Display for Type {
                     write!(f, "{e}")?;
                 }
                 write!(f, ")")
-            }
-            Self::NamedTuple(fields) => {
-                write!(f, "{{")?;
-                for (i, (n, t)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{n}: {t}")?;
-                }
-                write!(f, "}}")
             }
             Self::Nominal(nominal) => {
                 write!(f, "{}", nominal.name)?;
@@ -1195,7 +1182,6 @@ pub struct IntrinsicCall {
 pub enum Pattern {
     Ident(Ident),
     Tuple(Vec<PatternNode>),
-    NamedTuple(Vec<(Ident, PatternNode)>),
     Wildcard,
     Struct {
         name: Ident,
@@ -1246,7 +1232,6 @@ impl Pattern {
         match self {
             Self::Ident(_) => "Ident",
             Self::Tuple(_) => "Tuple",
-            Self::NamedTuple(_) => "NamedTuple",
             Self::Wildcard => "Wildcard",
             Self::Struct { .. } => "Struct",
             Self::EnumUnit { .. } => "EnumUnit",
@@ -1306,7 +1291,6 @@ pub enum ExprKind {
     Ternary(TernaryNode),
     IfLet(IfLetNode),
     Tuple(Vec<ExprNode>),
-    NamedTuple(Vec<(Ident, ExprNode)>),
     TupleIndex(TupleIndexNode),
     Field(FieldAccessNode),
     StructLiteral(StructLiteralNode),
@@ -1337,7 +1321,6 @@ impl ExprKind {
             Self::Ternary(_) => "Ternary",
             Self::IfLet(_) => "if let",
             Self::Tuple(_) => "Tuple",
-            Self::NamedTuple(_) => "NamedTuple",
             Self::TupleIndex(_) => "TupleIndex",
             Self::Field(_) => "Field",
             Self::StructLiteral(_) => "StructLiteral",

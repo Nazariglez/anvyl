@@ -161,12 +161,8 @@ pub(crate) enum TypeError {
         found: usize,
         span: Span,
     },
-    NamedPatternOnPositional {
-        span: Span,
-    },
-    TuplePatternLabelMismatch {
-        expected: Ident,
-        found: Ident,
+    TuplePatternOnNonTuple {
+        ty: Type,
         span: Span,
     },
     OrPatternUnsupported {
@@ -188,6 +184,16 @@ pub(crate) enum TypeError {
         ty: Type,
         member: Ident,
         kind: MemberAccessKind,
+        span: Span,
+    },
+    TupleIndexOnNonTuple {
+        ty: Type,
+        index: u32,
+        span: Span,
+    },
+    TupleIndexOutOfBounds {
+        index: u32,
+        len: usize,
         span: Span,
     },
     UndefinedModuleMember {
@@ -510,10 +516,6 @@ impl TypeChecker {
 
     fn tuple_handle(&mut self, elems: Vec<TypeHandle>) -> TypeHandle {
         self.solver.tuple_handle(elems)
-    }
-
-    fn named_tuple_handle(&mut self, fields: Vec<(Ident, TypeHandle)>) -> TypeHandle {
-        self.solver.named_tuple_handle(fields)
     }
 
     fn handle_type(&self, handle: &TypeHandle) -> Type {
@@ -1066,11 +1068,6 @@ impl TypeChecker {
                     self.validate_nominal_uses(elem, span);
                 }
             }
-            Type::NamedTuple(fields) => {
-                for (_, field) in fields {
-                    self.validate_nominal_uses(field, span);
-                }
-            }
             Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
                 self.validate_nominal_uses(elem, span);
             }
@@ -1162,11 +1159,6 @@ impl TypeChecker {
             Type::Tuple(elems) => {
                 for elem in elems {
                     self.validate_nominal_uses_in(decls, elem, span);
-                }
-            }
-            Type::NamedTuple(fields) => {
-                for (_, field) in fields {
-                    self.validate_nominal_uses_in(decls, field, span);
                 }
             }
             Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
@@ -2184,9 +2176,7 @@ fn check_expr_checked_with_hint(
             check_postfix_chain(&chain, expr, expected.as_ref(), tc)
         }
         ExprKind::Tuple(elems) => check_tuple_checked_with_hint(expr, elems, expected, tc),
-        ExprKind::NamedTuple(fields) => {
-            check_named_tuple_checked_with_hint(expr, fields, expected, tc)
-        }
+        ExprKind::TupleIndex(node) => check_tuple_index(expr, node, tc),
         ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected, tc),
         ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected, tc),
         ExprKind::IfLet(if_let_node) => checked_from_checked(
@@ -2202,7 +2192,6 @@ fn check_expr_checked_with_hint(
         ExprKind::Range(_)
         | ExprKind::MapLiteral(_)
         | ExprKind::Index(_)
-        | ExprKind::TupleIndex(_)
         | ExprKind::StringInterp(_)
         | ExprKind::Cast(_)
         | ExprKind::Lambda(_)
@@ -2657,50 +2646,28 @@ fn check_tuple_checked_with_hint(
     checked
 }
 
-fn named_tuple_hints(
-    fields: &[(Ident, ExprNode)],
-    expected: Option<&TypeHandle>,
-    tc: &mut TypeChecker,
-) -> Vec<TypeHandle> {
-    if let Some(Type::NamedTuple(expected_fields)) = expected.map(|handle| tc.handle_type(handle)) {
-        let same_labels = expected_fields.len() == fields.len()
-            && expected_fields
-                .iter()
-                .zip(fields)
-                .all(|((expected, _), (found, _))| expected == found);
-        if same_labels {
-            return expected_fields
-                .iter()
-                .map(|(_, ty)| tc.type_handle(ty))
-                .collect();
-        }
-    }
-    fields
-        .iter()
-        .map(|(_, expr)| tc.fresh_temp_handle(expr.span))
-        .collect()
-}
+fn check_tuple_index(expr: &ExprNode, node: &TupleIndexNode, tc: &mut TypeChecker) -> CheckedType {
+    let target = check_expr_checked(&node.node.target, tc);
+    let Type::Tuple(elems) = &target.ty else {
+        tc.push_error(TypeError::TupleIndexOnNonTuple {
+            ty: target.ty,
+            index: node.node.index,
+            span: node.span,
+        });
+        return checked_from_type(expr, Type::Infer, tc);
+    };
 
-fn check_named_tuple_checked_with_hint(
-    expr: &ExprNode,
-    fields: &[(Ident, ExprNode)],
-    expected: Option<TypeHandle>,
-    tc: &mut TypeChecker,
-) -> CheckedType {
-    let hints = named_tuple_hints(fields, expected.as_ref(), tc);
-    let mut contains_extern_any = false;
-    for ((_, value), hint) in fields.iter().zip(&hints) {
-        let checked = check_expected(value, hint.clone(), tc);
-        contains_extern_any |= checked.contains_extern_any;
-    }
-    let fields = fields
-        .iter()
-        .zip(hints)
-        .map(|((name, _), handle)| (*name, handle))
-        .collect();
-    let tuple = tc.named_tuple_handle(fields);
-    let mut checked = solve_and_checked_from_handle(expr, tuple, tc);
-    checked.contains_extern_any = contains_extern_any;
+    let Some(elem_ty) = elems.get(node.node.index as usize).cloned() else {
+        tc.push_error(TypeError::TupleIndexOutOfBounds {
+            index: node.node.index,
+            len: elems.len(),
+            span: node.span,
+        });
+        return checked_from_type(expr, Type::Infer, tc);
+    };
+
+    let mut checked = checked_from_type(expr, elem_ty, tc);
+    checked.contains_extern_any = target.contains_extern_any;
     checked
 }
 
@@ -3387,9 +3354,8 @@ fn check_pattern(pattern: &PatternNode, expected: &Type, mutable: bool, tc: &mut
             let elem_tys = match expected {
                 Type::Tuple(tys) => tys.clone(),
                 _ => {
-                    tc.push_error(TypeError::TypeMismatch {
-                        expected: expected.clone(),
-                        found: Type::Tuple(elems.iter().map(|_| Type::Infer).collect()),
+                    tc.push_error(TypeError::TuplePatternOnNonTuple {
+                        ty: expected.clone(),
                         span: pattern.span,
                     });
                     return;
@@ -3406,47 +3372,6 @@ fn check_pattern(pattern: &PatternNode, expected: &Type, mutable: bool, tc: &mut
             }
             for (elem, elem_ty) in elems.iter().zip(elem_tys.iter()) {
                 check_pattern(elem, elem_ty, mutable, tc);
-            }
-        }
-        Pattern::NamedTuple(fields) => {
-            let (elem_tys, labels) = match expected {
-                Type::NamedTuple(fs) => (
-                    fs.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(),
-                    fs.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-                ),
-                Type::Tuple(_) => {
-                    tc.push_error(TypeError::NamedPatternOnPositional { span: pattern.span });
-                    return;
-                }
-                _ => {
-                    tc.push_error(TypeError::TypeMismatch {
-                        expected: expected.clone(),
-                        found: Type::Tuple(fields.iter().map(|_| Type::Infer).collect()),
-                        span: pattern.span,
-                    });
-                    return;
-                }
-            };
-            let same_arity = fields.len() == elem_tys.len();
-            if !same_arity {
-                tc.push_error(TypeError::TuplePatternArityMismatch {
-                    expected: elem_tys.len(),
-                    found: fields.len(),
-                    span: pattern.span,
-                });
-                return;
-            }
-            for ((field_name, subpat), (exp_ty, label)) in
-                fields.iter().zip(elem_tys.iter().zip(labels.iter()))
-            {
-                if *field_name != *label {
-                    tc.push_error(TypeError::TuplePatternLabelMismatch {
-                        expected: *label,
-                        found: *field_name,
-                        span: pattern.span,
-                    });
-                }
-                check_pattern(subpat, exp_ty, mutable, tc);
             }
         }
         Pattern::Lit(lit) => {
@@ -3624,13 +3549,6 @@ fn record_extern_pattern_reads(
             if let Type::Tuple(tys) = expected {
                 for (elem, ty) in elems.iter().zip(tys) {
                     record_extern_pattern_reads(elem, ty, site, tc);
-                }
-            }
-        }
-        Pattern::NamedTuple(fields) => {
-            if let Type::NamedTuple(tys) = expected {
-                for ((_, pattern), (_, ty)) in fields.iter().zip(tys) {
-                    record_extern_pattern_reads(pattern, ty, site, tc);
                 }
             }
         }

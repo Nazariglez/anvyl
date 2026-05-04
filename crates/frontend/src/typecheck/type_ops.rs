@@ -101,12 +101,6 @@ pub(crate) trait TypeFolder {
                 generic_args,
             } => self.fold_unresolved_nominal(*qualifier, *name, generic_args),
             Type::Tuple(elems) => Type::Tuple(elems.iter().map(|ty| self.fold_type(ty)).collect()),
-            Type::NamedTuple(fields) => Type::NamedTuple(
-                fields
-                    .iter()
-                    .map(|(name, ty)| (*name, self.fold_type(ty)))
-                    .collect(),
-            ),
             Type::Nominal(nominal) => Type::nominal_with_origin(
                 nominal.kind,
                 nominal.name,
@@ -207,7 +201,6 @@ pub(crate) trait TypeVisitor {
                 params.iter().any(|param| self.visit_func_param(param)) || self.visit_type(ret)
             }
             Type::Tuple(elems) => elems.iter().any(|ty| self.visit_type(ty)),
-            Type::NamedTuple(fields) => fields.iter().any(|(_, ty)| self.visit_type(ty)),
             Type::Nominal(nominal) => {
                 nominal.type_args.iter().any(|ty| self.visit_type(ty))
                     || nominal
