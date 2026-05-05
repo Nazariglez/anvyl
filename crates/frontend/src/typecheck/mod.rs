@@ -10,6 +10,7 @@ use self::{
         GenericSolverSeeds, GenericSolverVars, LocalTypeId, Solver, SolverFinalizeError,
         SolverRelationError, TypeHandle,
     },
+    pattern::PatternContext,
     place::{PlaceAccess, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::TypeFolder,
@@ -33,12 +34,17 @@ use crate::{
 
 mod const_eval;
 mod const_term;
+mod control_flow;
 mod decls;
+mod enum_variant;
 mod extern_boundary;
 mod extern_ops;
+mod field_check;
 mod generic;
 mod generic_bind;
 mod infer;
+mod match_coverage;
+mod pattern;
 mod place;
 mod postfix;
 mod result;
@@ -60,6 +66,13 @@ pub(crate) enum ConstDiagnostic {
 pub(crate) enum MemberAccessKind {
     Field,
     Method,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariantShape {
+    Unit,
+    Tuple,
+    Struct,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,7 +184,36 @@ pub(crate) enum TypeError {
     EmptyMatch {
         span: Span,
     },
-    UnreachableFalsePattern {
+    NonExhaustiveMatch {
+        span: Span,
+    },
+    UnsupportedMatchScrutinee {
+        found: Type,
+        span: Span,
+    },
+    InvalidLiteralPattern {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    OptionalPatternOnNonOptional {
+        span: Span,
+    },
+    NestedOptionalPattern {
+        span: Span,
+    },
+    MatchArmTypeMismatch {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    RequiresUnwrappingPattern {
+        span: Span,
+    },
+    IrrefutableLetElse {
+        span: Span,
+    },
+    LetElseMustDiverge {
         span: Span,
     },
     MemberAccessOnNonAggregate {
@@ -214,6 +256,18 @@ pub(crate) enum TypeError {
         name: Ident,
         span: Span,
     },
+    UnknownVariantField {
+        enum_name: Ident,
+        variant: Ident,
+        field: Ident,
+        span: Span,
+    },
+    MissingVariantField {
+        enum_name: Ident,
+        variant: Ident,
+        field: Ident,
+        span: Span,
+    },
     InvalidStructLiteral {
         name: Ident,
         kind: String,
@@ -227,6 +281,17 @@ pub(crate) enum TypeError {
     UnknownEnumVariant {
         enum_name: Ident,
         variant: Ident,
+        span: Span,
+    },
+    EnumPatternTypeMismatch {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    EnumVariantShapeMismatch {
+        enum_name: Ident,
+        variant: Ident,
+        expected: VariantShape,
         span: Span,
     },
     GenericArity(ArityError),
@@ -1531,11 +1596,10 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
                 check_const(const_node, tc);
             }
         }
-        Stmt::Import(_)
-        | Stmt::ExternFunc(_)
-        | Stmt::ExternType(_)
-        | Stmt::LetElse(_)
-        | Stmt::Defer(_) => {}
+        Stmt::LetElse(let_else_node) => {
+            check_let_else(let_else_node, tc);
+        }
+        Stmt::Import(_) | Stmt::ExternFunc(_) | Stmt::ExternType(_) | Stmt::Defer(_) => {}
     }
 }
 
@@ -1910,15 +1974,28 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
                 check_value_expr_checked_with_hint(&binding.value, Some(annot_handle.clone()), tc);
             tc.reject_extern_any_escape(&value, binding.value.span);
             tc.expect_assignable(binding_node.span, value.handle, annot_handle);
-            record_extern_pattern_reads(&binding.pattern, &annot_ty, binding.value.node.id, tc);
-            check_pattern(&binding.pattern, &annot_ty, mutable, tc);
+            pattern::check_at(
+                &binding.pattern,
+                &annot_ty,
+                mutable,
+                binding.value.node.id,
+                PatternContext::Binding,
+                tc,
+            );
         }
         None => {
             let value = check_value_expr_checked_with_hint(&binding.value, None, tc);
             tc.reject_extern_any_escape(&value, binding.value.span);
             tc.reject_user_any_type(&value.ty, binding_node.span);
-            record_extern_pattern_reads(&binding.pattern, &value.ty, binding.value.node.id, tc);
-            check_pattern_from_handle(&binding.pattern, value.handle, value.ty, mutable, tc);
+            pattern::check_handle_at(
+                &binding.pattern,
+                value.handle,
+                value.ty,
+                mutable,
+                binding.value.node.id,
+                PatternContext::Binding,
+                tc,
+            );
         }
     }
 }
@@ -2751,6 +2828,10 @@ fn check_struct_lit_hint(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
+    if let Some(checked) = check_enum_struct_variant_lit(expr, lit, expected.clone(), tc) {
+        return checked;
+    }
+
     let Some(key) = resolve_struct_key(lit, tc) else {
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return checked_from_type(expr, Type::Infer, tc);
@@ -2807,6 +2888,61 @@ fn check_struct_lit_hint(
     let mut checked = solve_and_checked_from_handle(expr, handle, tc);
     checked.contains_extern_any = field_check.contains_extern_any;
     checked
+}
+
+fn check_enum_struct_variant_lit(
+    expr: &ExprNode,
+    lit: &StructLiteralNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> Option<CheckedType> {
+    let qualifier = lit.node.qualifier?;
+    let key = tc
+        .resolve_visible_type_key(None, qualifier)
+        .filter(|key| key.kind == NominalKind::Enum)?;
+    let Some(resolved) = enum_variant::resolve_member(tc, &key, lit.node.name, lit.span) else {
+        check_unknown_nominal_fields(&lit.node.fields, tc);
+        return Some(checked_from_type(expr, Type::Infer, tc));
+    };
+    let VariantSchema::Struct(fields) = &resolved.schema else {
+        enum_variant::push_shape_mismatch(tc, &resolved, VariantShape::Struct, lit.span);
+        check_unknown_nominal_fields(&lit.node.fields, tc);
+        return Some(checked_from_type(expr, Type::Infer, tc));
+    };
+
+    if !lit.node.generic_args.is_empty() {
+        tc.push_error(TypeError::GenericArity(ArityError::TypeArgs {
+            expected: 0,
+            found: lit.node.generic_args.len(),
+        }));
+        check_unknown_nominal_fields(&lit.node.fields, tc);
+        return Some(checked_from_type(expr, Type::Infer, tc));
+    }
+
+    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let inf = NominalLiteralSolver::without_args(&resolved.generics, lit.span, tc);
+    let expected_ok =
+        inf.bind_expected(&key, &resolved.generics, expected_ty.as_ref(), lit.span, tc);
+    let field_check = check_variant_literal_fields(
+        &lit.node.fields,
+        fields,
+        &key,
+        lit.node.name,
+        lit.span,
+        &inf,
+        tc,
+    );
+    if !expected_ok || field_check.failed {
+        return Some(checked_from_type(expr, Type::Infer, tc));
+    }
+    let Some(ty) = inf.finalize(&key, &resolved.generics, lit.span, tc) else {
+        return Some(checked_from_type(expr, Type::Infer, tc));
+    };
+    tc.reject_user_any_type(&ty, lit.span);
+    let handle = tc.type_handle(&ty);
+    let mut checked = solve_and_checked_from_handle(expr, handle, tc);
+    checked.contains_extern_any = field_check.contains_extern_any;
+    Some(checked)
 }
 
 fn check_extern_lit(
@@ -3077,40 +3213,80 @@ fn check_nominal_fields(
     inf: &NominalLiteralSolver,
     tc: &mut TypeChecker,
 ) -> NominalFieldCheck {
-    let mut seen = HashMap::new();
-    let mut check = NominalFieldCheck::default();
-    for (name, value) in fields {
-        if seen.insert(*name, value.span).is_some() {
-            tc.push_error(TypeError::DuplicateField {
-                name: *name,
-                span: value.span,
-            });
-        }
-        match schema.get(name) {
-            Some(field) => {
-                let hint = inf.instantiate(&field.ty, tc);
-                let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
-                check.contains_extern_any |= checked.contains_extern_any;
-                tc.expect_assignable(value.span, checked.handle, hint);
-                check.failed |= tc.solve_constraints();
-            }
-            None => {
-                tc.push_error(TypeError::UnknownMember {
-                    ty: owner_ty.clone(),
-                    member: *name,
-                    kind: MemberAccessKind::Field,
-                    span: value.span,
-                });
-                check_expr_checked(value, tc);
-            }
+    check_expr_fields(
+        fields,
+        schema,
+        field_check::FieldOwner::Nominal(owner_ty),
+        field_check::MissingFields::AllowDefaults,
+        span,
+        inf,
+        tc,
+    )
+}
+
+fn check_variant_literal_fields(
+    fields: &[(Ident, ExprNode)],
+    schema: &HashMap<Ident, FieldSchema>,
+    key: &NominalKey,
+    variant: Ident,
+    span: Span,
+    inf: &NominalLiteralSolver,
+    tc: &mut TypeChecker,
+) -> NominalFieldCheck {
+    check_expr_fields(
+        fields,
+        schema,
+        field_check::FieldOwner::Variant {
+            enum_name: key.name,
+            variant,
+        },
+        field_check::MissingFields::AllowDefaults,
+        span,
+        inf,
+        tc,
+    )
+}
+
+fn check_expr_fields(
+    fields: &[(Ident, ExprNode)],
+    schema: &HashMap<Ident, FieldSchema>,
+    owner: field_check::FieldOwner,
+    missing: field_check::MissingFields,
+    span: Span,
+    inf: &NominalLiteralSolver,
+    tc: &mut TypeChecker,
+) -> NominalFieldCheck {
+    let uses = fields
+        .iter()
+        .enumerate()
+        .map(|(index, (name, value))| field_check::FieldUse {
+            name: *name,
+            span: value.span,
+            index,
+        })
+        .collect::<Vec<_>>();
+    let shape = field_check::check(&uses, schema, owner, missing, span, tc);
+    let valid = shape
+        .fields
+        .iter()
+        .map(|field| field.index)
+        .collect::<HashSet<_>>();
+    for (index, (_, value)) in fields.iter().enumerate() {
+        if !valid.contains(&index) {
+            check_expr_checked(value, tc);
         }
     }
-
-    for (name, field) in schema {
-        let missing_required_field = !seen.contains_key(name) && !field.has_default;
-        if missing_required_field {
-            tc.push_error(TypeError::MissingField { name: *name, span });
-        }
+    let mut check = NominalFieldCheck {
+        failed: shape.failed,
+        contains_extern_any: false,
+    };
+    for field in shape.fields {
+        let value = &fields[field.index].1;
+        let hint = inf.instantiate(&field.ty, tc);
+        let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
+        check.contains_extern_any |= checked.contains_extern_any;
+        tc.expect_assignable(value.span, checked.handle, hint);
+        check.failed |= tc.solve_constraints();
     }
     check
 }
@@ -3285,7 +3461,7 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     });
 
     tc.push_scope();
-    check_pattern(&node.pattern, &item_ty, false, tc);
+    pattern::check(&node.pattern, &item_ty, false, PatternContext::For, tc);
     tc.enter_loop();
     check_block_checked(&node.body, tc);
     tc.exit_loop();
@@ -3315,266 +3491,46 @@ fn iterable_item_type(ty: &Type) -> Option<Type> {
     }
 }
 
-fn check_pattern_from_handle(
-    pattern: &PatternNode,
-    expected_handle: TypeHandle,
-    expected_ty: Type,
-    mutable: bool,
-    tc: &mut TypeChecker,
-) {
-    match &pattern.node {
-        Pattern::Ident(name) => {
-            tc.define(*name, expected_ty, mutable);
-            if let Some(type_id) = tc.lookup(*name).map(|info| info.type_id) {
-                tc.set_local_type_from_handle(type_id, expected_handle.clone());
-                tc.expect_equal(pattern.span, tc.local_handle(type_id), expected_handle);
-            }
-        }
-        _ => check_pattern(pattern, &expected_ty, mutable, tc),
+fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
+    let node = &let_else_node.node;
+    let value = check_expr_checked(&node.value, tc);
+    let saved_return_seen = tc.return_seen.last().copied();
+    tc.push_scope();
+    check_block_checked(&node.else_block, tc);
+    tc.pop_scope();
+    if let Some(saved) = saved_return_seen
+        && let Some(current) = tc.return_seen.last_mut()
+    {
+        *current = saved;
     }
-}
-
-fn check_pattern(pattern: &PatternNode, expected: &Type, mutable: bool, tc: &mut TypeChecker) {
-    match &pattern.node {
-        Pattern::Ident(name) => {
-            tc.define(*name, expected.clone(), mutable);
-        }
-        Pattern::Wildcard => {}
-        Pattern::VarIdent(_) => {
-            tc.push_error(TypeError::UnsupportedPattern {
-                pattern: pattern.node.variant_name(),
-                span: pattern.span,
-            });
-        }
-        Pattern::Tuple(elems) => {
-            let elem_tys = match expected {
-                Type::Tuple(tys) => tys.clone(),
-                _ => {
-                    tc.push_error(TypeError::TuplePatternOnNonTuple {
-                        ty: expected.clone(),
-                        span: pattern.span,
-                    });
-                    return;
-                }
-            };
-            let same_arity = elems.len() == elem_tys.len();
-            if !same_arity {
-                tc.push_error(TypeError::TuplePatternArityMismatch {
-                    expected: elem_tys.len(),
-                    found: elems.len(),
-                    span: pattern.span,
-                });
-                return;
-            }
-            for (elem, elem_ty) in elems.iter().zip(elem_tys.iter()) {
-                check_pattern(elem, elem_ty, mutable, tc);
-            }
-        }
-        Pattern::Lit(lit) => {
-            let lit_ty = type_from_lit(lit);
-            if lit_ty != *expected && !matches!(expected, Type::Infer) {
-                tc.push_error(TypeError::TypeMismatch {
-                    expected: expected.clone(),
-                    found: lit_ty,
-                    span: pattern.span,
-                });
-            } else if matches!(lit, Lit::Bool(false)) {
-                tc.push_error(TypeError::UnreachableFalsePattern { span: pattern.span });
-            }
-        }
-        Pattern::Nil => {
-            if !expected.is_option() && !matches!(expected, Type::Infer) {
-                tc.push_error(TypeError::TypeMismatch {
-                    expected: expected.clone(),
-                    found: Type::Infer,
-                    span: pattern.span,
-                });
-            }
-        }
-        Pattern::Optional(inner) => {
-            let inner_ty = expected.option_inner().unwrap_or(&Type::Infer);
-            check_pattern(inner, inner_ty, mutable, tc);
-        }
-        Pattern::Range { .. } => {
-            tc.push_error(TypeError::UnsupportedPattern {
-                pattern: "range",
-                span: pattern.span,
-            });
-        }
-        Pattern::Or(_) => {
-            tc.push_error(TypeError::OrPatternUnsupported { span: pattern.span });
-        }
-        Pattern::Rest => {
-            tc.push_error(TypeError::UnsupportedPattern {
-                pattern: "..",
-                span: pattern.span,
-            });
-        }
-        Pattern::Struct { name, fields } => {
-            check_struct_pattern(*name, fields, pattern.span, expected, mutable, tc);
-        }
-        Pattern::EnumUnit { .. }
-        | Pattern::EnumTuple { .. }
-        | Pattern::EnumStruct { .. }
-        | Pattern::InferredEnumUnit { .. }
-        | Pattern::InferredEnumTuple { .. }
-        | Pattern::InferredEnumStruct { .. } => {
-            tc.push_error(TypeError::UnsupportedPattern {
-                pattern: pattern.node.variant_name(),
-                span: pattern.span,
-            });
-        }
-    }
-}
-
-fn check_struct_pattern(
-    name: Ident,
-    fields: &[(Ident, PatternNode)],
-    span: Span,
-    expected: &Type,
-    mutable: bool,
-    tc: &mut TypeChecker,
-) {
-    let Some(key) = tc.resolve_visible_type_key(None, name) else {
-        tc.push_error(TypeError::UnknownType {
-            qualifier: None,
-            name,
-            span,
+    if !control_flow::block_diverges(&node.else_block) {
+        tc.push_error(TypeError::LetElseMustDiverge {
+            span: node.else_block.span,
         });
-        for (_, field) in fields {
-            check_pattern(field, &Type::Infer, mutable, tc);
-        }
-        return;
-    };
-
-    let expected_key = tc.decls.key_for_type(expected);
-    if expected_key.as_ref() != Some(&key) && !matches!(expected, Type::Infer) {
-        tc.push_error(TypeError::TypeMismatch {
-            expected: nominal_type(&key),
-            found: expected.clone(),
-            span,
-        });
-        return;
     }
-
-    match key.kind {
-        NominalKind::Struct | NominalKind::DataRef => {
-            let Some(agg) = tc.decls.aggregate(&key).cloned() else {
-                return;
-            };
-            let field_tys = agg
-                .fields
-                .iter()
-                .map(|(name, field)| (*name, field.ty.clone()))
-                .collect();
-            check_struct_field_patterns(fields, nominal_type(&key), &field_tys, mutable, tc);
-        }
-        NominalKind::Extern => {
-            let Some(owner) = tc.externs.type_by_nominal(&key) else {
-                return;
-            };
-            let field_tys = tc
-                .extern_type(owner)
-                .fields
-                .iter()
-                .map(|field| (field.name, field.ty.ty.clone()))
-                .collect();
-            check_struct_field_patterns(fields, nominal_type(&key), &field_tys, mutable, tc);
-        }
-        NominalKind::Enum => {
-            tc.push_error(TypeError::UnsupportedPattern {
-                pattern: "Struct",
-                span,
-            });
-        }
-    }
-}
-
-fn check_struct_field_patterns(
-    fields: &[(Ident, PatternNode)],
-    owner_ty: Type,
-    field_tys: &HashMap<Ident, Type>,
-    mutable: bool,
-    tc: &mut TypeChecker,
-) {
-    let mut seen = HashSet::new();
-    for (name, pattern) in fields {
-        if !seen.insert(*name) {
-            tc.push_error(TypeError::DuplicateField {
-                name: *name,
-                span: pattern.span,
-            });
-            continue;
-        }
-        match field_tys.get(name) {
-            Some(ty) => check_pattern(pattern, ty, mutable, tc),
-            None => tc.push_error(TypeError::UnknownMember {
-                ty: owner_ty.clone(),
-                member: *name,
-                kind: MemberAccessKind::Field,
-                span: pattern.span,
-            }),
-        }
-    }
-}
-
-fn record_extern_pattern_reads(
-    pattern: &PatternNode,
-    expected: &Type,
-    site: ExprId,
-    tc: &mut TypeChecker,
-) {
-    match &pattern.node {
-        Pattern::Struct { fields, .. } => {
-            let Some(owner) = tc.extern_type_id(expected) else {
-                return;
-            };
-            for (name, subpattern) in fields {
-                let Some((field, decl)) = tc
-                    .extern_field(owner, *name)
-                    .map(|(id, decl)| (id, decl.clone()))
-                else {
-                    continue;
-                };
-                tc.record_extern_use(site, ExternUseTarget::FieldRead(field));
-                tc.reject_extern_any_escape_fact(decl.ty.contains_any(), subpattern.span);
-                record_extern_pattern_reads(subpattern, &decl.ty.ty, site, tc);
-            }
-        }
-        Pattern::Tuple(elems) => {
-            if let Type::Tuple(tys) = expected {
-                for (elem, ty) in elems.iter().zip(tys) {
-                    record_extern_pattern_reads(elem, ty, site, tc);
-                }
-            }
-        }
-        Pattern::Optional(inner) => {
-            let inner_ty = expected.option_inner().unwrap_or(&Type::Infer);
-            record_extern_pattern_reads(inner, inner_ty, site, tc);
-        }
-        Pattern::Ident(_)
-        | Pattern::Wildcard
-        | Pattern::VarIdent(_)
-        | Pattern::Lit(_)
-        | Pattern::Nil
-        | Pattern::Range { .. }
-        | Pattern::Or(_)
-        | Pattern::Rest
-        | Pattern::EnumUnit { .. }
-        | Pattern::EnumTuple { .. }
-        | Pattern::EnumStruct { .. }
-        | Pattern::InferredEnumUnit { .. }
-        | Pattern::InferredEnumTuple { .. }
-        | Pattern::InferredEnumStruct { .. } => {}
-    }
+    pattern::check_handle_at(
+        &node.pattern,
+        value.handle,
+        value.ty,
+        false,
+        node.value.node.id,
+        PatternContext::LetElse,
+        tc,
+    );
 }
 
 fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
     let node = &while_let_node.node;
     let value_ty = check_expr_checked(&node.value, tc).ty;
-    record_extern_pattern_reads(&node.pattern, &value_ty, node.value.node.id, tc);
     tc.push_scope();
-    check_pattern(&node.pattern, &value_ty, false, tc);
+    pattern::check_at(
+        &node.pattern,
+        &value_ty,
+        false,
+        node.value.node.id,
+        PatternContext::WhileLet,
+        tc,
+    );
     tc.enter_loop();
     check_block_checked(&node.body, tc);
     tc.exit_loop();
@@ -3588,9 +3544,16 @@ fn check_if_let_checked_with_hint(
 ) -> CheckedType {
     let node = &if_let_node.node;
     let value = check_expr_checked(&node.value, tc);
-    record_extern_pattern_reads(&node.pattern, &value.ty, node.value.node.id, tc);
     tc.push_scope();
-    check_pattern_from_handle(&node.pattern, value.handle, value.ty, false, tc);
+    pattern::check_handle_at(
+        &node.pattern,
+        value.handle,
+        value.ty,
+        false,
+        node.value.node.id,
+        PatternContext::IfLet,
+        tc,
+    );
     let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
     tc.pop_scope();
     let Some(else_block) = &node.else_block else {
@@ -3620,20 +3583,34 @@ fn check_match_checked_with_hint(
         return checked_void(tc);
     }
     let mut arms = Vec::with_capacity(node.arms.len());
+    let mut outcomes = Vec::with_capacity(node.arms.len());
     for arm in &node.arms {
         tc.push_scope();
-        record_extern_pattern_reads(&arm.node.pattern, &scrutinee.ty, node.scrutinee.node.id, tc);
-        check_pattern_from_handle(
+        let outcome = pattern::check_handle_at(
             &arm.node.pattern,
             scrutinee.handle.clone(),
             scrutinee.ty.clone(),
             false,
+            node.scrutinee.node.id,
+            PatternContext::Match,
             tc,
         );
         let body = check_expr_checked_with_hint(&arm.node.body, expected.clone(), tc);
+        if let Some(expected) = expected.as_ref() {
+            let expected_ty = tc.handle_type(expected);
+            if !body.ty.is_void() && !matches!(body.ty, Type::Infer) && body.ty != expected_ty {
+                tc.push_error(TypeError::MatchArmTypeMismatch {
+                    expected: expected_ty,
+                    found: body.ty.clone(),
+                    span: arm.node.body.span,
+                });
+            }
+        }
         tc.pop_scope();
+        outcomes.push(outcome);
         arms.push((arm.node.body.span, body));
     }
+    match_coverage::check(&scrutinee.ty, &outcomes, match_node.span, tc);
     if arms[0].1.ty.is_void() {
         return checked_void(tc);
     }

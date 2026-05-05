@@ -18,7 +18,7 @@ use crate::{
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError},
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, MemberAccessKind,
-        ModuleScope, TypeError,
+        ModuleScope, TypeError, VariantShape,
     },
 };
 
@@ -414,7 +414,29 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         }
         TypeError::OrPatternUnsupported { .. } => "or-patterns are not supported".to_string(),
         TypeError::EmptyMatch { .. } => "match expression must have at least one arm".to_string(),
-        TypeError::UnreachableFalsePattern { .. } => "false pattern is unreachable".to_string(),
+        TypeError::NonExhaustiveMatch { .. } => "non-exhaustive match".to_string(),
+        TypeError::UnsupportedMatchScrutinee { found, .. } => {
+            format!("unsupported match scrutinee: '{found}'")
+        }
+        TypeError::InvalidLiteralPattern {
+            expected, found, ..
+        } => format!("invalid literal pattern: mismatch expected '{expected}', found '{found}'"),
+        TypeError::OptionalPatternOnNonOptional { .. } => {
+            "optional pattern requires an optional scrutinee".to_string()
+        }
+        TypeError::NestedOptionalPattern { .. } => {
+            "nested optional patterns are not supported".to_string()
+        }
+        TypeError::MatchArmTypeMismatch {
+            expected, found, ..
+        } => format!("match arm type mismatch: expected '{expected}', found '{found}'"),
+        TypeError::RequiresUnwrappingPattern { .. } => {
+            "optional value requires an unwrapping pattern".to_string()
+        }
+        TypeError::IrrefutableLetElse { .. } => "irrefutable pattern in let-else".to_string(),
+        TypeError::LetElseMustDiverge { .. } => {
+            "the else block of a let-else must always return, break, or continue".to_string()
+        }
         TypeError::MemberAccessOnNonAggregate {
             ty, member, kind, ..
         }
@@ -441,6 +463,18 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         }
         TypeError::DuplicateField { name, .. } => format!("Duplicate field '{name}'"),
         TypeError::MissingField { name, .. } => format!("Missing field '{name}'"),
+        TypeError::UnknownVariantField {
+            enum_name,
+            variant,
+            field,
+            ..
+        } => format!("Unknown field '{field}' for variant '{enum_name}.{variant}'"),
+        TypeError::MissingVariantField {
+            enum_name,
+            variant,
+            field,
+            ..
+        } => format!("Missing field '{field}' in variant '{enum_name}.{variant}'"),
         TypeError::InvalidStructLiteral { name, kind, .. } => {
             format!("type '{name}' does not support struct literal construction ({kind})")
         }
@@ -453,6 +487,20 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::UnknownEnumVariant {
             enum_name, variant, ..
         } => format!("Unknown variant '{variant}' for enum '{enum_name}'"),
+        TypeError::EnumPatternTypeMismatch {
+            expected, found, ..
+        } => {
+            format!("pattern does not match scrutinee enum: expected '{expected}', found '{found}'")
+        }
+        TypeError::EnumVariantShapeMismatch {
+            enum_name,
+            variant,
+            expected,
+            ..
+        } => format!(
+            "variant '{enum_name}.{variant}' is not a {} variant",
+            render_variant_shape(*expected)
+        ),
         TypeError::GenericArity(ArityError::TypeArgs { expected, found }) => {
             format!("wrong number of type parameters: expected {expected}, found {found}")
         }
@@ -487,6 +535,14 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("duplicate generic parameter '{name}'")
         }
     })
+}
+
+fn render_variant_shape(shape: VariantShape) -> &'static str {
+    match shape {
+        VariantShape::Unit => "unit",
+        VariantShape::Tuple => "tuple",
+        VariantShape::Struct => "struct",
+    }
 }
 
 fn render_type_mismatch(expected: &Type, found: &Type) -> String {

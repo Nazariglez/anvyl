@@ -2,9 +2,12 @@
 // @expect: error
 // @contains: requires an unwrapping pattern
 
+fn next() -> int? {
+    nil
+}
+
 fn main() {
-    var items: [int] = [1, 2, 3];
-    while let var val = items.pop() {
+    while let var val = next() {
         println(val);
     }
 }

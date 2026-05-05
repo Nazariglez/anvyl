@@ -2,13 +2,14 @@ use anvyx_externs::ReceiverMode;
 
 use super::{
     CallForm, CallTarget, CheckedType, ConstSubst, ExternUseTarget, GenericArgs, GenericParams,
-    MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, check_arg_count,
-    check_expr_checked, checked_type,
+    MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, VariantShape,
+    check_arg_count, check_expr_checked, checked_type,
     decls::{
         AggregateSchema, CallableKind, CallableParent, CallableRef, DeclarationIndex,
         ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, MethodSchema, ModuleScope, NominalKey,
         ResolvedValue, ValueDecl, VariantSchema, nominal_type, owner_template,
     },
+    enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
     generic_bind::bind_prefix_generic_seeds,
     infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
@@ -27,7 +28,6 @@ use crate::{
 
 pub(super) enum Subject {
     Value(PlaceValue),
-    NonAggregate(Type),
     Module(ModuleScope),
     Type(NominalKey),
     QualifiedExtend {
@@ -37,6 +37,10 @@ pub(super) enum Subject {
     },
     Callable {
         callee: Box<CallableRef>,
+        surface_ty: Type,
+    },
+    EnumVariant {
+        resolved: ResolvedEnumVariant,
         surface_ty: Type,
     },
     ExternMethod {
@@ -160,7 +164,11 @@ pub(super) fn check_postfix_chain(
         let next_is_call = matches!(chain.steps.get(i + 1), Some(PostfixStep::Call { .. }));
         subject = match step {
             PostfixStep::Field { node, id } => {
-                let subject = apply_field(&subject, node, next_is_call, tc);
+                let field_expected = (is_last_step && !next_is_call)
+                    .then(|| expected.cloned())
+                    .flatten();
+                let subject =
+                    apply_field(&subject, node, next_is_call, field_expected.as_ref(), tc);
                 tc.set_type(*id, subject_type(&subject), node.span);
                 subject
             }
@@ -211,7 +219,9 @@ fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> 
 fn subject_type(subject: &Subject) -> Type {
     match subject {
         Subject::Value(value) => value.checked.ty.clone(),
-        Subject::NonAggregate(ty) | Subject::Callable { surface_ty: ty, .. } => ty.clone(),
+        Subject::Callable { surface_ty: ty, .. } | Subject::EnumVariant { surface_ty: ty, .. } => {
+            ty.clone()
+        }
         Subject::ExternMethod { signature, .. } | Subject::ExternStatic { signature, .. } => {
             signature.to_func_type()
         }
@@ -241,6 +251,7 @@ fn apply_field(
     subject: &Subject,
     field: &FieldAccessNode,
     next_is_call: bool,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> Subject {
     let kind = if next_is_call {
@@ -261,9 +272,11 @@ fn apply_field(
             tc,
         ),
         Subject::Module(scope) => apply_module_field(scope, field.node.field, field.span, kind, tc),
-        Subject::Type(key) => apply_type_field(key, field.node.field, field.span, kind, tc),
-        Subject::NonAggregate(_)
-        | Subject::Callable { .. }
+        Subject::Type(key) => {
+            apply_type_field(key, field.node.field, field.span, kind, expected, tc)
+        }
+        Subject::Callable { .. }
+        | Subject::EnumVariant { .. }
         | Subject::QualifiedExtend { .. }
         | Subject::ExternMethod { .. }
         | Subject::ExternStatic { .. } => {
@@ -334,17 +347,19 @@ fn extend_method_subject(
 }
 
 fn enum_variant_subject(
-    decls: &DeclarationIndex,
-    enum_key: &NominalKey,
-    variant: Ident,
-    schema: &VariantSchema,
+    resolved: ResolvedEnumVariant,
+    expected: Option<&TypeHandle>,
+    tc: &TypeChecker,
 ) -> Subject {
-    match decls.callable_for_variant(enum_key, variant, schema) {
-        Some(callee) => Subject::Callable {
-            callee: Box::new(callee),
-            surface_ty: nominal_type(enum_key),
-        },
-        None => Subject::NonAggregate(nominal_type(enum_key)),
+    let expected_ty = expected.map(|handle| tc.handle_type(handle));
+    let surface_ty = expected_ty
+        .as_ref()
+        .filter(|ty| tc.decls.key_for_type(ty).as_ref() == Some(&resolved.key))
+        .cloned()
+        .unwrap_or_else(|| resolved.owner_ty());
+    Subject::EnumVariant {
+        resolved,
+        surface_ty,
     }
 }
 
@@ -354,20 +369,6 @@ fn func_callable_subject(callee: CallableRef) -> Subject {
         callee: Box::new(callee),
         surface_ty,
     }
-}
-
-fn unknown_enum_variant(
-    enum_key: &NominalKey,
-    variant: Ident,
-    span: Span,
-    tc: &mut TypeChecker,
-) -> Subject {
-    tc.push_error(TypeError::UnknownEnumVariant {
-        enum_name: enum_key.name,
-        variant,
-        span,
-    });
-    Subject::Error
 }
 
 fn apply_value_field(
@@ -583,6 +584,7 @@ fn apply_type_field(
     name: Ident,
     span: Span,
     kind: MemberAccessKind,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> Subject {
     if let Some(owner) = tc.externs.type_by_nominal(key) {
@@ -590,8 +592,10 @@ fn apply_type_field(
     }
 
     if let Some(schema) = tc.decls.enum_schema(key) {
-        if let Some(variant) = schema.variants.get(&name) {
-            return enum_variant_subject(&tc.decls, &schema.key, name, variant);
+        if schema.variants.contains_key(&name) {
+            let resolved = enum_variant::resolve_member(tc, key, name, span)
+                .expect("variant exists in enum schema");
+            return enum_variant_subject(resolved, expected, tc);
         }
 
         if let Some(agg) = tc.decls.aggregate(key)
@@ -600,7 +604,8 @@ fn apply_type_field(
         {
             return aggregate_method_subject(&tc.decls, agg, None, name, method);
         }
-        return unknown_enum_variant(key, name, span, tc);
+        enum_variant::resolve_member(tc, key, name, span);
+        return Subject::Error;
     }
     let Some(agg) = tc.decls.aggregate(key) else {
         return unknown_member(nominal_type(key), name, kind, span, tc);
@@ -648,6 +653,9 @@ fn apply_call(
         Subject::QualifiedExtend { module, name, span } => {
             check_qualified_extend_call(module, *name, *span, call, call_id, expected, tc)
         }
+        Subject::EnumVariant { resolved, .. } => {
+            check_enum_variant_call(resolved, call, call_id, expected, tc)
+        }
         Subject::ExternMethod {
             method_ref,
             receiver,
@@ -679,7 +687,7 @@ fn apply_call(
             place::record_value_read(call.node.func.node.id, value, tc);
             checked_type(call_value(value.checked.ty.clone(), call, tc), tc)
         }
-        Subject::NonAggregate(_) | Subject::Module(_) | Subject::Type(_) => {
+        Subject::Module(_) | Subject::Type(_) => {
             checked_type(not_callable(subject_type(subject), call, tc), tc)
         }
         Subject::Error => {
@@ -835,6 +843,40 @@ fn substitute_params_checked(
             )
         })
         .collect()
+}
+
+fn check_enum_variant_call(
+    resolved: &ResolvedEnumVariant,
+    call: &CallNode,
+    call_id: ExprId,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let can_call = match &resolved.schema {
+        VariantSchema::Tuple(_) => true,
+        VariantSchema::Unit => call.node.args.is_empty(),
+        VariantSchema::Struct(_) => false,
+    };
+    if !can_call {
+        enum_variant::push_shape_mismatch(tc, resolved, VariantShape::Tuple, call.span);
+        return check_unhinted_args(&call.node.args, tc);
+    }
+    let Some(callee) =
+        tc.decls
+            .callable_for_variant(&resolved.key, resolved.variant, &resolved.schema)
+    else {
+        return checked_type(Type::Infer, tc);
+    };
+    check_callable_call_with_args(
+        &callee,
+        &call.node.args,
+        &call.node.generic_args,
+        call.span,
+        call_id,
+        CallForm::Normal,
+        expected,
+        tc,
+    )
 }
 
 fn check_callable_call(

@@ -201,6 +201,59 @@ fn function_enum_return_origin() {
 }
 
 #[test]
+fn imported_enum_pattern_origin() {
+    let root = "
+        import colors { Color };
+        fn use_it(c: Color) -> int { match c { Color.Red => 1, Color.Green => 2 } }
+    ";
+    let modules = [("colors", "pub enum Color { Red, Green }")];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn reexported_enum_pattern_origin() {
+    let root = "
+        import facade { Color };
+        fn use_it(c: Color) -> int { match c { Color.Red => 1, Color.Green => 2 } }
+    ";
+    let modules = [
+        ("colors", "pub enum Color { Red, Green }"),
+        ("facade", "pub import colors { Color };"),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn transitive_return_enum_pattern_origin() {
+    let root = "
+        import lib { color };
+        fn use_it() -> int { match color() { Color.Red => 1, Color.Green => 2 } }
+    ";
+    let modules = [
+        ("colors", "pub enum Color { Red, Green }"),
+        (
+            "lib",
+            "import colors { Color }; pub fn color() -> Color { Color.Red }",
+        ),
+    ];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
+fn imported_enum_payload_pattern_origin() {
+    let root = "
+        import messages { Message };
+        fn use_it(m: Message) -> int { match m { Message.Data(x) => x, Message.Empty => 0 } }
+    ";
+    let modules = [("messages", "pub enum Message { Data(int), Empty }")];
+
+    assert_ty_named(root, &modules, Type::Int);
+}
+
+#[test]
 fn selective_imported_dataref() {
     let dep = "pub dataref Vec2 { x: float, y: float }";
     let root = "

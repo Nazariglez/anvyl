@@ -752,7 +752,6 @@ pub(crate) struct MethodSchema {
 
 #[derive(Clone)]
 pub(crate) struct EnumSchema {
-    pub(crate) key: NominalKey,
     pub(crate) generics: GenericParams,
     pub(crate) variants: HashMap<Ident, VariantSchema>,
 }
@@ -1235,7 +1234,6 @@ impl DeclarationIndex {
                         self.enums.insert(
                             key.clone(),
                             EnumSchema {
-                                key,
                                 generics: generic_params(&enm.type_params, &enm.const_params),
                                 variants,
                             },
@@ -2133,21 +2131,34 @@ impl DeclarationIndex {
                 .map(|ty| self.finalize_type_ref(module, generics, ty))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Type::Tuple),
-            Type::Nominal(nominal) => Ok(Type::nominal_with_origin(
-                nominal.kind,
-                nominal.name,
-                nominal
+            Type::Nominal(nominal) => {
+                let type_args = nominal
                     .type_args
                     .iter()
                     .map(|ty| self.finalize_type_ref(module, generics, ty))
-                    .collect::<Result<_, _>>()?,
-                nominal
+                    .collect::<Result<Vec<_>, _>>()?;
+                let const_args = nominal
                     .const_args
                     .iter()
                     .map(|arg| Self::finalize_const_arg(generics, arg))
-                    .collect::<Result<_, _>>()?,
-                nominal.origin.clone(),
-            )),
+                    .collect::<Result<Vec<_>, _>>()?;
+                if nominal.kind == NominalKind::Enum
+                    && nominal.origin.is_none()
+                    && nominal.name.0.as_ref() == Type::OPTION_ENUM_NAME
+                    && let Some(key) = self
+                        .resolve_visible_type_key(module, None, nominal.name)
+                        .filter(|key| key.kind == NominalKind::Enum)
+                {
+                    return Ok(nominal_type_with_args(&key, &type_args, &const_args));
+                }
+                Ok(Type::nominal_with_origin(
+                    nominal.kind,
+                    nominal.name,
+                    type_args,
+                    const_args,
+                    nominal.origin.clone(),
+                ))
+            }
             Type::List { elem } => Ok(Type::List {
                 elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
             }),

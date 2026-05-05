@@ -5,7 +5,7 @@ use super::support::{
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
-        CallTarget, GenericArgs, MemberAccessKind, TypeError, TypecheckResult,
+        CallTarget, GenericArgs, MemberAccessKind, TypeError, TypecheckResult, VariantShape,
         decls::{CallableId, ExtendId, ModuleScope, NominalKey, VariantSchema},
     },
 };
@@ -537,6 +537,20 @@ mod method_calls {
     }
 
     #[test]
+    fn collection_pop_not_builtin() {
+        assert_single_error("fn main() { let xs = [1]; xs.pop(); }", |err| {
+            matches!(
+                err,
+                TypeError::MemberAccessOnNonAggregate {
+                    member,
+                    kind: MemberAccessKind::Method,
+                    ..
+                } if *member == Ident::new("pop")
+            )
+        });
+    }
+
+    #[test]
     fn unknown_enum_variant_call() {
         assert_single_error("enum Color { Red } fn main() { Color.Yellow(); }", |err| {
             matches!(
@@ -548,6 +562,46 @@ mod method_calls {
                 } if *enum_name == Ident::new("Color") && *variant == Ident::new("Yellow")
             )
         });
+    }
+
+    #[test]
+    fn enum_struct_literal() {
+        assert_ty(
+            "enum Event { Move { dx: int, dy: int } } fn main() { let e = Event.Move { dx: 1, dy: 2 }; e; }",
+            nominal(NominalKind::Enum, "Event", vec![], None),
+        );
+    }
+
+    #[test]
+    fn enum_struct_unknown_field() {
+        let errors = errors("enum Event { Move { dx: int } } fn main() { Event.Move { dz: 1 }; }");
+        assert!(errors.iter().any(|err| {
+            matches!(err, TypeError::UnknownVariantField { field, .. } if *field == Ident::new("dz"))
+        }));
+    }
+
+    #[test]
+    fn enum_struct_missing_field() {
+        assert_single_error(
+            "enum Event { Move { dx: int, dy: int } } fn main() { Event.Move { dx: 1 }; }",
+            |err| matches!(err, TypeError::MissingVariantField { field, .. } if *field == Ident::new("dy")),
+        );
+    }
+
+    #[test]
+    fn enum_struct_on_tuple() {
+        assert_single_error(
+            "enum Event { Move(int) } fn main() { Event.Move { dx: 1 }; }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::EnumVariantShapeMismatch {
+                        expected: VariantShape::Struct,
+                        ..
+                    }
+                )
+            },
+        );
     }
 
     #[test]
@@ -1308,17 +1362,17 @@ mod enum_variants {
     }
 
     #[test]
-    fn enum_tuple_variant_wrong_args() {
+    fn tuple_variant_wrong_args() {
         assert_err("enum Color { Rgb(int, int, int) } fn main() { Color.Rgb(1, 2); }");
     }
 
     #[test]
-    fn enum_tuple_variant_type_mismatch() {
+    fn tuple_variant_type_mismatch() {
         assert_err("enum Color { Rgb(int, int, int) } fn main() { Color.Rgb(1, 2, true); }");
     }
 
     #[test]
-    fn enum_unit_variant_no_args() {
+    fn unit_variant_no_args() {
         assert_ty(
             "enum Color { Red } fn main() { Color.Red(); }",
             color_type(),
@@ -1331,7 +1385,7 @@ mod enum_variants {
     }
 
     #[test]
-    fn enum_unit_variant_via_variable() {
+    fn unit_variant_via_variable() {
         assert_ty(
             "enum Color { Red, Blue } fn main() { let c = Color.Red; c; }",
             color_type(),
@@ -1399,6 +1453,14 @@ mod enum_variants {
     fn unit_expected_return() {
         assert_ty(
             "enum Option<T> { Some(T), None } fn main() -> Option<int> { Option.None() }",
+            option_type(Type::Int),
+        );
+    }
+
+    #[test]
+    fn unit_expected_binding() {
+        assert_ty(
+            "enum Option<T> { Some(T), None } fn main() -> Option<int> { let x: Option<int> = Option.None; x }",
             option_type(Type::Int),
         );
     }
