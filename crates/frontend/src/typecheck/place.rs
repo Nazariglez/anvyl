@@ -91,16 +91,21 @@ pub(super) struct ExternFieldPlace<'a> {
     pub(super) access: PlaceAccess,
 }
 
+pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
+    let place = check_place(expr, tc);
+    if place.value.access != PlaceAccess::Mutable {
+        tc.push_error(TypeError::VarPatternRequiresMutablePlace { span: expr.span });
+    }
+    record_value_read(expr.node.id, &place.value, tc);
+    place.value.checked
+}
+
 pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     if let ExprKind::Ident(name) = &expr.node.kind
         && let Some(info) = tc.lookup(*name).cloned()
     {
         let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
-        let access = if info.mutable {
-            PlaceAccess::Mutable
-        } else {
-            PlaceAccess::Immutable
-        };
+        let access = info.kind.place_access();
         return CheckedPlace::new(checked, access);
     }
 
@@ -134,6 +139,28 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
             ));
             place.accepts_extern_any = contains_any;
             return place;
+        }
+
+        if let Some(key) = tc.decls.key_for_type(&receiver.value.checked.ty) {
+            if let Some(ty) = tc
+                .decls
+                .aggregate_field_type(&receiver.value.checked.ty, field.node.field)
+            {
+                let checked = super::checked_from_type(expr, ty, tc);
+                let access = projected_field_access(receiver.value.access);
+                let mut place = CheckedPlace::new(checked, access);
+                place.value.facts = receiver.value.facts;
+                return place;
+            }
+
+            tc.push_error(TypeError::UnknownMember {
+                ty: nominal_type(&key),
+                member: field.node.field,
+                kind: MemberAccessKind::Field,
+                span: field.span,
+            });
+            let checked = super::checked_from_type(expr, Type::Infer, tc);
+            return CheckedPlace::new(checked, PlaceAccess::NotPlace);
         }
     }
 
@@ -222,7 +249,18 @@ impl CheckedPlace {
     }
 }
 
-fn extern_field_access(receiver_access: PlaceAccess, field_access: FieldAccess) -> PlaceAccess {
+pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAccess {
+    match receiver_access {
+        PlaceAccess::Mutable => PlaceAccess::Mutable,
+        PlaceAccess::NotPlace => PlaceAccess::NotPlace,
+        PlaceAccess::Settable | PlaceAccess::Immutable => PlaceAccess::Immutable,
+    }
+}
+
+pub(super) fn extern_field_access(
+    receiver_access: PlaceAccess,
+    field_access: FieldAccess,
+) -> PlaceAccess {
     match (receiver_access, field_access) {
         (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: false }) => PlaceAccess::Mutable,
         (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: true }) => PlaceAccess::Settable,

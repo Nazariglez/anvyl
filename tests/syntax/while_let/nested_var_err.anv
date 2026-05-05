@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: `var` is only allowed before the whole pattern
+// @frontend: new
+
+fn main() {
+    var opt: int? = 42;
+    while let var value? = opt {
+        println(value);
+    }
+}

@@ -876,6 +876,31 @@ mod tests {
     }
 
     #[test]
+    fn pattern_head_var() {
+        for (source, expected) in [
+            (
+                "fn f(x: int?) { if var val? = x { val = 1; } }",
+                "if var val? = x {",
+            ),
+            (
+                "fn f(x: int?) { while var val? = x { val = 1; break; } }",
+                "while var val? = x {",
+            ),
+            (
+                "fn f(x: int?) { var val? = x else { return; } val = 1; }",
+                "var val? = x else {",
+            ),
+            (
+                "fn f(x: int?) { match var x { Option.Some(v) => { v = 1; }, Option.None => {} } }",
+                "match var x {",
+            ),
+        ] {
+            let formatted = format_source(source).expect("format failed");
+            assert!(formatted.contains(expected));
+        }
+    }
+
+    #[test]
     fn expr_match() {
         let source = r#"fn f(x: int) -> string { match x { 1 => "one", _ => "other" } }"#;
         let formatted = format_source(source).expect("format failed");

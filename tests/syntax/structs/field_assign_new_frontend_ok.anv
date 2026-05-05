@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn main() {
+    var p = Point { x: 1, y: 2 };
+    p.x = 3;
+}

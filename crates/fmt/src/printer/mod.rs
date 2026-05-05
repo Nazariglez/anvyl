@@ -108,6 +108,13 @@ impl<'a> Printer<'a> {
         }
     }
 
+    fn format_pattern_head(&mut self, head: ast::PatternHead) {
+        self.write(match head {
+            ast::PatternHead::Let => "let",
+            ast::PatternHead::Var => "var",
+        });
+    }
+
     fn indent(&mut self) {
         self.indent += 1;
     }

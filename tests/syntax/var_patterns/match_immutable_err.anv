@@ -1,13 +1,14 @@
 // @mode: check
 // @expect: error
-// @contains: mutable
+// @contains: var pattern requires a mutable place
+// @frontend: new
 
 enum Color { Red, Green, Blue }
 
 fn main() {
     let c = Color.Red;
-    match c {
+    match var c {
         Color.Red => { println("red"); },
-        var other => { println("other"); },
+        other => { println("other"); },
     }
 }

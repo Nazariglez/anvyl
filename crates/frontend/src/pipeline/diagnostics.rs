@@ -379,6 +379,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::RequiresMutablePlace { name, .. } => {
             format!("cannot mutably borrow non-storage place '{name}'")
         }
+        TypeError::VarPatternRequiresMutablePlace { .. } => {
+            "var pattern requires a mutable place".to_string()
+        }
         TypeError::InvalidOperand {
             op, operand_type, ..
         } => format!("Invalid operand type: operator '{op}' cannot be applied to '{operand_type}'"),

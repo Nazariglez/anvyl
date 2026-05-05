@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: `var` is only allowed before the whole pattern
+// @frontend: new
+
+fn main() {
+    var opt: int? = 42;
+    let var value? = opt else { return; }
+    println(value);
+}

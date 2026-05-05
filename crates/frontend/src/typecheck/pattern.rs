@@ -20,6 +20,12 @@ pub(crate) enum Refutability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PatternBindMode {
+    Owned { mutable: bool },
+    Alias,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PatternContext {
     Binding,
     For,
@@ -74,24 +80,26 @@ struct PatternChecker<'tc> {
     tc: &'tc mut TypeChecker,
     extern_site: Option<ExprId>,
     context: PatternContext,
+    mode: PatternBindMode,
 }
 
 impl<'tc> PatternChecker<'tc> {
-    fn new(tc: &'tc mut TypeChecker, extern_site: Option<ExprId>, context: PatternContext) -> Self {
+    fn new(
+        tc: &'tc mut TypeChecker,
+        extern_site: Option<ExprId>,
+        context: PatternContext,
+        mode: PatternBindMode,
+    ) -> Self {
         Self {
             tc,
             extern_site,
             context,
+            mode,
         }
     }
 
-    fn check_root(
-        &mut self,
-        pattern: &PatternNode,
-        expected: &Type,
-        mutable: bool,
-    ) -> PatternOutcome {
-        let mut outcome = self.check(pattern, expected, mutable);
+    fn check_root(&mut self, pattern: &PatternNode, expected: &Type) -> PatternOutcome {
+        let mut outcome = self.check(pattern, expected, PlaceAccess::Mutable);
         self.apply_context_policy(pattern, expected, &mut outcome);
         outcome
     }
@@ -101,11 +109,15 @@ impl<'tc> PatternChecker<'tc> {
         pattern: &PatternNode,
         expected_handle: TypeHandle,
         expected_ty: Type,
-        mutable: bool,
     ) -> PatternOutcome {
         let mut outcome = match &pattern.node {
             Pattern::Ident(name) => {
-                self.tc.define(*name, expected_ty.clone(), mutable);
+                self.define_ident(
+                    *name,
+                    expected_ty.clone(),
+                    PlaceAccess::Mutable,
+                    pattern.span,
+                );
                 if let Some(type_id) = self.tc.lookup(*name).map(|info| info.type_id) {
                     self.tc
                         .set_local_type_from_handle(type_id, expected_handle.clone());
@@ -117,7 +129,7 @@ impl<'tc> PatternChecker<'tc> {
                 }
                 PatternOutcome::irrefutable(PatternCover::CatchAll)
             }
-            _ => self.check(pattern, &expected_ty, mutable),
+            _ => self.check(pattern, &expected_ty, PlaceAccess::Mutable),
         };
         self.apply_context_policy(pattern, &expected_ty, &mut outcome);
         outcome
@@ -130,7 +142,7 @@ impl<'tc> PatternChecker<'tc> {
         outcome: &mut PatternOutcome,
     ) {
         match self.context {
-            PatternContext::IfLet | PatternContext::WhileLet
+            PatternContext::IfLet | PatternContext::WhileLet | PatternContext::LetElse
                 if expected.is_option() && outcome.refutability == Refutability::Irrefutable =>
             {
                 self.tc
@@ -146,22 +158,30 @@ impl<'tc> PatternChecker<'tc> {
         }
     }
 
-    fn check(&mut self, pattern: &PatternNode, expected: &Type, mutable: bool) -> PatternOutcome {
+    fn define_ident(&mut self, name: Ident, ty: Type, access: PlaceAccess, span: Span) {
+        if matches!(self.mode, PatternBindMode::Alias) && access != PlaceAccess::Mutable {
+            self.tc
+                .push_error(TypeError::VarPatternRequiresMutablePlace { span });
+        }
+        self.tc.define_pattern_binding(name, ty, self.mode);
+    }
+
+    fn check(
+        &mut self,
+        pattern: &PatternNode,
+        expected: &Type,
+        access: PlaceAccess,
+    ) -> PatternOutcome {
         match &pattern.node {
             Pattern::Ident(name) => {
-                self.tc.define(*name, expected.clone(), mutable);
+                self.define_ident(*name, expected.clone(), access, pattern.span);
                 PatternOutcome::irrefutable(PatternCover::CatchAll)
             }
             Pattern::Wildcard => PatternOutcome::irrefutable(PatternCover::CatchAll),
-            Pattern::VarIdent(_) => {
-                let mut outcome = self.unsupported(pattern);
-                outcome.refutability = Refutability::Irrefutable;
-                outcome
-            }
-            Pattern::Tuple(elems) => self.check_tuple(elems, pattern.span, expected, mutable),
+            Pattern::Tuple(elems) => self.check_tuple(elems, pattern.span, expected, access),
             Pattern::Lit(lit) => self.check_lit(pattern.span, lit, expected),
             Pattern::Nil => self.check_nil(pattern.span, expected),
-            Pattern::Optional(inner) => self.check_optional(inner, expected, mutable),
+            Pattern::Optional(inner) => self.check_optional(inner, expected, access),
             Pattern::Range { start, end, .. } => {
                 self.check_range(pattern.span, start.clone(), end.clone(), expected)
             }
@@ -172,7 +192,7 @@ impl<'tc> PatternChecker<'tc> {
             }
             Pattern::Rest => self.unsupported_named("..", pattern.span),
             Pattern::Struct { name, fields } => {
-                self.check_struct(*name, fields, pattern.span, expected, mutable)
+                self.check_struct(*name, fields, pattern.span, expected, access)
             }
             Pattern::EnumUnit { qualifier, variant } => {
                 self.check_enum_unit(Some(*qualifier), *variant, pattern.span, expected)
@@ -190,10 +210,10 @@ impl<'tc> PatternChecker<'tc> {
                 fields,
                 pattern.span,
                 expected,
-                mutable,
+                access,
             ),
             Pattern::InferredEnumTuple { variant, fields } => {
-                self.check_enum_tuple(None, *variant, fields, pattern.span, expected, mutable)
+                self.check_enum_tuple(None, *variant, fields, pattern.span, expected, access)
             }
             Pattern::EnumStruct {
                 qualifier,
@@ -207,7 +227,7 @@ impl<'tc> PatternChecker<'tc> {
                 *has_rest,
                 pattern.span,
                 expected,
-                mutable,
+                access,
             ),
             Pattern::InferredEnumStruct {
                 variant,
@@ -220,7 +240,7 @@ impl<'tc> PatternChecker<'tc> {
                 *has_rest,
                 pattern.span,
                 expected,
-                mutable,
+                access,
             ),
         }
     }
@@ -230,7 +250,7 @@ impl<'tc> PatternChecker<'tc> {
         elems: &[PatternNode],
         span: Span,
         expected: &Type,
-        mutable: bool,
+        access: PlaceAccess,
     ) -> PatternOutcome {
         let elem_tys = match expected {
             Type::Tuple(tys) => tys.clone(),
@@ -257,7 +277,7 @@ impl<'tc> PatternChecker<'tc> {
             .iter()
             .zip(elem_tys.iter())
             .map(|(elem, elem_ty)| {
-                let outcome = self.check(elem, elem_ty, mutable);
+                let outcome = self.check(elem, elem_ty, access);
                 had_error |= outcome.had_error;
                 refutability = combine_refutability(refutability, outcome.refutability);
                 outcome.cover
@@ -306,12 +326,12 @@ impl<'tc> PatternChecker<'tc> {
         &mut self,
         inner: &PatternNode,
         expected: &Type,
-        mutable: bool,
+        access: PlaceAccess,
     ) -> PatternOutcome {
         if matches!(inner.node, Pattern::Optional(_)) {
             self.tc
                 .push_error(TypeError::NestedOptionalPattern { span: inner.span });
-            self.check(inner, &Type::Infer, mutable);
+            self.check(inner, &Type::Infer, access);
             return PatternOutcome::error();
         }
         let Some(inner_ty) = expected.option_inner() else {
@@ -319,10 +339,10 @@ impl<'tc> PatternChecker<'tc> {
                 self.tc
                     .push_error(TypeError::OptionalPatternOnNonOptional { span: inner.span });
             }
-            self.check(inner, &Type::Infer, mutable);
+            self.check(inner, &Type::Infer, access);
             return PatternOutcome::error();
         };
-        let outcome = self.check(inner, inner_ty, mutable);
+        let outcome = self.check(inner, inner_ty, access);
         PatternOutcome {
             cover: self.option_cover(expected, "Some").unwrap_or(outcome.cover),
             had_error: outcome.had_error,
@@ -367,7 +387,7 @@ impl<'tc> PatternChecker<'tc> {
         fields: &[(Ident, PatternNode)],
         span: Span,
         expected: &Type,
-        mutable: bool,
+        access: PlaceAccess,
     ) -> PatternOutcome {
         let Some(key) = self.tc.resolve_visible_type_key(None, name) else {
             self.tc.push_error(TypeError::UnknownType {
@@ -375,7 +395,7 @@ impl<'tc> PatternChecker<'tc> {
                 name,
                 span,
             });
-            self.check_field_patterns(fields, mutable);
+            self.check_field_patterns(fields, access);
             return PatternOutcome::error();
         };
 
@@ -394,7 +414,7 @@ impl<'tc> PatternChecker<'tc> {
                 let Some(agg) = self.tc.decls.aggregate(&key).cloned() else {
                     return PatternOutcome::error();
                 };
-                self.check_struct_fields(fields, nominal_type(&key), &agg.fields, mutable)
+                self.check_struct_fields(fields, nominal_type(&key), &agg.fields, access)
             }
             NominalKind::Extern => {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
@@ -415,7 +435,7 @@ impl<'tc> PatternChecker<'tc> {
                         )
                     })
                     .collect();
-                self.check_struct_fields(fields, nominal_type(&key), &field_schema, mutable)
+                self.check_struct_fields(fields, nominal_type(&key), &field_schema, access)
             }
             NominalKind::Enum => self.unsupported_named("Struct", span),
         }
@@ -426,7 +446,7 @@ impl<'tc> PatternChecker<'tc> {
         fields: &[(Ident, PatternNode)],
         owner_ty: Type,
         schema: &HashMap<Ident, FieldSchema>,
-        mutable: bool,
+        access: PlaceAccess,
     ) -> PatternOutcome {
         let shape = self.check_field_shape(
             fields,
@@ -436,11 +456,12 @@ impl<'tc> PatternChecker<'tc> {
             Span::new(0, 0),
         );
         let mut had_error = shape.failed;
-        self.check_bad_field_patterns(fields, &shape, mutable);
+        self.check_bad_field_patterns(fields, &shape, access);
         for field in shape.fields {
             let pattern = &fields[field.index].1;
             self.record_extern_field_read(field.name, pattern, &owner_ty);
-            had_error |= self.check(pattern, &field.ty, mutable).had_error;
+            let field_access = self.struct_field_access(&owner_ty, field.name, access);
+            had_error |= self.check(pattern, &field.ty, field_access).had_error;
         }
         PatternOutcome {
             cover: PatternCover::CatchAll,
@@ -449,9 +470,9 @@ impl<'tc> PatternChecker<'tc> {
         }
     }
 
-    fn check_field_patterns(&mut self, fields: &[(Ident, PatternNode)], mutable: bool) {
+    fn check_field_patterns(&mut self, fields: &[(Ident, PatternNode)], access: PlaceAccess) {
         for (_, pattern) in fields {
-            self.check(pattern, &Type::Infer, mutable);
+            self.check(pattern, &Type::Infer, access);
         }
     }
 
@@ -459,13 +480,33 @@ impl<'tc> PatternChecker<'tc> {
         &mut self,
         fields: &[(Ident, PatternNode)],
         shape: &field_check::FieldShape,
-        mutable: bool,
+        access: PlaceAccess,
     ) {
         for (index, (_, pattern)) in fields.iter().enumerate() {
             if shape.fields.iter().all(|field| field.index != index) {
-                self.check(pattern, &Type::Infer, mutable);
+                self.check(pattern, &Type::Infer, access);
             }
         }
+    }
+
+    fn struct_field_access(
+        &self,
+        owner_ty: &Type,
+        field_name: Ident,
+        receiver_access: PlaceAccess,
+    ) -> PlaceAccess {
+        if let Some(owner) = self.tc.extern_type_id(owner_ty) {
+            let Some((_, decl)) = self.tc.extern_field(owner, field_name) else {
+                return PlaceAccess::NotPlace;
+            };
+            return place::extern_field_access(receiver_access, decl.access);
+        }
+
+        if self.tc.decls.key_for_type(owner_ty).is_some() {
+            return place::projected_field_access(receiver_access);
+        }
+
+        receiver_access
     }
 
     fn check_field_shape(
@@ -519,17 +560,17 @@ impl<'tc> PatternChecker<'tc> {
         fields: &[PatternNode],
         span: Span,
         expected: &Type,
-        mutable: bool,
+        access: PlaceAccess,
     ) -> PatternOutcome {
         let Some(resolved) =
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, expected)
         else {
-            self.check_tuple_fields_recovery(fields, mutable);
+            self.check_tuple_fields_recovery(fields, access);
             return PatternOutcome::error();
         };
         let VariantSchema::Tuple(payloads) = &resolved.schema else {
             enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Tuple, span);
-            self.check_tuple_fields_recovery(fields, mutable);
+            self.check_tuple_fields_recovery(fields, access);
             return PatternOutcome::error();
         };
         if payloads.len() != fields.len() {
@@ -538,13 +579,13 @@ impl<'tc> PatternChecker<'tc> {
                 found: fields.len(),
                 span,
             });
-            self.check_tuple_fields_recovery(fields, mutable);
+            self.check_tuple_fields_recovery(fields, access);
             return PatternOutcome::error();
         }
         let mut had_error = false;
         for (field, payload) in fields.iter().zip(payloads) {
             let ty = self.payload_ty(payload, &resolved, expected, span);
-            had_error |= self.check(field, &ty, mutable).had_error;
+            had_error |= self.check(field, &ty, access).had_error;
         }
         PatternOutcome {
             cover: PatternCover::EnumVariant {
@@ -564,17 +605,17 @@ impl<'tc> PatternChecker<'tc> {
         has_rest: bool,
         span: Span,
         expected: &Type,
-        mutable: bool,
+        access: PlaceAccess,
     ) -> PatternOutcome {
         let Some(resolved) =
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, expected)
         else {
-            self.check_field_patterns(fields, mutable);
+            self.check_field_patterns(fields, access);
             return PatternOutcome::error();
         };
         let VariantSchema::Struct(schema) = &resolved.schema else {
             enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Struct, span);
-            self.check_field_patterns(fields, mutable);
+            self.check_field_patterns(fields, access);
             return PatternOutcome::error();
         };
 
@@ -589,10 +630,10 @@ impl<'tc> PatternChecker<'tc> {
             span,
         );
         let mut had_error = shape.failed;
-        self.check_bad_field_patterns(fields, &shape, mutable);
+        self.check_bad_field_patterns(fields, &shape, access);
         for field in shape.fields {
             let ty = self.payload_ty(&field.ty, &resolved, expected, span);
-            had_error |= self.check(&fields[field.index].1, &ty, mutable).had_error;
+            had_error |= self.check(&fields[field.index].1, &ty, access).had_error;
         }
         PatternOutcome {
             cover: PatternCover::EnumVariant {
@@ -604,9 +645,9 @@ impl<'tc> PatternChecker<'tc> {
         }
     }
 
-    fn check_tuple_fields_recovery(&mut self, fields: &[PatternNode], mutable: bool) {
+    fn check_tuple_fields_recovery(&mut self, fields: &[PatternNode], access: PlaceAccess) {
         for field in fields {
-            self.check(field, &Type::Infer, mutable);
+            self.check(field, &Type::Infer, access);
         }
     }
 
@@ -661,10 +702,6 @@ impl<'tc> PatternChecker<'tc> {
             .reject_extern_any_escape_fact(decl.ty.contains_any(), pattern.span);
     }
 
-    fn unsupported(&mut self, pattern: &PatternNode) -> PatternOutcome {
-        self.unsupported_named(pattern.node.variant_name(), pattern.span)
-    }
-
     fn unsupported_named(&mut self, pattern: &'static str, span: Span) -> PatternOutcome {
         self.tc
             .push_error(TypeError::UnsupportedPattern { pattern, span });
@@ -675,37 +712,36 @@ impl<'tc> PatternChecker<'tc> {
 pub(super) fn check(
     pattern: &PatternNode,
     expected: &Type,
-    mutable: bool,
+    mode: PatternBindMode,
     context: PatternContext,
     tc: &mut TypeChecker,
 ) -> PatternOutcome {
-    PatternChecker::new(tc, None, context).check_root(pattern, expected, mutable)
+    PatternChecker::new(tc, None, context, mode).check_root(pattern, expected)
 }
 
 pub(super) fn check_at(
     pattern: &PatternNode,
     expected: &Type,
-    mutable: bool,
+    mode: PatternBindMode,
     site: ExprId,
     context: PatternContext,
     tc: &mut TypeChecker,
 ) -> PatternOutcome {
-    PatternChecker::new(tc, Some(site), context).check_root(pattern, expected, mutable)
+    PatternChecker::new(tc, Some(site), context, mode).check_root(pattern, expected)
 }
 
 pub(super) fn check_handle_at(
     pattern: &PatternNode,
     expected_handle: TypeHandle,
     expected_ty: Type,
-    mutable: bool,
+    mode: PatternBindMode,
     site: ExprId,
     context: PatternContext,
     tc: &mut TypeChecker,
 ) -> PatternOutcome {
-    PatternChecker::new(tc, Some(site), context).check_from_handle_root(
+    PatternChecker::new(tc, Some(site), context, mode).check_from_handle_root(
         pattern,
         expected_handle,
         expected_ty,
-        mutable,
     )
 }

@@ -2243,6 +2243,29 @@ mod compound {
     }
 
     #[test]
+    fn records_user_field_writes_through_extern_field() {
+        for (body, reads, writes) in [
+            ("holder.point.x = 1.0;", 0, 1),
+            ("holder.point.x += 1.0;", 1, 1),
+        ] {
+            let result = check(&format!(
+                r"
+                struct Point {{ x: float }}
+                extern type Holder {{ var point: Point; }}
+                fn write(var holder: Holder) {{ {body} }}
+                "
+            ))
+            .expect("typecheck failed");
+            let owner = catalog_type(&result, ModuleScope::Root, "Holder");
+            let field = catalog_field(&result, owner, "point");
+
+            assert_use_count(&result, ExternUseTarget::FieldRead(field), reads);
+            assert_use_count(&result, ExternUseTarget::FieldWrite(field), writes);
+            assert_use_total(&result, reads + writes);
+        }
+    }
+
+    #[test]
     fn rejects_computed_readonly_write() {
         let errors = expect_type_errors(check(
             r"

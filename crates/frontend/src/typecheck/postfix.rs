@@ -117,11 +117,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
             }
             if let Some(info) = tc.lookup(*name).cloned() {
                 let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
-                let access = if info.mutable {
-                    PlaceAccess::Mutable
-                } else {
-                    PlaceAccess::Immutable
-                };
+                let access = info.kind.place_access();
                 return Some(Subject::Value(PlaceValue {
                     checked,
                     access,

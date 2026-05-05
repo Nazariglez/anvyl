@@ -10,6 +10,14 @@ use crate::{
     span::{Span, Spanned},
 };
 
+pub(super) fn let_or_var_head<'src>() -> BoxedParser<'src, ast::PatternHead> {
+    select! {
+        (Token::Keyword(Keyword::Let), _) => ast::PatternHead::Let,
+        (Token::Keyword(Keyword::Var), _) => ast::PatternHead::Var,
+    }
+    .boxed()
+}
+
 pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
     recursive(|pat| {
         let ident_or_wildcard = identifier().map_with(|ident, e| {
@@ -30,10 +38,14 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
             (Token::Keyword(Keyword::Var), _) => ()
         }
         .ignore_then(identifier())
-        .map_with(|name, e| {
+        .validate(|name, e, emitter| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
-            Spanned::new(ast::Pattern::VarIdent(name), span)
+            emitter.emit(Rich::custom(
+                s,
+                "`var` is only allowed before the whole pattern",
+            ));
+            Spanned::new(ast::Pattern::Ident(name), span)
         });
 
         let nil_pat = select! {

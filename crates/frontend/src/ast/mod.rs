@@ -1027,6 +1027,7 @@ pub struct Ternary {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfLet {
+    pub head: PatternHead,
     pub pattern: PatternNode,
     pub value: Box<ExprNode>,
     pub then_block: BlockNode,
@@ -1041,6 +1042,7 @@ pub struct While {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhileLet {
+    pub head: PatternHead,
     pub pattern: PatternNode,
     pub value: ExprNode,
     pub body: BlockNode,
@@ -1057,6 +1059,7 @@ pub struct For {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
+    pub head: PatternHead,
     pub scrutinee: Box<ExprNode>,
     pub arms: Vec<MatchArmNode>,
 }
@@ -1178,6 +1181,12 @@ pub struct IntrinsicCall {
     pub args: Vec<ExprNode>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternHead {
+    Let,
+    Var,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Ident(Ident),
@@ -1220,7 +1229,6 @@ pub enum Pattern {
         inclusive: bool,
     },
     Lit(Lit),
-    VarIdent(Ident),
     Rest,
     Nil,
     Optional(Box<PatternNode>),
@@ -1242,7 +1250,6 @@ impl Pattern {
             Self::InferredEnumStruct { .. } => "InferredEnumStruct",
             Self::Range { .. } => "range",
             Self::Lit(_) => "literal",
-            Self::VarIdent(_) => "var binding",
             Self::Rest => "..",
             Self::Nil => "nil",
             Self::Optional(_) => "optional pattern",
@@ -1261,6 +1268,7 @@ pub struct Binding {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LetElse {
+    pub head: PatternHead,
     pub pattern: PatternNode,
     pub value: ExprNode,
     pub else_block: BlockNode,

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: cannot assign to immutable value
+// @frontend: new
+
+fn main() {
+    var opt: int? = 42;
+    match opt {
+        Option.Some(value) => { value = 1; },
+        Option.None => {},
+    }
+}

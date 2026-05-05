@@ -1,4 +1,4 @@
-use super::helpers::{parse_program, parse_program_err};
+use super::helpers::{parse_expr, parse_program, parse_program_err};
 use crate::ast::{
     self, BinaryOp, ExternFieldAccess, ExternReceiverMode, ExternTypeRep, MethodReceiver,
     Mutability, NominalKind, Type,
@@ -16,10 +16,58 @@ fn while_let() {
     let ast::Stmt::WhileLet(while_let_node) = &body_stmts[0].node else {
         panic!("expected WhileLet");
     };
+    assert!(matches!(while_let_node.node.head, ast::PatternHead::Let));
     assert!(matches!(
         &while_let_node.node.pattern.node,
         ast::Pattern::EnumTuple { .. }
     ));
+}
+
+#[test]
+fn while_var() {
+    let prog = parse_program("fn main() { while var x? = opt {} }");
+    let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    let ast::Stmt::WhileLet(while_let_node) = &func_node.node.body.node.stmts[0].node else {
+        panic!("expected WhileLet");
+    };
+    assert!(matches!(while_let_node.node.head, ast::PatternHead::Var));
+}
+
+#[test]
+fn let_else_var() {
+    let prog = parse_program("fn main() { var x? = opt else { return; } }");
+    let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    let ast::Stmt::LetElse(let_else_node) = &func_node.node.body.node.stmts[0].node else {
+        panic!("expected LetElse");
+    };
+    assert!(matches!(let_else_node.node.head, ast::PatternHead::Var));
+}
+
+#[test]
+fn if_var() {
+    let expr = parse_expr("if var x? = opt {}");
+    let ast::ExprKind::IfLet(if_let_node) = &expr.node.kind else {
+        panic!("expected IfLet");
+    };
+    assert!(matches!(if_let_node.node.head, ast::PatternHead::Var));
+}
+
+#[test]
+fn match_var() {
+    let expr = parse_expr("match var opt { Option.Some(x) => x, Option.None => 0 }");
+    let ast::ExprKind::Match(match_node) = &expr.node.kind else {
+        panic!("expected Match");
+    };
+    assert!(matches!(match_node.node.head, ast::PatternHead::Var));
+}
+
+#[test]
+fn match_let_head_rejected() {
+    parse_program_err("fn main() { let _ = match let opt { _ => 0 }; }");
 }
 
 #[test]

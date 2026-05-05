@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: `var` is only allowed before the whole pattern
+// @frontend: new
+
+fn main() {
+    var opt: int? = 42;
+    match opt {
+        Option.Some(var value) => { println(value); },
+        Option.None => {},
+    }
+}

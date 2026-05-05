@@ -10,8 +10,8 @@ use self::{
         GenericSolverSeeds, GenericSolverVars, LocalTypeId, Solver, SolverFinalizeError,
         SolverRelationError, TypeHandle,
     },
-    pattern::PatternContext,
-    place::{PlaceAccess, check_place},
+    pattern::{PatternBindMode, PatternContext},
+    place::{PlaceAccess, check_alias_scrutinee, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::TypeFolder,
     type_refs::{GenericParamError, GenericTypeContext},
@@ -126,6 +126,9 @@ pub(crate) enum TypeError {
     },
     RequiresMutablePlace {
         name: Ident,
+        span: Span,
+    },
+    VarPatternRequiresMutablePlace {
         span: Span,
     },
     InvalidOperand {
@@ -359,10 +362,34 @@ impl From<SolverFinalizeError> for TypeError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalBindingKind {
+    Immutable,
+    Mutable,
+    Alias,
+}
+
+impl LocalBindingKind {
+    fn from_mutable(mutable: bool) -> Self {
+        if mutable {
+            Self::Mutable
+        } else {
+            Self::Immutable
+        }
+    }
+
+    fn place_access(self) -> PlaceAccess {
+        match self {
+            Self::Immutable => PlaceAccess::Immutable,
+            Self::Mutable | Self::Alias => PlaceAccess::Mutable,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct VarInfo {
     type_id: LocalTypeId,
-    mutable: bool,
+    kind: LocalBindingKind,
     const_value: Option<ConstValue>,
 }
 
@@ -484,18 +511,26 @@ impl TypeChecker {
     }
 
     fn define(&mut self, name: Ident, ty: Type, mutable: bool) {
-        self.define_value(name, ty, mutable, None);
+        self.define_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
+    }
+
+    fn define_pattern_binding(&mut self, name: Ident, ty: Type, mode: PatternBindMode) {
+        let kind = match mode {
+            PatternBindMode::Owned { mutable } => LocalBindingKind::from_mutable(mutable),
+            PatternBindMode::Alias => LocalBindingKind::Alias,
+        };
+        self.define_value(name, ty, kind, None);
     }
 
     fn define_const(&mut self, name: Ident, ty: Type, value: ConstValue) {
-        self.define_value(name, ty, false, Some(value));
+        self.define_value(name, ty, LocalBindingKind::Immutable, Some(value));
     }
 
     fn define_value(
         &mut self,
         name: Ident,
         ty: Type,
-        mutable: bool,
+        kind: LocalBindingKind,
         const_value: Option<ConstValue>,
     ) {
         let Some(scope) = self.scopes.last() else {
@@ -514,7 +549,7 @@ impl TypeChecker {
             name,
             VarInfo {
                 type_id,
-                mutable,
+                kind,
                 const_value,
             },
         );
@@ -1963,35 +1998,69 @@ fn check_block_checked_with_hint(
     checked
 }
 
+fn mode_for_head(head: PatternHead) -> PatternBindMode {
+    match head {
+        PatternHead::Let => PatternBindMode::Owned { mutable: false },
+        PatternHead::Var => PatternBindMode::Alias,
+    }
+}
+
+fn mode_for_binding(binding: &Binding) -> PatternBindMode {
+    match binding.mutability {
+        Mutability::Immutable => PatternBindMode::Owned { mutable: false },
+        Mutability::Mutable if matches!(binding.pattern.node, Pattern::Ident(_)) => {
+            PatternBindMode::Owned { mutable: true }
+        }
+        Mutability::Mutable => PatternBindMode::Alias,
+    }
+}
+
+fn check_pattern_scrutinee(
+    expr: &ExprNode,
+    mode: PatternBindMode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match mode {
+        PatternBindMode::Owned { .. } => check_value_expr_checked_with_hint(expr, None, tc),
+        PatternBindMode::Alias => check_alias_scrutinee(expr, tc),
+    }
+}
+
 fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let binding = &binding_node.node;
-    let mutable = matches!(binding.mutability, Mutability::Mutable);
+    let mode = mode_for_binding(binding);
     match &binding.ty {
         Some(annot) => {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
-            let value =
-                check_value_expr_checked_with_hint(&binding.value, Some(annot_handle.clone()), tc);
+            let value = match mode {
+                PatternBindMode::Owned { .. } => check_value_expr_checked_with_hint(
+                    &binding.value,
+                    Some(annot_handle.clone()),
+                    tc,
+                ),
+                PatternBindMode::Alias => check_alias_scrutinee(&binding.value, tc),
+            };
             tc.reject_extern_any_escape(&value, binding.value.span);
             tc.expect_assignable(binding_node.span, value.handle, annot_handle);
             pattern::check_at(
                 &binding.pattern,
                 &annot_ty,
-                mutable,
+                mode,
                 binding.value.node.id,
                 PatternContext::Binding,
                 tc,
             );
         }
         None => {
-            let value = check_value_expr_checked_with_hint(&binding.value, None, tc);
+            let value = check_pattern_scrutinee(&binding.value, mode, tc);
             tc.reject_extern_any_escape(&value, binding.value.span);
             tc.reject_user_any_type(&value.ty, binding_node.span);
             pattern::check_handle_at(
                 &binding.pattern,
                 value.handle,
                 value.ty,
-                mutable,
+                mode,
                 binding.value.node.id,
                 PatternContext::Binding,
                 tc,
@@ -3461,7 +3530,13 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     });
 
     tc.push_scope();
-    pattern::check(&node.pattern, &item_ty, false, PatternContext::For, tc);
+    pattern::check(
+        &node.pattern,
+        &item_ty,
+        PatternBindMode::Owned { mutable: false },
+        PatternContext::For,
+        tc,
+    );
     tc.enter_loop();
     check_block_checked(&node.body, tc);
     tc.exit_loop();
@@ -3493,7 +3568,8 @@ fn iterable_item_type(ty: &Type) -> Option<Type> {
 
 fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
     let node = &let_else_node.node;
-    let value = check_expr_checked(&node.value, tc);
+    let mode = mode_for_head(node.head);
+    let value = check_pattern_scrutinee(&node.value, mode, tc);
     let saved_return_seen = tc.return_seen.last().copied();
     tc.push_scope();
     check_block_checked(&node.else_block, tc);
@@ -3512,7 +3588,7 @@ fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
         &node.pattern,
         value.handle,
         value.ty,
-        false,
+        mode,
         node.value.node.id,
         PatternContext::LetElse,
         tc,
@@ -3521,12 +3597,14 @@ fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
 
 fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
     let node = &while_let_node.node;
-    let value_ty = check_expr_checked(&node.value, tc).ty;
+    let mode = mode_for_head(node.head);
+    let value = check_pattern_scrutinee(&node.value, mode, tc);
     tc.push_scope();
-    pattern::check_at(
+    pattern::check_handle_at(
         &node.pattern,
-        &value_ty,
-        false,
+        value.handle,
+        value.ty,
+        mode,
         node.value.node.id,
         PatternContext::WhileLet,
         tc,
@@ -3543,13 +3621,14 @@ fn check_if_let_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &if_let_node.node;
-    let value = check_expr_checked(&node.value, tc);
+    let mode = mode_for_head(node.head);
+    let value = check_pattern_scrutinee(&node.value, mode, tc);
     tc.push_scope();
     pattern::check_handle_at(
         &node.pattern,
         value.handle,
         value.ty,
-        false,
+        mode,
         node.value.node.id,
         PatternContext::IfLet,
         tc,
@@ -3575,7 +3654,8 @@ fn check_match_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &match_node.node;
-    let scrutinee = check_expr_checked(&node.scrutinee, tc);
+    let mode = mode_for_head(node.head);
+    let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
     if node.arms.is_empty() {
         tc.push_error(TypeError::EmptyMatch {
             span: match_node.span,
@@ -3590,7 +3670,7 @@ fn check_match_checked_with_hint(
             &arm.node.pattern,
             scrutinee.handle.clone(),
             scrutinee.ty.clone(),
-            false,
+            mode,
             node.scrutinee.node.id,
             PatternContext::Match,
             tc,

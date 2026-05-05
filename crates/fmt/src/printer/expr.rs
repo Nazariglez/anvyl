@@ -260,7 +260,9 @@ impl Printer<'_> {
     }
 
     fn format_if_let(&mut self, il: &ast::IfLet) {
-        self.write("if let ");
+        self.write("if ");
+        self.format_pattern_head(il.head);
+        self.write(" ");
         self.format_pattern(&il.pattern.node);
         self.write(" = ");
         self.format_expr(&il.value.node);
@@ -295,6 +297,9 @@ impl Printer<'_> {
 
     fn format_match(&mut self, m: &ast::Match) {
         self.write("match ");
+        if matches!(m.head, ast::PatternHead::Var) {
+            self.write("var ");
+        }
         self.format_expr(&m.scrutinee.node);
         self.write(" {");
         self.writeln();

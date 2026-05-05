@@ -11,7 +11,7 @@ use super::{
         add_sub_op, and_op, assign_op, bit_and_op, bit_or_op, cmp_op, coalesce_op, eq_op,
         infix_left, mul_div_op, or_op, shift_op, xor_op,
     },
-    pattern::{or_pattern, pattern},
+    pattern::{let_or_var_head, or_pattern, pattern},
     types::{generic_arg, type_ident},
 };
 use crate::{
@@ -124,17 +124,18 @@ fn if_expr<'src>(
         .or_not();
 
         let if_let = select! { (Token::Keyword(Keyword::If), _) => () }
-            .ignore_then(select! { (Token::Keyword(Keyword::Let), _) => () })
-            .ignore_then(pattern())
+            .ignore_then(let_or_var_head())
+            .then(pattern())
             .then_ignore(select! { (Token::Op(Op::Assign), _) => () })
             .then(cond_expression())
             .then(block_stmt(stmt.clone(), expr.clone()))
             .then(else_branch.clone())
-            .map_with(|(((pat, value), then_block), else_block), e| {
+            .map_with(|((((head, pat), value), then_block), else_block), e| {
                 let s = e.span();
                 let span = Span::new(s.start, s.end);
                 let if_let_node = Spanned::new(
                     ast::IfLet {
+                        head,
                         pattern: pat,
                         value: Box::new(value),
                         then_block,
@@ -206,9 +207,13 @@ fn match_expr<'src>(
             });
 
     let cond_expr = cond_expression();
+    let match_head = select! { (Token::Keyword(Keyword::Var), _) => ast::PatternHead::Var }
+        .or_not()
+        .map(|head| head.unwrap_or(ast::PatternHead::Let));
 
     select! { (Token::Keyword(Keyword::Match), _) => () }
-        .ignore_then(cond_expr)
+        .ignore_then(match_head)
+        .then(cond_expr)
         .then(
             open_brace
                 .ignore_then(
@@ -219,11 +224,12 @@ fn match_expr<'src>(
                 )
                 .then_ignore(close_brace),
         )
-        .map_with(|(scrutinee, arms), e| {
+        .map_with(|((head, scrutinee), arms), e| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
             let match_node = Spanned::new(
                 ast::Match {
+                    head,
                     scrutinee: Box::new(scrutinee),
                     arms,
                 },

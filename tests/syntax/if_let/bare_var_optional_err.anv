@@ -1,10 +1,11 @@
 // @mode: check
 // @expect: error
-// @contains: requires an unwrapping pattern
+// @contains: optional value requires an unwrapping pattern
+// @frontend: new
 
 fn main() {
-    let opt: int? = 42;
-    if let var x = opt {
+    var opt: int? = 42;
+    if var x = opt {
         println(x);
     }
 }

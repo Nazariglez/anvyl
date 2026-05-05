@@ -6,10 +6,6 @@ impl Printer<'_> {
     pub(super) fn format_pattern(&mut self, pat: &ast::Pattern) {
         match pat {
             ast::Pattern::Ident(id) => self.write_fmt(id),
-            ast::Pattern::VarIdent(id) => {
-                self.write("var ");
-                self.write_fmt(id);
-            }
             ast::Pattern::Wildcard => self.write("_"),
             ast::Pattern::Nil => self.write("nil"),
             ast::Pattern::Rest => self.write(".."),

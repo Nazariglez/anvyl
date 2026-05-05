@@ -4,8 +4,7 @@
 // @frontend: new
 
 fn main() {
-    let opt: int? = 10;
-    while var n? = opt {
-        n = nil;
+    match var (1, 2) {
+        (a, b) => { a = 1; },
     }
 }

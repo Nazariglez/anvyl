@@ -1,13 +1,11 @@
 // @mode: check
 // @expect: error
-// @contains: requires an unwrapping pattern
-
-fn next() -> int? {
-    nil
-}
+// @contains: optional value requires an unwrapping pattern
+// @frontend: new
 
 fn main() {
-    while let var val = next() {
+    var opt: int? = nil;
+    while var val = opt {
         println(val);
     }
 }

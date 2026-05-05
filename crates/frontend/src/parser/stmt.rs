@@ -5,7 +5,7 @@ use super::{
     common::{block_stmt, identifier},
     decl::function,
     expr::{cond_expression, expression, for_header_expression},
-    pattern::pattern,
+    pattern::{let_or_var_head, pattern},
     types::type_ident,
 };
 use crate::{
@@ -28,18 +28,19 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let continue_s = continue_stmt();
         let defer_s = defer_stmt(stmt.clone(), expr.clone());
 
-        let let_else = select! { (Token::Keyword(Keyword::Let), _) => () }
-            .ignore_then(pattern())
+        let let_else = let_or_var_head()
+            .then(pattern())
             .then_ignore(select! { (Token::Op(Op::Assign), _) => () })
             .then(expression(stmt.clone()))
             .then_ignore(select! { (Token::Keyword(Keyword::Else), _) => () })
             .then(block_stmt(stmt.clone(), expr.clone()))
-            .map_with(|((pat, value), else_block), e| {
+            .map_with(|(((head, pat), value), else_block), e| {
                 let s = e.span();
                 let span = Span::new(s.start, s.end);
                 Spanned::new(
                     ast::Stmt::LetElse(Spanned::new(
                         ast::LetElse {
+                            head,
                             pattern: pat,
                             value,
                             else_block,
@@ -233,16 +234,17 @@ fn while_let_stmt<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
     select! { (Token::Keyword(Keyword::While), _) => () }
-        .ignore_then(select! { (Token::Keyword(Keyword::Let), _) => () })
-        .ignore_then(pattern())
+        .ignore_then(let_or_var_head())
+        .then(pattern())
         .then_ignore(select! { (Token::Op(Op::Assign), _) => () })
         .then(cond_expression())
         .then(block_stmt(stmt, expr))
-        .map_with(|((pat, value), body), e| {
+        .map_with(|(((head, pat), value), body), e| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
             let node = Spanned::new(
                 ast::WhileLet {
+                    head,
                     pattern: pat,
                     value,
                     body,

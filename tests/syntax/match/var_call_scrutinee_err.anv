@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: var pattern requires a mutable place
+// @frontend: new
+
+fn next() -> int? { return 1; }
+
+fn main() {
+    match var next() {
+        Option.Some(value) => { value = 1; },
+        Option.None => {},
+    }
+}

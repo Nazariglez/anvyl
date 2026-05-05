@@ -1,9 +1,11 @@
 // @mode: check
 // @expect: error
 // @contains: irrefutable pattern in let-else
+// @frontend: new
 
 fn main() {
-    let var x = 99 else { return; }
+    var n = 99;
+    var x = n else { return; }
     x = 100;
     println(x);
 }

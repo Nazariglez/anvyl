@@ -545,9 +545,4 @@ mod unsupported_forms {
     fn struct_pattern() {
         assert_err("fn main() { let _ = match 1 { Point { x, y } => 1 }; }");
     }
-
-    #[test]
-    fn var_ident() {
-        assert_err("fn main() { let _ = match 1 { var x => 1 }; }");
-    }
 }

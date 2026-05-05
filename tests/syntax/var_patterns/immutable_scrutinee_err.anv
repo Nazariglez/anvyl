@@ -1,10 +1,11 @@
 // @mode: check
 // @expect: error
-// @contains: mutable
+// @contains: var pattern requires a mutable place
+// @frontend: new
 
 fn main() {
     let opt: int? = 10;
-    if let Option.Some(var n) = opt {
+    if var n? = opt {
         n = 20;
     }
 }
