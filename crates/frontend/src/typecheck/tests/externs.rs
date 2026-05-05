@@ -2624,7 +2624,7 @@ mod provider_imports {
             import ext:api { provider_tick };
             fn use_it() { source_tick(); provider_tick(); }
             ",
-            &[("api", "extern fn source_tick();")],
+            &[("api", "pub extern fn source_tick();")],
             provider(ExternModuleDescriptor {
                 path: extern_path(&["api"]),
                 types: vec![],
@@ -3045,7 +3045,10 @@ mod named_modules {
     fn catalog() {
         let result = check_named(
             "import math { Vec2, dot }; fn use_it(v: Vec2) -> float { dot(v) }",
-            &[("math", "extern fn dot(v: Vec2) -> float; extern type Vec2;")],
+            &[(
+                "math",
+                "pub extern fn dot(v: Vec2) -> float; pub extern type Vec2;",
+            )],
         )
         .expect("typecheck failed");
         let dot = result
@@ -3074,7 +3077,7 @@ mod named_modules {
                 "math",
                 r"
                 extern fn tick(p: Point);
-                extern type Point {
+                pub extern type Point {
                     init;
                     x: float;
                     fn shift(var self, delta: Point);

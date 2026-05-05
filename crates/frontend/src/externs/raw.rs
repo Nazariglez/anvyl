@@ -84,6 +84,7 @@ pub(crate) struct RawExternModule {
 pub(crate) struct RawExternType {
     pub name: String,
     pub doc: Option<String>,
+    pub exported: bool,
     pub rep: ExternRep,
     pub fields: Vec<RawExternField>,
     pub init: Option<RawExternInit>,
@@ -96,6 +97,7 @@ pub(crate) struct RawExternType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawExternFunction {
     pub decl: ExternFunctionDescriptor,
+    pub exported: bool,
     pub site: RawExternSite,
 }
 

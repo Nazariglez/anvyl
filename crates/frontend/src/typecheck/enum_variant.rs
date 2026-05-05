@@ -151,3 +151,20 @@ pub(super) fn push_shape_mismatch(
         span,
     });
 }
+
+pub(super) fn push_arg_count_mismatch(
+    tc: &mut TypeChecker,
+    enum_name: Ident,
+    variant: Ident,
+    expected: usize,
+    found: usize,
+    span: Span,
+) {
+    tc.push_error(TypeError::EnumVariantArgCount {
+        enum_name,
+        variant,
+        expected,
+        found,
+        span,
+    });
+}

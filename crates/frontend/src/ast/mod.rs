@@ -563,7 +563,7 @@ impl Display for Type {
             Self::List { elem } => write!(f, "[{elem}]"),
             Self::Array { elem, len } => write!(f, "[{elem}; {len}]"),
             Self::Map { key, value } => write!(f, "[{key}: {value}]"),
-            Self::Slice { elem } => write!(f, "[{elem}; _]"),
+            Self::Slice { elem } => write!(f, "slice[{elem}]"),
         }
     }
 }
@@ -589,6 +589,26 @@ pub enum BinaryOp {
     Shl,
     Shr,
     Coalesce,
+}
+
+impl BinaryOp {
+    pub fn precedence(self) -> ExprPrecedence {
+        match self {
+            Self::Mul | Self::Div | Self::Rem => ExprPrecedence::Multiplicative,
+            Self::Add | Self::Sub => ExprPrecedence::Additive,
+            Self::Shl | Self::Shr => ExprPrecedence::Shift,
+            Self::LessThan | Self::GreaterThan | Self::LessThanEq | Self::GreaterThanEq => {
+                ExprPrecedence::Comparison
+            }
+            Self::Eq | Self::NotEq => ExprPrecedence::Equality,
+            Self::BitAnd => ExprPrecedence::BitAnd,
+            Self::Xor => ExprPrecedence::Xor,
+            Self::BitOr => ExprPrecedence::BitOr,
+            Self::And => ExprPrecedence::LogicalAnd,
+            Self::Coalesce => ExprPrecedence::Coalesce,
+            Self::Or => ExprPrecedence::LogicalOr,
+        }
+    }
 }
 
 impl Display for BinaryOp {
@@ -717,6 +737,7 @@ pub struct Block {
 pub struct ExternFunc {
     pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
+    pub visibility: Visibility,
     pub name: Ident,
     pub params: Vec<Param>,
     pub ret: Type,
@@ -726,6 +747,7 @@ pub struct ExternFunc {
 pub struct ExternType {
     pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
+    pub visibility: Visibility,
     pub name: Ident,
     pub rep: ExternTypeRep,
     pub init: Option<ExternInit>,
@@ -1279,6 +1301,44 @@ pub struct LetElse {
     pub else_block: BlockNode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExprPrecedence {
+    Lowest,
+    Assignment,
+    Ternary,
+    LogicalOr,
+    Coalesce,
+    LogicalAnd,
+    BitOr,
+    Xor,
+    BitAnd,
+    Equality,
+    Comparison,
+    Shift,
+    Range,
+    Additive,
+    Multiplicative,
+    Cast,
+    Prefix,
+    Postfix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExprChildSide {
+    Left,
+    Right,
+}
+
+pub fn expr_needs_parens(child: &Expr, parent: ExprPrecedence, side: ExprChildSide) -> bool {
+    let Some(child) = child.precedence() else {
+        return false;
+    };
+    match side {
+        ExprChildSide::Left => child < parent,
+        ExprChildSide::Right => child <= parent,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub id: ExprId,
@@ -1288,6 +1348,10 @@ pub struct Expr {
 impl Expr {
     pub fn new(kind: ExprKind, id: ExprId) -> Self {
         Self { id, kind }
+    }
+
+    pub fn precedence(&self) -> Option<ExprPrecedence> {
+        self.kind.precedence()
     }
 }
 
@@ -1322,6 +1386,18 @@ pub enum ExprKind {
 }
 
 impl ExprKind {
+    pub fn precedence(&self) -> Option<ExprPrecedence> {
+        match self {
+            Self::Binary(node) => Some(node.node.op.precedence()),
+            Self::Range(_) => Some(ExprPrecedence::Range),
+            Self::Cast(_) => Some(ExprPrecedence::Cast),
+            Self::Unary(_) | Self::Try(_) => Some(ExprPrecedence::Prefix),
+            Self::Ternary(_) => Some(ExprPrecedence::Ternary),
+            Self::Assign(_) => Some(ExprPrecedence::Assignment),
+            _ => None,
+        }
+    }
+
     pub fn variant_name(&self) -> &'static str {
         match self {
             Self::Ident(_) => "Ident",

@@ -117,6 +117,7 @@ impl Printer<'_> {
         self.format_annotations(&ef.annotations);
         self.format_doc_comment(ef.doc.as_ref());
         self.write_indent();
+        self.format_visibility(ef.visibility);
         self.write("extern fn ");
         self.write_fmt(ef.name);
         self.format_param_list(&ef.params);
@@ -227,6 +228,7 @@ impl Printer<'_> {
         self.format_annotations(&et.annotations);
         self.format_doc_comment(et.doc.as_ref());
         self.write_indent();
+        self.format_visibility(et.visibility);
         self.write("extern type ");
         self.write_fmt(et.name);
         if et.init.is_none() && et.members.is_empty() {

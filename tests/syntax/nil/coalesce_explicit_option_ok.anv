@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let a: Option<int> = Option.Some(1);
+    let b: int = a ?? 2;
+
+    let c: Option<string> = Option.None;
+    let d: string = c ?? "fallback";
+}

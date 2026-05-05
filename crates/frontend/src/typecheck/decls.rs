@@ -277,6 +277,11 @@ fn package_for_scope(scope: &ModuleScope) -> PackageId {
     }
 }
 
+fn core_module_scope(segment: &str) -> ModuleScope {
+    let path = ModulePath::new(vec![segment.to_string()]).expect("core module segment is valid");
+    ModuleScope::Package(ModuleId::named(PackageId::core(), path))
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DeclarationIndex {
     modules: HashMap<ModuleScope, ModuleDecls>,
@@ -303,6 +308,12 @@ pub(crate) struct Namespace {
 }
 
 pub(crate) type ModuleExports = Namespace;
+
+pub(crate) enum ModuleMemberLookup<T> {
+    Found(T),
+    Private,
+    Missing,
+}
 
 type OriginKey = (BindingNamespace, Ident);
 
@@ -514,7 +525,9 @@ impl ImportScopeBuilder {
         if found || !validate_members {
             return;
         }
-        if dep.locals.contains_member(source_name) {
+        if dep.locals.contains_member(source_name)
+            || dep.imports.namespace.contains_member(source_name)
+        {
             self.push_private_member(origin_module.clone(), source_name, span);
         } else {
             self.push_missing_member(origin_module.clone(), source_name, span);
@@ -705,6 +718,7 @@ pub(crate) struct FuncSig {
     pub(crate) kind: CallableKind,
     pub(crate) generics: GenericParams,
     pub(crate) ty: Type,
+    pub(crate) required_params: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -712,6 +726,7 @@ pub(crate) struct CallableSig {
     pub(crate) owner_generics: GenericParams,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
+    pub(crate) required_params: usize,
     pub(crate) ret: Type,
 }
 
@@ -747,6 +762,7 @@ pub(crate) struct MethodSchema {
     pub(crate) generics: GenericParams,
     pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) params: Vec<FuncParam>,
+    pub(crate) required_params: usize,
     pub(crate) ret: Type,
 }
 
@@ -778,6 +794,7 @@ pub(crate) struct ExtendMethodSchema {
     pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
+    pub(crate) required_params: usize,
     pub(crate) ret: Type,
 }
 
@@ -875,6 +892,7 @@ impl DeclarationIndex {
             };
             assert_eq!(sig.kind, CallableKind::ExternFunction);
             sig.ty = function.signature.to_func_type();
+            sig.required_params = function.signature.params.len();
         }
 
         self.sync_value_projections();
@@ -1139,6 +1157,7 @@ impl DeclarationIndex {
                             kind: CallableKind::Function,
                             generics: generic_params(&func.type_params, &func.const_params),
                             ty,
+                            required_params: required_param_count(&func.params),
                         }),
                     };
                     self.insert_local_value(
@@ -1178,6 +1197,7 @@ impl DeclarationIndex {
                                 ),
                                 receiver: method.sig.receiver,
                                 params: resolve_func_params(&method.sig.params),
+                                required_params: required_param_count(&method.sig.params),
                                 ret: method.sig.ret.clone(),
                             },
                         );
@@ -1284,6 +1304,7 @@ impl DeclarationIndex {
                                 receiver: m.sig.receiver,
                                 generics: generic_params(&m.sig.type_params, &m.sig.const_params),
                                 params: resolve_func_params(&m.sig.params),
+                                required_params: required_param_count(&m.sig.params),
                                 ret: m.sig.ret.clone(),
                             },
                         );
@@ -1324,7 +1345,7 @@ impl DeclarationIndex {
                 name,
             };
             let span = ty.site.span.unwrap_or(Span::new(0, 0));
-            if self.insert_local_type(&mut decls, &scope, name, key.clone(), true, span) {
+            if self.insert_local_type(&mut decls, &scope, name, key.clone(), ty.exported, span) {
                 self.type_spans.insert(key, span);
             }
         }
@@ -1341,6 +1362,7 @@ impl DeclarationIndex {
                         params: vec![],
                         ret: Box::new(Type::Void),
                     },
+                    required_params: 0,
                 }),
             };
             self.insert_local_value(
@@ -1348,7 +1370,7 @@ impl DeclarationIndex {
                 &scope,
                 name,
                 value,
-                true,
+                func.exported,
                 func.site.span.unwrap_or(Span::new(0, 0)),
             );
         }
@@ -1484,7 +1506,7 @@ impl DeclarationIndex {
         modules: &[(ModuleScope, &Program)],
         resolved: &ResolveResult,
     ) {
-        for (scope, program) in modules {
+        for (scope, program) in modules.iter().skip(1).chain(modules.first()) {
             let mut builder = ImportScopeBuilder::new(scope.clone(), ImportMode::Import);
             if let Some(decls) = self.modules.get(scope) {
                 builder.seed_origins(&decls.locals, &BindingOrigin::Local);
@@ -1580,6 +1602,63 @@ impl DeclarationIndex {
 
     pub(crate) fn exported_module(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope> {
         self.modules.get(module)?.exports.module(name).cloned()
+    }
+
+    pub(crate) fn module_value(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> ModuleMemberLookup<ResolvedValue> {
+        let Some(decls) = self.modules.get(module) else {
+            return ModuleMemberLookup::Missing;
+        };
+        if let Some(value) = decls.exports.value(name) {
+            return ModuleMemberLookup::Found(value.clone());
+        }
+        if decls.locals.values.contains_key(&name)
+            || decls.imports.namespace.values.contains_key(&name)
+        {
+            return ModuleMemberLookup::Private;
+        }
+        ModuleMemberLookup::Missing
+    }
+
+    pub(crate) fn module_type(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> ModuleMemberLookup<NominalKey> {
+        let Some(decls) = self.modules.get(module) else {
+            return ModuleMemberLookup::Missing;
+        };
+        if let Some(key) = decls.exports.ty(name) {
+            return ModuleMemberLookup::Found(key.clone());
+        }
+        if decls.locals.types.contains_key(&name)
+            || decls.imports.namespace.types.contains_key(&name)
+        {
+            return ModuleMemberLookup::Private;
+        }
+        ModuleMemberLookup::Missing
+    }
+
+    pub(crate) fn module_module(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> ModuleMemberLookup<ModuleScope> {
+        let Some(decls) = self.modules.get(module) else {
+            return ModuleMemberLookup::Missing;
+        };
+        if let Some(module) = decls.exports.module(name) {
+            return ModuleMemberLookup::Found(module.clone());
+        }
+        if decls.locals.modules.contains_key(&name)
+            || decls.imports.namespace.modules.contains_key(&name)
+        {
+            return ModuleMemberLookup::Private;
+        }
+        ModuleMemberLookup::Missing
     }
 
     pub(crate) fn imported_value(
@@ -1697,6 +1776,38 @@ impl DeclarationIndex {
         };
         self.local_type(&scope, nominal.name)
             .filter(|key| key.kind == nominal.kind)
+    }
+
+    pub(crate) fn core_result_key(&self) -> Option<NominalKey> {
+        self.core_enum_key("result", "Result")
+    }
+
+    pub(crate) fn core_option_of(&self, inner: Type) -> Option<Type> {
+        let key = self.core_option_key()?;
+        Some(nominal_type_with_args(&key, &[inner], &[]))
+    }
+
+    pub(crate) fn core_option_inner<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
+        if self.key_for_type(ty)? != self.core_option_key()? {
+            return None;
+        }
+        let Type::Nominal(nominal) = ty else {
+            return None;
+        };
+        let [inner] = nominal.type_args.as_slice() else {
+            return None;
+        };
+        Some(inner)
+    }
+
+    fn core_option_key(&self) -> Option<NominalKey> {
+        self.core_enum_key("option", Type::OPTION_ENUM_NAME)
+    }
+
+    fn core_enum_key(&self, module: &str, name: &str) -> Option<NominalKey> {
+        let name = Ident::new(name);
+        self.local_type(&core_module_scope(module), name)
+            .filter(|key| key.kind == NominalKind::Enum && key.name == name)
     }
 
     pub(crate) fn aggregate_field_type(&self, receiver: &Type, name: Ident) -> Option<Type> {
@@ -1817,6 +1928,7 @@ impl DeclarationIndex {
                     owner_generics: GenericParams::default(),
                     generics: sig.generics.clone(),
                     params: params.clone(),
+                    required_params: sig.required_params,
                     ret: (**ret).clone(),
                 },
             },
@@ -1862,6 +1974,7 @@ impl DeclarationIndex {
                     owner_generics: aggregate.generics.clone(),
                     generics: method.generics.clone(),
                     params,
+                    required_params: method.required_params,
                     ret,
                 },
             },
@@ -1900,6 +2013,7 @@ impl DeclarationIndex {
                     owner_generics: extend.generics.clone(),
                     generics: method.generics.clone(),
                     params: substitute_func_params(&template_params, &type_subst, &const_subst),
+                    required_params: method.required_params,
                     ret: substitute(&template_ret, &type_subst, &const_subst),
                 },
             },
@@ -1929,6 +2043,7 @@ impl DeclarationIndex {
                 sig: CallableSig {
                     owner_generics,
                     generics: GenericParams::default(),
+                    required_params: params.len(),
                     params,
                     ret,
                 },
@@ -2500,9 +2615,17 @@ fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
         .collect()
 }
 
+fn required_param_count(params: &[Param]) -> usize {
+    params
+        .iter()
+        .position(|param| param.default.is_some())
+        .unwrap_or(params.len())
+}
+
 fn stmt_visibility(stmt: &StmtNode) -> Visibility {
     match &stmt.node {
-        Stmt::ExternFunc(_) | Stmt::ExternType(_) => Visibility::Public,
+        Stmt::ExternFunc(n) => n.node.visibility,
+        Stmt::ExternType(n) => n.node.visibility,
         Stmt::Extend(n) => n.node.visibility,
         Stmt::Func(n) => n.node.visibility,
         Stmt::Aggregate(n) => n.node.visibility,

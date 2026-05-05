@@ -98,6 +98,7 @@ pub(super) fn normalize_type(ty: ExternTypeDescriptor) -> RawExternType {
     RawExternType {
         name: ty.name,
         doc: ty.doc,
+        exported: true,
         rep: ty.rep,
         fields: ty.fields.into_iter().map(normalize_field).collect(),
         init: ty.init.map(normalize_init),
@@ -111,6 +112,7 @@ pub(super) fn normalize_type(ty: ExternTypeDescriptor) -> RawExternType {
 fn normalize_function(decl: ExternFunctionDescriptor) -> RawExternFunction {
     RawExternFunction {
         decl,
+        exported: true,
         site: RawExternSite::default(),
     }
 }

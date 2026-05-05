@@ -1100,6 +1100,34 @@ mod tests {
     }
 
     #[test]
+    fn expr_parens_precedence_boundaries() {
+        let cases = [
+            ("fn f() { let x = a ?? b || c; }", "a ?? b || c"),
+            ("fn f() { let x = a && b ?? c; }", "a && b ?? c"),
+            ("fn f() { let x = (a ? b : c).x; }", "(a ? b : c).x"),
+            ("fn f() { let x = a ? b : c ? d : e; }", "a ? b : c ? d : e"),
+            (
+                "fn f() { let x = (a ? b : c) ? d : e; }",
+                "(a ? b : c) ? d : e",
+            ),
+            (
+                "fn f() { let x = (try read()).value; }",
+                "(try read()).value",
+            ),
+            ("fn f() { let x = 0..10 + 1; }", "0..10 + 1"),
+            ("fn f() { let x = (0..10) + 1; }", "(0..10) + 1"),
+        ];
+
+        for (source, expected) in cases {
+            let formatted = format_source(source).expect("format failed");
+            assert!(
+                formatted.contains(expected),
+                "expected `{expected}` in `{formatted}`"
+            );
+        }
+    }
+
+    #[test]
     fn expr_parens_negation_eq() {
         let source = "fn f(x: int) -> bool { !(x == 6) }";
         let formatted = format_source(source).expect("format failed");

@@ -677,7 +677,7 @@ mod tests {
                 "main.anv",
                 "import helper { tick as a }; import .helper { tick as b }; fn main() { let x: int = a() + b(); }",
             );
-            write(&temp, "helper.anv", "extern fn tick() -> int;");
+            write(&temp, "helper.anv", "pub extern fn tick() -> int;");
 
             check_file(empty_input(main)).unwrap();
         }

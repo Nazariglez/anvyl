@@ -503,7 +503,7 @@ fn private_qualified_member() {
     expect_single_error(check_named(root, &modules), |err| {
         matches!(
             err,
-            TypeError::UndefinedModuleMember { module, name, .. }
+            TypeError::PrivateModuleMember { module, name, .. }
                 if *module == helpers && *name == Ident::new("secret")
         )
     });

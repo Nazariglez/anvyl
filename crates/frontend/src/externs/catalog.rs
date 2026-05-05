@@ -1958,6 +1958,7 @@ mod tests {
                                 ),
                                 effects: ExternEffects::default(),
                             },
+                            exported: true,
                             site: RawExternSite::default(),
                         }],
                     }],

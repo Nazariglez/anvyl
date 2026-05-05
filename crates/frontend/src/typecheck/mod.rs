@@ -28,7 +28,7 @@ use crate::{
             ExternTypeId,
         },
     },
-    resolve::{PackageId, PackageModulePath, ResolveResult},
+    resolve::ResolveResult,
     span::Span,
 };
 
@@ -112,6 +112,23 @@ pub(crate) enum TypeError {
         span: Span,
     },
     WrongArgCount {
+        expected: usize,
+        found: usize,
+        span: Span,
+    },
+    WrongArgRange {
+        min: usize,
+        max: usize,
+        found: usize,
+        span: Span,
+    },
+    RequiredParamAfterDefault {
+        name: Ident,
+        span: Span,
+    },
+    EnumVariantArgCount {
+        enum_name: Ident,
+        variant: Ident,
         expected: usize,
         found: usize,
         span: Span,
@@ -267,6 +284,11 @@ pub(crate) enum TypeError {
         span: Span,
     },
     UndefinedModuleMember {
+        module: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
+    PrivateModuleMember {
         module: ModuleScope,
         name: Ident,
         span: Span,
@@ -753,16 +775,7 @@ impl TypeChecker {
     }
 
     fn core_result_parts(&self, ty: &Type) -> Option<ResultParts> {
-        let key = self.decls.key_for_type(ty)?;
-        if key.kind != NominalKind::Enum || key.name != Ident::new("Result") {
-            return None;
-        }
-        let ModuleScope::Package(module) = &key.module else {
-            return None;
-        };
-        if module.package() != &PackageId::core()
-            || !matches!(module.path(), PackageModulePath::Named(path) if path.segments() == ["result"])
-        {
+        if self.decls.key_for_type(ty)? != self.decls.core_result_key()? {
             return None;
         }
         let Type::Nominal(nominal) = ty else {
@@ -978,14 +991,6 @@ impl TypeChecker {
         self.decls
             .exported_value(scope, name)
             .map(Self::resolved_value)
-    }
-
-    fn exported_type_in_module(&self, scope: &ModuleScope, name: Ident) -> Option<NominalKey> {
-        self.decls.exported_type(scope, name)
-    }
-
-    fn exported_module_in_module(&self, scope: &ModuleScope, name: Ident) -> Option<ModuleScope> {
-        self.decls.exported_module(scope, name)
     }
 
     fn current_module_value(&self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
@@ -1453,21 +1458,28 @@ pub(crate) fn check_with_modules(
     tc.collect_const_decls(root_scope.clone(), program);
     collect_callable_templates(root_scope.clone(), program, &mut tc);
 
+    let mut module_bodies = vec![];
     for group in &resolved.module_groups {
         for module in group {
             if module.key == resolved.root {
                 continue;
             }
             let scope = ModuleScope::from_module_id(&module.key);
+            let program = Rc::new(module.program.clone());
             tc.module_programs
-                .insert(scope.clone(), Rc::new(module.program.clone()));
-            tc.collect_const_decls(scope.clone(), &module.program);
-            collect_callable_templates(scope, &module.program, &mut tc);
+                .insert(scope.clone(), Rc::clone(&program));
+            tc.collect_const_decls(scope.clone(), program.as_ref());
+            collect_callable_templates(scope.clone(), program.as_ref(), &mut tc);
+            module_bodies.push((scope, program));
         }
     }
 
     tc.eval_module_consts(&root_scope);
     tc.finalize_declarations();
+    check_decl_param_order(program, &mut tc);
+    for (_, program) in &module_bodies {
+        check_decl_param_order(program.as_ref(), &mut tc);
+    }
     if !tc.errors.is_empty() {
         return Err(tc.errors);
     }
@@ -1475,6 +1487,11 @@ pub(crate) fn check_with_modules(
     register_declarations(program, &mut tc);
     check_stmts(&program.stmts, &mut tc);
     tc.pop_scope();
+
+    for (module, program) in module_bodies {
+        check_module_bodies(&module, program.as_ref(), &mut tc);
+    }
+
     tc.into_result()
 }
 
@@ -1711,6 +1728,43 @@ fn check_stmts(stmts: &[StmtNode], tc: &mut TypeChecker) {
     }
 }
 
+fn check_decl_param_order(program: &Program, tc: &mut TypeChecker) {
+    for stmt in &program.stmts {
+        match &stmt.node {
+            Stmt::Func(func) => check_param_order(&func.node.params, func.span, tc),
+            Stmt::Aggregate(agg) => {
+                for method in &agg.node.methods {
+                    check_param_order(&method.sig.params, agg.span, tc);
+                }
+            }
+            Stmt::Extend(extend) => {
+                for method in &extend.node.methods {
+                    check_param_order(&method.node.sig.params, method.span, tc);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_param_order(params: &[Param], span: Span, tc: &mut TypeChecker) {
+    let mut saw_default = false;
+    for param in params {
+        if param.default.is_some() {
+            saw_default = true;
+        } else if saw_default {
+            tc.push_error(TypeError::RequiredParamAfterDefault {
+                name: param.name,
+                span,
+            });
+        }
+    }
+}
+
+fn check_module_bodies(module: &ModuleScope, program: &Program, tc: &mut TypeChecker) {
+    with_source_module_scope(module, tc, |tc| check_stmts(&program.stmts, tc));
+}
+
 fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
     match &stmt.node {
         Stmt::Func(func_node) => {
@@ -1851,6 +1905,7 @@ fn check_func_body(
     const_bindings: &[(Ident, ConstValue)],
     tc: &mut TypeChecker,
 ) {
+    check_param_default_values(params, param_types, tc);
     let flow = tc.enter_function_control_flow();
     tc.push_scope();
     for (name, value) in const_bindings {
@@ -1901,6 +1956,23 @@ fn check_func_body(
     tc.pop_return_type();
     tc.pop_scope();
     tc.exit_function_control_flow(flow);
+}
+
+fn check_param_default_values(params: &[Param], param_types: &[FuncParam], tc: &mut TypeChecker) {
+    for (param, param_ty) in params.iter().zip(param_types) {
+        let Some(default) = &param.default else {
+            continue;
+        };
+        let expected = tc.type_handle(&param_ty.ty);
+        match validate_const_expr_type(default, Some(expected), tc) {
+            Ok(_) => {
+                if let Err(error) = tc.eval_const_expr(default) {
+                    tc.push_error(error);
+                }
+            }
+            Err(error) => tc.push_error(error),
+        }
+    }
 }
 
 fn check_specialized_callable_body(
@@ -2376,15 +2448,34 @@ fn check_arg_count(
     call_span: Span,
     tc: &mut TypeChecker,
 ) -> bool {
-    if args.len() == expected {
+    check_arg_range(args, expected, expected, call_span, tc)
+}
+
+fn check_arg_range(
+    args: &[ExprNode],
+    min: usize,
+    max: usize,
+    call_span: Span,
+    tc: &mut TypeChecker,
+) -> bool {
+    if (min..=max).contains(&args.len()) {
         return true;
     }
 
-    tc.push_error(TypeError::WrongArgCount {
-        expected,
-        found: args.len(),
-        span: call_span,
-    });
+    if min == max {
+        tc.push_error(TypeError::WrongArgCount {
+            expected: max,
+            found: args.len(),
+            span: call_span,
+        });
+    } else {
+        tc.push_error(TypeError::WrongArgRange {
+            min,
+            max,
+            found: args.len(),
+            span: call_span,
+        });
+    }
     for arg in args {
         check_expr_checked(arg, tc);
     }
@@ -2450,7 +2541,7 @@ fn check_expr_checked_with_hint(
             }
         },
         ExprKind::Binary(bin_node) => {
-            checked_from_checked(expr, check_binary(expr.node.id, bin_node, tc), tc)
+            checked_from_checked(expr, check_binary(expr.node.id, bin_node, expected, tc), tc)
         }
         ExprKind::Unary(unary_node) => {
             checked_from_checked(expr, check_unary(expr.node.id, unary_node, tc), tc)
@@ -2606,7 +2697,16 @@ fn check_try(
     checked
 }
 
-fn check_binary(expr_id: ExprId, bin: &BinaryNode, tc: &mut TypeChecker) -> CheckedType {
+fn check_binary(
+    expr_id: ExprId,
+    bin: &BinaryNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if bin.node.op == BinaryOp::Coalesce {
+        return check_coalesce(&bin.node.left, &bin.node.right, bin.span, expected, tc);
+    }
+
     let left = check_expr_checked(&bin.node.left, tc);
     let right = check_expr_checked(&bin.node.right, tc);
     check_binary_checked(
@@ -2619,6 +2719,50 @@ fn check_binary(expr_id: ExprId, bin: &BinaryNode, tc: &mut TypeChecker) -> Chec
         bin.span,
         tc,
     )
+}
+
+fn check_coalesce(
+    left_expr: &ExprNode,
+    right_expr: &ExprNode,
+    span: Span,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let left_expected = expected_ty
+        .as_ref()
+        .and_then(|ty| tc.decls.core_option_of(ty.clone()))
+        .map(|ty| tc.type_handle(&ty));
+    let left = check_value_expr_checked_with_hint(left_expr, left_expected, tc);
+    let Some(inner) = tc.decls.core_option_inner(&left.ty).cloned() else {
+        if matches!(left.ty, Type::Infer) {
+            let mut right = check_expr_checked(right_expr, tc);
+            right.contains_extern_any |= left.contains_extern_any;
+            return checked_from_checked(right_expr, right, tc);
+        }
+        tc.push_error(TypeError::InvalidOperand {
+            op: BinaryOp::Coalesce.to_string(),
+            operand_type: left.ty,
+            span,
+        });
+        check_expr_checked(right_expr, tc);
+        return checked_type(Type::Infer, tc);
+    };
+
+    let mut right = check_expr_checked(right_expr, tc);
+    right.contains_extern_any |= left.contains_extern_any;
+    if tc.decls.core_option_inner(&right.ty) == Some(&inner) {
+        return right;
+    }
+
+    let result = tc.type_handle(&inner);
+    tc.expect_assignable(right_expr.span, right.handle, result.clone());
+    tc.solve_constraints();
+    CheckedType {
+        ty: tc.handle_type(&result),
+        handle: result,
+        contains_extern_any: right.contains_extern_any,
+    }
 }
 
 fn check_binary_checked(
@@ -2738,10 +2882,7 @@ fn builtin_binary_type(
                 })
             }
         }
-        BinaryOp::Coalesce => Err(BinaryTypeFailure::InvalidOperand {
-            op: op.to_string(),
-            operand_type: left_ty.clone(),
-        }),
+        BinaryOp::Coalesce => unreachable!("coalesce is checked before builtin binary dispatch"),
     }
 }
 
@@ -3457,11 +3598,14 @@ fn check_inferred_enum_hint(
         }
         (VariantSchema::Tuple(params), InferredEnumArgs::Tuple(args)) => {
             if params.len() != args.len() {
-                tc.push_error(TypeError::WrongArgCount {
-                    expected: params.len(),
-                    found: args.len(),
-                    span: node.span,
-                });
+                enum_variant::push_arg_count_mismatch(
+                    tc,
+                    key.name,
+                    node.node.variant,
+                    params.len(),
+                    args.len(),
+                    node.span,
+                );
                 check_exprs_without_hint(args, tc);
                 return checked_from_type(expr, Type::Infer, tc);
             }

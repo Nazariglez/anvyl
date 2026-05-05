@@ -372,6 +372,21 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         } => {
             format!("Wrong number of arguments: expected {expected}, found {found}")
         }
+        TypeError::WrongArgRange {
+            min, max, found, ..
+        } => format!("Wrong number of arguments: expected between {min} and {max}, found {found}"),
+        TypeError::RequiredParamAfterDefault { name, .. } => {
+            format!("required parameter '{name}' cannot follow a default parameter")
+        }
+        TypeError::EnumVariantArgCount {
+            enum_name,
+            variant,
+            expected,
+            found,
+            ..
+        } => format!(
+            "Wrong number of arguments for variant '{enum_name}.{variant}': expected {expected}, found {found}"
+        ),
         TypeError::DuplicateName { name, .. } => format!("name '{name}' is already declared"),
         TypeError::ImmutableAssignment { name, .. } => {
             format!("cannot assign to immutable value '{name}'")
@@ -474,6 +489,12 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::UndefinedModuleMember { module, name, .. } => {
             format!(
                 "Unknown member '{name}' in module '{}'",
+                render_module_scope(module)
+            )
+        }
+        TypeError::PrivateModuleMember { module, name, .. } => {
+            format!(
+                "member '{name}' in module '{}' is private",
                 render_module_scope(module)
             )
         }
@@ -597,7 +618,7 @@ fn render_detailed_type(ty: &Type) -> String {
             render_detailed_type(key),
             render_detailed_type(value)
         ),
-        Type::Slice { elem } => format!("[{}; _]", render_detailed_type(elem)),
+        Type::Slice { elem } => format!("slice[{}]", render_detailed_type(elem)),
         Type::UnresolvedNominal {
             qualifier,
             name,

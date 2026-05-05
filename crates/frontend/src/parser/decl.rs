@@ -287,36 +287,51 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
 pub(super) fn extern_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
-    let semicolon = select! { (Token::Semicolon, _) => () };
-
-    select! { (Token::Keyword(Keyword::Extern), _) => () }
-        .ignore_then(choice((
-            // extern fn...
-            select! { (Token::Keyword(Keyword::Fn), _) => () }
-                .ignore_then(identifier())
-                .then(params(stmt.clone()))
-                .then(return_type())
-                .then_ignore(semicolon)
-                .map_with(|((name, params), ret), e| {
-                    let s = e.span();
-                    let resolved_ret = ret.unwrap_or(ast::Type::Void);
-                    let node = Spanned::new(
-                        ast::ExternFunc {
-                            annotations: vec![],
-                            doc: None,
-                            name,
-                            params,
-                            ret: resolved_ret,
-                        },
-                        Span::new(s.start, s.end),
-                    );
-                    let span = node.span;
-                    Spanned::new(ast::Stmt::ExternFunc(node), span)
-                }),
+    visibility()
+        .then_ignore(select! { (Token::Keyword(Keyword::Extern), _) => () })
+        .then(choice((
+            extern_func_declaration(stmt.clone()),
             extern_type_declaration(stmt),
         )))
+        .map(|(visibility, mut stmt)| {
+            match &mut stmt.node {
+                ast::Stmt::ExternFunc(func) => func.node.visibility = visibility,
+                ast::Stmt::ExternType(ty) => ty.node.visibility = visibility,
+                _ => unreachable!(),
+            }
+            stmt
+        })
         .labelled("extern declaration")
         .as_context()
+        .boxed()
+}
+
+fn extern_func_declaration<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, ast::StmtNode> {
+    let semicolon = select! { (Token::Semicolon, _) => () };
+
+    select! { (Token::Keyword(Keyword::Fn), _) => () }
+        .ignore_then(identifier())
+        .then(params(stmt))
+        .then(return_type())
+        .then_ignore(semicolon)
+        .map_with(|((name, params), ret), e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let node = Spanned::new(
+                ast::ExternFunc {
+                    annotations: vec![],
+                    doc: None,
+                    visibility: ast::Visibility::Private,
+                    name,
+                    params,
+                    ret: ret.unwrap_or(ast::Type::Void),
+                },
+                span,
+            );
+            Spanned::new(ast::Stmt::ExternFunc(node), span)
+        })
         .boxed()
 }
 
@@ -359,6 +374,7 @@ fn extern_type_declaration<'src>(
                 ast::ExternType {
                     annotations: vec![],
                     doc: None,
+                    visibility: ast::Visibility::Private,
                     name,
                     rep: rep.unwrap_or(ast::ExternTypeRep::Shared),
                     init,

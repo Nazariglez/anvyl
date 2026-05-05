@@ -1,0 +1,3 @@
+// @helper
+
+extern fn secret() -> int;

@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn add(a: int, b: int = 0) -> int {
+    a + b
+}
+
+fn greet(name: string, greeting: string = "Hello") -> string {
+    greeting
+}
+
+fn main() {
+    let x: int = add(10);
+    let y: int = add(10, 5);
+    let a: string = greet("Alice");
+    let b: string = greet("Bob", "Hi");
+}

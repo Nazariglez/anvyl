@@ -1,0 +1,7 @@
+// @helper
+
+import math;
+
+pub fn twice() -> int {
+    math.double(21)
+}

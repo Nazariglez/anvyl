@@ -10,6 +10,7 @@ use crate::{
     ast::{
         self, BinaryOp, ExternFieldAccess, ExternFuncNode, ExternReceiverMode, ExternTypeMember,
         ExternTypeNode, ExternTypeRep, GenericArg, Mutability, Param, Program, Stmt, Type, UnaryOp,
+        Visibility,
     },
     resolve::{ModuleId, ResolveResult},
     span::Span,
@@ -102,6 +103,7 @@ fn normalize_function(func: &ExternFuncNode) -> SourceResult<RawExternFunction> 
             signature: signature(&func.node.params, &func.node.ret, span)?,
             effects: ExternEffects::default(),
         },
+        exported: matches!(func.node.visibility, Visibility::Public),
         site: RawExternSite { span: Some(span) },
     })
 }
@@ -146,6 +148,7 @@ fn normalize_type(ty: &ExternTypeNode) -> Result<RawExternType, Vec<ExternInputE
     Ok(RawExternType {
         name: ty.node.name.to_string(),
         doc: ty.node.doc.clone(),
+        exported: matches!(ty.node.visibility, Visibility::Public),
         rep: match ty.node.rep {
             ExternTypeRep::Shared => ExternRep::Shared,
             ExternTypeRep::Inline => ExternRep::Inline,

@@ -836,6 +836,7 @@ mod tests {
                         .into_iter()
                         .map(|decl| RawExternFunction {
                             decl,
+                            exported: true,
                             site: RawExternSite::default(),
                         })
                         .collect(),

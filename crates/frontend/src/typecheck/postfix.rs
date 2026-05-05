@@ -3,11 +3,12 @@ use anvyx_externs::ReceiverMode;
 use super::{
     CallForm, CallTarget, CheckedType, ConstSubst, ExternUseTarget, GenericArgs, GenericParams,
     MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, VariantShape,
-    check_arg_count, check_expr_checked, checked_type,
+    check_arg_count, check_arg_range, check_expr_checked, checked_type,
     decls::{
         AggregateSchema, CallableKind, CallableParent, CallableRef, DeclarationIndex,
-        ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, MethodSchema, ModuleScope, NominalKey,
-        ResolvedValue, ValueDecl, VariantSchema, nominal_type, owner_template,
+        ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, MethodSchema, ModuleMemberLookup,
+        ModuleScope, NominalKey, ResolvedValue, ValueDecl, VariantSchema, nominal_type,
+        owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
@@ -551,14 +552,24 @@ fn apply_module_field(
     kind: MemberAccessKind,
     tc: &mut TypeChecker,
 ) -> Subject {
-    if let Some(module) = tc.exported_module_in_module(scope, name) {
-        return Subject::Module(module);
+    let mut private = false;
+    match tc.decls.module_module(scope, name) {
+        ModuleMemberLookup::Found(module) => return Subject::Module(module),
+        ModuleMemberLookup::Private => private = true,
+        ModuleMemberLookup::Missing => {}
     }
-    if let Some((module, value_name, decl)) = tc.exported_value_in_module(scope, name) {
-        return named_value_subject(tc, module, value_name, &decl);
+    match tc.decls.module_value(scope, name) {
+        ModuleMemberLookup::Found(value) => {
+            let (module, value_name, decl) = TypeChecker::resolved_value(value);
+            return named_value_subject(tc, module, value_name, &decl);
+        }
+        ModuleMemberLookup::Private => private = true,
+        ModuleMemberLookup::Missing => {}
     }
-    if let Some(key) = tc.exported_type_in_module(scope, name) {
-        return Subject::Type(key);
+    match tc.decls.module_type(scope, name) {
+        ModuleMemberLookup::Found(key) => return Subject::Type(key),
+        ModuleMemberLookup::Private => private = true,
+        ModuleMemberLookup::Missing => {}
     }
     if kind == MemberAccessKind::Method && tc.decls.module_surface_has_extend_method(scope, name) {
         return Subject::QualifiedExtend {
@@ -567,11 +578,19 @@ fn apply_module_field(
             span,
         };
     }
-    tc.push_error(TypeError::UndefinedModuleMember {
-        module: scope.clone(),
-        name,
-        span,
-    });
+    if private {
+        tc.push_error(TypeError::PrivateModuleMember {
+            module: scope.clone(),
+            name,
+            span,
+        });
+    } else {
+        tc.push_error(TypeError::UndefinedModuleMember {
+            module: scope.clone(),
+            name,
+            span,
+        });
+    }
     Subject::Error
 }
 
@@ -727,6 +746,7 @@ fn solve_generic_call_with(
     generics: &GenericParams,
     seeds: &GenericSolverSeeds,
     template_params: &[FuncParam],
+    required_params: usize,
     template_ret: &Type,
     args: &[ExprNode],
     call_span: Span,
@@ -734,7 +754,7 @@ fn solve_generic_call_with(
     tc: &mut TypeChecker,
     add_constraints: impl FnOnce(&GenericSolverVars, &mut TypeChecker),
 ) -> Option<GenericCallInstantiation> {
-    if !check_arg_count(args, template_params.len(), call_span, tc) {
+    if !check_arg_range(args, required_params, template_params.len(), call_span, tc) {
         return None;
     }
 
@@ -857,6 +877,19 @@ fn check_enum_variant_call(
         enum_variant::push_shape_mismatch(tc, resolved, VariantShape::Tuple, call.span);
         return check_unhinted_args(&call.node.args, tc);
     }
+    if let VariantSchema::Tuple(params) = &resolved.schema {
+        if params.len() != call.node.args.len() {
+            enum_variant::push_arg_count_mismatch(
+                tc,
+                resolved.key.name,
+                resolved.variant,
+                params.len(),
+                call.node.args.len(),
+                call.span,
+            );
+            return check_unhinted_args(&call.node.args, tc);
+        }
+    }
     let Some(callee) =
         tc.decls
             .callable_for_variant(&resolved.key, resolved.variant, &resolved.schema)
@@ -924,6 +957,7 @@ fn check_callable_call_with_args(
         &all_generics,
         &seeds,
         &callee.def.sig.params,
+        callee.def.sig.required_params,
         &callee.def.sig.ret,
         args,
         call_span,

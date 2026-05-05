@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import native_api;
+
+fn main() {
+    let x: int = native_api.add(1, 2);
+}

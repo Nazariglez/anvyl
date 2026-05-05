@@ -1,0 +1,3 @@
+// @helper
+
+pub fn exposed() -> int { 1 }

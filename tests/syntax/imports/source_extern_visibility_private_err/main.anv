@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: is private
+
+import native_api;
+
+fn main() {
+    let x: int = native_api.secret();
+}

@@ -1,61 +1,18 @@
-use anvyx_frontend::ast;
+use anvyx_frontend::ast::{
+    self, ExprChildSide,
+    ExprChildSide::{Left, Right},
+    ExprPrecedence,
+};
 
 use super::{Printer, escape_string};
 
-const ASSIGN_PREC: u8 = 1;
-const TERNARY_PREC: u8 = 2;
-const LOGICAL_OR_PREC: u8 = 3;
-const PREFIX_PREC: u8 = 16;
-const POSTFIX_PREC: u8 = 17;
-
-fn binary_op_precedence(op: ast::BinaryOp) -> u8 {
-    match op {
-        ast::BinaryOp::Mul | ast::BinaryOp::Div | ast::BinaryOp::Rem => 14,
-        ast::BinaryOp::Add | ast::BinaryOp::Sub => 13,
-        ast::BinaryOp::Shl | ast::BinaryOp::Shr => 11,
-        ast::BinaryOp::LessThan
-        | ast::BinaryOp::GreaterThan
-        | ast::BinaryOp::LessThanEq
-        | ast::BinaryOp::GreaterThanEq => 10,
-        ast::BinaryOp::Eq | ast::BinaryOp::NotEq => 9,
-        ast::BinaryOp::BitAnd => 8,
-        ast::BinaryOp::Xor => 7,
-        ast::BinaryOp::BitOr => 6,
-        ast::BinaryOp::And => 5,
-        ast::BinaryOp::Coalesce => 4,
-        ast::BinaryOp::Or => LOGICAL_OR_PREC,
-    }
-}
-
-fn expr_precedence(expr: &ast::Expr) -> Option<u8> {
-    match &expr.kind {
-        ast::ExprKind::Binary(node) => Some(binary_op_precedence(node.node.op)),
-        ast::ExprKind::Range(_) => Some(12),
-        ast::ExprKind::Cast(_) => Some(15),
-        ast::ExprKind::Unary(_) | ast::ExprKind::Try(_) => Some(PREFIX_PREC),
-        ast::ExprKind::Ternary(_) => Some(TERNARY_PREC),
-        ast::ExprKind::Assign(_) => Some(ASSIGN_PREC),
-        _ => None,
-    }
-}
-
 impl Printer<'_> {
     pub(super) fn format_expr(&mut self, expr: &ast::Expr) {
-        self.format_expr_prec(expr, 0, false);
+        self.format_expr_prec(expr, ExprPrecedence::Lowest, Left);
     }
 
-    fn format_expr_prec(&mut self, expr: &ast::Expr, parent_prec: u8, is_right: bool) {
-        let needs_parens = match expr_precedence(expr) {
-            None => false,
-            Some(child_prec) => {
-                if is_right {
-                    child_prec <= parent_prec
-                } else {
-                    child_prec < parent_prec
-                }
-            }
-        };
-        if needs_parens {
+    fn format_expr_prec(&mut self, expr: &ast::Expr, parent: ExprPrecedence, side: ExprChildSide) {
+        if ast::expr_needs_parens(expr, parent, side) {
             self.write("(");
             self.format_expr_inner(expr);
             self.write(")");
@@ -71,35 +28,35 @@ impl Printer<'_> {
             ast::ExprKind::Block(block) => self.format_block(block),
 
             ast::ExprKind::Binary(node) => {
-                let prec = binary_op_precedence(node.node.op);
+                let prec = node.node.op.precedence();
                 let op = node.node.op;
                 let fits = self.try_single_line(|p| {
-                    p.format_expr_prec(&node.node.left.node, prec, false);
+                    p.format_expr_prec(&node.node.left.node, prec, Left);
                     p.write(" ");
                     p.write_fmt(op);
                     p.write(" ");
-                    p.format_expr_prec(&node.node.right.node, prec, true);
+                    p.format_expr_prec(&node.node.right.node, prec, Right);
                 });
                 if !fits {
-                    self.format_expr_prec(&node.node.left.node, prec, false);
+                    self.format_expr_prec(&node.node.left.node, prec, Left);
                     self.writeln();
                     self.indent();
                     self.write_indent();
                     self.write_fmt(op);
                     self.write(" ");
-                    self.format_expr_prec(&node.node.right.node, prec, true);
+                    self.format_expr_prec(&node.node.right.node, prec, Right);
                     self.dedent();
                 }
             }
 
             ast::ExprKind::Unary(node) => {
                 self.write_fmt(node.node.op);
-                self.format_expr_prec(&node.node.expr.node, PREFIX_PREC, false);
+                self.format_expr_prec(&node.node.expr.node, ExprPrecedence::Prefix, Left);
             }
 
             ast::ExprKind::Try(node) => {
                 self.write("try ");
-                self.format_expr_prec(&node.node.expr.node, PREFIX_PREC, false);
+                self.format_expr_prec(&node.node.expr.node, ExprPrecedence::Prefix, Left);
             }
 
             ast::ExprKind::Assign(node) => {
@@ -113,19 +70,19 @@ impl Printer<'_> {
             ast::ExprKind::Call(node) => self.format_call(&node.node),
 
             ast::ExprKind::Field(node) => {
-                self.format_expr_prec(&node.node.target.node, POSTFIX_PREC, false);
+                self.format_expr_prec(&node.node.target.node, ExprPrecedence::Postfix, Left);
                 self.write(if node.node.safe { "?." } else { "." });
                 self.write_fmt(node.node.field);
             }
 
             ast::ExprKind::TupleIndex(node) => {
-                self.format_expr_prec(&node.node.target.node, POSTFIX_PREC, false);
+                self.format_expr_prec(&node.node.target.node, ExprPrecedence::Postfix, Left);
                 self.write(".");
                 self.write_fmt(node.node.index);
             }
 
             ast::ExprKind::Index(node) => {
-                self.format_expr_prec(&node.node.target.node, POSTFIX_PREC, false);
+                self.format_expr_prec(&node.node.target.node, ExprPrecedence::Postfix, Left);
                 self.write(if node.node.safe { "?[" } else { "[" });
                 self.format_expr(&node.node.index.node);
                 self.write("]");
@@ -178,24 +135,24 @@ impl Printer<'_> {
                     end,
                     inclusive,
                 } => {
-                    self.format_expr_prec(&start.node, 12, false);
+                    self.format_expr_prec(&start.node, ExprPrecedence::Range, Left);
                     self.write(if *inclusive { "..=" } else { ".." });
-                    self.format_expr_prec(&end.node, 12, true);
+                    self.format_expr_prec(&end.node, ExprPrecedence::Range, Right);
                 }
                 ast::Range::From { start } => {
-                    self.format_expr_prec(&start.node, 12, false);
+                    self.format_expr_prec(&start.node, ExprPrecedence::Range, Left);
                     self.write("..");
                 }
                 ast::Range::To { end, inclusive } => {
                     self.write(if *inclusive { "..=" } else { ".." });
-                    self.format_expr_prec(&end.node, 12, true);
+                    self.format_expr_prec(&end.node, ExprPrecedence::Range, Right);
                 }
             },
 
             ast::ExprKind::StringInterp(parts) => self.format_string_interp(parts),
 
             ast::ExprKind::Cast(node) => {
-                self.format_expr_prec(&node.node.expr.node, 15, false);
+                self.format_expr_prec(&node.node.expr.node, ExprPrecedence::Cast, Left);
                 self.write(" as ");
                 self.format_type(&node.node.target);
             }
@@ -213,7 +170,7 @@ impl Printer<'_> {
     }
 
     fn format_call(&mut self, call: &ast::Call) {
-        self.format_expr_prec(&call.func.node, POSTFIX_PREC, false);
+        self.format_expr_prec(&call.func.node, ExprPrecedence::Postfix, Left);
         if call.safe {
             self.write("?");
         }
@@ -243,7 +200,7 @@ impl Printer<'_> {
             self.format_expr(expr);
             self.write(")");
         } else {
-            self.format_expr_prec(expr, TERNARY_PREC, false);
+            self.format_expr_prec(expr, ExprPrecedence::Ternary, Left);
         }
     }
 
@@ -261,7 +218,7 @@ impl Printer<'_> {
         if matches!(ternary.else_expr.node.kind, ast::ExprKind::Ternary(_)) {
             self.format_expr(&ternary.else_expr.node);
         } else {
-            self.format_expr_prec(&ternary.else_expr.node, TERNARY_PREC, true);
+            self.format_expr_prec(&ternary.else_expr.node, ExprPrecedence::Ternary, Right);
         }
     }
 

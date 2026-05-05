@@ -14,6 +14,7 @@ use self::diagnostics::{
 };
 use crate::{
     ast::Program,
+    conditional,
     externs::{self, ExternInputs},
     lexer, parser,
     resolve::{
@@ -218,7 +219,12 @@ fn parse_package_modules<E>(
 }
 
 fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
-    let tokens = lexer::tokenize(&source.code).map_err(|errors| CheckError::Lex {
+    let code = conditional::filter(&source.code).map_err(|errors| CheckError::Parse {
+        label: source.label.clone(),
+        diagnostics: errors.into_iter().map(Diagnostic::error).collect(),
+    })?;
+
+    let tokens = lexer::tokenize(&code).map_err(|errors| CheckError::Lex {
         label: source.label.clone(),
         diagnostics: errors.iter().map(diagnose_lex_error).collect(),
     })?;
@@ -1336,7 +1342,7 @@ mod tests {
                 ),
                 (
                     native.clone(),
-                    package_input(&native, "extern fn tick() -> int;", &[]),
+                    package_input(&native, "pub extern fn tick() -> int;", &[]),
                 ),
             ]),
             preloaded_modules: vec![],
@@ -1350,7 +1356,7 @@ mod tests {
         let game = PackageId::new("game");
         let native = PackageId::new("native");
         let mut loader = TestLoader::default();
-        loader.package_source(&native, &["host"], "extern fn tick() -> int;");
+        loader.package_source(&native, &["host"], "pub extern fn tick() -> int;");
 
         check(PackageProgramInput {
             root_package: game.clone(),
