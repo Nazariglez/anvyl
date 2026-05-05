@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn len(e: string) -> int {
+    1
+}
+
+fn main() {
+    let r: Result<int, string> = Result.Err("bad");
+    let mapped = r.map_err(len);
+    let _: Result<int, int> = mapped;
+}

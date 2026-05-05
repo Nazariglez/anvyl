@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: try requires enclosing function to return Result, found 'int'
+// @frontend: new
+
+fn read() -> Result<int, string> {
+    Result.Ok(1)
+}
+
+fn load() -> int {
+    try read()
+}

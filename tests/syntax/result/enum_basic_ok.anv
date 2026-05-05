@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn ok() -> Result<int, string> {
+    Result.Ok(1)
+}
+
+fn err() -> Result<int, string> {
+    Result.Err("bad")
+}
+
+fn main() {
+    let good = ok();
+    let bad = err();
+}

@@ -1161,12 +1161,21 @@ fn cast_expr<'src>(unary: impl AnvParser<'src, ast::ExprNode>) -> BoxedParser<'s
         .boxed()
 }
 
+enum PrefixOp {
+    Unary(ast::UnaryOp),
+    Try,
+}
+
 fn unary_expr<'src>(expr: impl AnvParser<'src, ast::ExprNode>) -> BoxedParser<'src, ast::ExprNode> {
-    select! {
-        (Token::Op(Op::Sub), _) => ast::UnaryOp::Neg,
-        (Token::Op(Op::Not), _) => ast::UnaryOp::Not,
-        (Token::Op(Op::Tilde), _) => ast::UnaryOp::BitNot,
-    }
+    choice((
+        select! {
+            (Token::Op(Op::Sub), _) => ast::UnaryOp::Neg,
+            (Token::Op(Op::Not), _) => ast::UnaryOp::Not,
+            (Token::Op(Op::Tilde), _) => ast::UnaryOp::BitNot,
+        }
+        .map(PrefixOp::Unary),
+        select! { (Token::Keyword(Keyword::Try), _) => PrefixOp::Try },
+    ))
     .repeated()
     .collect::<Vec<_>>()
     .then(expr)
@@ -1176,18 +1185,31 @@ fn unary_expr<'src>(expr: impl AnvParser<'src, ast::ExprNode>) -> BoxedParser<'s
 
         let mut expr_node = expr;
         for op in ops.into_iter().rev() {
-            let unary_node = Spanned::new(
-                ast::Unary {
-                    op,
-                    expr: Box::new(expr_node),
-                },
-                span,
-            );
             let expr_id = new_expr_id();
-            expr_node = Spanned::new(
-                ast::Expr::new(ast::ExprKind::Unary(unary_node), expr_id),
-                span,
-            );
+            expr_node = match op {
+                PrefixOp::Unary(op) => {
+                    let unary_node = Spanned::new(
+                        ast::Unary {
+                            op,
+                            expr: Box::new(expr_node),
+                        },
+                        span,
+                    );
+                    Spanned::new(
+                        ast::Expr::new(ast::ExprKind::Unary(unary_node), expr_id),
+                        span,
+                    )
+                }
+                PrefixOp::Try => {
+                    let try_node = Spanned::new(
+                        ast::Try {
+                            expr: Box::new(expr_node),
+                        },
+                        span,
+                    );
+                    Spanned::new(ast::Expr::new(ast::ExprKind::Try(try_node), expr_id), span)
+                }
+            };
         }
 
         expr_node

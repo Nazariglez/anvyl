@@ -5,6 +5,7 @@ use super::{Printer, escape_string};
 const ASSIGN_PREC: u8 = 1;
 const TERNARY_PREC: u8 = 2;
 const LOGICAL_OR_PREC: u8 = 3;
+const PREFIX_PREC: u8 = 16;
 const POSTFIX_PREC: u8 = 17;
 
 fn binary_op_precedence(op: ast::BinaryOp) -> u8 {
@@ -31,7 +32,7 @@ fn expr_precedence(expr: &ast::Expr) -> Option<u8> {
         ast::ExprKind::Binary(node) => Some(binary_op_precedence(node.node.op)),
         ast::ExprKind::Range(_) => Some(12),
         ast::ExprKind::Cast(_) => Some(15),
-        ast::ExprKind::Unary(_) => Some(16),
+        ast::ExprKind::Unary(_) | ast::ExprKind::Try(_) => Some(PREFIX_PREC),
         ast::ExprKind::Ternary(_) => Some(TERNARY_PREC),
         ast::ExprKind::Assign(_) => Some(ASSIGN_PREC),
         _ => None,
@@ -93,7 +94,12 @@ impl Printer<'_> {
 
             ast::ExprKind::Unary(node) => {
                 self.write_fmt(node.node.op);
-                self.format_expr_prec(&node.node.expr.node, 16, false);
+                self.format_expr_prec(&node.node.expr.node, PREFIX_PREC, false);
+            }
+
+            ast::ExprKind::Try(node) => {
+                self.write("try ");
+                self.format_expr_prec(&node.node.expr.node, PREFIX_PREC, false);
             }
 
             ast::ExprKind::Assign(node) => {

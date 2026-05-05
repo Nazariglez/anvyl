@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let ok: Result<int, string> = Result.Ok(2);
+    let err: Result<int, string> = Result.Err("bad");
+
+    let a: bool = ok.is_ok();
+    let b: bool = err.is_err();
+    let c: int = ok.unwrap_or(0);
+    let d: string = err.err_or("none");
+}

@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Holder<T> {
+    item: T,
+}
+
+extend<T> Holder<T> {
+    fn replace<U>(self, value: U) -> U {
+        value
+    }
+}
+
+fn main() {
+    let holder = Holder { item: 1 };
+    let text = holder.replace("next");
+    let _: string = text;
+}

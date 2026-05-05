@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn read() -> Result<int, string> {
+    Result.Ok(1)
+}
+
+fn load() -> Result<int, string> {
+    let value = try read();
+    Result.Ok(value + 1)
+}

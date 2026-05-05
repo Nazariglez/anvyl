@@ -3,7 +3,7 @@
 // @contains: continue inside defer
 
 fn main() {
-    for i in 0..3 {
+    while true {
         defer { continue; }
     }
 }

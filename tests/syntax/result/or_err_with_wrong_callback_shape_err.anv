@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: expected '_', found 'fn(int) -> string'
+// @frontend: new
+
+fn wrong(x: int) -> string {
+    "missing"
+}
+
+fn main() {
+    let x: int? = nil;
+    let r: Result<int, string> = x.or_err_with(wrong);
+}

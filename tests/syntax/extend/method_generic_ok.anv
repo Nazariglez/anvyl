@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend int {
+    fn keep<U>(self, value: U) -> U {
+        value
+    }
+}
+
+fn main() {
+    let text = 1.keep("fallback");
+    let _: string = text;
+    let num = 2.keep<int>(3);
+    let _: int = num;
+}

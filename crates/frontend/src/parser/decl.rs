@@ -916,12 +916,6 @@ fn method_sig<'src>(
                             "extend methods must have 'self' or 'var self' receiver",
                         ));
                     }
-                    if !type_params.is_empty() || !const_params.is_empty() {
-                        emitter.emit(Rich::custom(
-                            extra.span(),
-                            "extend methods cannot declare method-level generics yet",
-                        ));
-                    }
                 }
                 ast::MethodSig {
                     name,

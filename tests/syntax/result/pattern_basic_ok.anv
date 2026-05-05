@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn unwrap_or_default(r: Result<int, string>) -> int {
+    match r {
+        Result.Ok(v) => v,
+        Result.Err(_) => 0,
+    }
+}
+
+fn is_ok(r: Result<int, string>) -> bool {
+    match r {
+        .Ok(_) => true,
+        .Err(_) => false,
+    }
+}

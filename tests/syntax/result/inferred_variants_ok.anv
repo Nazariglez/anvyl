@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let ok: Result<int, string> = .Ok(1);
+    let err: Result<int, string> = .Err("bad");
+}

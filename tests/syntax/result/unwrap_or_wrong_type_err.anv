@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'int', found 'string'
+// @frontend: new
+
+fn main() {
+    let r: Result<int, string> = Result.Err("bad");
+    let x = r.unwrap_or("wrong");
+}

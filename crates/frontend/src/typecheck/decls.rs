@@ -992,18 +992,26 @@ impl DeclarationIndex {
             };
             extend.target = f(target_site, extend.target.clone());
             for method in extend.methods.values_mut() {
+                let method_generics = extend_generic_context(
+                    origin.clone(),
+                    &generics,
+                    &method.generics.type_params,
+                    &method.generics.const_params,
+                    span,
+                    &mut errors,
+                );
                 for param in &mut method.params {
                     let site = DeclTypeSite {
                         module: origin.clone(),
                         span,
-                        generics: generics.clone(),
+                        generics: method_generics.clone(),
                     };
                     param.ty = f(site, param.ty.clone());
                 }
                 let site = DeclTypeSite {
                     module: origin.clone(),
                     span,
-                    generics: generics.clone(),
+                    generics: method_generics,
                 };
                 method.ret = f(site, method.ret.clone());
             }

@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: try inside defer
+// @frontend: new
+
+fn read() -> Result<int, string> {
+    Result.Ok(1)
+}
+
+fn load() -> Result<int, string> {
+    defer {
+        let value = try read();
+    }
+    Result.Ok(0)
+}

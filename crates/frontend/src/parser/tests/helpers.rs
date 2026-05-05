@@ -212,6 +212,13 @@ pub(super) fn expect_unary(expr: &ast::ExprNode, op: ast::UnaryOp) -> &ast::Expr
     }
 }
 
+pub(super) fn expect_try(expr: &ast::ExprNode) -> &ast::ExprNode {
+    match &expr.node.kind {
+        ast::ExprKind::Try(node) => node.node.expr.as_ref(),
+        other => panic!("expected try expression, found {other:?}"),
+    }
+}
+
 pub(super) fn expect_field<'a>(
     expr: &'a ast::ExprNode,
     name: &str,

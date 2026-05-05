@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: try requires Result, found 'Option<int>'
+// @frontend: new
+
+fn load(x: int?) -> Result<int, string> {
+    let value = try x;
+    Result.Ok(value)
+}

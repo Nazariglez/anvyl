@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn missing() -> string {
+    "missing"
+}
+
+fn from_optional(x: int?) -> Result<int, string> {
+    x.or_err_with(missing)
+}

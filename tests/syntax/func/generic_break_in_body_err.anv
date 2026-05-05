@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: break outside of loop
+// @frontend: new
+
+fn bad<T>(x: T) -> T {
+    break;
+    x
+}
+
+fn main() {
+    while true { bad(1); }
+}

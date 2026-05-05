@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn to_text(x: int) -> string {
+    "value"
+}
+
+fn main() {
+    let r: Result<int, string> = Result.Ok(2);
+    let mapped = r.map(to_text);
+    let _: Result<string, string> = mapped;
+}

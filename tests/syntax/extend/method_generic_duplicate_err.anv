@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: duplicate generic parameter 'U'
+// @frontend: new
+
+extend int {
+    fn bad<U, U>(self, value: U) -> U {
+        value
+    }
+}
+
+fn main() {}

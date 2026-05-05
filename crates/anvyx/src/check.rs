@@ -343,6 +343,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 let expected = [
                     path(&["option"]),
+                    path(&["result"]),
                     path(&["range"]),
                     path(&["core_int"]),
                     path(&["core_float"]),
@@ -355,6 +356,7 @@ mod tests {
                 assert!(core.root().code().contains("pub import core_float { * };"));
                 assert!(core.root().code().contains("pub import core_string { * };"));
                 assert!(core.root().code().contains("pub import option { * };"));
+                assert!(core.root().code().contains("pub import result { * };"));
                 assert!(core.root().code().contains("pub import range { * };"));
             }
 
@@ -424,6 +426,7 @@ mod tests {
                     core_paths,
                     [
                         path(&["option"]),
+                        path(&["result"]),
                         path(&["range"]),
                         path(&["core_int"]),
                         path(&["core_float"]),

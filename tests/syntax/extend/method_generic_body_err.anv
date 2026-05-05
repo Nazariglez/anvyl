@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'string', found 'int'
+// @frontend: new
+
+extend int {
+    fn bad<U>(self, value: U) -> U {
+        1
+    }
+}
+
+fn main() {
+    let text = 1.bad("fallback");
+    let _: string = text;
+}

@@ -180,6 +180,26 @@ mod tests {
     }
 
     #[test]
+    fn exact_frontend_try() {
+        assert_fmt(
+            "fn f() -> int { try read() + 1 }",
+            "fn f() -> int { try read() + 1 }\n",
+        );
+        assert_fmt(
+            "fn f() -> int { (try read()).value }",
+            "fn f() -> int { (try read()).value }\n",
+        );
+        assert_fmt(
+            "fn f() -> int { -try read() }",
+            "fn f() -> int { -try read() }\n",
+        );
+        assert_fmt(
+            "fn f() -> int { try try nested() }",
+            "fn f() -> int { try try nested() }\n",
+        );
+    }
+
+    #[test]
     fn exact_frontend_methods_and_ternary() {
         assert_fmt(
             "struct S { fn make() -> S { S {} } fn get(self) -> int { 0 } }",

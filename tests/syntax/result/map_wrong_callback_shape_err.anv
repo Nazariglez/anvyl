@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'int', found 'string'
+// @frontend: new
+
+fn wrong(x: string) -> string {
+    x
+}
+
+fn main() {
+    let r: Result<int, string> = Result.Ok(2);
+    let mapped: Result<string, string> = r.map(wrong);
+}

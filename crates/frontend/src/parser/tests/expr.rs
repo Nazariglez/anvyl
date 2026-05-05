@@ -83,6 +83,35 @@ fn ternary_shape() {
 }
 
 #[test]
+fn try_precedence() {
+    let expr = parse_expr("try a + b");
+    let (left, right) = expect_binary(&expr, ast::BinaryOp::Add);
+    expect_ident(expect_try(left), "a");
+    expect_ident(right, "b");
+
+    let expr = parse_expr("try f().g()");
+    let target = expect_try(&expr);
+    let (method, method_args) = expect_call(target, false);
+    assert!(method_args.is_empty());
+    let call_target = expect_field(method, "g", false);
+    let (func, args) = expect_call(call_target, false);
+    expect_ident(func, "f");
+    assert!(args.is_empty());
+
+    let expr = parse_expr("try -a");
+    expect_ident(expect_unary(expect_try(&expr), ast::UnaryOp::Neg), "a");
+
+    let expr = parse_expr("-try a");
+    expect_ident(expect_try(expect_unary(&expr, ast::UnaryOp::Neg)), "a");
+
+    let expr = parse_expr("try try nested()");
+    let inner = expect_try(expect_try(&expr));
+    let (func, args) = expect_call(inner, false);
+    expect_ident(func, "nested");
+    assert!(args.is_empty());
+}
+
+#[test]
 fn ternary_precedence() {
     let expr = parse_expr("a || b ? c + d : e * f");
     let (cond, then_expr, else_expr) = expect_ternary(&expr);

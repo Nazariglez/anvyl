@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: success
 
-enum Result<T, E> {
+enum Outcome<T, E> {
     Ok(T),
     Err(E),
 }

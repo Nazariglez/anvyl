@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn unwrap<T>(x: Result<T, string>) -> Result<T, string> {
+    let v = try x;
+    Result.Ok(v)
+}
+
+fn main() {
+    let r: Result<int, string> = Result.Ok(1);
+    defer { unwrap(r); }
+}

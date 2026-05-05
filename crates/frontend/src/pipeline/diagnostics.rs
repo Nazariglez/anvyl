@@ -403,6 +403,22 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         }
         TypeError::BreakOutsideLoop { .. } => "break outside of loop".to_string(),
         TypeError::ContinueOutsideLoop { .. } => "continue outside of loop".to_string(),
+        TypeError::ReturnInsideDefer { .. } => "return inside defer".to_string(),
+        TypeError::BreakInsideDefer { .. } => "break inside defer".to_string(),
+        TypeError::ContinueInsideDefer { .. } => "continue inside defer".to_string(),
+        TypeError::TryOnNonResult { found, .. } => {
+            format!("try requires Result, found '{found}'")
+        }
+        TypeError::TryOutsideResultFunction { found: None, .. } => {
+            "try requires an enclosing Result-returning function".to_string()
+        }
+        TypeError::TryOutsideResultFunction {
+            found: Some(found), ..
+        } => format!("try requires enclosing function to return Result, found '{found}'"),
+        TypeError::TryErrorMismatch {
+            expected, found, ..
+        } => format!("try error type mismatch: expected '{expected}', found '{found}'"),
+        TypeError::TryInsideDefer { .. } => "try inside defer".to_string(),
         TypeError::ForIterableNotSupported { found, .. } => {
             format!("type '{found}' cannot be iterated")
         }

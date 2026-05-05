@@ -7,7 +7,7 @@ use super::{
 use crate::{
     ast::{
         ArrayLen, ConstArg, ConstParamId, ExprId, FuncParam, GenericArg, Ident, ModuleOrigin,
-        NominalKind, Type, TypeVarId,
+        NominalKind, NominalType, Type, TypeVarId,
     },
     span::Span,
 };
@@ -647,6 +647,26 @@ impl Solver {
     pub(super) fn fresh_temp_handle(&mut self, span: Span) -> TypeHandle {
         let ty = self.fresh_type(span);
         self.temp_handle(ty)
+    }
+
+    pub(super) fn nominal_handle(
+        &mut self,
+        nominal: &NominalType,
+        type_args: Vec<TypeHandle>,
+    ) -> TypeHandle {
+        debug_assert_eq!(nominal.type_args.len(), type_args.len());
+        let type_args = type_args
+            .into_iter()
+            .map(|arg| self.resolve_ref(&arg.0))
+            .collect();
+        let const_args = ConstTerm::from_args(&nominal.const_args);
+        self.temp_handle(Ty::nominal(
+            nominal.kind,
+            nominal.name,
+            type_args,
+            const_args,
+            nominal.origin.clone(),
+        ))
     }
 
     fn temp_handle(&mut self, ty: Ty) -> TypeHandle {

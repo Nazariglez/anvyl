@@ -1,0 +1,97 @@
+import option { Option };
+
+pub enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+pub extend<T, E> Result<T, E> {
+    fn is_ok(self) -> bool {
+        match self {
+            Result.Ok(_) => true,
+            Result.Err(_) => false,
+        }
+    }
+
+    fn is_err(self) -> bool {
+        match self {
+            Result.Ok(_) => false,
+            Result.Err(_) => true,
+        }
+    }
+
+    fn unwrap_or(self, default: T) -> T {
+        match self {
+            Result.Ok(v) => v,
+            Result.Err(_) => default,
+        }
+    }
+
+    fn err_or(self, default: E) -> E {
+        match self {
+            Result.Ok(_) => default,
+            Result.Err(e) => e,
+        }
+    }
+
+    fn map<U>(self, f: fn(T) -> U) -> Result<U, E> {
+        match self {
+            Result.Ok(v) => {
+                let out: Result<U, E> = Result.Ok(f(v));
+                out
+            },
+            Result.Err(e) => {
+                let out: Result<U, E> = Result.Err(e);
+                out
+            },
+        }
+    }
+
+    fn map_err<F>(self, f: fn(E) -> F) -> Result<T, F> {
+        match self {
+            Result.Ok(v) => {
+                let out: Result<T, F> = Result.Ok(v);
+                out
+            },
+            Result.Err(e) => {
+                let out: Result<T, F> = Result.Err(f(e));
+                out
+            },
+        }
+    }
+
+    fn unwrap_or_else(self, f: fn(E) -> T) -> T {
+        match self {
+            Result.Ok(v) => v,
+            Result.Err(e) => f(e),
+        }
+    }
+}
+
+pub extend<T> Option<T> {
+    fn or_err<E>(self, err: E) -> Result<T, E> {
+        match self {
+            Option.Some(v) => {
+                let out: Result<T, E> = Result.Ok(v);
+                out
+            },
+            Option.None => {
+                let out: Result<T, E> = Result.Err(err);
+                out
+            },
+        }
+    }
+
+    fn or_err_with<E>(self, f: fn() -> E) -> Result<T, E> {
+        match self {
+            Option.Some(v) => {
+                let out: Result<T, E> = Result.Ok(v);
+                out
+            },
+            Option.None => {
+                let out: Result<T, E> = Result.Err(f());
+                out
+            },
+        }
+    }
+}

@@ -28,7 +28,7 @@ use crate::{
             ExternTypeId,
         },
     },
-    resolve::ResolveResult,
+    resolve::{PackageId, PackageModulePath, ResolveResult},
     span::Span,
 };
 
@@ -162,6 +162,31 @@ pub(crate) enum TypeError {
         span: Span,
     },
     ContinueOutsideLoop {
+        span: Span,
+    },
+    ReturnInsideDefer {
+        span: Span,
+    },
+    BreakInsideDefer {
+        span: Span,
+    },
+    ContinueInsideDefer {
+        span: Span,
+    },
+    TryOnNonResult {
+        found: Type,
+        span: Span,
+    },
+    TryOutsideResultFunction {
+        found: Option<Type>,
+        span: Span,
+    },
+    TryErrorMismatch {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    TryInsideDefer {
         span: Span,
     },
     ForIterableNotSupported {
@@ -402,6 +427,12 @@ struct CallableTemplate {
     body: BlockNode,
 }
 
+#[derive(Clone, Copy)]
+struct ControlFlowFrame {
+    loop_depth: usize,
+    defer_depth: usize,
+}
+
 struct TypeChecker {
     solver: Solver,
     calls: HashMap<ExprId, CallTarget>,
@@ -412,6 +443,7 @@ struct TypeChecker {
     return_types: Vec<Type>,
     return_seen: Vec<bool>,
     loop_depth: usize,
+    defer_depth: usize,
     errors: Vec<TypeError>,
     current_module: ModuleScope,
     module_programs: HashMap<ModuleScope, Rc<Program>>,
@@ -490,6 +522,7 @@ impl TypeChecker {
             return_types: vec![],
             return_seen: vec![],
             loop_depth: 0,
+            defer_depth: 0,
             errors: vec![],
             current_module: ModuleScope::Root,
             module_programs: HashMap::new(),
@@ -719,6 +752,37 @@ impl TypeChecker {
         self.externs.ty(owner)
     }
 
+    fn core_result_parts(&self, ty: &Type) -> Option<ResultParts> {
+        let key = self.decls.key_for_type(ty)?;
+        if key.kind != NominalKind::Enum || key.name != Ident::new("Result") {
+            return None;
+        }
+        let ModuleScope::Package(module) = &key.module else {
+            return None;
+        };
+        if module.package() != &PackageId::core()
+            || !matches!(module.path(), PackageModulePath::Named(path) if path.segments() == ["result"])
+        {
+            return None;
+        }
+        let Type::Nominal(nominal) = ty else {
+            return None;
+        };
+        let [ok, err] = nominal.type_args.as_slice() else {
+            return None;
+        };
+        Some(ResultParts {
+            nominal: nominal.clone(),
+            ok: ok.clone(),
+            err: err.clone(),
+        })
+    }
+
+    fn result_operand_handle(&mut self, parts: &ResultParts, ok: TypeHandle) -> TypeHandle {
+        let err = self.type_handle(&parts.err);
+        self.solver.nominal_handle(&parts.nominal, vec![ok, err])
+    }
+
     fn extern_field(
         &self,
         owner: ExternTypeId,
@@ -772,11 +836,44 @@ impl TypeChecker {
     }
 
     fn exit_loop(&mut self) {
-        self.loop_depth = self.loop_depth.saturating_sub(1);
+        self.loop_depth = self
+            .loop_depth
+            .checked_sub(1)
+            .expect("loop depth underflow");
     }
 
     fn in_loop(&self) -> bool {
         self.loop_depth > 0
+    }
+
+    fn enter_defer(&mut self) {
+        self.defer_depth += 1;
+    }
+
+    fn exit_defer(&mut self) {
+        self.defer_depth = self
+            .defer_depth
+            .checked_sub(1)
+            .expect("defer depth underflow");
+    }
+
+    fn in_defer(&self) -> bool {
+        self.defer_depth > 0
+    }
+
+    fn enter_function_control_flow(&mut self) -> ControlFlowFrame {
+        let frame = ControlFlowFrame {
+            loop_depth: self.loop_depth,
+            defer_depth: self.defer_depth,
+        };
+        self.loop_depth = 0;
+        self.defer_depth = 0;
+        frame
+    }
+
+    fn exit_function_control_flow(&mut self, frame: ControlFlowFrame) {
+        self.loop_depth = frame.loop_depth;
+        self.defer_depth = frame.defer_depth;
     }
 
     fn push_type_subst(&mut self, subst: TypeSubst) {
@@ -1416,8 +1513,16 @@ fn type_ref_error(error: TypeRefError, span: Span) -> TypeError {
     }
 }
 
+fn has_generics(type_params: &[TypeParam], const_params: &[ConstParam]) -> bool {
+    !type_params.is_empty() || !const_params.is_empty()
+}
+
 fn is_generic(func: &Func) -> bool {
-    !func.type_params.is_empty() || !func.const_params.is_empty()
+    has_generics(&func.type_params, &func.const_params)
+}
+
+fn method_sig_is_generic(sig: &MethodSig) -> bool {
+    has_generics(&sig.type_params, &sig.const_params)
 }
 
 fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut TypeChecker) {
@@ -1450,16 +1555,21 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                     kind: agg.kind.into(),
                     name: agg.name,
                 };
-                let aggregate_is_generic =
-                    !agg.type_params.is_empty() || !agg.const_params.is_empty();
+                let owner_is_generic = has_generics(&agg.type_params, &agg.const_params);
+                let has_generic_method = agg
+                    .methods
+                    .iter()
+                    .any(|method| method_sig_is_generic(&method.sig));
+                if !owner_is_generic && !has_generic_method {
+                    continue;
+                }
+                let owner_generics =
+                    tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
                 for method in &agg.methods {
-                    let method_is_generic =
-                        !method.sig.type_params.is_empty() || !method.sig.const_params.is_empty();
-                    if !aggregate_is_generic && !method_is_generic {
+                    let method_is_generic = method_sig_is_generic(&method.sig);
+                    if !owner_is_generic && !method_is_generic {
                         continue;
                     }
-                    let owner_generics =
-                        tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
                     let generics = tc.extended_generic_context(
                         &owner_generics,
                         &method.sig.type_params,
@@ -1489,24 +1599,36 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                     index: extend_index,
                 };
                 extend_index += 1;
-                if extend.type_params.is_empty() && extend.const_params.is_empty() {
+                let owner_is_generic = has_generics(&extend.type_params, &extend.const_params);
+                let has_generic_method = extend
+                    .methods
+                    .iter()
+                    .any(|method| method_sig_is_generic(&method.node.sig));
+                if !owner_is_generic && !has_generic_method {
                     continue;
                 }
+                let owner_generics =
+                    tc.generic_context(&extend.type_params, &extend.const_params, extend_node.span);
                 for method_node in &extend.methods {
                     let method = &method_node.node;
+                    let method_is_generic = method_sig_is_generic(&method.sig);
+                    if !owner_is_generic && !method_is_generic {
+                        continue;
+                    }
                     let Some(receiver) = method.sig.receiver else {
                         debug_assert!(false, "extend method parser requires a receiver");
                         continue;
                     };
-                    let generics = tc.generic_context(
-                        &extend.type_params,
-                        &extend.const_params,
-                        extend_node.span,
+                    let generics = tc.extended_generic_context(
+                        &owner_generics,
+                        &method.sig.type_params,
+                        &method.sig.const_params,
+                        method_node.span,
                     );
                     tc.store_callable_template(
                         CallableId::extend_method(extend_id.clone(), method.sig.name),
                         CallableTemplate {
-                            span: extend_node.span,
+                            span: method_node.span,
                             receiver: Some(receiver),
                             generics,
                             params: method.sig.params.clone(),
@@ -1634,8 +1756,24 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
         Stmt::LetElse(let_else_node) => {
             check_let_else(let_else_node, tc);
         }
-        Stmt::Import(_) | Stmt::ExternFunc(_) | Stmt::ExternType(_) | Stmt::Defer(_) => {}
+        Stmt::Defer(defer_node) => {
+            check_defer(defer_node, tc);
+        }
+        Stmt::Import(_) | Stmt::ExternFunc(_) | Stmt::ExternType(_) => {}
     }
+}
+
+fn check_defer(defer_node: &DeferNode, tc: &mut TypeChecker) {
+    tc.enter_defer();
+    match &defer_node.node.body {
+        DeferBody::Expr(expr) => {
+            check_expr_checked(expr, tc);
+        }
+        DeferBody::Block(block) => {
+            check_block_checked(block, tc);
+        }
+    }
+    tc.exit_defer();
 }
 
 fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
@@ -1664,14 +1802,17 @@ fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
 
 fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
     let extend = &extend_node.node;
-    let is_generic_extend = !extend.type_params.is_empty() || !extend.const_params.is_empty();
-    if is_generic_extend {
+    let owner_is_generic = has_generics(&extend.type_params, &extend.const_params);
+    if owner_is_generic {
         return;
     }
 
     let self_ty = tc.resolve_type_for_tc_at(&extend.ty, extend_node.span);
     for method_node in &extend.methods {
         let method = &method_node.node;
+        if method_sig_is_generic(&method.sig) {
+            continue;
+        }
         let Some(receiver) = method.sig.receiver else {
             debug_assert!(false, "extend method parser requires a receiver");
             continue;
@@ -1710,6 +1851,7 @@ fn check_func_body(
     const_bindings: &[(Ident, ConstValue)],
     tc: &mut TypeChecker,
 ) {
+    let flow = tc.enter_function_control_flow();
     tc.push_scope();
     for (name, value) in const_bindings {
         tc.define_const(*name, const_eval::const_type(value), value.clone());
@@ -1758,6 +1900,7 @@ fn check_func_body(
     }
     tc.pop_return_type();
     tc.pop_scope();
+    tc.exit_function_control_flow(flow);
 }
 
 fn check_specialized_callable_body(
@@ -1924,6 +2067,13 @@ struct CheckedType {
     ty: Type,
     handle: TypeHandle,
     contains_extern_any: bool,
+}
+
+#[derive(Clone)]
+struct ResultParts {
+    nominal: NominalType,
+    ok: Type,
+    err: Type,
 }
 
 fn checked_type(ty: Type, tc: &TypeChecker) -> CheckedType {
@@ -2099,6 +2249,17 @@ fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
 
 fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
     let ret = &ret_node.node;
+    if tc.in_defer() {
+        tc.push_error(TypeError::ReturnInsideDefer {
+            span: ret_node.span,
+        });
+        if let Some(expr) = &ret.value {
+            let actual = check_value_expr_checked_with_hint(expr, None, tc);
+            tc.reject_extern_any_escape(&actual, expr.span);
+        }
+        return;
+    }
+
     tc.mark_return();
     if let Some(expr) = &ret.value {
         if let Some(expected_ty) = tc.return_type().cloned() {
@@ -2294,6 +2455,9 @@ fn check_expr_checked_with_hint(
         ExprKind::Unary(unary_node) => {
             checked_from_checked(expr, check_unary(expr.node.id, unary_node, tc), tc)
         }
+        ExprKind::Try(try_node) => {
+            checked_from_checked(expr, check_try(try_node, expected, tc), tc)
+        }
         ExprKind::Block(block_node) => checked_from_checked(
             expr,
             check_block_checked_with_hint(block_node, expected, tc),
@@ -2349,6 +2513,97 @@ fn type_from_lit(lit: &Lit) -> Type {
         Lit::String(_) => Type::String,
         Lit::Nil => Type::Infer,
     }
+}
+
+fn take_try_error_mismatch(
+    start: usize,
+    end: usize,
+    expected_ty: &Type,
+    tc: &mut TypeChecker,
+) -> Option<Type> {
+    let end = end.min(tc.errors.len());
+    let index = tc.errors[start..end].iter().position(|error| {
+        matches!(error, TypeError::TypeMismatch { expected, .. } if expected == expected_ty)
+    })? + start;
+    let TypeError::TypeMismatch { found, .. } = tc.errors.remove(index) else {
+        unreachable!();
+    };
+    Some(found)
+}
+
+fn check_try(
+    try_node: &TryNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let return_ty = tc.return_type().cloned();
+    let return_parts = return_ty.as_ref().and_then(|ty| tc.core_result_parts(ty));
+
+    if tc.in_defer() {
+        tc.push_error(TypeError::TryInsideDefer {
+            span: try_node.span,
+        });
+    }
+    if return_parts.is_none() {
+        tc.push_error(TypeError::TryOutsideResultFunction {
+            found: return_ty.clone(),
+            span: try_node.span,
+        });
+    }
+
+    let expected_ok_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let operand_expected = match &return_parts {
+        Some(parts) => {
+            let ok = expected.unwrap_or_else(|| tc.fresh_temp_handle(try_node.span));
+            Some(tc.result_operand_handle(parts, ok))
+        }
+        None => None,
+    };
+    let operand_error_start = tc.errors.len();
+    let operand = check_value_expr_checked_with_hint(&try_node.node.expr, operand_expected, tc);
+    tc.solve_constraints();
+    let operand_ty = tc.handle_type(&operand.handle);
+    let operand_error_end = tc.errors.len();
+
+    if operand_ty == Type::Infer && operand_error_start != operand_error_end {
+        if let Some(return_parts) = &return_parts
+            && expected_ok_ty.as_ref() != Some(&return_parts.err)
+            && let Some(found) = take_try_error_mismatch(
+                operand_error_start,
+                operand_error_end,
+                &return_parts.err,
+                tc,
+            )
+        {
+            tc.push_error(TypeError::TryErrorMismatch {
+                expected: return_parts.err.clone(),
+                found,
+                span: try_node.span,
+            });
+        }
+        return checked_type(Type::Infer, tc);
+    }
+    let Some(operand_parts) = tc.core_result_parts(&operand_ty) else {
+        tc.push_error(TypeError::TryOnNonResult {
+            found: operand_ty,
+            span: try_node.span,
+        });
+        return checked_type(Type::Infer, tc);
+    };
+    let Some(return_parts) = return_parts else {
+        return checked_type(Type::Infer, tc);
+    };
+    if operand_parts.err != return_parts.err {
+        tc.push_error(TypeError::TryErrorMismatch {
+            expected: return_parts.err,
+            found: operand_parts.err,
+            span: try_node.span,
+        });
+        return checked_type(Type::Infer, tc);
+    }
+    let mut checked = checked_type(operand_parts.ok, tc);
+    checked.contains_extern_any = type_closure_facts(&checked.ty).contains_any;
+    checked
 }
 
 fn check_binary(expr_id: ExprId, bin: &BinaryNode, tc: &mut TypeChecker) -> CheckedType {
@@ -3544,13 +3799,17 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
 }
 
 fn check_break(span: Span, tc: &mut TypeChecker) {
-    if !tc.in_loop() {
+    if tc.in_defer() {
+        tc.push_error(TypeError::BreakInsideDefer { span });
+    } else if !tc.in_loop() {
         tc.push_error(TypeError::BreakOutsideLoop { span });
     }
 }
 
 fn check_continue(span: Span, tc: &mut TypeChecker) {
-    if !tc.in_loop() {
+    if tc.in_defer() {
+        tc.push_error(TypeError::ContinueInsideDefer { span });
+    } else if !tc.in_loop() {
         tc.push_error(TypeError::ContinueOutsideLoop { span });
     }
 }

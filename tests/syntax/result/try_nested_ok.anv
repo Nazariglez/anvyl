@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn nested() -> Result<Result<int, string>, string> {
+    let inner: Result<int, string> = Result.Ok(1);
+    Result.Ok(inner)
+}
+
+fn load() -> Result<int, string> {
+    let value = try try nested();
+    Result.Ok(value)
+}

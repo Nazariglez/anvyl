@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn from_optional(x: int?) -> Result<int, string> {
+    x.or_err("missing")
+}
+
+fn from_named(x: Option<int>) -> Result<int, string> {
+    x.or_err("missing")
+}

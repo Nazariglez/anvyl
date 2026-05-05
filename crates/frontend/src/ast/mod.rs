@@ -1152,6 +1152,11 @@ pub struct Cast {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Try {
+    pub expr: Box<ExprNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Defer {
     pub body: DeferBody,
 }
@@ -1310,6 +1315,7 @@ pub enum ExprKind {
     Match(MatchNode),
     StringInterp(Vec<StringPart>),
     Cast(CastNode),
+    Try(TryNode),
     Lambda(LambdaNode),
     InferredEnum(InferredEnumNode),
     IntrinsicCall(IntrinsicCallNode),
@@ -1340,6 +1346,7 @@ impl ExprKind {
             Self::Match(_) => "Match",
             Self::StringInterp(_) => "StringInterp",
             Self::Cast(_) => "Cast",
+            Self::Try(_) => "Try",
             Self::Lambda(_) => "Lambda",
             Self::InferredEnum(_) => "InferredEnum",
             Self::IntrinsicCall(_) => "IntrinsicCall",
@@ -1562,6 +1569,7 @@ pub type DeferNode = Spanned<Defer>;
 pub type IntrinsicCallNode = Spanned<IntrinsicCall>;
 pub type InferredEnumNode = Spanned<InferredEnum>;
 pub type CastNode = Spanned<Cast>;
+pub type TryNode = Spanned<Try>;
 pub type ConstDeclNode = Spanned<ConstDecl>;
 
 #[cfg(test)]

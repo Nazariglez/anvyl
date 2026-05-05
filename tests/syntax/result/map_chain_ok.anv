@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn inc(x: int) -> int {
+    x + 1
+}
+
+fn mark(e: string) -> string {
+    "error"
+}
+
+fn main() {
+    let r: Result<int, string> = Result.Ok(2);
+    let mapped = r.map(inc).map_err(mark);
+    let _: Result<int, string> = mapped;
+}

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: try error type mismatch: expected 'string', found 'int'
+// @frontend: new
+
+fn load() -> Result<int, string> {
+    let value: int = try Result.Err(1);
+    Result.Ok(value)
+}

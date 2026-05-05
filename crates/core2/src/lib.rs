@@ -17,6 +17,11 @@ pub const MODULES: &[SourceFile] = &[
         code: include_str!("option.anv"),
     },
     SourceFile {
+        path: &["result"],
+        label: "crates/core2/src/result.anv",
+        code: include_str!("result.anv"),
+    },
+    SourceFile {
         path: &["range"],
         label: "crates/core2/src/range.anv",
         code: include_str!("range.anv"),
@@ -120,6 +125,7 @@ mod tests {
         assert!(ROOT.code.contains("pub import core_float { * };"));
         assert!(ROOT.code.contains("pub import core_string { * };"));
         assert!(ROOT.code.contains("pub import option { * };"));
+        assert!(ROOT.code.contains("pub import result { * };"));
         assert!(ROOT.code.contains("pub import range { * };"));
         assert!(!ROOT.code.contains("pub import core_int;"));
         assert!(!ROOT.code.contains("pub import core_float;"));
@@ -132,6 +138,7 @@ mod tests {
             paths(MODULES),
             vec![
                 &["option"][..],
+                &["result"],
                 &["range"],
                 &["core_int"],
                 &["core_float"],
