@@ -187,6 +187,9 @@ pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnosti
 fn render_unsupported_source(kind: &UnsupportedSourceKind) -> String {
     match kind {
         UnsupportedSourceKind::Type(ty) => format!("unsupported source extern type '{ty}'"),
+        UnsupportedSourceKind::InferReturn => {
+            "inferred return type is not allowed in extern declarations".to_string()
+        }
         UnsupportedSourceKind::Operator(op) => format!("unsupported source extern operator '{op}'"),
         UnsupportedSourceKind::Param { name, reason } => {
             render_unsupported_param(Some(name), *reason, false)
@@ -359,6 +362,21 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             "recursive type inference is not allowed".to_string()
         }
         TypeError::CannotInferType { .. } => "Could not infer type".to_string(),
+        TypeError::InferReturnNonGeneric { .. } => {
+            "inferred return type is only allowed on generic callables".to_string()
+        }
+        TypeError::InferReturnExtern { .. } => {
+            "inferred return type is not allowed in extern declarations".to_string()
+        }
+        TypeError::InferReturnValue { .. } => {
+            "generic inferred-return callables cannot be used as values".to_string()
+        }
+        TypeError::InferReturnMismatch {
+            expected, found, ..
+        } => format!("inferred return type mismatch: expected '{expected}', found '{found}'"),
+        TypeError::InferReturnRecursive { .. } => {
+            "recursive inferred return type requires an explicit return type".to_string()
+        }
         TypeError::UnknownType {
             qualifier, name, ..
         } => format!(
@@ -938,6 +956,40 @@ fn render_decl_error(error: &DeclError) -> String {
         }
         DeclError::DuplicateGenericParam { name, .. } => {
             format!("duplicate generic parameter '{name}'")
+        }
+        DeclError::DuplicateAggregateMethod {
+            owner,
+            name,
+            surface,
+            ..
+        } => format!(
+            "duplicate {} method '{name}' on type '{}'",
+            surface.label(),
+            owner.name
+        ),
+        DeclError::DuplicateExtendMethod { name, surface, .. } => {
+            format!("duplicate extend {} method '{name}'", surface.label())
+        }
+        DeclError::UnsupportedExtendTarget { ty, .. } => {
+            format!("cannot extend type '{ty}'")
+        }
+        DeclError::UnusedExtendTypeParam { name, .. } => {
+            format!("unused type parameter '{name}' in extend target")
+        }
+        DeclError::UnusedExtendConstParam { name, .. } => {
+            format!("unused const parameter '{name}' in extend target")
+        }
+        DeclError::ExtendMethodConflict {
+            ty, name, surface, ..
+        } => format!(
+            "{} method '{name}' already exists for type '{ty}'",
+            surface.label()
+        ),
+        DeclError::MutableSliceExtendReceiver { name, .. } => {
+            format!("slice extension receiver for method '{name}' cannot be mutable")
+        }
+        DeclError::UnsupportedStaticExtendTarget { ty, name, .. } => {
+            format!("static extension method '{name}' cannot target type '{ty}'")
         }
         DeclError::UnknownType {
             qualifier, name, ..

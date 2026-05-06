@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: no method named
+// @contains: Unknown method 'nonexistent' for type '[int; 3]'
 
 fn main() {
     let a: [int; 3] = [1, 2, 3];

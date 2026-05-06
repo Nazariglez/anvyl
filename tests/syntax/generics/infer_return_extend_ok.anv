@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Pair<T> {
+    first: T,
+    second: T,
+}
+
+extend<T> Pair<T> {
+    fn first_value(self) -> _ {
+        self.first
+    }
+}
+
+fn main() {
+    let p = Pair { first: 1, second: 2 };
+    let x: int = p.first_value();
+}

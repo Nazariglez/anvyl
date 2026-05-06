@@ -1,0 +1,7 @@
+// @helper
+
+pub fn keep() {}
+
+pub extend<T> slice[T] {
+    fn keep(self, value: T) -> T { value }
+}

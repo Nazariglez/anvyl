@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variable 'self'
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn bad() -> int { self.value }
+}
+
+fn main() {}

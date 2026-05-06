@@ -170,6 +170,7 @@ pub(crate) enum RawExternIdentityKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnsupportedSourceKind {
     Type(String),
+    InferReturn,
     Operator(String),
     Param {
         name: String,

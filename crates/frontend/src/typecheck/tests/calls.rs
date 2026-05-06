@@ -360,7 +360,7 @@ fn call_target_facts_distinguish_const_infer() {
         },
     ));
 
-    assert!(!facts.types.contains_infer);
+    assert!(!facts.types.infer.contains_type);
     assert!(facts.types.first_unresolved.is_none());
     assert!(!facts.contains_unresolved_const());
     assert!(facts.consts.contains_infer);

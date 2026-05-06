@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'make' for type 'int'
+
+fn make<T>() -> _ {
+    T.make()
+}
+
+fn main() {
+    let x = make<int>();
+}

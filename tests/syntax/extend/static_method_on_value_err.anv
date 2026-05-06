@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: static method
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn zero() -> int { 0 }
+}
+
+fn main() {
+    let c = Counter { value: 1 };
+    c.zero();
+}

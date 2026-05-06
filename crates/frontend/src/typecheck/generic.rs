@@ -66,9 +66,15 @@ pub(crate) struct SpecializationKey {
 pub(crate) type SpecializedBodyTypes = HashMap<ExprId, (Span, Type)>;
 
 #[derive(Clone)]
+pub(crate) struct SpecializedBody {
+    pub(crate) types: SpecializedBodyTypes,
+    pub(crate) inferred_ret: Option<Type>,
+}
+
+#[derive(Clone)]
 pub(crate) enum SpecializationState {
     InProgress,
-    Done(SpecializedBodyTypes),
+    Done(SpecializedBody),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: instance method
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn value(self) -> int { self.value }
+}
+
+fn main() {
+    Counter.value();
+}

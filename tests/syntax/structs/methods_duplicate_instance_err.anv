@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate instance method 'value'
+
+struct Counter {
+    amount: int,
+
+    fn value(self) -> int { self.amount }
+    fn value(var self) -> int { self.amount }
+}
+
+fn main() {}

@@ -208,7 +208,7 @@ impl Ty {
 
     fn from_recovery_type(ty: &Type) -> Self {
         match ty {
-            Type::Infer => Self::Error,
+            Type::Infer | Type::InferReturn => Self::Error,
             Type::Any => Self::Any,
             Type::Int => Self::Int,
             Type::Float => Self::Float,
@@ -816,7 +816,7 @@ impl Solver {
 
     fn instantiate_type_template(&self, ty: &Type, vars: &GenericSolverVars) -> Ty {
         match ty {
-            Type::Infer => Ty::Error,
+            Type::Infer | Type::InferReturn => Ty::Error,
             Type::Any => Ty::Any,
             Type::Int => Ty::Int,
             Type::Float => Ty::Float,

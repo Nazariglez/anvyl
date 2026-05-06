@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn zero() -> int { 0 }
+}
+
+fn main() {
+    let n: int = Counter.zero();
+}

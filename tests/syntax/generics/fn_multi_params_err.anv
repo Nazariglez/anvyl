@@ -1,11 +1,12 @@
 // @mode: check
 // @expect: error
-// @contains: Wrong number of type arguments
+// @frontend: new
+// @contains: wrong number of type parameters: expected 2, found 3
 
 fn pair<T, U>(a: T, b: U) -> T {
     a
 }
 
 fn main() {
-    let x = pair<int>(10, true);
+    let x = pair<int, bool, string>(10, true);
 }

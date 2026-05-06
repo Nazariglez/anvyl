@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: static method 'zero' already exists
+
+struct Counter {
+    value: int,
+
+    fn zero() -> int { 0 }
+}
+
+extend Counter {
+    fn zero() -> int { 1 }
+}
+
+fn main() {}

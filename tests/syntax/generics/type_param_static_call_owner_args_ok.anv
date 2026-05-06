@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> {
+    value: T,
+
+    fn default() -> Box<T> {
+        Box { value: 0 }
+    }
+}
+
+fn make<T>() -> _ {
+    T.default()
+}
+
+fn main() {
+    let b: Box<int> = make<Box<int>>();
+}

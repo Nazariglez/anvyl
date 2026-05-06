@@ -417,6 +417,15 @@ fn parse_extend_method(source: &str) -> ast::ExtendMethod {
     extend_node.node.methods.into_iter().next().unwrap().node
 }
 
+fn parse_extend(source: &str) -> ast::ExtendDecl {
+    let mut prog = parse_program(source);
+    assert_eq!(prog.stmts.len(), 1);
+    let ast::Stmt::Extend(extend_node) = prog.stmts.pop().unwrap().node else {
+        panic!("expected Extend");
+    };
+    extend_node.node
+}
+
 #[test]
 fn value_self() {
     let method = parse_aggregate_method("struct S { fn m(self) {} }");
@@ -496,9 +505,25 @@ fn extend_var_self() {
 }
 
 #[test]
+fn extend_static_method() {
+    let method = parse_extend_method("extend Point { fn make() -> int { 1 } }");
+    assert_eq!(method.sig.receiver, None);
+    assert!(method.sig.params.is_empty());
+}
+
+#[test]
+fn extend_slice_target() {
+    let extend = parse_extend("extend<T> slice[T] { fn keep(self, value: T) -> T { value } }");
+    assert_eq!(extend.type_params.len(), 1);
+    let Type::Slice { elem } = extend.ty else {
+        panic!("expected slice target");
+    };
+    assert!(matches!(*elem, Type::UnresolvedNominal { .. }));
+}
+
+#[test]
 fn extend_invalid_receivers_fail() {
     for source in [
-        "extend int { fn m() {} }",
         "extend int { fn m(self: int) {} }",
         "extend int { fn m(var self: int) {} }",
         "extend int { fn m(shared self) {} }",

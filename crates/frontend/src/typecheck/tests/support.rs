@@ -12,7 +12,7 @@ pub(crate) fn assert_typecheck_closed(result: &typecheck::TypecheckResult) {
     for target in result.calls().values() {
         let facts = typecheck::call_target_closure_facts(target);
         assert!(
-            !facts.types.contains_infer,
+            !facts.types.infer.contains_type,
             "call target contains inferred type: {target:?}"
         );
         assert!(
@@ -36,7 +36,7 @@ pub(crate) fn assert_typecheck_closed(result: &typecheck::TypecheckResult) {
 fn assert_closed_type(ty: &Type, label: &str) {
     let facts = typecheck::type_closure_facts(ty);
     assert!(
-        !facts.contains_infer,
+        !facts.infer.contains_type,
         "{label} type contains inferred type: {ty:?}"
     );
     assert!(

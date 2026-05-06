@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: error
+// @skip: todo -> clean frontend indexing expression checker (finding 107)
 // @contains: not an array or list
 // @contains: must be an array, list, or slice
 

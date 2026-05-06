@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: static method 'zero' already exists for type 'Point'
+
+import base { Point };
+import exts { keep };
+
+fn main() {
+    keep();
+    let n: int = Point.zero();
+}

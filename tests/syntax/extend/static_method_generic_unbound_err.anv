@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Could not infer type parameter 'T'
+
+struct Box<T> {
+    value: T,
+}
+
+extend<T> Box<T> {
+    fn make() -> Box<T> { Box { value: 0 } }
+}
+
+fn main() {
+    Box.make();
+}

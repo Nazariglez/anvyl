@@ -35,7 +35,7 @@ impl Printer<'_> {
             ast::Type::Bool => self.write("bool"),
             ast::Type::String => self.write("string"),
             ast::Type::Void => self.write("void"),
-            ast::Type::Infer => self.write("_"),
+            ast::Type::Infer | ast::Type::InferReturn => self.write("_"),
             ast::Type::Any => self.write("any"),
             ast::Type::Var(id) => {
                 if let Some(name) = self.type_var_names.get(id) {

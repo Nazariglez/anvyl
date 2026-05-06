@@ -1257,7 +1257,7 @@ fn validate_type_facts(
             site,
         ));
     }
-    if facts.contains_infer {
+    if facts.infer.contains_type || facts.infer.contains_return {
         errors.push(invalid_type(
             context,
             ty,
@@ -1322,6 +1322,7 @@ fn validate_void_positions(
         }
         Type::Void
         | Type::Infer
+        | Type::InferReturn
         | Type::Any
         | Type::Int
         | Type::Float

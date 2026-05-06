@@ -6,7 +6,7 @@ use super::{
     AnvParser, BoxedParser,
     common::{block_stmt, field_name_ident, identifier, param, params, return_type},
     expr::expression,
-    types::type_ident,
+    types::{extend_type_ident, type_ident},
 };
 use crate::{
     ast,
@@ -919,30 +919,20 @@ fn method_sig<'src>(
         .then(generic_params())
         .then(method_params(stmt))
         .then(return_type())
-        .validate(
-            move |(((name, gp), (receiver, params)), ret), extra, emitter| {
-                let GenericParams {
-                    type_params,
-                    const_params,
-                } = gp;
-                if matches!(policy, MethodSigPolicy::Extend) {
-                    if receiver.is_none() {
-                        emitter.emit(Rich::custom(
-                            extra.span(),
-                            "extend methods must have 'self' or 'var self' receiver",
-                        ));
-                    }
-                }
-                ast::MethodSig {
-                    name,
-                    type_params,
-                    const_params,
-                    receiver,
-                    params,
-                    ret: ret.unwrap_or(ast::Type::Void),
-                }
-            },
-        )
+        .map(|(((name, gp), (receiver, params)), ret)| {
+            let GenericParams {
+                type_params,
+                const_params,
+            } = gp;
+            ast::MethodSig {
+                name,
+                type_params,
+                const_params,
+                receiver,
+                params,
+                ret: ret.unwrap_or(ast::Type::Void),
+            }
+        })
         .boxed()
 }
 
@@ -1421,7 +1411,7 @@ pub(super) fn extend_declaration<'src>(
     let extend_head = choice((
         // extend<T, ...> type_expr, explicit type params followed by any type expression
         required_generic_params()
-            .then(type_ident())
+            .then(extend_type_ident())
             .map(|(gp, ty)| (ty, gp)),
         // dataref keyword followed by identifier targets that dataref type
         select! { (Token::Keyword(Keyword::DataRef), _) => () }
@@ -1434,7 +1424,7 @@ pub(super) fn extend_declaration<'src>(
                 )
             }),
         // target type expression without extend params
-        type_ident().map(|ty| (ty, GenericParams::default())),
+        extend_type_ident().map(|ty| (ty, GenericParams::default())),
     ));
 
     visibility()

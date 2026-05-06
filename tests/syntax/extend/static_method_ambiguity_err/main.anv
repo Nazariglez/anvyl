@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ambiguous method 'zero'
+
+import a { Counter, use_a };
+import b { use_b };
+
+fn main() {
+    use_a();
+    use_b();
+    Counter.zero();
+}

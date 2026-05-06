@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Point {
+    x: int,
+
+    fn make() -> Point {
+        Point { x: 1 }
+    }
+}
+
+fn make<T>() -> _ {
+    T.make()
+}
+
+fn main() {
+    let p: Point = make<Point>();
+}

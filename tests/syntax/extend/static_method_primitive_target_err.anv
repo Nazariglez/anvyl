@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: must have 'self'
+// @contains: static extension method
 
 extend int {
     fn f() -> int { 0 }

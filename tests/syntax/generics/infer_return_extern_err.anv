@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: inferred return type is not allowed in extern declarations
+
+extern fn make() -> _;
+
+fn main() {}

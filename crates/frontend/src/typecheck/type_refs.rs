@@ -41,15 +41,9 @@ pub(crate) fn validate_generic_params(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TypeParamBinding {
-    Explicit(TypeVarId),
-    ImplicitExtend,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GenericTypeContext {
-    type_params: HashMap<Ident, TypeParamBinding>,
+    type_params: HashMap<Ident, TypeVarId>,
     const_params: HashMap<Ident, ConstParamId>,
 }
 
@@ -82,8 +76,7 @@ impl GenericTypeContext {
     ) {
         for param in type_params {
             self.const_params.remove(&param.name);
-            self.type_params
-                .insert(param.name, TypeParamBinding::Explicit(param.id));
+            self.type_params.insert(param.name, param.id);
         }
         for param in const_params {
             self.type_params.remove(&param.name);
@@ -91,16 +84,7 @@ impl GenericTypeContext {
         }
     }
 
-    pub(crate) fn insert_implicit_extend_type(&mut self, name: Ident) {
-        if self.const_params.contains_key(&name) {
-            return;
-        }
-        self.type_params
-            .entry(name)
-            .or_insert(TypeParamBinding::ImplicitExtend);
-    }
-
-    pub(crate) fn type_param(&self, name: Ident) -> Option<TypeParamBinding> {
+    pub(crate) fn type_param(&self, name: Ident) -> Option<TypeVarId> {
         self.type_params.get(&name).copied()
     }
 
@@ -117,10 +101,9 @@ impl GenericTypeContext {
     }
 
     pub(crate) fn type_param_name(&self, id: TypeVarId) -> Option<Ident> {
-        self.type_params.iter().find_map(|(name, binding)| {
-            matches!(binding, TypeParamBinding::Explicit(binding_id) if *binding_id == id)
-                .then_some(*name)
-        })
+        self.type_params
+            .iter()
+            .find_map(|(name, binding)| (*binding == id).then_some(*name))
     }
 }
 
@@ -153,10 +136,7 @@ mod tests {
             .try_with_shadowing_params(&[type_param("T", 1)], &[])
             .unwrap();
 
-        assert_eq!(
-            inner.type_param(ident("T")),
-            Some(TypeParamBinding::Explicit(TypeVarId(1)))
-        );
+        assert_eq!(inner.type_param(ident("T")), Some(TypeVarId(1)));
         assert_eq!(inner.type_param_name(TypeVarId(0)), None);
     }
 
@@ -179,10 +159,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(inner.const_param(ident("N")), None);
-        assert_eq!(
-            inner.type_param(ident("N")),
-            Some(TypeParamBinding::Explicit(TypeVarId(1)))
-        );
+        assert_eq!(inner.type_param(ident("N")), Some(TypeVarId(1)));
     }
 
     #[test]
@@ -193,25 +170,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(inner.const_param(ident("N")), Some(ConstParamId(1)));
-    }
-
-    #[test]
-    fn shadow_implicit_extend_type() {
-        let mut owner = GenericTypeContext::default();
-        owner.insert_implicit_extend_type(ident("N"));
-
-        let as_type = owner
-            .try_with_shadowing_params(&[type_param("N", 1)], &[])
-            .unwrap();
-        assert_eq!(
-            as_type.type_param(ident("N")),
-            Some(TypeParamBinding::Explicit(TypeVarId(1)))
-        );
-
-        let as_const = owner
-            .try_with_shadowing_params(&[], &[const_param("N", 2)])
-            .unwrap();
-        assert_eq!(as_const.type_param(ident("N")), None);
-        assert_eq!(as_const.const_param(ident("N")), Some(ConstParamId(2)));
     }
 }

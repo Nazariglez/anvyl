@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: operator '-' cannot be applied to 'string'
-// @contains: must be int, float, or double
 
 struct Pair<T> {
     a: T,

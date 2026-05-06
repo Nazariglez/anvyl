@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'default'
+
+struct Box<T> {
+    value: T,
+}
+
+fn make<T>() -> _ {
+    T.default()
+}
+
+fn main() {
+    let b: Box<int> = make<Box<int>>();
+}

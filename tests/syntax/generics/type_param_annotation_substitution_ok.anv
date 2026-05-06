@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn keep<T>(x: T) -> T {
+    let y: T = x;
+    y
+}
+
+fn main() {
+    let x: int = keep<int>(1);
+    let y: string = keep<string>("hi");
+}

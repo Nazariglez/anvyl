@@ -14,12 +14,62 @@ enum TypeSuffix {
     Optional,
 }
 
+#[derive(Clone, Copy)]
+enum TypeContext {
+    Ordinary,
+    Param,
+    ExtendTarget,
+}
+
+impl TypeContext {
+    fn allows_slice(self) -> bool {
+        matches!(self, Self::Param | Self::ExtendTarget)
+    }
+}
+
 pub(super) fn type_ident<'src>() -> BoxedParser<'src, Type> {
-    type_ident_inner(false)
+    type_ident_inner(TypeContext::Ordinary)
 }
 
 pub(super) fn param_type_ident<'src>() -> BoxedParser<'src, Type> {
-    type_ident_inner(true)
+    type_ident_inner(TypeContext::Param)
+}
+
+pub(super) fn extend_type_ident<'src>() -> BoxedParser<'src, Type> {
+    type_ident_inner(TypeContext::ExtendTarget)
+}
+
+fn type_contains_slice(ty: &Type) -> bool {
+    match ty {
+        Type::Slice { .. } => true,
+        Type::Func { params, ret } => {
+            params.iter().any(|param| type_contains_slice(&param.ty)) || type_contains_slice(ret)
+        }
+        Type::Tuple(elems) => elems.iter().any(type_contains_slice),
+        Type::Nominal(nominal) => nominal.type_args.iter().any(type_contains_slice),
+        Type::List { elem } | Type::Array { elem, .. } => type_contains_slice(elem),
+        Type::Map { key, value } => type_contains_slice(key) || type_contains_slice(value),
+        Type::UnresolvedNominal { generic_args, .. } => {
+            generic_args.iter().any(generic_arg_contains_slice)
+        }
+        Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Var(_)
+        | Type::UnresolvedName(_) => false,
+    }
+}
+
+fn generic_arg_contains_slice(arg: &ast::GenericArg) -> bool {
+    match arg {
+        ast::GenericArg::Type(ty) => type_contains_slice(ty),
+        ast::GenericArg::Const(_) => false,
+    }
 }
 
 fn const_value_arg<'src>() -> BoxedParser<'src, ast::ConstArg> {
@@ -50,7 +100,7 @@ pub(super) fn generic_arg<'src>(
     .boxed()
 }
 
-fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
+fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
     recursive(move |type_parser| {
         let builtin_typ = select! {
             (Token::Keyword(Keyword::Int), _) => Type::Int,
@@ -64,6 +114,15 @@ fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
         let generic_args = select! { (Token::Op(Op::LessThan), _) => () }
             .ignore_then(
                 generic_arg(type_parser.clone())
+                    .validate(|arg, extra, emitter| {
+                        if generic_arg_contains_slice(&arg) {
+                            emitter.emit(Rich::custom(
+                                extra.span(),
+                                "slice types are not allowed in generic arguments",
+                            ));
+                        }
+                        arg
+                    })
                     .separated_by(select! { (Token::Comma, _) => () })
                     .allow_trailing()
                     .collect::<Vec<_>>(),
@@ -100,7 +159,7 @@ fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
         let semicolon = select! { (Token::Semicolon, _) => () };
         let colon = select! { (Token::Colon, _) => () };
 
-        let param_type_parser: BoxedParser<'src, Type> = if allow_slice {
+        let param_type_parser: BoxedParser<'src, Type> = if context.allows_slice() {
             type_parser.clone().boxed()
         } else {
             param_type_ident()
@@ -147,10 +206,10 @@ fn type_ident_inner<'src>(allow_slice: bool) -> BoxedParser<'src, Type> {
             .ignore_then(type_parser.clone())
             .then_ignore(close_bracket)
             .validate(move |elem, extra, emitter| {
-                if !allow_slice {
+                if !context.allows_slice() {
                     emitter.emit(Rich::custom(
                         extra.span(),
-                        "slice types are only allowed in function parameters",
+                        "slice types are only allowed in function parameters or extend targets",
                     ));
                 }
                 Type::Slice { elem: elem.boxed() }

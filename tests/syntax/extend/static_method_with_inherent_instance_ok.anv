@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    value: int,
+
+    fn id(self) -> int { self.value }
+}
+
+extend Counter {
+    fn id() -> int { 0 }
+}
+
+fn main() {
+    let c = Counter { value: 3 };
+    let a: int = c.id();
+    let b: int = Counter.id();
+}

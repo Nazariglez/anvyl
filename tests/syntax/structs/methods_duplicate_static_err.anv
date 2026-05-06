@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate static method 'make'
+
+struct Counter {
+    amount: int,
+
+    fn make(start: int) -> Counter { Counter { amount: start } }
+    fn make() -> Counter { Counter { amount: 0 } }
+}
+
+fn main() {}

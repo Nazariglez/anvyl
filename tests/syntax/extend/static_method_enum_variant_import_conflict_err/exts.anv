@@ -1,0 +1,9 @@
+// @helper
+
+import base { Mode };
+
+pub fn keep() {}
+
+pub extend Mode {
+    fn Open() -> int { 1 }
+}

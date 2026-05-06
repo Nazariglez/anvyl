@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown type 'T'
+
+struct Pair<T> {
+    first: T,
+}
+
+extend Pair<T> {
+    fn tag(self) -> int { 0 }
+}
+
+fn main() {}

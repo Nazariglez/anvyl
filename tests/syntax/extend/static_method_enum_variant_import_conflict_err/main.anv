@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: static method 'Open' already exists for type 'Mode'
+
+import base { Mode };
+import exts { keep };
+
+fn main() {
+    keep();
+    let n: int = Mode.Open();
+}

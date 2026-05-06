@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: generic inferred-return callables cannot be used as values
+
+fn id<T>(x: T) -> _ {
+    x
+}
+
+fn main() {
+    let f = id;
+}

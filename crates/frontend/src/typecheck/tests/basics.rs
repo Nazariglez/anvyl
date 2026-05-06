@@ -237,7 +237,7 @@ mod constraints {
             elem: Box::new(Type::Int),
             len: ArrayLen::Infer,
         };
-        assert!(type_closure_facts(&ty).contains_infer);
+        assert!(type_closure_facts(&ty).infer.contains_type);
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod constraints {
             params: vec![FuncParam::new(Type::Int, false)],
             ret: Box::new(Type::Tuple(vec![Type::Infer])),
         };
-        assert!(type_closure_facts(&ty).contains_infer);
+        assert!(type_closure_facts(&ty).infer.contains_type);
     }
 
     #[test]
@@ -256,7 +256,7 @@ mod constraints {
             name: Ident::new("Box"),
             generic_args: vec![GenericArg::Type(Type::Infer)],
         };
-        assert!(type_closure_facts(&ty).contains_infer);
+        assert!(type_closure_facts(&ty).infer.contains_type);
     }
 
     #[test]
@@ -268,7 +268,7 @@ mod constraints {
             vec![],
             None,
         );
-        assert!(type_closure_facts(&ty).contains_infer);
+        assert!(type_closure_facts(&ty).infer.contains_type);
     }
 }
 

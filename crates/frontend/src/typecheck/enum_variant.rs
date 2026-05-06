@@ -1,6 +1,6 @@
 use super::{
-    ConstTerm, GenericArgs, GenericParams, TypeChecker, TypeError, VariantShape,
-    decls::{NominalKey, VariantSchema, nominal_type},
+    GenericArgs, GenericParams, TypeChecker, TypeError, VariantShape,
+    decls::{NominalKey, VariantSchema, nominal_generic_args, nominal_type},
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
@@ -31,10 +31,7 @@ impl ResolvedEnumVariant {
         let Type::Nominal(nominal) = expected else {
             return None;
         };
-        Some(GenericArgs {
-            type_args: nominal.type_args.clone(),
-            const_args: nominal.const_args.iter().map(ConstTerm::from_arg).collect(),
-        })
+        nominal_generic_args(expected)
     }
 }
 

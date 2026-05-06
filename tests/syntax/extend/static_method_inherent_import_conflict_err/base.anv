@@ -1,0 +1,7 @@
+// @helper
+
+pub struct Point {
+    x: int,
+
+    fn zero() -> int { 1 }
+}

@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: not generic
+// @frontend: new
+// @contains: wrong number of type parameters: expected 0, found 1
 
 struct Counter {
     value: int,

@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @skip: todo -> frontend_nominal_const_generics
+// @frontend: new
 // @contains: ambiguous
 
 struct FixedBuf<T, N: int> {

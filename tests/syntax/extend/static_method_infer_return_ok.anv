@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> {
+    value: T,
+}
+
+extend<T> Box<T> {
+    fn make(value: T) -> _ { Box { value } }
+}
+
+fn main() {
+    let b: Box<int> = Box.make(1);
+}

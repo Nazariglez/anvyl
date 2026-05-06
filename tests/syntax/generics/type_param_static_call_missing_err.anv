@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'missing' for type 'Empty'
+
+struct Empty {}
+
+fn make<T>() -> T {
+    T.missing()
+}
+
+fn main() {
+    let x = make<Empty>();
+}

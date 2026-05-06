@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variable 'T'
+
+fn bad<T>() -> _ {
+    T
+}
+
+fn main() {
+    let x = bad<int>();
+}

@@ -13,7 +13,7 @@ use self::{
     pattern::{PatternBindMode, PatternContext},
     place::{PlaceAccess, check_alias_scrutinee, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
-    type_ops::{TypeFolder, type_depends_on_generics},
+    type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
     type_refs::{GenericParamError, GenericTypeContext},
 };
 pub(crate) use self::{
@@ -112,6 +112,23 @@ pub(crate) enum TypeError {
         span: Span,
     },
     CannotInferType {
+        span: Span,
+    },
+    InferReturnNonGeneric {
+        span: Span,
+    },
+    InferReturnExtern {
+        span: Span,
+    },
+    InferReturnValue {
+        span: Span,
+    },
+    InferReturnMismatch {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    InferReturnRecursive {
         span: Span,
     },
     UnknownType {
@@ -483,9 +500,11 @@ struct VarInfo {
 #[derive(Debug, Clone)]
 struct CallableTemplate {
     span: Span,
-    receiver: Option<MethodReceiver>,
+    mode: MethodMode,
     generics: GenericTypeContext,
     params: Vec<Param>,
+    ret: Type,
+    ret_span: Span,
     body: BlockNode,
 }
 
@@ -495,6 +514,16 @@ struct ControlFlowFrame {
     defer_depth: usize,
 }
 
+enum ReturnMode {
+    Explicit(Type),
+    Infer { candidates: Vec<(Span, TypeHandle)> },
+}
+
+struct ReturnFrame {
+    mode: ReturnMode,
+    saw_return: bool,
+}
+
 struct TypeChecker {
     solver: Solver,
     calls: HashMap<ExprId, CallTarget>,
@@ -502,8 +531,7 @@ struct TypeChecker {
     decls: DeclarationIndex,
     externs: ExternCatalog,
     scopes: Vec<HashMap<Ident, VarInfo>>,
-    return_types: Vec<Type>,
-    return_seen: Vec<bool>,
+    returns: Vec<ReturnFrame>,
     loop_depth: usize,
     defer_depth: usize,
     errors: Vec<TypeError>,
@@ -581,8 +609,7 @@ impl TypeChecker {
             decls,
             externs,
             scopes: vec![],
-            return_types: vec![],
-            return_seen: vec![],
+            returns: vec![],
             loop_depth: 0,
             defer_depth: 0,
             errors: vec![],
@@ -844,28 +871,42 @@ impl TypeChecker {
         self.externs.field(owner, name)
     }
 
-    fn push_return_type(&mut self, ty: Type) {
-        self.return_types.push(ty);
-        self.return_seen.push(false);
+    fn push_return_frame(&mut self, mode: ReturnMode) {
+        self.returns.push(ReturnFrame {
+            mode,
+            saw_return: false,
+        });
     }
 
-    fn pop_return_type(&mut self) {
-        self.return_types.pop();
-        self.return_seen.pop();
+    fn pop_return_frame(&mut self) -> Option<ReturnFrame> {
+        self.returns.pop()
     }
 
     fn return_type(&self) -> Option<&Type> {
-        self.return_types.last()
+        match &self.returns.last()?.mode {
+            ReturnMode::Explicit(ty) => Some(ty),
+            ReturnMode::Infer { .. } => None,
+        }
     }
 
     fn saw_return(&self) -> bool {
-        self.return_seen.last().copied().unwrap_or(false)
+        self.returns.last().is_some_and(|frame| frame.saw_return)
     }
 
     fn mark_return(&mut self) {
-        if let Some(seen) = self.return_seen.last_mut() {
-            *seen = true;
+        if let Some(frame) = self.returns.last_mut() {
+            frame.saw_return = true;
         }
+    }
+
+    fn push_inferred_return(&mut self, span: Span, handle: TypeHandle) {
+        let Some(frame) = self.returns.last_mut() else {
+            return;
+        };
+        let ReturnMode::Infer { candidates } = &mut frame.mode else {
+            return;
+        };
+        candidates.push((span, handle));
     }
 
     fn push_error(&mut self, err: TypeError) {
@@ -984,6 +1025,19 @@ impl TypeChecker {
         self.generic_contexts.pop();
     }
 
+    fn substituted_type_param(&self, name: Ident) -> Option<Type> {
+        let id = self
+            .generic_contexts
+            .iter()
+            .rev()
+            .find_map(|ctx| ctx.type_param(name))?;
+        self.type_substs
+            .iter()
+            .rev()
+            .find_map(|subst| subst.get(&id).cloned())
+            .or(Some(Type::Var(id)))
+    }
+
     fn store_callable_template(&mut self, id: CallableId, template: CallableTemplate) {
         self.callable_templates.insert(id, template);
     }
@@ -1020,7 +1074,16 @@ impl TypeChecker {
 
     fn find_extend_method(&self, receiver: &Type, name: Ident) -> Option<ExtendMethodMatch<'_>> {
         self.decls
-            .find_extend_method(receiver, name, |ext| self.extend_visible(&ext.origin))
+            .find_instance_extend_method(receiver, name, |ext| self.extend_visible(&ext.origin))
+    }
+
+    fn find_static_extend_method(
+        &self,
+        target: &Type,
+        name: Ident,
+    ) -> Option<ExtendMethodMatch<'_>> {
+        self.decls
+            .find_static_extend_method(target, name, |ext| self.extend_visible(&ext.origin))
     }
 
     fn exported_value_in_module(
@@ -1290,10 +1353,7 @@ impl TypeChecker {
                 let Some(generics) = self.nominal_generics(&key) else {
                     return;
                 };
-                let args = GenericArgs {
-                    type_args: nominal.type_args.clone(),
-                    const_args: nominal.const_args.iter().map(ConstTerm::from_arg).collect(),
-                };
+                let args = nominal_generic_args(ty).expect("nominal type");
                 let decls = self.decls.clone();
                 self.validate_nominal_args(&decls, &key, &generics, &args, span);
             }
@@ -1316,6 +1376,7 @@ impl TypeChecker {
                 self.validate_nominal_uses(value, span);
             }
             Type::Infer
+            | Type::InferReturn
             | Type::Any
             | Type::Int
             | Type::Float
@@ -1344,6 +1405,7 @@ impl TypeChecker {
         for error in generic_errors {
             self.push_error(generic_param_decl_type_error(error));
         }
+        validate_extend_decls(&decls, &mut self.errors);
         self.current_module = saved_module;
         self.decls = decls;
     }
@@ -1384,10 +1446,7 @@ impl TypeChecker {
                 let Some(generics) = self.nominal_generics_in(decls, &key) else {
                     return;
                 };
-                let args = GenericArgs {
-                    type_args: nominal.type_args.clone(),
-                    const_args: nominal.const_args.iter().map(ConstTerm::from_arg).collect(),
-                };
+                let args = nominal_generic_args(ty).expect("nominal type");
                 self.validate_nominal_args(decls, &key, &generics, &args, span);
             }
             Type::Func { params, ret } => {
@@ -1409,6 +1468,7 @@ impl TypeChecker {
                 self.validate_nominal_uses_in(decls, value, span);
             }
             Type::Infer
+            | Type::InferReturn
             | Type::Any
             | Type::Int
             | Type::Float
@@ -1517,8 +1577,10 @@ pub(crate) fn check_with_modules(
     tc.eval_module_consts(&root_scope);
     tc.finalize_declarations();
     check_decl_param_order(program, &mut tc);
+    check_infer_return_decls(program, &mut tc);
     for (_, program) in &module_bodies {
         check_decl_param_order(program.as_ref(), &mut tc);
+        check_infer_return_decls(program.as_ref(), &mut tc);
     }
     if !tc.errors.is_empty() {
         return Err(tc.errors);
@@ -1554,6 +1616,165 @@ fn generic_param_type_error(error: GenericParamError, span: Span) -> TypeError {
     }
 }
 
+fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
+    for extend in decls.extends() {
+        if matches!(extend.target, Type::Infer) {
+            continue;
+        }
+        let facts = extend_target_facts(&extend.target);
+        if unsupported_extend_target(&extend.target, &facts) {
+            errors.push(TypeError::Decl(DeclError::UnsupportedExtendTarget {
+                ty: extend.target.clone(),
+                span: extend.span,
+            }));
+        }
+        for param in &extend.generics.type_params {
+            if !facts.type_params.contains(&param.id) {
+                errors.push(TypeError::Decl(DeclError::UnusedExtendTypeParam {
+                    name: param.name,
+                    span: extend.span,
+                }));
+            }
+        }
+        for param in &extend.generics.const_params {
+            if !facts.const_params.contains(&param.id) {
+                errors.push(TypeError::Decl(DeclError::UnusedExtendConstParam {
+                    name: param.name,
+                    span: extend.span,
+                }));
+            }
+        }
+        validate_slice_extend_methods(extend, errors);
+        validate_static_extend_methods(decls, extend, errors);
+        validate_extend_method_conflicts(decls, extend, errors);
+    }
+}
+
+fn validate_slice_extend_methods(extend: &ExtendSchema, errors: &mut Vec<TypeError>) {
+    if !matches!(extend.target, Type::Slice { .. }) {
+        return;
+    }
+    for (key, method) in &extend.methods {
+        if matches!(method.mode, MethodMode::Instance { mutable: true }) {
+            errors.push(TypeError::Decl(DeclError::MutableSliceExtendReceiver {
+                name: key.name,
+                span: extend.span,
+            }));
+        }
+    }
+}
+
+fn validate_static_extend_methods(
+    decls: &DeclarationIndex,
+    extend: &ExtendSchema,
+    errors: &mut Vec<TypeError>,
+) {
+    if static_extend_target_supported(decls, &extend.target) {
+        return;
+    }
+    for (key, method) in &extend.methods {
+        if matches!(method.mode, MethodMode::Static) {
+            errors.push(TypeError::Decl(DeclError::UnsupportedStaticExtendTarget {
+                ty: extend.target.clone(),
+                name: key.name,
+                span: extend.span,
+            }));
+        }
+    }
+}
+
+fn static_extend_target_supported(decls: &DeclarationIndex, ty: &Type) -> bool {
+    matches!(ty, Type::Nominal(_))
+        && decls.key_for_type(ty).is_some()
+        && decls.core_option_inner(ty).is_none()
+}
+
+fn unsupported_extend_target(ty: &Type, facts: &ExtendTargetFacts) -> bool {
+    matches!(ty, Type::Void | Type::Func { .. } | Type::InferReturn) || facts.contains_void
+}
+
+fn validate_extend_method_conflicts(
+    decls: &DeclarationIndex,
+    extend: &ExtendSchema,
+    errors: &mut Vec<TypeError>,
+) {
+    let Some(key) = decls.key_for_type(&extend.target) else {
+        return;
+    };
+    if key.module != extend.origin {
+        return;
+    }
+    if let Some(aggregate) = decls.aggregate(&key) {
+        for method_key in extend.methods.keys() {
+            if aggregate.methods.contains_key(method_key) {
+                push_extend_method_conflict(errors, extend, *method_key);
+            }
+        }
+    }
+    if let Some(enum_schema) = decls.enum_schema(&key) {
+        for method_key in extend.methods.keys() {
+            if method_key.surface == MethodSurface::Static
+                && enum_schema.variants.contains_key(&method_key.name)
+            {
+                push_extend_method_conflict(errors, extend, *method_key);
+            }
+        }
+    }
+}
+
+fn push_extend_method_conflict(
+    errors: &mut Vec<TypeError>,
+    extend: &ExtendSchema,
+    method_key: MethodKey,
+) {
+    errors.push(TypeError::Decl(DeclError::ExtendMethodConflict {
+        ty: extend.target.clone(),
+        name: method_key.name,
+        surface: method_key.surface,
+        span: extend.span,
+    }));
+}
+
+#[derive(Default)]
+struct ExtendTargetFacts {
+    contains_void: bool,
+    type_params: HashSet<TypeVarId>,
+    const_params: HashSet<ConstParamId>,
+}
+
+impl TypeVisitor for ExtendTargetFacts {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        match ty {
+            Type::Void => self.contains_void = true,
+            Type::Var(id) => {
+                self.type_params.insert(*id);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn visit_const_arg(&mut self, arg: &ConstArg) -> bool {
+        if let ConstArg::Param(id) = arg {
+            self.const_params.insert(*id);
+        }
+        false
+    }
+
+    fn visit_array_len(&mut self, len: ArrayLen) -> bool {
+        if let ArrayLen::Param(id) = len {
+            self.const_params.insert(id);
+        }
+        false
+    }
+}
+
+fn extend_target_facts(ty: &Type) -> ExtendTargetFacts {
+    let mut facts = ExtendTargetFacts::default();
+    facts.visit_type(ty);
+    facts
+}
+
 fn type_ref_error(error: TypeRefError, span: Span) -> TypeError {
     match error {
         TypeRefError::Unknown { qualifier, name } => TypeError::UnknownType {
@@ -1582,6 +1803,55 @@ fn method_sig_is_generic(sig: &MethodSig) -> bool {
     has_generics(&sig.type_params, &sig.const_params)
 }
 
+fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) {
+    for stmt in &program.stmts {
+        match &stmt.node {
+            Stmt::Func(func_node) => {
+                let func = &func_node.node;
+                check_infer_return_allowed(&func.ret, is_generic(func), func_node.span, tc);
+            }
+            Stmt::ExternFunc(func_node) => {
+                if matches!(func_node.node.ret, Type::InferReturn) {
+                    tc.push_error(TypeError::InferReturnExtern {
+                        span: func_node.span,
+                    });
+                }
+            }
+            Stmt::Aggregate(agg_node) => {
+                let agg = &agg_node.node;
+                let owner_is_generic = has_generics(&agg.type_params, &agg.const_params);
+                for method in &agg.methods {
+                    check_infer_return_allowed(
+                        &method.sig.ret,
+                        owner_is_generic || method_sig_is_generic(&method.sig),
+                        agg_node.span,
+                        tc,
+                    );
+                }
+            }
+            Stmt::Extend(extend_node) => {
+                let extend = &extend_node.node;
+                let owner_is_generic = has_generics(&extend.type_params, &extend.const_params);
+                for method in &extend.methods {
+                    check_infer_return_allowed(
+                        &method.node.sig.ret,
+                        owner_is_generic || method_sig_is_generic(&method.node.sig),
+                        method.span,
+                        tc,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_infer_return_allowed(ret: &Type, generic: bool, span: Span, tc: &mut TypeChecker) {
+    if matches!(ret, Type::InferReturn) && !generic {
+        tc.push_error(TypeError::InferReturnNonGeneric { span });
+    }
+}
+
 fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut TypeChecker) {
     let mut extend_index = 0;
 
@@ -1598,9 +1868,11 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                     CallableId::function(module.clone(), func.name),
                     CallableTemplate {
                         span: func_node.span,
-                        receiver: None,
+                        mode: MethodMode::Static,
                         generics,
                         params: func.params.clone(),
+                        ret: func.ret.clone(),
+                        ret_span: func_node.span,
                         body: func.body.clone(),
                     },
                 );
@@ -1633,17 +1905,20 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                         &method.sig.const_params,
                         agg_node.span,
                     );
+                    let mode = MethodMode::from_receiver(method.sig.receiver);
                     tc.store_callable_template(
                         CallableId::aggregate_method(
                             owner.clone(),
                             method.sig.name,
-                            method.sig.receiver.is_some(),
+                            mode.surface(),
                         ),
                         CallableTemplate {
                             span: agg_node.span,
-                            receiver: method.sig.receiver,
+                            mode,
                             generics,
                             params: method.sig.params.clone(),
+                            ret: method.sig.ret.clone(),
+                            ret_span: agg_node.span,
                             body: method.body.clone(),
                         },
                     );
@@ -1672,10 +1947,7 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                     if !owner_is_generic && !method_is_generic {
                         continue;
                     }
-                    let Some(receiver) = method.sig.receiver else {
-                        debug_assert!(false, "extend method parser requires a receiver");
-                        continue;
-                    };
+                    let mode = MethodMode::from_receiver(method.sig.receiver);
                     let generics = tc.extended_generic_context(
                         &owner_generics,
                         &method.sig.type_params,
@@ -1683,12 +1955,18 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                         method_node.span,
                     );
                     tc.store_callable_template(
-                        CallableId::extend_method(extend_id.clone(), method.sig.name),
+                        CallableId::extend_method(
+                            extend_id.clone(),
+                            method.sig.name,
+                            mode.surface(),
+                        ),
                         CallableTemplate {
                             span: method_node.span,
-                            receiver: Some(receiver),
+                            mode,
                             generics,
                             params: method.sig.params.clone(),
+                            ret: method.sig.ret.clone(),
+                            ret_span: method_node.span,
                             body: method.body.clone(),
                         },
                     );
@@ -1958,10 +2236,7 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
         if method_sig_is_generic(&method.sig) {
             continue;
         }
-        let Some(receiver) = method.sig.receiver else {
-            debug_assert!(false, "extend method parser requires a receiver");
-            continue;
-        };
+        let mode = MethodMode::from_receiver(method.sig.receiver);
         let params = &method.sig.params;
         let param_types: Vec<_> = params
             .iter()
@@ -1974,7 +2249,7 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
             .collect();
         let ret_ty = tc.resolve_type_for_tc_at(&method.sig.ret, method_node.span);
         check_func_body(
-            Some((receiver, self_ty.clone())),
+            mode.receiver().map(|receiver| (receiver, self_ty.clone())),
             params,
             &param_types,
             ret_ty,
@@ -2002,13 +2277,17 @@ fn check_aggregate_method_bodies(
         if method_sig_is_generic(&method.sig) {
             continue;
         }
-        let Some(method_schema) = schema.methods.get(&method.sig.name) else {
+        let mode = MethodMode::from_receiver(method.sig.receiver);
+        let Some(method_schema) = schema
+            .methods
+            .get(&MethodKey::new(method.sig.name, mode.surface()))
+        else {
             continue;
         };
         check_func_body(
-            method
-                .sig
-                .receiver
+            method_schema
+                .mode
+                .receiver()
                 .map(|receiver| (receiver, self_ty.clone())),
             &method.sig.params,
             &method_schema.params,
@@ -2087,14 +2366,20 @@ fn check_func_body(
     span: Span,
     const_bindings: &[(Ident, ConstValue)],
     tc: &mut TypeChecker,
-) {
+) -> Option<Type> {
     check_param_default_values(params, param_types, tc);
     let flow = tc.enter_function_control_flow();
     tc.push_scope();
     for (name, value) in const_bindings {
         tc.define_const(*name, const_eval::const_type(value), value.clone());
     }
-    tc.push_return_type(ret_ty.clone());
+    let infer_return = matches!(ret_ty, Type::InferReturn);
+    let return_mode = if infer_return {
+        ReturnMode::Infer { candidates: vec![] }
+    } else {
+        ReturnMode::Explicit(ret_ty.clone())
+    };
+    tc.push_return_frame(return_mode);
     if let Some((receiver, self_ty)) = self_binding {
         let kind = match receiver {
             MethodReceiver::Var => LocalBindingKind::Mutable,
@@ -2109,7 +2394,7 @@ fn check_func_body(
             matches!(param.mutability, Mutability::Mutable),
         );
     }
-    let expects_value = !ret_ty.is_void();
+    let expects_value = !ret_ty.is_void() && !infer_return;
     let body_checked = if expects_value {
         let ret_handle = tc.type_handle(&ret_ty);
         check_block_checked_with_hint(body, Some(ret_handle), tc)
@@ -2119,7 +2404,14 @@ fn check_func_body(
     let body_is_void = body_checked.ty.is_void();
     let saw_return = tc.saw_return();
     let missing_implicit_return = body_is_void && !saw_return;
-    if expects_value {
+    if infer_return {
+        if body_is_void && !saw_return {
+            tc.push_inferred_return(span, tc.type_handle(&Type::Void));
+        } else if !body_is_void {
+            tc.reject_extern_any_escape(&body_checked, span);
+            tc.push_inferred_return(span, body_checked.handle);
+        }
+    } else if expects_value {
         if missing_implicit_return {
             tc.push_error(TypeError::MissingReturn {
                 expected: ret_ty.clone(),
@@ -2136,9 +2428,32 @@ fn check_func_body(
             .map_or_else(|| Span::new(0, 0), |(span, _)| span);
         tc.push_error(TypeError::UnusedValue { span });
     }
-    tc.pop_return_type();
+    let frame = tc.pop_return_frame();
+    let inferred_ret = frame.and_then(|frame| infer_return_type(frame, tc));
     tc.pop_scope();
     tc.exit_function_control_flow(flow);
+    inferred_ret
+}
+
+fn infer_return_type(frame: ReturnFrame, tc: &mut TypeChecker) -> Option<Type> {
+    let ReturnMode::Infer { candidates } = frame.mode else {
+        return None;
+    };
+    let mut candidates = candidates.into_iter();
+    let (_, first) = candidates.next()?;
+    tc.solve_constraints();
+    let inferred = tc.handle_type(&first);
+    for (span, candidate) in candidates {
+        let found = tc.handle_type(&candidate);
+        if inferred != found && !matches!(inferred, Type::Infer) && !matches!(found, Type::Infer) {
+            tc.push_error(TypeError::InferReturnMismatch {
+                expected: inferred.clone(),
+                found,
+                span,
+            });
+        }
+    }
+    Some(inferred)
 }
 
 fn check_param_default_values(params: &[Param], param_types: &[FuncParam], tc: &mut TypeChecker) {
@@ -2167,25 +2482,35 @@ fn check_specialized_callable_body(
     const_subst: ConstSubst,
     const_bindings: Vec<(Ident, ConstValue)>,
     tc: &mut TypeChecker,
-) {
+) -> Option<Type> {
     if args.is_empty()
         || matches!(
             callee.def.id.kind,
             CallableKind::ExternFunction | CallableKind::EnumVariant
         )
     {
-        return;
+        return None;
     }
 
+    let template = tc.callable_template(&callee.def.id).cloned()?;
+    let inferred = matches!(template.ret, Type::InferReturn);
     let key = specialization_key(callee.def.id.clone(), args);
-    if specialization_is_cached(&key, tc) {
-        return;
+    match tc.specialization(&key).cloned() {
+        Some(SpecializationState::InProgress) if inferred => {
+            tc.push_error(TypeError::InferReturnRecursive {
+                span: template.ret_span,
+            });
+            return Some(Type::Infer);
+        }
+        Some(SpecializationState::InProgress) => return None,
+        Some(SpecializationState::Done(body)) => {
+            tc.restore_specialization(body.types);
+            return body.inferred_ret;
+        }
+        None => {}
     }
 
-    let Some(template) = tc.callable_template(&callee.def.id).cloned() else {
-        return;
-    };
-    let receiver = template.receiver.zip(callee.receiver_ty.clone());
+    let receiver = template.mode.receiver().zip(callee.receiver_ty.clone());
 
     check_with_specialization(key, type_subst, const_subst, template.generics, tc, |tc| {
         with_source_module_scope(&callee.def.id.module, tc, |tc| {
@@ -2198,20 +2523,9 @@ fn check_specialized_callable_body(
                 template.span,
                 &const_bindings,
                 tc,
-            );
-        });
-    });
-}
-
-fn specialization_is_cached(key: &SpecializationKey, tc: &mut TypeChecker) -> bool {
-    match tc.specialization(key).cloned() {
-        Some(SpecializationState::InProgress) => true,
-        Some(SpecializationState::Done(body_types)) => {
-            tc.restore_specialization(body_types);
-            true
-        }
-        None => false,
-    }
+            )
+        })
+    })
 }
 
 fn check_with_specialization(
@@ -2220,22 +2534,26 @@ fn check_with_specialization(
     const_subst: ConstSubst,
     generics: GenericTypeContext,
     tc: &mut TypeChecker,
-    check_body: impl FnOnce(&mut TypeChecker),
-) {
+    check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
+) -> Option<Type> {
     let old_types = tc.expr_types();
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
     tc.push_type_subst(type_subst);
     tc.push_const_subst(const_subst);
     tc.push_generic_context(generics);
-    check_body(tc);
+    let inferred_ret = check_body(tc);
     tc.solve_constraints();
     tc.pop_generic_context();
     tc.pop_const_subst();
     tc.pop_type_subst();
     tc.store_specialization(
         key,
-        SpecializationState::Done(specialized_body_types(&old_types, &tc.expr_types())),
+        SpecializationState::Done(SpecializedBody {
+            types: specialized_body_types(&old_types, &tc.expr_types()),
+            inferred_ret: inferred_ret.clone(),
+        }),
     );
+    inferred_ret
 }
 
 fn const_param_bindings(params: &GenericParams, args: &GenericArgs) -> Vec<(Ident, ConstValue)> {
@@ -2525,14 +2843,17 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
         } else {
             let actual = check_value_expr_checked_with_hint(expr, None, tc);
             tc.reject_extern_any_escape(&actual, expr.span);
+            tc.push_inferred_return(expr.span, actual.handle);
         }
-    } else if let Some(expected_ty) = tc.return_type().cloned()
-        && !expected_ty.is_void()
-    {
-        tc.push_error(TypeError::MissingReturn {
-            expected: expected_ty,
-            span: ret_node.span,
-        });
+    } else if let Some(expected_ty) = tc.return_type().cloned() {
+        if !expected_ty.is_void() {
+            tc.push_error(TypeError::MissingReturn {
+                expected: expected_ty,
+                span: ret_node.span,
+            });
+        }
+    } else {
+        tc.push_inferred_return(ret_node.span, tc.type_handle(&Type::Void));
     }
 }
 
@@ -2706,21 +3027,33 @@ fn check_expr_checked_with_hint(
                 }
             }
             None => {
-                let ty = match tc.eval_visible_const(*name, expr.span) {
-                    Some(Ok(value)) => const_eval::const_type(&value),
-                    Some(Err(err)) => {
-                        tc.push_error(err);
-                        Type::Infer
-                    }
-                    None => tc.lookup_imported_value(*name).unwrap_or_else(|| {
-                        tc.push_error(TypeError::UndefinedVariable {
-                            name: *name,
-                            span: expr.span,
-                        });
-                        Type::Infer
-                    }),
-                };
-                checked_from_type(expr, ty, tc)
+                if let Some((module, value_name, value)) = tc.lookup_named_value(*name)
+                    && let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
+                        module,
+                        name: value_name,
+                        decl: value,
+                    })
+                    && matches!(callee.def.sig.ret, Type::InferReturn)
+                {
+                    tc.push_error(TypeError::InferReturnValue { span: expr.span });
+                    checked_from_type(expr, Type::Infer, tc)
+                } else {
+                    let ty = match tc.eval_visible_const(*name, expr.span) {
+                        Some(Ok(value)) => const_eval::const_type(&value),
+                        Some(Err(err)) => {
+                            tc.push_error(err);
+                            Type::Infer
+                        }
+                        None => tc.lookup_imported_value(*name).unwrap_or_else(|| {
+                            tc.push_error(TypeError::UndefinedVariable {
+                                name: *name,
+                                span: expr.span,
+                            });
+                            Type::Infer
+                        }),
+                    };
+                    checked_from_type(expr, ty, tc)
+                }
             }
         },
         ExprKind::Binary(bin_node) => {
@@ -4155,14 +4488,14 @@ fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
     let node = &let_else_node.node;
     let mode = mode_for_head(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
-    let saved_return_seen = tc.return_seen.last().copied();
+    let saved_return_seen = tc.returns.last().map(|frame| frame.saw_return);
     tc.push_scope();
     check_block_checked(&node.else_block, tc);
     tc.pop_scope();
     if let Some(saved) = saved_return_seen
-        && let Some(current) = tc.return_seen.last_mut()
+        && let Some(current) = tc.returns.last_mut()
     {
-        *current = saved;
+        current.saw_return = saved;
     }
     if !control_flow::block_diverges(&node.else_block) {
         tc.push_error(TypeError::LetElseMustDiverge {
@@ -4313,7 +4646,8 @@ impl CallTargetClosureFacts {
     }
 
     fn is_empty(&self) -> bool {
-        !self.types.contains_infer
+        !self.types.infer.contains_type
+            && !self.types.infer.contains_return
             && self.types.first_unresolved.is_none()
             && !self.contains_unresolved_const()
             && !self.consts.contains_infer
@@ -4324,7 +4658,8 @@ pub(crate) fn call_target_closure_facts(target: &CallTarget) -> CallTargetClosur
     let mut facts = CallTargetClosureFacts::default();
     for ty in &target.args.type_args {
         let ty_facts = type_closure_facts(ty);
-        facts.types.contains_infer |= ty_facts.contains_infer;
+        facts.types.infer.contains_type |= ty_facts.infer.contains_type;
+        facts.types.infer.contains_return |= ty_facts.infer.contains_return;
         facts.types.first_unresolved = facts.types.first_unresolved.or(ty_facts.first_unresolved);
         facts.types.contains_unresolved_const |= ty_facts.contains_unresolved_const;
     }
@@ -4371,7 +4706,9 @@ fn push_type_closure_error(errors: &mut Vec<TypeError>, ty: &Type, span: Span) {
             name: unresolved.name,
             span,
         });
-    } else if facts.contains_infer {
+    } else if facts.infer.contains_return {
+        errors.push(TypeError::InferReturnValue { span });
+    } else if facts.infer.contains_type {
         errors.push(TypeError::CannotInferType { span });
     } else if facts.contains_unresolved_const {
         errors.push(TypeError::CannotInferConst { span });

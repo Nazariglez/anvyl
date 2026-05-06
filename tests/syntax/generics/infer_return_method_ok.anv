@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Wrapper<T> {
+    value: T,
+
+    fn get(self) -> _ {
+        self.value
+    }
+}
+
+fn main() {
+    let a = Wrapper { value: 1 };
+    let x: int = a.get();
+
+    let b = Wrapper { value: "hi" };
+    let y: string = b.get();
+}

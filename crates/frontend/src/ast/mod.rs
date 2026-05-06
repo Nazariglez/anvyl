@@ -206,6 +206,7 @@ pub struct NominalType {
 #[derive(Debug, Clone)]
 pub enum Type {
     Infer,
+    InferReturn,
     Any,
     Int,
     Float,
@@ -245,6 +246,7 @@ impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Infer, Self::Infer)
+            | (Self::InferReturn, Self::InferReturn)
             | (Self::Any, Self::Any)
             | (Self::Int, Self::Int)
             | (Self::Float, Self::Float)
@@ -509,7 +511,7 @@ fn fmt_generic_args(
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Infer => write!(f, "_"),
+            Self::Infer | Self::InferReturn => write!(f, "_"),
             Self::Any => write!(f, "any"),
             Self::Int => write!(f, "int"),
             Self::Float => write!(f, "float"),

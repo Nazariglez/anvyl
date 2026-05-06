@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<T, N: int> [T; N] {
+    fn capacity(self) -> int { N }
+}
+
+fn main() {
+    let a: int = [1, 2].capacity();
+    let b: int = ["x", "y", "z"].capacity();
+}

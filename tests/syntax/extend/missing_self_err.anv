@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: must have 'self'
+// @frontend: new
+// @contains: static extension method
 
 extend float {
     fn double_val(x: float) -> float { x * 2.0 }

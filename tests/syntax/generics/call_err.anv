@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: Function is not generic
+// @frontend: new
+// @contains: wrong number of type parameters: expected 0, found 1
 
 fn foo(x: int) -> int {
     x

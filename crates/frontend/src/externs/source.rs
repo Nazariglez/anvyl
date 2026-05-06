@@ -330,6 +330,10 @@ fn type_expr(ty: &Type, span: Span) -> SourceResult<ExternTypeExpr> {
     }
 
     match ty {
+        Type::InferReturn => Err(Box::new(ExternInputError::UnsupportedSource {
+            span,
+            kind: UnsupportedSourceKind::InferReturn,
+        })),
         Type::Void => Ok(ExternTypeExpr::Void),
         Type::Bool => Ok(ExternTypeExpr::Bool),
         Type::Int => Ok(ExternTypeExpr::Int),

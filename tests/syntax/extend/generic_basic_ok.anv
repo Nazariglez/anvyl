@@ -6,7 +6,7 @@ struct Pair<T> {
     second: T,
 }
 
-extend Pair<T> {
+extend<T> Pair<T> {
     fn first_val(self) -> T {
         self.first
     }

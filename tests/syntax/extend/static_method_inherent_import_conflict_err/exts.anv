@@ -1,0 +1,9 @@
+// @helper
+
+import base { Point };
+
+pub fn keep() {}
+
+pub extend Point {
+    fn zero() -> int { 2 }
+}

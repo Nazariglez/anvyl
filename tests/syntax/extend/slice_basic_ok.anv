@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend slice[int] {
+    fn keep(self, value: int) -> int { value }
+}
+
+fn use(xs: slice[int]) -> int {
+    xs.keep(1)
+}
+
+fn main() {}

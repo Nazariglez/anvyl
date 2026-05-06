@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: no method named 'foo'
-// @contains: must be a type with a 'foo' method
+// @contains: Unknown method 'foo' for type 'int'
 
 fn call_foo<T>(a: T) {
     a.foo();

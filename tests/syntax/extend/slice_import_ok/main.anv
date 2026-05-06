@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import exts { keep };
+
+fn use(xs: slice[int]) -> int {
+    keep();
+    xs.keep(3)
+}
+
+fn main() {}

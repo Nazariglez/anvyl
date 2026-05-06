@@ -1,17 +1,18 @@
 // @mode: check
 // @expect: error
-// @contains: duplicate extend method
+// @frontend: new
+// @contains: duplicate extend instance method
 
 struct Pair<T> {
     first: T,
     second: T,
 }
 
-extend Pair<T> {
+extend<T> Pair<T> {
     fn foo(self) -> T { self.first }
 }
 
-extend Pair<T> {
+extend<T> Pair<T> {
     fn foo(self) -> T { self.second }
 }
 

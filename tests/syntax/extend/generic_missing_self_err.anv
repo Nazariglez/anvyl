@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: must have 'self'
+// @frontend: new
+// @contains: Unknown type 'T'
 
 struct Pair<T> {
     first: T,

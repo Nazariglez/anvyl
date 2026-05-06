@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'tag' for type '[int]'
+
+extend slice[int] {
+    fn tag(self) -> int { 1 }
+}
+
+fn main() {
+    let xs: [int] = [1, 2, 3];
+    xs.tag();
+}

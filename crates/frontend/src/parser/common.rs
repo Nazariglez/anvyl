@@ -119,10 +119,13 @@ pub(super) fn param<'src>(
 }
 
 pub(super) fn return_type<'src>() -> BoxedParser<'src, Option<ast::Type>> {
+    let inferred =
+        select! { (Token::Ident(ident), _) if ident.0.as_ref() == "_" => ast::Type::InferReturn };
+
     select! {
         (Token::Op(Op::ThinArrow), _) => (),
     }
-    .ignore_then(type_ident())
+    .ignore_then(choice((inferred, type_ident())))
     .or_not()
     .labelled("return type")
     .as_context()

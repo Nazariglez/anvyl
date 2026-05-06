@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn id<T>(x: T) -> _ {
+    x
+}
+
+fn main() {
+    let a: int = id(1);
+    let b: string = id("hi");
+}

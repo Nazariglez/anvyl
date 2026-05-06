@@ -1,0 +1,9 @@
+// @helper
+
+import a { Counter };
+
+pub fn use_b() {}
+
+pub extend Counter {
+    fn zero() -> int { 1 }
+}

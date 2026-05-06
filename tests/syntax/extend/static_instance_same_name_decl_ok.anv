@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn id() -> int { 0 }
+    fn id(self) -> int { self.value }
+}
+
+fn main() {}

@@ -1,0 +1,11 @@
+// @helper
+
+pub fn use_a() {}
+
+pub struct Counter {
+    value: int,
+}
+
+pub extend Counter {
+    fn zero() -> int { 0 }
+}

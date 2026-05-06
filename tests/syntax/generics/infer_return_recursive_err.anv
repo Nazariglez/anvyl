@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: recursive inferred return type requires an explicit return type
+
+fn rec<T>(x: T) -> _ {
+    rec<T>(x)
+}
+
+fn main() {
+    rec(1);
+}

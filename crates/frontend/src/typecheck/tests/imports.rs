@@ -4,7 +4,10 @@ use crate::{
     resolve::ModulePath,
     typecheck::{
         CallTarget, GenericArgs, TypeError, TypecheckResult,
-        decls::{BindingNamespace, BindingOrigin, CallableId, DeclError, ExtendId, ModuleScope},
+        decls::{
+            BindingNamespace, BindingOrigin, CallableId, DeclError, ExtendId, MethodSurface,
+            ModuleScope,
+        },
     },
 };
 
@@ -1362,5 +1365,6 @@ fn pick_id(module: &str) -> CallableId {
             index: 0,
         },
         Ident::new("pick"),
+        MethodSurface::Instance,
     )
 }

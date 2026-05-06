@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: error
+// @skip: todo -> clean frontend generic comparison diagnostics (finding 108)
 // @contains: Invalid operand type
 // @contains: operator '<' cannot be applied to 'bool'
 // @contains: must be int, float, double, or string

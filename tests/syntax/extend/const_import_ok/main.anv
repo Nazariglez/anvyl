@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: success
-// @skip: todo -> frontend_nominal_const_generics
+// @frontend: new
 
 import bufs { FixedBuf };
 import exts { keep };

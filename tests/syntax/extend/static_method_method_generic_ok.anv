@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> {
+    value: T,
+}
+
+extend Box<int> {
+    fn wrap<U>(value: U) -> Box<U> { Box { value } }
+}
+
+fn main() {
+    let b: Box<string> = Box.wrap("x");
+    let c: Box<int> = Box.wrap<int>(1);
+}

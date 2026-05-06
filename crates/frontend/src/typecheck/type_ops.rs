@@ -21,9 +21,15 @@ pub(crate) fn bare_type_name(ty: &Type) -> Option<Ident> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TypeClosureFacts {
     pub(crate) first_unresolved: Option<UnresolvedTypeRef>,
-    pub(crate) contains_infer: bool,
+    pub(crate) infer: TypeInferFacts,
     pub(crate) contains_unresolved_const: bool,
     pub(crate) contains_any: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TypeInferFacts {
+    pub(crate) contains_type: bool,
+    pub(crate) contains_return: bool,
 }
 
 pub(crate) fn type_closure_facts(ty: &Type) -> TypeClosureFacts {
@@ -70,7 +76,8 @@ impl TypeVisitor for TypeClosureFacts {
                     name: *name,
                 });
             }
-            Type::Infer => self.contains_infer = true,
+            Type::Infer => self.infer.contains_type = true,
+            Type::InferReturn => self.infer.contains_return = true,
             Type::Any => self.contains_any = true,
             _ => {}
         }
@@ -87,7 +94,7 @@ impl TypeVisitor for TypeClosureFacts {
     fn visit_array_len(&mut self, len: ArrayLen) -> bool {
         match len {
             ArrayLen::Infer => {
-                self.contains_infer = true;
+                self.infer.contains_type = true;
                 self.contains_unresolved_const = true;
             }
             ArrayLen::Named(_) => self.contains_unresolved_const = true,
@@ -101,6 +108,7 @@ pub(crate) trait TypeFolder {
     fn fold_type(&mut self, ty: &Type) -> Type {
         match ty {
             Type::Infer => Type::Infer,
+            Type::InferReturn => Type::InferReturn,
             Type::Any => Type::Any,
             Type::Int => Type::Int,
             Type::Float => Type::Float,
@@ -236,6 +244,7 @@ pub(crate) trait TypeVisitor {
                 generic_args.iter().any(|arg| self.visit_generic_arg(arg))
             }
             Type::Infer
+            | Type::InferReturn
             | Type::Any
             | Type::Int
             | Type::Float

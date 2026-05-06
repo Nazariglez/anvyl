@@ -6,7 +6,10 @@ use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
         CallTarget, GenericArgs, MemberAccessKind, TypeError, TypecheckResult, VariantShape,
-        decls::{CallableId, ExtendId, ModuleScope, NominalKey, VariantSchema},
+        decls::{
+            CallableId, DeclError, ExtendId, MethodKey, MethodSurface, ModuleScope, NominalKey,
+            VariantSchema,
+        },
     },
 };
 
@@ -379,8 +382,11 @@ mod method_schemas {
             .decls()
             .aggregate(&root_key(NominalKind::Struct, "Point"))
             .expect("no aggregate");
-        let method = agg.methods.get(&Ident::new("len")).expect("no method");
-        assert!(method.receiver.is_some());
+        let method = agg
+            .methods
+            .get(&MethodKey::instance(Ident::new("len")))
+            .expect("no method");
+        assert_eq!(method.mode.surface(), MethodSurface::Instance);
         assert_eq!(method.params.len(), 0);
         assert_eq!(method.ret, Type::Int);
     }
@@ -397,8 +403,11 @@ mod method_schemas {
             .decls()
             .aggregate(&root_key(NominalKind::Struct, "Point"))
             .expect("no aggregate");
-        let method = agg.methods.get(&Ident::new("origin")).expect("no method");
-        assert!(method.receiver.is_none());
+        let method = agg
+            .methods
+            .get(&MethodKey::static_(Ident::new("origin")))
+            .expect("no method");
+        assert_eq!(method.mode.surface(), MethodSurface::Static);
         assert_eq!(method.params.len(), 0);
     }
 
@@ -411,8 +420,11 @@ mod method_schemas {
             .decls()
             .aggregate(&root_key(NominalKind::Struct, "Point"))
             .expect("no aggregate");
-        let method = agg.methods.get(&Ident::new("add")).expect("no method");
-        assert!(method.receiver.is_some());
+        let method = agg
+            .methods
+            .get(&MethodKey::instance(Ident::new("add")))
+            .expect("no method");
+        assert_eq!(method.mode.surface(), MethodSurface::Instance);
         assert_eq!(method.params.len(), 1);
         assert_eq!(method.params[0].ty, Type::Int);
         assert_eq!(method.ret, Type::Int);
@@ -426,10 +438,13 @@ mod method_schemas {
             .decls()
             .aggregate(&root_key(NominalKind::Struct, "Point"))
             .expect("no aggregate");
-        let method = agg.methods.get(&Ident::new("map")).expect("no method");
+        let method = agg
+            .methods
+            .get(&MethodKey::instance(Ident::new("map")))
+            .expect("no method");
         let t = method.generics.type_params[0].id;
 
-        assert!(method.receiver.is_some());
+        assert_eq!(method.mode.surface(), MethodSurface::Instance);
         assert_eq!(method.generics.type_params.len(), 1);
         assert!(method.generics.const_params.is_empty());
         assert_eq!(method.params[0].ty, Type::Var(t));
@@ -445,7 +460,10 @@ mod method_schemas {
             .decls()
             .aggregate(&root_key(NominalKind::Struct, "Point"))
             .expect("no aggregate");
-        let method = agg.methods.get(&Ident::new("wrap")).expect("no method");
+        let method = agg
+            .methods
+            .get(&MethodKey::static_(Ident::new("wrap")))
+            .expect("no method");
         let t = method.generics.type_params[0].id;
         let n = method.generics.const_params[0].id;
         let array_ty = Type::Array {
@@ -453,7 +471,7 @@ mod method_schemas {
             len: ArrayLen::Param(n),
         };
 
-        assert!(method.receiver.is_none());
+        assert_eq!(method.mode.surface(), MethodSurface::Static);
         assert_eq!(method.generics.type_params.len(), 1);
         assert_eq!(method.generics.const_params.len(), 1);
         assert_eq!(method.params[0].ty, array_ty.clone());
@@ -478,7 +496,11 @@ mod method_calls {
                 CallableId::aggregate_method(
                     root_key(NominalKind::Struct, owner),
                     Ident::new(name),
-                    is_instance,
+                    if is_instance {
+                        MethodSurface::Instance
+                    } else {
+                        MethodSurface::Static
+                    },
                 ),
                 GenericArgs {
                     type_args,
@@ -843,7 +865,10 @@ mod extend_schemas {
             .extends()
             .filter(|ext| ext.target == Type::Int)
         {
-            if ext.methods.contains_key(&Ident::new("double")) {
+            if ext
+                .methods
+                .contains_key(&MethodKey::instance(Ident::new("double")))
+            {
                 found = true;
                 break;
             }
@@ -860,7 +885,10 @@ mod extend_schemas {
             .extends()
             .find(|ext| ext.target == Type::Int)
             .expect("no extend");
-        let method = ext.methods.get(&Ident::new("add")).expect("no method");
+        let method = ext
+            .methods
+            .get(&MethodKey::instance(Ident::new("add")))
+            .expect("no method");
         assert_eq!(method.params.len(), 1);
         assert_eq!(method.params[0].ty, Type::Int);
         assert_eq!(method.ret, Type::Int);
@@ -873,7 +901,10 @@ mod extend_schemas {
         )
         .unwrap();
         let ext = result.decls().extends().next().expect("no extend");
-        let method = ext.methods.get(&Ident::new("get")).expect("no method");
+        let method = ext
+            .methods
+            .get(&MethodKey::instance(Ident::new("get")))
+            .expect("no method");
 
         assert_eq!(ext.generics.type_params.len(), 1);
         let type_param = ext.generics.type_params[0].id;
@@ -917,7 +948,10 @@ mod extend_schemas {
             .extends()
             .find(|ext| ext.target == ty)
             .expect("no extend");
-        assert!(ext.methods.contains_key(&Ident::new("len")));
+        assert!(
+            ext.methods
+                .contains_key(&MethodKey::instance(Ident::new("len")))
+        );
     }
 }
 
@@ -928,6 +962,7 @@ mod extend_calls {
         result: &TypecheckResult,
         index: usize,
         name: &str,
+        surface: MethodSurface,
         type_args: Vec<Type>,
     ) {
         let target = result.calls().values().next().expect("missing call target");
@@ -940,6 +975,7 @@ mod extend_calls {
                         index,
                     },
                     Ident::new(name),
+                    surface,
                 ),
                 GenericArgs {
                     type_args,
@@ -998,7 +1034,16 @@ mod extend_calls {
         let result =
             check("extend int { fn double(self) -> int { self * 2 } } fn main() { 5.double(); }")
                 .unwrap();
-        assert_extend_target(&result, 0, "double", vec![]);
+        assert_extend_target(&result, 0, "double", MethodSurface::Instance, vec![]);
+    }
+
+    #[test]
+    fn call_target_static_extend() {
+        let result = check(
+            "struct Point { x: int } extend Point { fn zero() -> int { 0 } } fn main() { Point.zero(); }",
+        )
+        .unwrap();
+        assert_extend_target(&result, 0, "zero", MethodSurface::Static, vec![]);
     }
 
     #[test]
@@ -1038,7 +1083,7 @@ mod extend_calls {
         let errors = errors("extend<T, U> T { fn bad(self) -> int { 0 } } fn main() { 1.bad(); }");
         assert!(errors.iter().any(|err| matches!(
             err,
-            TypeError::UnboundGenericParam { name, .. } if *name == Ident::new("U")
+            TypeError::Decl(DeclError::UnusedExtendTypeParam { name, .. }) if *name == Ident::new("U")
         )));
     }
 
@@ -1079,7 +1124,7 @@ mod extend_calls {
     fn generic_call_target() {
         let result =
             check("extend<T> T { fn id(self) -> T { self } } fn main() { 1.id(); }").unwrap();
-        assert_extend_target(&result, 0, "id", vec![Type::Int]);
+        assert_extend_target(&result, 0, "id", MethodSurface::Instance, vec![Type::Int]);
     }
 
     #[test]
@@ -1296,7 +1341,7 @@ mod extend_calls {
 
     #[test]
     fn method_beats_extend() {
-        assert_ty(
+        let errors = errors(
             "struct Point { 
                 x: int,
 
@@ -1311,8 +1356,11 @@ mod extend_calls {
                 let p = Point { x: 1 }; 
                 p.len()
             }",
-            Type::Int,
         );
+        assert!(errors.iter().any(|err| matches!(
+            err,
+            TypeError::Decl(DeclError::ExtendMethodConflict { name, .. }) if *name == Ident::new("len")
+        )));
     }
 }
 

@@ -209,6 +209,11 @@ fn opt_array_fixed() {
 }
 
 #[test]
+fn slice_in_generic_arg_fails() {
+    parse_type_err("Box<slice[int]>");
+}
+
+#[test]
 fn slice_int() {
     let ty = parse_param_type("slice[int]");
     match ty {

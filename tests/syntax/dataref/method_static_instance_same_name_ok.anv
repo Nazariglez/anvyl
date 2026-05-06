@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+dataref Counter {
+    amount: int,
+
+    fn value(self) -> int { self.amount }
+    fn value(start: int) -> Counter { Counter { amount: start } }
+}
+
+fn main() {
+    let c = Counter.value(3);
+    let x: int = c.value();
+}

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use super::{
     ConstSubst, GenericArgs, GenericParams, Specificity, TypeSubst, compare_specificity,
@@ -6,7 +6,7 @@ use super::{
     infer::{GenericSolverSeeds, Solver},
     substitute,
     type_ops::{TypeFolder, bare_type_name},
-    type_refs::{GenericParamError, GenericTypeContext, TypeParamBinding},
+    type_refs::{GenericParamError, GenericTypeContext},
 };
 use crate::{
     ast::{
@@ -131,24 +131,23 @@ impl CallableId {
         }
     }
 
-    pub(crate) fn aggregate_method(owner: NominalKey, name: Ident, is_instance: bool) -> Self {
+    pub(crate) fn aggregate_method(owner: NominalKey, name: Ident, surface: MethodSurface) -> Self {
         Self {
             module: owner.module.clone(),
             parent: Some(CallableParent::Nominal(owner)),
-            kind: if is_instance {
-                CallableKind::InstanceMethod
-            } else {
-                CallableKind::StaticMethod
+            kind: match surface {
+                MethodSurface::Static => CallableKind::StaticMethod,
+                MethodSurface::Instance => CallableKind::InstanceMethod,
             },
             name,
         }
     }
 
-    pub(crate) fn extend_method(extend: ExtendId, name: Ident) -> Self {
+    pub(crate) fn extend_method(extend: ExtendId, name: Ident, surface: MethodSurface) -> Self {
         Self {
             module: extend.module.clone(),
             parent: Some(CallableParent::Extend(extend)),
-            kind: CallableKind::ExtendMethod,
+            kind: CallableKind::ExtendMethod(surface),
             name,
         }
     }
@@ -175,8 +174,74 @@ pub(crate) enum CallableKind {
     ExternFunction,
     StaticMethod,
     InstanceMethod,
-    ExtendMethod,
+    ExtendMethod(MethodSurface),
     EnumVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MethodMode {
+    Static,
+    Instance { mutable: bool },
+}
+
+impl MethodMode {
+    pub(crate) fn from_receiver(receiver: Option<MethodReceiver>) -> Self {
+        match receiver {
+            Some(MethodReceiver::Value) => Self::Instance { mutable: false },
+            Some(MethodReceiver::Var) => Self::Instance { mutable: true },
+            None => Self::Static,
+        }
+    }
+
+    pub(crate) fn surface(self) -> MethodSurface {
+        match self {
+            Self::Static => MethodSurface::Static,
+            Self::Instance { .. } => MethodSurface::Instance,
+        }
+    }
+
+    pub(crate) fn receiver(self) -> Option<MethodReceiver> {
+        match self {
+            Self::Static => None,
+            Self::Instance { mutable: false } => Some(MethodReceiver::Value),
+            Self::Instance { mutable: true } => Some(MethodReceiver::Var),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MethodSurface {
+    Static,
+    Instance,
+}
+
+impl MethodSurface {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Instance => "instance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MethodKey {
+    pub(crate) name: Ident,
+    pub(crate) surface: MethodSurface,
+}
+
+impl MethodKey {
+    pub(crate) fn new(name: Ident, surface: MethodSurface) -> Self {
+        Self { name, surface }
+    }
+
+    pub(crate) fn instance(name: Ident) -> Self {
+        Self::new(name, MethodSurface::Instance)
+    }
+
+    pub(crate) fn static_(name: Ident) -> Self {
+        Self::new(name, MethodSurface::Static)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -240,6 +305,44 @@ pub(crate) enum DeclError {
     },
     DuplicateGenericParam {
         module: ModuleScope,
+        name: Ident,
+        span: Span,
+    },
+    DuplicateAggregateMethod {
+        owner: NominalKey,
+        name: Ident,
+        surface: MethodSurface,
+        span: Span,
+    },
+    DuplicateExtendMethod {
+        name: Ident,
+        surface: MethodSurface,
+        span: Span,
+    },
+    UnsupportedExtendTarget {
+        ty: Type,
+        span: Span,
+    },
+    UnusedExtendTypeParam {
+        name: Ident,
+        span: Span,
+    },
+    UnusedExtendConstParam {
+        name: Ident,
+        span: Span,
+    },
+    ExtendMethodConflict {
+        ty: Type,
+        name: Ident,
+        surface: MethodSurface,
+        span: Span,
+    },
+    MutableSliceExtendReceiver {
+        name: Ident,
+        span: Span,
+    },
+    UnsupportedStaticExtendTarget {
+        ty: Type,
         name: Ident,
         span: Span,
     },
@@ -748,7 +851,7 @@ pub(crate) struct AggregateSchema {
     pub(crate) key: NominalKey,
     pub(crate) generics: GenericParams,
     pub(crate) fields: HashMap<Ident, FieldSchema>,
-    pub(crate) methods: HashMap<Ident, MethodSchema>,
+    pub(crate) methods: HashMap<MethodKey, MethodSchema>,
 }
 
 #[derive(Clone)]
@@ -760,7 +863,7 @@ pub(crate) struct FieldSchema {
 #[derive(Clone)]
 pub(crate) struct MethodSchema {
     pub(crate) generics: GenericParams,
-    pub(crate) receiver: Option<MethodReceiver>,
+    pub(crate) mode: MethodMode,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
     pub(crate) ret: Type,
@@ -785,13 +888,13 @@ pub(crate) struct ExtendSchema {
     pub(crate) origin: ModuleScope,
     pub(crate) target: Type,
     pub(crate) generics: GenericParams,
-    pub(crate) methods: HashMap<Ident, ExtendMethodSchema>,
-    span: Span,
+    pub(crate) methods: HashMap<MethodKey, ExtendMethodSchema>,
+    pub(crate) span: Span,
 }
 
 #[derive(Clone)]
 pub(crate) struct ExtendMethodSchema {
-    pub(crate) receiver: Option<MethodReceiver>,
+    pub(crate) mode: MethodMode,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
@@ -1002,7 +1105,6 @@ impl DeclarationIndex {
                 span,
                 &mut errors,
             );
-            collect_implicit_extend_generics(&extend.target, &mut generics, true);
             let target_site = DeclTypeSite {
                 module: origin.clone(),
                 span,
@@ -1188,19 +1290,31 @@ impl DeclarationIndex {
                     }
                     let mut methods = HashMap::new();
                     for method in &agg.methods {
-                        methods.insert(
-                            method.sig.name,
-                            MethodSchema {
-                                generics: generic_params(
-                                    &method.sig.type_params,
-                                    &method.sig.const_params,
-                                ),
-                                receiver: method.sig.receiver,
-                                params: resolve_func_params(&method.sig.params),
-                                required_params: required_param_count(&method.sig.params),
-                                ret: method.sig.ret.clone(),
-                            },
-                        );
+                        let mode = MethodMode::from_receiver(method.sig.receiver);
+                        let method_key = MethodKey::new(method.sig.name, mode.surface());
+                        let schema = MethodSchema {
+                            generics: generic_params(
+                                &method.sig.type_params,
+                                &method.sig.const_params,
+                            ),
+                            mode,
+                            params: resolve_func_params(&method.sig.params),
+                            required_params: required_param_count(&method.sig.params),
+                            ret: method.sig.ret.clone(),
+                        };
+                        match methods.entry(method_key) {
+                            Entry::Occupied(entry) => {
+                                self.errors.push(DeclError::DuplicateAggregateMethod {
+                                    owner: key.clone(),
+                                    name: method.sig.name,
+                                    surface: entry.key().surface,
+                                    span: agg_node.span,
+                                });
+                            }
+                            Entry::Vacant(entry) => {
+                                entry.insert(schema);
+                            }
+                        }
                     }
                     if self.insert_local_type(
                         &mut decls,
@@ -1294,26 +1408,45 @@ impl DeclarationIndex {
                         continue;
                     }
                     let ext = &extend_node.node;
+                    let generics = generic_params(&ext.type_params, &ext.const_params);
                     let mut methods = HashMap::new();
                     for method_node in &ext.methods {
                         let m = &method_node.node;
-                        debug_assert!(m.sig.receiver.is_some());
-                        methods.insert(
-                            m.sig.name,
-                            ExtendMethodSchema {
-                                receiver: m.sig.receiver,
-                                generics: generic_params(&m.sig.type_params, &m.sig.const_params),
-                                params: resolve_func_params(&m.sig.params),
-                                required_params: required_param_count(&m.sig.params),
-                                ret: m.sig.ret.clone(),
-                            },
-                        );
+                        let mode = MethodMode::from_receiver(m.sig.receiver);
+                        let key = MethodKey::new(m.sig.name, mode.surface());
+                        let schema = ExtendMethodSchema {
+                            mode,
+                            generics: generic_params(&m.sig.type_params, &m.sig.const_params),
+                            params: resolve_func_params(&m.sig.params),
+                            required_params: required_param_count(&m.sig.params),
+                            ret: m.sig.ret.clone(),
+                        };
+                        if methods.contains_key(&key)
+                            || self.extends.iter().any(|prior| {
+                                prior.origin == scope
+                                    && same_extend_target(
+                                        &prior.target,
+                                        &prior.generics,
+                                        &ext.ty,
+                                        &generics,
+                                    )
+                                    && prior.methods.contains_key(&key)
+                            })
+                        {
+                            self.errors.push(DeclError::DuplicateExtendMethod {
+                                name: m.sig.name,
+                                surface: key.surface,
+                                span: method_node.span,
+                            });
+                        } else {
+                            methods.insert(key, schema);
+                        }
                     }
                     self.extends.push(ExtendSchema {
                         id,
                         origin: scope.clone(),
                         target: ext.ty.clone(),
-                        generics: generic_params(&ext.type_params, &ext.const_params),
+                        generics,
                         methods,
                         span: extend_node.span,
                     });
@@ -1839,7 +1972,8 @@ impl DeclarationIndex {
         name: Ident,
     ) -> bool {
         self.extends().any(|ext| {
-            ext.methods.contains_key(&name) && self.module_surface_contains(module, &ext.origin)
+            ext.methods.contains_key(&MethodKey::instance(name))
+                && self.module_surface_contains(module, &ext.origin)
         })
     }
 
@@ -1849,55 +1983,53 @@ impl DeclarationIndex {
         receiver: &Type,
         name: Ident,
     ) -> Option<ExtendMethodMatch<'_>> {
-        self.find_extend_method(receiver, name, |ext| {
+        self.find_instance_extend_method(receiver, name, |ext| {
             self.module_surface_contains(module, &ext.origin)
         })
     }
 
-    pub(crate) fn find_extend_method<F>(
+    pub(crate) fn find_instance_extend_method<F>(
         &self,
         receiver: &Type,
+        name: Ident,
+        visible: F,
+    ) -> Option<ExtendMethodMatch<'_>>
+    where
+        F: FnMut(&ExtendSchema) -> bool,
+    {
+        self.find_extend_method(MethodSurface::Instance, receiver, name, visible)
+    }
+
+    pub(crate) fn find_static_extend_method<F>(
+        &self,
+        target: &Type,
+        name: Ident,
+        visible: F,
+    ) -> Option<ExtendMethodMatch<'_>>
+    where
+        F: FnMut(&ExtendSchema) -> bool,
+    {
+        self.find_extend_method(MethodSurface::Static, target, name, visible)
+    }
+
+    fn find_extend_method<F>(
+        &self,
+        surface: MethodSurface,
+        subject: &Type,
         name: Ident,
         mut visible: F,
     ) -> Option<ExtendMethodMatch<'_>>
     where
         F: FnMut(&ExtendSchema) -> bool,
     {
-        let mut candidates = vec![];
+        let method_key = MethodKey::new(name, surface);
+        let candidates = self
+            .extends()
+            .filter(|ext| visible(ext))
+            .filter_map(|ext| extend_candidate(ext, method_key, subject))
+            .collect::<Vec<_>>();
 
-        for ext in self.extends() {
-            if !visible(ext) {
-                continue;
-            }
-            let Some(method) = ext.methods.get(&name) else {
-                continue;
-            };
-            let target = generic_template_type(&ext.target, &ext.generics);
-            let Some(owner_args) =
-                match_generic_template_args(&ext.generics, &target, receiver, Span::new(0, 0))
-            else {
-                continue;
-            };
-            candidates.push(ExtendCandidate {
-                extend: ext,
-                method,
-                target,
-                owner_args,
-            });
-        }
-
-        match candidates.len() {
-            0 => None,
-            1 => {
-                let candidate = candidates.remove(0);
-                Some(ExtendMethodMatch::Match {
-                    extend: candidate.extend,
-                    method: candidate.method,
-                    owner_args: candidate.owner_args,
-                })
-            }
-            _ => Some(most_specific_extend(candidates)),
-        }
+        select_extend_candidate(candidates)
     }
 
     pub(crate) fn callable_for_value(&self, value: &ResolvedValue) -> Option<CallableRef> {
@@ -1917,7 +2049,7 @@ impl DeclarationIndex {
             }
             CallableKind::StaticMethod
             | CallableKind::InstanceMethod
-            | CallableKind::ExtendMethod
+            | CallableKind::ExtendMethod(_)
             | CallableKind::EnumVariant => return None,
         };
 
@@ -1942,25 +2074,49 @@ impl DeclarationIndex {
         aggregate: &AggregateSchema,
         name: Ident,
         method: &MethodSchema,
+        receiver_ty: Type,
+    ) -> CallableRef {
+        debug_assert_eq!(method.mode.surface(), MethodSurface::Instance);
+        let owner_ty = receiver_ty.clone();
+        self.callable_for_aggregate_member(
+            aggregate,
+            name,
+            method,
+            Some(&owner_ty),
+            Some(receiver_ty),
+        )
+    }
+
+    pub(crate) fn callable_for_aggregate_static_method(
+        &self,
+        aggregate: &AggregateSchema,
+        name: Ident,
+        method: &MethodSchema,
+        owner_ty: Option<&Type>,
+    ) -> CallableRef {
+        debug_assert_eq!(method.mode.surface(), MethodSurface::Static);
+        self.callable_for_aggregate_member(aggregate, name, method, owner_ty, None)
+    }
+
+    fn callable_for_aggregate_member(
+        &self,
+        aggregate: &AggregateSchema,
+        name: Ident,
+        method: &MethodSchema,
+        owner_ty: Option<&Type>,
         receiver_ty: Option<Type>,
     ) -> CallableRef {
         debug_assert!(self.aggregates.contains_key(&aggregate.key));
-        let params = match receiver_ty.as_ref() {
-            Some(receiver) => method
-                .params
-                .iter()
-                .map(|param| {
-                    FuncParam::new(
-                        substitute_aggregate_member(receiver, &aggregate.generics, &param.ty),
-                        param.mutable,
-                    )
-                })
-                .collect(),
-            None => method.params.clone(),
-        };
-        let ret = receiver_ty.as_ref().map_or_else(
+        let subst = owner_ty.and_then(|ty| aggregate_substitutions(ty, &aggregate.generics));
+        let params = subst.as_ref().map_or_else(
+            || method.params.clone(),
+            |(type_subst, const_subst)| {
+                substitute_func_params(&method.params, type_subst, const_subst)
+            },
+        );
+        let ret = subst.as_ref().map_or_else(
             || method.ret.clone(),
-            |receiver| substitute_aggregate_member(receiver, &aggregate.generics, &method.ret),
+            |(type_subst, const_subst)| substitute(&method.ret, type_subst, const_subst),
         );
 
         CallableRef {
@@ -1968,7 +2124,7 @@ impl DeclarationIndex {
                 id: CallableId::aggregate_method(
                     aggregate.key.clone(),
                     name,
-                    method.receiver.is_some(),
+                    method.mode.surface(),
                 ),
                 sig: CallableSig {
                     owner_generics: aggregate.generics.clone(),
@@ -1979,7 +2135,7 @@ impl DeclarationIndex {
                 },
             },
             receiver_ty,
-            owner_args: GenericArgs::default(),
+            owner_args: owner_ty.and_then(nominal_generic_args).unwrap_or_default(),
         }
     }
 
@@ -1990,9 +2146,31 @@ impl DeclarationIndex {
         name: Ident,
         method: &ExtendMethodSchema,
         owner_args: GenericArgs,
-    ) -> Option<CallableRef> {
+    ) -> CallableRef {
+        debug_assert_eq!(method.mode.surface(), MethodSurface::Instance);
+        self.callable_for_extension(Some(receiver_ty), extend, name, method, owner_args)
+    }
+
+    pub(crate) fn callable_for_static_extend_method(
+        &self,
+        extend: &ExtendSchema,
+        name: Ident,
+        method: &ExtendMethodSchema,
+        owner_args: GenericArgs,
+    ) -> CallableRef {
+        debug_assert_eq!(method.mode.surface(), MethodSurface::Static);
+        self.callable_for_extension(None, extend, name, method, owner_args)
+    }
+
+    fn callable_for_extension(
+        &self,
+        receiver_ty: Option<Type>,
+        extend: &ExtendSchema,
+        name: Ident,
+        method: &ExtendMethodSchema,
+        owner_args: GenericArgs,
+    ) -> CallableRef {
         debug_assert!(self.extends.iter().any(|schema| schema.id == extend.id));
-        method.receiver?;
         let (type_subst, const_subst) = extend.generics.substitutions(&owner_args);
         let template_params = method
             .params
@@ -2006,9 +2184,9 @@ impl DeclarationIndex {
             .collect::<Vec<_>>();
         let template_ret = generic_template_type(&method.ret, &extend.generics);
 
-        Some(CallableRef {
+        CallableRef {
             def: CallableDef {
-                id: CallableId::extend_method(extend.id.clone(), name),
+                id: CallableId::extend_method(extend.id.clone(), name, method.mode.surface()),
                 sig: CallableSig {
                     owner_generics: extend.generics.clone(),
                     generics: method.generics.clone(),
@@ -2017,9 +2195,9 @@ impl DeclarationIndex {
                     ret: substitute(&template_ret, &type_subst, &const_subst),
                 },
             },
-            receiver_ty: Some(receiver_ty),
+            receiver_ty,
             owner_args,
-        })
+        }
     }
 
     pub(crate) fn callable_for_variant(
@@ -2059,26 +2237,40 @@ pub(crate) fn substitute_aggregate_member(
     generics: &GenericParams,
     ty: &Type,
 ) -> Type {
-    let Some(receiver) = receiver.as_aggregate() else {
+    let Some((type_subst, const_subst)) = aggregate_substitutions(receiver, generics) else {
         return ty.clone();
     };
+    substitute(ty, &type_subst, &const_subst)
+}
+
+fn aggregate_substitutions(
+    owner_ty: &Type,
+    generics: &GenericParams,
+) -> Option<(TypeSubst, ConstSubst)> {
+    let owner = owner_ty.as_aggregate()?;
     let type_subst: TypeSubst = generics
         .type_params
         .iter()
-        .zip(receiver.type_args)
+        .zip(owner.type_args)
         .map(|(param, arg)| (param.id, arg.clone()))
         .collect();
     let const_subst: ConstSubst = generics
         .const_params
         .iter()
-        .zip(receiver.const_args)
+        .zip(owner.const_args)
         .map(|(param, arg)| (param.id, ConstTerm::from_arg(arg)))
         .collect();
-    let has_substitutions = !type_subst.is_empty() || !const_subst.is_empty();
-    if !has_substitutions {
-        return ty.clone();
-    }
-    substitute(ty, &type_subst, &const_subst)
+    (!type_subst.is_empty() || !const_subst.is_empty()).then_some((type_subst, const_subst))
+}
+
+pub(crate) fn nominal_generic_args(ty: &Type) -> Option<GenericArgs> {
+    let Type::Nominal(nominal) = ty else {
+        return None;
+    };
+    Some(GenericArgs {
+        type_args: nominal.type_args.clone(),
+        const_args: nominal.const_args.iter().map(ConstTerm::from_arg).collect(),
+    })
 }
 
 fn substitute_func_params(
@@ -2119,6 +2311,56 @@ struct ExtendCandidate<'a> {
 }
 
 type GenericTemplateMatch = Result<GenericArgs, Vec<Ident>>;
+
+fn extend_candidate<'a>(
+    ext: &'a ExtendSchema,
+    method_key: MethodKey,
+    subject: &Type,
+) -> Option<ExtendCandidate<'a>> {
+    let method = ext.methods.get(&method_key)?;
+    let target = generic_template_type(&ext.target, &ext.generics);
+    let owner_args = if method_key.surface == MethodSurface::Static
+        && static_nominal_family_match(&target, subject)
+    {
+        Ok(GenericArgs::default())
+    } else {
+        match_generic_template_args(&ext.generics, &target, subject, Span::new(0, 0))?
+    };
+    Some(ExtendCandidate {
+        extend: ext,
+        method,
+        target,
+        owner_args,
+    })
+}
+
+fn static_nominal_family_match(target: &Type, subject: &Type) -> bool {
+    let (Type::Nominal(target), Type::Nominal(subject)) = (target, subject) else {
+        return false;
+    };
+    target.kind == subject.kind
+        && target.name == subject.name
+        && target.origin == subject.origin
+        && subject.type_args.is_empty()
+        && subject.const_args.is_empty()
+}
+
+fn select_extend_candidate(
+    mut candidates: Vec<ExtendCandidate<'_>>,
+) -> Option<ExtendMethodMatch<'_>> {
+    match candidates.len() {
+        0 => None,
+        1 => {
+            let candidate = candidates.pop().expect("one extend candidate");
+            Some(ExtendMethodMatch::Match {
+                extend: candidate.extend,
+                method: candidate.method,
+                owner_args: candidate.owner_args,
+            })
+        }
+        _ => Some(most_specific_extend(candidates)),
+    }
+}
 
 fn match_generic_template_args(
     generics: &GenericParams,
@@ -2197,7 +2439,7 @@ impl DeclarationIndex {
     ) -> Result<Type, TypeRefError> {
         match ty {
             Type::UnresolvedName(name) => {
-                if let Some(TypeParamBinding::Explicit(id)) = generics.type_param(*name) {
+                if let Some(id) = generics.type_param(*name) {
                     return Ok(Type::Var(id));
                 }
                 if generics.has_const_param(*name) {
@@ -2219,7 +2461,7 @@ impl DeclarationIndex {
                 generic_args,
             } => {
                 if qualifier.is_none() && generic_args.is_empty() {
-                    if let Some(TypeParamBinding::Explicit(id)) = generics.type_param(*name) {
+                    if let Some(id) = generics.type_param(*name) {
                         return Ok(Type::Var(id));
                     }
                     if generics.has_const_param(*name) {
@@ -2295,6 +2537,7 @@ impl DeclarationIndex {
                 value: Box::new(self.finalize_type_ref(module, generics, value)?),
             }),
             Type::Infer
+            | Type::InferReturn
             | Type::Any
             | Type::Int
             | Type::Float
@@ -2477,10 +2720,9 @@ struct GenericTemplate {
 
 impl TypeFolder for GenericTemplate {
     fn fold_unresolved_name(&mut self, name: Ident) -> Type {
-        match self.generics.type_param(name) {
-            Some(TypeParamBinding::Explicit(id)) => Type::Var(id),
-            Some(TypeParamBinding::ImplicitExtend) | None => Type::UnresolvedName(name),
-        }
+        self.generics
+            .type_param(name)
+            .map_or(Type::UnresolvedName(name), Type::Var)
     }
 
     fn fold_unresolved_nominal(
@@ -2491,7 +2733,7 @@ impl TypeFolder for GenericTemplate {
     ) -> Type {
         if qualifier.is_none()
             && generic_args.is_empty()
-            && let Some(TypeParamBinding::Explicit(id)) = self.generics.type_param(name)
+            && let Some(id) = self.generics.type_param(name)
         {
             return Type::Var(id);
         }
@@ -2519,6 +2761,29 @@ impl TypeFolder for GenericTemplate {
     }
 }
 
+fn same_extend_target(
+    a: &Type,
+    a_generics: &GenericParams,
+    b: &Type,
+    b_generics: &GenericParams,
+) -> bool {
+    let Some(a_template) = try_generic_template_type(a, a_generics) else {
+        return false;
+    };
+    let Some(b_template) = try_generic_template_type(b, b_generics) else {
+        return false;
+    };
+    let span = Span::new(0, 0);
+    match_generic_template_args(a_generics, &a_template, &b_template, span).is_some()
+        && match_generic_template_args(b_generics, &b_template, &a_template, span).is_some()
+}
+
+fn try_generic_template_type(ty: &Type, generics: &GenericParams) -> Option<Type> {
+    let generics =
+        GenericTypeContext::try_from_params(&generics.type_params, &generics.const_params).ok()?;
+    Some(GenericTemplate { generics }.fold_type(ty))
+}
+
 pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type {
     GenericTemplate {
         generics: GenericTypeContext::try_from_params(
@@ -2534,64 +2799,6 @@ fn generic_params(type_params: &[TypeParam], const_params: &[ConstParam]) -> Gen
     GenericParams {
         type_params: type_params.to_vec(),
         const_params: const_params.to_vec(),
-    }
-}
-
-fn collect_implicit_extend_generics(
-    ty: &Type,
-    generics: &mut GenericTypeContext,
-    target_root: bool,
-) {
-    match ty {
-        Type::UnresolvedName(name) if !target_root => {
-            generics.insert_implicit_extend_type(*name);
-        }
-        Type::UnresolvedNominal {
-            name,
-            generic_args,
-            qualifier,
-        } => {
-            if qualifier.is_none() && !target_root {
-                generics.insert_implicit_extend_type(*name);
-            }
-            for arg in generic_args {
-                if let GenericArg::Type(ty) = arg {
-                    collect_implicit_extend_generics(ty, generics, false);
-                }
-            }
-        }
-        Type::Func { params, ret } => {
-            for param in params {
-                collect_implicit_extend_generics(&param.ty, generics, false);
-            }
-            collect_implicit_extend_generics(ret, generics, false);
-        }
-        Type::Tuple(elems) => {
-            for ty in elems {
-                collect_implicit_extend_generics(ty, generics, false);
-            }
-        }
-        Type::Nominal(nominal) => {
-            for ty in &nominal.type_args {
-                collect_implicit_extend_generics(ty, generics, false);
-            }
-        }
-        Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
-            collect_implicit_extend_generics(elem, generics, false);
-        }
-        Type::Map { key, value } => {
-            collect_implicit_extend_generics(key, generics, false);
-            collect_implicit_extend_generics(value, generics, false);
-        }
-        Type::UnresolvedName(_)
-        | Type::Infer
-        | Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Var(_) => {}
     }
 }
 
@@ -3334,16 +3541,26 @@ mod tests {
             vec![],
             None,
         );
-        let static_method = aggregate.methods.get(&ident("make")).unwrap();
-        let instance_method = aggregate.methods.get(&ident("get")).unwrap();
+        let static_method = aggregate
+            .methods
+            .get(&MethodKey::static_(ident("make")))
+            .unwrap();
+        let instance_method = aggregate
+            .methods
+            .get(&MethodKey::instance(ident("get")))
+            .unwrap();
 
-        let static_ref =
-            index.callable_for_aggregate_method(aggregate, ident("make"), static_method, None);
+        let static_ref = index.callable_for_aggregate_static_method(
+            aggregate,
+            ident("make"),
+            static_method,
+            None,
+        );
         let instance_ref = index.callable_for_aggregate_method(
             aggregate,
             ident("get"),
             instance_method,
-            Some(receiver.clone()),
+            receiver.clone(),
         );
 
         assert_eq!(static_ref.def.id.kind, CallableKind::StaticMethod);
@@ -3364,16 +3581,23 @@ mod tests {
             method,
             owner_args: Ok(owner_args),
         } = index
-            .find_extend_method(&Type::Int, ident("id"), |_| true)
+            .find_instance_extend_method(&Type::Int, ident("id"), |_| true)
             .unwrap()
         else {
             panic!("expected extend match");
         };
-        let callable = index
-            .callable_for_extend_method(Type::Int, extend, ident("id"), method, owner_args.clone())
-            .unwrap();
+        let callable = index.callable_for_extend_method(
+            Type::Int,
+            extend,
+            ident("id"),
+            method,
+            owner_args.clone(),
+        );
 
-        assert_eq!(callable.def.id.kind, CallableKind::ExtendMethod);
+        assert_eq!(
+            callable.def.id.kind,
+            CallableKind::ExtendMethod(MethodSurface::Instance)
+        );
         assert_eq!(callable.owner_args, owner_args);
         assert_eq!(callable.receiver_ty, Some(Type::Int));
         assert_eq!(callable.def.sig.params, vec![FuncParam::immut(Type::Int)]);
