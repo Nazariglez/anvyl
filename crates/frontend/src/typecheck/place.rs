@@ -14,6 +14,7 @@ pub(super) enum PlaceAccess {
     Mutable,
     Settable,
     Immutable,
+    ReadonlySelf,
     NotPlace,
 }
 
@@ -26,6 +27,14 @@ impl PlaceAccess {
         matches!(self, Self::Mutable)
     }
 
+    pub(super) fn assign_error(self, name: Ident, span: crate::span::Span) -> Option<TypeError> {
+        match self {
+            Self::Mutable | Self::Settable => None,
+            Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
+            Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
+        }
+    }
+
     pub(super) fn mut_borrow_error(
         self,
         name: Ident,
@@ -34,6 +43,7 @@ impl PlaceAccess {
         match self {
             Self::Mutable => None,
             Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+            Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
             Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
         }
     }
@@ -252,6 +262,7 @@ impl CheckedPlace {
 pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAccess {
     match receiver_access {
         PlaceAccess::Mutable => PlaceAccess::Mutable,
+        PlaceAccess::ReadonlySelf => PlaceAccess::ReadonlySelf,
         PlaceAccess::NotPlace => PlaceAccess::NotPlace,
         PlaceAccess::Settable | PlaceAccess::Immutable => PlaceAccess::Immutable,
     }
@@ -264,6 +275,7 @@ pub(super) fn extern_field_access(
     match (receiver_access, field_access) {
         (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: false }) => PlaceAccess::Mutable,
         (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: true }) => PlaceAccess::Settable,
+        (PlaceAccess::ReadonlySelf, _) => PlaceAccess::ReadonlySelf,
         (PlaceAccess::NotPlace, _) => PlaceAccess::NotPlace,
         _ => PlaceAccess::Immutable,
     }

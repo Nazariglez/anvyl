@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+
+struct Config {
+    width: int = 800,
+    height: int = 600,
+}
+
+struct Player {
+    name: string,
+    health: float = 100.0,
+}
+
+fn main() {
+    let c = Config {};
+    let c2 = Config { width: 1920 };
+    let p = Player { name: "Alice" };
+    let p2 = Player { name: "Bob", health: 50.0 };
+}

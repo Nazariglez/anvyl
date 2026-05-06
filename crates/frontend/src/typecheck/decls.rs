@@ -2265,12 +2265,10 @@ impl DeclarationIndex {
                     .iter()
                     .map(|arg| Self::finalize_const_arg(generics, arg))
                     .collect::<Result<Vec<_>, _>>()?;
-                if nominal.kind == NominalKind::Enum
-                    && nominal.origin.is_none()
-                    && nominal.name.0.as_ref() == Type::OPTION_ENUM_NAME
+                if nominal.origin.is_none()
                     && let Some(key) = self
                         .resolve_visible_type_key(module, None, nominal.name)
-                        .filter(|key| key.kind == NominalKind::Enum)
+                        .filter(|key| key.kind == nominal.kind)
                 {
                     return Ok(nominal_type_with_args(&key, &type_args, &const_args));
                 }

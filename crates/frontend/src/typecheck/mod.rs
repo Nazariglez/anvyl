@@ -13,7 +13,7 @@ use self::{
     pattern::{PatternBindMode, PatternContext},
     place::{PlaceAccess, check_alias_scrutinee, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
-    type_ops::TypeFolder,
+    type_ops::{TypeFolder, type_depends_on_generics},
     type_refs::{GenericParamError, GenericTypeContext},
 };
 pub(crate) use self::{
@@ -73,6 +73,21 @@ pub(crate) enum VariantShape {
     Unit,
     Tuple,
     Struct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenericParamKind {
+    Type,
+    Const,
+}
+
+impl GenericParamKind {
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            Self::Type => "type",
+            Self::Const => "const",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,6 +288,26 @@ pub(crate) enum TypeError {
         kind: MemberAccessKind,
         span: Span,
     },
+    InstanceMethodOnType {
+        ty: Type,
+        method: Ident,
+        span: Span,
+    },
+    StaticMethodOnValue {
+        ty: Type,
+        method: Ident,
+        span: Span,
+    },
+    ReadonlyMethodMutation {
+        span: Span,
+    },
+    MethodGenericShadow {
+        owner_kind: AggregateKind,
+        method_param: GenericParamKind,
+        owner_param: GenericParamKind,
+        name: Ident,
+        span: Span,
+    },
     TupleIndexOnNonTuple {
         ty: Type,
         index: u32,
@@ -360,6 +395,9 @@ pub(crate) enum TypeError {
     NonConstExpression {
         span: Span,
     },
+    GenericFieldDefault {
+        span: Span,
+    },
     ConstTypeMismatch {
         expected: Type,
         found: Type,
@@ -414,6 +452,7 @@ enum LocalBindingKind {
     Immutable,
     Mutable,
     Alias,
+    ReadonlySelf,
 }
 
 impl LocalBindingKind {
@@ -429,6 +468,7 @@ impl LocalBindingKind {
         match self {
             Self::Immutable => PlaceAccess::Immutable,
             Self::Mutable | Self::Alias => PlaceAccess::Mutable,
+            Self::ReadonlySelf => PlaceAccess::ReadonlySelf,
         }
     }
 }
@@ -1761,6 +1801,54 @@ fn check_param_order(params: &[Param], span: Span, tc: &mut TypeChecker) {
     }
 }
 
+fn check_aggregate_decl(agg_node: &AggregateDeclNode, tc: &mut TypeChecker) {
+    let agg = &agg_node.node;
+    let key = NominalKey {
+        module: tc.current_module.clone(),
+        kind: agg.kind.into(),
+        name: agg.name,
+    };
+    let Some(schema) = tc.decls.aggregate(&key).cloned() else {
+        return;
+    };
+
+    check_aggregate_field_defaults(&agg.fields, &schema.fields, tc);
+    check_method_generic_shadows(agg, agg_node.span, tc);
+    check_aggregate_method_bodies(agg, agg_node.span, &key, &schema, tc);
+}
+
+fn check_aggregate_field_defaults(
+    fields: &[StructField],
+    schema: &HashMap<Ident, FieldSchema>,
+    tc: &mut TypeChecker,
+) {
+    for field in fields {
+        let Some(default) = &field.default else {
+            continue;
+        };
+        let Some(schema) = schema.get(&field.name) else {
+            continue;
+        };
+        if type_depends_on_generics(&schema.ty) {
+            tc.push_error(TypeError::GenericFieldDefault { span: default.span });
+            continue;
+        }
+        let expected = tc.type_handle(&schema.ty);
+        if let Err(error) = validate_const_expr_type(default, Some(expected), tc) {
+            tc.push_error(error);
+            continue;
+        }
+        if matches!(default.node.kind, ExprKind::Lit(Lit::Nil))
+            && tc.decls.core_option_inner(&schema.ty).is_some()
+        {
+            continue;
+        }
+        if let Err(error) = tc.eval_const_expr(default) {
+            tc.push_error(error);
+        }
+    }
+}
+
 fn check_module_bodies(module: &ModuleScope, program: &Program, tc: &mut TypeChecker) {
     with_source_module_scope(module, tc, |tc| check_stmts(&program.stmts, tc));
 }
@@ -1801,7 +1889,10 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
         Stmt::Extend(extend_node) => {
             check_extend(extend_node, tc);
         }
-        Stmt::Aggregate(_) | Stmt::Enum(_) => {}
+        Stmt::Aggregate(agg_node) => {
+            check_aggregate_decl(agg_node, tc);
+        }
+        Stmt::Enum(_) => {}
         Stmt::Const(const_node) => {
             if tc.scopes.len() > 1 {
                 check_const(const_node, tc);
@@ -1895,6 +1986,98 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
     }
 }
 
+fn check_aggregate_method_bodies(
+    agg: &StructDecl,
+    span: Span,
+    key: &NominalKey,
+    schema: &AggregateSchema,
+    tc: &mut TypeChecker,
+) {
+    if !schema.generics.is_empty() {
+        return;
+    }
+
+    let self_ty = nominal_type(key);
+    for method in &agg.methods {
+        if method_sig_is_generic(&method.sig) {
+            continue;
+        }
+        let Some(method_schema) = schema.methods.get(&method.sig.name) else {
+            continue;
+        };
+        check_func_body(
+            method
+                .sig
+                .receiver
+                .map(|receiver| (receiver, self_ty.clone())),
+            &method.sig.params,
+            &method_schema.params,
+            method_schema.ret.clone(),
+            &method.body,
+            span,
+            &[],
+            tc,
+        );
+    }
+}
+
+fn check_method_generic_shadows(agg: &StructDecl, span: Span, tc: &mut TypeChecker) {
+    let mut owner_params = HashMap::new();
+    owner_params.extend(
+        agg.type_params
+            .iter()
+            .map(|param| (param.name, GenericParamKind::Type)),
+    );
+    owner_params.extend(
+        agg.const_params
+            .iter()
+            .map(|param| (param.name, GenericParamKind::Const)),
+    );
+
+    for method in &agg.methods {
+        for param in &method.sig.type_params {
+            check_method_generic_shadow(
+                agg.kind,
+                &owner_params,
+                GenericParamKind::Type,
+                param.name,
+                span,
+                tc,
+            );
+        }
+        for param in &method.sig.const_params {
+            check_method_generic_shadow(
+                agg.kind,
+                &owner_params,
+                GenericParamKind::Const,
+                param.name,
+                span,
+                tc,
+            );
+        }
+    }
+}
+
+fn check_method_generic_shadow(
+    owner_kind: AggregateKind,
+    owner_params: &HashMap<Ident, GenericParamKind>,
+    method_param: GenericParamKind,
+    name: Ident,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    let Some(owner_param) = owner_params.get(&name).copied() else {
+        return;
+    };
+    tc.push_error(TypeError::MethodGenericShadow {
+        owner_kind,
+        method_param,
+        owner_param,
+        name,
+        span,
+    });
+}
+
 fn check_func_body(
     self_binding: Option<(MethodReceiver, Type)>,
     params: &[Param],
@@ -1913,11 +2096,11 @@ fn check_func_body(
     }
     tc.push_return_type(ret_ty.clone());
     if let Some((receiver, self_ty)) = self_binding {
-        tc.define(
-            Ident::new("self"),
-            self_ty,
-            matches!(receiver, MethodReceiver::Var),
-        );
+        let kind = match receiver {
+            MethodReceiver::Var => LocalBindingKind::Mutable,
+            MethodReceiver::Value => LocalBindingKind::ReadonlySelf,
+        };
+        tc.define_value(Ident::new("self"), self_ty, kind, None);
     }
     for (param, param_ty) in params.iter().zip(param_types.iter()) {
         tc.define(
@@ -3825,12 +4008,11 @@ fn resolve_struct_key(lit: &StructLiteralNode, tc: &mut TypeChecker) -> Option<N
 
 fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
     let target = check_place(&assign.node.target, tc);
-    if !target.value.access.can_assign() {
-        let name = assignment_target_name(&assign.node.target);
-        tc.push_error(TypeError::ImmutableAssignment {
-            name,
-            span: assign.node.target.span,
-        });
+    if let Some(error) = target.value.access.assign_error(
+        assignment_target_name(&assign.node.target),
+        assign.node.target.span,
+    ) {
+        tc.push_error(error);
     }
 
     match assign_op_to_binary_op(assign.node.op) {

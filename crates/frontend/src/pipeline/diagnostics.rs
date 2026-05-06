@@ -480,6 +480,27 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             let kind = render_member_access_kind(*kind);
             format!("Unknown {kind} '{member}' for type '{ty}'")
         }
+        TypeError::InstanceMethodOnType { ty, method, .. } => {
+            format!("instance method '{method}' requires a value of type '{ty}'")
+        }
+        TypeError::StaticMethodOnValue { ty, method, .. } => {
+            format!("static method '{method}' must be called on type '{ty}'")
+        }
+        TypeError::ReadonlyMethodMutation { .. } => {
+            "readonly method cannot mutate self".to_string()
+        }
+        TypeError::MethodGenericShadow {
+            owner_kind,
+            method_param,
+            owner_param,
+            name,
+            ..
+        } => format!(
+            "method {} parameter shadows {} {} parameter '{name}'",
+            method_param.keyword(),
+            owner_kind.keyword(),
+            owner_param.keyword()
+        ),
         TypeError::TupleIndexOnNonTuple { ty, index, .. } => {
             format!("cannot index non-tuple type with .{index}: found '{ty}'")
         }
@@ -550,6 +571,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::UnknownConst { name, .. } => format!("unknown constant '{name}'"),
         TypeError::ConstCycle { name, .. } => format!("constant '{name}' depends on itself"),
         TypeError::NonConstExpression { .. } => "not a constant expression".to_string(),
+        TypeError::GenericFieldDefault { .. } => {
+            "field default cannot depend on generic parameters".to_string()
+        }
         TypeError::ConstTypeMismatch {
             expected, found, ..
         } => {

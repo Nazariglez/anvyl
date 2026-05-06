@@ -1,0 +1,13 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: wrong number of type parameters
+
+dataref Buffer<T, N: int> {
+    data: [T; N],
+}
+
+fn main() {
+    let buf = Buffer { data: [1, 2, 3] };
+    let _: Buffer<int> = buf;
+}

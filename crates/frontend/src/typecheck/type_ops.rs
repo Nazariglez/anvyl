@@ -32,6 +32,27 @@ pub(crate) fn type_closure_facts(ty: &Type) -> TypeClosureFacts {
     facts
 }
 
+pub(crate) fn type_depends_on_generics(ty: &Type) -> bool {
+    let mut visitor = GenericDependencyVisitor;
+    visitor.visit_type(ty)
+}
+
+struct GenericDependencyVisitor;
+
+impl TypeVisitor for GenericDependencyVisitor {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        matches!(ty, Type::Var(_))
+    }
+
+    fn visit_const_arg(&mut self, arg: &ConstArg) -> bool {
+        matches!(arg, ConstArg::Param(_))
+    }
+
+    fn visit_array_len(&mut self, len: ArrayLen) -> bool {
+        matches!(len, ArrayLen::Param(_))
+    }
+}
+
 impl TypeVisitor for TypeClosureFacts {
     fn visit_type_leaf(&mut self, ty: &Type) -> bool {
         match ty {

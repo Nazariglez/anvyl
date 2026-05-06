@@ -414,7 +414,12 @@ impl<'tc> PatternChecker<'tc> {
                 let Some(agg) = self.tc.decls.aggregate(&key).cloned() else {
                     return PatternOutcome::error();
                 };
-                self.check_struct_fields(fields, nominal_type(&key), &agg.fields, access)
+                let owner_ty = if matches!(expected_key.as_ref(), Some(found) if found == &key) {
+                    expected.clone()
+                } else {
+                    nominal_type(&key)
+                };
+                self.check_struct_fields(fields, owner_ty, &agg.fields, access)
             }
             NominalKind::Extern => {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
@@ -456,17 +461,29 @@ impl<'tc> PatternChecker<'tc> {
             Span::new(0, 0),
         );
         let mut had_error = shape.failed;
+        let mut refutability = if shape.failed {
+            Refutability::Unknown
+        } else {
+            Refutability::Irrefutable
+        };
         self.check_bad_field_patterns(fields, &shape, access);
         for field in shape.fields {
             let pattern = &fields[field.index].1;
             self.record_extern_field_read(field.name, pattern, &owner_ty);
             let field_access = self.struct_field_access(&owner_ty, field.name, access);
-            had_error |= self.check(pattern, &field.ty, field_access).had_error;
+            let field_ty = self
+                .tc
+                .decls
+                .aggregate_field_type(&owner_ty, field.name)
+                .unwrap_or(field.ty);
+            let outcome = self.check(pattern, &field_ty, field_access);
+            had_error |= outcome.had_error;
+            refutability = combine_refutability(refutability, outcome.refutability);
         }
         PatternOutcome {
             cover: PatternCover::CatchAll,
             had_error,
-            refutability: Refutability::Refutable,
+            refutability,
         }
     }
 

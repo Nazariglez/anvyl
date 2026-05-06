@@ -1,0 +1,12 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: irrefutable pattern in let-else
+
+dataref Point { x: int, y: int }
+
+fn main() {
+    let p = Point { x: 1, y: 2 };
+    let Point { x } = p else { return; }
+    println(x);
+}

@@ -396,11 +396,28 @@ fn apply_value_field(
         place::record_facts_read(receiver_id, facts, tc);
     }
 
+    let mut static_method_on_value = false;
     if let Some(key) = key.as_ref()
         && let Some(agg) = tc.decls.aggregate(key)
-        && let Some(subject) = aggregate_field_subject(agg, &receiver, name, kind, tc)
     {
-        return subject;
+        if kind == MemberAccessKind::Field
+            && let Some(ty) = tc.decls.aggregate_field_type(&receiver, name)
+        {
+            return value_subject(ty, tc);
+        }
+        if let Some(method) = agg.methods.get(&name) {
+            if method.receiver.is_none() {
+                static_method_on_value = true;
+            } else {
+                return aggregate_method_subject(
+                    &tc.decls,
+                    agg,
+                    Some(receiver.clone()),
+                    name,
+                    method,
+                );
+            }
+        }
     }
 
     if let Some(matched) = tc.find_extend_method(&receiver, name) {
@@ -421,7 +438,14 @@ fn apply_value_field(
         };
     }
 
-    if key.is_some() {
+    if static_method_on_value {
+        tc.push_error(TypeError::StaticMethodOnValue {
+            ty: receiver,
+            method: name,
+            span,
+        });
+        Subject::Error
+    } else if key.is_some() {
         unknown_member(receiver, name, kind, span, tc)
     } else {
         non_aggregate_member(receiver, name, kind, span, tc)
@@ -472,42 +496,6 @@ fn extern_value_member_subject(
                 name: decl.name,
                 signature: decl.signature.clone(),
             }
-        }
-    }
-}
-
-fn aggregate_field_subject(
-    agg: &AggregateSchema,
-    receiver: &Type,
-    name: Ident,
-    kind: MemberAccessKind,
-    tc: &TypeChecker,
-) -> Option<Subject> {
-    match kind {
-        MemberAccessKind::Field => tc
-            .decls
-            .aggregate_field_type(receiver, name)
-            .map(|ty| value_subject(ty, tc))
-            .or_else(|| {
-                let method = agg.methods.get(&name)?;
-                Some(aggregate_method_subject(
-                    &tc.decls,
-                    agg,
-                    Some(receiver.clone()),
-                    name,
-                    method,
-                ))
-            }),
-        MemberAccessKind::Method => {
-            let method = agg.methods.get(&name)?;
-            method.receiver?;
-            Some(aggregate_method_subject(
-                &tc.decls,
-                agg,
-                Some(receiver.clone()),
-                name,
-                method,
-            ))
         }
     }
 }
@@ -613,12 +601,6 @@ fn apply_type_field(
             return enum_variant_subject(resolved, expected, tc);
         }
 
-        if let Some(agg) = tc.decls.aggregate(key)
-            && let Some(method) = agg.methods.get(&name)
-            && method.receiver.is_none()
-        {
-            return aggregate_method_subject(&tc.decls, agg, None, name, method);
-        }
         enum_variant::resolve_member(tc, key, name, span);
         return Subject::Error;
     }
@@ -629,7 +611,12 @@ fn apply_type_field(
         return unknown_member(nominal_type(key), name, kind, span, tc);
     };
     if method.receiver.is_some() {
-        return unknown_member(nominal_type(key), name, kind, span, tc);
+        tc.push_error(TypeError::InstanceMethodOnType {
+            ty: nominal_type(key),
+            method: name,
+            span,
+        });
+        return Subject::Error;
     }
     aggregate_method_subject(&tc.decls, agg, None, name, method)
 }

@@ -1,4 +1,5 @@
 // @mode: check
+// @frontend: new
 // @expect: success
 
 dataref Buffer<T, N: int> {
@@ -8,6 +9,6 @@ dataref Buffer<T, N: int> {
 fn main() {
     let a = Buffer { data: [true, false] };
     let b = Buffer { data: [1, 2, 3] };
-    let _: Buffer<bool> = a;
-    let _: Buffer<int> = b;
+    let _: Buffer<bool, 2> = a;
+    let _: Buffer<int, 3> = b;
 }

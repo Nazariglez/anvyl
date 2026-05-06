@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: mismatch
+// @contains: Mismatched types
 
 dataref Bad {
     name: string = nil,

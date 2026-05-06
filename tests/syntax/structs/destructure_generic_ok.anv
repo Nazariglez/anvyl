@@ -1,0 +1,27 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+struct Box<T> {
+    value: T,
+}
+
+struct FixedBuf<T, N: int> {
+    data: [T; N],
+}
+
+fn use_box(box: Box<int>) {
+    let Box { value } = box;
+    let _: int = value;
+}
+
+fn use_fixed(buf: FixedBuf<int, 3>) {
+    let FixedBuf { data } = buf;
+    let _: [int; 3] = data;
+}
+
+fn main() {
+    use_box(Box { value: 42 });
+    let buf: FixedBuf<int, 3> = FixedBuf { data: [1, 2, 3] };
+    use_fixed(buf);
+}

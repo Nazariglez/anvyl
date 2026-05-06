@@ -1,0 +1,12 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: method const parameter shadows dataref const parameter
+
+dataref Fixed<N: int> {
+    fn len<N: int>(self) -> int {
+        N
+    }
+}
+
+fn main() {}

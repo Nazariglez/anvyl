@@ -10,7 +10,4 @@ struct Counter {
     }
 }
 
-fn main() {
-    let c = Counter { value: 2 };
-    let _ = c.get();
-}
+fn main() {}
