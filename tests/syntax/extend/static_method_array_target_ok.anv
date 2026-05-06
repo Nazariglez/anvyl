@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<T, N: int> [T; N] {
+    fn len() -> int { N }
+}
+
+fn main() {
+    let n: int = <[int; 4]>.len();
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<T> slice[T] {
+    fn label() -> string { "slice" }
+}
+
+fn main() {
+    let label: string = <slice[int]>.label();
+}

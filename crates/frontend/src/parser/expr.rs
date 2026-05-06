@@ -12,7 +12,7 @@ use super::{
         infix_left, mul_div_op, or_op, shift_op, xor_op,
     },
     pattern::{let_or_var_head, or_pattern, pattern},
-    types::{generic_arg, type_ident},
+    types::{generic_arg, type_ident, type_subject_type_ident},
 };
 use crate::{
     ast,
@@ -65,6 +65,7 @@ fn for_header_atom_expr<'src>(
             Spanned::new(expr, span)
         }),
         array_literal(expr.clone()),
+        type_subject_expr(),
         identifier().map_with(|ident, e| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
@@ -732,6 +733,30 @@ fn intrinsic_call_expr<'src>(
         .boxed()
 }
 
+fn type_subject_expr<'src>() -> BoxedParser<'src, ast::ExprNode> {
+    let explicit = select! { (Token::Op(Op::LessThan), _) => () }
+        .ignore_then(type_subject_type_ident())
+        .then_ignore(select! { (Token::Op(Op::GreaterThan), _) => () });
+
+    let primitive = select! {
+        (Token::Keyword(Keyword::Int), _) => ast::Type::Int,
+        (Token::Keyword(Keyword::Float), _) => ast::Type::Float,
+        (Token::Keyword(Keyword::Bool), _) => ast::Type::Bool,
+        (Token::Keyword(Keyword::String), _) => ast::Type::String,
+    };
+
+    choice((explicit, primitive))
+        .map_with(|ty, e| {
+            let s = e.span();
+            let span = Span::new(s.start, s.end);
+            let expr_id = new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::TypeSubject(ty), expr_id);
+            Spanned::new(expr, span)
+        })
+        .labelled("type subject")
+        .boxed()
+}
+
 fn atom_expr<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
@@ -750,6 +775,7 @@ fn atom_expr<'src>(
         }),
         struct_literal(expr.clone()),
         array_literal(expr.clone()),
+        type_subject_expr(),
         identifier().map_with(|ident, e| {
             let s = e.span();
             let span = Span::new(s.start, s.end);
@@ -785,6 +811,7 @@ fn cond_atom_expr<'src>(
             Spanned::new(expr, span)
         }),
         array_literal(cond_expr.clone()),
+        type_subject_expr(),
         identifier().map_with(|ident, e| {
             let s = e.span();
             let span = Span::new(s.start, s.end);

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import tools;
+
+fn main() {
+    let x: float = float.zero();
+}

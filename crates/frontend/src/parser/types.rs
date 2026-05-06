@@ -19,11 +19,12 @@ enum TypeContext {
     Ordinary,
     Param,
     ExtendTarget,
+    TypeSubject,
 }
 
 impl TypeContext {
     fn allows_slice(self) -> bool {
-        matches!(self, Self::Param | Self::ExtendTarget)
+        matches!(self, Self::Param | Self::ExtendTarget | Self::TypeSubject)
     }
 }
 
@@ -37,6 +38,10 @@ pub(super) fn param_type_ident<'src>() -> BoxedParser<'src, Type> {
 
 pub(super) fn extend_type_ident<'src>() -> BoxedParser<'src, Type> {
     type_ident_inner(TypeContext::ExtendTarget)
+}
+
+pub(super) fn type_subject_type_ident<'src>() -> BoxedParser<'src, Type> {
+    type_ident_inner(TypeContext::TypeSubject)
 }
 
 fn type_contains_slice(ty: &Type) -> bool {

@@ -1360,6 +1360,7 @@ impl Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Ident(Ident),
+    TypeSubject(Type),
     Block(BlockNode),
     Lit(Lit),
     Call(CallNode),
@@ -1403,6 +1404,7 @@ impl ExprKind {
     pub fn variant_name(&self) -> &'static str {
         match self {
             Self::Ident(_) => "Ident",
+            Self::TypeSubject(_) => "TypeSubject",
             Self::Block(_) => "Block",
             Self::Lit(_) => "Lit",
             Self::Call(_) => "Call",

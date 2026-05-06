@@ -1,0 +1,5 @@
+// @helper
+
+pub extend float {
+    fn zero() -> float { 1.0 }
+}

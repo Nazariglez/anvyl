@@ -1,8 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: static extension method
-
-extend int {
-    fn f() -> int { 0 }
-}

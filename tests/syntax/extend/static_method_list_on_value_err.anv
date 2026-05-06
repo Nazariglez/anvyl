@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: static method 'empty' must be called on type '[int]'
+
+extend<T> [T] {
+    fn empty() -> [T] { [] }
+}
+
+fn main() {
+    let xs: [int] = [];
+    xs.empty();
+}

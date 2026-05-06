@@ -1,0 +1,5 @@
+// @helper
+
+pub extend<T> [T] {
+    fn empty() -> [T] { [] }
+}

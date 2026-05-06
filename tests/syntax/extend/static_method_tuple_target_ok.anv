@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<A, B> (A, B) {
+    fn arity() -> int { 2 }
+}
+
+fn main() {
+    let n: int = <(int, string)>.arity();
+}

@@ -342,6 +342,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::Decl(error) => render_decl_error(error),
         TypeError::ExternCatalog(error) => render_extern_catalog_error(error),
         TypeError::UndefinedVariable { name, .. } => format!("Unknown variable '{name}'"),
+        TypeError::TypeUsedAsValue { ty, .. } => {
+            format!("type '{ty}' cannot be used as a value")
+        }
         TypeError::TypeMismatch {
             expected, found, ..
         } => render_type_mismatch(expected, found),
@@ -991,9 +994,6 @@ fn render_decl_error(error: &DeclError) -> String {
             "{} method '{name}' already exists for type '{ty}'",
             surface.label()
         ),
-        DeclError::UnsupportedStaticExtendTarget { ty, name, .. } => {
-            format!("static extension method '{name}' cannot target type '{ty}'")
-        }
         DeclError::UnknownType {
             qualifier, name, ..
         } => format!(

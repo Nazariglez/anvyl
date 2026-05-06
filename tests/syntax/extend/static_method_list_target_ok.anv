@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<T> [T] {
+    fn empty() -> [T] { [] }
+}
+
+fn main() {
+    let xs: [int] = <[int]>.empty();
+}

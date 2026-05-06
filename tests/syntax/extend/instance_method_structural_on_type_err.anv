@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: instance method 'count' requires a value of type '[int]'
+
+extend<T> [T] {
+    fn count(self) -> int { 0 }
+}
+
+fn main() {
+    <[int]>.count();
+}

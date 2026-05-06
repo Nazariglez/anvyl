@@ -136,6 +136,10 @@ pub(crate) enum TypeError {
         name: Ident,
         span: Span,
     },
+    TypeUsedAsValue {
+        ty: Type,
+        span: Span,
+    },
     CannotInferConst {
         span: Span,
     },
@@ -1114,6 +1118,11 @@ impl TypeChecker {
         self.resolve_type_for_tc_at(ty, Span::new(0, 0))
     }
 
+    fn resolve_type_subject(&mut self, ty: &Type, span: Span) -> Option<Type> {
+        let ty = self.resolve_type_for_tc_at(ty, span);
+        (!matches!(ty, Type::Infer)).then_some(ty)
+    }
+
     fn resolve_type_for_tc_at(&mut self, ty: &Type, span: Span) -> Type {
         let generics = self.generic_contexts.last().cloned().unwrap_or_default();
         let finalized = match self
@@ -1268,6 +1277,13 @@ impl TypeChecker {
     ) -> Option<NominalKey> {
         self.decls
             .resolve_visible_type_key(&self.current_module, qualifier, name)
+    }
+
+    fn visible_type_subject(&self, name: Ident) -> Option<Type> {
+        self.substituted_type_param(name).or_else(|| {
+            self.resolve_visible_type_key(None, name)
+                .map(|key| nominal_type(&key))
+        })
     }
 
     fn func_type_from_sig(&mut self, params: &[Param], ret: &Type) -> Type {
@@ -1652,34 +1668,8 @@ fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) 
                 }));
             }
         }
-        validate_static_extend_methods(decls, extend, errors);
         validate_extend_method_conflicts(decls, extend, errors);
     }
-}
-
-fn validate_static_extend_methods(
-    decls: &DeclarationIndex,
-    extend: &ExtendSchema,
-    errors: &mut Vec<TypeError>,
-) {
-    if static_extend_target_supported(decls, &extend.target) {
-        return;
-    }
-    for (key, method) in &extend.methods {
-        if matches!(method.mode, MethodMode::Static) {
-            errors.push(TypeError::Decl(DeclError::UnsupportedStaticExtendTarget {
-                ty: extend.target.clone(),
-                name: key.name,
-                span: extend.span,
-            }));
-        }
-    }
-}
-
-fn static_extend_target_supported(decls: &DeclarationIndex, ty: &Type) -> bool {
-    matches!(ty, Type::Nominal(_))
-        && decls.key_for_type(ty).is_some()
-        && decls.core_option_inner(ty).is_none()
 }
 
 fn unsupported_extend_target(ty: &Type, facts: &ExtendTargetFacts) -> bool {
@@ -3001,6 +2991,15 @@ fn check_expr_checked_with_hint(
             }
         },
         ExprKind::Lit(lit) => checked_from_type(expr, type_from_lit(lit), tc),
+        ExprKind::TypeSubject(ty) => {
+            if let Some(ty) = tc.resolve_type_subject(ty, expr.span) {
+                tc.push_error(TypeError::TypeUsedAsValue {
+                    ty,
+                    span: expr.span,
+                });
+            }
+            checked_from_type(expr, Type::Infer, tc)
+        }
         ExprKind::Ident(name) => match tc.lookup(*name).cloned() {
             Some(info) => {
                 let fallback = tc.solver.local_type_to_type(info.type_id);
@@ -3037,13 +3036,23 @@ fn check_expr_checked_with_hint(
                             tc.push_error(err);
                             Type::Infer
                         }
-                        None => tc.lookup_imported_value(*name).unwrap_or_else(|| {
-                            tc.push_error(TypeError::UndefinedVariable {
-                                name: *name,
-                                span: expr.span,
-                            });
-                            Type::Infer
-                        }),
+                        None => match tc.lookup_imported_value(*name) {
+                            Some(ty) => ty,
+                            None => {
+                                if let Some(ty) = tc.visible_type_subject(*name) {
+                                    tc.push_error(TypeError::TypeUsedAsValue {
+                                        ty,
+                                        span: expr.span,
+                                    });
+                                } else {
+                                    tc.push_error(TypeError::UndefinedVariable {
+                                        name: *name,
+                                        span: expr.span,
+                                    });
+                                }
+                                Type::Infer
+                            }
+                        },
                     };
                     checked_from_type(expr, ty, tc)
                 }

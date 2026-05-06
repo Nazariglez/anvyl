@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<K, V> [K: V] {
+    fn count() -> int { 0 }
+}
+
+fn main() {
+    let n: int = <[string: int]>.count();
+}

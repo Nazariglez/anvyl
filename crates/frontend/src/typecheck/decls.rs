@@ -337,11 +337,6 @@ pub(crate) enum DeclError {
         surface: MethodSurface,
         span: Span,
     },
-    UnsupportedStaticExtendTarget {
-        ty: Type,
-        name: Ident,
-        span: Span,
-    },
     ReexportConflict {
         module: ModuleScope,
         name: Ident,
@@ -2350,21 +2345,20 @@ fn extend_receiver_match(
         ));
     }
 
-    if let Some(owner_args) =
-        match_generic_template_args(generics, target, subject, Span::new(0, 0))
-    {
-        return Some((subject.clone(), owner_args, ExtendReceiverMatch::Exact));
-    }
-
-    if surface != MethodSurface::Instance {
-        return None;
+    match match_generic_template_args(generics, target, subject, Span::new(0, 0)) {
+        Some(owner_args) => return Some((subject.clone(), owner_args, ExtendReceiverMatch::Exact)),
+        None if surface != MethodSurface::Instance => return None,
+        None => {}
     }
     let Type::Slice { elem: target_elem } = target else {
         return None;
     };
-    let subject_elem = match subject {
-        Type::List { elem } | Type::Array { elem, .. } => elem,
-        _ => return None,
+    let (Type::List { elem: subject_elem }
+    | Type::Array {
+        elem: subject_elem, ..
+    }) = subject
+    else {
+        return None;
     };
     let receiver_ty = Type::Slice {
         elem: subject_elem.clone(),

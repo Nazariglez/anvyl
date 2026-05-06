@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: type 'float' cannot be used as a value
+
+fn main() {
+    let a = float;
+}

@@ -7,8 +7,7 @@ use super::{
     decls::{
         CallableKind, CallableParent, CallableRef, DeclError, ExtendMethodMatch,
         ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface, ModuleMemberLookup,
-        ModuleScope, NominalKey, ResolvedValue, ValueDecl, VariantSchema, nominal_type,
-        owner_template,
+        ModuleScope, ResolvedValue, ValueDecl, VariantSchema, nominal_type, owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
@@ -30,8 +29,7 @@ use crate::{
 pub(super) enum Subject {
     Value(PlaceValue),
     Module(ModuleScope),
-    Type(NominalKey),
-    TypeParam(Type),
+    Type(Type),
     QualifiedExtend {
         module: ModuleScope,
         name: Ident,
@@ -138,14 +136,15 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
             if let Some(scope) = tc.lookup_module_alias(*name) {
                 return Some(Subject::Module(scope));
             }
-            if let Some(ty) = tc.substituted_type_param(*name) {
-                return Some(Subject::TypeParam(ty));
-            }
-            if let Some(key) = tc.resolve_visible_type_key(None, *name) {
-                return Some(Subject::Type(key));
+            if let Some(ty) = tc.visible_type_subject(*name) {
+                return Some(Subject::Type(ty));
             }
             None
         }
+        ExprKind::TypeSubject(ty) => Some(match tc.resolve_type_subject(ty, expr.span) {
+            Some(ty) => Subject::Type(ty),
+            None => Subject::Error,
+        }),
         _ => Some(Subject::Value(check_receiver_value(expr, tc))),
     }
 }
@@ -205,6 +204,14 @@ pub(super) fn check_postfix_chain(
         place::record_value_read(expr.node.id, value, tc);
     }
 
+    if let Subject::Type(ty) = &subject {
+        tc.push_error(TypeError::TypeUsedAsValue {
+            ty: ty.clone(),
+            span: expr.span,
+        });
+        return super::checked_from_type(expr, Type::Infer, tc);
+    }
+
     let ty = subject_type(&subject);
     let handle = tc.set_type(expr.node.id, ty.clone(), expr.span);
     CheckedType {
@@ -242,8 +249,7 @@ fn subject_type(subject: &Subject) -> Type {
             signature.to_func_type()
         }
         Subject::Module(_) => Type::Void,
-        Subject::Type(key) => nominal_type(key),
-        Subject::TypeParam(ty) => ty.clone(),
+        Subject::Type(ty) => ty.clone(),
         Subject::QualifiedExtend { .. } | Subject::Error => Type::Infer,
     }
 }
@@ -288,18 +294,7 @@ fn apply_field(
             tc,
         ),
         Subject::Module(scope) => apply_module_field(scope, field.node.field, field.span, kind, tc),
-        Subject::Type(key) => apply_type_field(
-            nominal_type(key),
-            key,
-            field.node.field,
-            field.span,
-            kind,
-            expected,
-            tc,
-        ),
-        Subject::TypeParam(ty) => {
-            apply_type_param_field(ty, field.node.field, field.span, kind, expected, tc)
-        }
+        Subject::Type(ty) => apply_type_field(ty, field.node.field, field.span, kind, expected, tc),
         Subject::Callable { .. }
         | Subject::EnumVariant { .. }
         | Subject::QualifiedExtend { .. }
@@ -430,10 +425,11 @@ fn apply_value_field(
     let key = tc.decls.key_for_type(&receiver);
 
     if let Some(owner) = tc.extern_type_id(&receiver) {
-        if kind == MemberAccessKind::Method
+        let static_on_value = kind == MemberAccessKind::Method
             && tc.externs.method(owner, name).is_none()
-            && tc.find_static_extend_method(&receiver, name).is_some()
-        {
+            && (tc.externs.static_method(owner, name).is_some()
+                || tc.find_static_extend_method(&receiver, name).is_some());
+        if static_on_value {
             tc.push_error(TypeError::StaticMethodOnValue {
                 ty: receiver,
                 method: name,
@@ -512,8 +508,7 @@ fn apply_value_field(
         };
     }
 
-    static_method_on_value |=
-        key.is_some() && tc.find_static_extend_method(&receiver, name).is_some();
+    static_method_on_value |= tc.find_static_extend_method(&receiver, name).is_some();
 
     if static_method_on_value {
         tc.push_error(TypeError::StaticMethodOnValue {
@@ -637,7 +632,7 @@ fn apply_module_field(
         ModuleMemberLookup::Missing => {}
     }
     match tc.decls.module_type(scope, name) {
-        ModuleMemberLookup::Found(key) => return Subject::Type(key),
+        ModuleMemberLookup::Found(key) => return Subject::Type(nominal_type(&key)),
         ModuleMemberLookup::Private => private = true,
         ModuleMemberLookup::Missing => {}
     }
@@ -664,106 +659,84 @@ fn apply_module_field(
     Subject::Error
 }
 
-fn apply_type_param_field(
-    ty: &Type,
-    name: Ident,
-    span: Span,
-    kind: MemberAccessKind,
-    expected: Option<&TypeHandle>,
-    tc: &mut TypeChecker,
-) -> Subject {
-    let Some(key) = tc.decls.key_for_type(ty) else {
-        return field_access_on_non_aggregate(
-            &Subject::TypeParam(ty.clone()),
-            name,
-            kind,
-            span,
-            tc,
-        );
-    };
-    apply_type_field(ty.clone(), &key, name, span, kind, expected, tc)
-}
-
 fn apply_type_field(
-    target: Type,
-    key: &NominalKey,
+    target: &Type,
     name: Ident,
     span: Span,
     kind: MemberAccessKind,
     expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> Subject {
-    if let Some(owner) = tc.externs.type_by_nominal(key) {
+    let has_static_extend = tc.find_static_extend_method(target, name).is_some();
+    let mut enum_key = None;
+    let mut has_instance = false;
+
+    if let Some(owner) = tc.extern_type_id(target) {
         let has_extern_static = tc.externs.static_method(owner, name).is_some();
-        if has_extern_static && tc.find_static_extend_method(&target, name).is_some() {
+        if has_extern_static && has_static_extend {
             return static_extend_conflict(target, name, span, tc);
         }
         if let Some(subject) = extern_type_member_subject(owner, name, kind, tc) {
             return subject;
         }
+        has_instance = kind == MemberAccessKind::Method && tc.externs.method(owner, name).is_some();
     }
 
-    if let Some(schema) = tc.decls.enum_schema(key) {
-        let has_variant = schema.variants.contains_key(&name);
-        if has_variant && tc.find_static_extend_method(&target, name).is_some() {
-            return static_extend_conflict(target, name, span, tc);
+    if let Some(key) = tc.decls.key_for_type(target) {
+        if let Some(schema) = tc.decls.enum_schema(&key) {
+            let has_variant = schema.variants.contains_key(&name);
+            if has_variant && has_static_extend {
+                return static_extend_conflict(target, name, span, tc);
+            }
+            if has_variant {
+                let resolved = enum_variant::resolve_member(tc, &key, name, span)
+                    .expect("variant exists in enum schema");
+                return enum_variant_subject(resolved, expected, tc);
+            }
+            enum_key = Some(key);
+        } else if let Some(agg) = tc.decls.aggregate(&key) {
+            let static_key = MethodKey::static_(name);
+            let instance_key = MethodKey::instance(name);
+            let has_static = agg.methods.contains_key(&static_key);
+            has_instance |= agg.methods.contains_key(&instance_key);
+            if has_static && has_static_extend {
+                return static_extend_conflict(target, name, span, tc);
+            }
+            if let Some(method) = agg.methods.get(&static_key) {
+                return callable_subject(
+                    tc.decls
+                        .callable_for_aggregate_static_method(agg, name, method, Some(target)),
+                    None,
+                );
+            }
         }
-        if has_variant {
-            let resolved = enum_variant::resolve_member(tc, key, name, span)
-                .expect("variant exists in enum schema");
-            return enum_variant_subject(resolved, expected, tc);
-        }
-        if let Some(subject) = static_extend_subject(&target, name, span, tc) {
-            return subject;
-        }
-        enum_variant::resolve_member(tc, key, name, span);
-        return Subject::Error;
     }
 
-    if let Some(agg) = tc.decls.aggregate(key) {
-        let static_key = MethodKey::static_(name);
-        let instance_key = MethodKey::instance(name);
-        let has_static = agg.methods.contains_key(&static_key);
-        let has_instance = agg.methods.contains_key(&instance_key);
-        if has_static && tc.find_static_extend_method(&target, name).is_some() {
-            return static_extend_conflict(target, name, span, tc);
-        }
-        if let Some(method) = agg.methods.get(&static_key) {
-            return callable_subject(
-                tc.decls
-                    .callable_for_aggregate_static_method(agg, name, method, Some(&target)),
-                None,
-            );
-        }
-        if let Some(subject) = static_extend_subject(&target, name, span, tc) {
-            return subject;
-        }
-        if has_instance {
-            tc.push_error(TypeError::InstanceMethodOnType {
-                ty: target,
-                method: name,
-                span,
-            });
-            return Subject::Error;
-        }
-    } else if let Some(subject) = static_extend_subject(&target, name, span, tc) {
-        return subject;
+    if has_static_extend {
+        return static_extend_subject(target, name, span, tc).expect("static extension exists");
     }
 
-    if tc.find_extend_method(&target, name).is_some() {
+    has_instance |= tc.find_extend_method(target, name).is_some();
+    if has_instance {
         tc.push_error(TypeError::InstanceMethodOnType {
-            ty: target,
+            ty: target.clone(),
             method: name,
             span,
         });
         return Subject::Error;
     }
-    unknown_member(target, name, kind, span, tc)
+
+    if let Some(key) = enum_key {
+        enum_variant::resolve_member(tc, &key, name, span);
+        return Subject::Error;
+    }
+
+    unknown_member(target.clone(), name, kind, span, tc)
 }
 
-fn static_extend_conflict(ty: Type, name: Ident, span: Span, tc: &mut TypeChecker) -> Subject {
+fn static_extend_conflict(ty: &Type, name: Ident, span: Span, tc: &mut TypeChecker) -> Subject {
     tc.push_error(TypeError::Decl(DeclError::ExtendMethodConflict {
-        ty,
+        ty: ty.clone(),
         name,
         surface: MethodSurface::Static,
         span,
@@ -861,7 +834,7 @@ fn apply_call(
             place::record_value_read(call.node.func.node.id, value, tc);
             checked_type(call_value(value.checked.ty.clone(), call, tc), tc)
         }
-        Subject::Module(_) | Subject::Type(_) | Subject::TypeParam(_) => {
+        Subject::Module(_) | Subject::Type(_) => {
             checked_type(not_callable(subject_type(subject), call, tc), tc)
         }
         Subject::Error => {

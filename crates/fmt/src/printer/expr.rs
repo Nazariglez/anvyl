@@ -24,6 +24,16 @@ impl Printer<'_> {
     fn format_expr_inner(&mut self, expr: &ast::Expr) {
         match &expr.kind {
             ast::ExprKind::Ident(id) => self.write_fmt(id),
+            ast::ExprKind::TypeSubject(ty) => match ty {
+                ast::Type::Int | ast::Type::Float | ast::Type::Bool | ast::Type::String => {
+                    self.format_type(ty);
+                }
+                _ => {
+                    self.write("<");
+                    self.format_type(ty);
+                    self.write(">");
+                }
+            },
             ast::ExprKind::Lit(lit) => self.format_lit(lit),
             ast::ExprKind::Block(block) => self.format_block(block),
 

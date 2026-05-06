@@ -1720,11 +1720,9 @@ mod methods {
             panic!("instance method on type should fail");
         };
 
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::UnknownMember { .. }))
-        );
+        assert_has_error(&errors, |error| {
+            matches!(error, TypeError::InstanceMethodOnType { .. })
+        });
     }
 
     #[test]
@@ -1738,11 +1736,9 @@ mod methods {
             panic!("static method on value should fail");
         };
 
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::UnknownMember { .. }))
-        );
+        assert_has_error(&errors, |error| {
+            matches!(error, TypeError::StaticMethodOnValue { .. })
+        });
     }
 
     #[test]

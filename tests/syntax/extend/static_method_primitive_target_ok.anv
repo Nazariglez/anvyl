@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend float {
+    fn zero() -> float { 0.0 }
+    fn double(self) -> float { self * 2.0 }
+}
+
+fn main() {
+    let a: float = float.zero();
+    let b: float = 2.0.double();
+}
