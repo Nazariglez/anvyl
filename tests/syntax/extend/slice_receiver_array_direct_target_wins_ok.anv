@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<T, N: int> [T; N] {
+    fn tag(self) -> string { "array" }
+}
+
+extend<T> slice[T] {
+    fn tag(self) -> string { "slice" }
+}
+
+fn use(xs: [int; 3]) -> string {
+    xs.tag()
+}

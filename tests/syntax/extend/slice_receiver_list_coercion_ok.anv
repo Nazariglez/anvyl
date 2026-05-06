@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<T> slice[T] {
+    fn first(self) -> T { self[0] }
+}
+
+fn use(xs: [int]) -> int {
+    xs.first()
+}

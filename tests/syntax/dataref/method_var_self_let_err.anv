@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot assign to immutable value 'inc'
+
+dataref Counter {
+    value: int,
+}
+
+extend Counter {
+    fn inc(var self) { self.value = self.value + 1; }
+}
+
+fn main() {
+    let c = Counter { value: 0 };
+    c.inc();
+}

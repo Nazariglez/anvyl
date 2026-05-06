@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend int? {
+    fn unwrap_or(self, default: int) -> int {
+        match self { v? => v, nil => default }
+    }
+}
+
+fn get(m: [string: int], key: string) -> int {
+    m[key].unwrap_or(0)
+}

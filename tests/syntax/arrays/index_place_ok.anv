@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var xs = [1, 2, 3];
+    xs[0] = xs[1];
+
+    var matrix = [[1, 2], [3, 4]];
+    matrix[0][1] = matrix[1][0];
+
+    let _ = xs[0] + matrix[0][1];
+}

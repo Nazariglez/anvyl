@@ -3071,7 +3071,7 @@ mod named_modules {
         let result = check_named(
             r"
             import math { Point, use_it };
-            fn main(p: Point) -> Point { use_it(p, 1) }
+            fn main(var p: Point) -> Point { use_it(p, 1) }
             ",
             &[(
                 "math",

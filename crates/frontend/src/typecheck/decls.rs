@@ -337,10 +337,6 @@ pub(crate) enum DeclError {
         surface: MethodSurface,
         span: Span,
     },
-    MutableSliceExtendReceiver {
-        name: Ident,
-        span: Span,
-    },
     UnsupportedStaticExtendTarget {
         ty: Type,
         name: Ident,
@@ -905,6 +901,7 @@ pub(crate) enum ExtendMethodMatch<'a> {
     Match {
         extend: &'a ExtendSchema,
         method: &'a ExtendMethodSchema,
+        receiver_ty: Type,
         owner_args: Result<GenericArgs, Vec<Ident>>,
     },
     Ambiguous,
@@ -1098,7 +1095,7 @@ impl DeclarationIndex {
             let origin = self.extends[index].origin.clone();
             let span = self.extends[index].span;
             let extend = &mut self.extends[index];
-            let mut generics = generic_context(
+            let generics = generic_context(
                 origin.clone(),
                 &extend.generics.type_params,
                 &extend.generics.const_params,
@@ -2303,11 +2300,19 @@ pub(crate) fn owner_template(owner: &NominalKey, generics: &GenericParams) -> Ty
     nominal_type_with_args(owner, &type_args, &const_args)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtendReceiverMatch {
+    Exact,
+    SliceView,
+}
+
 struct ExtendCandidate<'a> {
     extend: &'a ExtendSchema,
     method: &'a ExtendMethodSchema,
     target: Type,
+    receiver_ty: Type,
     owner_args: Result<GenericArgs, Vec<Ident>>,
+    receiver_match: ExtendReceiverMatch,
 }
 
 type GenericTemplateMatch = Result<GenericArgs, Vec<Ident>>;
@@ -2319,19 +2324,54 @@ fn extend_candidate<'a>(
 ) -> Option<ExtendCandidate<'a>> {
     let method = ext.methods.get(&method_key)?;
     let target = generic_template_type(&ext.target, &ext.generics);
-    let owner_args = if method_key.surface == MethodSurface::Static
-        && static_nominal_family_match(&target, subject)
-    {
-        Ok(GenericArgs::default())
-    } else {
-        match_generic_template_args(&ext.generics, &target, subject, Span::new(0, 0))?
-    };
+    let (receiver_ty, owner_args, receiver_match) =
+        extend_receiver_match(&ext.generics, &target, subject, method_key.surface)?;
     Some(ExtendCandidate {
         extend: ext,
         method,
         target,
+        receiver_ty,
         owner_args,
+        receiver_match,
     })
+}
+
+fn extend_receiver_match(
+    generics: &GenericParams,
+    target: &Type,
+    subject: &Type,
+    surface: MethodSurface,
+) -> Option<(Type, Result<GenericArgs, Vec<Ident>>, ExtendReceiverMatch)> {
+    if surface == MethodSurface::Static && static_nominal_family_match(target, subject) {
+        return Some((
+            subject.clone(),
+            Ok(GenericArgs::default()),
+            ExtendReceiverMatch::Exact,
+        ));
+    }
+
+    if let Some(owner_args) =
+        match_generic_template_args(generics, target, subject, Span::new(0, 0))
+    {
+        return Some((subject.clone(), owner_args, ExtendReceiverMatch::Exact));
+    }
+
+    if surface != MethodSurface::Instance {
+        return None;
+    }
+    let Type::Slice { elem: target_elem } = target else {
+        return None;
+    };
+    let subject_elem = match subject {
+        Type::List { elem } | Type::Array { elem, .. } => elem,
+        _ => return None,
+    };
+    let receiver_ty = Type::Slice {
+        elem: subject_elem.clone(),
+    };
+    let owner_args =
+        match_generic_template_args(generics, target_elem, subject_elem, Span::new(0, 0))?;
+    Some((receiver_ty, owner_args, ExtendReceiverMatch::SliceView))
 }
 
 fn static_nominal_family_match(target: &Type, subject: &Type) -> bool {
@@ -2348,6 +2388,13 @@ fn static_nominal_family_match(target: &Type, subject: &Type) -> bool {
 fn select_extend_candidate(
     mut candidates: Vec<ExtendCandidate<'_>>,
 ) -> Option<ExtendMethodMatch<'_>> {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.receiver_match == ExtendReceiverMatch::Exact)
+    {
+        candidates.retain(|candidate| candidate.receiver_match == ExtendReceiverMatch::Exact);
+    }
+
     match candidates.len() {
         0 => None,
         1 => {
@@ -2355,6 +2402,7 @@ fn select_extend_candidate(
             Some(ExtendMethodMatch::Match {
                 extend: candidate.extend,
                 method: candidate.method,
+                receiver_ty: candidate.receiver_ty,
                 owner_args: candidate.owner_args,
             })
         }
@@ -2407,6 +2455,7 @@ fn most_specific_extend(mut candidates: Vec<ExtendCandidate<'_>>) -> ExtendMetho
     ExtendMethodMatch::Match {
         extend: candidate.extend,
         method: candidate.method,
+        receiver_ty: candidate.receiver_ty,
         owner_args: candidate.owner_args,
     }
 }
@@ -3579,6 +3628,7 @@ mod tests {
         let ExtendMethodMatch::Match {
             extend,
             method,
+            receiver_ty: _,
             owner_args: Ok(owner_args),
         } = index
             .find_instance_extend_method(&Type::Int, ident("id"), |_| true)

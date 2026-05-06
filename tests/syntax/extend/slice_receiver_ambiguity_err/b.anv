@@ -1,0 +1,5 @@
+// @helper
+
+pub extend<T> slice[T] {
+    fn tag(self) -> int { 2 }
+}

@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot assign to immutable value 'inc'
+
+struct Counter {
+    n: int,
+
+    fn inc(var self) { self.n = self.n + 1; }
+}
+
+fn main() {
+    let c = Counter { n: 0 };
+    c.inc();
+}

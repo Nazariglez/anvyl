@@ -5,10 +5,10 @@ use super::{
     MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, VariantShape,
     check_arg_count, check_arg_range, check_expr_checked, checked_type,
     decls::{
-        AggregateSchema, CallableKind, CallableParent, CallableRef, DeclError, DeclarationIndex,
-        ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, MethodKey, MethodSchema,
-        MethodSurface, ModuleMemberLookup, ModuleScope, NominalKey, ResolvedValue, ValueDecl,
-        VariantSchema, nominal_type, owner_template,
+        CallableKind, CallableParent, CallableRef, DeclError, ExtendMethodMatch,
+        ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface, ModuleMemberLookup,
+        ModuleScope, NominalKey, ResolvedValue, ValueDecl, VariantSchema, nominal_type,
+        owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
@@ -40,6 +40,7 @@ pub(super) enum Subject {
     Callable {
         callee: Box<CallableRef>,
         surface_ty: Type,
+        receiver: Option<SourceReceiver>,
     },
     EnumVariant {
         resolved: ResolvedEnumVariant,
@@ -75,6 +76,14 @@ pub(super) enum PostfixStep<'a> {
 pub(super) struct PostfixChain<'a> {
     pub base: &'a ExprNode,
     pub steps: Vec<PostfixStep<'a>>,
+}
+
+pub(super) struct SourceReceiver {
+    mutable: bool,
+    access: PlaceAccess,
+    facts: Option<PlaceUseFacts>,
+    expr_id: ExprId,
+    name: Ident,
 }
 
 pub(super) fn collect_postfix_chain(expr: &ExprNode) -> Option<PostfixChain<'_>> {
@@ -137,7 +146,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
             }
             None
         }
-        _ => Some(value_subject_checked(check_expr_checked(expr, tc))),
+        _ => Some(Subject::Value(check_receiver_value(expr, tc))),
     }
 }
 
@@ -318,26 +327,6 @@ fn field_access_on_non_aggregate(
     Subject::Error
 }
 
-fn aggregate_instance_method_subject(
-    decls: &DeclarationIndex,
-    agg: &AggregateSchema,
-    receiver: Type,
-    name: Ident,
-    method: &MethodSchema,
-) -> Subject {
-    func_callable_subject(decls.callable_for_aggregate_method(agg, name, method, receiver))
-}
-
-fn aggregate_static_method_subject(
-    decls: &DeclarationIndex,
-    agg: &AggregateSchema,
-    owner_ty: Option<&Type>,
-    name: Ident,
-    method: &MethodSchema,
-) -> Subject {
-    func_callable_subject(decls.callable_for_aggregate_static_method(agg, name, method, owner_ty))
-}
-
 fn named_value_subject(
     tc: &TypeChecker,
     module: ModuleScope,
@@ -350,25 +339,9 @@ fn named_value_subject(
         decl: value.clone(),
     };
     match tc.decls.callable_for_value(&resolved) {
-        Some(callee) => Subject::Callable {
-            callee: Box::new(callee),
-            surface_ty: value.ty().clone(),
-        },
+        Some(callee) => callable_subject(callee, None),
         None => value_subject(value.ty().clone(), tc),
     }
-}
-
-fn extend_method_subject(
-    decls: &DeclarationIndex,
-    receiver: Type,
-    extend: &ExtendSchema,
-    name: Ident,
-    method: &ExtendMethodSchema,
-    owner_args: GenericArgs,
-) -> Subject {
-    func_callable_subject(
-        decls.callable_for_extend_method(receiver, extend, name, method, owner_args),
-    )
 }
 
 fn enum_variant_subject(
@@ -388,11 +361,59 @@ fn enum_variant_subject(
     }
 }
 
-fn func_callable_subject(callee: CallableRef) -> Subject {
+fn callable_subject(callee: CallableRef, receiver: Option<SourceReceiver>) -> Subject {
     let surface_ty = func_type(&callee.def.sig.params, &callee.def.sig.ret);
     Subject::Callable {
         callee: Box::new(callee),
         surface_ty,
+        receiver,
+    }
+}
+
+fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
+    let ExprKind::Index(index) = &expr.node.kind else {
+        return place::check_place(expr, tc).value;
+    };
+
+    let target = place::check_place(&index.node.target, tc);
+    let indexed = super::check_index_access(index, &target.value.checked, tc);
+    let indexed_place = matches!(
+        &target.value.checked.ty,
+        Type::List { .. } | Type::Array { .. } | Type::Slice { .. }
+    );
+    let ty = if indexed_place {
+        indexed.write_ty
+    } else {
+        indexed.read_ty
+    };
+    let mut checked = super::checked_from_type(expr, ty, tc);
+    checked.contains_extern_any = indexed.contains_extern_any;
+
+    if indexed_place {
+        return PlaceValue::new(
+            checked,
+            place::projected_field_access(target.value.access),
+            target.value.facts,
+        );
+    }
+
+    place::record_value_read(index.node.target.node.id, &target.value, tc);
+    PlaceValue::not_place(checked)
+}
+
+fn source_receiver(
+    mode: MethodMode,
+    access: PlaceAccess,
+    facts: Option<&PlaceUseFacts>,
+    expr_id: ExprId,
+    name: Ident,
+) -> SourceReceiver {
+    SourceReceiver {
+        mutable: matches!(mode, MethodMode::Instance { mutable: true }),
+        access,
+        facts: facts.cloned(),
+        expr_id,
+        name,
     }
 }
 
@@ -431,10 +452,6 @@ fn apply_value_field(
             tc,
         );
     }
-    if let Some(facts) = receiver_place {
-        place::record_facts_read(receiver_id, facts, tc);
-    }
-
     let mut static_method_on_value = false;
     if let Some(key) = key.as_ref()
         && let Some(agg) = tc.decls.aggregate(key)
@@ -442,15 +459,25 @@ fn apply_value_field(
         if kind == MemberAccessKind::Field
             && let Some(ty) = tc.decls.aggregate_field_type(&receiver, name)
         {
-            return value_subject(ty, tc);
+            return Subject::Value(PlaceValue::new(
+                checked_type(ty, tc),
+                place::projected_field_access(receiver_access),
+                receiver_place.cloned(),
+            ));
         }
         if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
-            return aggregate_instance_method_subject(
-                &tc.decls,
-                agg,
-                receiver.clone(),
-                name,
-                method,
+            let callee =
+                tc.decls
+                    .callable_for_aggregate_method(agg, name, method, receiver.clone());
+            return callable_subject(
+                callee,
+                Some(source_receiver(
+                    method.mode,
+                    receiver_access,
+                    receiver_place,
+                    receiver_id,
+                    name,
+                )),
             );
         }
         static_method_on_value = agg.methods.contains_key(&MethodKey::static_(name));
@@ -459,8 +486,24 @@ fn apply_value_field(
     if let Some(matched) = tc.find_extend_method(&receiver, name) {
         let parts = extend_method_parts(receiver.clone(), name, &matched);
         return match parts {
-            Ok((extend, method, owner_args)) => {
-                extend_method_subject(&tc.decls, receiver, extend, name, method, owner_args)
+            Ok((extend, method, receiver_ty, owner_args)) => {
+                let callee = tc.decls.callable_for_extend_method(
+                    receiver_ty,
+                    extend,
+                    name,
+                    method,
+                    owner_args,
+                );
+                callable_subject(
+                    callee,
+                    Some(source_receiver(
+                        method.mode,
+                        receiver_access,
+                        receiver_place,
+                        receiver_id,
+                        name,
+                    )),
+                )
             }
             Err(error) => {
                 push_extend_method_error(tc, error, span);
@@ -543,13 +586,14 @@ fn extend_method_parts<'a>(
     receiver: Type,
     name: Ident,
     matched: &'a ExtendMethodMatch<'a>,
-) -> Result<(&'a ExtendSchema, &'a ExtendMethodSchema, GenericArgs), ExtendMethodError> {
+) -> Result<(&'a ExtendSchema, &'a ExtendMethodSchema, Type, GenericArgs), ExtendMethodError> {
     match matched {
         ExtendMethodMatch::Match {
             extend,
             method,
+            receiver_ty,
             owner_args: Ok(owner_args),
-        } => Ok((extend, method, owner_args.clone())),
+        } => Ok((extend, method, receiver_ty.clone(), owner_args.clone())),
         ExtendMethodMatch::Match {
             owner_args: Err(unbound),
             ..
@@ -685,7 +729,11 @@ fn apply_type_field(
             return static_extend_conflict(target, name, span, tc);
         }
         if let Some(method) = agg.methods.get(&static_key) {
-            return aggregate_static_method_subject(&tc.decls, agg, Some(&target), name, method);
+            return callable_subject(
+                tc.decls
+                    .callable_for_aggregate_static_method(agg, name, method, Some(&target)),
+                None,
+            );
         }
         if let Some(subject) = static_extend_subject(&target, name, span, tc) {
             return subject;
@@ -747,9 +795,10 @@ fn static_extend_subject(
 ) -> Option<Subject> {
     let matched = tc.find_static_extend_method(target, name)?;
     let subject = match extend_method_parts(target.clone(), name, &matched) {
-        Ok((extend, method, owner_args)) => func_callable_subject(
+        Ok((extend, method, _, owner_args)) => callable_subject(
             tc.decls
                 .callable_for_static_extend_method(extend, name, method, owner_args),
+            None,
         ),
         Err(error) => {
             push_extend_method_error(tc, error, span);
@@ -767,7 +816,12 @@ fn apply_call(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     match subject {
-        Subject::Callable { callee, .. } => {
+        Subject::Callable {
+            callee, receiver, ..
+        } => {
+            if let Some(receiver) = receiver {
+                check_source_receiver(receiver, call.span, tc);
+            }
             check_callable_call(callee, call, call_id, expected, tc)
         }
         Subject::QualifiedExtend { module, name, span } => {
@@ -819,6 +873,18 @@ fn apply_call(
     }
 }
 
+fn check_source_receiver(receiver: &SourceReceiver, span: Span, tc: &mut TypeChecker) {
+    if receiver.mutable {
+        if let Some(error) = receiver.access.mut_borrow_error(receiver.name, span) {
+            tc.push_error(error);
+        } else if let Some(facts) = &receiver.facts {
+            place::record_facts_write(receiver.expr_id, facts, tc);
+        }
+    } else if let Some(facts) = &receiver.facts {
+        place::record_facts_read(receiver.expr_id, facts, tc);
+    }
+}
+
 fn call_value(callee_ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
     match &callee_ty {
         Type::Func { params, ret } => {
@@ -829,6 +895,7 @@ fn call_value(callee_ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ExternMethodCall<'a> {
     method_ref: ExternMethodRef,
     receiver: ReceiverMode,
@@ -845,6 +912,11 @@ struct GenericCallInstantiation {
     const_subst: ConstSubst,
     concrete_params: Vec<FuncParam>,
     ret: Type,
+}
+
+struct CallParam {
+    ty: TypeHandle,
+    mutable: bool,
 }
 
 fn solve_generic_call_with(
@@ -882,8 +954,8 @@ fn solve_generic_call_with(
     add_constraints(&vars, tc);
     let mut failed = tc.solve_constraints();
 
-    let param_handles = instantiate_param_handles(template_params, &vars, tc);
-    failed |= check_call_arg_handles(args, &param_handles, tc);
+    let params = instantiate_call_params(template_params, &vars, tc);
+    failed |= check_source_args(args, &params, tc);
     if !inferred_ret {
         let ret_handle = tc.solver.instantiate_generic_type(template_ret, &vars);
         failed |= constrain_expected_return(call_span, ret_handle, expected, tc);
@@ -919,23 +991,40 @@ fn solve_generic_call_with(
     })
 }
 
-fn instantiate_param_handles(
+fn instantiate_call_params(
     params: &[FuncParam],
     vars: &GenericSolverVars,
     tc: &mut TypeChecker,
-) -> Vec<TypeHandle> {
+) -> Vec<CallParam> {
     params
         .iter()
-        .map(|param| tc.solver.instantiate_generic_type(&param.ty, vars))
+        .map(|param| CallParam {
+            ty: tc.solver.instantiate_generic_type(&param.ty, vars),
+            mutable: param.mutable,
+        })
         .collect()
 }
 
-fn check_call_arg_handles(args: &[ExprNode], params: &[TypeHandle], tc: &mut TypeChecker) -> bool {
+fn check_source_args(args: &[ExprNode], params: &[CallParam], tc: &mut TypeChecker) -> bool {
     let mut failed = false;
     for (arg, param) in args.iter().zip(params) {
-        let checked = super::check_value_expr_checked_with_hint(arg, Some(param.clone()), tc);
+        let checked = if param.mutable {
+            let place = place::check_place(arg, tc);
+            if let Some(error) = place
+                .value
+                .access
+                .mut_borrow_error(super::assignment_target_name(arg), arg.span)
+            {
+                tc.push_error(error);
+            } else {
+                place::record_write(arg.node.id, &place, tc);
+            }
+            place.into_checked()
+        } else {
+            super::check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc)
+        };
         tc.reject_extern_any_escape(&checked, arg.span);
-        tc.expect_assignable(arg.span, checked.handle, param.clone());
+        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
         failed |= tc.solve_constraints();
     }
     failed
@@ -990,18 +1079,18 @@ fn check_enum_variant_call(
         enum_variant::push_shape_mismatch(tc, resolved, VariantShape::Tuple, call.span);
         return check_unhinted_args(&call.node.args, tc);
     }
-    if let VariantSchema::Tuple(params) = &resolved.schema {
-        if params.len() != call.node.args.len() {
-            enum_variant::push_arg_count_mismatch(
-                tc,
-                resolved.key.name,
-                resolved.variant,
-                params.len(),
-                call.node.args.len(),
-                call.span,
-            );
-            return check_unhinted_args(&call.node.args, tc);
-        }
+    if let VariantSchema::Tuple(params) = &resolved.schema
+        && params.len() != call.node.args.len()
+    {
+        enum_variant::push_arg_count_mismatch(
+            tc,
+            resolved.key.name,
+            resolved.variant,
+            params.len(),
+            call.node.args.len(),
+            call.span,
+        );
+        return check_unhinted_args(&call.node.args, tc);
     }
     let Some(callee) =
         tc.decls
@@ -1149,15 +1238,15 @@ fn check_qualified_extend_call(
         return checked_type(Type::Infer, tc);
     };
 
-    let receiver = check_expr_checked(receiver_expr, tc);
-    tc.reject_extern_any_escape(&receiver, receiver_expr.span);
+    let receiver = check_receiver_value(receiver_expr, tc);
+    tc.reject_extern_any_escape(&receiver.checked, receiver_expr.span);
 
-    let Some(matched) = tc
-        .decls
-        .find_extend_method_in_module_surface(module, &receiver.ty, name)
+    let Some(matched) =
+        tc.decls
+            .find_extend_method_in_module_surface(module, &receiver.checked.ty, name)
     else {
         tc.push_error(TypeError::UnknownMember {
-            ty: receiver.ty,
+            ty: receiver.checked.ty.clone(),
             member: name,
             kind: MemberAccessKind::Method,
             span,
@@ -1165,8 +1254,8 @@ fn check_qualified_extend_call(
         return check_unhinted_args(args, tc);
     };
 
-    let (extend, method, owner_args) =
-        match extend_method_parts(receiver.ty.clone(), name, &matched) {
+    let (extend, method, receiver_ty, owner_args) =
+        match extend_method_parts(receiver.checked.ty.clone(), name, &matched) {
             Ok(parts) => parts,
             Err(error) => {
                 push_extend_method_error(tc, error, span);
@@ -1174,9 +1263,17 @@ fn check_qualified_extend_call(
             }
         };
 
+    let receiver_use = source_receiver(
+        method.mode,
+        receiver.access,
+        receiver.facts.as_ref(),
+        receiver_expr.node.id,
+        name,
+    );
     let callee = tc
         .decls
-        .callable_for_extend_method(receiver.ty, extend, name, method, owner_args);
+        .callable_for_extend_method(receiver_ty, extend, name, method, owner_args);
+    check_source_receiver(&receiver_use, call.span, tc);
     tc.set_type(
         call.node.func.node.id,
         func_type(&callee.def.sig.params, &callee.def.sig.ret),
@@ -1460,9 +1557,12 @@ pub(super) fn check_args(
         return;
     }
 
-    let param_handles = params
+    let params = params
         .iter()
-        .map(|param| tc.type_handle(&param.ty))
+        .map(|param| CallParam {
+            ty: tc.type_handle(&param.ty),
+            mutable: param.mutable,
+        })
         .collect::<Vec<_>>();
-    check_call_arg_handles(args, &param_handles, tc);
+    check_source_args(args, &params, tc);
 }

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot assign to immutable value 'swap'
+
+import exts;
+
+fn use(xs: [int]) {
+    exts.swap(xs, 0, 1);
+}

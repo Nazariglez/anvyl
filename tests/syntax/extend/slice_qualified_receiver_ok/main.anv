@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import exts;
+
+fn list_first(xs: [int]) -> int {
+    exts.first(xs)
+}
+
+fn array_first(xs: [int; 3]) -> int {
+    exts.first(xs)
+}
+
+fn list_swap(var xs: [int]) {
+    exts.swap(xs, 0, 1);
+}
+
+fn array_swap(var xs: [int; 3]) {
+    exts.swap(xs, 0, 1);
+}
+
+fn direct_wins(xs: [int]) -> string {
+    exts.tag(xs)
+}

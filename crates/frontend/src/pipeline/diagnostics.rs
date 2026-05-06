@@ -525,6 +525,12 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::TupleIndexOutOfBounds { index, len, .. } => {
             format!("tuple index {index} is out of bounds for tuple of length {len}")
         }
+        TypeError::IndexNotInt { found, .. } => {
+            format!("index must be an integer: found '{found}'")
+        }
+        TypeError::IndexOnNonIndexable { found, .. } => {
+            format!("cannot index non-array type '{found}'")
+        }
         TypeError::UndefinedModuleMember { module, name, .. } => {
             format!(
                 "Unknown member '{name}' in module '{}'",
@@ -985,9 +991,6 @@ fn render_decl_error(error: &DeclError) -> String {
             "{} method '{name}' already exists for type '{ty}'",
             surface.label()
         ),
-        DeclError::MutableSliceExtendReceiver { name, .. } => {
-            format!("slice extension receiver for method '{name}' cannot be mutable")
-        }
         DeclError::UnsupportedStaticExtendTarget { ty, name, .. } => {
             format!("static extension method '{name}' cannot target type '{ty}'")
         }

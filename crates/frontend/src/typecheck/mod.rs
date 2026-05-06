@@ -335,6 +335,14 @@ pub(crate) enum TypeError {
         len: usize,
         span: Span,
     },
+    IndexNotInt {
+        found: Type,
+        span: Span,
+    },
+    IndexOnNonIndexable {
+        found: Type,
+        span: Span,
+    },
     UndefinedModuleMember {
         module: ModuleScope,
         name: Ident,
@@ -1644,23 +1652,8 @@ fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) 
                 }));
             }
         }
-        validate_slice_extend_methods(extend, errors);
         validate_static_extend_methods(decls, extend, errors);
         validate_extend_method_conflicts(decls, extend, errors);
-    }
-}
-
-fn validate_slice_extend_methods(extend: &ExtendSchema, errors: &mut Vec<TypeError>) {
-    if !matches!(extend.target, Type::Slice { .. }) {
-        return;
-    }
-    for (key, method) in &extend.methods {
-        if matches!(method.mode, MethodMode::Instance { mutable: true }) {
-            errors.push(TypeError::Decl(DeclError::MutableSliceExtendReceiver {
-                name: key.name,
-                span: extend.span,
-            }));
-        }
     }
 }
 
@@ -3090,6 +3083,7 @@ fn check_expr_checked_with_hint(
         }
         ExprKind::Tuple(elems) => check_tuple_checked_with_hint(expr, elems, expected, tc),
         ExprKind::TupleIndex(node) => check_tuple_index(expr, node, tc),
+        ExprKind::Index(node) => check_index_expr(expr, node, tc),
         ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected, tc),
         ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected, tc),
         ExprKind::IfLet(if_let_node) => checked_from_checked(
@@ -3104,7 +3098,6 @@ fn check_expr_checked_with_hint(
         ),
         ExprKind::Range(_)
         | ExprKind::MapLiteral(_)
-        | ExprKind::Index(_)
         | ExprKind::StringInterp(_)
         | ExprKind::Cast(_)
         | ExprKind::Lambda(_)
@@ -3723,6 +3716,96 @@ fn check_tuple_index(expr: &ExprNode, node: &TupleIndexNode, tc: &mut TypeChecke
     let mut checked = checked_from_type(expr, elem_ty, tc);
     checked.contains_extern_any = target.contains_extern_any;
     checked
+}
+
+struct CheckedIndex {
+    read_ty: Type,
+    write_ty: Type,
+    contains_extern_any: bool,
+}
+
+impl CheckedIndex {
+    fn new(read_ty: Type, write_ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+        Self {
+            read_ty,
+            write_ty,
+            contains_extern_any: target.contains_extern_any || index.contains_extern_any,
+        }
+    }
+
+    fn same(ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+        Self::new(ty.clone(), ty, target, index)
+    }
+
+    fn infer(target: &CheckedType, index: &CheckedType) -> Self {
+        Self::same(Type::Infer, target, index)
+    }
+}
+
+fn check_index_expr(expr: &ExprNode, node: &IndexNode, tc: &mut TypeChecker) -> CheckedType {
+    let target = check_expr_checked(&node.node.target, tc);
+    let indexed = check_index_access(node, &target, tc);
+    let mut checked = checked_from_type(expr, indexed.read_ty, tc);
+    checked.contains_extern_any = indexed.contains_extern_any;
+    checked
+}
+
+fn check_index_access(
+    node: &IndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedIndex {
+    if node.node.safe || matches!(node.node.index.node.kind, ExprKind::Range(_)) {
+        let index = check_expr_checked(&node.node.index, tc);
+        return CheckedIndex::infer(target, &index);
+    }
+
+    match &target.ty {
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+            let index = check_value_expr_checked_with_hint(
+                &node.node.index,
+                Some(tc.type_handle(&Type::Int)),
+                tc,
+            );
+            if !matches!(index.ty, Type::Infer | Type::Int) {
+                tc.push_error(TypeError::IndexNotInt {
+                    found: index.ty.clone(),
+                    span: node.node.index.span,
+                });
+            }
+            CheckedIndex::same((**elem).clone(), target, &index)
+        }
+        Type::Map { key, value } => {
+            let key_handle = tc.type_handle(key);
+            let index =
+                check_value_expr_checked_with_hint(&node.node.index, Some(key_handle.clone()), tc);
+            tc.expect_assignable(node.node.index.span, index.handle.clone(), key_handle);
+            tc.solve_constraints();
+            let value = (**value).clone();
+            CheckedIndex::new(
+                tc.decls
+                    .core_option_of(value.clone())
+                    .unwrap_or(Type::Infer),
+                value,
+                target,
+                &index,
+            )
+        }
+        Type::Infer => {
+            let index = check_expr_checked(&node.node.index, tc);
+            CheckedIndex::infer(target, &index)
+        }
+        found => {
+            let index = check_expr_checked(&node.node.index, tc);
+            if !found.is_void() {
+                tc.push_error(TypeError::IndexOnNonIndexable {
+                    found: found.clone(),
+                    span: node.span,
+                });
+            }
+            CheckedIndex::infer(target, &index)
+        }
+    }
 }
 
 struct NominalLiteralSolver {
@@ -4400,6 +4483,7 @@ fn assignment_target_name(expr: &ExprNode) -> Ident {
     match &expr.node.kind {
         ExprKind::Ident(name) => *name,
         ExprKind::Field(field) => field.node.field,
+        ExprKind::Index(index) => assignment_target_name(&index.node.target),
         _ => Ident::new("<target>"),
     }
 }

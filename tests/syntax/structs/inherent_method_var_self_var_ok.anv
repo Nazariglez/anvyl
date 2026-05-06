@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    n: int,
+
+    fn inc(var self) { self.n = self.n + 1; }
+}
+
+fn main() {
+    var c = Counter { n: 0 };
+    c.inc();
+}

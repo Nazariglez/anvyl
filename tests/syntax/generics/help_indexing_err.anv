@@ -1,8 +1,7 @@
 // @mode: check
 // @expect: error
-// @skip: todo -> clean frontend indexing expression checker (finding 107)
-// @contains: not an array or list
-// @contains: must be an array, list, or slice
+// @frontend: new
+// @contains: cannot index non-array type
 
 fn get_first<T>(a: T) -> int {
     return a[0];

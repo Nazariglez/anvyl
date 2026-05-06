@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn set(var m: [string: int], key: string) {
+    m[key] = 1;
+}

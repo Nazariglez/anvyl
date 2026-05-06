@@ -2,7 +2,7 @@ use anvyx_externs::FieldAccess;
 
 use super::{
     CheckedType, ExternUseTarget, MemberAccessKind, TypeChecker, TypeError, check_expr_checked,
-    decls::nominal_type,
+    check_index_access, decls::nominal_type,
 };
 use crate::{
     ast::{ExprId, ExprKind, ExprNode, Ident, Type},
@@ -117,6 +117,18 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
         let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
         let access = info.kind.place_access();
         return CheckedPlace::new(checked, access);
+    }
+
+    if let ExprKind::Index(index) = &expr.node.kind {
+        let target = check_place(&index.node.target, tc);
+        let indexed = check_index_access(index, &target.value.checked, tc);
+        let mut checked = super::checked_from_type(expr, indexed.write_ty, tc);
+        checked.contains_extern_any = indexed.contains_extern_any;
+        let access = projected_field_access(target.value.access);
+        let mut place = CheckedPlace::new(checked, access);
+        place.value.facts = target.value.facts;
+        place.accepts_extern_any = target.accepts_extern_any;
+        return place;
     }
 
     if let ExprKind::Field(field) = &expr.node.kind {
