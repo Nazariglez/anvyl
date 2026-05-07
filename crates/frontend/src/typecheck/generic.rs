@@ -397,14 +397,14 @@ mod tests {
     fn substitute_func_type() {
         let ts = HashMap::from([(tv(0), Type::Int), (tv(1), Type::Bool)]);
         let ty = Type::Func {
-            params: vec![FuncParam::new(Type::Var(tv(0)), false)],
+            params: vec![FuncParam::new(Type::Var(tv(0)), false, false)],
             ret: Box::new(Type::Var(tv(1))),
         };
         let result = substitute(&ty, &ts, &HashMap::new());
         assert_eq!(
             result,
             Type::Func {
-                params: vec![FuncParam::new(Type::Int, false)],
+                params: vec![FuncParam::new(Type::Int, false, false)],
                 ret: Box::new(Type::Bool),
             }
         );

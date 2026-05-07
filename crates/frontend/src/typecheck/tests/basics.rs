@@ -247,7 +247,7 @@ mod constraints {
     #[test]
     fn nested_func_ret_infer_guard() {
         let ty = Type::Func {
-            params: vec![FuncParam::new(Type::Int, false)],
+            params: vec![FuncParam::new(Type::Int, false, false)],
             ret: Box::new(Type::Tuple(vec![Type::Infer])),
         };
         assert!(type_closure_facts(&ty).infer.contains_type);

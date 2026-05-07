@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: success
 // @frontend: new
-// @skip: clean frontend lambda callback checking is deferred
 
 extern fn app_run(update: fn(float) -> void, draw: fn() -> void);
 

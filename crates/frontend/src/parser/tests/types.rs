@@ -285,7 +285,10 @@ fn fn_type_var_param() {
     let ty = parse_type("fn(var int) -> void");
     match ty {
         ast::Type::Func { params, ret } => {
-            assert_eq!(params, vec![ast::FuncParam::new(ast::Type::Int, true)]);
+            assert_eq!(
+                params,
+                vec![ast::FuncParam::new(ast::Type::Int, true, false)]
+            );
             assert_eq!(*ret, ast::Type::Void);
         }
         other => panic!("expected function type with var param, found {other:?}"),
@@ -300,7 +303,7 @@ fn fn_type_mixed_var() {
             assert_eq!(
                 params,
                 vec![
-                    ast::FuncParam::new(ast::Type::Int, true),
+                    ast::FuncParam::new(ast::Type::Int, true, false),
                     ast::FuncParam::immut(ast::Type::String),
                 ]
             );

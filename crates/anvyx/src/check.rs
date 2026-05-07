@@ -390,6 +390,7 @@ mod tests {
                     path(&["option"]),
                     path(&["result"]),
                     path(&["range"]),
+                    path(&["collections"]),
                     path(&["core_int"]),
                     path(&["core_float"]),
                     path(&["core_string"]),
@@ -403,6 +404,7 @@ mod tests {
                 assert!(core.root().code().contains("pub import option { * };"));
                 assert!(core.root().code().contains("pub import result { * };"));
                 assert!(core.root().code().contains("pub import range { * };"));
+                assert!(core.root().code().contains("pub import collections { * };"));
             }
 
             #[test]
@@ -473,6 +475,7 @@ mod tests {
                         path(&["option"]),
                         path(&["result"]),
                         path(&["range"]),
+                        path(&["collections"]),
                         path(&["core_int"]),
                         path(&["core_float"]),
                         path(&["core_string"]),

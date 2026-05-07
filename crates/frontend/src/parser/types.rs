@@ -228,7 +228,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
 
         let fn_param = var_kw
             .then(param_type_parser)
-            .map(|(mutable, ty)| ast::FuncParam::new(ty, mutable));
+            .map(|(mutable, ty)| ast::FuncParam::new(ty, mutable, false));
 
         let fn_type = select! { (Token::Keyword(Keyword::Fn), _) => () }
             .ignore_then(

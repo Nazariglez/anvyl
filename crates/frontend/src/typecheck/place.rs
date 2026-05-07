@@ -14,6 +14,7 @@ pub(super) enum PlaceAccess {
     Mutable,
     Settable,
     Immutable,
+    Captured,
     ReadonlySelf,
     NotPlace,
 }
@@ -30,6 +31,7 @@ impl PlaceAccess {
     pub(super) fn assign_error(self, name: Ident, span: crate::span::Span) -> Option<TypeError> {
         match self {
             Self::Mutable | Self::Settable => None,
+            Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
             Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
             Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
         }
@@ -43,6 +45,7 @@ impl PlaceAccess {
         match self {
             Self::Mutable => None,
             Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+            Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
             Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
             Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
         }
@@ -103,7 +106,7 @@ pub(super) struct ExternFieldPlace<'a> {
 
 pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
     let place = check_place(expr, tc);
-    if place.value.access != PlaceAccess::Mutable {
+    if !place.value.access.can_assign() {
         tc.push_error(TypeError::VarPatternRequiresMutablePlace { span: expr.span });
     }
     record_value_read(expr.node.id, &place.value, tc);
@@ -112,11 +115,25 @@ pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> Ch
 
 pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     if let ExprKind::Ident(name) = &expr.node.kind
-        && let Some(info) = tc.lookup(*name).cloned()
+        && let Some((info, depth)) = tc
+            .lookup_with_depth(*name)
+            .map(|(info, depth)| (info.clone(), depth))
     {
+        tc.record_capture(*name, depth);
         let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
-        let access = info.kind.place_access();
-        return CheckedPlace::new(checked, access);
+        let access = if tc.is_captured_local(depth) {
+            PlaceAccess::Captured
+        } else {
+            info.alias
+                .as_ref()
+                .map_or_else(|| info.kind.place_access(), |alias| alias.access)
+        };
+        let mut place = CheckedPlace::new(checked, access);
+        if let Some(alias) = info.alias {
+            place.value.facts = alias.facts;
+            place.accepts_extern_any = alias.accepts_extern_any;
+        }
+        return place;
     }
 
     if let ExprKind::Index(index) = &expr.node.kind {
@@ -279,6 +296,7 @@ impl CheckedPlace {
 pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAccess {
     match receiver_access {
         PlaceAccess::Mutable => PlaceAccess::Mutable,
+        PlaceAccess::Captured => PlaceAccess::Captured,
         PlaceAccess::ReadonlySelf => PlaceAccess::ReadonlySelf,
         PlaceAccess::NotPlace => PlaceAccess::NotPlace,
         PlaceAccess::Settable | PlaceAccess::Immutable => PlaceAccess::Immutable,
@@ -292,6 +310,7 @@ pub(super) fn extern_field_access(
     match (receiver_access, field_access) {
         (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: false }) => PlaceAccess::Mutable,
         (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: true }) => PlaceAccess::Settable,
+        (PlaceAccess::Captured, _) => PlaceAccess::Captured,
         (PlaceAccess::ReadonlySelf, _) => PlaceAccess::ReadonlySelf,
         (PlaceAccess::NotPlace, _) => PlaceAccess::NotPlace,
         _ => PlaceAccess::Immutable,

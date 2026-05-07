@@ -323,6 +323,20 @@ pub(crate) enum DeclError {
         surface: MethodSurface,
         span: Span,
     },
+    DuplicateCastFrom {
+        target: Type,
+        source: Type,
+        span: Span,
+    },
+    PointlessCastFrom {
+        ty: Type,
+        span: Span,
+    },
+    CastFromReturnMismatch {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
     UnsupportedExtendTarget {
         ty: Type,
         span: Span,
@@ -965,6 +979,14 @@ pub(crate) struct ExtendSchema {
     pub(crate) target: Type,
     pub(crate) generics: GenericParams,
     pub(crate) methods: HashMap<MethodKey, ExtendMethodSchema>,
+    pub(crate) cast_froms: Vec<CastConversionSchema>,
+    pub(crate) span: Span,
+}
+
+#[derive(Clone)]
+pub(crate) struct CastConversionSchema {
+    pub(crate) source: Type,
+    pub(crate) ret: Option<Type>,
     pub(crate) span: Span,
 }
 
@@ -985,6 +1007,11 @@ pub(crate) enum ExtendMethodMatch<'a> {
         receiver_ty: Type,
         owner_args: Result<GenericArgs, Vec<Ident>>,
     },
+    Ambiguous,
+}
+
+pub(crate) enum CastConversionMatch {
+    Match,
     Ambiguous,
 }
 
@@ -1214,6 +1241,17 @@ impl DeclarationIndex {
                     generics: method_generics,
                 };
                 method.ret = f(site, method.ret.clone());
+            }
+            for cast in &mut extend.cast_froms {
+                let site = DeclTypeSite {
+                    module: origin.clone(),
+                    span: cast.span,
+                    generics: generics.clone(),
+                };
+                cast.source = f(site.clone(), cast.source.clone());
+                if let Some(ret) = &mut cast.ret {
+                    *ret = f(site, ret.clone());
+                }
             }
         }
 
@@ -1618,12 +1656,22 @@ impl DeclarationIndex {
                             methods.insert(key, schema);
                         }
                     }
+                    let cast_froms = ext
+                        .cast_froms
+                        .iter()
+                        .map(|cast| CastConversionSchema {
+                            source: cast.node.param.ty.clone(),
+                            ret: cast.node.ret.clone(),
+                            span: cast.span,
+                        })
+                        .collect();
                     self.extends.push(ExtendSchema {
                         id,
                         origin: scope.clone(),
                         target: ext.ty.clone(),
                         generics,
                         methods,
+                        cast_froms,
                         span: extend_node.span,
                     });
                 }
@@ -2278,6 +2326,37 @@ impl DeclarationIndex {
         self.extends.iter()
     }
 
+    pub(crate) fn find_cast_conversion(
+        &self,
+        source: &Type,
+        target: &Type,
+        visible: impl Fn(&ExtendSchema) -> bool,
+    ) -> Option<CastConversionMatch> {
+        let mut selected = None;
+        for extend in self.extends.iter().filter(|extend| visible(extend)) {
+            let target_template = generic_template_type(&extend.target, &extend.generics);
+            for cast in &extend.cast_froms {
+                let source_template = generic_template_type(&cast.source, &extend.generics);
+                if match_cast_conversion(
+                    &extend.generics,
+                    &source_template,
+                    source,
+                    &target_template,
+                    target,
+                )
+                .is_none()
+                {
+                    continue;
+                }
+                if selected.is_some() {
+                    return Some(CastConversionMatch::Ambiguous);
+                }
+                selected = Some(());
+            }
+        }
+        selected.map(|()| CastConversionMatch::Match)
+    }
+
     fn module_surface_contains(&self, module: &ModuleScope, origin: &ModuleScope) -> bool {
         module == origin
             || self
@@ -2499,6 +2578,7 @@ impl DeclarationIndex {
                 FuncParam::new(
                     generic_template_type(&param.ty, &extend.generics),
                     param.mutable,
+                    param.cast_accept,
                 )
             })
             .collect::<Vec<_>>();
@@ -2604,6 +2684,7 @@ fn substitute_func_params(
             FuncParam::new(
                 substitute(&param.ty, type_subst, const_subst),
                 param.mutable,
+                param.cast_accept,
             )
         })
         .collect()
@@ -2673,7 +2754,7 @@ fn extend_receiver_match(
         ));
     }
 
-    match match_generic_template_args(generics, target, subject, Span::new(0, 0)) {
+    match match_generic_template_args(generics, target, subject) {
         Some(owner_args) => return Some((subject.clone(), owner_args, ExtendReceiverMatch::Exact)),
         None if surface != MethodSurface::Instance => return None,
         None => {}
@@ -2691,8 +2772,7 @@ fn extend_receiver_match(
     let receiver_ty = Type::Slice {
         elem: subject_elem.clone(),
     };
-    let owner_args =
-        match_generic_template_args(generics, target_elem, subject_elem, Span::new(0, 0))?;
+    let owner_args = match_generic_template_args(generics, target_elem, subject_elem)?;
     Some((receiver_ty, owner_args, ExtendReceiverMatch::SliceView))
 }
 
@@ -2736,18 +2816,32 @@ fn match_generic_template_args(
     generics: &GenericParams,
     template: &Type,
     concrete: &Type,
-    span: Span,
 ) -> Option<GenericTemplateMatch> {
+    match_cast_conversion(generics, template, concrete, template, concrete)
+}
+
+fn match_cast_conversion(
+    generics: &GenericParams,
+    source_template: &Type,
+    source: &Type,
+    target_template: &Type,
+    target: &Type,
+) -> Option<GenericTemplateMatch> {
+    let span = Span::new(0, 0);
     if generics.is_empty() {
-        return (template == concrete).then(|| Ok(GenericArgs::default()));
+        return (source_template == source && target_template == target)
+            .then(|| Ok(GenericArgs::default()));
     }
 
     let mut solver = Solver::default();
     let seeds = GenericSolverSeeds::default();
     let vars = solver.generic_solver_vars(generics, &seeds, span);
-    let template = solver.instantiate_generic_type(template, &vars);
-    let concrete = solver.concrete_type(concrete);
-    solver.add_handle_equal(span, template, concrete);
+    let source_template = solver.instantiate_generic_type(source_template, &vars);
+    let target_template = solver.instantiate_generic_type(target_template, &vars);
+    let source = solver.concrete_type(source);
+    let target = solver.concrete_type(target);
+    solver.add_handle_equal(span, source_template, source);
+    solver.add_handle_equal(span, target_template, target);
     if !solver.solve_pending().is_empty() {
         return None;
     }
@@ -2857,6 +2951,7 @@ impl DeclarationIndex {
                         Ok(FuncParam::new(
                             self.finalize_type_ref(module, generics, &param.ty)?,
                             param.mutable,
+                            param.cast_accept,
                         ))
                     })
                     .collect::<Result<_, _>>()?,
@@ -3132,7 +3227,7 @@ impl TypeFolder for GenericTemplate {
     }
 }
 
-fn same_extend_target(
+pub(crate) fn same_extend_target(
     a: &Type,
     a_generics: &GenericParams,
     b: &Type,
@@ -3144,9 +3239,8 @@ fn same_extend_target(
     let Some(b_template) = try_generic_template_type(b, b_generics) else {
         return false;
     };
-    let span = Span::new(0, 0);
-    match_generic_template_args(a_generics, &a_template, &b_template, span).is_some()
-        && match_generic_template_args(b_generics, &b_template, &a_template, span).is_some()
+    match_generic_template_args(a_generics, &a_template, &b_template).is_some()
+        && match_generic_template_args(b_generics, &b_template, &a_template).is_some()
 }
 
 fn try_generic_template_type(ty: &Type, generics: &GenericParams) -> Option<Type> {
@@ -3176,7 +3270,13 @@ fn generic_params(type_params: &[TypeParam], const_params: &[ConstParam]) -> Gen
 fn func_type_from_params(params: &[Param], ret: &Type) -> Type {
     let resolved_params = params
         .iter()
-        .map(|p| FuncParam::new(p.ty.clone(), matches!(p.mutability, Mutability::Mutable)))
+        .map(|p| {
+            FuncParam::new(
+                p.ty.clone(),
+                matches!(p.mutability, Mutability::Mutable),
+                p.cast_accept,
+            )
+        })
         .collect();
     Type::Func {
         params: resolved_params,
@@ -3187,7 +3287,13 @@ fn func_type_from_params(params: &[Param], ret: &Type) -> Type {
 fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
     params
         .iter()
-        .map(|p| FuncParam::new(p.ty.clone(), matches!(p.mutability, Mutability::Mutable)))
+        .map(|p| {
+            FuncParam::new(
+                p.ty.clone(),
+                matches!(p.mutability, Mutability::Mutable),
+                p.cast_accept,
+            )
+        })
         .collect()
 }
 

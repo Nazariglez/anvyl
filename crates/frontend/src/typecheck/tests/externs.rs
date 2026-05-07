@@ -1001,17 +1001,14 @@ mod callbacks {
     }
 
     #[test]
-    fn lambda_deferred() {
-        let Err(errors) = check(
+    fn lambda_callback() {
+        check(
             r"
             extern fn apply(value: int, cb: fn(int) -> int) -> int;
             fn main() { apply(5, |x| x * 2); }
             ",
-        ) else {
-            panic!("closure callbacks are still blocked by lambda typechecking");
-        };
-
-        assert!(!errors.is_empty());
+        )
+        .expect("lambda callback should typecheck");
     }
 }
 
@@ -2309,6 +2306,66 @@ mod compound {
         )
         .expect("typecheck failed");
         assert_compound_assignment_uses(&result);
+    }
+
+    #[test]
+    fn records_computed_alias_write() {
+        let result = check(
+            r"
+            extern type Point { computed var x: float; }
+            fn write(var p: Point) {
+                var Point { x } = p;
+                x = 1.0;
+            }
+            ",
+        )
+        .expect("typecheck failed");
+        let owner = result
+            .externs()
+            .type_by_key(&type_key(ModuleScope::Root, "Point"))
+            .expect("extern type");
+        let (field, _) = result
+            .externs()
+            .field(owner, Ident::new("x"))
+            .expect("extern field");
+
+        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
+        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 1);
+    }
+
+    #[test]
+    fn records_nested_computed_alias_write_prefix() {
+        let result = check(
+            r"
+            extern type Inner { computed var x: float; }
+            extern type Outer { var inner: Inner; }
+            fn write(var o: Outer) {
+                var Outer { inner: Inner { x } } = o;
+                x = 1.0;
+            }
+            ",
+        )
+        .expect("typecheck failed");
+        let outer = result
+            .externs()
+            .type_by_key(&type_key(ModuleScope::Root, "Outer"))
+            .expect("extern type");
+        let inner = result
+            .externs()
+            .type_by_key(&type_key(ModuleScope::Root, "Inner"))
+            .expect("extern type");
+        let (inner_field, _) = result
+            .externs()
+            .field(outer, Ident::new("inner"))
+            .expect("extern field");
+        let (x_field, _) = result
+            .externs()
+            .field(inner, Ident::new("x"))
+            .expect("extern field");
+
+        assert_use_count(&result, ExternUseTarget::FieldRead(inner_field), 2);
+        assert_use_count(&result, ExternUseTarget::FieldRead(x_field), 1);
+        assert_use_count(&result, ExternUseTarget::FieldWrite(x_field), 1);
     }
 
     fn assert_compound_assignment_uses(result: &TypecheckTestResult) {

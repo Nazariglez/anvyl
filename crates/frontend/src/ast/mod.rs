@@ -158,20 +158,33 @@ pub enum ArrayLen {
 pub struct FuncParam {
     pub ty: Type,
     pub mutable: bool,
+    pub cast_accept: bool,
 }
 
 impl FuncParam {
-    pub fn new(ty: Type, mutable: bool) -> Self {
-        Self { ty, mutable }
+    pub fn new(ty: Type, mutable: bool, cast_accept: bool) -> Self {
+        Self {
+            ty,
+            mutable,
+            cast_accept,
+        }
     }
     pub fn immut(ty: Type) -> Self {
-        Self { ty, mutable: false }
+        Self {
+            ty,
+            mutable: false,
+            cast_accept: false,
+        }
     }
 }
 
 impl Display for FuncParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.ty)
+        if self.cast_accept {
+            write!(f, "as {}", self.ty)
+        } else {
+            write!(f, "{}", self.ty)
+        }
     }
 }
 

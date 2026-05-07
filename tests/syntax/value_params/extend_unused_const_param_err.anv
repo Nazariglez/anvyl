@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: unused type parameter
+// @contains: unused const parameter
 
 extend<T, N: int> [T] {
     fn dummy(self) -> int { 0 }

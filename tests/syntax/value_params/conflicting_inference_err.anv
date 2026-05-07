@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Conflicting const inference
+// @contains: Mismatched types: expected const '2', found '3'
 
 fn same_len<T, N: int>(a: [T; N], b: [T; N]) -> T {
     a[0]

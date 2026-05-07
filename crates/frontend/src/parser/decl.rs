@@ -1668,6 +1668,7 @@ fn resolve_type_params_with_self(
                             self_type,
                         ),
                         p.mutable,
+                        p.cast_accept,
                     )
                 })
                 .collect::<Vec<_>>();

@@ -498,16 +498,18 @@ fn apply_value_field(
             });
             return Subject::Error;
         }
-        return extern_value_member_subject(
-            owner,
-            name,
-            receiver_access,
-            receiver_place,
-            receiver_id,
-            span,
-            kind,
-            tc,
-        );
+        if kind == MemberAccessKind::Field || tc.externs.method(owner, name).is_some() {
+            return extern_value_member_subject(
+                owner,
+                name,
+                receiver_access,
+                receiver_place,
+                receiver_id,
+                span,
+                kind,
+                tc,
+            );
+        }
     }
     let mut static_method_on_value = false;
     if let Some(key) = key.as_ref()
@@ -1023,6 +1025,7 @@ struct GenericCallInstantiation {
 struct CallParam {
     ty: TypeHandle,
     mutable: bool,
+    cast_accept: bool,
 }
 
 fn solve_generic_call_with(
@@ -1107,6 +1110,7 @@ fn instantiate_call_params(
         .map(|param| CallParam {
             ty: tc.solver.instantiate_generic_type(&param.ty, vars),
             mutable: param.mutable,
+            cast_accept: param.cast_accept,
         })
         .collect()
 }
@@ -1114,26 +1118,59 @@ fn instantiate_call_params(
 fn check_source_args(args: &[ExprNode], params: &[CallParam], tc: &mut TypeChecker) -> bool {
     let mut failed = false;
     for (arg, param) in args.iter().zip(params) {
-        let checked = if param.mutable {
-            let place = place::check_place(arg, tc);
-            if let Some(error) = place
-                .value
-                .access
-                .mut_borrow_error(super::assignment_target_name(arg), arg.span)
-            {
-                tc.push_error(error);
-            } else {
-                place::record_write(arg.node.id, &place, tc);
-            }
-            place.into_checked()
-        } else {
-            super::check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc)
-        };
-        tc.reject_extern_any_escape(&checked, arg.span);
-        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
-        failed |= tc.solve_constraints();
+        failed |= check_source_arg(arg, param, tc);
     }
     failed
+}
+
+fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> bool {
+    if param.mutable {
+        let place = place::check_place(arg, tc);
+        if let Some(error) = place
+            .value
+            .access
+            .mut_borrow_error(super::assignment_target_name(arg), arg.span)
+        {
+            tc.push_error(error);
+        } else {
+            place::record_write(arg.node.id, &place, tc);
+        }
+        let checked = place.into_checked();
+        tc.reject_extern_any_escape(&checked, arg.span);
+        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+        return tc.solve_constraints();
+    }
+
+    if param.cast_accept {
+        let checked = super::check_value_expr_checked_with_hint(arg, None, tc);
+        tc.reject_extern_any_escape(&checked, arg.span);
+        if can_assign_without_errors(arg.span, checked.handle.clone(), param.ty.clone(), tc) {
+            tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+            return tc.solve_constraints();
+        }
+        let target = tc.handle_type(&param.ty);
+        if tc.has_direct_conversion(&checked.ty, &target) {
+            return tc.solve_constraints();
+        }
+        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+        return tc.solve_constraints();
+    }
+
+    let checked = super::check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc);
+    tc.reject_extern_any_escape(&checked, arg.span);
+    tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+    tc.solve_constraints()
+}
+
+fn can_assign_without_errors(
+    span: Span,
+    from: TypeHandle,
+    to: TypeHandle,
+    tc: &TypeChecker,
+) -> bool {
+    let mut solver = tc.solver.clone();
+    solver.add_handle_assignable(span, from, to);
+    solver.solve_pending().is_empty()
 }
 
 fn constrain_expected_return(
@@ -1164,6 +1201,7 @@ fn substitute_params_checked(
             FuncParam::new(
                 tc.substitute_checked(&param.ty, type_subst, const_subst, span),
                 param.mutable,
+                param.cast_accept,
             )
         })
         .collect()
@@ -1681,6 +1719,7 @@ pub(super) fn check_args(
         .map(|param| CallParam {
             ty: tc.type_handle(&param.ty),
             mutable: param.mutable,
+            cast_accept: param.cast_accept,
         })
         .collect::<Vec<_>>();
     check_source_args(args, &params, tc);

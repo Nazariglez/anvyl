@@ -13,6 +13,7 @@ use crate::{
         catalog::{
             ExternCatalogContext, ExternCatalogError, ExternContextItem, InvalidExternTypeReason,
         },
+        raw_module_scope,
     },
     lexer::SpannedToken,
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError, SourceFileId},
@@ -195,7 +196,7 @@ pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnosti
             duplicate,
         } => render_duplicate_raw_identity(
             render_raw_identity_kind(key),
-            &render_raw_identity_key(key),
+            &render_extern_identity_label(key, first, duplicate),
             first,
             duplicate,
         ),
@@ -273,6 +274,60 @@ fn render_raw_identity_key(key: &RawExternIdentityKey) -> String {
         RawExternIdentityKey::Function(key) => render_raw_function_key(key),
         RawExternIdentityKey::Type(key) => render_raw_type_key(key),
         RawExternIdentityKey::Member(key) => render_raw_member_key(key),
+    }
+}
+
+fn render_extern_identity_label(
+    key: &RawExternIdentityKey,
+    first: &RawExternDecl,
+    duplicate: &RawExternDecl,
+) -> String {
+    if is_source_raw_identity(key, first, duplicate) {
+        render_source_raw_identity_key(key)
+    } else {
+        render_raw_identity_key(key)
+    }
+}
+
+fn is_source_raw_identity(
+    key: &RawExternIdentityKey,
+    first: &RawExternDecl,
+    duplicate: &RawExternDecl,
+) -> bool {
+    let Some(first_scope) = source_provenance_scope(&first.provenance) else {
+        return false;
+    };
+    let Some(duplicate_scope) = source_provenance_scope(&duplicate.provenance) else {
+        return false;
+    };
+
+    first_scope == duplicate_scope && raw_identity_scope(key) == first_scope
+}
+
+fn source_provenance_scope(provenance: &ExternProvenance) -> Option<&RawExternScope> {
+    match provenance {
+        ExternProvenance::Source { module } => Some(module),
+        ExternProvenance::Provider { .. } => None,
+    }
+}
+
+fn raw_identity_scope(key: &RawExternIdentityKey) -> &RawExternScope {
+    match key {
+        RawExternIdentityKey::Function(key) => &key.module,
+        RawExternIdentityKey::Type(key) => &key.module,
+        RawExternIdentityKey::Member(key) => &key.owner.module,
+    }
+}
+
+fn render_source_raw_identity_key(key: &RawExternIdentityKey) -> String {
+    match key {
+        RawExternIdentityKey::Function(key) => key.name.clone(),
+        RawExternIdentityKey::Type(key) => key.name.clone(),
+        RawExternIdentityKey::Member(key) => format!(
+            "{}.{}",
+            key.owner.name.as_str(),
+            render_extern_member_selector(&key.selector)
+        ),
     }
 }
 
@@ -423,6 +478,12 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             render_qualified_name(*qualifier, *name)
         ),
         TypeError::CannotInferConst { .. } => "Could not infer const value".to_string(),
+        TypeError::AllNilArrayLiteral { .. } => {
+            "cannot infer element type for all-nil array literal".to_string()
+        }
+        TypeError::ArrayFillLengthNotConst { .. } => {
+            "array fill length must be a compile-time constant".to_string()
+        }
         TypeError::NotCallable { ty, .. } => format!("type '{ty}' is not callable"),
         TypeError::WrongArgCount {
             expected, found, ..
@@ -432,6 +493,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::WrongArgRange {
             min, max, found, ..
         } => format!("Wrong number of arguments: expected between {min} and {max}, found {found}"),
+        TypeError::LambdaParamCountMismatch {
+            expected, found, ..
+        } => format!("parameter count mismatch: expected {expected}, found {found}"),
         TypeError::RequiredParamAfterDefault { name, .. } => {
             format!("required parameter '{name}' cannot follow a default parameter")
         }
@@ -447,6 +511,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::DuplicateName { name, .. } => format!("name '{name}' is already declared"),
         TypeError::ImmutableAssignment { name, .. } => {
             format!("cannot assign to immutable value '{name}'")
+        }
+        TypeError::CannotMutateCapturedVariable { name, .. } => {
+            format!("cannot mutate captured variable '{name}'")
         }
         TypeError::RequiresMutablePlace { name, .. } => {
             format!("cannot mutably borrow non-storage place '{name}'")
@@ -689,7 +756,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::InvalidConstCast { from, to, .. } => {
             format!("cannot cast constant from '{from}' to '{to}'")
         }
-        TypeError::InvalidCast { from, to, .. } => format!("Invalid cast from '{from}' to '{to}'"),
+        TypeError::InvalidCast { from, to, .. } => {
+            format!("Invalid cast: cannot cast from '{from}' to '{to}'")
+        }
         TypeError::ConstDivisionByZero { .. } => {
             "division by zero in constant expression".to_string()
         }
@@ -949,37 +1018,60 @@ fn render_extern_item(context: &ExternCatalogContext) -> String {
         ExternContextItem::Function { name } => {
             format!(
                 "extern function {}",
-                render_scoped_name(&context.module, *name)
+                render_extern_context_name(context, *name)
             )
         }
         ExternContextItem::Type { name } => {
-            format!("extern type {}", render_scoped_name(&context.module, *name))
+            format!("extern type {}", render_extern_context_name(context, *name))
         }
         ExternContextItem::Field { ty, field } => {
             format!(
                 "extern field {}",
-                render_scoped_member(&context.module, *ty, *field)
+                render_extern_context_member(context, *ty, *field)
             )
         }
         ExternContextItem::Init { ty } => {
-            format!("extern init {}", render_scoped_name(&context.module, *ty))
+            format!("extern init {}", render_extern_context_name(context, *ty))
         }
         ExternContextItem::Method { ty, method } => {
             format!(
                 "extern method {}",
-                render_scoped_member(&context.module, *ty, *method)
+                render_extern_context_member(context, *ty, *method)
             )
         }
         ExternContextItem::Static { ty, method } => {
             format!(
                 "extern static {}",
-                render_scoped_member(&context.module, *ty, *method)
+                render_extern_context_member(context, *ty, *method)
             )
         }
         ExternContextItem::Operator { ty, op } => {
-            let owner = render_scoped_name(&context.module, *ty);
+            let owner = render_extern_context_name(context, *ty);
             format!("extern operator {owner}.{}", render_extern_operator(*op))
         }
+    }
+}
+
+fn render_extern_context_name(context: &ExternCatalogContext, name: Ident) -> String {
+    if is_source_extern_context(context) {
+        name.to_string()
+    } else {
+        render_scoped_name(&context.module, name)
+    }
+}
+
+fn render_extern_context_member(
+    context: &ExternCatalogContext,
+    ty: Ident,
+    member: Ident,
+) -> String {
+    format!("{}.{}", render_extern_context_name(context, ty), member)
+}
+
+fn is_source_extern_context(context: &ExternCatalogContext) -> bool {
+    match &context.provenance {
+        ExternProvenance::Source { module } => raw_module_scope(module) == context.module,
+        ExternProvenance::Provider { .. } => false,
     }
 }
 
@@ -989,10 +1081,6 @@ fn render_scoped_name(module: &ModuleScope, name: Ident) -> String {
         ModuleScope::Named(path) => format!("{}.{name}", render_module_path(path)),
         ModuleScope::Package(module) => format!("{}.{name}", render_module_id(module)),
     }
-}
-
-fn render_scoped_member(module: &ModuleScope, ty: Ident, member: Ident) -> String {
-    format!("{}.{}", render_scoped_name(module, ty), member)
 }
 
 fn render_member_access_kind(kind: MemberAccessKind) -> &'static str {
@@ -1095,6 +1183,17 @@ fn render_decl_error(error: &DeclError) -> String {
         ),
         DeclError::DuplicateExtendMethod { name, surface, .. } => {
             format!("duplicate extend {} method '{name}'", surface.label())
+        }
+        DeclError::DuplicateCastFrom { source, target, .. } => {
+            format!("duplicate cast from '{source}' to '{target}'")
+        }
+        DeclError::PointlessCastFrom { ty, .. } => {
+            format!("pointless cast from '{ty}' to itself")
+        }
+        DeclError::CastFromReturnMismatch {
+            expected, found, ..
+        } => {
+            format!("cast from return type mismatch: expected '{expected}', found '{found}'")
         }
         DeclError::UnsupportedExtendTarget { ty, .. } => {
             format!("cannot extend type '{ty}'")
@@ -1401,7 +1500,7 @@ fn render_module_scope(scope: &ModuleScope) -> String {
 
 #[cfg(test)]
 mod tests {
-    use anvyx_externs::BinaryOp;
+    use anvyx_externs::{BinaryOp, ExternMemberSelector, ProviderId};
     use chumsky::error::{LabelError, RichPattern};
 
     use super::*;
@@ -1455,6 +1554,18 @@ mod tests {
     fn source_decl(module: RawExternScope) -> RawExternDecl {
         RawExternDecl {
             provenance: ExternProvenance::Source { module },
+            site: RawExternSite::default(),
+        }
+    }
+
+    fn provider_decl(name: &str) -> RawExternDecl {
+        RawExternDecl {
+            provenance: ExternProvenance::Provider {
+                package: PackageId::synthetic_root(),
+                provider: ProviderId {
+                    name: name.to_string(),
+                },
+            },
             site: RawExternSite::default(),
         }
     }
@@ -1987,9 +2098,86 @@ mod tests {
     }
 
     #[test]
-    fn renders_named_raw_member_identity() {
+    fn renders_source_raw_identities_without_source_module_prefix() {
         let module = RawExternScope::Module(module_id(&["host"]));
         let decl = source_decl(module.clone());
+        let op = ExternOperator::Binary {
+            op: BinaryOp::Add,
+            self_on_right: false,
+        };
+        let cases = vec![
+            (
+                RawExternIdentityKey::Function(RawExternFunctionKey {
+                    module: module.clone(),
+                    name: "ping".to_string(),
+                }),
+                "duplicate extern function 'ping' declared in source module 'host' and source module 'host'",
+            ),
+            (
+                RawExternIdentityKey::Type(RawExternTypeKey {
+                    module: module.clone(),
+                    name: "Handle".to_string(),
+                }),
+                "duplicate extern type 'Handle' declared in source module 'host' and source module 'host'",
+            ),
+            (
+                RawExternIdentityKey::Member(RawExternMemberKey {
+                    owner: RawExternTypeKey {
+                        module: module.clone(),
+                        name: "Handle".to_string(),
+                    },
+                    selector: ExternMemberSelector::Field("id".to_string()),
+                }),
+                "duplicate extern field 'Handle.id' declared in source module 'host' and source module 'host'",
+            ),
+            (
+                RawExternIdentityKey::Member(RawExternMemberKey {
+                    owner: RawExternTypeKey {
+                        module: module.clone(),
+                        name: "Handle".to_string(),
+                    },
+                    selector: ExternMemberSelector::Method("get".to_string()),
+                }),
+                "duplicate extern method 'Handle.get' declared in source module 'host' and source module 'host'",
+            ),
+            (
+                RawExternIdentityKey::Member(RawExternMemberKey {
+                    owner: RawExternTypeKey {
+                        module: module.clone(),
+                        name: "Handle".to_string(),
+                    },
+                    selector: ExternMemberSelector::Static("make".to_string()),
+                }),
+                "duplicate extern static method 'Handle.make' declared in source module 'host' and source module 'host'",
+            ),
+            (
+                RawExternIdentityKey::Member(RawExternMemberKey {
+                    owner: RawExternTypeKey {
+                        module,
+                        name: "Vec2".to_string(),
+                    },
+                    selector: ExternMemberSelector::Operator(op),
+                }),
+                "duplicate extern operator 'Vec2.+' declared in source module 'host' and source module 'host'",
+            ),
+        ];
+
+        for (key, expected) in cases {
+            assert_msg(
+                diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
+                    key,
+                    first: decl.clone(),
+                    duplicate: decl.clone(),
+                }),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn renders_provider_raw_identity_with_module_prefix() {
+        let module = RawExternScope::Module(module_id(&["host"]));
+        let decl = provider_decl("native");
 
         assert_msg(
             diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
@@ -1998,12 +2186,65 @@ mod tests {
                         module,
                         name: "Handle".to_string(),
                     },
-                    selector: anvyx_externs::ExternMemberSelector::Field("id".to_string()),
+                    selector: ExternMemberSelector::Field("id".to_string()),
                 }),
                 first: decl.clone(),
                 duplicate: decl,
             }),
-            "duplicate extern field 'host.Handle.id' declared in source module 'host' and source module 'host'",
+            "duplicate extern field 'host.Handle.id' declared in provider 'native' in package '<root>' and provider 'native' in package '<root>'",
+        );
+    }
+
+    #[test]
+    fn renders_source_extern_catalog_context_without_source_module_prefix() {
+        let module = ModuleId::source_without_package(
+            SourceFileId::new("/tmp/unresolved_callback_param_err.anv").unwrap(),
+        );
+        let context = ExternCatalogContext {
+            provenance: ExternProvenance::Source {
+                module: RawExternScope::Module(module.clone()),
+            },
+            module: ModuleScope::from_module_id(&module),
+            item: ExternContextItem::Function {
+                name: ident("apply"),
+            },
+        };
+
+        assert_msg(
+            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+                context,
+                module: None,
+                name: ident("Missing"),
+                site: RawExternSite::default(),
+            })),
+            "Unknown extern type 'Missing' in extern function apply from source module 'unresolved_callback_param_err'",
+        );
+    }
+
+    #[test]
+    fn renders_provider_extern_catalog_context_with_module_prefix() {
+        let context = ExternCatalogContext {
+            provenance: ExternProvenance::Provider {
+                package: PackageId::synthetic_root(),
+                provider: ProviderId {
+                    name: "native".to_string(),
+                },
+            },
+            module: module_scope(&["host"]),
+            item: ExternContextItem::Field {
+                ty: ident("Handle"),
+                field: ident("id"),
+            },
+        };
+
+        assert_msg(
+            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+                context,
+                module: None,
+                name: ident("Missing"),
+                site: RawExternSite::default(),
+            })),
+            "Unknown extern type 'Missing' in extern field host.Handle.id from provider 'native' in package '<root>'",
         );
     }
 

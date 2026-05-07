@@ -11,7 +11,7 @@ use self::{
         SolverRelationError, TypeHandle,
     },
     pattern::{PatternBindMode, PatternContext},
-    place::{PlaceAccess, check_alias_scrutinee, check_place},
+    place::{PlaceAccess, PlaceUseFacts, check_alias_scrutinee, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
     type_refs::{GenericParamError, GenericTypeContext},
@@ -166,6 +166,12 @@ pub(crate) enum TypeError {
     CannotInferType {
         span: Span,
     },
+    AllNilArrayLiteral {
+        span: Span,
+    },
+    ArrayFillLengthNotConst {
+        span: Span,
+    },
     InferReturnNonGeneric {
         span: Span,
     },
@@ -210,6 +216,11 @@ pub(crate) enum TypeError {
         found: usize,
         span: Span,
     },
+    LambdaParamCountMismatch {
+        expected: usize,
+        found: usize,
+        span: Span,
+    },
     RequiredParamAfterDefault {
         name: Ident,
         span: Span,
@@ -226,6 +237,10 @@ pub(crate) enum TypeError {
         span: Span,
     },
     ImmutableAssignment {
+        name: Ident,
+        span: Span,
+    },
+    CannotMutateCapturedVariable {
         name: Ident,
         span: Span,
     },
@@ -617,10 +632,18 @@ impl LocalBindingKind {
 }
 
 #[derive(Clone)]
+struct AliasTarget {
+    access: PlaceAccess,
+    facts: Option<PlaceUseFacts>,
+    accepts_extern_any: bool,
+}
+
+#[derive(Clone)]
 struct VarInfo {
     type_id: LocalTypeId,
     kind: LocalBindingKind,
     const_value: Option<ConstValue>,
+    alias: Option<AliasTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -650,6 +673,11 @@ struct ReturnFrame {
     saw_return: bool,
 }
 
+struct LambdaFrame {
+    start_scope: usize,
+    captures: Vec<Ident>,
+}
+
 struct TypeChecker {
     solver: Solver,
     calls: CallMap,
@@ -657,6 +685,7 @@ struct TypeChecker {
     decls: DeclarationIndex,
     externs: ExternCatalog,
     scopes: Vec<HashMap<Ident, VarInfo>>,
+    lambda_frames: Vec<LambdaFrame>,
     returns: Vec<ReturnFrame>,
     loop_depth: usize,
     defer_depth: usize,
@@ -737,6 +766,7 @@ impl TypeChecker {
             decls,
             externs,
             scopes: vec![],
+            lambda_frames: vec![],
             returns: vec![],
             loop_depth: 0,
             defer_depth: 0,
@@ -766,12 +796,29 @@ impl TypeChecker {
         self.define_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
     }
 
-    fn define_pattern_binding(&mut self, name: Ident, ty: Type, mode: PatternBindMode) {
-        let kind = match mode {
-            PatternBindMode::Owned { mutable } => LocalBindingKind::from_mutable(mutable),
-            PatternBindMode::Alias => LocalBindingKind::Alias,
-        };
-        self.define_value(name, ty, kind, None);
+    fn define_pattern_binding(&mut self, name: Ident, ty: Type, mutable: bool) {
+        self.define_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
+    }
+
+    fn define_alias_binding(
+        &mut self,
+        name: Ident,
+        ty: Type,
+        access: PlaceAccess,
+        facts: Option<PlaceUseFacts>,
+        accepts_extern_any: bool,
+    ) {
+        self.define_value_with_alias(
+            name,
+            ty,
+            LocalBindingKind::Alias,
+            None,
+            Some(AliasTarget {
+                access,
+                facts,
+                accepts_extern_any,
+            }),
+        );
     }
 
     fn define_const(&mut self, name: Ident, ty: Type, value: ConstValue) {
@@ -784,6 +831,17 @@ impl TypeChecker {
         ty: Type,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
+    ) {
+        self.define_value_with_alias(name, ty, kind, const_value, None);
+    }
+
+    fn define_value_with_alias(
+        &mut self,
+        name: Ident,
+        ty: Type,
+        kind: LocalBindingKind,
+        const_value: Option<ConstValue>,
+        alias: Option<AliasTarget>,
     ) {
         let Some(scope) = self.scopes.last() else {
             return;
@@ -803,17 +861,51 @@ impl TypeChecker {
                 type_id,
                 kind,
                 const_value,
+                alias,
             },
         );
     }
 
     fn lookup(&self, name: Ident) -> Option<&VarInfo> {
-        for scope in self.scopes.iter().rev() {
+        self.lookup_with_depth(name).map(|(info, _)| info)
+    }
+
+    fn lookup_with_depth(&self, name: Ident) -> Option<(&VarInfo, usize)> {
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
             if let Some(info) = scope.get(&name) {
-                return Some(info);
+                return Some((info, depth));
             }
         }
         None
+    }
+
+    fn is_captured_local(&self, depth: usize) -> bool {
+        self.lambda_frames
+            .last()
+            .is_some_and(|frame| depth > 0 && depth < frame.start_scope)
+    }
+
+    fn enter_lambda(&mut self) {
+        self.lambda_frames.push(LambdaFrame {
+            start_scope: self.scopes.len(),
+            captures: vec![],
+        });
+    }
+
+    fn record_capture(&mut self, name: Ident, depth: usize) {
+        if !self.is_captured_local(depth) {
+            return;
+        }
+        let Some(frame) = self.lambda_frames.last_mut() else {
+            return;
+        };
+        if !frame.captures.contains(&name) {
+            frame.captures.push(name);
+        }
+    }
+
+    fn exit_lambda(&mut self) {
+        self.lambda_frames.pop();
     }
 
     fn lookup_type(&self, name: Ident) -> Option<Type> {
@@ -1384,6 +1476,19 @@ impl TypeChecker {
             .find_static_extend_method(target, name, |ext| self.extend_visible(&ext.origin))
     }
 
+    fn has_direct_conversion(&self, source: &Type, target: &Type) -> bool {
+        source == target
+            || matches!(
+                (source, target),
+                (Type::Int, Type::Float) | (Type::Float, Type::Int)
+            )
+            || matches!(
+                self.decls
+                    .find_cast_conversion(source, target, |ext| self.extend_visible(&ext.origin)),
+                Some(CastConversionMatch::Match)
+            )
+    }
+
     fn exported_value_in_module(
         &self,
         scope: &ModuleScope,
@@ -1604,6 +1709,7 @@ impl TypeChecker {
                 FuncParam::new(
                     self.resolve_type_for_tc_at(&p.ty, Span::new(0, 0)),
                     matches!(p.mutability, Mutability::Mutable),
+                    p.cast_accept,
                 )
             })
             .collect();
@@ -2067,7 +2173,90 @@ fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) 
             }
         }
         validate_extend_method_conflicts(decls, extend, errors);
+        validate_cast_froms(decls, extend, errors);
     }
+}
+
+fn validate_cast_froms(
+    decls: &DeclarationIndex,
+    extend: &ExtendSchema,
+    errors: &mut Vec<TypeError>,
+) {
+    for cast in &extend.cast_froms {
+        if same_extend_target(
+            &cast.source,
+            &extend.generics,
+            &extend.target,
+            &extend.generics,
+        ) {
+            errors.push(TypeError::Decl(DeclError::PointlessCastFrom {
+                ty: cast.source.clone(),
+                span: cast.span,
+            }));
+        }
+        if let Some(ret) = &cast.ret
+            && !same_extend_target(ret, &extend.generics, &extend.target, &extend.generics)
+        {
+            errors.push(TypeError::Decl(DeclError::CastFromReturnMismatch {
+                expected: extend.target.clone(),
+                found: ret.clone(),
+                span: cast.span,
+            }));
+        }
+        if has_duplicate_cast_from(decls, extend, cast) {
+            errors.push(TypeError::Decl(DeclError::DuplicateCastFrom {
+                target: extend.target.clone(),
+                source: cast.source.clone(),
+                span: cast.span,
+            }));
+        }
+    }
+}
+
+fn has_duplicate_cast_from(
+    decls: &DeclarationIndex,
+    extend: &ExtendSchema,
+    cast: &CastConversionSchema,
+) -> bool {
+    for other_extend in decls.extends() {
+        if other_extend.id == extend.id {
+            for other in &other_extend.cast_froms {
+                if std::ptr::eq(other, cast) {
+                    return false;
+                }
+                if same_extend_target(
+                    &other.source,
+                    &other_extend.generics,
+                    &cast.source,
+                    &extend.generics,
+                ) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        if other_extend.origin != extend.origin
+            || !same_extend_target(
+                &other_extend.target,
+                &other_extend.generics,
+                &extend.target,
+                &extend.generics,
+            )
+        {
+            continue;
+        }
+        if other_extend.cast_froms.iter().any(|other| {
+            same_extend_target(
+                &other.source,
+                &other_extend.generics,
+                &cast.source,
+                &extend.generics,
+            )
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn unsupported_extend_target(ty: &Type, facts: &ExtendTargetFacts) -> bool {
@@ -2625,6 +2814,7 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
                 FuncParam::new(
                     tc.resolve_type_for_tc_at(&param.ty, method_node.span),
                     matches!(param.mutability, Mutability::Mutable),
+                    param.cast_accept,
                 )
             })
             .collect();
@@ -2636,6 +2826,20 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
             ret_ty,
             &method.body,
             extend_node.span,
+            &[],
+            tc,
+        );
+    }
+    for cast in &extend.cast_froms {
+        let param_ty = tc.resolve_type_for_tc_at(&cast.node.param.ty, cast.span);
+        let param = FuncParam::new(param_ty, false, false);
+        check_func_body(
+            None,
+            std::slice::from_ref(&cast.node.param),
+            std::slice::from_ref(&param),
+            self_ty.clone(),
+            &cast.node.body,
+            cast.span,
             &[],
             tc,
         );
@@ -3388,7 +3592,13 @@ fn check_expr_checked_with_hint(
                 }
             }
         },
-        ExprKind::Lit(lit) => checked_from_type(expr, type_from_lit(lit), tc),
+        ExprKind::Lit(lit) => {
+            let ty = match (lit, expected_assignable_type(expected.as_ref(), tc)) {
+                (Lit::Int(_), Some(Type::Float)) => Type::Float,
+                _ => type_from_lit(lit),
+            };
+            checked_from_type(expr, ty, tc)
+        }
         ExprKind::TypeSubject(ty) => {
             if let Some(ty) = tc.resolve_type_subject(ty, expr.span) {
                 tc.push_error(TypeError::TypeUsedAsValue {
@@ -3398,8 +3608,12 @@ fn check_expr_checked_with_hint(
             }
             checked_from_type(expr, Type::Infer, tc)
         }
-        ExprKind::Ident(name) => match tc.lookup(*name).cloned() {
-            Some(info) => {
+        ExprKind::Ident(name) => match tc
+            .lookup_with_depth(*name)
+            .map(|(info, depth)| (info.clone(), depth))
+        {
+            Some((info, depth)) => {
+                tc.record_capture(*name, depth);
                 if let Some((_, value_name, value)) = tc.lookup_named_value(*name) {
                     tc.warn_named_value_deprecated(&value, value_name, expr.span);
                 }
@@ -3515,7 +3729,7 @@ fn check_expr_checked_with_hint(
         ExprKind::IntrinsicCall(call) => check_intrinsic_call(expr, call, tc),
         ExprKind::Range(range) => check_range_expr(expr, range, expected, tc),
         ExprKind::Cast(cast) => check_cast_expr(expr, cast, tc),
-        ExprKind::Lambda(_) => checked_from_type(expr, Type::Void, tc),
+        ExprKind::Lambda(lambda) => check_lambda_expr(expr, lambda, expected, tc),
     }
 }
 
@@ -3883,6 +4097,7 @@ enum BinaryTypeFailure {
     InvalidOperand {
         op: String,
         operand_type: Type,
+        fallback: Type,
     },
     TypeMismatch {
         expected: Type,
@@ -3912,6 +4127,7 @@ fn builtin_binary_type(
             Err(BinaryTypeFailure::InvalidOperand {
                 op: op.to_string(),
                 operand_type: right_ty.clone(),
+                fallback: Type::Infer,
             })
         }
         BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
@@ -3921,6 +4137,7 @@ fn builtin_binary_type(
             Err(BinaryTypeFailure::InvalidOperand {
                 op: op.to_string(),
                 operand_type: right_ty.clone(),
+                fallback: Type::Infer,
             })
         }
         BinaryOp::Eq | BinaryOp::NotEq => {
@@ -3931,6 +4148,7 @@ fn builtin_binary_type(
                 Err(BinaryTypeFailure::InvalidOperand {
                     op: op.to_string(),
                     operand_type: right_ty.clone(),
+                    fallback: Type::Infer,
                 })
             } else {
                 Err(BinaryTypeFailure::TypeMismatch {
@@ -3946,6 +4164,12 @@ fn builtin_binary_type(
         | BinaryOp::GreaterThanEq => {
             if left_ty.is_num() && same {
                 Ok(Type::Bool)
+            } else if same {
+                Err(BinaryTypeFailure::InvalidOperand {
+                    op: op.to_string(),
+                    operand_type: left_ty.clone(),
+                    fallback: Type::Bool,
+                })
             } else {
                 Err(BinaryTypeFailure::TypeMismatch {
                     expected: left_ty.clone(),
@@ -3982,13 +4206,17 @@ fn builtin_binary_type(
 
 fn emit_binary_failure(failure: BinaryTypeFailure, span: Span, tc: &mut TypeChecker) -> Type {
     match failure {
-        BinaryTypeFailure::InvalidOperand { op, operand_type } => {
+        BinaryTypeFailure::InvalidOperand {
+            op,
+            operand_type,
+            fallback,
+        } => {
             tc.push_error(TypeError::InvalidOperand {
                 op,
                 operand_type,
                 span,
             });
-            Type::Infer
+            fallback
         }
         BinaryTypeFailure::TypeMismatch {
             expected,
@@ -4184,6 +4412,124 @@ fn expected_assignable_type(expected: Option<&TypeHandle>, tc: &TypeChecker) -> 
     Some(tc.decls.core_option_inner(&ty).unwrap_or(&ty).clone())
 }
 
+fn check_lambda_expr(
+    expr: &ExprNode,
+    lambda: &LambdaNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let expected_func = expected_assignable_type(expected.as_ref(), tc).and_then(|ty| match ty {
+        Type::Func { params, ret } => Some((params, *ret)),
+        _ => None,
+    });
+    if let Some((params, _)) = &expected_func
+        && params.len() != lambda.node.params.len()
+    {
+        tc.push_error(TypeError::LambdaParamCountMismatch {
+            expected: params.len(),
+            found: lambda.node.params.len(),
+            span: lambda.span,
+        });
+        return checked_from_type(expr, Type::Infer, tc);
+    }
+
+    let params = lambda
+        .node
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let ty = match &param.ty {
+                Some(ty) => tc.resolve_type_for_tc_at(ty, lambda.span),
+                None => expected_func
+                    .as_ref()
+                    .and_then(|(params, _)| params.get(index))
+                    .map_or_else(
+                        || {
+                            tc.push_error(TypeError::CannotInferType { span: lambda.span });
+                            Type::Infer
+                        },
+                        |param| param.ty.clone(),
+                    ),
+            };
+            FuncParam::new(ty, param.mutable, param.cast_accept)
+        })
+        .collect::<Vec<_>>();
+
+    let explicit_ret = lambda
+        .node
+        .ret_type
+        .as_ref()
+        .map(|ty| tc.resolve_type_for_tc_at(ty, lambda.span));
+    let expected_ret = explicit_ret.or_else(|| expected_func.as_ref().map(|(_, ret)| ret.clone()));
+
+    let flow = tc.enter_function_control_flow();
+    tc.enter_lambda();
+    tc.push_scope();
+    for (param, param_ty) in lambda.node.params.iter().zip(&params) {
+        tc.define(param.name, param_ty.ty.clone(), param.mutable);
+    }
+    let return_mode = match &expected_ret {
+        Some(ret) => ReturnMode::Explicit(ret.clone()),
+        None => ReturnMode::Infer { candidates: vec![] },
+    };
+    tc.push_return_frame(return_mode);
+
+    let body_checked = match &expected_ret {
+        Some(ret) if !ret.is_void() => {
+            let ret_handle = tc.type_handle(ret);
+            check_expr_checked_with_hint(&lambda.node.body, Some(ret_handle), tc)
+        }
+        _ => check_expr_checked(&lambda.node.body, tc),
+    };
+
+    if let Some(ret) = &expected_ret {
+        let expects_value = !ret.is_void();
+        let missing_implicit_return = body_checked.ty.is_void() && !tc.saw_return();
+        if expects_value {
+            if missing_implicit_return {
+                tc.push_error(TypeError::MissingReturn {
+                    expected: ret.clone(),
+                    span: lambda.span,
+                });
+            } else if !body_checked.ty.is_void() {
+                tc.reject_extern_any_escape(&body_checked, lambda.node.body.span);
+                let ret_handle = tc.type_handle(ret);
+                tc.expect_assignable(
+                    lambda.node.body.span,
+                    body_checked.handle.clone(),
+                    ret_handle,
+                );
+            }
+        } else if !body_checked.ty.is_void() {
+            tc.push_error(TypeError::UnusedValue {
+                span: lambda.node.body.span,
+            });
+        }
+    } else if !body_checked.ty.is_void() {
+        tc.reject_extern_any_escape(&body_checked, lambda.node.body.span);
+        tc.push_inferred_return(lambda.node.body.span, body_checked.handle.clone());
+    } else if !tc.saw_return() {
+        tc.push_inferred_return(lambda.span, tc.type_handle(&Type::Void));
+    }
+
+    let frame = tc.pop_return_frame();
+    let inferred_ret = frame.and_then(|frame| infer_return_type(frame, tc));
+    tc.pop_scope();
+    tc.exit_lambda();
+    tc.exit_function_control_flow(flow);
+
+    let ret = expected_ret.or(inferred_ret).unwrap_or(Type::Infer);
+    checked_from_type(
+        expr,
+        Type::Func {
+            params,
+            ret: Box::new(ret),
+        },
+        tc,
+    )
+}
+
 fn expected_collection(
     expected: Option<&TypeHandle>,
     tc: &TypeChecker,
@@ -4229,11 +4575,7 @@ fn check_cast_expr(expr: &ExprNode, cast: &CastNode, tc: &mut TypeChecker) -> Ch
     let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
     let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
     let from = checked.ty;
-    let valid = from == target
-        || matches!(
-            (&from, &target),
-            (Type::Int, Type::Float) | (Type::Float, Type::Int)
-        );
+    let valid = tc.has_direct_conversion(&from, &target);
     let ty = if valid || matches!(from, Type::Infer) || matches!(target, Type::Infer) {
         target
     } else {
@@ -4387,7 +4729,19 @@ fn check_array_lit_hint(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let (elem, kind) = expected_collection(expected.as_ref(), tc)
+    let expected = expected.as_ref();
+    let expected_collection = expected_collection(expected, tc);
+    if expected_collection.is_none()
+        && !lit.node.elements.is_empty()
+        && lit
+            .node
+            .elements
+            .iter()
+            .all(|element| matches!(element.node.kind, ExprKind::Lit(Lit::Nil)))
+    {
+        tc.push_error(TypeError::AllNilArrayLiteral { span: lit.span });
+    }
+    let (elem, kind) = expected_collection
         .unwrap_or_else(|| (tc.fresh_temp_handle(lit.span), CollectionLiteralKind::Array));
     let array = collection_literal_handle(
         kind,
@@ -4419,8 +4773,10 @@ fn check_array_fill_hint(
                 ArrayLen::Infer
             }
         },
-        Err(err) => {
-            tc.push_error(err);
+        Err(_) => {
+            tc.push_error(TypeError::ArrayFillLengthNotConst {
+                span: fill.node.len.span,
+            });
             ArrayLen::Infer
         }
     };

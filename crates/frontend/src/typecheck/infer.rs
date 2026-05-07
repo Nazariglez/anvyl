@@ -19,6 +19,7 @@ struct InferVarId(u32);
 struct TyFuncParam {
     ty: Ty,
     mutable: bool,
+    cast_accept: bool,
 }
 
 impl TyFuncParam {
@@ -26,6 +27,7 @@ impl TyFuncParam {
         Self {
             ty: Ty::from_recovery_type(&param.ty),
             mutable: param.mutable,
+            cast_accept: param.cast_accept,
         }
     }
 
@@ -33,6 +35,7 @@ impl TyFuncParam {
         Some(FuncParam {
             ty: self.ty.try_to_type_no_infer()?,
             mutable: self.mutable,
+            cast_accept: self.cast_accept,
         })
     }
 }
@@ -838,6 +841,7 @@ impl Solver {
                     .map(|param| TyFuncParam {
                         ty: self.instantiate_type_template(&param.ty, vars),
                         mutable: param.mutable,
+                        cast_accept: param.cast_accept,
                     })
                     .collect(),
                 ret: Box::new(self.instantiate_type_template(ret, vars)),
@@ -1149,8 +1153,13 @@ impl Solver {
                     return Err(SolveError::func_param_mismatch(expected, found, span));
                 }
                 let mutable = expected.mutable;
+                let cast_accept = expected.cast_accept || found.cast_accept;
                 let ty = self.unify_tys_equal(span, expected.ty, found.ty)?;
-                Ok(TyFuncParam { ty, mutable })
+                Ok(TyFuncParam {
+                    ty,
+                    mutable,
+                    cast_accept,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Ty::Func {
@@ -1642,6 +1651,7 @@ impl Solver {
                     .map(|param| TyFuncParam {
                         ty: self.resolve_ty(&param.ty),
                         mutable: param.mutable,
+                        cast_accept: param.cast_accept,
                     })
                     .collect(),
                 ret: Box::new(self.resolve_ty(ret)),
@@ -1777,6 +1787,7 @@ impl Solver {
                     .map(|param| FuncParam {
                         ty: self.finalize_ty_inner(&param.ty, cx),
                         mutable: param.mutable,
+                        cast_accept: param.cast_accept,
                     })
                     .collect(),
                 ret: Box::new(self.finalize_ty_inner(&ret, cx)),
@@ -2208,7 +2219,7 @@ mod tests {
     fn roundtrip_func_mutability() {
         assert_roundtrip(Type::Func {
             params: vec![
-                FuncParam::new(Type::Int, true),
+                FuncParam::new(Type::Int, true, false),
                 FuncParam::immut(Type::Bool),
             ],
             ret: Box::new(Type::String),
@@ -2750,6 +2761,7 @@ mod tests {
             params: vec![TyFuncParam {
                 ty: Ty::Int,
                 mutable: false,
+                cast_accept: false,
             }],
             ret: Box::new(Ty::Bool),
         };
@@ -2761,6 +2773,7 @@ mod tests {
             params: vec![TyFuncParam {
                 ty: Ty::Int,
                 mutable: true,
+                cast_accept: false,
             }],
             ret: Box::new(Ty::Bool),
         };
@@ -3045,6 +3058,7 @@ mod tests {
             params: vec![TyFuncParam {
                 ty: Ty::Int,
                 mutable: false,
+                cast_accept: false,
             }],
             ret: Box::new(Ty::Int),
         };
@@ -3052,6 +3066,7 @@ mod tests {
             params: vec![TyFuncParam {
                 ty: Ty::Int,
                 mutable: false,
+                cast_accept: false,
             }],
             ret: Box::new(ty_option(Ty::Int)),
         };

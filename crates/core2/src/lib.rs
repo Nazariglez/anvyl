@@ -27,6 +27,11 @@ pub const MODULES: &[SourceFile] = &[
         code: include_str!("range.anv"),
     },
     SourceFile {
+        path: &["collections"],
+        label: "crates/core2/src/collections.anv",
+        code: include_str!("collections.anv"),
+    },
+    SourceFile {
         path: &["core_int"],
         label: "crates/core2/src/core_int.anv",
         code: include_str!("core_int.anv"),
@@ -127,6 +132,7 @@ mod tests {
         assert!(ROOT.code.contains("pub import option { * };"));
         assert!(ROOT.code.contains("pub import result { * };"));
         assert!(ROOT.code.contains("pub import range { * };"));
+        assert!(ROOT.code.contains("pub import collections { * };"));
         assert!(!ROOT.code.contains("pub import core_int;"));
         assert!(!ROOT.code.contains("pub import core_float;"));
         assert!(!ROOT.code.contains("pub import core_string;"));
@@ -140,6 +146,7 @@ mod tests {
                 &["option"][..],
                 &["result"],
                 &["range"],
+                &["collections"],
                 &["core_int"],
                 &["core_float"],
                 &["core_string"]

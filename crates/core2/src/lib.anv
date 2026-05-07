@@ -4,3 +4,4 @@ pub import core_string { * };
 pub import option { * };
 pub import result { * };
 pub import range { * };
+pub import collections { * };

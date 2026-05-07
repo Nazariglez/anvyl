@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched
+
+enum Packet<T, N: int> {
+    Data([T; N]),
+}
+
+fn main() {
+    let _: Packet<int, 2> = Packet.Data([1, 2, 3]);
+}

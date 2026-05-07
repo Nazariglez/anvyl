@@ -107,6 +107,7 @@ impl ResolvedExternParam {
         FuncParam::new(
             self.ty.ty.clone(),
             matches!(self.flow, ParamFlow::MutBorrow),
+            false,
         )
     }
 }

@@ -9,6 +9,6 @@ enum Packet<T, N: int> {
 fn main() {
     let a = Packet.Data([1, 2, 3]);
     let b = Packet.Data<int>([4, 5]);
-    let _: Packet<int> = a;
-    let _: Packet<int> = b;
+    let _: Packet<int, 3> = a;
+    let _: Packet<int, 2> = b;
 }

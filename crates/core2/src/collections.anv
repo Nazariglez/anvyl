@@ -1,0 +1,9 @@
+pub extend<T> [T] {
+    fn push(var self, value: T) { }
+    fn for_each(var self, f: fn(var T) -> void) { }
+    fn sort_by(var self, compare: fn(T, T) -> bool) { }
+}
+
+pub extend<K, V> [K: V] {
+    fn insert(var self, key: K, value: V) { }
+}

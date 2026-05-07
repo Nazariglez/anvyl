@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: requires the target to be declared with 'var'
+// @contains: cannot assign to immutable value 'for_each'
 
 fn mutate(var x: int) {
     x *= 2;

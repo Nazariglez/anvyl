@@ -163,7 +163,7 @@ pub(crate) trait TypeFolder {
     }
 
     fn fold_func_param(&mut self, param: &FuncParam) -> FuncParam {
-        FuncParam::new(self.fold_type(&param.ty), param.mutable)
+        FuncParam::new(self.fold_type(&param.ty), param.mutable, param.cast_accept)
     }
 
     fn fold_generic_arg(&mut self, arg: &GenericArg) -> GenericArg {

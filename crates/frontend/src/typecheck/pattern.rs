@@ -116,6 +116,8 @@ impl<'tc> PatternChecker<'tc> {
                     *name,
                     expected_ty.clone(),
                     PlaceAccess::Mutable,
+                    None,
+                    false,
                     pattern.span,
                 );
                 if let Some(type_id) = self.tc.lookup(*name).map(|info| info.type_id) {
@@ -158,12 +160,25 @@ impl<'tc> PatternChecker<'tc> {
         }
     }
 
-    fn define_ident(&mut self, name: Ident, ty: Type, access: PlaceAccess, span: Span) {
-        if matches!(self.mode, PatternBindMode::Alias) && access != PlaceAccess::Mutable {
+    fn define_ident(
+        &mut self,
+        name: Ident,
+        ty: Type,
+        access: PlaceAccess,
+        facts: Option<PlaceUseFacts>,
+        accepts_extern_any: bool,
+        span: Span,
+    ) {
+        if matches!(self.mode, PatternBindMode::Alias) {
+            if !access.can_assign() {
+                self.tc
+                    .push_error(TypeError::VarPatternRequiresMutablePlace { span });
+            }
             self.tc
-                .push_error(TypeError::VarPatternRequiresMutablePlace { span });
+                .define_alias_binding(name, ty, access, facts, accepts_extern_any);
+        } else if let PatternBindMode::Owned { mutable } = self.mode {
+            self.tc.define_pattern_binding(name, ty, mutable);
         }
-        self.tc.define_pattern_binding(name, ty, self.mode);
     }
 
     fn check(
@@ -172,9 +187,27 @@ impl<'tc> PatternChecker<'tc> {
         expected: &Type,
         access: PlaceAccess,
     ) -> PatternOutcome {
+        self.check_with_facts(pattern, expected, access, None, false)
+    }
+
+    fn check_with_facts(
+        &mut self,
+        pattern: &PatternNode,
+        expected: &Type,
+        access: PlaceAccess,
+        facts: Option<PlaceUseFacts>,
+        accepts_extern_any: bool,
+    ) -> PatternOutcome {
         match &pattern.node {
             Pattern::Ident(name) => {
-                self.define_ident(*name, expected.clone(), access, pattern.span);
+                self.define_ident(
+                    *name,
+                    expected.clone(),
+                    access,
+                    facts,
+                    accepts_extern_any,
+                    pattern.span,
+                );
                 PatternOutcome::irrefutable(PatternCover::CatchAll)
             }
             Pattern::Wildcard => PatternOutcome::irrefutable(PatternCover::CatchAll),
@@ -191,9 +224,14 @@ impl<'tc> PatternChecker<'tc> {
                 PatternOutcome::error()
             }
             Pattern::Rest => self.unsupported_named("..", pattern.span),
-            Pattern::Struct { name, fields } => {
-                self.check_struct(*name, fields, pattern.span, expected, access)
-            }
+            Pattern::Struct { name, fields } => self.check_struct(
+                *name,
+                fields,
+                pattern.span,
+                expected,
+                access,
+                facts.as_ref(),
+            ),
             Pattern::EnumUnit { qualifier, variant } => {
                 self.check_enum_unit(Some(*qualifier), *variant, pattern.span, expected)
             }
@@ -388,6 +426,7 @@ impl<'tc> PatternChecker<'tc> {
         span: Span,
         expected: &Type,
         access: PlaceAccess,
+        facts: Option<&PlaceUseFacts>,
     ) -> PatternOutcome {
         let Some(key) = self.tc.resolve_visible_type_key(None, name) else {
             self.tc.push_error(TypeError::UnknownType {
@@ -419,7 +458,7 @@ impl<'tc> PatternChecker<'tc> {
                 } else {
                     nominal_type(&key)
                 };
-                self.check_struct_fields(fields, owner_ty, &agg.fields, access)
+                self.check_struct_fields(fields, owner_ty, &agg.fields, access, facts)
             }
             NominalKind::Extern => {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
@@ -441,7 +480,7 @@ impl<'tc> PatternChecker<'tc> {
                         )
                     })
                     .collect();
-                self.check_struct_fields(fields, nominal_type(&key), &field_schema, access)
+                self.check_struct_fields(fields, nominal_type(&key), &field_schema, access, facts)
             }
             NominalKind::Enum => self.unsupported_named("Struct", span),
         }
@@ -453,6 +492,7 @@ impl<'tc> PatternChecker<'tc> {
         owner_ty: Type,
         schema: &HashMap<Ident, FieldSchema>,
         access: PlaceAccess,
+        receiver_facts: Option<&PlaceUseFacts>,
     ) -> PatternOutcome {
         let owner = field_check::FieldOwner::Nominal(owner_ty.clone());
         let shape = self.check_field_shape(
@@ -484,7 +524,10 @@ impl<'tc> PatternChecker<'tc> {
                 .decls
                 .aggregate_field_type(&owner_ty, field.name)
                 .unwrap_or(field.ty);
-            let outcome = self.check(pattern, &field_ty, field_access);
+            let (facts, accepts_any) =
+                self.extern_field_alias_facts(&owner_ty, field.name, receiver_facts);
+            let outcome =
+                self.check_with_facts(pattern, &field_ty, field_access, facts, accepts_any);
             had_error |= outcome.had_error;
             refutability = combine_refutability(refutability, outcome.refutability);
         }
@@ -707,6 +750,24 @@ impl<'tc> PatternChecker<'tc> {
         expected: &Type,
     ) -> Option<GenericArgs> {
         resolved.owner_args_from_expected(expected, self.tc)
+    }
+
+    fn extern_field_alias_facts(
+        &self,
+        owner_ty: &Type,
+        field_name: Ident,
+        receiver_facts: Option<&PlaceUseFacts>,
+    ) -> (Option<PlaceUseFacts>, bool) {
+        let Some(owner) = self.tc.extern_type_id(owner_ty) else {
+            return (None, false);
+        };
+        let Some((field, decl)) = self.tc.extern_field(owner, field_name) else {
+            return (None, false);
+        };
+        (
+            Some(PlaceUseFacts::for_extern_field(receiver_facts, field)),
+            decl.ty.contains_any(),
+        )
     }
 
     fn record_extern_field_read(
