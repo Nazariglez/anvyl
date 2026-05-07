@@ -17,8 +17,8 @@ use crate::{
     lexer::SpannedToken,
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError, SourceFileId},
     typecheck::{
-        ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, MemberAccessKind,
-        ModuleScope, TypeError, TypeWarning, VariantShape,
+        ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, DeprecatedUseKind,
+        MemberAccessKind, ModuleScope, TypeError, TypeWarning, VariantShape,
     },
 };
 
@@ -1015,11 +1015,26 @@ fn render_internal_access(
     }
 }
 
-fn render_deprecated_access(kind: MemberAccessKind, name: Ident, reason: Option<&str>) -> String {
-    let kind = render_member_access_kind(kind);
+fn render_deprecated_access(kind: DeprecatedUseKind, name: Ident, reason: Option<&str>) -> String {
+    let kind = render_deprecated_use_kind(kind);
     match reason {
         Some(reason) => format!("use of deprecated {kind} '{name}': {reason}"),
         None => format!("use of deprecated {kind} '{name}'"),
+    }
+}
+
+fn render_deprecated_use_kind(kind: DeprecatedUseKind) -> &'static str {
+    match kind {
+        DeprecatedUseKind::Function => "function",
+        DeprecatedUseKind::ExternFunction => "extern function",
+        DeprecatedUseKind::Const => "const",
+        DeprecatedUseKind::ExternType => "extern type",
+        DeprecatedUseKind::Struct => "struct",
+        DeprecatedUseKind::DataRef => "dataref",
+        DeprecatedUseKind::Enum => "enum",
+        DeprecatedUseKind::EnumVariant => "variant",
+        DeprecatedUseKind::Field => "field",
+        DeprecatedUseKind::Method => "method",
     }
 }
 
@@ -1468,6 +1483,54 @@ mod tests {
                 "message contains debug artifact {artifact}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn renders_deprecated_warnings() {
+        let cases = [
+            (
+                DeprecatedUseKind::Function,
+                "use of deprecated function 'old'",
+            ),
+            (
+                DeprecatedUseKind::ExternFunction,
+                "use of deprecated extern function 'old'",
+            ),
+            (DeprecatedUseKind::Const, "use of deprecated const 'old'"),
+            (
+                DeprecatedUseKind::ExternType,
+                "use of deprecated extern type 'old'",
+            ),
+            (DeprecatedUseKind::Struct, "use of deprecated struct 'old'"),
+            (DeprecatedUseKind::Enum, "use of deprecated enum 'old'"),
+            (
+                DeprecatedUseKind::EnumVariant,
+                "use of deprecated variant 'old'",
+            ),
+            (DeprecatedUseKind::Field, "use of deprecated field 'old'"),
+            (DeprecatedUseKind::Method, "use of deprecated method 'old'"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_msg(
+                diagnose_type_warning(&TypeWarning::DeprecatedAccess {
+                    kind,
+                    name: ident("old"),
+                    reason: None,
+                    span: span(),
+                }),
+                expected,
+            );
+        }
+        assert_msg(
+            diagnose_type_warning(&TypeWarning::DeprecatedAccess {
+                kind: DeprecatedUseKind::DataRef,
+                name: ident("old"),
+                reason: Some("use new".to_string()),
+                span: span(),
+            }),
+            "use of deprecated dataref 'old': use new",
+        );
     }
 
     #[test]

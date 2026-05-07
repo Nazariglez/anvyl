@@ -1,15 +1,15 @@
 use super::support::{
-    TypecheckTestResult, assert_calls, assert_err, assert_err_count, assert_single_error,
-    assert_ty, assert_ty_mods, assert_ty_named, assert_typecheck_closed, check, check_named,
-    errors,
+    TypecheckTestResult, assert_calls, assert_deprecated_warning, assert_err, assert_err_count,
+    assert_single_error, assert_ty, assert_ty_mods, assert_ty_named, assert_typecheck_closed,
+    check, check_named, errors,
 };
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
-        CallTarget, GenericArgs, MemberAccessKind, TypeError, VariantShape,
+        CallTarget, DeprecatedUseKind, GenericArgs, MemberAccessKind, TypeError, VariantShape,
         decls::{
             CallableId, DeclError, ExtendId, MethodKey, MethodSurface, ModuleScope, NominalKey,
-            VariantSchema,
+            VariantPayload, VariantSchema,
         },
     },
 };
@@ -356,13 +356,95 @@ mod enum_schemas {
         assert!(enm.generics.const_params.is_empty());
         assert!(matches!(
             enm.variants.get(&Ident::new("Some")),
-            Some(VariantSchema::Tuple(types)) if types.as_slice() == [Type::Var(t)]
+            Some(VariantSchema { payload: VariantPayload::Tuple(types), .. }) if types.as_slice() == [Type::Var(t)]
         ));
         assert!(matches!(
             enm.variants.get(&Ident::new("None")),
-            Some(VariantSchema::Unit)
+            Some(VariantSchema {
+                payload: VariantPayload::Unit,
+                ..
+            })
         ));
     }
+}
+
+#[test]
+fn enum_and_variant_deprecation_warns_once() {
+    let result = check(
+        "@deprecated(\"use NewStatus\") enum Status { Active, @deprecated(\"use Active\") Disabled }
+         fn main() { let _ = Status.Disabled; }",
+    )
+    .unwrap();
+    assert_deprecated_warning(
+        &result,
+        DeprecatedUseKind::EnumVariant,
+        "Disabled",
+        Some("use Active"),
+    );
+}
+
+#[test]
+fn deprecated_const_read_warns() {
+    let result = check(
+        "@deprecated(\"use NEW\") const OLD: int = 1;
+         fn main() { let _ = OLD; }",
+    )
+    .unwrap();
+
+    assert_deprecated_warning(&result, DeprecatedUseKind::Const, "OLD", Some("use NEW"));
+}
+
+#[test]
+fn inherent_method_hides_deprecated_extend_warning() {
+    let result = check_named(
+        "import lib { Box }; import ext { * };
+         fn main() {
+             let b = Box { value: 1 };
+             let _ = b.get();
+         }",
+        &[
+            (
+                "lib",
+                "pub struct Box {
+                    value: int,
+                    fn get(self) -> int { self.value }
+                 }",
+            ),
+            (
+                "ext",
+                "import lib { Box };
+                 pub extend Box {
+                     @deprecated(\"use Box.get\")
+                     fn get(self) -> int { 0 }
+                 }",
+            ),
+        ],
+    )
+    .unwrap();
+
+    assert!(result.warnings().is_empty());
+}
+
+#[test]
+fn qualified_extend_method_deprecation_warns() {
+    let result = check_named(
+        "import ext;
+         fn main() { let _ = ext.old_double(1); }",
+        &[(
+            "ext",
+            "pub extend int {
+                @deprecated(\"use double\")
+                fn old_double(self) -> int { self + self }
+             }",
+        )],
+    )
+    .unwrap();
+    assert_deprecated_warning(
+        &result,
+        DeprecatedUseKind::Method,
+        "old_double",
+        Some("use double"),
+    );
 }
 
 mod method_schemas {
@@ -1403,6 +1485,26 @@ mod enum_variants {
     #[test]
     fn unknown_enum_variant() {
         assert_err("enum Color { Red } fn main() { Color.Blue; }");
+    }
+
+    #[test]
+    fn inferred_struct_variant_missing_field() {
+        assert_single_error(
+            "enum Event { Move { x: int } } fn main() { let _: Event = .Move {}; }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::MissingVariantField {
+                        enum_name,
+                        variant,
+                        field,
+                        ..
+                    } if *enum_name == Ident::new("Event")
+                        && *variant == Ident::new("Move")
+                        && *field == Ident::new("x")
+                )
+            },
+        );
     }
 
     #[test]

@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use NEW_LIMIT
+
+@deprecated("use NEW_LIMIT")
+const OLD_LIMIT: int = 100;
+
+fn main() {
+    let _ = OLD_LIMIT;
+}

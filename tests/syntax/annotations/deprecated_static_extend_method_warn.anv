@@ -1,0 +1,15 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use make
+
+struct Box<T> { value: T }
+
+extend<T> Box<T> {
+    @deprecated("use make")
+    fn old_make(value: T) -> Box<T> { Box { value } }
+}
+
+fn main() {
+    let _: Box<int> = Box.old_make(1);
+}

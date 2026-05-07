@@ -1,0 +1,15 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use label
+
+struct Item {
+    name: string,
+    @deprecated("use label")
+    old_name: string,
+}
+
+fn main() {
+    let i = Item { name: "n", old_name: "o" };
+    println(i.old_name);
+}

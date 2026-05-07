@@ -1,0 +1,13 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use Move2
+
+enum Event {
+    @deprecated("use Move2")
+    Move { dx: int },
+}
+
+fn main() {
+    let _ = Event.Move { dx: 1 };
+}

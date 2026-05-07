@@ -70,6 +70,15 @@ pub(crate) enum MemberAccessKind {
     Method,
 }
 
+impl From<MemberAccessKind> for DeprecatedUseKind {
+    fn from(kind: MemberAccessKind) -> Self {
+        match kind {
+            MemberAccessKind::Field => Self::Field,
+            MemberAccessKind::Method => Self::Method,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TypecheckConfig {
     pub(crate) lint: LintConfig,
@@ -98,10 +107,24 @@ impl GenericParamKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeprecatedUseKind {
+    Function,
+    ExternFunction,
+    Const,
+    ExternType,
+    Struct,
+    DataRef,
+    Enum,
+    EnumVariant,
+    Field,
+    Method,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TypeWarning {
     DeprecatedAccess {
-        kind: MemberAccessKind,
+        kind: DeprecatedUseKind,
         name: Ident,
         reason: Option<String>,
         span: Span,
@@ -1046,6 +1069,101 @@ impl TypeChecker {
         }
     }
 
+    fn check_matched_field_access_policy(
+        &mut self,
+        owner: &field_check::FieldOwner,
+        name: Ident,
+        policy: &annotation::AccessPolicy,
+        span: Span,
+    ) {
+        match owner {
+            field_check::FieldOwner::Nominal(owner_ty) => {
+                if let Some(key) = self.decls.key_for_type(owner_ty) {
+                    self.check_access_policy(
+                        policy,
+                        MemberAccessKind::Field,
+                        name,
+                        owner_ty,
+                        &key.module,
+                        span,
+                    );
+                }
+            }
+            field_check::FieldOwner::Variant { key, .. } => {
+                self.check_access_policy(
+                    policy,
+                    MemberAccessKind::Field,
+                    name,
+                    &nominal_type(key),
+                    &key.module,
+                    span,
+                );
+            }
+        }
+    }
+
+    fn warn_named_value_deprecated(&mut self, value: &ValueDecl, name: Ident, span: Span) {
+        match value {
+            ValueDecl::Func(sig) => match sig.kind {
+                CallableKind::Function => {
+                    self.warn_deprecated(&sig.policy, DeprecatedUseKind::Function, name, span);
+                }
+                CallableKind::ExternFunction => {
+                    self.warn_deprecated(
+                        &sig.policy,
+                        DeprecatedUseKind::ExternFunction,
+                        name,
+                        span,
+                    );
+                }
+                CallableKind::StaticMethod
+                | CallableKind::InstanceMethod
+                | CallableKind::ExtendMethod(_)
+                | CallableKind::EnumVariant => {}
+            },
+            ValueDecl::Const(sig) => {
+                self.warn_deprecated(&sig.policy, DeprecatedUseKind::Const, name, span);
+            }
+        }
+    }
+
+    fn warn_named_const_deprecated(&mut self, name: Ident, span: Span) {
+        let Some((_, _, ValueDecl::Const(sig))) = self.lookup_named_value(name) else {
+            return;
+        };
+        self.warn_deprecated(&sig.policy, DeprecatedUseKind::Const, name, span);
+    }
+
+    fn warn_extern_type_deprecated(&mut self, key: &NominalKey, span: Span) {
+        if key.kind != NominalKind::Extern {
+            return;
+        }
+        let reason = match self.decls.extern_type_policy(key) {
+            Some(policy) if policy.has_deprecated() => {
+                policy.deprecated_reason().map(str::to_string)
+            }
+            _ => return,
+        };
+        self.push_warning(TypeWarning::DeprecatedAccess {
+            kind: DeprecatedUseKind::ExternType,
+            name: key.name,
+            reason,
+            span,
+        });
+    }
+
+    fn warn_deprecated(
+        &mut self,
+        policy: &annotation::AccessPolicy,
+        kind: DeprecatedUseKind,
+        name: Ident,
+        span: Span,
+    ) {
+        if let Some(warning) = deprecated_access_warning(policy, kind, name, span) {
+            self.push_warning(warning);
+        }
+    }
+
     fn optional_chain_inner_type(&mut self, ty: &Type, span: Span) -> Type {
         if matches!(ty, Type::Infer) {
             return Type::Infer;
@@ -1073,40 +1191,20 @@ impl TypeChecker {
         origin: &ModuleScope,
         span: Span,
     ) {
-        if policy.has_deprecated() {
-            self.push_warning(TypeWarning::DeprecatedAccess {
-                kind,
-                name,
-                reason: policy.deprecated_reason().map(str::to_string),
-                span,
-            });
-        }
-
-        if !policy.has_internal() {
-            return;
-        }
-        if origin == &self.current_module || self.config.lint.internal_access == LintLevel::Allow {
-            return;
-        }
-
-        let reason = policy.internal_reason().map(str::to_string);
-        match self.config.lint.internal_access {
-            LintLevel::Allow => unreachable!("allow returned before diagnostic emission"),
-            LintLevel::Warn => self.push_warning(TypeWarning::InternalAccess {
-                kind,
-                name,
-                owner: owner.clone(),
-                reason,
-                span,
-            }),
-            LintLevel::Error => self.push_error(TypeError::InternalAccess {
-                kind,
-                name,
-                owner: owner.clone(),
-                reason,
-                span,
-            }),
-        }
+        emit_access_policy(
+            policy,
+            kind,
+            name,
+            owner,
+            origin,
+            span,
+            &mut AccessPolicyOutput {
+                current_module: &self.current_module,
+                config: &self.config,
+                warnings: &mut self.warnings,
+                errors: &mut self.errors,
+            },
+        );
     }
 
     fn push_error_once(&mut self, err: TypeError) {
@@ -1260,12 +1358,16 @@ impl TypeChecker {
         (value.module, value.name, value.decl)
     }
 
-    fn imports_module(&self, imported: &ModuleScope) -> bool {
-        self.decls.imports_module(&self.current_module, imported)
+    fn extend_visible(&self, origin: &ModuleScope) -> bool {
+        Self::extend_visible_in(&self.decls, &self.current_module, origin)
     }
 
-    fn extend_visible(&self, origin: &ModuleScope) -> bool {
-        origin == &self.current_module || self.imports_module(origin)
+    fn extend_visible_in(
+        decls: &DeclarationIndex,
+        current_module: &ModuleScope,
+        origin: &ModuleScope,
+    ) -> bool {
+        origin == current_module || decls.imports_module(current_module, origin)
     }
 
     fn find_extend_method(&self, receiver: &Type, name: Ident) -> Option<ExtendMethodMatch<'_>> {
@@ -1353,25 +1455,39 @@ impl TypeChecker {
     }
 
     fn eval_const_term(&mut self, term: ConstTerm, span: Span) -> Option<ConstTerm> {
+        self.eval_const_term_inner(term, span, true)
+    }
+
+    fn eval_const_term_inner(
+        &mut self,
+        term: ConstTerm,
+        span: Span,
+        warn_deprecated: bool,
+    ) -> Option<ConstTerm> {
         match term {
             ConstTerm::Value(_) => Some(term),
-            ConstTerm::Name(name) => match self.eval_visible_const(name, span) {
-                Some(Ok(value)) => Some(ConstTerm::Value(value)),
-                Some(Err(err)) => {
-                    self.push_error(err);
-                    None
+            ConstTerm::Name(name) => {
+                if warn_deprecated {
+                    self.warn_named_const_deprecated(name, span);
                 }
-                None => {
-                    self.push_error_once(TypeError::UnknownConst { name, span });
-                    None
+                match self.eval_visible_const(name, span) {
+                    Some(Ok(value)) => Some(ConstTerm::Value(value)),
+                    Some(Err(err)) => {
+                        self.push_error(err);
+                        None
+                    }
+                    None => {
+                        self.push_error_once(TypeError::UnknownConst { name, span });
+                        None
+                    }
                 }
-            },
+            }
             ConstTerm::Param(id) => match self
                 .const_substs
                 .last()
                 .and_then(|subst| subst.get(&id).cloned())
             {
-                Some(term) => self.eval_const_term(term, span),
+                Some(term) => self.eval_const_term_inner(term, span, warn_deprecated),
                 None => Some(ConstTerm::Param(id)),
             },
             ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
@@ -1379,7 +1495,16 @@ impl TypeChecker {
     }
 
     fn require_usize_const(&mut self, term: ConstTerm, span: Span) -> Option<usize> {
-        match self.eval_const_term(term, span)? {
+        self.require_usize_const_inner(term, span, true)
+    }
+
+    fn require_usize_const_inner(
+        &mut self,
+        term: ConstTerm,
+        span: Span,
+        warn_deprecated: bool,
+    ) -> Option<usize> {
+        match self.eval_const_term_inner(term, span, warn_deprecated)? {
             ConstTerm::Value(value) => match const_eval::const_usize(&value, span) {
                 Ok(value) => Some(value),
                 Err(err) => {
@@ -1463,11 +1588,13 @@ impl TypeChecker {
             .resolve_visible_type_key(&self.current_module, qualifier, name)
     }
 
-    fn visible_type_subject(&self, name: Ident) -> Option<Type> {
-        self.substituted_type_param(name).or_else(|| {
-            self.resolve_visible_type_key(None, name)
-                .map(|key| nominal_type(&key))
-        })
+    fn visible_type_subject(&mut self, name: Ident, span: Span) -> Option<Type> {
+        if let Some(ty) = self.substituted_type_param(name) {
+            return Some(ty);
+        }
+        let key = self.resolve_visible_type_key(None, name)?;
+        self.warn_extern_type_deprecated(&key, span);
+        Some(nominal_type(&key))
     }
 
     fn func_type_from_sig(&mut self, params: &[Param], ret: &Type) -> Type {
@@ -1558,6 +1685,7 @@ impl TypeChecker {
                 let Some(key) = self.decls.key_for_type(ty) else {
                     return;
                 };
+                self.warn_extern_type_deprecated(&key, span);
                 let Some(generics) = self.nominal_generics(&key) else {
                     return;
                 };
@@ -1701,7 +1829,7 @@ impl TypeChecker {
     ) {
         let error_count = self.errors.len();
         for term in &args.const_args {
-            self.require_usize_const(term.clone(), span);
+            self.require_usize_const_inner(term.clone(), span, false);
         }
         if self.errors.len() != error_count {
             return;
@@ -1719,14 +1847,14 @@ impl TypeChecker {
                 if let Some(variants) = decls.enum_schema(key).map(|schema| schema.variants.clone())
                 {
                     for variant in variants.values() {
-                        match variant {
-                            VariantSchema::Unit => {}
-                            VariantSchema::Tuple(params) => {
+                        match &variant.payload {
+                            VariantPayload::Unit => {}
+                            VariantPayload::Tuple(params) => {
                                 for param in params {
                                     self.substitute_checked(param, &type_subst, &const_subst, span);
                                 }
                             }
-                            VariantSchema::Struct(fields) => {
+                            VariantPayload::Struct(fields) => {
                                 for field in fields.values() {
                                     self.substitute_checked(
                                         &field.ty,
@@ -1752,6 +1880,71 @@ fn map_key_type_error(decls: &DeclarationIndex, ty: &Type, span: Span) -> Option
         field: err.field,
         span,
     })
+}
+
+fn deprecated_access_warning(
+    policy: &annotation::AccessPolicy,
+    kind: DeprecatedUseKind,
+    name: Ident,
+    span: Span,
+) -> Option<TypeWarning> {
+    policy
+        .has_deprecated()
+        .then(|| TypeWarning::DeprecatedAccess {
+            kind,
+            name,
+            reason: policy.deprecated_reason().map(str::to_string),
+            span,
+        })
+}
+
+struct AccessPolicyOutput<'a> {
+    current_module: &'a ModuleScope,
+    config: &'a TypecheckConfig,
+    warnings: &'a mut Vec<TypeWarning>,
+    errors: &'a mut Vec<TypeError>,
+}
+
+fn emit_access_policy(
+    policy: &annotation::AccessPolicy,
+    kind: MemberAccessKind,
+    name: Ident,
+    owner: &Type,
+    origin: &ModuleScope,
+    span: Span,
+    out: &mut AccessPolicyOutput<'_>,
+) {
+    if let Some(warning) =
+        deprecated_access_warning(policy, DeprecatedUseKind::from(kind), name, span)
+    {
+        out.warnings.push(warning);
+    }
+
+    if !policy.has_internal()
+        || origin == out.current_module
+        || out.config.lint.internal_access == LintLevel::Allow
+    {
+        return;
+    }
+
+    let reason = policy.internal_reason().map(str::to_string);
+    match out.config.lint.internal_access {
+        LintLevel::Allow => unreachable!("allow returned before diagnostic emission"),
+        LintLevel::Warn => out.warnings.push(TypeWarning::InternalAccess {
+            kind,
+            name,
+            owner: owner.clone(),
+            reason,
+            span,
+        }),
+        LintLevel::Error => out.errors.push(TypeError::InternalAccess {
+            kind,
+            name,
+            owner: owner.clone(),
+            reason,
+            span,
+        }),
+    }
 }
 
 pub(crate) fn check_with_modules(
@@ -1784,7 +1977,7 @@ fn typechecker_for_modules(
     let mut tc = TypeChecker::new(decls, catalog, config);
     let root_scope = ModuleScope::from_module_id(&resolved.root);
     tc.current_module = root_scope.clone();
-    tc.collect_const_decls(root_scope.clone(), program);
+    tc.collect_const_decls(&root_scope, program);
     collect_callable_templates(root_scope.clone(), program, &mut tc);
 
     let mut module_bodies = vec![];
@@ -1797,7 +1990,7 @@ fn typechecker_for_modules(
             let program = Rc::new(module.program.clone());
             tc.module_programs
                 .insert(scope.clone(), Rc::clone(&program));
-            tc.collect_const_decls(scope.clone(), program.as_ref());
+            tc.collect_const_decls(&scope, program.as_ref());
             collect_callable_templates(scope.clone(), program.as_ref(), &mut tc);
             module_bodies.push((scope, program));
         }
@@ -2309,7 +2502,7 @@ fn check_aggregate_field_defaults(
         {
             continue;
         }
-        if let Err(error) = tc.eval_const_expr(default) {
+        if let Err(error) = tc.eval_const_expr(default, false) {
             tc.push_error(error);
         }
     }
@@ -2652,7 +2845,7 @@ fn check_param_default_values(params: &[Param], param_types: &[FuncParam], tc: &
         let expected = tc.type_handle(&param_ty.ty);
         match validate_const_expr_type(default, Some(expected), tc) {
             Ok(_) => {
-                if let Err(error) = tc.eval_const_expr(default) {
+                if let Err(error) = tc.eval_const_expr(default, false) {
                     tc.push_error(error);
                 }
             }
@@ -2982,7 +3175,7 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
 
 fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
     let c = &const_node.node;
-    let value = match tc.eval_const_expr(&c.value) {
+    let value = match tc.eval_const_expr(&c.value, true) {
         Ok(value) => value,
         Err(err) => {
             tc.push_error(err);
@@ -3207,6 +3400,9 @@ fn check_expr_checked_with_hint(
         }
         ExprKind::Ident(name) => match tc.lookup(*name).cloned() {
             Some(info) => {
+                if let Some((_, value_name, value)) = tc.lookup_named_value(*name) {
+                    tc.warn_named_value_deprecated(&value, value_name, expr.span);
+                }
                 let fallback = tc.solver.local_type_to_type(info.type_id);
                 if fallback != Type::Infer || info.const_value.is_some() {
                     checked_from_handle(expr, tc.local_handle(info.type_id), tc)
@@ -3224,7 +3420,11 @@ fn check_expr_checked_with_hint(
                 }
             }
             None => {
-                if let Some((module, value_name, value)) = tc.lookup_named_value(*name)
+                let named_value = tc.lookup_named_value(*name);
+                if let Some((_, value_name, value)) = &named_value {
+                    tc.warn_named_value_deprecated(value, *value_name, expr.span);
+                }
+                if let Some((module, value_name, value)) = named_value
                     && let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
                         module,
                         name: value_name,
@@ -3244,7 +3444,7 @@ fn check_expr_checked_with_hint(
                         None => match tc.lookup_imported_value(*name) {
                             Some(ty) => ty,
                             None => {
-                                if let Some(ty) = tc.visible_type_subject(*name) {
+                                if let Some(ty) = tc.visible_type_subject(*name, expr.span) {
                                     tc.push_error(TypeError::TypeUsedAsValue {
                                         ty,
                                         span: expr.span,
@@ -4211,7 +4411,7 @@ fn check_array_fill_hint(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let len = match tc.eval_const_expr(&fill.node.len) {
+    let len = match tc.eval_const_expr(&fill.node.len, true) {
         Ok(const_value) => match const_eval::const_usize(&const_value, fill.node.len.span) {
             Ok(len) => ArrayLen::Fixed(len),
             Err(err) => {
@@ -4570,6 +4770,12 @@ fn check_struct_lit_hint(
         .aggregate(&key)
         .expect("aggregate exists for resolved key")
         .clone();
+    let kind = match key.kind {
+        NominalKind::Struct => DeprecatedUseKind::Struct,
+        NominalKind::DataRef => DeprecatedUseKind::DataRef,
+        NominalKind::Enum | NominalKind::Extern => unreachable!("aggregate key checked above"),
+    };
+    tc.warn_deprecated(&agg.policy, kind, key.name, lit.span);
     let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
     let Some(inf) = NominalLiteralSolver::new(&agg.generics, &lit.node.generic_args, lit.span, tc)
     else {
@@ -4608,11 +4814,11 @@ fn check_enum_struct_variant_lit(
     let key = tc
         .resolve_visible_type_key(None, qualifier)
         .filter(|key| key.kind == NominalKind::Enum)?;
-    let Some(resolved) = enum_variant::resolve_member(tc, &key, lit.node.name, lit.span) else {
+    let Some(resolved) = enum_variant::resolve_use(tc, &key, lit.node.name, lit.span) else {
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return Some(checked_from_type(expr, Type::Infer, tc));
     };
-    let VariantSchema::Struct(fields) = &resolved.schema else {
+    let VariantPayload::Struct(fields) = &resolved.schema.payload else {
         enum_variant::push_shape_mismatch(tc, &resolved, VariantShape::Struct, lit.span);
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return Some(checked_from_type(expr, Type::Infer, tc));
@@ -4813,19 +5019,15 @@ fn check_inferred_enum_hint(
         return cannot_infer_inferred_enum(expr, node, tc);
     };
 
-    let Some(schema) = tc.decls.enum_schema(&key) else {
+    if tc.decls.enum_schema(&key).is_none() {
         return checked_from_type(expr, Type::Infer, tc);
-    };
-    let generics = schema.generics.clone();
-    let Some(variant) = schema.variants.get(&node.node.variant).cloned() else {
-        tc.push_error(TypeError::UnknownEnumVariant {
-            enum_name: key.name,
-            variant: node.node.variant,
-            span: node.span,
-        });
+    }
+    let Some(resolved) = enum_variant::resolve_use(tc, &key, node.node.variant, node.span) else {
         check_inferred_enum_args(&node.node.args, tc);
         return checked_from_type(expr, Type::Infer, tc);
     };
+    let generics = resolved.generics.clone();
+    let variant = resolved.schema;
 
     let inf = NominalLiteralSolver::without_args(&generics, node.span, tc);
     if !inf.bind_expected(&key, &generics, Some(&expected_ty), node.span, tc) {
@@ -4834,12 +5036,12 @@ fn check_inferred_enum_hint(
     }
 
     let mut contains_extern_any = false;
-    match (&variant, &node.node.args) {
-        (VariantSchema::Unit, InferredEnumArgs::Unit) => {}
-        (VariantSchema::Unit, args) => {
+    match (&variant.payload, &node.node.args) {
+        (VariantPayload::Unit, InferredEnumArgs::Unit) => {}
+        (VariantPayload::Unit, args) => {
             return wrong_inferred_enum_args(expr, node, 0, args, tc);
         }
-        (VariantSchema::Tuple(params), InferredEnumArgs::Tuple(args)) => {
+        (VariantPayload::Tuple(params), InferredEnumArgs::Tuple(args)) => {
             if params.len() != args.len() {
                 enum_variant::push_arg_count_mismatch(
                     tc,
@@ -4863,18 +5065,25 @@ fn check_inferred_enum_hint(
                 return checked_from_type(expr, Type::Infer, tc);
             }
         }
-        (VariantSchema::Tuple(params), args) => {
+        (VariantPayload::Tuple(params), args) => {
             return wrong_inferred_enum_args(expr, node, params.len(), args, tc);
         }
-        (VariantSchema::Struct(fields), InferredEnumArgs::Struct(args)) => {
-            let field_check =
-                check_nominal_fields(args, fields, expected_ty.clone(), node.span, &inf, tc);
+        (VariantPayload::Struct(fields), InferredEnumArgs::Struct(args)) => {
+            let field_check = check_variant_literal_fields(
+                args,
+                fields,
+                &key,
+                node.node.variant,
+                node.span,
+                &inf,
+                tc,
+            );
             contains_extern_any |= field_check.contains_extern_any;
             if field_check.failed || inf.finalize(&key, &generics, node.span, tc).is_none() {
                 return checked_from_type(expr, Type::Infer, tc);
             }
         }
-        (VariantSchema::Struct(fields), args) => {
+        (VariantPayload::Struct(fields), args) => {
             return wrong_inferred_enum_args(expr, node, fields.len(), args, tc);
         }
     }
@@ -4948,7 +5157,7 @@ fn check_variant_literal_fields(
         fields,
         schema,
         field_check::FieldOwner::Variant {
-            enum_name: key.name,
+            key: key.clone(),
             variant,
         },
         field_check::MissingFields::AllowDefaults,
@@ -4993,9 +5202,7 @@ fn check_expr_fields(
     };
     for field in shape.fields {
         let value = &fields[field.index].1;
-        if let field_check::FieldOwner::Nominal(owner_ty) = &owner {
-            tc.check_field_access_policy(owner_ty, field.name, value.span);
-        }
+        tc.check_matched_field_access_policy(&owner, field.name, &field.policy, value.span);
         let hint = inf.instantiate(&field.ty, tc);
         let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
         check.contains_extern_any |= checked.contains_extern_any;

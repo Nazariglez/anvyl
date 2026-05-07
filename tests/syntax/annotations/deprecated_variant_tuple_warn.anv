@@ -1,0 +1,13 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use Data2
+
+enum Message {
+    @deprecated("use Data2")
+    Data(int),
+}
+
+fn main() {
+    let _ = Message.Data(1);
+}

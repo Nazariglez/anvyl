@@ -1,17 +1,21 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{ExprId, Type},
+    ast::{ExprId, Ident, Type},
     externs::{self, RawExterns, catalog::ExternCatalog},
     span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
-    typecheck::{self, CallMap, ExternUseMap, TypeError, decls::DeclarationIndex},
+    typecheck::{
+        self, CallMap, DeprecatedUseKind, ExternUseMap, TypeError, TypeWarning,
+        decls::DeclarationIndex,
+    },
 };
 
 pub(crate) struct TypecheckTestResult {
     types: HashMap<ExprId, (Span, Type)>,
     calls: CallMap,
     extern_uses: ExternUseMap,
+    warnings: Vec<TypeWarning>,
     decls: DeclarationIndex,
     externs: ExternCatalog,
 }
@@ -29,6 +33,10 @@ impl TypecheckTestResult {
         &self.extern_uses
     }
 
+    pub(crate) fn warnings(&self) -> &[TypeWarning] {
+        &self.warnings
+    }
+
     pub(crate) fn decls(&self) -> &DeclarationIndex {
         &self.decls
     }
@@ -36,6 +44,27 @@ impl TypecheckTestResult {
     pub(crate) fn externs(&self) -> &ExternCatalog {
         &self.externs
     }
+}
+
+pub(crate) fn assert_deprecated_warning(
+    result: &TypecheckTestResult,
+    kind: DeprecatedUseKind,
+    name: &str,
+    reason: Option<&str>,
+) {
+    let warnings = result.warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(matches!(
+        &warnings[0],
+        TypeWarning::DeprecatedAccess {
+            kind: warning_kind,
+            name: warning_name,
+            reason: warning_reason,
+            ..
+        } if *warning_kind == kind
+            && *warning_name == Ident::new(name)
+            && warning_reason.as_deref() == reason
+    ));
 }
 
 pub(crate) fn assert_typecheck_closed(result: &TypecheckTestResult) {
@@ -105,6 +134,7 @@ pub(crate) fn check_with_raw_externs(
         types,
         calls: tc.calls,
         extern_uses: tc.extern_uses,
+        warnings: tc.warnings,
         decls: tc.decls,
         externs: tc.externs,
     })

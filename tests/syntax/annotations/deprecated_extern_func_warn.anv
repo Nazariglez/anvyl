@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use host_new
+
+@deprecated("use host_new")
+extern fn host_old(x: int) -> int;
+
+fn main() {
+    let _: int = host_old(1);
+}

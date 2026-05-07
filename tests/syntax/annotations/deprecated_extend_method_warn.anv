@@ -1,0 +1,16 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use double
+
+struct Item { value: int }
+
+extend Item {
+    @deprecated("use double")
+    fn old_double(self) -> int { self.value + self.value }
+}
+
+fn main() {
+    let i = Item { value: 2 };
+    let _ = i.old_double();
+}

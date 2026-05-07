@@ -15,7 +15,9 @@ use crate::{
         ImportItemKind, ImportKind, MethodReceiver, ModuleOrigin, Mutability, NominalKind, Param,
         Program, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
-    externs::{RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope},
+    externs::{
+        ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
+    },
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveResult, SourceFileId},
     span::Span,
     typecheck::annotation::AccessPolicy,
@@ -406,9 +408,16 @@ pub(crate) struct DeclarationIndex {
     aggregates: HashMap<NominalKey, AggregateSchema>,
     enums: HashMap<NominalKey, EnumSchema>,
     extends: Vec<ExtendSchema>,
+    extern_type_policies: HashMap<NominalKey, AccessPolicy>,
     value_spans: HashMap<(ModuleScope, Ident), Span>,
     type_spans: HashMap<NominalKey, Span>,
     errors: Vec<DeclError>,
+}
+
+#[derive(Default)]
+struct SourceExternPolicies {
+    funcs: HashMap<(ModuleScope, Ident), AccessPolicy>,
+    types: HashMap<(ModuleScope, Ident), AccessPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,7 +516,7 @@ pub(crate) struct ModuleDecls {
 #[derive(Debug, Clone)]
 pub(crate) enum ValueDecl {
     Func(FuncSig),
-    Const(Type),
+    Const(ConstSig),
 }
 
 impl Namespace {
@@ -861,7 +870,7 @@ impl ValueDecl {
     pub(crate) fn ty(&self) -> &Type {
         match self {
             ValueDecl::Func(sig) => &sig.ty,
-            ValueDecl::Const(ty) => ty,
+            ValueDecl::Const(sig) => &sig.ty,
         }
     }
 }
@@ -872,6 +881,13 @@ pub(crate) struct FuncSig {
     pub(crate) generics: GenericParams,
     pub(crate) ty: Type,
     pub(crate) required_params: usize,
+    pub(crate) policy: AccessPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConstSig {
+    pub(crate) ty: Type,
+    pub(crate) policy: AccessPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -902,6 +918,7 @@ pub(crate) struct AggregateSchema {
     pub(crate) generics: GenericParams,
     pub(crate) fields: HashMap<Ident, FieldSchema>,
     pub(crate) methods: HashMap<MethodKey, MethodSchema>,
+    pub(crate) policy: AccessPolicy,
 }
 
 #[derive(Clone)]
@@ -925,10 +942,17 @@ pub(crate) struct MethodSchema {
 pub(crate) struct EnumSchema {
     pub(crate) generics: GenericParams,
     pub(crate) variants: HashMap<Ident, VariantSchema>,
+    pub(crate) policy: AccessPolicy,
 }
 
 #[derive(Clone)]
-pub(crate) enum VariantSchema {
+pub(crate) struct VariantSchema {
+    pub(crate) policy: AccessPolicy,
+    pub(crate) payload: VariantPayload,
+}
+
+#[derive(Clone)]
+pub(crate) enum VariantPayload {
     Unit,
     Tuple(Vec<Type>),
     Struct(HashMap<Ident, FieldSchema>),
@@ -985,14 +1009,16 @@ impl DeclarationIndex {
     ) -> Self {
         let mut index = Self::default();
         let modules = Self::module_programs(root, resolved);
+        let mut source_extern_policies = SourceExternPolicies::default();
         for (scope, program) in &modules {
             index.collect_module(
                 program,
                 scope.clone(),
                 Self::is_export_all_scope(scope, resolved),
+                &mut source_extern_policies,
             );
         }
-        index.collect_extern_headers(externs);
+        index.collect_extern_headers(externs, &source_extern_policies);
         index.apply_public_import_reexports(&modules, resolved);
         index.close_exported_active_modules();
         index.build_import_scopes(&modules, resolved);
@@ -1122,9 +1148,9 @@ impl DeclarationIndex {
                 &mut errors,
             );
             for variant in schema.variants.values_mut() {
-                match variant {
-                    VariantSchema::Unit => {}
-                    VariantSchema::Tuple(types) => {
+                match &mut variant.payload {
+                    VariantPayload::Unit => {}
+                    VariantPayload::Tuple(types) => {
                         for ty in types {
                             let site = DeclTypeSite {
                                 module: key.module.clone(),
@@ -1134,7 +1160,7 @@ impl DeclarationIndex {
                             *ty = f(site, ty.clone());
                         }
                     }
-                    VariantSchema::Struct(fields) => {
+                    VariantPayload::Struct(fields) => {
                         for field in fields.values_mut() {
                             let site = DeclTypeSite {
                                 module: key.module.clone(),
@@ -1220,7 +1246,7 @@ impl DeclarationIndex {
                 match &mut value.decl {
                     ValueDecl::Func(sig) if sig.kind == CallableKind::ExternFunction => {}
                     ValueDecl::Func(sig) => sig.ty = f(site, sig.ty.clone()),
-                    ValueDecl::Const(ty) => *ty = f(site, ty.clone()),
+                    ValueDecl::Const(sig) => sig.ty = f(site, sig.ty.clone()),
                 }
             }
         }
@@ -1296,7 +1322,13 @@ impl DeclarationIndex {
         true
     }
 
-    fn collect_module(&mut self, program: &Program, scope: ModuleScope, export_all: bool) {
+    fn collect_module(
+        &mut self,
+        program: &Program,
+        scope: ModuleScope,
+        export_all: bool,
+        source_extern_policies: &mut SourceExternPolicies,
+    ) {
         let mut decls = ModuleDecls::default();
         let mut extend_index = 0;
 
@@ -1305,7 +1337,7 @@ impl DeclarationIndex {
             match &stmt.node {
                 Stmt::Func(func_node) => {
                     let func = &func_node.node;
-                    annotation::normalize_annotations(
+                    let policy = annotation::normalize_annotations(
                         &func.annotations,
                         annotation::AnnotationTarget::Func,
                         &mut self.errors,
@@ -1319,6 +1351,7 @@ impl DeclarationIndex {
                             generics: generic_params(&func.type_params, &func.const_params),
                             ty,
                             required_params: required_param_count(&func.params),
+                            policy,
                         }),
                     };
                     self.insert_local_value(
@@ -1341,7 +1374,11 @@ impl DeclarationIndex {
                         AggregateKind::Struct => annotation::AnnotationTarget::Struct,
                         AggregateKind::DataRef => annotation::AnnotationTarget::DataRef,
                     };
-                    annotation::normalize_annotations(&agg.annotations, target, &mut self.errors);
+                    let policy = annotation::normalize_annotations(
+                        &agg.annotations,
+                        target,
+                        &mut self.errors,
+                    );
                     let mut fields = HashMap::new();
                     for field in &agg.fields {
                         let policy = annotation::normalize_annotations(
@@ -1413,6 +1450,7 @@ impl DeclarationIndex {
                                 generics: generic_params(&agg.type_params, &agg.const_params),
                                 fields,
                                 methods,
+                                policy,
                             },
                         );
                     }
@@ -1424,21 +1462,21 @@ impl DeclarationIndex {
                         kind: NominalKind::Enum,
                         name: enm.name,
                     };
-                    annotation::normalize_annotations(
+                    let policy = annotation::normalize_annotations(
                         &enm.annotations,
                         annotation::AnnotationTarget::Enum,
                         &mut self.errors,
                     );
                     let mut variants = HashMap::new();
                     for variant in &enm.variants {
-                        annotation::normalize_annotations(
+                        let variant_policy = annotation::normalize_annotations(
                             &variant.annotations,
                             annotation::AnnotationTarget::Variant,
                             &mut self.errors,
                         );
-                        let schema = match &variant.kind {
-                            VariantKind::Unit => VariantSchema::Unit,
-                            VariantKind::Tuple(types) => VariantSchema::Tuple(types.clone()),
+                        let payload = match &variant.kind {
+                            VariantKind::Unit => VariantPayload::Unit,
+                            VariantKind::Tuple(types) => VariantPayload::Tuple(types.clone()),
                             VariantKind::Struct(fields) => {
                                 let mut field_map = HashMap::new();
                                 for f in fields {
@@ -1456,10 +1494,16 @@ impl DeclarationIndex {
                                         },
                                     );
                                 }
-                                VariantSchema::Struct(field_map)
+                                VariantPayload::Struct(field_map)
                             }
                         };
-                        variants.insert(variant.name, schema);
+                        variants.insert(
+                            variant.name,
+                            VariantSchema {
+                                policy: variant_policy,
+                                payload,
+                            },
+                        );
                     }
                     if self.insert_local_type(
                         &mut decls,
@@ -1475,13 +1519,14 @@ impl DeclarationIndex {
                             EnumSchema {
                                 generics: generic_params(&enm.type_params, &enm.const_params),
                                 variants,
+                                policy,
                             },
                         );
                     }
                 }
                 Stmt::Const(const_node) => {
                     let c = &const_node.node;
-                    annotation::normalize_annotations(
+                    let policy = annotation::normalize_annotations(
                         &c.annotations,
                         annotation::AnnotationTarget::Const,
                         &mut self.errors,
@@ -1489,7 +1534,10 @@ impl DeclarationIndex {
                     let value = ResolvedValue {
                         module: scope.clone(),
                         name: c.name,
-                        decl: ValueDecl::Const(c.ty.clone().unwrap_or(Type::Infer)),
+                        decl: ValueDecl::Const(ConstSig {
+                            ty: c.ty.clone().unwrap_or(Type::Infer),
+                            policy,
+                        }),
                     };
                     self.insert_local_value(
                         &mut decls,
@@ -1501,18 +1549,24 @@ impl DeclarationIndex {
                     );
                 }
                 Stmt::ExternFunc(func_node) => {
-                    annotation::normalize_annotations(
+                    let policy = annotation::normalize_annotations(
                         &func_node.node.annotations,
                         annotation::AnnotationTarget::ExternFunc,
                         &mut self.errors,
                     );
+                    source_extern_policies
+                        .funcs
+                        .insert((scope.clone(), func_node.node.name), policy);
                 }
                 Stmt::ExternType(ty_node) => {
-                    annotation::normalize_annotations(
+                    let policy = annotation::normalize_annotations(
                         &ty_node.node.annotations,
                         annotation::AnnotationTarget::ExternType,
                         &mut self.errors,
                     );
+                    source_extern_policies
+                        .types
+                        .insert((scope.clone(), ty_node.node.name), policy);
                 }
                 Stmt::Extend(extend_node) => {
                     let id = ExtendId {
@@ -1580,15 +1634,27 @@ impl DeclarationIndex {
         self.modules.insert(scope, decls);
     }
 
-    fn collect_extern_headers(&mut self, externs: &RawExterns) {
+    fn collect_extern_headers(
+        &mut self,
+        externs: &RawExterns,
+        source_policies: &SourceExternPolicies,
+    ) {
         for group in &externs.groups {
+            let policies = match &group.provenance {
+                ExternProvenance::Source { .. } => Some(source_policies),
+                ExternProvenance::Provider { .. } => None,
+            };
             for module in &group.modules {
-                self.collect_extern_module(module);
+                self.collect_extern_module(module, policies);
             }
         }
     }
 
-    fn collect_extern_module(&mut self, module: &RawExternModule) {
+    fn collect_extern_module(
+        &mut self,
+        module: &RawExternModule,
+        source_policies: Option<&SourceExternPolicies>,
+    ) {
         let scope = raw_module_scope(&module.scope);
         let mut decls = self.modules.remove(&scope).unwrap_or_default();
 
@@ -1601,12 +1667,21 @@ impl DeclarationIndex {
             };
             let span = ty.site.span.unwrap_or(Span::new(0, 0));
             if self.insert_local_type(&mut decls, &scope, name, key.clone(), ty.exported, span) {
-                self.type_spans.insert(key, span);
+                self.type_spans.insert(key.clone(), span);
+                let policy = source_policies
+                    .and_then(|policies| policies.types.get(&(scope.clone(), name)))
+                    .cloned()
+                    .unwrap_or_default();
+                self.extern_type_policies.insert(key, policy);
             }
         }
 
         for func in &module.functions {
             let name = Ident::new(&func.decl.name);
+            let policy = source_policies
+                .and_then(|policies| policies.funcs.get(&(scope.clone(), name)))
+                .cloned()
+                .unwrap_or_default();
             let value = ResolvedValue {
                 module: scope.clone(),
                 name,
@@ -1618,6 +1693,7 @@ impl DeclarationIndex {
                         ret: Box::new(Type::Void),
                     },
                     required_params: 0,
+                    policy,
                 }),
             };
             self.insert_local_value(
@@ -1991,9 +2067,9 @@ impl DeclarationIndex {
         for value in namespace.values.values_mut() {
             if value.module == *scope
                 && value.name == name
-                && let ValueDecl::Const(existing) = &mut value.decl
+                && let ValueDecl::Const(sig) = &mut value.decl
             {
-                *existing = ty.clone();
+                sig.ty = ty.clone();
             }
         }
     }
@@ -2004,6 +2080,10 @@ impl DeclarationIndex {
 
     pub(crate) fn enum_schema(&self, key: &NominalKey) -> Option<&EnumSchema> {
         self.enums.get(key)
+    }
+
+    pub(crate) fn extern_type_policy(&self, key: &NominalKey) -> Option<&AccessPolicy> {
+        self.extern_type_policies.get(key)
     }
 
     fn nominal_generics(&self, key: &NominalKey) -> Option<GenericParams> {
@@ -2446,10 +2526,10 @@ impl DeclarationIndex {
         variant: Ident,
         schema: &VariantSchema,
     ) -> Option<CallableRef> {
-        let params = match schema {
-            VariantSchema::Unit => vec![],
-            VariantSchema::Tuple(types) => types.iter().cloned().map(FuncParam::immut).collect(),
-            VariantSchema::Struct(_) => return None,
+        let params = match &schema.payload {
+            VariantPayload::Unit => vec![],
+            VariantPayload::Tuple(types) => types.iter().cloned().map(FuncParam::immut).collect(),
+            VariantPayload::Struct(_) => return None,
         };
         let enum_schema = self.enum_schema(enum_key)?;
         let owner_generics = enum_schema.generics.clone();
@@ -3297,6 +3377,111 @@ mod tests {
         );
     }
 
+    fn assert_deprecated_reason(policy: &AccessPolicy, reason: &str) {
+        assert_eq!(policy.deprecated_reason(), Some(reason));
+    }
+
+    #[test]
+    fn function_policy() {
+        let index = index("@deprecated(\"use newer\") fn old() {}", &[]);
+        let value = index
+            .local_value(&ModuleScope::Root, ident("old"))
+            .expect("missing function");
+        let ValueDecl::Func(sig) = &value.decl else {
+            panic!("expected function");
+        };
+
+        assert_deprecated_reason(&sig.policy, "use newer");
+    }
+
+    #[test]
+    fn imported_function_policy() {
+        let index = index(
+            "import reexport { old };",
+            &[
+                ("lib", "@deprecated(\"use fresh\") pub fn old() {}"),
+                ("reexport", "pub import lib { old };"),
+            ],
+        );
+        let value = index
+            .imported_value(&ModuleScope::Root, ident("old"))
+            .expect("missing imported function");
+        let ValueDecl::Func(sig) = &value.decl else {
+            panic!("expected function");
+        };
+
+        assert_deprecated_reason(&sig.policy, "use fresh");
+    }
+
+    #[test]
+    fn source_extern_function_policy() {
+        let index = index(
+            "@deprecated(\"use host_new\") extern fn host_old() -> int;",
+            &[],
+        );
+        let value = index
+            .local_value(&ModuleScope::Root, ident("host_old"))
+            .expect("missing extern function");
+        let ValueDecl::Func(sig) = &value.decl else {
+            panic!("expected function");
+        };
+
+        assert_eq!(sig.kind, CallableKind::ExternFunction);
+        assert_deprecated_reason(&sig.policy, "use host_new");
+    }
+
+    #[test]
+    fn aggregate_policy() {
+        let index = index(
+            "@deprecated(\"use NewPoint\") struct OldPoint { x: int }",
+            &[],
+        );
+        let key = index
+            .local_type(&ModuleScope::Root, ident("OldPoint"))
+            .expect("missing aggregate");
+        let agg = index.aggregate(&key).expect("missing aggregate schema");
+
+        assert_deprecated_reason(&agg.policy, "use NewPoint");
+    }
+
+    #[test]
+    fn enum_and_variant_policy() {
+        let index = index(
+            "@deprecated(\"use NewStatus\") enum Status { Active, @deprecated(\"use Active\") Disabled }",
+            &[],
+        );
+        let key = index
+            .local_type(&ModuleScope::Root, ident("Status"))
+            .expect("missing enum");
+        let enm = index.enum_schema(&key).expect("missing enum schema");
+        let variant = enm
+            .variants
+            .get(&ident("Disabled"))
+            .expect("missing variant");
+
+        assert_deprecated_reason(&enm.policy, "use NewStatus");
+        assert_deprecated_reason(&variant.policy, "use Active");
+    }
+
+    #[test]
+    fn enum_variant_field_policy() {
+        let index = index(
+            "enum Event { Move { @deprecated(\"use x\") old_x: int, x: int } }",
+            &[],
+        );
+        let key = index
+            .local_type(&ModuleScope::Root, ident("Event"))
+            .expect("missing enum");
+        let enm = index.enum_schema(&key).expect("missing enum schema");
+        let variant = enm.variants.get(&ident("Move")).expect("missing variant");
+        let VariantPayload::Struct(fields) = &variant.payload else {
+            panic!("expected struct variant");
+        };
+        let field = fields.get(&ident("old_x")).expect("missing field");
+
+        assert_deprecated_reason(&field.policy, "use x");
+    }
+
     #[test]
     fn generic_template_nominal_args() {
         let generics = GenericParams {
@@ -3952,7 +4137,13 @@ mod tests {
             .imported_value(&ModuleScope::Root, ident("SIZE"))
             .expect("missing import");
 
-        assert!(matches!(exported.decl, ValueDecl::Const(Type::Int)));
-        assert!(matches!(imported.decl, ValueDecl::Const(Type::Int)));
+        assert!(matches!(
+            exported.decl,
+            ValueDecl::Const(ConstSig { ty: Type::Int, .. })
+        ));
+        assert!(matches!(
+            imported.decl,
+            ValueDecl::Const(ConstSig { ty: Type::Int, .. })
+        ));
     }
 }

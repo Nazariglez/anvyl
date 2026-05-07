@@ -472,8 +472,12 @@ impl<'tc> PatternChecker<'tc> {
         for field in shape.fields {
             let pattern = &fields[field.index].1;
             self.record_extern_field_read(field.name, pattern, &owner_ty);
-            self.tc
-                .check_field_access_policy(&owner_ty, field.name, pattern.span);
+            self.tc.check_matched_field_access_policy(
+                &owner,
+                field.name,
+                &field.policy,
+                pattern.span,
+            );
             let field_access = self.struct_field_access(&owner_ty, field.name, access);
             let field_ty = self
                 .tc
@@ -562,12 +566,12 @@ impl<'tc> PatternChecker<'tc> {
         else {
             return PatternOutcome::error();
         };
-        match resolved.schema {
-            VariantSchema::Unit => PatternOutcome::refutable(PatternCover::EnumVariant {
+        match resolved.schema.payload {
+            VariantPayload::Unit => PatternOutcome::refutable(PatternCover::EnumVariant {
                 key: resolved.key,
                 variant,
             }),
-            VariantSchema::Tuple(_) | VariantSchema::Struct(_) => {
+            VariantPayload::Tuple(_) | VariantPayload::Struct(_) => {
                 enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Unit, span);
                 PatternOutcome::error()
             }
@@ -589,7 +593,7 @@ impl<'tc> PatternChecker<'tc> {
             self.check_tuple_fields_recovery(fields, access);
             return PatternOutcome::error();
         };
-        let VariantSchema::Tuple(payloads) = &resolved.schema else {
+        let VariantPayload::Tuple(payloads) = &resolved.schema.payload else {
             enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Tuple, span);
             self.check_tuple_fields_recovery(fields, access);
             return PatternOutcome::error();
@@ -634,14 +638,14 @@ impl<'tc> PatternChecker<'tc> {
             self.check_field_patterns(fields, access);
             return PatternOutcome::error();
         };
-        let VariantSchema::Struct(schema) = &resolved.schema else {
+        let VariantPayload::Struct(schema) = &resolved.schema.payload else {
             enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Struct, span);
             self.check_field_patterns(fields, access);
             return PatternOutcome::error();
         };
 
         let owner = field_check::FieldOwner::Variant {
-            enum_name: resolved.key.name,
+            key: resolved.key.clone(),
             variant,
         };
         let shape = self.check_field_shape(
@@ -654,6 +658,12 @@ impl<'tc> PatternChecker<'tc> {
         let mut had_error = shape.failed;
         self.check_bad_field_patterns(fields, &shape, access);
         for field in shape.fields {
+            self.tc.check_matched_field_access_policy(
+                &owner,
+                field.name,
+                &field.policy,
+                fields[field.index].1.span,
+            );
             let ty = self.payload_ty(&field.ty, &resolved, expected, span);
             had_error |= self.check(&fields[field.index].1, &ty, access).had_error;
         }

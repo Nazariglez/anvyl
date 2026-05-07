@@ -1,0 +1,15 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use BetterDisabled
+
+@deprecated("use NewStatus")
+enum Status {
+    Active,
+    @deprecated("use BetterDisabled")
+    Disabled,
+}
+
+fn main() {
+    let _ = Status.Disabled;
+}

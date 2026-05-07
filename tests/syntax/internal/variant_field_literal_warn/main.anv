@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: accessing internal field 'old_x' of type 'Event'
+
+import lib { Event };
+
+fn main() {
+    let _ = Event.Move { old_x: 1, x: 2 };
+}

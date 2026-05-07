@@ -8,7 +8,8 @@ use anvyx_externs::{
 };
 
 use super::support::{
-    TypecheckTestResult, assert_typecheck_closed, check, check_named, check_with_raw_externs,
+    TypecheckTestResult, assert_deprecated_warning, assert_typecheck_closed, check, check_named,
+    check_with_raw_externs,
 };
 use crate::{
     ast::{ExprId, Ident, ModuleOrigin, NominalKind, Program, Type},
@@ -21,11 +22,28 @@ use crate::{
     },
     resolve::{ModuleId, ModulePath, PackageId},
     test_support::{parse_program, resolved_modules_with_external},
-    typecheck::{self, ExternUseTarget, ModuleScope, TypeError},
+    typecheck::{self, DeprecatedUseKind, ExternUseTarget, ModuleScope, TypeError},
 };
 
 fn parse(source: &str) -> Program {
     parse_program(source)
+}
+
+#[test]
+fn deprecated_source_extern_type_warns_on_type_reference() {
+    let result = check(
+        "@deprecated(\"use NewHandle\") extern type Handle;
+         fn use_handle(handle: Handle) {}
+         fn main() {}",
+    )
+    .unwrap();
+
+    assert_deprecated_warning(
+        &result,
+        DeprecatedUseKind::ExternType,
+        "Handle",
+        Some("use NewHandle"),
+    );
 }
 
 fn extern_path(segments: &[&str]) -> ExternModulePath {

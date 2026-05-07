@@ -1,0 +1,16 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use value
+
+struct Item {
+    value: int,
+
+    @deprecated("use value")
+    fn old_value(self) -> int { self.value }
+}
+
+fn main() {
+    let i = Item { value: 1 };
+    let _ = i.old_value();
+}

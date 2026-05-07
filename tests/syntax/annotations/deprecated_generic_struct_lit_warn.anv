@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use NewBox
+
+@deprecated("use NewBox")
+struct OldBox<T> { value: T }
+
+fn main() {
+    let _: OldBox<int> = OldBox { value: 1 };
+}

@@ -1,0 +1,4 @@
+// @helper
+
+@deprecated("use fresh")
+pub fn old() {}

@@ -7,7 +7,7 @@ use super::{
     decls::{
         CallableKind, CallableParent, CallableRef, DeclError, ExtendMethodMatch,
         ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface, ModuleMemberLookup,
-        ModuleScope, ResolvedValue, ValueDecl, VariantSchema, nominal_type, owner_template,
+        ModuleScope, ResolvedValue, ValueDecl, VariantPayload, nominal_type, owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
@@ -122,7 +122,9 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
     match &expr.node.kind {
         ExprKind::Ident(name) => {
             if let Some((module, value_name, value)) = tc.lookup_named_value(*name) {
-                return Some(named_value_subject(tc, module, value_name, &value));
+                return Some(named_value_subject(
+                    tc, module, value_name, &value, expr.span,
+                ));
             }
             if let Some(info) = tc.lookup(*name).cloned() {
                 let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
@@ -136,7 +138,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
             if let Some(scope) = tc.lookup_module_alias(*name) {
                 return Some(Subject::Module(scope));
             }
-            if let Some(ty) = tc.visible_type_subject(*name) {
+            if let Some(ty) = tc.visible_type_subject(*name, expr.span) {
                 return Some(Subject::Type(ty));
             }
             None
@@ -379,11 +381,13 @@ fn field_access_on_non_aggregate(
 }
 
 fn named_value_subject(
-    tc: &TypeChecker,
+    tc: &mut TypeChecker,
     module: ModuleScope,
     name: Ident,
     value: &ValueDecl,
+    span: Span,
 ) -> Subject {
+    tc.warn_named_value_deprecated(value, name, span);
     let resolved = ResolvedValue {
         module,
         name,
@@ -545,13 +549,27 @@ fn apply_value_field(
         static_method_on_value = agg.methods.contains_key(&MethodKey::static_(name));
     }
 
-    if let Some(matched) = tc.find_extend_method(&receiver, name) {
+    let decls = &tc.decls;
+    let current_module = &tc.current_module;
+    if let Some(matched) = decls.find_instance_extend_method(&receiver, name, |ext| {
+        TypeChecker::extend_visible_in(decls, current_module, &ext.origin)
+    }) {
         let parts = extend_method_parts(receiver.clone(), name, &matched);
         return match parts {
             Ok((extend, method, receiver_ty, owner_args)) => {
-                let policy = method.policy.clone();
-                let origin = extend.origin.clone();
-                let owner_ty = receiver.clone();
+                check_extend_method_access(
+                    &mut super::AccessPolicyOutput {
+                        current_module: &tc.current_module,
+                        config: &tc.config,
+                        warnings: &mut tc.warnings,
+                        errors: &mut tc.errors,
+                    },
+                    extend,
+                    method,
+                    &receiver,
+                    name,
+                    span,
+                );
                 let callee = tc.decls.callable_for_extend_method(
                     receiver_ty,
                     extend,
@@ -565,14 +583,6 @@ fn apply_value_field(
                     receiver_place,
                     receiver_id,
                     name,
-                );
-                tc.check_access_policy(
-                    &policy,
-                    MemberAccessKind::Method,
-                    name,
-                    &owner_ty,
-                    &origin,
-                    span,
                 );
                 callable_subject(callee, Some(receiver))
             }
@@ -672,6 +682,25 @@ fn extend_method_parts<'a>(
     }
 }
 
+fn check_extend_method_access(
+    out: &mut super::AccessPolicyOutput<'_>,
+    extend: &ExtendSchema,
+    method: &ExtendMethodSchema,
+    owner_ty: &Type,
+    name: Ident,
+    span: Span,
+) {
+    super::emit_access_policy(
+        &method.policy,
+        MemberAccessKind::Method,
+        name,
+        owner_ty,
+        &extend.origin,
+        span,
+        out,
+    );
+}
+
 fn push_extend_method_error(tc: &mut TypeChecker, error: ExtendMethodError, span: Span) {
     match error {
         ExtendMethodError::Unbound(names) => tc.push_unbound_generic_errors(names, span),
@@ -701,13 +730,16 @@ fn apply_module_field(
     match tc.decls.module_value(scope, name) {
         ModuleMemberLookup::Found(value) => {
             let (module, value_name, decl) = TypeChecker::resolved_value(value);
-            return named_value_subject(tc, module, value_name, &decl);
+            return named_value_subject(tc, module, value_name, &decl, span);
         }
         ModuleMemberLookup::Private => private = true,
         ModuleMemberLookup::Missing => {}
     }
     match tc.decls.module_type(scope, name) {
-        ModuleMemberLookup::Found(key) => return Subject::Type(nominal_type(&key)),
+        ModuleMemberLookup::Found(key) => {
+            tc.warn_extern_type_deprecated(&key, span);
+            return Subject::Type(nominal_type(&key));
+        }
         ModuleMemberLookup::Private => private = true,
         ModuleMemberLookup::Missing => {}
     }
@@ -764,7 +796,7 @@ fn apply_type_field(
                 return static_extend_conflict(target, name, span, tc);
             }
             if has_variant {
-                let resolved = enum_variant::resolve_member(tc, &key, name, span)
+                let resolved = enum_variant::resolve_use(tc, &key, name, span)
                     .expect("variant exists in enum schema");
                 return enum_variant_subject(resolved, expected, tc);
             }
@@ -810,7 +842,7 @@ fn apply_type_field(
     }
 
     if let Some(key) = enum_key {
-        enum_variant::resolve_member(tc, &key, name, span);
+        enum_variant::resolve_use(tc, &key, name, span);
         return Subject::Error;
     }
 
@@ -849,22 +881,29 @@ fn static_extend_subject(
     span: Span,
     tc: &mut TypeChecker,
 ) -> Option<Subject> {
-    let matched = tc.find_static_extend_method(target, name)?;
+    let decls = &tc.decls;
+    let current_module = &tc.current_module;
+    let matched = decls.find_static_extend_method(target, name, |ext| {
+        TypeChecker::extend_visible_in(decls, current_module, &ext.origin)
+    })?;
     let subject = match extend_method_parts(target.clone(), name, &matched) {
         Ok((extend, method, _, owner_args)) => {
-            let policy = method.policy.clone();
-            let origin = extend.origin.clone();
+            check_extend_method_access(
+                &mut super::AccessPolicyOutput {
+                    current_module: &tc.current_module,
+                    config: &tc.config,
+                    warnings: &mut tc.warnings,
+                    errors: &mut tc.errors,
+                },
+                extend,
+                method,
+                target,
+                name,
+                span,
+            );
             let callee = tc
                 .decls
                 .callable_for_static_extend_method(extend, name, method, owner_args);
-            tc.check_access_policy(
-                &policy,
-                MemberAccessKind::Method,
-                name,
-                target,
-                &origin,
-                span,
-            );
             callable_subject(callee, None)
         }
         Err(error) => {
@@ -1137,16 +1176,16 @@ fn check_enum_variant_call(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let can_call = match &resolved.schema {
-        VariantSchema::Tuple(_) => true,
-        VariantSchema::Unit => call.node.args.is_empty(),
-        VariantSchema::Struct(_) => false,
+    let can_call = match &resolved.schema.payload {
+        VariantPayload::Tuple(_) => true,
+        VariantPayload::Unit => call.node.args.is_empty(),
+        VariantPayload::Struct(_) => false,
     };
     if !can_call {
         enum_variant::push_shape_mismatch(tc, resolved, VariantShape::Tuple, call.span);
         return check_unhinted_args(&call.node.args, tc);
     }
-    if let VariantSchema::Tuple(params) = &resolved.schema
+    if let VariantPayload::Tuple(params) = &resolved.schema.payload
         && params.len() != call.node.args.len()
     {
         enum_variant::push_arg_count_mismatch(
@@ -1184,7 +1223,7 @@ fn check_callable_call(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    if callee.def.id.kind == CallableKind::ExternFunction {
+    if matches!(callee.def.id.kind, CallableKind::ExternFunction) {
         return check_extern_function_call(callee, call, call_id, expected, tc);
     }
     let checked = check_callable_call_with_args(
@@ -1336,6 +1375,19 @@ fn check_qualified_extend_call(
         receiver.facts.as_ref(),
         receiver_expr.node.id,
         name,
+    );
+    check_extend_method_access(
+        &mut super::AccessPolicyOutput {
+            current_module: &tc.current_module,
+            config: &tc.config,
+            warnings: &mut tc.warnings,
+            errors: &mut tc.errors,
+        },
+        extend,
+        method,
+        &receiver.checked.ty,
+        name,
+        span,
     );
     let callee = tc
         .decls

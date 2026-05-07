@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: deprecated
+
+@deprecated
+struct OldPoint { x: int }
+
+fn main() {
+    let _ = OldPoint { x: 1 };
+}

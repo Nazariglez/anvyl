@@ -1,13 +1,13 @@
 use super::support::{
-    assert_calls, assert_calls_with_modules, assert_err_count, assert_single_error, assert_ty,
-    assert_ty_mods, assert_typecheck_closed, check, check_mods,
+    assert_calls, assert_calls_with_modules, assert_deprecated_warning, assert_err_count,
+    assert_single_error, assert_ty, assert_ty_mods, assert_typecheck_closed, check, check_mods,
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
     span::Span,
     typecheck::{
-        ArityError, CallTarget, CallableId, ConstDiagnostic, GenericArgs, ModuleScope, TypeError,
-        call_target_closure_facts,
+        ArityError, CallTarget, CallableId, ConstDiagnostic, DeprecatedUseKind, GenericArgs,
+        ModuleScope, TypeError, call_target_closure_facts,
         const_term::{ConstInferVarId, ConstTerm},
     },
 };
@@ -27,6 +27,21 @@ fn direct_call_typechecks() {
     assert_ty(
         "fn foo() -> int { 0 } fn main() -> int { foo() }",
         Type::Int,
+    );
+}
+
+#[test]
+fn deprecated_generic_call_warns_once() {
+    let result = check(
+        "@deprecated(\"use newer\") fn old<T>(value: T) -> T { value }
+         fn main() { old(1); }",
+    )
+    .unwrap();
+    assert_deprecated_warning(
+        &result,
+        DeprecatedUseKind::Function,
+        "old",
+        Some("use newer"),
     );
 }
 

@@ -1,5 +1,7 @@
 use super::{
-    GenericArgs, GenericParams, TypeChecker, TypeError, VariantShape,
+    DeprecatedUseKind, GenericArgs, GenericParams, TypeChecker, TypeError, TypeWarning,
+    VariantShape,
+    annotation::AccessPolicy,
     decls::{NominalKey, VariantSchema, nominal_generic_args, nominal_type},
 };
 use crate::{
@@ -32,7 +34,7 @@ impl ResolvedEnumVariant {
     }
 }
 
-pub(super) fn resolve_member(
+pub(super) fn resolve_use(
     tc: &mut TypeChecker,
     key: &NominalKey,
     variant: Ident,
@@ -47,12 +49,48 @@ pub(super) fn resolve_member(
         });
         return None;
     };
+    let generics = schema.generics.clone();
+    let warning = resolved_use_warning(
+        key.name,
+        variant,
+        &schema.policy,
+        &variant_schema.policy,
+        span,
+    );
+    if let Some(warning) = warning {
+        tc.push_warning(warning);
+    }
     Some(ResolvedEnumVariant {
         key: key.clone(),
         variant,
-        generics: schema.generics.clone(),
+        generics,
         schema: variant_schema,
     })
+}
+
+fn resolved_use_warning(
+    enum_name: Ident,
+    variant: Ident,
+    enum_policy: &AccessPolicy,
+    variant_policy: &AccessPolicy,
+    span: Span,
+) -> Option<TypeWarning> {
+    if variant_policy.has_deprecated() {
+        return Some(TypeWarning::DeprecatedAccess {
+            kind: DeprecatedUseKind::EnumVariant,
+            name: variant,
+            reason: variant_policy.deprecated_reason().map(str::to_string),
+            span,
+        });
+    }
+    enum_policy
+        .has_deprecated()
+        .then(|| TypeWarning::DeprecatedAccess {
+            kind: DeprecatedUseKind::Enum,
+            name: enum_name,
+            reason: enum_policy.deprecated_reason().map(str::to_string),
+            span,
+        })
 }
 
 pub(super) fn resolve_pattern(
@@ -70,7 +108,7 @@ pub(super) fn resolve_pattern(
         Some(name) => resolve_explicit_pattern(tc, name, expected_key.as_ref(), expected, span)?,
         None => resolve_inferred_pattern(tc, expected_key, span)?,
     };
-    resolve_member(tc, &key, variant, span)
+    resolve_use(tc, &key, variant, span)
 }
 
 fn resolve_explicit_pattern(

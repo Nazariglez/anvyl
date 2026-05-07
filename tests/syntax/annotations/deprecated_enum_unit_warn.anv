@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: deprecated
+
+@deprecated
+enum OldState { Ready }
+
+fn main() {
+    let _ = OldState.Ready;
+}

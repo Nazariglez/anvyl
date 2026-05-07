@@ -1,0 +1,7 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+fn main() {
+    let path: string = #file();
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use NewHandle
+
+@deprecated("use NewHandle")
+extern type OldHandle;
+
+fn use_handle(handle: OldHandle) {}
+
+fn main() {}

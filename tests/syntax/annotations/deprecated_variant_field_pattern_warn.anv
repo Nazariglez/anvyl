@@ -1,0 +1,22 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use x
+
+enum Event {
+    Move {
+        @deprecated("use x")
+        old_x: int,
+        x: int,
+    },
+}
+
+fn main() {
+    let e = Event.Move { old_x: 1, x: 2 };
+    match e {
+        Event.Move { old_x, x } => {
+            let _ = old_x;
+            let _ = x;
+        },
+    }
+}

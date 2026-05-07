@@ -1,0 +1,16 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: use get
+
+struct Box<T> { value: T }
+
+extend<T> Box<T> {
+    @deprecated("use get")
+    fn old_get(self) -> T { self.value }
+}
+
+fn main() {
+    let b: Box<int> = Box { value: 1 };
+    let _ = b.old_get();
+}

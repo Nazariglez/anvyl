@@ -253,7 +253,7 @@ mod tests {
             crate::externs::catalog::ExternCatalog::default(),
             TypecheckConfig::default(),
         );
-        tc.collect_const_decls(ModuleScope::Root, &program);
+        tc.collect_const_decls(&ModuleScope::Root, &program);
         tc.push_scope();
         tc
     }

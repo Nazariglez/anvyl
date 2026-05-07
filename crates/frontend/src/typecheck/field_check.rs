@@ -1,6 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use super::{MemberAccessKind, TypeChecker, TypeError, decls::FieldSchema};
+use super::{
+    MemberAccessKind, TypeChecker, TypeError,
+    annotation::AccessPolicy,
+    decls::{FieldSchema, NominalKey},
+};
 use crate::{
     ast::{Ident, Type},
     span::Span,
@@ -16,11 +20,12 @@ pub(super) struct CheckedField {
     pub(super) name: Ident,
     pub(super) index: usize,
     pub(super) ty: Type,
+    pub(super) policy: AccessPolicy,
 }
 
 pub(super) enum FieldOwner {
     Nominal(Type),
-    Variant { enum_name: Ident, variant: Ident },
+    Variant { key: NominalKey, variant: Ident },
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +67,7 @@ pub(super) fn check(
                 name: field.name,
                 index: field.index,
                 ty: schema.ty.clone(),
+                policy: schema.policy.clone(),
             }),
             None => {
                 push_unknown(owner, field.name, field.span, tc);
@@ -103,9 +109,9 @@ fn push_unknown(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecke
             kind: MemberAccessKind::Field,
             span,
         }),
-        FieldOwner::Variant { enum_name, variant } => {
+        FieldOwner::Variant { key, variant } => {
             tc.push_error(TypeError::UnknownVariantField {
-                enum_name: *enum_name,
+                enum_name: key.name,
                 variant: *variant,
                 field: name,
                 span,
@@ -117,9 +123,9 @@ fn push_unknown(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecke
 fn push_missing(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecker) {
     match owner {
         FieldOwner::Nominal(_) => tc.push_error(TypeError::MissingField { name, span }),
-        FieldOwner::Variant { enum_name, variant } => {
+        FieldOwner::Variant { key, variant } => {
             tc.push_error(TypeError::MissingVariantField {
-                enum_name: *enum_name,
+                enum_name: key.name,
                 variant: *variant,
                 field: name,
                 span,

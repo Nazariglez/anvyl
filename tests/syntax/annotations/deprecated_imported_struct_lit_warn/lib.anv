@@ -1,0 +1,4 @@
+// @helper
+
+@deprecated("use NewPoint")
+pub struct OldPoint { x: int }

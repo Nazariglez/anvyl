@@ -1,4 +1,4 @@
-use super::{ModuleScope, TypeChecker, TypeError, ValueDecl};
+use super::{DeprecatedUseKind, ModuleScope, TypeChecker, TypeError, ValueDecl};
 use crate::{
     ast::{
         BinaryOp, CastNode, ConstValue, ExprKind, ExprNode, FieldAccessNode, Ident, Lit, Program,
@@ -48,7 +48,7 @@ pub(super) fn const_usize(value: &ConstValue, span: Span) -> Result<usize, TypeE
 }
 
 impl TypeChecker {
-    pub(super) fn collect_const_decls(&mut self, module: ModuleScope, program: &Program) {
+    pub(super) fn collect_const_decls(&mut self, module: &ModuleScope, program: &Program) {
         for stmt in &program.stmts {
             let Stmt::Const(node) = &stmt.node else {
                 continue;
@@ -72,16 +72,23 @@ impl TypeChecker {
             .filter_map(|(scope, name)| (scope == module).then_some(*name))
             .collect::<Vec<_>>();
         for name in names {
-            if let Err(err) = self.eval_top_const(module.clone(), name, Span::new(0, 0)) {
+            if let Err(err) = self.eval_top_const(module, name, Span::new(0, 0)) {
                 self.push_error(err);
             }
         }
     }
 
-    pub(super) fn eval_const_expr(&mut self, expr: &ExprNode) -> Result<ConstValue, TypeError> {
+    pub(super) fn eval_const_expr(
+        &mut self,
+        expr: &ExprNode,
+        warn_deprecated: bool,
+    ) -> Result<ConstValue, TypeError> {
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.eval_const_lit(lit, expr.span),
             ExprKind::Ident(name) => {
+                if warn_deprecated {
+                    self.warn_named_const_deprecated(*name, expr.span);
+                }
                 self.eval_visible_const(*name, expr.span)
                     .unwrap_or(Err(TypeError::UnknownConst {
                         name: *name,
@@ -89,14 +96,14 @@ impl TypeChecker {
                     }))
             }
             ExprKind::Unary(node) => {
-                let value = self.eval_const_expr(&node.node.expr)?;
+                let value = self.eval_const_expr(&node.node.expr, warn_deprecated)?;
                 eval_unary(node.node.op, value, node.span)
             }
             ExprKind::Binary(node) => match node.node.op {
                 BinaryOp::And => {
                     let left = bool_operand(
                         node.node.op,
-                        self.eval_const_expr(&node.node.left)?,
+                        self.eval_const_expr(&node.node.left, warn_deprecated)?,
                         node.span,
                     )?;
                     if !left {
@@ -105,14 +112,14 @@ impl TypeChecker {
                     eval_binary(
                         node.node.op,
                         ConstValue::Bool(left),
-                        self.eval_const_expr(&node.node.right)?,
+                        self.eval_const_expr(&node.node.right, warn_deprecated)?,
                         node.span,
                     )
                 }
                 BinaryOp::Or => {
                     let left = bool_operand(
                         node.node.op,
-                        self.eval_const_expr(&node.node.left)?,
+                        self.eval_const_expr(&node.node.left, warn_deprecated)?,
                         node.span,
                     )?;
                     if left {
@@ -121,22 +128,26 @@ impl TypeChecker {
                     eval_binary(
                         node.node.op,
                         ConstValue::Bool(left),
-                        self.eval_const_expr(&node.node.right)?,
+                        self.eval_const_expr(&node.node.right, warn_deprecated)?,
                         node.span,
                     )
                 }
                 _ => {
-                    let left = self.eval_const_expr(&node.node.left)?;
-                    let right = self.eval_const_expr(&node.node.right)?;
+                    let left = self.eval_const_expr(&node.node.left, warn_deprecated)?;
+                    let right = self.eval_const_expr(&node.node.right, warn_deprecated)?;
                     eval_binary(node.node.op, left, right, node.span)
                 }
             },
-            ExprKind::Cast(node) => self.eval_const_cast(node),
+            ExprKind::Cast(node) => self.eval_const_cast(node, warn_deprecated),
             ExprKind::Ternary(node) => {
-                let cond = self.eval_const_expr(&node.node.cond)?;
+                let cond = self.eval_const_expr(&node.node.cond, warn_deprecated)?;
                 match cond {
-                    ConstValue::Bool(true) => self.eval_const_expr(&node.node.then_expr),
-                    ConstValue::Bool(false) => self.eval_const_expr(&node.node.else_expr),
+                    ConstValue::Bool(true) => {
+                        self.eval_const_expr(&node.node.then_expr, warn_deprecated)
+                    }
+                    ConstValue::Bool(false) => {
+                        self.eval_const_expr(&node.node.else_expr, warn_deprecated)
+                    }
                     other => Err(TypeError::InvalidOperand {
                         op: "?:".to_string(),
                         operand_type: const_type(&other),
@@ -144,8 +155,10 @@ impl TypeChecker {
                     }),
                 }
             }
-            ExprKind::StringInterp(parts) => self.eval_const_string_interp(parts, expr.span),
-            ExprKind::Field(node) => self.eval_const_field(node, expr.span),
+            ExprKind::StringInterp(parts) => {
+                self.eval_const_string_interp(parts, expr.span, warn_deprecated)
+            }
+            ExprKind::Field(node) => self.eval_const_field(node, expr.span, warn_deprecated),
             _ => Err(TypeError::NonConstExpression { span: expr.span }),
         }
     }
@@ -154,6 +167,7 @@ impl TypeChecker {
         &mut self,
         node: &FieldAccessNode,
         span: Span,
+        warn_deprecated: bool,
     ) -> Result<ConstValue, TypeError> {
         if node.node.safe {
             return Err(TypeError::NonConstExpression { span });
@@ -165,7 +179,12 @@ impl TypeChecker {
             return Err(TypeError::NonConstExpression { span });
         };
         match self.exported_value_in_module(&scope, node.node.field) {
-            Some((module, name, ValueDecl::Const(_))) => self.eval_top_const(module, name, span),
+            Some((module, name, ValueDecl::Const(sig))) => {
+                if warn_deprecated {
+                    self.warn_deprecated(&sig.policy, DeprecatedUseKind::Const, name, span);
+                }
+                self.eval_top_const(&module, name, span)
+            }
             Some((_, _, ValueDecl::Func(_))) => Err(TypeError::NonConstExpression { span }),
             None => Err(TypeError::UndefinedModuleMember {
                 module: scope,
@@ -196,13 +215,14 @@ impl TypeChecker {
         }
 
         if self.has_top_const(&self.current_module, name) {
-            return Some(self.eval_top_const(self.current_module.clone(), name, span));
+            let module = self.current_module.clone();
+            return Some(self.eval_top_const(&module, name, span));
         }
 
         let imported = self.imported_value(name)?;
         match imported {
             (module, imported_name, ValueDecl::Const(_)) => {
-                Some(self.eval_top_const(module, imported_name, span))
+                Some(self.eval_top_const(&module, imported_name, span))
             }
             (_, _, ValueDecl::Func(_)) => None,
         }
@@ -214,7 +234,7 @@ impl TypeChecker {
 
     fn eval_top_const(
         &mut self,
-        module: ModuleScope,
+        module: &ModuleScope,
         name: Ident,
         span: Span,
     ) -> Result<ConstValue, TypeError> {
@@ -236,11 +256,11 @@ impl TypeChecker {
         };
 
         let previous_module = std::mem::replace(&mut self.current_module, module.clone());
-        let saved_scopes = (previous_module != module).then(|| std::mem::take(&mut self.scopes));
+        let saved_scopes = (previous_module != *module).then(|| std::mem::take(&mut self.scopes));
         let expected_ty = ty.as_ref().map(|annot| self.resolve_type_for_tc(annot));
         let expected_handle = expected_ty.as_ref().map(|ty| self.type_handle(ty));
         let result = match super::validate_const_expr_type(&value_expr, expected_handle, self) {
-            Ok(_) => match self.eval_const_expr(&value_expr) {
+            Ok(_) => match self.eval_const_expr(&value_expr, false) {
                 Ok(value) => {
                     let value_ty = const_type(&value);
                     match expected_ty {
@@ -267,8 +287,8 @@ impl TypeChecker {
                 if let Some(entry) = self.consts.get_mut(&key) {
                     entry.state = ConstState::Evaluated(value.clone());
                 }
-                self.decls.set_const_type(&module, name, ty.clone());
-                self.set_current_scope_const(&module, name, ty, value.clone());
+                self.decls.set_const_type(module, name, ty.clone());
+                self.set_current_scope_const(module, name, &ty, value.clone());
                 Ok(value)
             }
             Err(err) => {
@@ -284,7 +304,7 @@ impl TypeChecker {
         &mut self,
         module: &ModuleScope,
         name: Ident,
-        ty: Type,
+        ty: &Type,
         value: ConstValue,
     ) {
         if &self.current_module != module {
@@ -298,7 +318,7 @@ impl TypeChecker {
         };
         let type_id = info.type_id;
         info.const_value = Some(value);
-        self.solver.set_local_type_from_type(type_id, &ty);
+        self.solver.set_local_type_from_type(type_id, ty);
     }
 
     fn eval_const_lit(&self, lit: &Lit, span: Span) -> Result<ConstValue, TypeError> {
@@ -311,8 +331,12 @@ impl TypeChecker {
         }
     }
 
-    fn eval_const_cast(&mut self, node: &CastNode) -> Result<ConstValue, TypeError> {
-        let value = self.eval_const_expr(&node.node.expr)?;
+    fn eval_const_cast(
+        &mut self,
+        node: &CastNode,
+        warn_deprecated: bool,
+    ) -> Result<ConstValue, TypeError> {
+        let value = self.eval_const_expr(&node.node.expr, warn_deprecated)?;
         let from = const_type(&value);
         let to = self.resolve_type_for_tc(&node.node.target);
         match (value, &to) {
@@ -331,13 +355,15 @@ impl TypeChecker {
         &mut self,
         parts: &[StringPart],
         span: Span,
+        warn_deprecated: bool,
     ) -> Result<ConstValue, TypeError> {
         let mut out = String::new();
         for part in parts {
             match part {
                 StringPart::Text(text) => out.push_str(text),
                 StringPart::Expr(expr, _) => {
-                    out.push_str(&const_string(&self.eval_const_expr(expr)?));
+                    let value = self.eval_const_expr(expr, warn_deprecated)?;
+                    out.push_str(&const_string(&value));
                 }
             }
         }
@@ -394,7 +420,7 @@ fn eval_binary(
         (ConstValue::Int(a), ConstValue::Int(b)) => eval_int_binary(op, a, b, span),
         (ConstValue::Float(a), ConstValue::Float(b)) => eval_float_binary(op, a, b, span),
         (ConstValue::Bool(a), ConstValue::Bool(b)) => eval_bool_binary(op, a, b, span),
-        (ConstValue::String(a), ConstValue::String(b)) => eval_string_binary(op, a, b, span),
+        (ConstValue::String(a), ConstValue::String(b)) => eval_string_binary(op, &a, &b, span),
         (ConstValue::String(a), value) if op == BinaryOp::Add => {
             Ok(ConstValue::String(format!("{a}{}", const_string(&value))))
         }
@@ -483,12 +509,7 @@ fn eval_bool_binary(op: BinaryOp, a: bool, b: bool, span: Span) -> Result<ConstV
     }
 }
 
-fn eval_string_binary(
-    op: BinaryOp,
-    a: String,
-    b: String,
-    span: Span,
-) -> Result<ConstValue, TypeError> {
+fn eval_string_binary(op: BinaryOp, a: &str, b: &str, span: Span) -> Result<ConstValue, TypeError> {
     match op {
         BinaryOp::Add => Ok(ConstValue::String(format!("{a}{b}"))),
         BinaryOp::Eq => Ok(ConstValue::Bool(a == b)),

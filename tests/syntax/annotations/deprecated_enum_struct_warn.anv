@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+// @warn-contains: deprecated
+
+@deprecated
+enum OldEvent { Move { dx: int } }
+
+fn main() {
+    let _ = OldEvent.Move { dx: 1 };
+}
