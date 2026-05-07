@@ -15,23 +15,43 @@ use crate::{
         },
     },
     lexer::SpannedToken,
-    resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError},
+    resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError, SourceFileId},
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, MemberAccessKind,
-        ModuleScope, TypeError, VariantShape,
+        ModuleScope, TypeError, TypeWarning, VariantShape,
     },
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
+    severity: DiagnosticSeverity,
     message: String,
 }
 
 impl Diagnostic {
     pub fn error(message: impl Into<String>) -> Self {
+        Self::new(DiagnosticSeverity::Error, message)
+    }
+
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self::new(DiagnosticSeverity::Warning, message)
+    }
+
+    fn new(severity: DiagnosticSeverity, message: impl Into<String>) -> Self {
         Self {
+            severity,
             message: message.into(),
         }
+    }
+
+    pub fn severity(&self) -> DiagnosticSeverity {
+        self.severity
     }
 
     pub fn message(&self) -> &str {
@@ -337,6 +357,22 @@ fn render_extern_member_selector(selector: &anvyx_externs::ExternMemberSelector)
     }
 }
 
+pub(super) fn diagnose_type_warning(warning: &TypeWarning) -> Diagnostic {
+    Diagnostic::warning(match warning {
+        TypeWarning::DeprecatedAccess {
+            kind, name, reason, ..
+        } => render_deprecated_access(*kind, *name, reason.as_deref()),
+        TypeWarning::InternalAccess {
+            kind,
+            name,
+            owner,
+            reason,
+            ..
+        } => render_internal_access(*kind, *name, owner, reason.as_deref()),
+        TypeWarning::CompileMessage { message, .. } => message.clone(),
+    })
+}
+
 pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
     Diagnostic::error(match error {
         TypeError::Decl(error) => render_decl_error(error),
@@ -458,6 +494,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ForIterableNotSupported { found, .. } => {
             format!("type '{found}' cannot be iterated")
         }
+        TypeError::ForIterationModifier { message, .. } => (*message).to_string(),
         TypeError::UnsupportedPattern { pattern, .. } => format!("Unsupported pattern: {pattern}"),
         TypeError::TuplePatternArityMismatch {
             expected, found, ..
@@ -478,6 +515,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         } => format!("invalid literal pattern: mismatch expected '{expected}', found '{found}'"),
         TypeError::OptionalPatternOnNonOptional { .. } => {
             "optional pattern requires an optional scrutinee".to_string()
+        }
+        TypeError::OptionalChainingOnNonOptional { .. } => {
+            "optional chaining requires an optional base type".to_string()
         }
         TypeError::NestedOptionalPattern { .. } => {
             "nested optional patterns are not supported".to_string()
@@ -510,6 +550,30 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ReadonlyMethodMutation { .. } => {
             "readonly method cannot mutate self".to_string()
         }
+        TypeError::InternalAccess {
+            kind,
+            name,
+            owner,
+            reason,
+            ..
+        } => render_internal_access(*kind, *name, owner, reason.as_deref()),
+        TypeError::UnknownIntrinsic { name, .. } => format!("unknown intrinsic '#{name}'"),
+        TypeError::IntrinsicArgCount {
+            name,
+            expected,
+            found,
+            ..
+        } => format!("intrinsic '#{name}' expects {expected} argument(s), found {found}"),
+        TypeError::IntrinsicExpectedIdent { name, .. } => {
+            format!("intrinsic '#{name}' expects an identifier argument")
+        }
+        TypeError::IntrinsicExpectedString { name, .. } => {
+            format!("intrinsic '#{name}' expects a string literal argument")
+        }
+        TypeError::UnknownIntrinsicValue {
+            predicate, value, ..
+        } => format!("unknown {predicate} '{value}'"),
+        TypeError::CompileError { message, .. } => message.clone(),
         TypeError::MethodGenericShadow {
             owner_kind,
             method_param,
@@ -534,6 +598,22 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::IndexOnNonIndexable { found, .. } => {
             format!("cannot index non-array type '{found}'")
         }
+        TypeError::RangeIndexNotInt { found, .. } => {
+            format!("range index bounds must be int, found '{found}'")
+        }
+        TypeError::RangeIndexUnsupported { found, .. } => {
+            format!("range indexing is not supported for type '{found}'")
+        }
+        TypeError::NonKeyableMapKey { ty, field, .. } => match field {
+            Some(field) => {
+                format!("field '{field}' is not keyable: type '{ty}' cannot be used as map key")
+            }
+            None if ty.is_option() => {
+                format!("optional type '{ty}' is not keyable and cannot be used as map key")
+            }
+            None => format!("type '{ty}' is not keyable and cannot be used as map key"),
+        },
+        TypeError::DuplicateMapKey { .. } => "duplicate key in map literal".to_string(),
         TypeError::UndefinedModuleMember { module, name, .. } => {
             format!(
                 "Unknown member '{name}' in module '{}'",
@@ -609,6 +689,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::InvalidConstCast { from, to, .. } => {
             format!("cannot cast constant from '{from}' to '{to}'")
         }
+        TypeError::InvalidCast { from, to, .. } => format!("Invalid cast from '{from}' to '{to}'"),
         TypeError::ConstDivisionByZero { .. } => {
             "division by zero in constant expression".to_string()
         }
@@ -921,6 +1002,27 @@ fn render_member_access_kind(kind: MemberAccessKind) -> &'static str {
     }
 }
 
+fn render_internal_access(
+    kind: MemberAccessKind,
+    name: Ident,
+    owner: &Type,
+    reason: Option<&str>,
+) -> String {
+    let kind = render_member_access_kind(kind);
+    match reason {
+        Some(reason) => format!("accessing internal {kind} '{name}' of type '{owner}': {reason}"),
+        None => format!("accessing internal {kind} '{name}' of type '{owner}'"),
+    }
+}
+
+fn render_deprecated_access(kind: MemberAccessKind, name: Ident, reason: Option<&str>) -> String {
+    let kind = render_member_access_kind(kind);
+    match reason {
+        Some(reason) => format!("use of deprecated {kind} '{name}': {reason}"),
+        None => format!("use of deprecated {kind} '{name}'"),
+    }
+}
+
 fn render_qualified_name(qualifier: Option<Ident>, name: Ident) -> String {
     match qualifier {
         Some(qualifier) => format!("{qualifier}.{name}"),
@@ -1012,6 +1114,22 @@ fn render_decl_error(error: &DeclError) -> String {
             render_binding_origin(first),
             render_binding_origin(second)
         ),
+        DeclError::UnknownAnnotation { name, .. } => format!("unknown annotation `@{name}`"),
+        DeclError::InvalidAnnotationTarget {
+            name,
+            target,
+            valid_targets,
+            ..
+        } => format!(
+            "`@{name}` is not valid on {target} declarations: can only be applied to {valid_targets}"
+        ),
+        DeclError::DuplicateAnnotation { name, .. } => format!("duplicate annotation `@{name}`"),
+        DeclError::InvalidAnnotationArgs { name, message, .. } => {
+            format!("invalid arguments for `@{name}`: {message}")
+        }
+        DeclError::InternalOnToString { .. } => {
+            "`@internal` cannot be applied to `to_string` methods".to_string()
+        }
     }
 }
 
@@ -1235,12 +1353,20 @@ fn render_module_path(path: &ModulePath) -> String {
     path.segments().join(".")
 }
 
+fn render_source_file(file: &SourceFileId) -> String {
+    file.path()
+        .file_stem()
+        .unwrap_or_else(|| file.path().as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn render_module_id(module: &ModuleId) -> String {
     let path = match module.path() {
         PackageModulePath::Root => "<root>".to_string(),
         PackageModulePath::Named(path) => render_module_path(path),
         PackageModulePath::Provider(path) => format!("ext:{}", render_module_path(path)),
-        PackageModulePath::Source(file) => file.to_string(),
+        PackageModulePath::Source(file) => render_source_file(file),
     };
     match module.package_context() {
         Some(package) if package != &PackageId::synthetic_root() => {
@@ -1293,6 +1419,12 @@ mod tests {
 
     fn module_scope(path: &[&str]) -> ModuleScope {
         ModuleScope::Named(module_path(path))
+    }
+
+    fn source_module_scope(path: &str) -> ModuleScope {
+        ModuleScope::Package(ModuleId::source_without_package(
+            SourceFileId::new(path).unwrap(),
+        ))
     }
 
     fn catalog_context(module: &[&str], item: ExternContextItem) -> ExternCatalogContext {
@@ -1397,6 +1529,15 @@ mod tests {
                     span: span(),
                 })),
                 "member 'secret' in module 'tools' is private",
+            ),
+            (
+                diagnose_type_error(&TypeError::Decl(DeclError::MissingImportMember {
+                    module: ModuleScope::Root,
+                    imported: source_module_scope("/tmp/lib.anv"),
+                    name: ident("missing"),
+                    span: span(),
+                })),
+                "Unknown member 'missing' in module 'lib'",
             ),
             (
                 diagnose_type_error(&TypeError::Decl(DeclError::DuplicateModuleBinding {

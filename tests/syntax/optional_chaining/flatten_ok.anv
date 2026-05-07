@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+
+struct Box {
+    item: int?,
+}
+
+fn main() {
+    let b: Box? = Box { item: 1 };
+    let item: int? = b?.item;
+
+    let m: [string: int]? = ["one": 1];
+    let found: int? = m?["one"];
+    let fallback: int = m?["missing"] ?? 0;
+}

@@ -1,8 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: Unexpected token
-// @skip: todo -> selective_self_import
-
 import gamekit as gk { self };
 
 fn main() {}

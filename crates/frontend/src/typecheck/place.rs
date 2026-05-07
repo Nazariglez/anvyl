@@ -168,6 +168,11 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
                 .decls
                 .aggregate_field_type(&receiver.value.checked.ty, field.node.field)
             {
+                tc.check_field_access_policy(
+                    &receiver.value.checked.ty,
+                    field.node.field,
+                    field.span,
+                );
                 let checked = super::checked_from_type(expr, ty, tc);
                 let access = projected_field_access(receiver.value.access);
                 let mut place = CheckedPlace::new(checked, access);

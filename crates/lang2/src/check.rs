@@ -14,7 +14,7 @@ use anvyx_frontend::{
 };
 
 use crate::{
-    CheckError, CheckOk, CheckResult, PackageSource, SourceBundle, SourceText,
+    CheckError, CheckResult, PackageSource, SourceBundle, SourceText,
     source::{PackageSourceEnvironment, SourceOwnership, canonical_source_file},
 };
 
@@ -22,6 +22,7 @@ use crate::{
 pub struct CheckFileInput {
     file: PathBuf,
     sources: SourceBundle,
+    config: FrontendConfig,
 }
 
 impl CheckFileInput {
@@ -33,7 +34,16 @@ impl CheckFileInput {
             ));
         }
 
-        Ok(Self { file, sources })
+        Ok(Self {
+            file,
+            sources,
+            config: FrontendConfig::default(),
+        })
+    }
+
+    pub fn with_config(mut self, config: FrontendConfig) -> Self {
+        self.config = config;
+        self
     }
 
     pub fn file(&self) -> &Path {
@@ -51,6 +61,7 @@ pub struct CheckPackageInput {
     root_file: PathBuf,
     packages: Vec<PackageSource>,
     sources: SourceBundle,
+    config: FrontendConfig,
 }
 
 impl CheckPackageInput {
@@ -84,12 +95,22 @@ impl CheckPackageInput {
             root_file,
             packages,
             sources,
+            config: FrontendConfig::default(),
         })
+    }
+
+    pub fn with_config(mut self, config: FrontendConfig) -> Self {
+        self.config = config;
+        self
     }
 }
 
 pub fn check_file(input: CheckFileInput) -> CheckResult {
-    let CheckFileInput { file, sources } = input;
+    let CheckFileInput {
+        file,
+        sources,
+        config,
+    } = input;
     let main_code = read_main(&file)?;
     let root_file_id = canonical_source_file(&file)?;
     let main = PackageModuleInput {
@@ -107,6 +128,7 @@ pub fn check_file(input: CheckFileInput) -> CheckResult {
         cached_sources: vec![main],
         ownership: SourceOwnership::new(&[])?,
         sources,
+        config,
     })
 }
 
@@ -116,6 +138,7 @@ pub fn check_package(input: CheckPackageInput) -> CheckResult {
         root_file,
         packages,
         sources,
+        config,
     } = input;
     let main_code = read_main(&root_file)?;
     let ownership = SourceOwnership::new(&packages)?;
@@ -153,6 +176,7 @@ pub fn check_package(input: CheckPackageInput) -> CheckResult {
         cached_sources,
         ownership,
         sources,
+        config,
     })
 }
 
@@ -163,6 +187,7 @@ struct PreparedCheck {
     cached_sources: Vec<PackageModuleInput>,
     ownership: SourceOwnership,
     sources: SourceBundle,
+    config: FrontendConfig,
 }
 
 fn check_prepared(input: PreparedCheck) -> CheckResult {
@@ -173,6 +198,7 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
         cached_sources,
         ownership,
         sources,
+        mut config,
     } = input;
     if let Some(core) = system_package_input(PackageId::core(), sources.core()) {
         packages.insert(PackageId::core(), core);
@@ -183,7 +209,7 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
     let mut source_loader = PackageSourceEnvironment::new(ownership, &sources);
     source_loader.cache_sources(cached_sources);
 
-    pipeline::check_packages(
+    let ok = pipeline::check_packages(
         PackageProgramInput {
             root_package,
             main,
@@ -195,12 +221,13 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
             preloaded_modules: preloaded_modules(&sources),
             source_loader: &mut source_loader,
         },
-        FrontendConfig {
-            externs: system_externs(&sources),
+        {
+            config.externs = system_externs(&sources);
+            config
         },
     )?;
 
-    Ok(CheckOk)
+    Ok(ok.into())
 }
 
 fn read_main(file: &Path) -> Result<String, CheckError> {

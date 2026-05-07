@@ -1,3 +1,5 @@
+use crate::config::{CompilationContext, PredicateError};
+
 struct Frame {
     parent_active: bool,
     active: bool,
@@ -11,7 +13,10 @@ enum ElseState {
     Seen,
 }
 
-pub(crate) fn filter(source: &str) -> Result<String, Vec<String>> {
+pub(crate) fn filter_with_context(
+    source: &str,
+    ctx: &CompilationContext,
+) -> Result<String, Vec<String>> {
     let mut out = String::with_capacity(source.len());
     let mut stack: Vec<Frame> = vec![];
     let mut errors = vec![];
@@ -20,7 +25,7 @@ pub(crate) fn filter(source: &str) -> Result<String, Vec<String>> {
         let trimmed = line.trim_start();
         match directive(trimmed) {
             Some(Directive::If(cond)) => {
-                let cond = eval_condition(cond, &mut errors).unwrap_or(false);
+                let cond = eval_condition(cond, ctx, &mut errors).unwrap_or(false);
                 let parent_active = active(&stack);
                 stack.push(Frame {
                     parent_active,
@@ -31,7 +36,7 @@ pub(crate) fn filter(source: &str) -> Result<String, Vec<String>> {
                 blank_line(line, &mut out);
             }
             Some(Directive::Elif(cond)) => {
-                let cond = eval_condition(cond, &mut errors).unwrap_or(false);
+                let cond = eval_condition(cond, ctx, &mut errors).unwrap_or(false);
                 match stack.last_mut() {
                     Some(frame) if frame.else_state == ElseState::Seen => {
                         errors.push("#elif after #else".into());
@@ -125,7 +130,7 @@ fn directive_condition<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
         .then(|| rest.trim())
 }
 
-fn eval_condition(cond: &str, errors: &mut Vec<String>) -> Option<bool> {
+fn eval_condition(cond: &str, ctx: &CompilationContext, errors: &mut Vec<String>) -> Option<bool> {
     if cond.is_empty() {
         errors.push("expected condition after #if".into());
         return None;
@@ -147,78 +152,26 @@ fn eval_condition(cond: &str, errors: &mut Vec<String>) -> Option<bool> {
         return None;
     }
 
-    match pred {
-        "profile" => match arg {
-            "debug" => Some(true),
-            "release" => Some(false),
-            _ => {
-                errors.push("unknown profile".into());
-                None
-            }
-        },
-        "os" => eval_known(arg, known_os(), host_os(), "unknown os", errors),
-        "arch" => eval_known(arg, known_arch(), host_arch(), "unknown arch", errors),
-        _ => {
+    match ctx.eval_predicate(pred, arg) {
+        Ok(value) => Some(value),
+        Err(PredicateError::UnknownPredicate) => {
             errors.push("unknown conditional predicate".into());
             None
         }
-    }
-}
-
-fn eval_known(
-    arg: &str,
-    known: &[&str],
-    current: &str,
-    message: &'static str,
-    errors: &mut Vec<String>,
-) -> Option<bool> {
-    if known.contains(&arg) {
-        Some(arg == current)
-    } else {
-        errors.push(message.into());
-        None
-    }
-}
-
-fn known_os() -> &'static [&'static str] {
-    &["macos", "linux", "windows", "wasm", "ios", "android"]
-}
-
-fn known_arch() -> &'static [&'static str] {
-    &["x86_64", "aarch64"]
-}
-
-fn host_os() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "ios") {
-        "ios"
-    } else if cfg!(target_os = "android") {
-        "android"
-    } else if cfg!(target_family = "wasm") {
-        "wasm"
-    } else {
-        "unknown"
-    }
-}
-
-fn host_arch() -> &'static str {
-    if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "unknown"
+        Err(PredicateError::UnknownValue) => {
+            errors.push(format!("unknown {pred}"));
+            None
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter(source: &str) -> Result<String, Vec<String>> {
+        filter_with_context(source, &CompilationContext::default())
+    }
 
     fn filtered(source: &str) -> String {
         filter(source).expect("filter failed")

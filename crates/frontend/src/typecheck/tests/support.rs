@@ -1,11 +1,44 @@
+use std::collections::HashMap;
+
 use crate::{
-    ast::Type,
-    externs,
+    ast::{ExprId, Type},
+    externs::{self, RawExterns, catalog::ExternCatalog},
+    span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
-    typecheck::{self, TypeError},
+    typecheck::{self, CallMap, ExternUseMap, TypeError, decls::DeclarationIndex},
 };
 
-pub(crate) fn assert_typecheck_closed(result: &typecheck::TypecheckResult) {
+pub(crate) struct TypecheckTestResult {
+    types: HashMap<ExprId, (Span, Type)>,
+    calls: CallMap,
+    extern_uses: ExternUseMap,
+    decls: DeclarationIndex,
+    externs: ExternCatalog,
+}
+
+impl TypecheckTestResult {
+    pub(crate) fn types(&self) -> impl Iterator<Item = (&ExprId, &(Span, Type))> {
+        self.types.iter()
+    }
+
+    pub(crate) fn calls(&self) -> &CallMap {
+        &self.calls
+    }
+
+    pub(crate) fn extern_uses(&self) -> &ExternUseMap {
+        &self.extern_uses
+    }
+
+    pub(crate) fn decls(&self) -> &DeclarationIndex {
+        &self.decls
+    }
+
+    pub(crate) fn externs(&self) -> &ExternCatalog {
+        &self.externs
+    }
+}
+
+pub(crate) fn assert_typecheck_closed(result: &TypecheckTestResult) {
     for ty in result.types().map(|(_, (_, ty))| ty) {
         assert_closed_type(ty, "result");
     }
@@ -49,11 +82,32 @@ fn assert_closed_type(ty: &Type, label: &str) {
     );
 }
 
-pub(crate) fn check(source: &str) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
+pub(crate) fn check(source: &str) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let program = parse_program(source);
     let resolved = empty_resolved();
     let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
-    typecheck::check_with_modules(&program, &resolved, raw_externs)
+    check_with_raw_externs(&program, &resolved, raw_externs)
+}
+
+pub(crate) fn check_with_raw_externs(
+    program: &crate::ast::Program,
+    resolved: &crate::resolve::ResolveResult,
+    raw_externs: RawExterns,
+) -> Result<TypecheckTestResult, Vec<TypeError>> {
+    let mut tc = typecheck::typechecker_for_modules(
+        program,
+        resolved,
+        raw_externs,
+        typecheck::TypecheckConfig::default(),
+    )?;
+    let types = tc.finish()?;
+    Ok(TypecheckTestResult {
+        types,
+        calls: tc.calls,
+        extern_uses: tc.extern_uses,
+        decls: tc.decls,
+        externs: tc.externs,
+    })
 }
 
 pub(crate) fn errors(source: &str) -> Vec<TypeError> {
@@ -72,21 +126,21 @@ pub(crate) fn assert_single_error(source: &str, matches: impl FnOnce(&TypeError)
 pub(crate) fn check_mods(
     root_source: &str,
     dep_source: &str,
-) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
+) -> Result<TypecheckTestResult, Vec<TypeError>> {
     check_named(root_source, &[("gamekit", dep_source)])
 }
 
 pub(crate) fn check_named(
     root_source: &str,
     modules: &[(&str, &str)],
-) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
+) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let root = parse_program(root_source);
     let resolved = resolved_modules(&root, modules);
     let raw_externs = externs::collect_source_externs(&root, &resolved).unwrap();
-    typecheck::check_with_modules(&root, &resolved, raw_externs)
+    check_with_raw_externs(&root, &resolved, raw_externs)
 }
 
-fn last_expr_type(result: &typecheck::TypecheckResult) -> Option<Type> {
+fn last_expr_type(result: &TypecheckTestResult) -> Option<Type> {
     result
         .types()
         .max_by(|(_, (left, _)), (_, (right, _))| {

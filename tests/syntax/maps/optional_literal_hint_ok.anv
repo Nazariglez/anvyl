@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+fn take_list(xs: [int]?) {}
+fn take_map(items: [string: int]?) {}
+fn take_tuple(pair: (int?, string)?) {}
+
+fn main() {
+    let xs: [int]? = [];
+    let items: [string: int]? = [:];
+    let pair: (int?, string)? = (nil, "x");
+
+    take_list([]);
+    take_map([:]);
+    take_tuple((nil, "y"));
+}

@@ -909,7 +909,12 @@ impl<'a> CatalogBuilder<'a> {
                 key: Box::new(self.resolve_ty(ctx, key).ty),
                 value: Box::new(self.resolve_ty(ctx, value).ty),
             },
-            ExternTypeExpr::Option(inner) => Type::option_of(self.resolve_ty(ctx, inner).ty),
+            ExternTypeExpr::Option(inner) => {
+                let inner = self.resolve_ty(ctx, inner).ty;
+                self.decls
+                    .core_option_of(inner)
+                    .expect("core Option declaration is available")
+            }
             ExternTypeExpr::Callback(callback) => {
                 let params = callback
                     .params
@@ -1600,7 +1605,18 @@ mod tests {
 
     fn decls(root: &str, modules: &[(&str, &str)], raw: &RawExterns) -> DeclarationIndex {
         let root = parse(root);
-        let resolved = resolved_modules(&root, modules);
+        let mut resolved = resolved_modules(&root, modules);
+        let option_module = ModuleId::named(
+            PackageId::core(),
+            ModulePath::new(vec!["option".to_string()]).unwrap(),
+        );
+        resolved.import_edges.insert(option_module.clone(), vec![]);
+        resolved
+            .module_groups
+            .push(vec![crate::resolve::ResolvedModule {
+                key: option_module,
+                program: parse("pub enum Option<T> { None, Some(T) }"),
+            }]);
         DeclarationIndex::from_root_and_modules(&root, &resolved, raw)
     }
 
@@ -2158,7 +2174,7 @@ mod tests {
             };
             assert_eq!(params.len(), 1);
             assert_eq!(params[0].ty, Type::Any);
-            assert_eq!(ret.as_ref(), &Type::option_of(Type::Int));
+            assert_eq!(ret.as_ref(), &decls.core_option_of(Type::Int).unwrap());
         }
     }
 

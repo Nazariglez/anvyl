@@ -1,11 +1,12 @@
 use super::support::{
-    assert_calls, assert_err, assert_err_count, assert_single_error, assert_ty, assert_ty_mods,
-    assert_ty_named, assert_typecheck_closed, check, check_named, errors,
+    TypecheckTestResult, assert_calls, assert_err, assert_err_count, assert_single_error,
+    assert_ty, assert_ty_mods, assert_ty_named, assert_typecheck_closed, check, check_named,
+    errors,
 };
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
-        CallTarget, GenericArgs, MemberAccessKind, TypeError, TypecheckResult, VariantShape,
+        CallTarget, GenericArgs, MemberAccessKind, TypeError, VariantShape,
         decls::{
             CallableId, DeclError, ExtendId, MethodKey, MethodSurface, ModuleScope, NominalKey,
             VariantSchema,
@@ -483,7 +484,7 @@ mod method_calls {
     use super::*;
 
     fn assert_method_target(
-        result: &TypecheckResult,
+        result: &TypecheckTestResult,
         owner: &str,
         name: &str,
         is_instance: bool,
@@ -959,7 +960,7 @@ mod extend_calls {
     use super::*;
 
     fn assert_extend_target(
-        result: &TypecheckResult,
+        result: &TypecheckTestResult,
         index: usize,
         name: &str,
         surface: MethodSurface,

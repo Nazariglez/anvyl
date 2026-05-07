@@ -704,7 +704,10 @@ impl<L: ModuleLoader> Resolver<'_, L> {
             }
             return;
         }
-        if import_key.is_ignored(self.ignored_roots) || self.loaded.contains(&import_key) {
+        if import_key.is_ignored(self.ignored_roots)
+            || self.loaded.contains(&import_key)
+            || self.visiting.contains(&import_key)
+        {
             return;
         }
         if self

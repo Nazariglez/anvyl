@@ -181,7 +181,7 @@ mod tests {
         lexer::tokenize,
         parser,
         test_support::empty_resolved,
-        typecheck::{DeclarationIndex, ModuleScope},
+        typecheck::{DeclarationIndex, ModuleScope, TypecheckConfig},
     };
 
     fn ident(name: &str) -> Ident {
@@ -248,7 +248,11 @@ mod tests {
             &resolved,
             &crate::externs::RawExterns::default(),
         );
-        let mut tc = TypeChecker::new(decls, crate::externs::catalog::ExternCatalog::default());
+        let mut tc = TypeChecker::new(
+            decls,
+            crate::externs::catalog::ExternCatalog::default(),
+            TypecheckConfig::default(),
+        );
         tc.collect_const_decls(ModuleScope::Root, &program);
         tc.push_scope();
         tc

@@ -436,6 +436,7 @@ impl<'tc> PatternChecker<'tc> {
                             FieldSchema {
                                 ty: field.ty.ty.clone(),
                                 has_default: false,
+                                policy: annotation::AccessPolicy::default(),
                             },
                         )
                     })
@@ -453,10 +454,11 @@ impl<'tc> PatternChecker<'tc> {
         schema: &HashMap<Ident, FieldSchema>,
         access: PlaceAccess,
     ) -> PatternOutcome {
+        let owner = field_check::FieldOwner::Nominal(owner_ty.clone());
         let shape = self.check_field_shape(
             fields,
             schema,
-            field_check::FieldOwner::Nominal(owner_ty.clone()),
+            &owner,
             field_check::MissingFields::None,
             Span::new(0, 0),
         );
@@ -470,6 +472,8 @@ impl<'tc> PatternChecker<'tc> {
         for field in shape.fields {
             let pattern = &fields[field.index].1;
             self.record_extern_field_read(field.name, pattern, &owner_ty);
+            self.tc
+                .check_field_access_policy(&owner_ty, field.name, pattern.span);
             let field_access = self.struct_field_access(&owner_ty, field.name, access);
             let field_ty = self
                 .tc
@@ -530,7 +534,7 @@ impl<'tc> PatternChecker<'tc> {
         &mut self,
         fields: &[(Ident, PatternNode)],
         schema: &HashMap<Ident, FieldSchema>,
-        owner: field_check::FieldOwner,
+        owner: &field_check::FieldOwner,
         missing: field_check::MissingFields,
         span: Span,
     ) -> field_check::FieldShape {
@@ -636,13 +640,14 @@ impl<'tc> PatternChecker<'tc> {
             return PatternOutcome::error();
         };
 
+        let owner = field_check::FieldOwner::Variant {
+            enum_name: resolved.key.name,
+            variant,
+        };
         let shape = self.check_field_shape(
             fields,
             schema,
-            field_check::FieldOwner::Variant {
-                enum_name: resolved.key.name,
-                variant,
-            },
+            &owner,
             field_check::MissingFields::AllowRest { has_rest },
             span,
         );

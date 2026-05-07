@@ -1,8 +1,12 @@
 use std::{collections::HashMap, fs, path::Path};
 
-use anvyx_lang::{CompilationContext, LintConfig, LintLevel};
+use anvyx_lang::{CompilationContext, LintConfig, LintLevel, Profile, TargetArch, TargetOs};
 use anvyx_lang2::{
-    CheckFileInput, CheckPackageInput, PackageId as FrontendPackageId, PackageSource, SourceBundle,
+    CheckFileInput, CheckOk as FrontendCheckOk, CheckPackageInput,
+    CompilationContext as FrontendCompilationContext, Diagnostic, DiagnosticSeverity,
+    FrontendConfig, LintConfig as FrontendLintConfig, LintLevel as FrontendLintLevel,
+    PackageId as FrontendPackageId, PackageSource, Profile as FrontendProfile, SourceBundle,
+    TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs,
 };
 
 use crate::{
@@ -34,19 +38,76 @@ pub fn cmd(
     Ok(())
 }
 
-pub fn new_frontend_cmd(file: &Path) -> Result<(), String> {
+pub fn new_frontend_cmd(
+    file: &Path,
+    lint: LintConfig,
+    ctx: &CompilationContext,
+) -> Result<(), String> {
     let sources = new_frontend_source_bundle()?;
     let manifest_path = Path::new("anvyx.toml");
-    if manifest_path.exists() {
+    let ok = if manifest_path.exists() {
         let graph = crate::manifest::load_package_graph(manifest_path)?;
-        let input = package_check_input(&graph, file, sources)?;
-        anvyx_lang2::check_package(input).map_err(|error| error.to_string())?;
-    } else {
         let input =
-            CheckFileInput::new(file.to_path_buf(), sources).map_err(|error| error.to_string())?;
-        anvyx_lang2::check_file(input).map_err(|error| error.to_string())?;
-    }
+            package_check_input(&graph, file, sources)?.with_config(new_frontend_config(lint, ctx));
+        anvyx_lang2::check_package(input).map_err(|error| error.to_string())?
+    } else {
+        let input = CheckFileInput::new(file.to_path_buf(), sources)
+            .map_err(|error| error.to_string())?
+            .with_config(new_frontend_config(lint, ctx));
+        anvyx_lang2::check_file(input).map_err(|error| error.to_string())?
+    };
+    emit_new_frontend_diagnostics(&ok);
     Ok(())
+}
+
+fn new_frontend_config(lint: LintConfig, ctx: &CompilationContext) -> FrontendConfig {
+    FrontendConfig {
+        lint: FrontendLintConfig {
+            internal_access: match lint.internal_access {
+                LintLevel::Allow => FrontendLintLevel::Allow,
+                LintLevel::Warn => FrontendLintLevel::Warn,
+                LintLevel::Error => FrontendLintLevel::Error,
+            },
+        },
+        context: new_frontend_context(ctx),
+        ..FrontendConfig::default()
+    }
+}
+
+fn new_frontend_context(ctx: &CompilationContext) -> FrontendCompilationContext {
+    FrontendCompilationContext {
+        profile: match ctx.profile {
+            Profile::Debug => FrontendProfile::Debug,
+            Profile::Release => FrontendProfile::Release,
+        },
+        os: match ctx.os {
+            TargetOs::MacOs => FrontendTargetOs::Macos,
+            TargetOs::Linux => FrontendTargetOs::Linux,
+            TargetOs::Windows => FrontendTargetOs::Windows,
+            TargetOs::Wasm => FrontendTargetOs::Wasm,
+            TargetOs::Ios => FrontendTargetOs::Ios,
+            TargetOs::Android => FrontendTargetOs::Android,
+        },
+        arch: match ctx.arch {
+            TargetArch::X86_64 => FrontendTargetArch::X86_64,
+            TargetArch::Aarch64 => FrontendTargetArch::Aarch64,
+        },
+        features: ctx.features.iter().cloned().collect(),
+    }
+}
+
+fn emit_new_frontend_diagnostics(ok: &FrontendCheckOk) {
+    for diagnostic in &ok.diagnostics {
+        eprintln!("{}", render_new_frontend_diagnostic(diagnostic));
+    }
+}
+
+fn render_new_frontend_diagnostic(diagnostic: &Diagnostic) -> String {
+    let prefix = match diagnostic.severity() {
+        DiagnosticSeverity::Error => "error",
+        DiagnosticSeverity::Warning => "warning",
+    };
+    format!("{prefix}: {}", diagnostic.message())
 }
 
 fn package_check_input(
@@ -93,29 +154,11 @@ fn frontend_package_id(id: &PackageId) -> FrontendPackageId {
     FrontendPackageId::new(id.manifest_path().display().to_string())
 }
 
-pub fn reject_new_frontend_inputs(
-    manifest: Option<&Manifest>,
-    lint_overrides: &[String],
-    features: &[String],
-    cfgs: &[String],
-) -> Result<(), String> {
-    if !features.is_empty() {
-        return Err("--new-frontend does not support --feature yet".to_string());
-    }
-    if !cfgs.is_empty() {
-        return Err("--new-frontend does not support --cfg yet".to_string());
-    }
-    if !lint_overrides.is_empty() {
-        return Err("--new-frontend does not support --lint yet".to_string());
-    }
-
+pub fn reject_new_frontend_inputs(manifest: Option<&Manifest>) -> Result<(), String> {
     let Some(manifest) = manifest else {
         return Ok(());
     };
 
-    if manifest.lint.internal_access != LintLevel::Warn {
-        return Err("--new-frontend does not support lint configuration yet".to_string());
-    }
     if manifest.has_externs() {
         return Err("--new-frontend does not support extern providers yet".to_string());
     }
@@ -133,6 +176,14 @@ mod tests {
 
     use super::*;
     use crate::manifest::{DependencyEntry, ExternEntry, Project};
+
+    fn check_new_frontend(file: &Path) -> Result<(), String> {
+        super::new_frontend_cmd(
+            file,
+            LintConfig::default(),
+            &CompilationContext::from_host(Profile::Debug),
+        )
+    }
 
     fn source(code: &str) -> StdModuleSource {
         StdModuleSource {
@@ -166,14 +217,8 @@ mod tests {
         }
     }
 
-    fn unsupported_error(
-        manifest: Option<&Manifest>,
-        lint_overrides: &[String],
-        features: &[String],
-        cfgs: &[String],
-    ) -> String {
-        reject_new_frontend_inputs(manifest, lint_overrides, features, cfgs)
-            .expect_err("input should be unsupported")
+    fn unsupported_error(manifest: Option<&Manifest>) -> String {
+        reject_new_frontend_inputs(manifest).expect_err("input should be unsupported")
     }
 
     mod frontend {
@@ -477,7 +522,7 @@ mod tests {
                     "fn takes_option(x: Option<int>) {} fn takes_ranges(a: Range<int>, b: RangeFrom<int>) {}",
                 );
 
-                new_frontend_cmd(&main).unwrap();
+                check_new_frontend(&main).unwrap();
             }
 
             #[test]
@@ -489,14 +534,14 @@ mod tests {
                     "fn main() { let a: int = (-1).abs(); let b: float = 4.0.sqrt(); let c: int = \"abc\".len(); }",
                 );
 
-                new_frontend_cmd(&main).unwrap();
+                check_new_frontend(&main).unwrap();
             }
 
             #[test]
             fn core_helper_externs_are_not_visible_to_user_modules() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "fn main() { int_abs(1); }");
-                let error = new_frontend_cmd(&main).unwrap_err();
+                let error = check_new_frontend(&main).unwrap_err();
 
                 assert!(error.contains("int_abs"));
             }
@@ -505,7 +550,7 @@ mod tests {
             fn core_primitive_wrapper_modules_are_not_preluded() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "fn main() { core_int.abs(1); }");
-                let error = new_frontend_cmd(&main).unwrap_err();
+                let error = check_new_frontend(&main).unwrap_err();
 
                 assert!(error.contains("core_int"));
             }
@@ -519,7 +564,7 @@ mod tests {
                     "import std:mem; fn main() { mem.collect_cycles(); }",
                 );
 
-                new_frontend_cmd(&main).unwrap();
+                check_new_frontend(&main).unwrap();
             }
 
             #[test]
@@ -531,14 +576,14 @@ mod tests {
                     "import std:mem { collect_cycles }; fn main() { collect_cycles(); }",
                 );
 
-                new_frontend_cmd(&main).unwrap();
+                check_new_frontend(&main).unwrap();
             }
 
             #[test]
             fn std_declarations_are_not_preluded() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "fn main() { collect_cycles(); }");
-                let error = new_frontend_cmd(&main).unwrap_err();
+                let error = check_new_frontend(&main).unwrap_err();
 
                 assert!(error.contains("collect_cycles"));
             }
@@ -547,7 +592,7 @@ mod tests {
             fn old_std_dot_import_is_local_source_syntax() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "import std.mem; fn main() {}");
-                let error = new_frontend_cmd(&main).unwrap_err();
+                let error = check_new_frontend(&main).unwrap_err();
 
                 assert!(error.contains("std/mem.anv") || error.contains("std\\mem.anv"));
             }
@@ -562,7 +607,7 @@ mod tests {
                 );
                 write(&temp, "std/mem.anv", "pub fn local() {}");
 
-                new_frontend_cmd(&main).unwrap();
+                check_new_frontend(&main).unwrap();
             }
 
             #[test]
@@ -576,7 +621,7 @@ mod tests {
                 write(&temp, "src/ui/helper.anv", "pub fn value() -> int { 1 }");
                 write(&temp, "src/common.anv", "pub fn value() -> int { 1 }");
 
-                new_frontend_cmd(&main).unwrap();
+                check_new_frontend(&main).unwrap();
             }
 
             #[test]
@@ -640,42 +685,38 @@ mod tests {
             }
         }
 
+        #[test]
+        fn renders_success_diagnostic() {
+            assert_eq!(
+                render_new_frontend_diagnostic(&Diagnostic::warning("careful")),
+                "warning: careful"
+            );
+        }
+
         mod unsupported {
             use super::*;
 
             #[test]
-            fn feature_flags() {
-                let error = unsupported_error(None, &[], &["demo".to_string()], &[]);
-
-                assert_eq!(error, "--new-frontend does not support --feature yet");
+            fn accepts_feature_flags() {
+                reject_new_frontend_inputs(None).unwrap();
             }
 
             #[test]
-            fn cfg_flags() {
-                let error = unsupported_error(None, &[], &[], &["os=wasm".to_string()]);
-
-                assert_eq!(error, "--new-frontend does not support --cfg yet");
+            fn accepts_cfg_flags() {
+                reject_new_frontend_inputs(None).unwrap();
             }
 
             #[test]
-            fn lint_flags() {
-                let error =
-                    unsupported_error(None, &["internal_access=allow".to_string()], &[], &[]);
-
-                assert_eq!(error, "--new-frontend does not support --lint yet");
+            fn accepts_lint_flags() {
+                reject_new_frontend_inputs(None).unwrap();
             }
 
             #[test]
-            fn manifest_lint() {
+            fn accepts_manifest_lint() {
                 let mut manifest = plain_manifest();
                 manifest.lint.internal_access = LintLevel::Error;
 
-                let error = unsupported_error(Some(&manifest), &[], &[], &[]);
-
-                assert_eq!(
-                    error,
-                    "--new-frontend does not support lint configuration yet"
-                );
+                reject_new_frontend_inputs(Some(&manifest)).unwrap();
             }
 
             #[test]
@@ -688,7 +729,7 @@ mod tests {
                     },
                 );
 
-                let error = unsupported_error(Some(&manifest), &[], &[], &[]);
+                let error = unsupported_error(Some(&manifest));
 
                 assert_eq!(
                     error,
@@ -700,7 +741,7 @@ mod tests {
             fn accepts_plain_manifest() {
                 let manifest = plain_manifest();
 
-                reject_new_frontend_inputs(Some(&manifest), &[], &[], &[]).unwrap();
+                reject_new_frontend_inputs(Some(&manifest)).unwrap();
             }
 
             #[test]
@@ -713,7 +754,7 @@ mod tests {
                     },
                 );
 
-                reject_new_frontend_inputs(Some(&manifest), &[], &[], &[]).unwrap();
+                reject_new_frontend_inputs(Some(&manifest)).unwrap();
             }
         }
     }

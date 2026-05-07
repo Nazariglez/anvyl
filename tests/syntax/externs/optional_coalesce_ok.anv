@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern fn maybe_id() -> int?;
+
+fn main() {
+    let id: int = maybe_id() ?? 0;
+}

@@ -6,15 +6,16 @@ use std::{
     path::PathBuf,
 };
 
-pub use diagnostics::Diagnostic;
+pub use diagnostics::{Diagnostic, DiagnosticSeverity};
 
 use self::diagnostics::{
     diagnose_extern_input_error, diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error,
-    diagnose_type_error,
+    diagnose_type_error, diagnose_type_warning,
 };
 use crate::{
     ast::Program,
     conditional,
+    config::{CompilationContext, LintConfig},
     externs::{self, ExternInputs},
     lexer, parser,
     resolve::{
@@ -84,10 +85,14 @@ pub struct PackageProgramInput<'a, L: PackageSourceLoader> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrontendConfig {
     pub externs: ExternInputs,
+    pub lint: LintConfig,
+    pub context: CompilationContext,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckOk;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckOk {
+    pub diagnostics: Vec<Diagnostic>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckError<E = std::convert::Infallible> {
@@ -115,15 +120,15 @@ pub fn check_packages<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
 ) -> Result<CheckOk, CheckError<L::FatalError>> {
-    let root = parse_package_module(input.main)?;
+    let root = parse_package_module(input.main, &config.context)?;
 
-    let packages = parse_package_inputs(input.packages)?;
-    let preloaded_modules = parse_package_modules(input.preloaded_modules)?;
+    let packages = parse_package_inputs(input.packages, &config.context)?;
+    let preloaded_modules = parse_package_modules(input.preloaded_modules, &config.context)?;
 
     let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
     let external_modules = externs::raw_extern_module_ids(&raw_externs);
 
-    let mut loader = InputModuleLoader::new(input.source_loader);
+    let mut loader = InputModuleLoader::new(input.source_loader, config.context.clone());
     loader.cache_loaded(root.clone());
     for package in packages.values() {
         if let Some(root) = &package.root {
@@ -160,13 +165,26 @@ pub fn check_packages<L: PackageSourceLoader>(
     externs::validate_raw_shapes(&raw_externs).map_err(extern_error)?;
     externs::validate_raw_identities(&raw_externs).map_err(extern_error)?;
 
-    typecheck::check_with_modules(&root.program, &resolved, raw_externs).map_err(|errors| {
-        CheckError::Type {
-            diagnostics: errors.iter().map(diagnose_type_error).collect(),
-        }
+    let typecheck_result = typecheck::check_with_modules(
+        &root.program,
+        &resolved,
+        raw_externs,
+        typecheck::TypecheckConfig {
+            lint: config.lint,
+            context: config.context,
+        },
+    )
+    .map_err(|errors| CheckError::Type {
+        diagnostics: errors.iter().map(diagnose_type_error).collect(),
     })?;
 
-    Ok(CheckOk)
+    Ok(CheckOk {
+        diagnostics: typecheck_result
+            .warnings()
+            .iter()
+            .map(diagnose_type_warning)
+            .collect(),
+    })
 }
 
 fn extern_error<E>(errors: Vec<externs::ExternInputError>) -> CheckError<E> {
@@ -180,11 +198,15 @@ fn extern_error<E>(errors: Vec<externs::ExternInputError>) -> CheckError<E> {
 
 fn parse_package_inputs<E>(
     packages: HashMap<PackageId, PackageSourceInput>,
+    ctx: &CompilationContext,
 ) -> Result<HashMap<PackageId, ResolvePackageInput>, CheckError<E>> {
     packages
         .into_iter()
         .map(|(id, package)| {
-            let root = package.root.map(parse_package_module).transpose()?;
+            let root = package
+                .root
+                .map(|module| parse_package_module(module, ctx))
+                .transpose()?;
             Ok((
                 id,
                 ResolvePackageInput {
@@ -197,31 +219,37 @@ fn parse_package_inputs<E>(
         .collect()
 }
 
-fn parse_package_module<E>(module: PackageModuleInput) -> Result<LoadedModule, CheckError<E>> {
+fn parse_package_module<E>(
+    module: PackageModuleInput,
+    ctx: &CompilationContext,
+) -> Result<LoadedModule, CheckError<E>> {
     Ok(LoadedModule {
         module: module.module,
-        program: parse_source(&module.source)?,
+        program: parse_source(&module.source, ctx)?,
     })
 }
 
 fn parse_package_modules<E>(
     modules: Vec<PackageModuleInput>,
+    ctx: &CompilationContext,
 ) -> Result<Vec<PreloadedModule>, CheckError<E>> {
     modules
         .into_iter()
         .map(|module| {
             Ok(PreloadedModule {
                 module: module.module,
-                program: parse_source(&module.source)?,
+                program: parse_source(&module.source, ctx)?,
             })
         })
         .collect()
 }
 
-fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
-    let code = conditional::filter(&source.code).map_err(|errors| CheckError::Parse {
-        label: source.label.clone(),
-        diagnostics: errors.into_iter().map(Diagnostic::error).collect(),
+fn parse_source<E>(source: &Source, ctx: &CompilationContext) -> Result<Program, CheckError<E>> {
+    let code = conditional::filter_with_context(&source.code, ctx).map_err(|errors| {
+        CheckError::Parse {
+            label: source.label.clone(),
+            diagnostics: errors.into_iter().map(Diagnostic::error).collect(),
+        }
     })?;
 
     let tokens = lexer::tokenize(&code).map_err(|errors| CheckError::Lex {
@@ -238,13 +266,15 @@ fn parse_source<E>(source: &Source) -> Result<Program, CheckError<E>> {
 struct InputModuleLoader<'a, L: PackageSourceLoader> {
     loader: &'a mut L,
     parsed: HashMap<ModuleId, LoadedModule>,
+    context: CompilationContext,
 }
 
 impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
-    fn new(loader: &'a mut L) -> Self {
+    fn new(loader: &'a mut L, context: CompilationContext) -> Self {
         Self {
             loader,
             parsed: HashMap::new(),
+            context,
         }
     }
 
@@ -259,7 +289,7 @@ impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
         if let Some(loaded) = self.parsed.get(&module.module) {
             return Ok(loaded.clone());
         }
-        let loaded = parse_package_module(module).map_err(ModuleLoadError::Fatal)?;
+        let loaded = parse_package_module(module, &self.context).map_err(ModuleLoadError::Fatal)?;
         self.cache_loaded(loaded.clone());
         Ok(loaded)
     }
@@ -536,6 +566,7 @@ mod tests {
             FrontendConfig::default(),
             FrontendConfig {
                 externs: ExternInputs::default(),
+                ..FrontendConfig::default()
             }
         );
     }
@@ -552,6 +583,7 @@ mod tests {
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap();
@@ -569,6 +601,7 @@ mod tests {
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();
@@ -591,6 +624,7 @@ mod tests {
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap();
@@ -626,6 +660,7 @@ mod tests {
             },
             FrontendConfig {
                 externs: package_extern_inputs(host, vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap();
@@ -657,6 +692,7 @@ mod tests {
             },
             FrontendConfig {
                 externs: package_extern_inputs(host, vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();
@@ -694,6 +730,7 @@ mod tests {
             },
             FrontendConfig {
                 externs: package_extern_inputs(math, vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();
@@ -734,6 +771,7 @@ mod tests {
             },
             FrontendConfig {
                 externs: package_extern_inputs(math, vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap();
@@ -772,6 +810,7 @@ mod tests {
             },
             FrontendConfig {
                 externs: package_extern_inputs(math, vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap();
@@ -789,6 +828,7 @@ mod tests {
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();
@@ -809,6 +849,7 @@ mod tests {
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();
@@ -828,6 +869,7 @@ mod tests {
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![invalid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();
@@ -865,6 +907,7 @@ mod tests {
             ),
             FrontendConfig {
                 externs: extern_inputs(vec![valid_provider_descriptor(), provider]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();
@@ -979,6 +1022,7 @@ mod tests {
             input(&mut loader, source("fn main( {}", "main.anv"), None, vec![]),
             FrontendConfig {
                 externs: extern_inputs(vec![invalid_provider_descriptor()]),
+                ..FrontendConfig::default()
             },
         )
         .unwrap_err();

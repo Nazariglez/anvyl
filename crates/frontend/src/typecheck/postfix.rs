@@ -168,23 +168,38 @@ pub(super) fn check_postfix_chain(
 
     tc.set_type(chain.base.node.id, subject_type(&subject), chain.base.span);
 
+    let mut optional_chain = false;
     for (i, step) in chain.steps.iter().enumerate() {
         let is_last_step = i + 1 == chain.steps.len();
         let next_is_call = matches!(chain.steps.get(i + 1), Some(PostfixStep::Call { .. }));
         subject = match step {
             PostfixStep::Field { node, id } => {
+                if node.node.safe {
+                    subject = safe_subject(&subject, node.span, tc);
+                    optional_chain = true;
+                }
                 let field_expected = (is_last_step && !next_is_call)
-                    .then(|| expected.cloned())
+                    .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
                 let subject =
                     apply_field(&subject, node, next_is_call, field_expected.as_ref(), tc);
-                tc.set_type(*id, subject_type(&subject), node.span);
+                tc.set_type(*id, chain_type(&subject, optional_chain, tc), node.span);
                 subject
             }
             PostfixStep::Call { node, id } => {
-                let call_expected = is_last_step.then(|| expected.cloned()).flatten();
+                if node.node.safe {
+                    subject = safe_subject(&subject, node.span, tc);
+                    optional_chain = true;
+                }
+                let call_expected = is_last_step
+                    .then(|| expected_for_chain(expected, optional_chain, tc))
+                    .flatten();
                 let checked = apply_call(&subject, node, *id, call_expected, tc);
-                tc.set_type(*id, checked.ty.clone(), node.span);
+                tc.set_type(
+                    *id,
+                    wrap_optional(checked.ty.clone(), optional_chain, tc),
+                    node.span,
+                );
                 if matches!(subject, Subject::Error) {
                     Subject::Error
                 } else {
@@ -212,7 +227,7 @@ pub(super) fn check_postfix_chain(
         return super::checked_from_type(expr, Type::Infer, tc);
     }
 
-    let ty = subject_type(&subject);
+    let ty = chain_type(&subject, optional_chain, tc);
     let handle = tc.set_type(expr.node.id, ty.clone(), expr.span);
     CheckedType {
         ty,
@@ -252,6 +267,47 @@ fn subject_type(subject: &Subject) -> Type {
         Subject::Type(ty) => ty.clone(),
         Subject::QualifiedExtend { .. } | Subject::Error => Type::Infer,
     }
+}
+
+fn chain_type(subject: &Subject, optional: bool, tc: &TypeChecker) -> Type {
+    wrap_optional(subject_type(subject), optional, tc)
+}
+
+fn wrap_optional(ty: Type, optional: bool, tc: &TypeChecker) -> Type {
+    if optional {
+        tc.optional_chain_result_type(ty)
+    } else {
+        ty
+    }
+}
+
+fn expected_for_chain(
+    expected: Option<&TypeHandle>,
+    optional: bool,
+    tc: &TypeChecker,
+) -> Option<TypeHandle> {
+    let expected = expected.cloned()?;
+    if !optional {
+        return Some(expected);
+    }
+    let ty = tc.handle_type(&expected);
+    tc.decls
+        .core_option_inner(&ty)
+        .map(|inner| tc.type_handle(inner))
+}
+
+fn safe_subject(subject: &Subject, span: Span, tc: &mut TypeChecker) -> Subject {
+    let Subject::Value(value) = subject else {
+        tc.push_error(TypeError::OptionalChainingOnNonOptional { span });
+        return Subject::Error;
+    };
+    if matches!(value.checked.ty, Type::Infer) {
+        return Subject::Value(value.clone());
+    }
+    let inner = tc.optional_chain_inner_type(&value.checked.ty, span);
+    let mut checked = checked_type(inner, tc);
+    checked.contains_extern_any = value.checked.contains_extern_any;
+    Subject::Value(PlaceValue::not_place(checked))
 }
 
 fn value_subject(ty: Type, tc: &TypeChecker) -> Subject {
@@ -372,10 +428,11 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
 
     let target = place::check_place(&index.node.target, tc);
     let indexed = super::check_index_access(index, &target.value.checked, tc);
-    let indexed_place = matches!(
-        &target.value.checked.ty,
-        Type::List { .. } | Type::Array { .. } | Type::Slice { .. }
-    );
+    let indexed_place = !index.node.safe
+        && matches!(
+            &target.value.checked.ty,
+            Type::List { .. } | Type::Array { .. } | Type::Slice { .. }
+        );
     let ty = if indexed_place {
         indexed.write_ty
     } else {
@@ -450,11 +507,12 @@ fn apply_value_field(
     }
     let mut static_method_on_value = false;
     if let Some(key) = key.as_ref()
-        && let Some(agg) = tc.decls.aggregate(key)
+        && let Some(agg) = tc.decls.aggregate(key).cloned()
     {
         if kind == MemberAccessKind::Field
             && let Some(ty) = tc.decls.aggregate_field_type(&receiver, name)
         {
+            tc.check_field_access_policy(&receiver, name, span);
             return Subject::Value(PlaceValue::new(
                 checked_type(ty, tc),
                 place::projected_field_access(receiver_access),
@@ -462,9 +520,17 @@ fn apply_value_field(
             ));
         }
         if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
+            tc.check_access_policy(
+                &method.policy,
+                MemberAccessKind::Method,
+                name,
+                &receiver,
+                &key.module,
+                span,
+            );
             let callee =
                 tc.decls
-                    .callable_for_aggregate_method(agg, name, method, receiver.clone());
+                    .callable_for_aggregate_method(&agg, name, method, receiver.clone());
             return callable_subject(
                 callee,
                 Some(source_receiver(
@@ -483,6 +549,9 @@ fn apply_value_field(
         let parts = extend_method_parts(receiver.clone(), name, &matched);
         return match parts {
             Ok((extend, method, receiver_ty, owner_args)) => {
+                let policy = method.policy.clone();
+                let origin = extend.origin.clone();
+                let owner_ty = receiver.clone();
                 let callee = tc.decls.callable_for_extend_method(
                     receiver_ty,
                     extend,
@@ -490,16 +559,22 @@ fn apply_value_field(
                     method,
                     owner_args,
                 );
-                callable_subject(
-                    callee,
-                    Some(source_receiver(
-                        method.mode,
-                        receiver_access,
-                        receiver_place,
-                        receiver_id,
-                        name,
-                    )),
-                )
+                let receiver = source_receiver(
+                    method.mode,
+                    receiver_access,
+                    receiver_place,
+                    receiver_id,
+                    name,
+                );
+                tc.check_access_policy(
+                    &policy,
+                    MemberAccessKind::Method,
+                    name,
+                    &owner_ty,
+                    &origin,
+                    span,
+                );
+                callable_subject(callee, Some(receiver))
             }
             Err(error) => {
                 push_extend_method_error(tc, error, span);
@@ -694,7 +769,7 @@ fn apply_type_field(
                 return enum_variant_subject(resolved, expected, tc);
             }
             enum_key = Some(key);
-        } else if let Some(agg) = tc.decls.aggregate(&key) {
+        } else if let Some(agg) = tc.decls.aggregate(&key).cloned() {
             let static_key = MethodKey::static_(name);
             let instance_key = MethodKey::instance(name);
             let has_static = agg.methods.contains_key(&static_key);
@@ -703,9 +778,17 @@ fn apply_type_field(
                 return static_extend_conflict(target, name, span, tc);
             }
             if let Some(method) = agg.methods.get(&static_key) {
+                tc.check_access_policy(
+                    &method.policy,
+                    MemberAccessKind::Method,
+                    name,
+                    target,
+                    &key.module,
+                    span,
+                );
                 return callable_subject(
                     tc.decls
-                        .callable_for_aggregate_static_method(agg, name, method, Some(target)),
+                        .callable_for_aggregate_static_method(&agg, name, method, Some(target)),
                     None,
                 );
             }
@@ -768,11 +851,22 @@ fn static_extend_subject(
 ) -> Option<Subject> {
     let matched = tc.find_static_extend_method(target, name)?;
     let subject = match extend_method_parts(target.clone(), name, &matched) {
-        Ok((extend, method, _, owner_args)) => callable_subject(
-            tc.decls
-                .callable_for_static_extend_method(extend, name, method, owner_args),
-            None,
-        ),
+        Ok((extend, method, _, owner_args)) => {
+            let policy = method.policy.clone();
+            let origin = extend.origin.clone();
+            let callee = tc
+                .decls
+                .callable_for_static_extend_method(extend, name, method, owner_args);
+            tc.check_access_policy(
+                &policy,
+                MemberAccessKind::Method,
+                name,
+                target,
+                &origin,
+                span,
+            );
+            callable_subject(callee, None)
+        }
         Err(error) => {
             push_extend_method_error(tc, error, span);
             Subject::Error

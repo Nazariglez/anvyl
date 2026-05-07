@@ -1,9 +1,9 @@
-use super::support::{assert_ty_mods, assert_ty_named, check, check_named};
+use super::support::{TypecheckTestResult, assert_ty_mods, assert_ty_named, check, check_named};
 use crate::{
     ast::{Ident, NominalKind, Type},
     resolve::ModulePath,
     typecheck::{
-        CallTarget, GenericArgs, TypeError, TypecheckResult,
+        CallTarget, GenericArgs, TypeError,
         decls::{
             BindingNamespace, BindingOrigin, CallableId, DeclError, ExtendId, MethodSurface,
             ModuleScope,
@@ -33,7 +33,10 @@ fn enum_ty(module: &str, name: &str) -> Type {
     )
 }
 
-fn expect_errors(result: Result<TypecheckResult, Vec<TypeError>>, message: &str) -> Vec<TypeError> {
+fn expect_errors(
+    result: Result<TypecheckTestResult, Vec<TypeError>>,
+    message: &str,
+) -> Vec<TypeError> {
     let Err(errors) = result else {
         panic!("{message}");
     };
@@ -41,7 +44,7 @@ fn expect_errors(result: Result<TypecheckResult, Vec<TypeError>>, message: &str)
 }
 
 fn expect_single_error(
-    result: Result<TypecheckResult, Vec<TypeError>>,
+    result: Result<TypecheckTestResult, Vec<TypeError>>,
     matches: impl FnOnce(&TypeError) -> bool,
 ) {
     let errors = expect_errors(result, "expected one typecheck error");
@@ -50,7 +53,7 @@ fn expect_single_error(
 }
 
 fn expect_decl_error_count(
-    result: Result<TypecheckResult, Vec<TypeError>>,
+    result: Result<TypecheckTestResult, Vec<TypeError>>,
     expected: usize,
     matches: impl Fn(&DeclError) -> bool,
 ) {
@@ -72,7 +75,7 @@ enum ExpectedDecl {
     ReexportConflict(BindingNamespace, &'static str),
 }
 
-fn assert_decl_error(result: Result<TypecheckResult, Vec<TypeError>>, expected: ExpectedDecl) {
+fn assert_decl_error(result: Result<TypecheckTestResult, Vec<TypeError>>, expected: ExpectedDecl) {
     let errors = expect_errors(result, "expected declaration error");
     assert!(
         errors.iter().any(|error| matches_decl(error, expected)),

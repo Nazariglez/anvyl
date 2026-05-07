@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use super::{
-    ConstSubst, GenericArgs, GenericParams, Specificity, TypeSubst, compare_specificity,
+    ConstSubst, GenericArgs, GenericParams, Specificity, TypeSubst, annotation,
+    compare_specificity,
     const_term::ConstTerm,
     infer::{GenericSolverSeeds, Solver},
     substitute,
@@ -10,13 +11,14 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, FuncParam, GenericArg, Ident, ImportItemKind,
-        ImportKind, MethodReceiver, ModuleOrigin, Mutability, NominalKind, Param, Program, Stmt,
-        StmtNode, Type, TypeParam, VariantKind, Visibility,
+        AggregateKind, ArrayLen, ConstArg, ConstParam, ConstParamId, FuncParam, GenericArg, Ident,
+        ImportItemKind, ImportKind, MethodReceiver, ModuleOrigin, Mutability, NominalKind, Param,
+        Program, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     externs::{RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope},
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveResult, SourceFileId},
     span::Span,
+    typecheck::annotation::AccessPolicy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -351,6 +353,28 @@ pub(crate) enum DeclError {
         name: Ident,
         span: Span,
     },
+    UnknownAnnotation {
+        name: Ident,
+        span: Span,
+    },
+    InvalidAnnotationTarget {
+        name: Ident,
+        target: String,
+        valid_targets: String,
+        span: Span,
+    },
+    DuplicateAnnotation {
+        name: Ident,
+        span: Span,
+    },
+    InvalidAnnotationArgs {
+        name: Ident,
+        message: String,
+        span: Span,
+    },
+    InternalOnToString {
+        span: Span,
+    },
 }
 
 fn module_id_for_scope(scope: &ModuleScope) -> ModuleId {
@@ -407,6 +431,41 @@ pub(crate) enum ModuleMemberLookup<T> {
     Found(T),
     Private,
     Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MapKeyError {
+    pub(crate) ty: Type,
+    pub(crate) field: Option<Ident>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoreRangeKind {
+    Exclusive,
+    Inclusive,
+    From,
+    To,
+    ToInclusive,
+}
+
+impl CoreRangeKind {
+    const ALL: [Self; 5] = [
+        Self::Exclusive,
+        Self::Inclusive,
+        Self::From,
+        Self::To,
+        Self::ToInclusive,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Exclusive => "Range",
+            Self::Inclusive => "RangeInclusive",
+            Self::From => "RangeFrom",
+            Self::To => "RangeTo",
+            Self::ToInclusive => "RangeToInclusive",
+        }
+    }
 }
 
 type OriginKey = (BindingNamespace, Ident);
@@ -849,6 +908,7 @@ pub(crate) struct AggregateSchema {
 pub(crate) struct FieldSchema {
     pub(crate) ty: Type,
     pub(crate) has_default: bool,
+    pub(crate) policy: AccessPolicy,
 }
 
 #[derive(Clone)]
@@ -858,6 +918,7 @@ pub(crate) struct MethodSchema {
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
     pub(crate) ret: Type,
+    pub(crate) policy: AccessPolicy,
 }
 
 #[derive(Clone)]
@@ -890,6 +951,7 @@ pub(crate) struct ExtendMethodSchema {
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
     pub(crate) ret: Type,
+    pub(crate) policy: AccessPolicy,
 }
 
 pub(crate) enum ExtendMethodMatch<'a> {
@@ -1243,6 +1305,11 @@ impl DeclarationIndex {
             match &stmt.node {
                 Stmt::Func(func_node) => {
                     let func = &func_node.node;
+                    annotation::normalize_annotations(
+                        &func.annotations,
+                        annotation::AnnotationTarget::Func,
+                        &mut self.errors,
+                    );
                     let ty = func_type_from_params(&func.params, &func.ret);
                     let value = ResolvedValue {
                         module: scope.clone(),
@@ -1270,18 +1337,39 @@ impl DeclarationIndex {
                         kind: agg.kind.into(),
                         name: agg.name,
                     };
+                    let target = match agg.kind {
+                        AggregateKind::Struct => annotation::AnnotationTarget::Struct,
+                        AggregateKind::DataRef => annotation::AnnotationTarget::DataRef,
+                    };
+                    annotation::normalize_annotations(&agg.annotations, target, &mut self.errors);
                     let mut fields = HashMap::new();
                     for field in &agg.fields {
+                        let policy = annotation::normalize_annotations(
+                            &field.annotations,
+                            annotation::AnnotationTarget::Field,
+                            &mut self.errors,
+                        );
                         fields.insert(
                             field.name,
                             FieldSchema {
                                 ty: field.ty.clone(),
                                 has_default: field.default.is_some(),
+                                policy,
                             },
                         );
                     }
                     let mut methods = HashMap::new();
                     for method in &agg.methods {
+                        let policy = annotation::normalize_annotations(
+                            &method.annotations,
+                            annotation::AnnotationTarget::InlineMethod,
+                            &mut self.errors,
+                        );
+                        if policy.has_internal() && method.sig.name == Ident::new("to_string") {
+                            self.errors.push(DeclError::InternalOnToString {
+                                span: agg_node.span,
+                            });
+                        }
                         let mode = MethodMode::from_receiver(method.sig.receiver);
                         let method_key = MethodKey::new(method.sig.name, mode.surface());
                         let schema = MethodSchema {
@@ -1293,6 +1381,7 @@ impl DeclarationIndex {
                             params: resolve_func_params(&method.sig.params),
                             required_params: required_param_count(&method.sig.params),
                             ret: method.sig.ret.clone(),
+                            policy,
                         };
                         match methods.entry(method_key) {
                             Entry::Occupied(entry) => {
@@ -1335,19 +1424,35 @@ impl DeclarationIndex {
                         kind: NominalKind::Enum,
                         name: enm.name,
                     };
+                    annotation::normalize_annotations(
+                        &enm.annotations,
+                        annotation::AnnotationTarget::Enum,
+                        &mut self.errors,
+                    );
                     let mut variants = HashMap::new();
                     for variant in &enm.variants {
+                        annotation::normalize_annotations(
+                            &variant.annotations,
+                            annotation::AnnotationTarget::Variant,
+                            &mut self.errors,
+                        );
                         let schema = match &variant.kind {
                             VariantKind::Unit => VariantSchema::Unit,
                             VariantKind::Tuple(types) => VariantSchema::Tuple(types.clone()),
                             VariantKind::Struct(fields) => {
                                 let mut field_map = HashMap::new();
                                 for f in fields {
+                                    let policy = annotation::normalize_annotations(
+                                        &f.annotations,
+                                        annotation::AnnotationTarget::Field,
+                                        &mut self.errors,
+                                    );
                                     field_map.insert(
                                         f.name,
                                         FieldSchema {
                                             ty: f.ty.clone(),
                                             has_default: f.default.is_some(),
+                                            policy,
                                         },
                                     );
                                 }
@@ -1376,6 +1481,11 @@ impl DeclarationIndex {
                 }
                 Stmt::Const(const_node) => {
                     let c = &const_node.node;
+                    annotation::normalize_annotations(
+                        &c.annotations,
+                        annotation::AnnotationTarget::Const,
+                        &mut self.errors,
+                    );
                     let value = ResolvedValue {
                         module: scope.clone(),
                         name: c.name,
@@ -1388,6 +1498,20 @@ impl DeclarationIndex {
                         value,
                         exported,
                         const_node.span,
+                    );
+                }
+                Stmt::ExternFunc(func_node) => {
+                    annotation::normalize_annotations(
+                        &func_node.node.annotations,
+                        annotation::AnnotationTarget::ExternFunc,
+                        &mut self.errors,
+                    );
+                }
+                Stmt::ExternType(ty_node) => {
+                    annotation::normalize_annotations(
+                        &ty_node.node.annotations,
+                        annotation::AnnotationTarget::ExternType,
+                        &mut self.errors,
                     );
                 }
                 Stmt::Extend(extend_node) => {
@@ -1404,6 +1528,11 @@ impl DeclarationIndex {
                     let mut methods = HashMap::new();
                     for method_node in &ext.methods {
                         let m = &method_node.node;
+                        let policy = annotation::normalize_annotations(
+                            &m.annotations,
+                            annotation::AnnotationTarget::ExtendMethod,
+                            &mut self.errors,
+                        );
                         let mode = MethodMode::from_receiver(m.sig.receiver);
                         let key = MethodKey::new(m.sig.name, mode.surface());
                         let schema = ExtendMethodSchema {
@@ -1412,6 +1541,7 @@ impl DeclarationIndex {
                             params: resolve_func_params(&m.sig.params),
                             required_params: required_param_count(&m.sig.params),
                             ret: m.sig.ret.clone(),
+                            policy,
                         };
                         if methods.contains_key(&key)
                             || self.extends.iter().any(|prior| {
@@ -1925,8 +2055,116 @@ impl DeclarationIndex {
         Some(inner)
     }
 
+    pub(crate) fn core_range_of(&self, kind: CoreRangeKind, inner: Type) -> Option<Type> {
+        let key = self.core_range_key(kind)?;
+        Some(nominal_type_with_args(&key, &[inner], &[]))
+    }
+
+    pub(crate) fn core_range_kind(&self, ty: &Type) -> Option<CoreRangeKind> {
+        let key = self.key_for_type(ty)?;
+        CoreRangeKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| self.core_range_key(*kind).as_ref() == Some(&key))
+    }
+
+    pub(crate) fn core_range_inner<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
+        self.core_range_kind(ty)?;
+        let Type::Nominal(nominal) = ty else {
+            return None;
+        };
+        let [inner] = nominal.type_args.as_slice() else {
+            return None;
+        };
+        Some(inner)
+    }
+
+    pub(crate) fn map_key_error(&self, ty: &Type) -> Option<MapKeyError> {
+        self.map_key_error_inner(ty, &mut HashSet::new())
+    }
+
+    fn map_key_error_inner(
+        &self,
+        ty: &Type,
+        seen: &mut HashSet<NominalKey>,
+    ) -> Option<MapKeyError> {
+        if self.core_option_inner(ty).is_some() {
+            return Some(MapKeyError {
+                ty: ty.clone(),
+                field: None,
+            });
+        }
+
+        match ty {
+            Type::Int
+            | Type::Bool
+            | Type::String
+            | Type::Infer
+            | Type::InferReturn
+            | Type::Var(_)
+            | Type::UnresolvedName(_)
+            | Type::UnresolvedNominal { .. } => None,
+            Type::Tuple(elems) => elems
+                .iter()
+                .find_map(|elem| self.map_key_error_inner(elem, seen)),
+            Type::Nominal(_) => self.nominal_map_key_error(ty, seen),
+            Type::Any
+            | Type::Float
+            | Type::Void
+            | Type::Func { .. }
+            | Type::List { .. }
+            | Type::Array { .. }
+            | Type::Map { .. }
+            | Type::Slice { .. } => Some(MapKeyError {
+                ty: ty.clone(),
+                field: None,
+            }),
+        }
+    }
+
+    fn nominal_map_key_error(
+        &self,
+        ty: &Type,
+        seen: &mut HashSet<NominalKey>,
+    ) -> Option<MapKeyError> {
+        let key = self.key_for_type(ty)?;
+        match key.kind {
+            NominalKind::Enum => None,
+            NominalKind::Extern => Some(MapKeyError {
+                ty: ty.clone(),
+                field: None,
+            }),
+            NominalKind::Struct | NominalKind::DataRef => {
+                if !seen.insert(key.clone()) {
+                    return None;
+                }
+                let agg = self.aggregate(&key)?;
+                let mut fields = agg.fields.iter().collect::<Vec<_>>();
+                fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+                for (name, field) in fields {
+                    let field_ty = substitute_aggregate_member(ty, &agg.generics, &field.ty);
+                    if let Some(err) = self.map_key_error_inner(&field_ty, seen) {
+                        seen.remove(&key);
+                        return Some(MapKeyError {
+                            ty: err.ty,
+                            field: Some(*name),
+                        });
+                    }
+                }
+                seen.remove(&key);
+                None
+            }
+        }
+    }
+
     fn core_option_key(&self) -> Option<NominalKey> {
         self.core_enum_key("option", Type::OPTION_ENUM_NAME)
+    }
+
+    fn core_range_key(&self, kind: CoreRangeKind) -> Option<NominalKey> {
+        let name = Ident::new(kind.name());
+        self.local_type(&core_module_scope("range"), name)
+            .filter(|key| key.kind == NominalKind::Struct && key.name == name)
     }
 
     fn core_enum_key(&self, module: &str, name: &str) -> Option<NominalKey> {
@@ -1944,6 +2182,16 @@ impl DeclarationIndex {
             &agg.generics,
             &field.ty,
         ))
+    }
+
+    pub(crate) fn aggregate_field_policy(
+        &self,
+        receiver: &Type,
+        name: Ident,
+    ) -> Option<(ModuleScope, AccessPolicy)> {
+        let key = self.key_for_type(receiver)?;
+        let policy = self.aggregate(&key)?.fields.get(&name)?.policy.clone();
+        Some((key.module, policy))
     }
 
     pub(crate) fn extends(&self) -> impl Iterator<Item = &ExtendSchema> {
@@ -2946,10 +3194,15 @@ mod tests {
         let root = parse(root);
         let resolved = resolved_modules(&root, modules);
         let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
-        super::super::check_with_modules(&root, &resolved, externs)
-            .expect("typecheck failed")
-            .decls()
-            .clone()
+        let mut tc = super::super::typechecker_for_modules(
+            &root,
+            &resolved,
+            externs,
+            super::super::TypecheckConfig::default(),
+        )
+        .expect("typecheck failed");
+        tc.finish().expect("typecheck failed");
+        tc.decls.clone()
     }
 
     fn provider_index(root: &str, provider: ProviderDescriptor) -> DeclarationIndex {

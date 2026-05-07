@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: range indexing is not supported for type
+
+fn main() {
+    let m = [1: "one", 2: "two"];
+    let _ = m[1..3];
+}

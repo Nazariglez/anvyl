@@ -21,6 +21,7 @@ pub(crate) use self::{
 };
 use crate::{
     ast::*,
+    config::{CompilationContext, LintConfig, LintLevel, PredicateError},
     externs::{
         RawExterns,
         catalog::{
@@ -32,6 +33,7 @@ use crate::{
     span::Span,
 };
 
+mod annotation;
 mod const_eval;
 mod const_term;
 mod control_flow;
@@ -68,6 +70,12 @@ pub(crate) enum MemberAccessKind {
     Method,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TypecheckConfig {
+    pub(crate) lint: LintConfig,
+    pub(crate) context: CompilationContext,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VariantShape {
     Unit,
@@ -88,6 +96,27 @@ impl GenericParamKind {
             Self::Const => "const",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TypeWarning {
+    DeprecatedAccess {
+        kind: MemberAccessKind,
+        name: Ident,
+        reason: Option<String>,
+        span: Span,
+    },
+    InternalAccess {
+        kind: MemberAccessKind,
+        name: Ident,
+        owner: Type,
+        reason: Option<String>,
+        span: Span,
+    },
+    CompileMessage {
+        message: String,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +275,10 @@ pub(crate) enum TypeError {
         found: Type,
         span: Span,
     },
+    ForIterationModifier {
+        message: &'static str,
+        span: Span,
+    },
     UnsupportedPattern {
         pattern: &'static str,
         span: Span,
@@ -278,6 +311,9 @@ pub(crate) enum TypeError {
         span: Span,
     },
     OptionalPatternOnNonOptional {
+        span: Span,
+    },
+    OptionalChainingOnNonOptional {
         span: Span,
     },
     NestedOptionalPattern {
@@ -322,6 +358,40 @@ pub(crate) enum TypeError {
     ReadonlyMethodMutation {
         span: Span,
     },
+    InternalAccess {
+        kind: MemberAccessKind,
+        name: Ident,
+        owner: Type,
+        reason: Option<String>,
+        span: Span,
+    },
+    UnknownIntrinsic {
+        name: Ident,
+        span: Span,
+    },
+    IntrinsicArgCount {
+        name: Ident,
+        expected: usize,
+        found: usize,
+        span: Span,
+    },
+    IntrinsicExpectedIdent {
+        name: Ident,
+        span: Span,
+    },
+    IntrinsicExpectedString {
+        name: Ident,
+        span: Span,
+    },
+    UnknownIntrinsicValue {
+        predicate: Ident,
+        value: Ident,
+        span: Span,
+    },
+    CompileError {
+        message: String,
+        span: Span,
+    },
     MethodGenericShadow {
         owner_kind: AggregateKind,
         method_param: GenericParamKind,
@@ -345,6 +415,22 @@ pub(crate) enum TypeError {
     },
     IndexOnNonIndexable {
         found: Type,
+        span: Span,
+    },
+    RangeIndexNotInt {
+        found: Type,
+        span: Span,
+    },
+    RangeIndexUnsupported {
+        found: Type,
+        span: Span,
+    },
+    NonKeyableMapKey {
+        ty: Type,
+        field: Option<Ident>,
+        span: Span,
+    },
+    DuplicateMapKey {
         span: Span,
     },
     UndefinedModuleMember {
@@ -433,6 +519,11 @@ pub(crate) enum TypeError {
         span: Span,
     },
     InvalidConstCast {
+        from: Type,
+        to: Type,
+        span: Span,
+    },
+    InvalidCast {
         from: Type,
         to: Type,
         span: Span,
@@ -538,7 +629,7 @@ struct ReturnFrame {
 
 struct TypeChecker {
     solver: Solver,
-    calls: HashMap<ExprId, CallTarget>,
+    calls: CallMap,
     extern_uses: ExternUseMap,
     decls: DeclarationIndex,
     externs: ExternCatalog,
@@ -547,6 +638,8 @@ struct TypeChecker {
     loop_depth: usize,
     defer_depth: usize,
     errors: Vec<TypeError>,
+    warnings: Vec<TypeWarning>,
+    config: TypecheckConfig,
     current_module: ModuleScope,
     module_programs: HashMap<ModuleScope, Rc<Program>>,
     type_substs: Vec<TypeSubst>,
@@ -613,7 +706,7 @@ impl TypeFolder for CheckedSubstituter<'_, '_> {
 }
 
 impl TypeChecker {
-    fn new(decls: DeclarationIndex, externs: ExternCatalog) -> Self {
+    fn new(decls: DeclarationIndex, externs: ExternCatalog, config: TypecheckConfig) -> Self {
         Self {
             solver: Solver::default(),
             calls: HashMap::new(),
@@ -625,6 +718,8 @@ impl TypeChecker {
             loop_depth: 0,
             defer_depth: 0,
             errors: vec![],
+            warnings: vec![],
+            config,
             current_module: ModuleScope::Root,
             module_programs: HashMap::new(),
             type_substs: vec![],
@@ -748,6 +843,10 @@ impl TypeChecker {
         self.solver.list_handle(elem)
     }
 
+    fn map_handle(&mut self, key: TypeHandle, value: TypeHandle) -> TypeHandle {
+        self.solver.map_handle(key, value)
+    }
+
     fn tuple_handle(&mut self, elems: Vec<TypeHandle>) -> TypeHandle {
         self.solver.tuple_handle(elems)
     }
@@ -842,6 +941,18 @@ impl TypeChecker {
         true
     }
 
+    fn validate_map_key_type(&mut self, ty: &Type, span: Span) {
+        if let Some(err) = map_key_type_error(&self.decls, ty, span) {
+            self.push_error(err);
+        }
+    }
+
+    fn validate_map_key_type_in(&mut self, decls: &DeclarationIndex, ty: &Type, span: Span) {
+        if let Some(err) = map_key_type_error(decls, ty, span) {
+            self.push_error(err);
+        }
+    }
+
     fn extern_type_id(&self, ty: &Type) -> Option<ExternTypeId> {
         let key = self.decls.key_for_type(ty)?;
         (key.kind == NominalKind::Extern)
@@ -923,6 +1034,79 @@ impl TypeChecker {
 
     fn push_error(&mut self, err: TypeError) {
         self.errors.push(err);
+    }
+
+    fn push_warning(&mut self, warning: TypeWarning) {
+        self.warnings.push(warning);
+    }
+
+    fn check_field_access_policy(&mut self, owner: &Type, name: Ident, span: Span) {
+        if let Some((origin, policy)) = self.decls.aggregate_field_policy(owner, name) {
+            self.check_access_policy(&policy, MemberAccessKind::Field, name, owner, &origin, span);
+        }
+    }
+
+    fn optional_chain_inner_type(&mut self, ty: &Type, span: Span) -> Type {
+        if matches!(ty, Type::Infer) {
+            return Type::Infer;
+        }
+        if let Some(inner) = self.decls.core_option_inner(ty) {
+            return inner.clone();
+        }
+        self.push_error(TypeError::OptionalChainingOnNonOptional { span });
+        ty.clone()
+    }
+
+    fn optional_chain_result_type(&self, ty: Type) -> Type {
+        if matches!(ty, Type::Infer | Type::Void) || self.decls.core_option_inner(&ty).is_some() {
+            return ty;
+        }
+        self.decls.core_option_of(ty).unwrap_or(Type::Infer)
+    }
+
+    fn check_access_policy(
+        &mut self,
+        policy: &annotation::AccessPolicy,
+        kind: MemberAccessKind,
+        name: Ident,
+        owner: &Type,
+        origin: &ModuleScope,
+        span: Span,
+    ) {
+        if policy.has_deprecated() {
+            self.push_warning(TypeWarning::DeprecatedAccess {
+                kind,
+                name,
+                reason: policy.deprecated_reason().map(str::to_string),
+                span,
+            });
+        }
+
+        if !policy.has_internal() {
+            return;
+        }
+        if origin == &self.current_module || self.config.lint.internal_access == LintLevel::Allow {
+            return;
+        }
+
+        let reason = policy.internal_reason().map(str::to_string);
+        match self.config.lint.internal_access {
+            LintLevel::Allow => unreachable!("allow returned before diagnostic emission"),
+            LintLevel::Warn => self.push_warning(TypeWarning::InternalAccess {
+                kind,
+                name,
+                owner: owner.clone(),
+                reason,
+                span,
+            }),
+            LintLevel::Error => self.push_error(TypeError::InternalAccess {
+                kind,
+                name,
+                owner: owner.clone(),
+                reason,
+                span,
+            }),
+        }
     }
 
     fn push_error_once(&mut self, err: TypeError) {
@@ -1303,10 +1487,10 @@ impl TypeChecker {
         }
     }
 
-    fn into_result(mut self) -> Result<TypecheckResult, Vec<TypeError>> {
+    fn finish(&mut self) -> Result<HashMap<ExprId, (Span, Type)>, Vec<TypeError>> {
         self.solve_constraints();
         if !self.errors.is_empty() {
-            return Err(self.errors);
+            return Err(std::mem::take(&mut self.errors));
         }
 
         let (types, finalize_errors) = self.solver.finalize_expr_types();
@@ -1317,17 +1501,17 @@ impl TypeChecker {
             }
         }
         if self.errors.is_empty() {
-            Ok(TypecheckResult {
-                types,
-                calls: self.calls,
-                extern_uses: self.extern_uses,
-                decls: self.decls,
-                externs: self.externs,
-                consts: const_eval::evaluated_consts(self.consts),
-            })
+            Ok(types)
         } else {
-            Err(self.errors)
+            Err(std::mem::take(&mut self.errors))
         }
+    }
+
+    fn into_result(mut self) -> Result<TypecheckResult, Vec<TypeError>> {
+        self.finish()?;
+        Ok(TypecheckResult {
+            warnings: self.warnings,
+        })
     }
 
     fn result_closure_errors(&self, types: &HashMap<ExprId, (Span, Type)>) -> Vec<TypeError> {
@@ -1397,6 +1581,7 @@ impl TypeChecker {
             }
             Type::Map { key, value } => {
                 self.validate_nominal_uses(key, span);
+                self.validate_map_key_type(key, span);
                 self.validate_nominal_uses(value, span);
             }
             Type::Infer
@@ -1489,6 +1674,7 @@ impl TypeChecker {
             }
             Type::Map { key, value } => {
                 self.validate_nominal_uses_in(decls, key, span);
+                self.validate_map_key_type_in(decls, key, span);
                 self.validate_nominal_uses_in(decls, value, span);
             }
             Type::Infer
@@ -1559,11 +1745,30 @@ impl TypeChecker {
     }
 }
 
+fn map_key_type_error(decls: &DeclarationIndex, ty: &Type, span: Span) -> Option<TypeError> {
+    let err = decls.map_key_error(ty)?;
+    Some(TypeError::NonKeyableMapKey {
+        ty: err.ty,
+        field: err.field,
+        span,
+    })
+}
+
 pub(crate) fn check_with_modules(
     program: &Program,
     resolved: &ResolveResult,
     externs: RawExterns,
+    config: TypecheckConfig,
 ) -> Result<TypecheckResult, Vec<TypeError>> {
+    typechecker_for_modules(program, resolved, externs, config)?.into_result()
+}
+
+fn typechecker_for_modules(
+    program: &Program,
+    resolved: &ResolveResult,
+    externs: RawExterns,
+    config: TypecheckConfig,
+) -> Result<TypeChecker, Vec<TypeError>> {
     let mut decls = DeclarationIndex::from_root_and_modules(program, resolved, &externs);
     if decls.has_errors() {
         return Err(decl_errors(decls.errors()));
@@ -1576,7 +1781,7 @@ pub(crate) fn check_with_modules(
     })?;
     decls.sync_extern_headers(&catalog);
 
-    let mut tc = TypeChecker::new(decls, catalog);
+    let mut tc = TypeChecker::new(decls, catalog, config);
     let root_scope = ModuleScope::from_module_id(&resolved.root);
     tc.current_module = root_scope.clone();
     tc.collect_const_decls(root_scope.clone(), program);
@@ -1618,7 +1823,7 @@ pub(crate) fn check_with_modules(
         check_module_bodies(&module, program.as_ref(), &mut tc);
     }
 
-    tc.into_result()
+    Ok(tc)
 }
 
 fn decl_errors(errors: &[DeclError]) -> Vec<TypeError> {
@@ -3105,13 +3310,184 @@ fn check_expr_checked_with_hint(
             check_match_checked_with_hint(match_node, expected, tc),
             tc,
         ),
-        ExprKind::Range(_)
-        | ExprKind::MapLiteral(_)
-        | ExprKind::StringInterp(_)
-        | ExprKind::Cast(_)
-        | ExprKind::Lambda(_)
-        | ExprKind::IntrinsicCall(_) => checked_from_type(expr, Type::Void, tc),
+        ExprKind::StringInterp(parts) => check_string_interp(expr, parts, tc),
+        ExprKind::MapLiteral(lit) => check_map_lit_hint(expr, lit, expected, tc),
+        ExprKind::IntrinsicCall(call) => check_intrinsic_call(expr, call, tc),
+        ExprKind::Range(range) => check_range_expr(expr, range, expected, tc),
+        ExprKind::Cast(cast) => check_cast_expr(expr, cast, tc),
+        ExprKind::Lambda(_) => checked_from_type(expr, Type::Void, tc),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntrinsicKind {
+    Predicate,
+    Warning,
+    Error,
+    Log,
+    File,
+    Line,
+    Function,
+}
+
+fn intrinsic_kind(name: Ident) -> Option<IntrinsicKind> {
+    Some(match name.as_str() {
+        "profile" | "os" | "arch" | "feature" => IntrinsicKind::Predicate,
+        "warning" => IntrinsicKind::Warning,
+        "error" => IntrinsicKind::Error,
+        "log" => IntrinsicKind::Log,
+        "file" => IntrinsicKind::File,
+        "line" => IntrinsicKind::Line,
+        "function" => IntrinsicKind::Function,
+        _ => return None,
+    })
+}
+
+fn check_intrinsic_call(
+    expr: &ExprNode,
+    call: &IntrinsicCallNode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let name = call.node.name;
+    let Some(kind) = intrinsic_kind(name) else {
+        tc.push_error(TypeError::UnknownIntrinsic {
+            name,
+            span: call.span,
+        });
+        return checked_from_type(expr, Type::Infer, tc);
+    };
+
+    match kind {
+        IntrinsicKind::Predicate => {
+            if let Some(arg) = intrinsic_ident_arg(name, &call.node.args, call.span, tc) {
+                eval_intrinsic_predicate(name, arg, call.span, tc);
+            }
+            checked_from_type(expr, Type::Bool, tc)
+        }
+        IntrinsicKind::Warning | IntrinsicKind::Log | IntrinsicKind::Error => {
+            let Some(message) = intrinsic_string_arg(name, &call.node.args, call.span, tc) else {
+                return checked_from_type(expr, Type::Void, tc);
+            };
+            if kind == IntrinsicKind::Error {
+                tc.push_error(TypeError::CompileError {
+                    message,
+                    span: call.span,
+                });
+            } else {
+                tc.push_warning(TypeWarning::CompileMessage {
+                    message,
+                    span: call.span,
+                });
+            }
+            checked_from_type(expr, Type::Void, tc)
+        }
+        IntrinsicKind::File | IntrinsicKind::Function => {
+            check_intrinsic_arg_count(name, &call.node.args, 0, call.span, tc);
+            checked_from_type(expr, Type::String, tc)
+        }
+        IntrinsicKind::Line => {
+            check_intrinsic_arg_count(name, &call.node.args, 0, call.span, tc);
+            checked_from_type(expr, Type::Int, tc)
+        }
+    }
+}
+
+fn intrinsic_ident_arg(
+    name: Ident,
+    args: &[ExprNode],
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Option<Ident> {
+    if !check_intrinsic_arg_count(name, args, 1, span, tc) {
+        return None;
+    }
+    let ExprKind::Ident(arg) = args[0].node.kind else {
+        tc.push_error(TypeError::IntrinsicExpectedIdent {
+            name,
+            span: args[0].span,
+        });
+        return None;
+    };
+    Some(arg)
+}
+
+fn intrinsic_string_arg(
+    name: Ident,
+    args: &[ExprNode],
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Option<String> {
+    if !check_intrinsic_arg_count(name, args, 1, span, tc) {
+        return None;
+    }
+    let ExprKind::Lit(Lit::String(message)) = &args[0].node.kind else {
+        tc.push_error(TypeError::IntrinsicExpectedString {
+            name,
+            span: args[0].span,
+        });
+        return None;
+    };
+    Some(message.clone())
+}
+
+fn check_intrinsic_arg_count(
+    name: Ident,
+    args: &[ExprNode],
+    expected: usize,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> bool {
+    if args.len() == expected {
+        return true;
+    }
+    tc.push_error(TypeError::IntrinsicArgCount {
+        name,
+        expected,
+        found: args.len(),
+        span,
+    });
+    false
+}
+
+fn eval_intrinsic_predicate(
+    name: Ident,
+    arg: Ident,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Option<bool> {
+    match tc
+        .config
+        .context
+        .eval_predicate(name.as_str(), arg.as_str())
+    {
+        Ok(value) => Some(value),
+        Err(PredicateError::UnknownValue) => {
+            tc.push_error(TypeError::UnknownIntrinsicValue {
+                predicate: name,
+                value: arg,
+                span,
+            });
+            None
+        }
+        Err(PredicateError::UnknownPredicate) => None,
+    }
+}
+
+fn intrinsic_bool_value(expr: &ExprNode, tc: &TypeChecker) -> Option<bool> {
+    let ExprKind::IntrinsicCall(call) = &expr.node.kind else {
+        return None;
+    };
+    let name = call.node.name;
+    if intrinsic_kind(name) != Some(IntrinsicKind::Predicate) || call.node.args.len() != 1 {
+        return None;
+    }
+    let ExprKind::Ident(arg) = call.node.args[0].node.kind else {
+        return None;
+    };
+    tc.config
+        .context
+        .eval_predicate(name.as_str(), arg.as_str())
+        .ok()
 }
 
 fn type_from_lit(lit: &Lit) -> Type {
@@ -3545,10 +3921,19 @@ fn check_if_checked_with_hint(
 ) -> CheckedType {
     let cond = check_expr_checked(&if_node.node.cond, tc);
     check_bool_condition(ConditionKind::If, cond, if_node.node.cond.span, tc);
+    let known_cond = intrinsic_bool_value(&if_node.node.cond, tc);
     let Some(else_block) = &if_node.node.else_block else {
-        check_block_checked(&if_node.node.then_block, tc);
+        if known_cond != Some(false) {
+            check_block_checked(&if_node.node.then_block, tc);
+        }
         return checked_void(tc);
     };
+    if known_cond == Some(true) {
+        return check_block_checked_with_hint(&if_node.node.then_block, expected, tc);
+    }
+    if known_cond == Some(false) {
+        return check_block_checked_with_hint(else_block, expected, tc);
+    }
     let then = check_block_checked_with_hint(&if_node.node.then_block, expected.clone(), tc);
     let else_checked = check_block_checked_with_hint(else_block, expected.clone(), tc);
     join_branches_with_hint(
@@ -3569,6 +3954,13 @@ fn check_ternary_checked_with_hint(
     let node = &ternary_node.node;
     let cond = check_expr_checked(&node.cond, tc);
     check_bool_condition(ConditionKind::Ternary, cond, node.cond.span, tc);
+    let known_cond = intrinsic_bool_value(&node.cond, tc);
+    if known_cond == Some(true) {
+        return check_value_expr_checked_with_hint(&node.then_expr, expected, tc);
+    }
+    if known_cond == Some(false) {
+        return check_value_expr_checked_with_hint(&node.else_expr, expected, tc);
+    }
     let then = check_value_expr_checked_with_hint(&node.then_expr, expected.clone(), tc);
     let else_checked = check_value_expr_checked_with_hint(&node.else_expr, expected.clone(), tc);
     join_branches_with_hint(
@@ -3587,17 +3979,38 @@ enum CollectionLiteralKind {
     List,
 }
 
+fn expected_assignable_type(expected: Option<&TypeHandle>, tc: &TypeChecker) -> Option<Type> {
+    let ty = expected.map(|handle| tc.handle_type(handle))?;
+    Some(tc.decls.core_option_inner(&ty).unwrap_or(&ty).clone())
+}
+
 fn expected_collection(
     expected: Option<&TypeHandle>,
     tc: &TypeChecker,
 ) -> Option<(TypeHandle, CollectionLiteralKind)> {
-    match expected.map(|handle| tc.handle_type(handle))? {
+    match expected_assignable_type(expected, tc)? {
         Type::Array { elem, .. } | Type::Slice { elem } => {
             Some((tc.type_handle(&elem), CollectionLiteralKind::Array))
         }
         Type::List { elem } => Some((tc.type_handle(&elem), CollectionLiteralKind::List)),
         _ => None,
     }
+}
+
+fn expected_map(
+    expected: Option<&TypeHandle>,
+    tc: &TypeChecker,
+) -> Option<(TypeHandle, TypeHandle)> {
+    let Type::Map { key, value } = expected_assignable_type(expected, tc)? else {
+        return None;
+    };
+    Some((tc.type_handle(&key), tc.type_handle(&value)))
+}
+
+fn expected_range_bound(expected: Option<&TypeHandle>, tc: &TypeChecker) -> Option<TypeHandle> {
+    let expected = expected_assignable_type(expected, tc)?;
+    let inner = tc.decls.core_range_inner(&expected)?;
+    Some(tc.type_handle(inner))
 }
 
 fn collection_literal_handle(
@@ -3610,6 +4023,162 @@ fn collection_literal_handle(
         CollectionLiteralKind::Array => tc.array_handle(elem, len),
         CollectionLiteralKind::List => tc.list_handle(elem),
     }
+}
+
+fn check_cast_expr(expr: &ExprNode, cast: &CastNode, tc: &mut TypeChecker) -> CheckedType {
+    let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
+    let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
+    let from = checked.ty;
+    let valid = from == target
+        || matches!(
+            (&from, &target),
+            (Type::Int, Type::Float) | (Type::Float, Type::Int)
+        );
+    let ty = if valid || matches!(from, Type::Infer) || matches!(target, Type::Infer) {
+        target
+    } else {
+        tc.push_error(TypeError::InvalidCast {
+            from,
+            to: target,
+            span: cast.span,
+        });
+        Type::Infer
+    };
+    let mut casted = checked_from_type(expr, ty, tc);
+    casted.contains_extern_any = checked.contains_extern_any;
+    casted
+}
+
+fn check_range_expr(
+    expr: &ExprNode,
+    range: &RangeNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let bound = expected_range_bound(expected.as_ref(), tc)
+        .unwrap_or_else(|| tc.fresh_temp_handle(range.span));
+    let (kind, contains_extern_any) = match &range.node {
+        Range::Bounded {
+            start,
+            end,
+            inclusive,
+        } => {
+            let start = check_expected(start, bound.clone(), tc);
+            let end = check_expected(end, bound.clone(), tc);
+            let kind = if *inclusive {
+                CoreRangeKind::Inclusive
+            } else {
+                CoreRangeKind::Exclusive
+            };
+            (kind, start.contains_extern_any || end.contains_extern_any)
+        }
+        Range::From { start } => {
+            let start = check_expected(start, bound.clone(), tc);
+            (CoreRangeKind::From, start.contains_extern_any)
+        }
+        Range::To { end, inclusive } => {
+            let end = check_expected(end, bound.clone(), tc);
+            let kind = if *inclusive {
+                CoreRangeKind::ToInclusive
+            } else {
+                CoreRangeKind::To
+            };
+            (kind, end.contains_extern_any)
+        }
+    };
+    tc.solve_constraints();
+    let ty = tc
+        .decls
+        .core_range_of(kind, tc.handle_type(&bound))
+        .expect("core range declaration is available");
+    let mut checked = checked_from_type(expr, ty, tc);
+    checked.contains_extern_any = contains_extern_any;
+    checked
+}
+
+fn check_string_interp(expr: &ExprNode, parts: &[StringPart], tc: &mut TypeChecker) -> CheckedType {
+    let mut contains_extern_any = false;
+    for part in parts {
+        let StringPart::Expr(inner, _) = part else {
+            continue;
+        };
+        let checked = check_value_expr_checked_with_hint(inner, None, tc);
+        contains_extern_any |= checked.contains_extern_any;
+    }
+    let mut checked = checked_from_type(expr, Type::String, tc);
+    checked.contains_extern_any = contains_extern_any;
+    checked
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LiteralMapKey {
+    Int(i64),
+    Bool(bool),
+    String(String),
+    Tuple(Vec<LiteralMapKey>),
+}
+
+fn literal_map_key(expr: &ExprNode) -> Option<LiteralMapKey> {
+    match &expr.node.kind {
+        ExprKind::Lit(Lit::Int(value)) => Some(LiteralMapKey::Int(*value)),
+        ExprKind::Lit(Lit::Bool(value)) => Some(LiteralMapKey::Bool(*value)),
+        ExprKind::Lit(Lit::String(value)) => Some(LiteralMapKey::String(value.clone())),
+        ExprKind::Tuple(elems) => elems
+            .iter()
+            .map(literal_map_key)
+            .collect::<Option<Vec<_>>>()
+            .map(LiteralMapKey::Tuple),
+        _ => None,
+    }
+}
+
+fn check_duplicate_map_keys(lit: &MapLiteralNode, tc: &mut TypeChecker) {
+    let mut keys = HashSet::new();
+    for (key, _) in &lit.node.entries {
+        let Some(key_value) = literal_map_key(key) else {
+            continue;
+        };
+        if !keys.insert(key_value) {
+            tc.push_error(TypeError::DuplicateMapKey { span: key.span });
+        }
+    }
+}
+
+fn check_map_lit_hint(
+    expr: &ExprNode,
+    lit: &MapLiteralNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    check_duplicate_map_keys(lit, tc);
+    let (key, value, has_hint) = match expected_map(expected.as_ref(), tc) {
+        Some((key, value)) => (key, value, true),
+        None => (
+            tc.fresh_temp_handle(lit.span),
+            tc.fresh_temp_handle(lit.span),
+            false,
+        ),
+    };
+
+    if lit.node.entries.is_empty() && !has_hint {
+        tc.push_error(TypeError::CannotInferType { span: lit.span });
+        return checked_from_type(expr, Type::Infer, tc);
+    }
+
+    let mut contains_extern_any = false;
+    for (key_expr, value_expr) in &lit.node.entries {
+        let key_checked = check_expected(key_expr, key.clone(), tc);
+        let value_checked = check_expected(value_expr, value.clone(), tc);
+        contains_extern_any |= key_checked.contains_extern_any || value_checked.contains_extern_any;
+    }
+
+    let map = tc.map_handle(key, value);
+    let mut checked = solve_and_checked_from_handle(expr, map, tc);
+    if !has_hint && let Type::Map { key, .. } = &checked.ty {
+        tc.validate_map_key_type(key, lit.span);
+    }
+    checked.contains_extern_any = contains_extern_any;
+    checked
 }
 
 fn check_array_lit_hint(
@@ -3673,7 +4242,7 @@ fn tuple_hints(
     expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> Vec<TypeHandle> {
-    match expected.map(|handle| tc.handle_type(handle)) {
+    match expected_assignable_type(expected, tc) {
         Some(Type::Tuple(types)) if types.len() == elems.len() => {
             types.iter().map(|ty| tc.type_handle(ty)).collect()
         }
@@ -3764,9 +4333,40 @@ fn check_index_access(
     target: &CheckedType,
     tc: &mut TypeChecker,
 ) -> CheckedIndex {
-    if node.node.safe || matches!(node.node.index.node.kind, ExprKind::Range(_)) {
-        let index = check_expr_checked(&node.node.index, tc);
-        return CheckedIndex::infer(target, &index);
+    if node.node.safe || has_safe_postfix(&node.node.target) {
+        let inner = tc.optional_chain_inner_type(&target.ty, node.span);
+        let inner_target = CheckedType {
+            ty: inner,
+            handle: target.handle.clone(),
+            contains_extern_any: target.contains_extern_any,
+        };
+        let indexed = check_index_access_inner(node, &inner_target, tc);
+        return CheckedIndex {
+            read_ty: tc.optional_chain_result_type(indexed.read_ty),
+            write_ty: Type::Infer,
+            contains_extern_any: indexed.contains_extern_any,
+        };
+    }
+
+    check_index_access_inner(node, target, tc)
+}
+
+fn has_safe_postfix(expr: &ExprNode) -> bool {
+    match &expr.node.kind {
+        ExprKind::Field(field) => field.node.safe || has_safe_postfix(&field.node.target),
+        ExprKind::Call(call) => call.node.safe || has_safe_postfix(&call.node.func),
+        ExprKind::Index(index) => index.node.safe || has_safe_postfix(&index.node.target),
+        _ => false,
+    }
+}
+
+fn check_index_access_inner(
+    node: &IndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedIndex {
+    if matches!(node.node.index.node.kind, ExprKind::Range(_)) {
+        return check_range_index_access(node, target, tc);
     }
 
     match &target.ty {
@@ -3812,6 +4412,41 @@ fn check_index_access(
                     span: node.span,
                 });
             }
+            CheckedIndex::infer(target, &index)
+        }
+    }
+}
+
+fn check_range_index_access(
+    node: &IndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedIndex {
+    let index = check_expr_checked(&node.node.index, tc);
+    match &target.ty {
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+            if !matches!(
+                tc.decls.core_range_inner(&index.ty),
+                Some(Type::Int | Type::Infer)
+            ) {
+                tc.push_error(TypeError::RangeIndexNotInt {
+                    found: index.ty.clone(),
+                    span: node.node.index.span,
+                });
+            }
+            CheckedIndex::new(
+                Type::Slice { elem: elem.clone() },
+                Type::Infer,
+                target,
+                &index,
+            )
+        }
+        Type::Infer => CheckedIndex::infer(target, &index),
+        found => {
+            tc.push_error(TypeError::RangeIndexUnsupported {
+                found: found.clone(),
+                span: node.span,
+            });
             CheckedIndex::infer(target, &index)
         }
     }
@@ -4341,7 +4976,7 @@ fn check_expr_fields(
             index,
         })
         .collect::<Vec<_>>();
-    let shape = field_check::check(&uses, schema, owner, missing, span, tc);
+    let shape = field_check::check(&uses, schema, &owner, missing, span, tc);
     let valid = shape
         .fields
         .iter()
@@ -4358,6 +4993,9 @@ fn check_expr_fields(
     };
     for field in shape.fields {
         let value = &fields[field.index].1;
+        if let field_check::FieldOwner::Nominal(owner_ty) = &owner {
+            tc.check_field_access_policy(owner_ty, field.name, value.span);
+        }
         let hint = inf.instantiate(&field.ty, tc);
         let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
         check.contains_extern_any |= checked.contains_extern_any;
@@ -4523,12 +5161,47 @@ fn check_while(while_node: &WhileNode, tc: &mut TypeChecker) {
 fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     let node = &for_node.node;
     let iterable_ty = check_expr_checked(&node.iterable, tc).ty;
+    let range_kind = tc.decls.core_range_kind(&iterable_ty);
 
-    if let Some(step) = &node.step {
-        check_expr_checked(step, tc);
+    if node.reversed {
+        if matches!(iterable_ty, Type::Map { .. }) {
+            push_for_modifier_error(
+                tc,
+                "rev is not supported for map iteration",
+                node.iterable.span,
+            );
+        } else if matches!(
+            range_kind,
+            Some(CoreRangeKind::From | CoreRangeKind::To | CoreRangeKind::ToInclusive)
+        ) {
+            push_for_modifier_error(
+                tc,
+                "reverse is not supported for open-ended ranges",
+                node.iterable.span,
+            );
+        }
     }
 
-    let item_ty = iterable_item_type(&iterable_ty).unwrap_or_else(|| {
+    if let Some(step) = &node.step {
+        if matches!(iterable_ty, Type::Map { .. }) {
+            push_for_modifier_error(tc, "step is not supported for map iteration", step.span);
+            check_expr_checked(step, tc);
+        } else {
+            let step_checked = check_expr_checked(step, tc);
+            let step_is_int = matches!(step_checked.ty, Type::Int | Type::Infer);
+            let range_is_int = matches!(
+                tc.decls.core_range_inner(&iterable_ty),
+                Some(Type::Int | Type::Infer)
+            );
+            if range_kind.is_some() && (!range_is_int || !step_is_int) {
+                push_for_modifier_error(tc, "step is only supported for integer ranges", step.span);
+            }
+            let int = tc.type_handle(&Type::Int);
+            tc.expect_assignable(step.span, step_checked.handle, int);
+        }
+    }
+
+    let item_ty = iterable_item_type(&iterable_ty, &tc.decls).unwrap_or_else(|| {
         tc.push_error(TypeError::ForIterableNotSupported {
             found: iterable_ty,
             span: node.iterable.span,
@@ -4550,6 +5223,10 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     tc.pop_scope();
 }
 
+fn push_for_modifier_error(tc: &mut TypeChecker, message: &'static str, span: Span) {
+    tc.push_error(TypeError::ForIterationModifier { message, span });
+}
+
 fn check_break(span: Span, tc: &mut TypeChecker) {
     if tc.in_defer() {
         tc.push_error(TypeError::BreakInsideDefer { span });
@@ -4566,14 +5243,14 @@ fn check_continue(span: Span, tc: &mut TypeChecker) {
     }
 }
 
-fn iterable_item_type(ty: &Type) -> Option<Type> {
+fn iterable_item_type(ty: &Type, decls: &DeclarationIndex) -> Option<Type> {
     match ty {
         Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
             Some((**elem).clone())
         }
         Type::Map { key, value } => Some(Type::Tuple(vec![(**key).clone(), (**value).clone()])),
         Type::Infer => Some(Type::Infer),
-        _ => None,
+        _ => decls.core_range_inner(ty).cloned(),
     }
 }
 

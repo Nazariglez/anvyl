@@ -28,9 +28,6 @@ impl ResolvedEnumVariant {
         if tc.decls.key_for_type(expected).as_ref() != Some(&self.key) {
             return None;
         }
-        let Type::Nominal(nominal) = expected else {
-            return None;
-        };
         nominal_generic_args(expected)
     }
 }

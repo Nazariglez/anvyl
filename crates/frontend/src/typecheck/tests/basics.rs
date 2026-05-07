@@ -4,14 +4,14 @@ use super::support::{
 };
 use crate::{
     ast::{ArrayLen, ConstArg, ConstValue, FuncParam, GenericArg, Ident, NominalKind, Type},
-    typecheck::{ArityError, DeclError, ModuleScope, TypeError, type_closure_facts},
+    typecheck::{ArityError, DeclError, TypeError, type_closure_facts},
 };
 
 mod storage {
     use crate::{
         ast::{Ident, Program, Type},
         test_support::empty_resolved,
-        typecheck::{DeclarationIndex, LocalTypeId, TypeChecker},
+        typecheck::{DeclarationIndex, LocalTypeId, TypeChecker, TypecheckConfig},
     };
 
     trait TypeCheckerTestExt {
@@ -33,7 +33,11 @@ mod storage {
             &resolved,
             &crate::externs::RawExterns::default(),
         );
-        let mut tc = TypeChecker::new(decls, crate::externs::catalog::ExternCatalog::default());
+        let mut tc = TypeChecker::new(
+            decls,
+            crate::externs::catalog::ExternCatalog::default(),
+            TypecheckConfig::default(),
+        );
         let name = Ident::new("x");
         tc.push_scope();
         tc.define(name, Type::Int, false);
@@ -306,11 +310,8 @@ mod consts {
 
     #[test]
     fn evaluated() {
-        let result = check("const X = 1 + 2; fn main() { X; }").expect("typecheck failed");
-        assert_eq!(
-            result.consts().get(&(ModuleScope::Root, Ident::new("X"))),
-            Some(&ConstValue::Int(3))
-        );
+        check("const X = 1 + 2; fn main() { let xs: [int; X] = [1, 2, 3]; }")
+            .expect("typecheck failed");
     }
 
     #[test]
@@ -370,12 +371,10 @@ mod consts {
 
     #[test]
     fn bool_short_circuit() {
-        let result =
-            check("const X = false && (1 / 0 == 0); fn main() { X; }").expect("typecheck failed");
-        assert_eq!(
-            result.consts().get(&(ModuleScope::Root, Ident::new("X"))),
-            Some(&ConstValue::Bool(false))
-        );
+        check(
+            "const X = false && (1 / 0 == 0); const N = X ? 1 : 2; fn main() { let xs: [int; N] = [1, 2]; }",
+        )
+        .expect("typecheck failed");
     }
 
     #[test]

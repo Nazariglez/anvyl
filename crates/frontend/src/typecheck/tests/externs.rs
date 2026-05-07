@@ -7,7 +7,9 @@ use anvyx_externs::{
     ProviderDescriptor, ProviderId, ReceiverMode, UnaryOp,
 };
 
-use super::support::{assert_typecheck_closed, check, check_named};
+use super::support::{
+    TypecheckTestResult, assert_typecheck_closed, check, check_named, check_with_raw_externs,
+};
 use crate::{
     ast::{ExprId, Ident, ModuleOrigin, NominalKind, Program, Type},
     externs::{
@@ -49,22 +51,14 @@ fn type_key(module: ModuleScope, name: &str) -> externs::catalog::TypeKey {
     }
 }
 
-fn catalog_type(
-    result: &typecheck::result::TypecheckResult,
-    module: ModuleScope,
-    name: &str,
-) -> ExternTypeId {
+fn catalog_type(result: &TypecheckTestResult, module: ModuleScope, name: &str) -> ExternTypeId {
     result
         .externs()
         .type_by_key(&type_key(module, name))
         .expect("extern type")
 }
 
-fn catalog_field(
-    result: &typecheck::result::TypecheckResult,
-    owner: ExternTypeId,
-    name: &str,
-) -> ExternFieldRef {
+fn catalog_field(result: &TypecheckTestResult, owner: ExternTypeId, name: &str) -> ExternFieldRef {
     result
         .externs()
         .field(owner, Ident::new(name))
@@ -73,7 +67,7 @@ fn catalog_field(
 }
 
 fn catalog_method(
-    result: &typecheck::result::TypecheckResult,
+    result: &TypecheckTestResult,
     owner: ExternTypeId,
     name: &str,
 ) -> ExternMethodRef {
@@ -85,7 +79,7 @@ fn catalog_method(
 }
 
 fn catalog_static(
-    result: &typecheck::result::TypecheckResult,
+    result: &TypecheckTestResult,
     owner: ExternTypeId,
     name: &str,
 ) -> ExternStaticRef {
@@ -97,7 +91,7 @@ fn catalog_static(
 }
 
 fn catalog_binary_operator(
-    result: &typecheck::result::TypecheckResult,
+    result: &TypecheckTestResult,
     owner: ExternTypeId,
     op: ExternBinaryOp,
 ) -> ExternOperatorRef {
@@ -276,7 +270,7 @@ fn callback(params: Vec<ExternTypeExpr>, ret: ExternTypeExpr) -> ExternTypeExpr 
 fn check_with_provider(
     root_source: &str,
     provider: ProviderDescriptor,
-) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
+) -> Result<TypecheckTestResult, Vec<TypeError>> {
     check_named_with_provider(root_source, &[], provider)
 }
 
@@ -284,7 +278,7 @@ fn check_named_with_provider(
     root_source: &str,
     modules: &[(&str, &str)],
     provider: ProviderDescriptor,
-) -> Result<typecheck::TypecheckResult, Vec<TypeError>> {
+) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let root = parse(root_source);
     let provider_raw = externs::ingest_providers(ExternInputs {
         packages: vec![PackageExternInputs {
@@ -297,7 +291,7 @@ fn check_named_with_provider(
     let resolved = resolved_modules_with_external(&root, modules, &external_modules);
     let mut raw = externs::collect_source_externs(&root, &resolved).expect("valid source externs");
     raw.append(provider_raw);
-    typecheck::check_with_modules(&root, &resolved, raw)
+    check_with_raw_externs(&root, &resolved, raw)
 }
 
 mod result {
@@ -402,9 +396,7 @@ mod calls {
     }
 }
 
-fn expect_type_errors(
-    result: Result<typecheck::TypecheckResult, Vec<TypeError>>,
-) -> Vec<TypeError> {
+fn expect_type_errors(result: Result<TypecheckTestResult, Vec<TypeError>>) -> Vec<TypeError> {
     let Err(errors) = result else {
         panic!("expected typecheck errors");
     };
@@ -418,7 +410,7 @@ fn assert_has_error(errors: &[TypeError], matches: impl Fn(&TypeError) -> bool) 
     );
 }
 
-fn use_exprs(result: &typecheck::TypecheckResult, expected: ExternUseTarget) -> Vec<ExprId> {
+fn use_exprs(result: &TypecheckTestResult, expected: ExternUseTarget) -> Vec<ExprId> {
     result
         .extern_uses()
         .iter()
@@ -426,7 +418,7 @@ fn use_exprs(result: &typecheck::TypecheckResult, expected: ExternUseTarget) -> 
         .collect()
 }
 
-fn use_count(result: &typecheck::TypecheckResult, expected: ExternUseTarget) -> usize {
+fn use_count(result: &TypecheckTestResult, expected: ExternUseTarget) -> usize {
     result
         .extern_uses()
         .values()
@@ -435,11 +427,11 @@ fn use_count(result: &typecheck::TypecheckResult, expected: ExternUseTarget) -> 
         .count()
 }
 
-fn extern_use_count(result: &typecheck::TypecheckResult) -> usize {
+fn extern_use_count(result: &TypecheckTestResult) -> usize {
     result.extern_uses().values().map(Vec::len).sum()
 }
 
-fn assert_use_count(result: &typecheck::TypecheckResult, expected: ExternUseTarget, count: usize) {
+fn assert_use_count(result: &TypecheckTestResult, expected: ExternUseTarget, count: usize) {
     assert_eq!(
         use_count(result, expected),
         count,
@@ -448,7 +440,7 @@ fn assert_use_count(result: &typecheck::TypecheckResult, expected: ExternUseTarg
     );
 }
 
-fn assert_use(result: &typecheck::TypecheckResult, expected: ExternUseTarget) -> ExprId {
+fn assert_use(result: &TypecheckTestResult, expected: ExternUseTarget) -> ExprId {
     assert_use_count(result, expected, 1);
     let exprs = use_exprs(result, expected);
     assert_eq!(
@@ -459,7 +451,7 @@ fn assert_use(result: &typecheck::TypecheckResult, expected: ExternUseTarget) ->
     exprs[0]
 }
 
-fn assert_use_total(result: &typecheck::TypecheckResult, count: usize) {
+fn assert_use_total(result: &TypecheckTestResult, count: usize) {
     assert_eq!(
         extern_use_count(result),
         count,
@@ -2301,7 +2293,7 @@ mod compound {
         assert_compound_assignment_uses(&result);
     }
 
-    fn assert_compound_assignment_uses(result: &typecheck::TypecheckResult) {
+    fn assert_compound_assignment_uses(result: &TypecheckTestResult) {
         let vec_owner = result
             .externs()
             .type_by_key(&type_key(ModuleScope::Root, "Vec2"))

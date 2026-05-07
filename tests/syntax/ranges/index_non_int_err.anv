@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: range index bounds must be int
+
+fn main() {
+    let xs = [1, 2, 3];
+    let _ = xs[(1, 2)..(3, 4)];
+}

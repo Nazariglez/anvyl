@@ -1,3 +1,4 @@
+import option { * };
 import ext:core_string {
     str_len,
     str_contains,

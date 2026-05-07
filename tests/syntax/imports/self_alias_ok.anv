@@ -1,7 +1,5 @@
 // @mode: check
 // @expect: success
-// @skip: todo -> selective_self_import
-
 import gamekit { self as gk };
 
 fn use_it(x: gk.GameKit) {}

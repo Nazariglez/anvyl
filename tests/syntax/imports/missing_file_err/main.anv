@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Cannot find module file
+// @contains: Cannot find source import
 
 import nonexistent_module;
 

@@ -689,6 +689,15 @@ impl Solver {
         })
     }
 
+    pub(super) fn map_handle(&mut self, key: TypeHandle, value: TypeHandle) -> TypeHandle {
+        let key = self.resolve_ref(&key.0);
+        let value = self.resolve_ref(&value.0);
+        self.temp_handle(Ty::Map {
+            key: Box::new(key),
+            value: Box::new(value),
+        })
+    }
+
     pub(super) fn tuple_handle(&mut self, elems: Vec<TypeHandle>) -> TypeHandle {
         let elems = elems
             .into_iter()

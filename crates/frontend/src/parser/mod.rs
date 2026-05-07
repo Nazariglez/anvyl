@@ -76,17 +76,6 @@ pub fn parse_ast(tokens: &[SpannedToken]) -> Result<ast::Program, Vec<Rich<'_, S
     parser().parse_with_state(tokens, &mut state).into_result()
 }
 
-pub(crate) fn parse_type_str(s: &str) -> Result<ast::Type, String> {
-    let tokens =
-        crate::lexer::tokenize(s).map_err(|_| format!("Failed to tokenize type string: '{s}'"))?;
-    let mut state = SimpleState(ParserState::default());
-    types::type_ident()
-        .then_ignore(end())
-        .parse_with_state(&tokens, &mut state)
-        .into_result()
-        .map_err(|_| format!("Failed to parse type string: '{s}'"))
-}
-
 fn parser<'src>() -> BoxedParser<'src, ast::Program> {
     let stmt = statement();
 

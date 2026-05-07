@@ -1,10 +1,8 @@
 // @mode: check
 // @expect: error
-// @contains: Unknown variable
-// @skip: todo -> selective_self_import
-
+// @contains: Unknown type
 import gamekit { self as gk };
 
-fn main() {
-    let x = gamekit;
-}
+fn use_it(x: gamekit.GameKit) {}
+
+fn main() {}

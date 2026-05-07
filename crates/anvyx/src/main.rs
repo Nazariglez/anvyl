@@ -182,18 +182,19 @@ fn run(cli: Cli) -> Result<(), String> {
             let manifest = manifest::parse_manifest()?;
             let path = resolve_entry(file, manifest.as_ref())?;
 
+            let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
+
             if new_frontend {
-                check::reject_new_frontend_inputs(manifest.as_ref(), &lint, &feature, &cfg)?;
+                let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
+                check::reject_new_frontend_inputs(manifest.as_ref())?;
                 progress::status("Checking", &format!("{}...", path.display()));
-                check::new_frontend_cmd(&path)?;
+                check::new_frontend_cmd(&path, lint_config, &compilation_ctx)?;
                 progress::status(
                     "Finished",
                     &format!("{} checked successfully", path.display()),
                 );
                 return Ok(());
             }
-
-            let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
             let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
 
             let has_externs = manifest.as_ref().is_some_and(Manifest::has_externs);

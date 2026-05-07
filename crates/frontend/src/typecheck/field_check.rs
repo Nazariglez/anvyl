@@ -23,6 +23,7 @@ pub(super) enum FieldOwner {
     Variant { enum_name: Ident, variant: Ident },
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum MissingFields {
     None,
     AllowDefaults,
@@ -38,7 +39,7 @@ pub(super) struct FieldShape {
 pub(super) fn check(
     uses: &[FieldUse],
     schema: &HashMap<Ident, FieldSchema>,
-    owner: FieldOwner,
+    owner: &FieldOwner,
     missing: MissingFields,
     span: Span,
     tc: &mut TypeChecker,
@@ -63,18 +64,18 @@ pub(super) fn check(
                 ty: schema.ty.clone(),
             }),
             None => {
-                push_unknown(&owner, field.name, field.span, tc);
+                push_unknown(owner, field.name, field.span, tc);
                 failed = true;
             }
         }
     }
 
-    if missing_fields_enabled(&missing) {
+    if missing_fields_enabled(missing) {
         for (name, field) in schema {
-            if seen.contains(name) || missing_default_ok(&missing, field) {
+            if seen.contains(name) || missing_default_ok(missing, field) {
                 continue;
             }
-            push_missing(&owner, *name, span, tc);
+            push_missing(owner, *name, span, tc);
             failed = true;
         }
     }
@@ -82,7 +83,7 @@ pub(super) fn check(
     FieldShape { fields, failed }
 }
 
-fn missing_fields_enabled(missing: &MissingFields) -> bool {
+fn missing_fields_enabled(missing: MissingFields) -> bool {
     match missing {
         MissingFields::None => false,
         MissingFields::AllowDefaults => true,
@@ -90,7 +91,7 @@ fn missing_fields_enabled(missing: &MissingFields) -> bool {
     }
 }
 
-fn missing_default_ok(missing: &MissingFields, field: &FieldSchema) -> bool {
+fn missing_default_ok(missing: MissingFields, field: &FieldSchema) -> bool {
     matches!(missing, MissingFields::AllowDefaults) && field.has_default
 }
 

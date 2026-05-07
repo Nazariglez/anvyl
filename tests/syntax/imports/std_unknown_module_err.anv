@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: Unknown standard library module
+// @contains: Unknown member 'nonexistent'
 
-import std.nonexistent;
+import std:nonexistent;
 
 fn main() {}

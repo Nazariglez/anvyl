@@ -8,7 +8,5 @@ fn main() {
     let d = 1.0 as float;
     let e = (1 + 2) as float;
     let f: float = 1.5;
-    let g: double = f as double;
-    let h: double = 1 as double;
-    let i: float = (1.5 as double) as float;
+    let g: float = f as float;
 }

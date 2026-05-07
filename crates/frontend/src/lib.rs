@@ -1,5 +1,6 @@
 pub mod air;
 pub mod ast;
+pub mod config;
 pub mod externs;
 pub mod lexer;
 pub mod parser;

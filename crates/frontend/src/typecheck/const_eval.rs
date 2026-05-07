@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use super::{ModuleScope, TypeChecker, TypeError, ValueDecl};
 use crate::{
     ast::{
@@ -47,18 +45,6 @@ pub(super) fn const_usize(value: &ConstValue, span: Span) -> Result<usize, TypeE
             span,
         }),
     }
-}
-
-pub(super) fn evaluated_consts(
-    consts: HashMap<(ModuleScope, Ident), ConstEntry>,
-) -> HashMap<(ModuleScope, Ident), ConstValue> {
-    consts
-        .into_iter()
-        .filter_map(|(key, entry)| match entry.state {
-            ConstState::Evaluated(value) => Some((key, value)),
-            ConstState::Unevaluated | ConstState::Evaluating | ConstState::Failed => None,
-        })
-        .collect()
 }
 
 impl TypeChecker {

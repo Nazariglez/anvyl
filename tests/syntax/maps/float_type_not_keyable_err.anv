@@ -3,5 +3,5 @@
 // @contains: cannot be used as map key
 
 fn main() {
-    let m: [double: int] = [:];
+    let m: [float: int] = [:];
 }

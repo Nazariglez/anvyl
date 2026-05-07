@@ -2,8 +2,18 @@ use std::{fmt, path::PathBuf};
 
 use anvyx_frontend::pipeline::{CheckError as FCheckError, Diagnostic};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckOk;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckOk {
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl From<anvyx_frontend::pipeline::CheckOk> for CheckOk {
+    fn from(ok: anvyx_frontend::pipeline::CheckOk) -> Self {
+        Self {
+            diagnostics: ok.diagnostics,
+        }
+    }
+}
 
 pub type CheckResult<T = CheckOk> = Result<T, CheckError>;
 
