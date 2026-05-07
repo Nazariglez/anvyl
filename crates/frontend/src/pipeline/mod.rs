@@ -948,10 +948,10 @@ mod tests {
             extern type Vec2 rep inline {
                 init;
                 x: float;
-                var y: float;
-                let length: float;
+                y: float;
+                computed length: float;
                 computed bounds: Rect;
-                computed var label: string;
+                computed label: string;
                 fn magnitude(shared self) -> float;
                 fn translate(var self, dx: float, dy: float) -> void;
                 fn zero() -> Self;

@@ -2,15 +2,14 @@ use anvyx_externs::{
     CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackSignature, ExternEffects,
     ExternFieldDescriptor, ExternFunctionDescriptor, ExternInitDescriptor, ExternMethodDescriptor,
     ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
-    ExternStaticDescriptor, ExternTypeExpr, FieldAccess, ModulePath, ParamFlow, ReceiverMode,
+    ExternStaticDescriptor, ExternTypeExpr, ModulePath, ParamFlow, ReceiverMode,
 };
 
 use super::raw::*;
 use crate::{
     ast::{
-        self, BinaryOp, ExternFieldAccess, ExternFuncNode, ExternReceiverMode, ExternTypeMember,
-        ExternTypeNode, ExternTypeRep, GenericArg, Mutability, Param, Program, Stmt, Type, UnaryOp,
-        Visibility,
+        self, BinaryOp, ExternFuncNode, ExternReceiverMode, ExternTypeMember, ExternTypeNode,
+        ExternTypeRep, GenericArg, Mutability, Param, Program, Stmt, Type, UnaryOp, Visibility,
     },
     resolve::{ModuleId, ResolveResult},
     span::Span,
@@ -175,20 +174,12 @@ fn normalize_member(member: &ExternTypeMember, span: Span) -> SourceResult<RawSo
             doc,
             name,
             ty,
-            access,
             computed,
         } => Ok(RawSourceMember::Field(RawExternField {
             decl: ExternFieldDescriptor {
                 name: name.to_string(),
                 ty: type_expr(ty, span)?,
-                access: match access {
-                    ExternFieldAccess::ReadOnly => FieldAccess::ReadOnly {
-                        computed: *computed,
-                    },
-                    ExternFieldAccess::ReadWrite => FieldAccess::ReadWrite {
-                        computed: *computed,
-                    },
-                },
+                computed: *computed,
                 doc: doc.clone(),
             },
             site: RawExternSite { span: Some(span) },

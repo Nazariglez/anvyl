@@ -52,8 +52,8 @@ mod tests {
         ExternDescriptorError, ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor,
         ExternInitDescriptor, ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor,
         ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
-        ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, FieldAccess, ModulePath,
-        OperatorReturn, ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, TypeContext,
+        ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, ModulePath, OperatorReturn,
+        ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, TypeContext,
     };
 
     use super::*;
@@ -469,10 +469,7 @@ mod tests {
             assert!(ty.site.span.is_some());
             assert!(ty.init.is_some());
             assert_eq!(ty.fields[0].decl.doc.as_deref(), Some("x coordinate."));
-            assert_eq!(
-                ty.fields[0].decl.access,
-                FieldAccess::ReadWrite { computed: false }
-            );
+            assert!(!ty.fields[0].decl.computed);
             assert_eq!(ty.methods[0].decl.receiver, ReceiverMode::Mutable);
             assert_eq!(
                 ty.methods[0].decl.signature.params[0],
@@ -521,15 +518,12 @@ mod tests {
         }
 
         #[test]
-        fn normalizes_source_field_access() {
+        fn normalizes_source_fields() {
             let ty = collect_root_type(
                 r"
                 extern type T {
                     plain: int;
-                    var mutable: int;
-                    let readonly: int;
                     computed cached: int;
-                    computed var live: int;
                 }
                 ",
             );
@@ -537,19 +531,10 @@ mod tests {
             let fields = ty
                 .fields
                 .iter()
-                .map(|field| (field.decl.name.as_str(), field.decl.access))
+                .map(|field| (field.decl.name.as_str(), field.decl.computed))
                 .collect::<Vec<_>>();
 
-            assert_eq!(
-                fields,
-                [
-                    ("plain", FieldAccess::ReadWrite { computed: false }),
-                    ("mutable", FieldAccess::ReadWrite { computed: false }),
-                    ("readonly", FieldAccess::ReadOnly { computed: false }),
-                    ("cached", FieldAccess::ReadOnly { computed: true }),
-                    ("live", FieldAccess::ReadWrite { computed: true }),
-                ]
-            );
+            assert_eq!(fields, [("plain", false), ("cached", true)]);
         }
 
         #[test]
@@ -1134,7 +1119,7 @@ mod tests {
                         fields: vec![ExternFieldDescriptor {
                             name: "x".to_string(),
                             ty: ExternTypeExpr::Float,
-                            access: FieldAccess::ReadWrite { computed: true },
+                            computed: true,
                             doc: Some("x pos".to_string()),
                         }],
                         init: Some(ExternInitDescriptor {
@@ -1184,10 +1169,7 @@ mod tests {
 
             assert_eq!(ty.doc.as_deref(), Some("sprite"));
             assert_eq!(ty.rep, ExternRep::Shared);
-            assert_eq!(
-                ty.fields[0].decl.access,
-                FieldAccess::ReadWrite { computed: true }
-            );
+            assert!(ty.fields[0].decl.computed);
             assert_eq!(ty.init.as_ref().unwrap().decl.field_init, ["x"]);
             assert_eq!(ty.methods[0].decl.receiver, ReceiverMode::Mutable);
             assert_eq!(

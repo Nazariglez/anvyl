@@ -37,7 +37,7 @@ pub struct ExternFunctionDescriptor {
 pub struct ExternFieldDescriptor {
     pub name: String,
     pub ty: ExternTypeExpr,
-    pub access: FieldAccess,
+    pub computed: bool,
     pub doc: Option<String>,
 }
 
@@ -107,12 +107,6 @@ pub enum ExternTypeExpr {
 pub enum ExternRep {
     Shared,
     Inline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FieldAccess {
-    ReadOnly { computed: bool },
-    ReadWrite { computed: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

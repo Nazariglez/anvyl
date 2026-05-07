@@ -9,10 +9,10 @@ extern type Rect;
 extern type Vec2 rep inline {
     init;
     x: float;
-    var y: float;
-    let length: float;
+    y: float;
+    computed length: float;
     computed bounds: Rect;
-    computed var label: string;
+    computed label: string;
     fn zero() -> Self;
     fn magnitude(shared self) -> float;
     fn translate(var self, dx: float, dy: float) -> void;

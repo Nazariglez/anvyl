@@ -567,7 +567,7 @@ impl<'tc> PatternChecker<'tc> {
             let Some((_, decl)) = self.tc.extern_field(owner, field_name) else {
                 return PlaceAccess::NotPlace;
             };
-            return place::extern_field_access(receiver_access, decl.access);
+            return place::extern_field_access(receiver_access, decl.computed);
         }
 
         if self.tc.decls.key_for_type(owner_ty).is_some() {

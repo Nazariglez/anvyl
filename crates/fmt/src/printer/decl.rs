@@ -132,16 +132,12 @@ impl Printer<'_> {
                 doc,
                 name,
                 ty,
-                access,
                 computed,
             } => {
                 self.format_doc_comment(doc.as_ref());
                 self.write_indent();
-                match (*computed, *access) {
-                    (false, ast::ExternFieldAccess::ReadOnly) => self.write("let "),
-                    (false, ast::ExternFieldAccess::ReadWrite) => self.write("var "),
-                    (true, ast::ExternFieldAccess::ReadOnly) => self.write("computed "),
-                    (true, ast::ExternFieldAccess::ReadWrite) => self.write("computed var "),
+                if *computed {
+                    self.write("computed ");
                 }
                 self.write_fmt(name);
                 self.write(": ");

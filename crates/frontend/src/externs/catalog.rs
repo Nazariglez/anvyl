@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anvyx_externs::{
     BinaryOp, ExternEffects, ExternOperator, ExternParam, ExternRep, ExternSignature,
-    ExternTypeExpr, FieldAccess, OperatorReturn, ParamFlow, ReceiverMode, UnaryOp,
+    ExternTypeExpr, OperatorReturn, ParamFlow, ReceiverMode, UnaryOp,
 };
 
 use crate::{
@@ -360,7 +360,7 @@ pub(crate) struct ExternField {
     pub(crate) id: ExternFieldId,
     pub(crate) name: Ident,
     pub(crate) ty: ResolvedExternTy,
-    pub(crate) access: FieldAccess,
+    pub(crate) computed: bool,
     pub(crate) site: RawExternSite,
     pub(crate) doc: Option<String>,
 }
@@ -763,7 +763,7 @@ impl<'a> CatalogBuilder<'a> {
                 id,
                 name,
                 ty,
-                access: raw_field.decl.access,
+                computed: raw_field.decl.computed,
                 site: raw_field.site,
                 doc: raw_field.decl.doc.clone(),
             });
@@ -1168,7 +1168,7 @@ fn validate_init(ty: &ExternType, init: &ExternInit, errors: &mut Vec<ExternCata
             });
             continue;
         };
-        if field_is_computed(field) {
+        if field.computed {
             errors.push(ExternCatalogError::ComputedInitField {
                 context: context.clone(),
                 field: *name,
@@ -1176,13 +1176,6 @@ fn validate_init(ty: &ExternType, init: &ExternInit, errors: &mut Vec<ExternCata
             });
         }
     }
-}
-
-fn field_is_computed(field: &ExternField) -> bool {
-    matches!(
-        field.access,
-        FieldAccess::ReadOnly { computed: true } | FieldAccess::ReadWrite { computed: true }
-    )
 }
 
 fn validate_signature(
@@ -1460,7 +1453,7 @@ mod tests {
                 id,
                 name,
                 ty: resolved_ty(Type::Int),
-                access: FieldAccess::ReadOnly { computed: false },
+                computed: false,
                 site: RawExternSite::default(),
                 doc: None,
             });
@@ -2322,7 +2315,7 @@ mod tests {
                     fields: vec![ExternFieldDescriptor {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Int,
-                        access: FieldAccess::ReadOnly { computed: true },
+                        computed: true,
                         doc: None,
                     }],
                     init: Some(ExternInitDescriptor {
@@ -2350,14 +2343,14 @@ mod tests {
         }
 
         #[test]
-        fn init_readonly_field_succeeds() {
+        fn init_plain_field_succeeds() {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![ExternTypeDescriptor {
                     fields: vec![ExternFieldDescriptor {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Int,
-                        access: FieldAccess::ReadOnly { computed: false },
+                        computed: false,
                         doc: None,
                     }],
                     init: Some(ExternInitDescriptor {
@@ -2494,7 +2487,7 @@ mod tests {
                     fields: vec![ExternFieldDescriptor {
                         name: "value".to_string(),
                         ty: ExternTypeExpr::Any,
-                        access: FieldAccess::ReadOnly { computed: false },
+                        computed: false,
                         doc: None,
                     }],
                     ..descriptor_type("Box")

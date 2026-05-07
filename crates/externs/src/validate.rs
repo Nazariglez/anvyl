@@ -432,7 +432,7 @@ mod tests {
                     fields: vec![ExternFieldDescriptor {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Float,
-                        access: FieldAccess::ReadWrite { computed: false },
+                        computed: false,
                         doc: None,
                     }],
                     init: Some(ExternInitDescriptor {

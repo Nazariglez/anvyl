@@ -174,8 +174,8 @@ mod tests {
     #[test]
     fn exact_frontend_extern_members() {
         assert_fmt(
-            "extern type T { init; let ro: int; var rw: int; computed cached: int; computed var live: int; fn a(self); fn b(shared self); fn c(var self); }",
-            "extern type T {\n    init;\n    let ro: int;\n    var rw: int;\n    computed cached: int;\n    computed var live: int;\n    fn a(self);\n    fn b(shared self);\n    fn c(var self);\n}\n",
+            "extern type T { init; ro: int; rw: int; computed cached: int; computed live: int; fn a(self); fn b(shared self); fn c(var self); }",
+            "extern type T {\n    init;\n    ro: int;\n    rw: int;\n    computed cached: int;\n    computed live: int;\n    fn a(self);\n    fn b(shared self);\n    fn c(var self);\n}\n",
         );
     }
 
@@ -378,8 +378,8 @@ mod tests {
         let source = "extern type Point {\n    x: float;\n    y: float;\n    fn distance(self, other: Point) -> float;\n}";
         let formatted = format_source(source).expect("format failed");
         assert!(formatted.contains("extern type Point {"));
-        assert!(formatted.contains("    var x: float;"));
-        assert!(formatted.contains("    var y: float;"));
+        assert!(formatted.contains("    x: float;"));
+        assert!(formatted.contains("    y: float;"));
         assert!(formatted.contains("    fn distance(self, other: Point) -> float;"));
         assert!(formatted.contains('}'));
     }
@@ -389,7 +389,7 @@ mod tests {
         let source = "extern type Vec2 {\n    init;\n    x: float;\n    y: float;\n}";
         let formatted = format_source(source).expect("format failed");
         assert!(formatted.contains("    init;"));
-        assert!(formatted.contains("    var x: float;"));
+        assert!(formatted.contains("    x: float;"));
     }
 
     // --- import formatting ---

@@ -4049,7 +4049,7 @@ mod tests {
                     fields: vec![anvyx_externs::ExternFieldDescriptor {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Int,
-                        access: anvyx_externs::FieldAccess::ReadOnly { computed: false },
+                        computed: false,
                         doc: None,
                     }],
                     ..extern_type("Handle")

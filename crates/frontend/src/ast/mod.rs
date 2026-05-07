@@ -780,7 +780,6 @@ pub enum ExternTypeMember {
         doc: Option<String>,
         name: Ident,
         ty: Type,
-        access: ExternFieldAccess,
         computed: bool,
     },
     Method {
@@ -1568,12 +1567,6 @@ impl AggregateTypeRef<'_> {
 pub enum ExternTypeRep {
     Shared,
     Inline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternFieldAccess {
-    ReadOnly,
-    ReadWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

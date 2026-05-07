@@ -435,7 +435,6 @@ fn resolve_extern_members(
                 doc,
                 name,
                 ty,
-                access,
                 computed,
             } => ast::ExternTypeMember::Field {
                 doc,
@@ -446,7 +445,6 @@ fn resolve_extern_members(
                     const_param_map,
                     Some(self_type),
                 ),
-                access,
                 computed,
             },
             ast::ExternTypeMember::Method {
@@ -643,41 +641,17 @@ fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
 }
 
 fn extern_type_field_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
-    let var_kw = select! { (Token::Keyword(Keyword::Var), _) => () };
-    let let_kw = select! { (Token::Keyword(Keyword::Let), _) => () };
-
-    let direct_access = choice((
-        var_kw.to(ast::ExternFieldAccess::ReadWrite),
-        let_kw.to(ast::ExternFieldAccess::ReadOnly),
-    ))
-    .or_not()
-    .map(|access| access.unwrap_or(ast::ExternFieldAccess::ReadWrite));
-
-    let computed_access = contextual_ident("computed")
-        .ignore_then(var_kw.or_not())
-        .map(|var_opt| {
-            if var_opt.is_some() {
-                ast::ExternFieldAccess::ReadWrite
-            } else {
-                ast::ExternFieldAccess::ReadOnly
-            }
-        });
-
     doc_comment_block()
-        .then(choice((
-            computed_access.map(|access| (access, true)),
-            direct_access.map(|access| (access, false)),
-        )))
+        .then(contextual_ident("computed").or_not())
         .then(identifier())
         .then_ignore(select! { (Token::Colon, _) => () })
         .then(type_ident())
         .map(
-            |(((doc, (access, computed)), name), ty)| ast::ExternTypeMember::Field {
+            |(((doc, computed), name), ty)| ast::ExternTypeMember::Field {
                 doc,
                 name,
                 ty,
-                access,
-                computed,
+                computed: computed.is_some(),
             },
         )
         .boxed()

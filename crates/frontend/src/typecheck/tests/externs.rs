@@ -3,7 +3,7 @@ use anvyx_externs::{
     ExternCallbackSignature, ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor,
     ExternInitDescriptor, ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator,
     ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor,
-    ExternTypeDescriptor, ExternTypeExpr, FieldAccess, ModulePath as ExternModulePath, ParamFlow,
+    ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath, ParamFlow,
     ProviderDescriptor, ProviderId, ReceiverMode, UnaryOp,
 };
 
@@ -168,15 +168,18 @@ fn extern_type(name: &str) -> ExternTypeDescriptor {
 }
 
 fn field(name: &str, ty: ExternTypeExpr) -> ExternFieldDescriptor {
-    access_field(name, ty, FieldAccess::ReadWrite { computed: false })
-}
-
-fn access_field(name: &str, ty: ExternTypeExpr, access: FieldAccess) -> ExternFieldDescriptor {
     ExternFieldDescriptor {
         name: name.to_string(),
         ty,
-        access,
+        computed: false,
         doc: None,
+    }
+}
+
+fn computed_field(name: &str, ty: ExternTypeExpr) -> ExternFieldDescriptor {
+    ExternFieldDescriptor {
+        computed: true,
+        ..field(name, ty)
     }
 }
 
@@ -1141,8 +1144,8 @@ mod fields {
     }
 
     #[test]
-    fn provider_rejects_readonly_write() {
-        let Err(errors) = check_with_provider(
+    fn provider_writes_computed_field_mut_receiver() {
+        let result = check_with_provider(
             r"
             import ext:host { Point };
             fn write(var p: Point) { p.x = 2.0; }
@@ -1150,24 +1153,23 @@ mod fields {
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
                 types: vec![ExternTypeDescriptor {
-                    fields: vec![access_field(
-                        "x",
-                        ExternTypeExpr::Float,
-                        FieldAccess::ReadOnly { computed: false },
-                    )],
+                    fields: vec![computed_field("x", ExternTypeExpr::Float)],
                     ..extern_type("Point")
                 }],
                 functions: vec![],
             }),
-        ) else {
-            panic!("readonly field should fail");
-        };
+        )
+        .expect("typecheck failed");
+        let owner = result
+            .externs()
+            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
+            .expect("extern type");
+        let (field, _) = result
+            .externs()
+            .field(owner, Ident::new("x"))
+            .expect("extern field");
 
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ImmutableAssignment { .. }))
-        );
+        assert_use(&result, ExternUseTarget::FieldWrite(field));
     }
 
     #[test]
@@ -1305,7 +1307,7 @@ mod struct_literals {
     fn rejects_computed() {
         let Err(errors) = check(
             r"
-            extern type Point { init; computed var x: float; }
+            extern type Point { init; computed x: float; }
             fn make() -> Point { Point { x: 1.0 } }
             ",
         ) else {
@@ -1706,7 +1708,7 @@ mod methods {
         let errors = expect_type_errors(check(
             r"
             extern type Point { fn move_by(var self, dx: float); }
-            extern type Holder { computed var point: Point; }
+            extern type Holder { computed point: Point; }
             fn move(var holder: Holder) { holder.point.move_by(1.0); }
             ",
         ));
@@ -2226,7 +2228,7 @@ mod compound {
     fn records_computed_write() {
         let result = check(
             r"
-            extern type Point { computed var x: float; }
+            extern type Point { computed x: float; }
             fn write(var p: Point) { p.x = 1.0; }
             ",
         )
@@ -2254,7 +2256,7 @@ mod compound {
             let result = check(&format!(
                 r"
                 struct Point {{ x: float }}
-                extern type Holder {{ var point: Point; }}
+                extern type Holder {{ point: Point; }}
                 fn write(var holder: Holder) {{ {body} }}
                 "
             ))
@@ -2269,11 +2271,11 @@ mod compound {
     }
 
     #[test]
-    fn rejects_computed_readonly_write() {
+    fn rejects_computed_write_through_immutable_receiver() {
         let errors = expect_type_errors(check(
             r"
             extern type Point { computed x: float; }
-            fn write(var p: Point) { p.x = 1.0; }
+            fn write(p: Point) { p.x = 1.0; }
             ",
         ));
 
@@ -2300,7 +2302,7 @@ mod compound {
         let result = check(
             r"
             extern type Vec2 { op Self + Self -> Self; }
-            extern type Holder { computed var value: Vec2; }
+            extern type Holder { computed value: Vec2; }
             fn add(var holder: Holder, rhs: Vec2) { holder.value += rhs; }
             ",
         )
@@ -2312,7 +2314,7 @@ mod compound {
     fn records_computed_alias_write() {
         let result = check(
             r"
-            extern type Point { computed var x: float; }
+            extern type Point { computed x: float; }
             fn write(var p: Point) {
                 var Point { x } = p;
                 x = 1.0;
@@ -2337,8 +2339,8 @@ mod compound {
     fn records_nested_computed_alias_write_prefix() {
         let result = check(
             r"
-            extern type Inner { computed var x: float; }
-            extern type Outer { var inner: Inner; }
+            extern type Inner { computed x: float; }
+            extern type Outer { inner: Inner; }
             fn write(var o: Outer) {
                 var Outer { inner: Inner { x } } = o;
                 x = 1.0;
@@ -2810,28 +2812,31 @@ mod mut_borrow {
     }
 
     #[test]
-    fn rejects_readonly_field() {
-        let errors = expect_type_errors(check_with_provider(
+    fn accepts_direct_field() {
+        let result = check_with_provider(
             r"
             import ext:host { Point, touch };
             fn use_it(var p: Point) { touch(p.x); }
             ",
             touch_provider(
                 vec![ExternTypeDescriptor {
-                    fields: vec![access_field(
-                        "x",
-                        ExternTypeExpr::Float,
-                        FieldAccess::ReadOnly { computed: false },
-                    )],
+                    fields: vec![field("x", ExternTypeExpr::Float)],
                     ..extern_type("Point")
                 }],
                 ExternTypeExpr::Float,
             ),
-        ));
+        )
+        .expect("typecheck failed");
+        let owner = result
+            .externs()
+            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
+            .expect("extern type");
+        let (field, _) = result
+            .externs()
+            .field(owner, Ident::new("x"))
+            .expect("extern field");
 
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ImmutableAssignment { .. })
-        });
+        assert_use(&result, ExternUseTarget::FieldWrite(field));
     }
 
     #[test]
@@ -2843,11 +2848,7 @@ mod mut_borrow {
             ",
             touch_provider(
                 vec![ExternTypeDescriptor {
-                    fields: vec![access_field(
-                        "x",
-                        ExternTypeExpr::Float,
-                        FieldAccess::ReadWrite { computed: true },
-                    )],
+                    fields: vec![computed_field("x", ExternTypeExpr::Float)],
                     ..extern_type("Point")
                 }],
                 ExternTypeExpr::Float,

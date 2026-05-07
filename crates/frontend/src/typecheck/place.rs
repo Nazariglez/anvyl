@@ -1,5 +1,3 @@
-use anvyx_externs::FieldAccess;
-
 use super::{
     CheckedType, ExternUseTarget, MemberAccessKind, TypeChecker, TypeError, check_expr_checked,
     check_index_access, decls::nominal_type,
@@ -222,7 +220,7 @@ pub(super) fn resolve_extern_field(
     Some(ExternFieldPlace {
         field_ref: field,
         decl,
-        access: extern_field_access(receiver_access, decl.access),
+        access: extern_field_access(receiver_access, decl.computed),
     })
 }
 
@@ -303,16 +301,13 @@ pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAcces
     }
 }
 
-pub(super) fn extern_field_access(
-    receiver_access: PlaceAccess,
-    field_access: FieldAccess,
-) -> PlaceAccess {
-    match (receiver_access, field_access) {
-        (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: false }) => PlaceAccess::Mutable,
-        (PlaceAccess::Mutable, FieldAccess::ReadWrite { computed: true }) => PlaceAccess::Settable,
-        (PlaceAccess::Captured, _) => PlaceAccess::Captured,
-        (PlaceAccess::ReadonlySelf, _) => PlaceAccess::ReadonlySelf,
-        (PlaceAccess::NotPlace, _) => PlaceAccess::NotPlace,
-        _ => PlaceAccess::Immutable,
+pub(super) fn extern_field_access(receiver_access: PlaceAccess, computed: bool) -> PlaceAccess {
+    match receiver_access {
+        PlaceAccess::Mutable if computed => PlaceAccess::Settable,
+        PlaceAccess::Mutable => PlaceAccess::Mutable,
+        PlaceAccess::Captured => PlaceAccess::Captured,
+        PlaceAccess::ReadonlySelf => PlaceAccess::ReadonlySelf,
+        PlaceAccess::NotPlace => PlaceAccess::NotPlace,
+        PlaceAccess::Settable | PlaceAccess::Immutable => PlaceAccess::Immutable,
     }
 }

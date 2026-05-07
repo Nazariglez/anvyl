@@ -9,6 +9,6 @@ extern type Point {
 }
 
 fn main() {
-    var p = Point {};
+    let p = Point {};
     p.x = 1;
 }

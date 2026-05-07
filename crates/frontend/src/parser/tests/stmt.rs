@@ -1,7 +1,7 @@
 use super::helpers::{parse_expr, parse_program, parse_program_err};
 use crate::ast::{
-    self, BinaryOp, ExternFieldAccess, ExternReceiverMode, ExternTypeRep, MethodReceiver,
-    Mutability, NominalKind, Type,
+    self, BinaryOp, ExternReceiverMode, ExternTypeRep, MethodReceiver, Mutability, NominalKind,
+    Type,
 };
 
 #[test]
@@ -665,15 +665,12 @@ mod externs {
     }
 
     #[test]
-    fn field_access() {
+    fn field_forms() {
         let node = parse_extern_type(
             r"
         extern type T {
             plain: int;
-            var mutable: int;
-            let readonly: int;
             computed cached: int;
-            computed var live: int;
         }
     ",
         );
@@ -683,34 +680,25 @@ mod externs {
             .members
             .iter()
             .map(|member| {
-                let ast::ExternTypeMember::Field {
-                    name,
-                    access,
-                    computed,
-                    ..
-                } = member
-                else {
+                let ast::ExternTypeMember::Field { name, computed, .. } = member else {
                     panic!("expected Field");
                 };
-                (name.0.as_ref().as_str(), *access, *computed)
+                (name.0.as_ref().as_str(), *computed)
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            fields,
-            [
-                ("plain", ExternFieldAccess::ReadWrite, false),
-                ("mutable", ExternFieldAccess::ReadWrite, false),
-                ("readonly", ExternFieldAccess::ReadOnly, false),
-                ("cached", ExternFieldAccess::ReadOnly, true),
-                ("live", ExternFieldAccess::ReadWrite, true),
-            ]
-        );
+        assert_eq!(fields, [("plain", false), ("cached", true)]);
     }
 
     #[test]
-    fn computed_let_field_fails() {
-        parse_program_err("extern type T { computed let x: int; }");
+    fn invalid_field_forms_fail() {
+        for source in [
+            "extern type T { let x: int; }",
+            "extern type T { var x: int; }",
+            "extern type T { computed var x: int; }",
+        ] {
+            parse_program_err(source);
+        }
     }
 
     #[test]

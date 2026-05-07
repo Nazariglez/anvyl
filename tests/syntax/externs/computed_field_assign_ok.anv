@@ -3,7 +3,7 @@
 // @frontend: new
 
 extern type Point {
-    computed var x: int;
+    computed x: int;
     init;
 }
 

@@ -5303,14 +5303,9 @@ fn check_extern_literal_fields(
             continue;
         };
 
-        let access = field.access;
         let field_ty = field.ty.clone();
         let allowed = if explicit_init.is_empty() {
-            !matches!(
-                access,
-                anvyx_externs::FieldAccess::ReadOnly { computed: true }
-                    | anvyx_externs::FieldAccess::ReadWrite { computed: true }
-            )
+            !field.computed
         } else {
             explicit_init.contains(name)
         };
@@ -5346,13 +5341,7 @@ fn required_extern_literal_fields(
     tc.extern_type(owner)
         .fields
         .iter()
-        .filter(|field| {
-            !matches!(
-                field.access,
-                anvyx_externs::FieldAccess::ReadOnly { computed: true }
-                    | anvyx_externs::FieldAccess::ReadWrite { computed: true }
-            )
-        })
+        .filter(|field| !field.computed)
         .map(|field| field.name)
         .collect()
 }

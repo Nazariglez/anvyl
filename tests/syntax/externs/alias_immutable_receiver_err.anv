@@ -1,5 +1,6 @@
 // @mode: check
-// @expect: success
+// @expect: error
+// @contains: var pattern requires a mutable place
 // @frontend: new
 
 extern type Point {
@@ -7,7 +8,6 @@ extern type Point {
     y: float;
 }
 
-fn main(var p: Point) {
+fn main(p: Point) {
     var Point { x } = p;
-    x = 1.0;
 }
