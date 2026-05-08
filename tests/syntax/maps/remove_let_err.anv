@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
-// @frontend: default
-// @contains: var
+// @frontend: new
+// @contains: mutating method requires mutable receiver
 
 fn main() {
     let m = ["a": 1];

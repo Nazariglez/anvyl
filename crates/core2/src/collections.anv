@@ -6,4 +6,5 @@ pub extend<T> [T] {
 
 pub extend<K, V> [K: V] {
     fn insert(var self, key: K, value: V) { }
+    fn remove(var self, key: K) -> V? { nil }
 }
