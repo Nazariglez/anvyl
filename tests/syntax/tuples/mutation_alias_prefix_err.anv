@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: same variable
+
+fn take(var pair: (int, int), var x: int) {
+    pair.0 = x;
+}
+
+fn main() {
+    var nested = ((1, 2), 3);
+    take(nested.0, nested.0.1);
+}

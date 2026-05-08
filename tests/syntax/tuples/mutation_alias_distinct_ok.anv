@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn set(var x: int, var y: int) {
+    x = 1;
+    y = 2;
+}
+
+fn main() {
+    var pair = (0, 0);
+    set(pair.0, pair.1);
+}

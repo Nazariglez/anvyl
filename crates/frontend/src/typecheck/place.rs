@@ -1,6 +1,6 @@
 use super::{
     CheckedType, ExternUseTarget, MemberAccessKind, TypeChecker, TypeError, ValueDecl,
-    check_expr_checked, check_index_access, decls::nominal_type,
+    check_expr_checked, check_index_access, check_tuple_index_access, decls::nominal_type,
 };
 use crate::{
     ast::{ExprId, ExprKind, ExprNode, Ident, Type},
@@ -208,6 +208,20 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
         let mut place = CheckedPlace::new(checked, access);
         place.value.facts = target.value.facts;
         place.value.path = target.value.path.map(PlacePath::index);
+        place.accepts_extern_any = target.accepts_extern_any;
+        return place;
+    }
+
+    if let ExprKind::TupleIndex(index) = &expr.node.kind {
+        let target = check_place(&index.node.target, tc);
+        let checked = check_tuple_index_access(expr, index, &target.value.checked, tc);
+        let access = projected_field_access(target.value.access);
+        let mut place = CheckedPlace::new(checked, access);
+        place.value.facts = target.value.facts;
+        place.value.path = target
+            .value
+            .path
+            .map(|path| path.tuple(index.node.index as usize));
         place.accepts_extern_any = target.accepts_extern_any;
         return place;
     }

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter { value: int }
+
+extend Counter {
+    fn inc(var self) {
+        self.value = self.value + 1;
+    }
+}
+
+fn main() {
+    var pair = (Counter { value: 0 }, 2);
+    pair.0.value = 3;
+    pair.0.inc();
+}

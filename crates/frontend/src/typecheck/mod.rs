@@ -5288,9 +5288,18 @@ fn check_tuple_checked_with_hint(
 
 fn check_tuple_index(expr: &ExprNode, node: &TupleIndexNode, tc: &mut TypeChecker) -> CheckedType {
     let target = check_expr_checked(&node.node.target, tc);
+    check_tuple_index_access(expr, node, &target, tc)
+}
+
+fn check_tuple_index_access(
+    expr: &ExprNode,
+    node: &TupleIndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedType {
     let Type::Tuple(elems) = &target.ty else {
         tc.push_error(TypeError::TupleIndexOnNonTuple {
-            ty: target.ty,
+            ty: target.ty.clone(),
             index: node.node.index,
             span: node.span,
         });
@@ -6147,6 +6156,7 @@ fn assignment_target_name(expr: &ExprNode) -> Ident {
         ExprKind::Ident(name) => *name,
         ExprKind::Field(field) => field.node.field,
         ExprKind::Index(index) => assignment_target_name(&index.node.target),
+        ExprKind::TupleIndex(index) => assignment_target_name(&index.node.target),
         _ => Ident::new("<target>"),
     }
 }
