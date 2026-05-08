@@ -2,6 +2,8 @@
 // @expect: error
 // @contains: Mismatched types
 
-fn foo(x: int, y: float = 1) {}
+fn takes_float(x: float) {}
 
-fn main() {}
+fn main() {
+    takes_float(1);
+}

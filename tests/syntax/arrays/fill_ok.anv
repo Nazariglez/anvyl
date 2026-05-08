@@ -7,7 +7,7 @@ fn main() {
     let c: [int; _] = [1; 4];
 
     let ints: [int] = [0; 3];
-    let floats: [float] = [1; 2];
+    let floats: [float] = [1.0; 2];
 
     var nils: [int?] = [nil; 2];
 }

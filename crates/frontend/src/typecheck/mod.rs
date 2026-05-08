@@ -1555,17 +1555,18 @@ impl TypeChecker {
             .find_static_extend_method(target, name, |ext| self.extend_visible(&ext.origin))
     }
 
-    fn has_direct_conversion(&self, source: &Type, target: &Type) -> bool {
+    fn has_explicit_cast_conversion(&self, source: &Type, target: &Type) -> bool {
         source == target
-            || matches!(
-                (source, target),
-                (Type::Int, Type::Float) | (Type::Float, Type::Int)
-            )
-            || matches!(
-                self.decls
-                    .find_cast_conversion(source, target, |ext| self.extend_visible(&ext.origin)),
-                Some(CastConversionMatch::Match)
-            )
+            || builtin_numeric_cast(source, target)
+            || self.has_cast_from_conversion(source, target)
+    }
+
+    fn has_cast_from_conversion(&self, source: &Type, target: &Type) -> bool {
+        matches!(
+            self.decls
+                .find_cast_conversion(source, target, |ext| self.extend_visible(&ext.origin)),
+            Some(CastConversionMatch::Match)
+        )
     }
 
     fn exported_value_in_module(
@@ -3944,13 +3945,7 @@ fn check_expr_checked_with_hint(
                 }
             }
         },
-        ExprKind::Lit(lit) => {
-            let ty = match (lit, expected_assignable_type(expected.as_ref(), tc)) {
-                (Lit::Int(_), Some(Type::Float)) => Type::Float,
-                _ => type_from_lit(lit),
-            };
-            checked_from_type(expr, ty, tc)
-        }
+        ExprKind::Lit(lit) => checked_from_type(expr, type_from_lit(lit), tc),
         ExprKind::TypeSubject(ty) => {
             if let Some(ty) = tc.resolve_type_subject(ty, expr.span) {
                 tc.push_error(TypeError::TypeUsedAsValue {
@@ -4968,11 +4963,18 @@ fn option_elem_handle(elem: TypeHandle, tc: &mut TypeChecker) -> TypeHandle {
     tc.type_handle(&option_ty)
 }
 
+fn builtin_numeric_cast(source: &Type, target: &Type) -> bool {
+    matches!(
+        (source, target),
+        (Type::Int, Type::Float) | (Type::Float, Type::Int)
+    )
+}
+
 fn check_cast_expr(expr: &ExprNode, cast: &CastNode, tc: &mut TypeChecker) -> CheckedType {
     let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
     let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
     let from = checked.ty;
-    let valid = tc.has_direct_conversion(&from, &target);
+    let valid = tc.has_explicit_cast_conversion(&from, &target);
     let ty = if valid || matches!(from, Type::Infer) || matches!(target, Type::Infer) {
         target
     } else {

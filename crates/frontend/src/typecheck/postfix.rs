@@ -1254,7 +1254,7 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
             };
         }
         let target = tc.handle_type(&param.ty);
-        if tc.has_direct_conversion(&checked.ty, &target) {
+        if tc.has_cast_from_conversion(&checked.ty, &target) {
             return SourceArgCheck {
                 failed: tc.solve_constraints(),
                 mutable_path: None,

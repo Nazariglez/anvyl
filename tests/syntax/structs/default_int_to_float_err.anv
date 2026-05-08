@@ -2,6 +2,6 @@
 // @expect: error
 // @contains: Mismatched types
 
-fn foo(x: int, y: float = 1) {}
+struct Bad { x: float = 1 }
 
 fn main() {}

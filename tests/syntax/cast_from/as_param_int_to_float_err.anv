@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Mismatched types
+
+fn takes_as_float(x: as float) {}
+
+fn main() {
+    takes_as_float(1);
+}
