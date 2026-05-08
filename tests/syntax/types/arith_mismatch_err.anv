@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Mismatched types
+// @contains: Invalid operand type
 
 fn main() {
     let a: int = 10 + true;

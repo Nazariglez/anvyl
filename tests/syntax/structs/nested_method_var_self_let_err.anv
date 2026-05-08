@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: cannot assign to immutable value 'inc'
+// @contains: mutating method
 
 struct Counter {
     n: int,

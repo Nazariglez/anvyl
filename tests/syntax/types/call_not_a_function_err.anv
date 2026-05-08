@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Not a function
+// @contains: is not callable
 
 fn main() {
     let x: int = 10;

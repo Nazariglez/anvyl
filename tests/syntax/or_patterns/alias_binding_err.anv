@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot be used as aliases
+// @skip: FIXME: x should be a var ref to e, same as rust, this should be allowed
+
+enum E { A(int), B(int) }
+
+fn main() {
+    var e = E.A(1);
+    match var e {
+        E.A(x) | E.B(x) => {},
+    }
+}

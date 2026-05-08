@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: cannot assign to immutable value 'swap'
+// @contains: mutating method
 
 extend<T> slice[T] {
     fn swap(var self, a: int, b: int) {

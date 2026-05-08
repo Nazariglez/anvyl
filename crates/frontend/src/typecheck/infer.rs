@@ -1115,6 +1115,42 @@ impl Solver {
         Ok(Box::new(self.relate_tys(span, expected, found, relation)?))
     }
 
+    fn relate_boxed_assignable(
+        &mut self,
+        span: Span,
+        expected_elem: Ty,
+        found_elem: Ty,
+        expected: &Ty,
+        found: &Ty,
+    ) -> Result<Box<Ty>, SolveError> {
+        match self.relate_boxed(span, expected_elem, found_elem, TyRelation::Assignable) {
+            Ok(ty) => Ok(ty),
+            Err(_) => Err(SolveError::type_mismatch(
+                expected.clone(),
+                found.clone(),
+                span,
+            )),
+        }
+    }
+
+    fn outer_mismatch<T>(
+        result: Result<T, SolveError>,
+        mismatch: bool,
+        expected: &Ty,
+        found: &Ty,
+        span: Span,
+    ) -> Result<T, SolveError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(_) if mismatch => Err(SolveError::type_mismatch(
+                expected.clone(),
+                found.clone(),
+                span,
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
     fn relate_ty_lists(
         &mut self,
         span: Span,
@@ -1122,11 +1158,11 @@ impl Solver {
         found: Vec<Ty>,
         relation: TyRelation,
     ) -> Result<Vec<Ty>, SolveError> {
-        expected
-            .into_iter()
-            .zip(found)
-            .map(|(expected, found)| self.relate_tys(span, expected, found, relation))
-            .collect()
+        let mut related = Vec::with_capacity(expected.len());
+        for (expected, found) in expected.into_iter().zip(found) {
+            related.push(self.relate_tys(span, expected, found, relation)?);
+        }
+        Ok(related)
     }
 
     fn unify_func_invariant(
@@ -1335,7 +1371,7 @@ impl Solver {
                 )?))
             }
             (Ty::List { elem }, Ty::List { elem: to_elem }) => Ok(Ty::List {
-                elem: self.relate_boxed(span, *to_elem, *elem, TyRelation::Assignable)?,
+                elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
             }),
             (
                 Ty::Array { elem, len },
@@ -1344,7 +1380,7 @@ impl Solver {
                     len: to_len,
                 },
             ) => Ok(Ty::Array {
-                elem: self.relate_boxed(span, *to_elem, *elem, TyRelation::Assignable)?,
+                elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
                 len: self.unify_const_equal(span, len, to_len)?,
             }),
             (
@@ -1354,15 +1390,15 @@ impl Solver {
                     value: to_value,
                 },
             ) => Ok(Ty::Map {
-                key: self.relate_boxed(span, *to_key, *key, TyRelation::Assignable)?,
-                value: self.relate_boxed(span, *to_value, *value, TyRelation::Assignable)?,
+                key: self.relate_boxed_assignable(span, *to_key, *key, &expected, &found)?,
+                value: self.relate_boxed_assignable(span, *to_value, *value, &expected, &found)?,
             }),
             (Ty::Slice { elem }, Ty::Slice { elem: to_elem }) => Ok(Ty::Slice {
-                elem: self.relate_boxed(span, *to_elem, *elem, TyRelation::Assignable)?,
+                elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
             }),
             (Ty::Array { elem, .. } | Ty::List { elem }, Ty::Slice { elem: to_elem }) => {
                 Ok(Ty::Slice {
-                    elem: self.relate_boxed(span, *to_elem, *elem, TyRelation::Assignable)?,
+                    elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
                 })
             }
             _ => Err(SolveError::type_mismatch(expected, found, span)),
@@ -1426,9 +1462,22 @@ impl Solver {
         if !from.same_head(&to) {
             return Err(SolveError::type_mismatch(expected, found, span));
         }
-        let type_args =
-            self.relate_ty_lists(span, to.type_args, from.type_args, TyRelation::Assignable)?;
-        let const_args = self.relate_const_arg_lists(span, to.const_args, from.const_args)?;
+        let outer_mismatch =
+            to.kind == NominalKind::Enum && to.name.0.as_ref() == Type::OPTION_ENUM_NAME;
+        let type_args = Self::outer_mismatch(
+            self.relate_ty_lists(span, to.type_args, from.type_args, TyRelation::Assignable),
+            outer_mismatch,
+            &expected,
+            &found,
+            span,
+        )?;
+        let const_args = Self::outer_mismatch(
+            self.relate_const_arg_lists(span, to.const_args, from.const_args),
+            outer_mismatch,
+            &expected,
+            &found,
+            span,
+        )?;
         Ok(Ty::nominal(
             to.kind, to.name, type_args, const_args, to.origin,
         ))

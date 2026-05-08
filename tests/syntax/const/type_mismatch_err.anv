@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: type mismatch
+// @contains: Mismatched types
 
 const X: bool = 42;
 fn main() {}

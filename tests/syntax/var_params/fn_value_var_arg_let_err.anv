@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: cannot assign to immutable value 'x'
+// @contains: immutable binding
 
 fn set(var x: int) { x = 1; }
 

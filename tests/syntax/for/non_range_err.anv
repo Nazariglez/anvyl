@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: type is not iterable
+// @contains: cannot be iterated
 
 fn main() {
     for n in 123 {

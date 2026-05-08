@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: immutable value 'sort_by'
+// @contains: mutating method
 
 fn main() {
     let xs: [int] = [3, 1, 2];

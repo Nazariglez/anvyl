@@ -164,7 +164,7 @@ fn resolve_inferred_pattern(
     match expected_key {
         Some(key) => Some(key),
         None => {
-            tc.push_error(TypeError::CannotInferType { span });
+            tc.push_error(TypeError::CannotInferEnum { span });
             None
         }
     }

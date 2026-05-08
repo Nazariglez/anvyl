@@ -2042,7 +2042,7 @@ mod operators {
         assert!(
             errors
                 .iter()
-                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
+                .any(|error| matches!(error, TypeError::InvalidOperand { .. }))
         );
     }
 }

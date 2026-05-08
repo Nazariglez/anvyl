@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: immutable value 'push'
+// @contains: mutating method
 
 fn main() {
     let list: [int] = [1, 2, 3];

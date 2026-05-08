@@ -11,7 +11,7 @@ use self::{
         SolverRelationError, TypeHandle,
     },
     pattern::{PatternBindMode, PatternContext},
-    place::{PlaceAccess, PlaceUseFacts, check_alias_scrutinee, check_place},
+    place::{PlaceAccess, PlacePath, PlaceUseFacts, check_alias_scrutinee, check_place},
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
     type_refs::{GenericParamError, GenericTypeContext},
@@ -166,6 +166,13 @@ pub(crate) enum TypeError {
     CannotInferType {
         span: Span,
     },
+    CannotInferEnum {
+        span: Span,
+    },
+    GenericLocalFunction {
+        name: Ident,
+        span: Span,
+    },
     AllNilArrayLiteral {
         span: Span,
     },
@@ -238,6 +245,28 @@ pub(crate) enum TypeError {
     },
     ImmutableAssignment {
         name: Ident,
+        span: Span,
+    },
+    ConstAssignment {
+        name: Ident,
+        span: Span,
+    },
+    VarArgNonLvalue {
+        span: Span,
+    },
+    VarArgImmutableBinding {
+        name: Ident,
+        span: Span,
+    },
+    MutatingMethodImmutableReceiver {
+        name: Ident,
+        span: Span,
+    },
+    MutableAlias {
+        span: Span,
+    },
+    InvalidFormatSpec {
+        reason: &'static str,
         span: Span,
     },
     CannotMutateCapturedVariable {
@@ -317,6 +346,14 @@ pub(crate) enum TypeError {
         message: &'static str,
         span: Span,
     },
+    InfiniteSize {
+        name: Ident,
+        span: Span,
+    },
+    NotEquatable {
+        ty: Type,
+        span: Span,
+    },
     UnsupportedPattern {
         pattern: &'static str,
         span: Span,
@@ -330,7 +367,16 @@ pub(crate) enum TypeError {
         ty: Type,
         span: Span,
     },
-    OrPatternUnsupported {
+    OrPatternBindingMismatch {
+        span: Span,
+    },
+    OrPatternBindingTypeMismatch {
+        name: Ident,
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    OrPatternAliasBinding {
         span: Span,
     },
     EmptyMatch {
@@ -609,6 +655,7 @@ impl From<SolverFinalizeError> for TypeError {
 enum LocalBindingKind {
     Immutable,
     Mutable,
+    Const,
     Alias,
     ReadonlySelf,
 }
@@ -626,6 +673,7 @@ impl LocalBindingKind {
         match self {
             Self::Immutable => PlaceAccess::Immutable,
             Self::Mutable | Self::Alias => PlaceAccess::Mutable,
+            Self::Const => PlaceAccess::Const,
             Self::ReadonlySelf => PlaceAccess::ReadonlySelf,
         }
     }
@@ -635,6 +683,7 @@ impl LocalBindingKind {
 struct AliasTarget {
     access: PlaceAccess,
     facts: Option<PlaceUseFacts>,
+    path: Option<PlacePath>,
     accepts_extern_any: bool,
 }
 
@@ -797,7 +846,7 @@ impl TypeChecker {
     }
 
     fn define_pattern_binding(&mut self, name: Ident, ty: Type, mutable: bool) {
-        self.define_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
+        self.define_shadowing_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
     }
 
     fn define_alias_binding(
@@ -806,9 +855,10 @@ impl TypeChecker {
         ty: Type,
         access: PlaceAccess,
         facts: Option<PlaceUseFacts>,
+        path: Option<PlacePath>,
         accepts_extern_any: bool,
     ) {
-        self.define_value_with_alias(
+        self.define_shadowing_value_with_alias(
             name,
             ty,
             LocalBindingKind::Alias,
@@ -816,13 +866,14 @@ impl TypeChecker {
             Some(AliasTarget {
                 access,
                 facts,
+                path,
                 accepts_extern_any,
             }),
         );
     }
 
     fn define_const(&mut self, name: Ident, ty: Type, value: ConstValue) {
-        self.define_value(name, ty, LocalBindingKind::Immutable, Some(value));
+        self.define_value(name, ty, LocalBindingKind::Const, Some(value));
     }
 
     fn define_value(
@@ -833,6 +884,16 @@ impl TypeChecker {
         const_value: Option<ConstValue>,
     ) {
         self.define_value_with_alias(name, ty, kind, const_value, None);
+    }
+
+    fn define_shadowing_value(
+        &mut self,
+        name: Ident,
+        ty: Type,
+        kind: LocalBindingKind,
+        const_value: Option<ConstValue>,
+    ) {
+        self.define_shadowing_value_with_alias(name, ty, kind, const_value, None);
     }
 
     fn define_value_with_alias(
@@ -856,6 +917,29 @@ impl TypeChecker {
 
         let type_id = self.solver.alloc_local_type(&ty);
         self.scopes.last_mut().expect("scope exists").insert(
+            name,
+            VarInfo {
+                type_id,
+                kind,
+                const_value,
+                alias,
+            },
+        );
+    }
+
+    fn define_shadowing_value_with_alias(
+        &mut self,
+        name: Ident,
+        ty: Type,
+        kind: LocalBindingKind,
+        const_value: Option<ConstValue>,
+        alias: Option<AliasTarget>,
+    ) {
+        let type_id = self.solver.alloc_local_type(&ty);
+        let Some(scope) = self.scopes.last_mut() else {
+            return;
+        };
+        scope.insert(
             name,
             VarInfo {
                 type_id,
@@ -906,11 +990,6 @@ impl TypeChecker {
 
     fn exit_lambda(&mut self) {
         self.lambda_frames.pop();
-    }
-
-    fn lookup_type(&self, name: Ident) -> Option<Type> {
-        self.lookup(name)
-            .map(|info| self.solver.local_type_to_type(info.type_id))
     }
 
     fn type_handle(&self, ty: &Type) -> TypeHandle {
@@ -2104,6 +2183,7 @@ fn typechecker_for_modules(
 
     tc.eval_module_consts(&root_scope);
     tc.finalize_declarations();
+    check_finite_size_cycles(&mut tc);
     check_decl_param_order(program, &mut tc);
     check_infer_return_decls(program, &mut tc);
     for (_, program) in &module_bodies {
@@ -2127,6 +2207,127 @@ fn typechecker_for_modules(
 
 fn decl_errors(errors: &[DeclError]) -> Vec<TypeError> {
     errors.iter().cloned().map(TypeError::Decl).collect()
+}
+
+fn check_finite_size_cycles(tc: &mut TypeChecker) {
+    let graph = finite_size_graph(&tc.decls);
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut reported = HashSet::new();
+    let mut keys = graph.keys().cloned().collect::<Vec<_>>();
+    keys.sort_by_key(nominal_key_sort_key);
+    for key in keys {
+        check_finite_size_key(&key, &graph, &mut visiting, &mut visited, &mut reported, tc);
+    }
+}
+
+fn check_finite_size_key(
+    key: &NominalKey,
+    graph: &HashMap<NominalKey, Vec<NominalKey>>,
+    visiting: &mut HashSet<NominalKey>,
+    visited: &mut HashSet<NominalKey>,
+    reported: &mut HashSet<NominalKey>,
+    tc: &mut TypeChecker,
+) {
+    if visited.contains(key) {
+        return;
+    }
+    if !visiting.insert(key.clone()) {
+        if reported.insert(key.clone()) {
+            tc.push_error(TypeError::InfiniteSize {
+                name: key.name,
+                span: tc.decls.type_span_or_default(key),
+            });
+        }
+        return;
+    }
+    if let Some(edges) = graph.get(key) {
+        for edge in edges {
+            check_finite_size_key(edge, graph, visiting, visited, reported, tc);
+        }
+    }
+    visiting.remove(key);
+    visited.insert(key.clone());
+}
+
+fn finite_size_graph(decls: &DeclarationIndex) -> HashMap<NominalKey, Vec<NominalKey>> {
+    let mut graph = HashMap::new();
+    for (key, schema) in decls.aggregates() {
+        let mut edges = vec![];
+        for field in schema.fields.values() {
+            finite_size_edges(&field.ty, decls, &mut edges);
+        }
+        sort_finite_size_edges(&mut edges);
+        graph.insert(key.clone(), edges);
+    }
+    for (key, schema) in decls.enums() {
+        let mut edges = vec![];
+        for variant in schema.variants.values() {
+            match &variant.payload {
+                VariantPayload::Unit => {}
+                VariantPayload::Tuple(types) => {
+                    for ty in types {
+                        finite_size_edges(ty, decls, &mut edges);
+                    }
+                }
+                VariantPayload::Struct(fields) => {
+                    for field in fields.values() {
+                        finite_size_edges(&field.ty, decls, &mut edges);
+                    }
+                }
+            }
+        }
+        sort_finite_size_edges(&mut edges);
+        graph.insert(key.clone(), edges);
+    }
+    graph
+}
+
+fn sort_finite_size_edges(edges: &mut Vec<NominalKey>) {
+    edges.sort_by_key(nominal_key_sort_key);
+    edges.dedup();
+}
+
+fn nominal_key_sort_key(key: &NominalKey) -> String {
+    format!("{:?}:{:?}:{}", key.module, key.kind, key.name)
+}
+
+fn finite_size_edges(ty: &Type, decls: &DeclarationIndex, edges: &mut Vec<NominalKey>) {
+    match ty {
+        Type::Nominal(nominal) => {
+            if let Some(key) = decls.key_for_type(ty)
+                && matches!(key.kind, NominalKind::Struct | NominalKind::Enum)
+            {
+                edges.push(key);
+            }
+            if !matches!(nominal.kind, NominalKind::DataRef | NominalKind::Extern) {
+                for arg in &nominal.type_args {
+                    finite_size_edges(arg, decls, edges);
+                }
+            }
+        }
+        Type::Array { elem, .. } => finite_size_edges(elem, decls, edges),
+        Type::Tuple(types) => {
+            for ty in types {
+                finite_size_edges(ty, decls, edges);
+            }
+        }
+        Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Func { .. }
+        | Type::Var(_)
+        | Type::UnresolvedName(_)
+        | Type::UnresolvedNominal { .. }
+        | Type::List { .. }
+        | Type::Map { .. }
+        | Type::Slice { .. } => {}
+    }
 }
 
 fn generic_param_decl_type_error(error: GenericContextError) -> TypeError {
@@ -2603,7 +2804,7 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                     Some(t) => tc.resolve_type_for_tc_at(t, const_node.span),
                     None => Type::Infer,
                 };
-                tc.define(c.name, ty, false);
+                tc.define_value(c.name, ty, LocalBindingKind::Const, None);
             }
             _ => {}
         }
@@ -2613,6 +2814,24 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
 fn check_stmts(stmts: &[StmtNode], tc: &mut TypeChecker) {
     for stmt in stmts {
         check_stmt(stmt, tc);
+    }
+}
+
+fn register_block_declarations(stmts: &[StmtNode], tc: &mut TypeChecker) {
+    for stmt in stmts {
+        let Stmt::Func(func_node) = &stmt.node else {
+            continue;
+        };
+        let func = &func_node.node;
+        if is_generic(func) {
+            tc.push_error(TypeError::GenericLocalFunction {
+                name: func.name,
+                span: func_node.span,
+            });
+            continue;
+        }
+        let func_ty = tc.func_type_from_sig(&func.params, &func.ret);
+        tc.define_value(func.name, func_ty, LocalBindingKind::Immutable, None);
     }
 }
 
@@ -2691,9 +2910,20 @@ fn check_aggregate_field_defaults(
         {
             continue;
         }
+        if empty_heap_collection_default(default, &schema.ty) {
+            continue;
+        }
         if let Err(error) = tc.eval_const_expr(default, false) {
             tc.push_error(error);
         }
+    }
+}
+
+fn empty_heap_collection_default(expr: &ExprNode, ty: &Type) -> bool {
+    match (&expr.node.kind, ty) {
+        (ExprKind::ArrayLiteral(lit), Type::List { .. }) => lit.node.elements.is_empty(),
+        (ExprKind::MapLiteral(lit), Type::Map { .. }) => lit.node.entries.is_empty(),
+        _ => false,
     }
 }
 
@@ -2771,8 +3001,12 @@ fn check_defer(defer_node: &DeferNode, tc: &mut TypeChecker) {
 
 fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
     let func = &func_node.node;
-    let Some(func_ty) = tc.lookup_type(func.name) else {
-        return;
+    let registered_ty = tc
+        .lookup(func.name)
+        .map(|info| tc.solver.local_type_to_type(info.type_id));
+    let func_ty = match registered_ty {
+        Some(ty @ Type::Func { .. }) => ty,
+        _ => tc.func_type_from_sig(&func.params, &func.ret),
     };
     let Type::Func {
         params: param_types,
@@ -3295,6 +3529,7 @@ fn check_block_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     tc.push_scope();
+    register_block_declarations(&block.node.stmts, tc);
     for stmt in &block.node.stmts {
         check_stmt(stmt, tc);
     }
@@ -3323,14 +3558,121 @@ fn mode_for_binding(binding: &Binding) -> PatternBindMode {
     }
 }
 
+struct PatternScrutinee {
+    checked: CheckedType,
+    access: PlaceAccess,
+    facts: Option<PlaceUseFacts>,
+    path: Option<PlacePath>,
+    accepts_extern_any: bool,
+}
+
+impl PatternScrutinee {
+    fn owned(checked: CheckedType) -> Self {
+        Self {
+            checked,
+            access: PlaceAccess::Mutable,
+            facts: None,
+            path: None,
+            accepts_extern_any: false,
+        }
+    }
+
+    fn alias(place: place::CheckedPlace) -> Self {
+        let accepts_extern_any = place.accepts_extern_any();
+        let place::PlaceValue {
+            checked,
+            access,
+            facts,
+            path,
+        } = place.value;
+        Self {
+            checked,
+            access,
+            facts,
+            path,
+            accepts_extern_any,
+        }
+    }
+
+    fn pattern_place(
+        &self,
+        expected_handle: TypeHandle,
+        expected_ty: Type,
+    ) -> pattern::PatternPlace {
+        pattern::PatternPlace {
+            expected_handle,
+            expected_ty,
+            access: self.access,
+            facts: self.facts.clone(),
+            path: self.path.clone(),
+            accepts_extern_any: self.accepts_extern_any,
+        }
+    }
+}
+
 fn check_pattern_scrutinee(
     expr: &ExprNode,
     mode: PatternBindMode,
     tc: &mut TypeChecker,
-) -> CheckedType {
+) -> PatternScrutinee {
     match mode {
-        PatternBindMode::Owned { .. } => check_value_expr_checked_with_hint(expr, None, tc),
-        PatternBindMode::Alias => check_alias_scrutinee(expr, tc),
+        PatternBindMode::Owned { .. } => {
+            PatternScrutinee::owned(check_value_expr_checked_with_hint(expr, None, tc))
+        }
+        PatternBindMode::Alias => PatternScrutinee::alias(check_alias_scrutinee(expr, tc)),
+    }
+}
+
+fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
+    if let Some(annot_inner) = tc.decls.core_option_inner(annot) {
+        let value_inner = tc.decls.core_option_inner(value).unwrap_or(value);
+        let inner = refined_binding_type(annot_inner, value_inner, tc);
+        return tc
+            .decls
+            .core_option_of(inner)
+            .unwrap_or_else(|| annot.clone());
+    }
+    match (annot, value) {
+        (
+            Type::Array { elem, len },
+            Type::Array {
+                elem: value_elem,
+                len: value_len,
+            },
+        ) => Type::Array {
+            elem: Box::new(refined_binding_type(elem, value_elem, tc)),
+            len: if matches!(len, ArrayLen::Infer) {
+                *value_len
+            } else {
+                *len
+            },
+        },
+        (Type::List { elem }, Type::List { elem: value_elem }) => Type::List {
+            elem: Box::new(refined_binding_type(elem, value_elem, tc)),
+        },
+        (Type::Slice { elem }, Type::Slice { elem: value_elem }) => Type::Slice {
+            elem: Box::new(refined_binding_type(elem, value_elem, tc)),
+        },
+        (
+            Type::Map { key, value },
+            Type::Map {
+                key: value_key,
+                value: value_value,
+            },
+        ) => Type::Map {
+            key: Box::new(refined_binding_type(key, value_key, tc)),
+            value: Box::new(refined_binding_type(value, value_value, tc)),
+        },
+        (Type::Tuple(types), Type::Tuple(value_types)) if types.len() == value_types.len() => {
+            Type::Tuple(
+                types
+                    .iter()
+                    .zip(value_types)
+                    .map(|(ty, value_ty)| refined_binding_type(ty, value_ty, tc))
+                    .collect(),
+            )
+        }
+        _ => annot.clone(),
     }
 }
 
@@ -3342,18 +3684,29 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
             let value = match mode {
-                PatternBindMode::Owned { .. } => check_value_expr_checked_with_hint(
-                    &binding.value,
-                    Some(annot_handle.clone()),
-                    tc,
-                ),
-                PatternBindMode::Alias => check_alias_scrutinee(&binding.value, tc),
+                PatternBindMode::Owned { .. } => {
+                    PatternScrutinee::owned(check_value_expr_checked_with_hint(
+                        &binding.value,
+                        Some(annot_handle.clone()),
+                        tc,
+                    ))
+                }
+                PatternBindMode::Alias => {
+                    PatternScrutinee::alias(check_alias_scrutinee(&binding.value, tc))
+                }
             };
-            tc.reject_extern_any_escape(&value, binding.value.span);
-            tc.expect_assignable(binding_node.span, value.handle, annot_handle);
-            pattern::check_at(
+            tc.reject_extern_any_escape(&value.checked, binding.value.span);
+            tc.expect_assignable(
+                binding_node.span,
+                value.checked.handle.clone(),
+                annot_handle,
+            );
+            tc.solve_constraints();
+            let binding_ty = refined_binding_type(&annot_ty, &value.checked.ty, tc);
+            let binding_handle = tc.type_handle(&binding_ty);
+            pattern::check_place_at(
                 &binding.pattern,
-                &annot_ty,
+                value.pattern_place(binding_handle, binding_ty),
                 mode,
                 binding.value.node.id,
                 PatternContext::Binding,
@@ -3362,12 +3715,11 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
         }
         None => {
             let value = check_pattern_scrutinee(&binding.value, mode, tc);
-            tc.reject_extern_any_escape(&value, binding.value.span);
-            tc.reject_user_any_type(&value.ty, binding_node.span);
-            pattern::check_handle_at(
+            tc.reject_extern_any_escape(&value.checked, binding.value.span);
+            tc.reject_user_any_type(&value.checked.ty, binding_node.span);
+            pattern::check_place_at(
                 &binding.pattern,
-                value.handle,
-                value.ty,
+                value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
                 mode,
                 binding.value.node.id,
                 PatternContext::Binding,
@@ -4104,6 +4456,14 @@ enum BinaryTypeFailure {
         found: Type,
         fallback: Type,
     },
+    NotEquatable {
+        ty: Type,
+        fallback: Type,
+    },
+}
+
+fn equatable_type(ty: &Type) -> bool {
+    !matches!(ty, Type::Slice { .. })
 }
 
 fn builtin_binary_type(
@@ -4142,12 +4502,17 @@ fn builtin_binary_type(
         }
         BinaryOp::Eq | BinaryOp::NotEq => {
             let extern_eq = same && tc.extern_type_id(left_ty).is_some();
-            if same && !extern_eq {
-                Ok(Type::Bool)
-            } else if extern_eq {
+            if extern_eq {
                 Err(BinaryTypeFailure::InvalidOperand {
                     op: op.to_string(),
                     operand_type: right_ty.clone(),
+                    fallback: Type::Infer,
+                })
+            } else if same && equatable_type(left_ty) {
+                Ok(Type::Bool)
+            } else if same {
+                Err(BinaryTypeFailure::NotEquatable {
+                    ty: left_ty.clone(),
                     fallback: Type::Infer,
                 })
             } else {
@@ -4162,7 +4527,7 @@ fn builtin_binary_type(
         | BinaryOp::GreaterThan
         | BinaryOp::LessThanEq
         | BinaryOp::GreaterThanEq => {
-            if left_ty.is_num() && same {
+            if (left_ty.is_num() || left_ty.is_str()) && same {
                 Ok(Type::Bool)
             } else if same {
                 Err(BinaryTypeFailure::InvalidOperand {
@@ -4179,23 +4544,34 @@ fn builtin_binary_type(
             }
         }
         BinaryOp::And | BinaryOp::Or => {
-            if left_ty.is_bool() && same {
+            if left_ty.is_bool() && right_ty.is_bool() {
                 Ok(Type::Bool)
             } else {
-                Err(BinaryTypeFailure::TypeMismatch {
-                    expected: Type::Bool,
-                    found: left_ty.clone(),
+                let operand_type = if left_ty.is_bool() { right_ty } else { left_ty };
+                Err(BinaryTypeFailure::InvalidOperand {
+                    op: op.to_string(),
+                    operand_type: operand_type.clone(),
                     fallback: Type::Bool,
                 })
             }
         }
         BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor | BinaryOp::Shl | BinaryOp::Shr => {
-            if left_ty.is_int() && same {
+            if left_ty.is_int() && right_ty.is_int() {
                 Ok(Type::Int)
+            } else if same {
+                Err(BinaryTypeFailure::InvalidOperand {
+                    op: op.to_string(),
+                    operand_type: left_ty.clone(),
+                    fallback: Type::Int,
+                })
             } else {
                 Err(BinaryTypeFailure::TypeMismatch {
                     expected: Type::Int,
-                    found: left_ty.clone(),
+                    found: if left_ty.is_int() {
+                        right_ty.clone()
+                    } else {
+                        left_ty.clone()
+                    },
                     fallback: Type::Int,
                 })
             }
@@ -4228,6 +4604,10 @@ fn emit_binary_failure(failure: BinaryTypeFailure, span: Span, tc: &mut TypeChec
                 found,
                 span,
             });
+            fallback
+        }
+        BinaryTypeFailure::NotEquatable { ty, fallback } => {
+            tc.push_error(TypeError::NotEquatable { ty, span });
             fallback
         }
     }
@@ -4571,6 +4951,23 @@ fn collection_literal_handle(
     }
 }
 
+fn contains_nil(elements: &[ExprNode]) -> bool {
+    elements
+        .iter()
+        .any(|element| matches!(element.node.kind, ExprKind::Lit(Lit::Nil)))
+}
+
+fn option_elem_handle(elem: TypeHandle, tc: &mut TypeChecker) -> TypeHandle {
+    let ty = tc.handle_type(&elem);
+    if tc.decls.core_option_inner(&ty).is_some() {
+        return elem;
+    }
+    let Some(option_ty) = tc.decls.core_option_of(ty) else {
+        return elem;
+    };
+    tc.type_handle(&option_ty)
+}
+
 fn check_cast_expr(expr: &ExprNode, cast: &CastNode, tc: &mut TypeChecker) -> CheckedType {
     let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
     let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
@@ -4641,15 +5038,42 @@ fn check_range_expr(
 fn check_string_interp(expr: &ExprNode, parts: &[StringPart], tc: &mut TypeChecker) -> CheckedType {
     let mut contains_extern_any = false;
     for part in parts {
-        let StringPart::Expr(inner, _) = part else {
+        let StringPart::Expr(inner, spec) = part else {
             continue;
         };
         let checked = check_value_expr_checked_with_hint(inner, None, tc);
+        if let Some(spec) = spec {
+            validate_format_spec(&checked.ty, &spec.node, spec.span, tc);
+        }
         contains_extern_any |= checked.contains_extern_any;
     }
     let mut checked = checked_from_type(expr, Type::String, tc);
     checked.contains_extern_any = contains_extern_any;
     checked
+}
+
+fn validate_format_spec(ty: &Type, spec: &FormatSpec, span: Span, tc: &mut TypeChecker) {
+    if matches!(ty, Type::Infer) {
+        return;
+    }
+    let reason = match spec.kind {
+        FormatKind::Hex | FormatKind::HexUpper | FormatKind::Binary if !ty.is_int() => {
+            Some("integer format requires int")
+        }
+        FormatKind::Exp | FormatKind::ExpUpper if !ty.is_float() => {
+            Some("scientific format requires float")
+        }
+        _ if spec.precision.is_some() && !(ty.is_float() || ty.is_str()) => {
+            Some("precision requires float or string")
+        }
+        _ if spec.sign == FormatSign::Always && !(ty.is_int() || ty.is_float()) => {
+            Some("sign requires numeric type")
+        }
+        _ => None,
+    };
+    if let Some(reason) = reason {
+        tc.push_error(TypeError::InvalidFormatSpec { reason, span });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4731,6 +5155,7 @@ fn check_array_lit_hint(
 ) -> CheckedType {
     let expected = expected.as_ref();
     let expected_collection = expected_collection(expected, tc);
+    let has_nil = contains_nil(&lit.node.elements);
     if expected_collection.is_none()
         && !lit.node.elements.is_empty()
         && lit
@@ -4743,6 +5168,11 @@ fn check_array_lit_hint(
     }
     let (elem, kind) = expected_collection
         .unwrap_or_else(|| (tc.fresh_temp_handle(lit.span), CollectionLiteralKind::Array));
+    let elem = if has_nil {
+        option_elem_handle(elem, tc)
+    } else {
+        elem
+    };
     let array = collection_literal_handle(
         kind,
         elem.clone(),
@@ -5372,7 +5802,7 @@ fn check_inferred_enum_hint(
         return checked_from_type(expr, Type::Infer, tc);
     };
     let generics = resolved.generics.clone();
-    let variant = resolved.schema;
+    let variant = &resolved.schema;
 
     let inf = NominalLiteralSolver::without_args(&generics, node.span, tc);
     if !inf.bind_expected(&key, &generics, Some(&expected_ty), node.span, tc) {
@@ -5384,7 +5814,14 @@ fn check_inferred_enum_hint(
     match (&variant.payload, &node.node.args) {
         (VariantPayload::Unit, InferredEnumArgs::Unit) => {}
         (VariantPayload::Unit, args) => {
-            return wrong_inferred_enum_args(expr, node, 0, args, tc);
+            enum_variant::push_shape_mismatch(
+                tc,
+                &resolved,
+                inferred_enum_arg_shape(args),
+                node.span,
+            );
+            check_inferred_enum_args(args, tc);
+            return checked_from_type(expr, Type::Infer, tc);
         }
         (VariantPayload::Tuple(params), InferredEnumArgs::Tuple(args)) => {
             if params.len() != args.len() {
@@ -5410,8 +5847,15 @@ fn check_inferred_enum_hint(
                 return checked_from_type(expr, Type::Infer, tc);
             }
         }
-        (VariantPayload::Tuple(params), args) => {
-            return wrong_inferred_enum_args(expr, node, params.len(), args, tc);
+        (VariantPayload::Tuple(_), args) => {
+            enum_variant::push_shape_mismatch(
+                tc,
+                &resolved,
+                inferred_enum_arg_shape(args),
+                node.span,
+            );
+            check_inferred_enum_args(args, tc);
+            return checked_from_type(expr, Type::Infer, tc);
         }
         (VariantPayload::Struct(fields), InferredEnumArgs::Struct(args)) => {
             let field_check = check_variant_literal_fields(
@@ -5428,8 +5872,15 @@ fn check_inferred_enum_hint(
                 return checked_from_type(expr, Type::Infer, tc);
             }
         }
-        (VariantPayload::Struct(fields), args) => {
-            return wrong_inferred_enum_args(expr, node, fields.len(), args, tc);
+        (VariantPayload::Struct(_), args) => {
+            enum_variant::push_shape_mismatch(
+                tc,
+                &resolved,
+                inferred_enum_arg_shape(args),
+                node.span,
+            );
+            check_inferred_enum_args(args, tc);
+            return checked_from_type(expr, Type::Infer, tc);
         }
     }
 
@@ -5443,24 +5894,8 @@ fn cannot_infer_inferred_enum(
     node: &InferredEnumNode,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    tc.push_error(TypeError::CannotInferType { span: node.span });
+    tc.push_error(TypeError::CannotInferEnum { span: node.span });
     check_inferred_enum_args(&node.node.args, tc);
-    checked_from_type(expr, Type::Infer, tc)
-}
-
-fn wrong_inferred_enum_args(
-    expr: &ExprNode,
-    node: &InferredEnumNode,
-    expected: usize,
-    args: &InferredEnumArgs,
-    tc: &mut TypeChecker,
-) -> CheckedType {
-    tc.push_error(TypeError::WrongArgCount {
-        expected,
-        found: inferred_enum_arg_count(args),
-        span: node.span,
-    });
-    check_inferred_enum_args(args, tc);
     checked_from_type(expr, Type::Infer, tc)
 }
 
@@ -5577,11 +6012,11 @@ fn check_exprs_without_hint(args: &[ExprNode], tc: &mut TypeChecker) {
     }
 }
 
-fn inferred_enum_arg_count(args: &InferredEnumArgs) -> usize {
+fn inferred_enum_arg_shape(args: &InferredEnumArgs) -> VariantShape {
     match args {
-        InferredEnumArgs::Unit => 0,
-        InferredEnumArgs::Tuple(args) => args.len(),
-        InferredEnumArgs::Struct(fields) => fields.len(),
+        InferredEnumArgs::Unit => VariantShape::Unit,
+        InferredEnumArgs::Tuple(_) => VariantShape::Tuple,
+        InferredEnumArgs::Struct(_) => VariantShape::Struct,
     }
 }
 
@@ -5755,16 +6190,17 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
 
     let item_ty = iterable_item_type(&iterable_ty, &tc.decls).unwrap_or_else(|| {
         tc.push_error(TypeError::ForIterableNotSupported {
-            found: iterable_ty,
+            found: iterable_ty.clone(),
             span: node.iterable.span,
         });
         Type::Infer
     });
+    let pattern_ty = for_pattern_item_type(&node.pattern, &iterable_ty, item_ty);
 
     tc.push_scope();
     pattern::check(
         &node.pattern,
-        &item_ty,
+        &pattern_ty,
         PatternBindMode::Owned { mutable: false },
         PatternContext::For,
         tc,
@@ -5806,6 +6242,40 @@ fn iterable_item_type(ty: &Type, decls: &DeclarationIndex) -> Option<Type> {
     }
 }
 
+fn for_pattern_item_type(pattern: &PatternNode, iterable: &Type, item: Type) -> Type {
+    if tuple_pattern_len(pattern) != Some(2) {
+        return item;
+    }
+    if matches!(iterable, Type::Map { .. }) {
+        return if is_enumerated_map_pattern(pattern) {
+            Type::Tuple(vec![Type::Int, item])
+        } else {
+            item
+        };
+    }
+    if matches!(&item, Type::Tuple(types) if tuple_pattern_len(pattern) == Some(types.len())) {
+        return item;
+    }
+    Type::Tuple(vec![Type::Int, item])
+}
+
+fn tuple_pattern_len(pattern: &PatternNode) -> Option<usize> {
+    match &pattern.node {
+        Pattern::Tuple(fields) => Some(fields.len()),
+        _ => None,
+    }
+}
+
+fn is_enumerated_map_pattern(pattern: &PatternNode) -> bool {
+    let Pattern::Tuple(fields) = &pattern.node else {
+        return false;
+    };
+    matches!(
+        fields.get(1).map(|field| &field.node),
+        Some(Pattern::Tuple(_))
+    )
+}
+
 fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
     let node = &let_else_node.node;
     let mode = mode_for_head(node.head);
@@ -5824,10 +6294,9 @@ fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
             span: node.else_block.span,
         });
     }
-    pattern::check_handle_at(
+    pattern::check_place_at(
         &node.pattern,
-        value.handle,
-        value.ty,
+        value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
         mode,
         node.value.node.id,
         PatternContext::LetElse,
@@ -5840,10 +6309,9 @@ fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
     let mode = mode_for_head(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
     tc.push_scope();
-    pattern::check_handle_at(
+    pattern::check_place_at(
         &node.pattern,
-        value.handle,
-        value.ty,
+        value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
         mode,
         node.value.node.id,
         PatternContext::WhileLet,
@@ -5864,10 +6332,9 @@ fn check_if_let_checked_with_hint(
     let mode = mode_for_head(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
     tc.push_scope();
-    pattern::check_handle_at(
+    pattern::check_place_at(
         &node.pattern,
-        value.handle,
-        value.ty,
+        value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
         mode,
         node.value.node.id,
         PatternContext::IfLet,
@@ -5906,10 +6373,12 @@ fn check_match_checked_with_hint(
     let mut outcomes = Vec::with_capacity(node.arms.len());
     for arm in &node.arms {
         tc.push_scope();
-        let outcome = pattern::check_handle_at(
+        let outcome = pattern::check_place_at(
             &arm.node.pattern,
-            scrutinee.handle.clone(),
-            scrutinee.ty.clone(),
+            scrutinee.pattern_place(
+                scrutinee.checked.handle.clone(),
+                scrutinee.checked.ty.clone(),
+            ),
             mode,
             node.scrutinee.node.id,
             PatternContext::Match,
@@ -5930,7 +6399,7 @@ fn check_match_checked_with_hint(
         outcomes.push(outcome);
         arms.push((arm.node.body.span, body));
     }
-    match_coverage::check(&scrutinee.ty, &outcomes, match_node.span, tc);
+    match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
     if arms[0].1.ty.is_void() {
         return checked_void(tc);
     }

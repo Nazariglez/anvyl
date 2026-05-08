@@ -47,7 +47,7 @@ mod storage {
 
         let info = tc.lookup(name).expect("local binding");
         assert_eq!(info.type_id, type_id);
-        assert_eq!(tc.lookup_type(name), Some(Type::String));
+        assert_eq!(tc.solver.local_type_to_type(info.type_id), Type::String);
     }
 }
 
@@ -236,12 +236,12 @@ mod constraints {
     }
 
     #[test]
-    fn array_len_infer_guard() {
+    fn array_len_infer_is_closed() {
         let ty = Type::Array {
             elem: Box::new(Type::Int),
             len: ArrayLen::Infer,
         };
-        assert!(type_closure_facts(&ty).infer.contains_type);
+        assert!(!type_closure_facts(&ty).infer.contains_type);
     }
 
     #[test]

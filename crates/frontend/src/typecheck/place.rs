@@ -1,6 +1,6 @@
 use super::{
-    CheckedType, ExternUseTarget, MemberAccessKind, TypeChecker, TypeError, check_expr_checked,
-    check_index_access, decls::nominal_type,
+    CheckedType, ExternUseTarget, MemberAccessKind, TypeChecker, TypeError, ValueDecl,
+    check_expr_checked, check_index_access, decls::nominal_type,
 };
 use crate::{
     ast::{ExprId, ExprKind, ExprNode, Ident, Type},
@@ -12,9 +12,59 @@ pub(super) enum PlaceAccess {
     Mutable,
     Settable,
     Immutable,
+    Const,
     Captured,
     ReadonlySelf,
     NotPlace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlacePath {
+    root: Ident,
+    segments: Vec<PlacePathSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PlacePathSegment {
+    Field(Ident),
+    Tuple(usize),
+    Variant(Ident),
+    Index,
+}
+
+impl PlacePath {
+    pub(super) fn root(root: Ident) -> Self {
+        Self {
+            root,
+            segments: vec![],
+        }
+    }
+
+    pub(super) fn field(mut self, field: Ident) -> Self {
+        self.segments.push(PlacePathSegment::Field(field));
+        self
+    }
+
+    pub(super) fn tuple(mut self, index: usize) -> Self {
+        self.segments.push(PlacePathSegment::Tuple(index));
+        self
+    }
+
+    pub(super) fn variant(mut self, variant: Ident) -> Self {
+        self.segments.push(PlacePathSegment::Variant(variant));
+        self
+    }
+
+    pub(super) fn index(mut self) -> Self {
+        self.segments.push(PlacePathSegment::Index);
+        self
+    }
+
+    pub(super) fn conflicts_with(&self, other: &Self) -> bool {
+        self.root == other.root
+            && (self.segments.starts_with(&other.segments)
+                || other.segments.starts_with(&self.segments))
+    }
 }
 
 impl PlaceAccess {
@@ -29,6 +79,7 @@ impl PlaceAccess {
     pub(super) fn assign_error(self, name: Ident, span: crate::span::Span) -> Option<TypeError> {
         match self {
             Self::Mutable | Self::Settable => None,
+            Self::Const => Some(TypeError::ConstAssignment { name, span }),
             Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
             Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
             Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
@@ -43,6 +94,7 @@ impl PlaceAccess {
         match self {
             Self::Mutable => None,
             Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+            Self::Const => Some(TypeError::ConstAssignment { name, span }),
             Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
             Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
             Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
@@ -71,6 +123,7 @@ pub(super) struct PlaceValue {
     pub(super) checked: CheckedType,
     pub(super) access: PlaceAccess,
     pub(super) facts: Option<PlaceUseFacts>,
+    pub(super) path: Option<PlacePath>,
 }
 
 pub(super) struct CheckedPlace {
@@ -88,6 +141,7 @@ impl PlaceValue {
             checked,
             access,
             facts,
+            path: None,
         }
     }
 
@@ -102,13 +156,13 @@ pub(super) struct ExternFieldPlace<'a> {
     pub(super) access: PlaceAccess,
 }
 
-pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
+pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     let place = check_place(expr, tc);
     if !place.value.access.can_assign() {
         tc.push_error(TypeError::VarPatternRequiresMutablePlace { span: expr.span });
     }
     record_value_read(expr.node.id, &place.value, tc);
-    place.value.checked
+    place
 }
 
 pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
@@ -127,11 +181,22 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
                 .map_or_else(|| info.kind.place_access(), |alias| alias.access)
         };
         let mut place = CheckedPlace::new(checked, access);
+        place.value.path =
+            Some(PlacePath::root(*name)).filter(|_| place.value.access.can_mut_borrow());
         if let Some(alias) = info.alias {
             place.value.facts = alias.facts;
+            place.value.path = alias.path;
             place.accepts_extern_any = alias.accepts_extern_any;
         }
         return place;
+    }
+
+    if let ExprKind::Ident(name) = &expr.node.kind
+        && let Some((_, value_name, ValueDecl::Const(sig))) = tc.lookup_named_value(*name)
+    {
+        tc.warn_named_const_deprecated(value_name, expr.span);
+        let checked = super::checked_from_type(expr, sig.ty.clone(), tc);
+        return CheckedPlace::new(checked, PlaceAccess::Const);
     }
 
     if let ExprKind::Index(index) = &expr.node.kind {
@@ -142,6 +207,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
         let access = projected_field_access(target.value.access);
         let mut place = CheckedPlace::new(checked, access);
         place.value.facts = target.value.facts;
+        place.value.path = target.value.path.map(PlacePath::index);
         place.accepts_extern_any = target.accepts_extern_any;
         return place;
     }
@@ -192,6 +258,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
                 let access = projected_field_access(receiver.value.access);
                 let mut place = CheckedPlace::new(checked, access);
                 place.value.facts = receiver.value.facts;
+                place.value.path = receiver.value.path.map(|path| path.field(field.node.field));
                 return place;
             }
 
@@ -294,6 +361,7 @@ impl CheckedPlace {
 pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAccess {
     match receiver_access {
         PlaceAccess::Mutable => PlaceAccess::Mutable,
+        PlaceAccess::Const => PlaceAccess::Const,
         PlaceAccess::Captured => PlaceAccess::Captured,
         PlaceAccess::ReadonlySelf => PlaceAccess::ReadonlySelf,
         PlaceAccess::NotPlace => PlaceAccess::NotPlace,
@@ -305,9 +373,46 @@ pub(super) fn extern_field_access(receiver_access: PlaceAccess, computed: bool) 
     match receiver_access {
         PlaceAccess::Mutable if computed => PlaceAccess::Settable,
         PlaceAccess::Mutable => PlaceAccess::Mutable,
+        PlaceAccess::Const => PlaceAccess::Const,
         PlaceAccess::Captured => PlaceAccess::Captured,
         PlaceAccess::ReadonlySelf => PlaceAccess::ReadonlySelf,
         PlaceAccess::NotPlace => PlaceAccess::NotPlace,
         PlaceAccess::Settable | PlaceAccess::Immutable => PlaceAccess::Immutable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(name: &str) -> Ident {
+        Ident::new(name)
+    }
+
+    #[test]
+    fn place_path_conflicts_on_same_or_prefix_path() {
+        let root = PlacePath::root(ident("x"));
+        let field = PlacePath::root(ident("x")).field(ident("a"));
+        let nested = PlacePath::root(ident("x"))
+            .field(ident("a"))
+            .field(ident("b"));
+
+        assert!(root.conflicts_with(&field));
+        assert!(field.conflicts_with(&root));
+        assert!(field.conflicts_with(&nested));
+        assert!(root.conflicts_with(&PlacePath::root(ident("x")).tuple(0)));
+    }
+
+    #[test]
+    fn place_path_does_not_conflict_on_distinct_fields_or_roots() {
+        let a = PlacePath::root(ident("x")).field(ident("a"));
+        let b = PlacePath::root(ident("x")).field(ident("b"));
+        let other = PlacePath::root(ident("y")).field(ident("a"));
+        let first = PlacePath::root(ident("x")).tuple(0);
+        let second = PlacePath::root(ident("x")).tuple(1);
+
+        assert!(!a.conflicts_with(&b));
+        assert!(!a.conflicts_with(&other));
+        assert!(!first.conflicts_with(&second));
     }
 }

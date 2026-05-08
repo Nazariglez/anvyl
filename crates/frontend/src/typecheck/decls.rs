@@ -12,8 +12,8 @@ use super::{
 use crate::{
     ast::{
         AggregateKind, ArrayLen, ConstArg, ConstParam, ConstParamId, FuncParam, GenericArg, Ident,
-        ImportItemKind, ImportKind, MethodReceiver, ModuleOrigin, Mutability, NominalKind, Param,
-        Program, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
+        ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
+        NominalKind, Param, Program, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     externs::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
@@ -389,6 +389,10 @@ pub(crate) enum DeclError {
         span: Span,
     },
     InternalOnToString {
+        span: Span,
+    },
+    InvalidToStringMethod {
+        message: &'static str,
         span: Span,
     },
 }
@@ -1293,7 +1297,7 @@ impl DeclarationIndex {
         errors
     }
 
-    fn type_span_or_default(&self, key: &NominalKey) -> Span {
+    pub(crate) fn type_span_or_default(&self, key: &NominalKey) -> Span {
         self.type_spans.get(key).copied().unwrap_or(Span::new(0, 0))
     }
 
@@ -1358,6 +1362,24 @@ impl DeclarationIndex {
             decls.exports.insert_type(name, key);
         }
         true
+    }
+
+    fn validate_to_string_method(&mut self, sig: &MethodSig, span: Span) {
+        let message = match sig.receiver {
+            None => Some("to_string method must have a 'self' receiver"),
+            Some(MethodReceiver::Var) => Some("to_string method must be 'self', not 'var self'"),
+            Some(MethodReceiver::Value) if !sig.params.is_empty() => {
+                Some("to_string method must take no parameters")
+            }
+            Some(MethodReceiver::Value) if sig.ret != Type::String => {
+                Some("to_string method must return 'string'")
+            }
+            Some(MethodReceiver::Value) => None,
+        };
+        if let Some(message) = message {
+            self.errors
+                .push(DeclError::InvalidToStringMethod { message, span });
+        }
     }
 
     fn collect_module(
@@ -1440,10 +1462,13 @@ impl DeclarationIndex {
                             annotation::AnnotationTarget::InlineMethod,
                             &mut self.errors,
                         );
-                        if policy.has_internal() && method.sig.name == Ident::new("to_string") {
-                            self.errors.push(DeclError::InternalOnToString {
-                                span: agg_node.span,
-                            });
+                        if method.sig.name == Ident::new("to_string") {
+                            if policy.has_internal() {
+                                self.errors.push(DeclError::InternalOnToString {
+                                    span: agg_node.span,
+                                });
+                            }
+                            self.validate_to_string_method(&method.sig, agg_node.span);
                         }
                         let mode = MethodMode::from_receiver(method.sig.receiver);
                         let method_key = MethodKey::new(method.sig.name, mode.surface());
@@ -2126,8 +2151,16 @@ impl DeclarationIndex {
         self.aggregates.get(key)
     }
 
+    pub(crate) fn aggregates(&self) -> impl Iterator<Item = (&NominalKey, &AggregateSchema)> {
+        self.aggregates.iter()
+    }
+
     pub(crate) fn enum_schema(&self, key: &NominalKey) -> Option<&EnumSchema> {
         self.enums.get(key)
+    }
+
+    pub(crate) fn enums(&self) -> impl Iterator<Item = (&NominalKey, &EnumSchema)> {
+        self.enums.iter()
     }
 
     pub(crate) fn extern_type_policy(&self, key: &NominalKey) -> Option<&AccessPolicy> {

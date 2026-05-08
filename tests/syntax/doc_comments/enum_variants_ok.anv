@@ -2,7 +2,7 @@
 // @expect: success
 
 /// Represents optional values.
-pub enum Maybe {
+pub enum Maybe<T> {
     /// No value.
     None,
     /// Some value of type T.
@@ -10,11 +10,11 @@ pub enum Maybe {
 }
 
 /// A result type that can be either success or error.
-pub enum Outcome {
+pub enum Outcome<T> {
     /// The operation succeeded.
     Ok(T),
     /// The operation failed with an error message.
-    Err(String),
+    Err(string),
 }
 
 /// A shape that can be rendered.

@@ -408,7 +408,7 @@ mod enum_unit_patterns {
     #[test]
     fn inferred_needs_expected() {
         assert_single_error("fn main() { let .A = 1; }", |err| {
-            matches!(err, TypeError::CannotInferType { .. })
+            matches!(err, TypeError::CannotInferEnum { .. })
         });
     }
 

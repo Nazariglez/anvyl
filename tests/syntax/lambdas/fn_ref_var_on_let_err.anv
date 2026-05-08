@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: cannot assign to immutable value 'for_each'
+// @contains: mutating method
 
 fn mutate(var x: int) {
     x *= 2;

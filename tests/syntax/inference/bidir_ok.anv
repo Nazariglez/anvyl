@@ -1,8 +1,6 @@
 // @mode: check
 // @expect: success
 
-import std.maps;
-
 fn make_map<K, V>() -> [K: V] {
     [:]
 }
@@ -24,11 +22,11 @@ fn wrap<T>(x: T) -> T? {
 }
 
 fn make_ordered_map() -> [string: int] {
-    return maps.ordered();
+    return make_map();
 }
 
 fn make_ordered_map_tail() -> [string: int] {
-    maps.ordered()
+    make_map()
 }
 
 fn main() {
@@ -36,7 +34,7 @@ fn main() {
     let n: [int: bool] = make_map();
     let x: int = identity(42);
 
-    var m2: [string: int] = maps.ordered();
+    var m2: [string: int] = make_map();
 
     var m3 = make_ordered_map();
 

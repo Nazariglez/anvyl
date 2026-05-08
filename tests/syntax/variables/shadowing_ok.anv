@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let x = 1;
+    let x = x + 1;
+    var y = x;
+    let y = y + 1;
+    {
+        let x = y;
+        let _z = x;
+    }
+}

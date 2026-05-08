@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Unexpected token while parsing a function
+// @contains: Unexpected token ':'
 
 struct Foo { x: int }
 

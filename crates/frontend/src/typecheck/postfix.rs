@@ -80,6 +80,7 @@ pub(super) struct SourceReceiver {
     mutable: bool,
     access: PlaceAccess,
     facts: Option<PlaceUseFacts>,
+    path: Option<place::PlacePath>,
     expr_id: ExprId,
     name: Ident,
 }
@@ -128,12 +129,18 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
             }
             if let Some(info) = tc.lookup(*name).cloned() {
                 let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
-                let access = info.kind.place_access();
-                return Some(Subject::Value(PlaceValue {
-                    checked,
-                    access,
-                    facts: Some(PlaceUseFacts::default()),
-                }));
+                let access = info
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| info.kind.place_access(), |alias| alias.access);
+                let mut value = PlaceValue::new(checked, access, Some(PlaceUseFacts::default()));
+                value.path =
+                    Some(place::PlacePath::root(*name)).filter(|_| access.can_mut_borrow());
+                if let Some(alias) = info.alias {
+                    value.facts = alias.facts;
+                    value.path = alias.path;
+                }
+                return Some(Subject::Value(value));
             }
             if let Some(scope) = tc.lookup_module_alias(*name) {
                 return Some(Subject::Module(scope));
@@ -345,6 +352,7 @@ fn apply_field(
             value.checked.ty.clone(),
             value.access,
             value.facts.as_ref(),
+            value.path.as_ref(),
             field.node.target.node.id,
             field.node.field,
             field.span,
@@ -446,11 +454,13 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     checked.contains_extern_any = indexed.contains_extern_any;
 
     if indexed_place {
-        return PlaceValue::new(
+        let mut value = PlaceValue::new(
             checked,
             place::projected_field_access(target.value.access),
             target.value.facts,
         );
+        value.path = target.value.path.map(place::PlacePath::index);
+        return value;
     }
 
     place::record_value_read(index.node.target.node.id, &target.value, tc);
@@ -461,6 +471,7 @@ fn source_receiver(
     mode: MethodMode,
     access: PlaceAccess,
     facts: Option<&PlaceUseFacts>,
+    path: Option<&place::PlacePath>,
     expr_id: ExprId,
     name: Ident,
 ) -> SourceReceiver {
@@ -468,6 +479,7 @@ fn source_receiver(
         mutable: matches!(mode, MethodMode::Instance { mutable: true }),
         access,
         facts: facts.cloned(),
+        path: path.cloned(),
         expr_id,
         name,
     }
@@ -477,6 +489,7 @@ fn apply_value_field(
     receiver: Type,
     receiver_access: PlaceAccess,
     receiver_place: Option<&PlaceUseFacts>,
+    receiver_path: Option<&place::PlacePath>,
     receiver_id: ExprId,
     name: Ident,
     span: Span,
@@ -519,11 +532,13 @@ fn apply_value_field(
             && let Some(ty) = tc.decls.aggregate_field_type(&receiver, name)
         {
             tc.check_field_access_policy(&receiver, name, span);
-            return Subject::Value(PlaceValue::new(
+            let mut value = PlaceValue::new(
                 checked_type(ty, tc),
                 place::projected_field_access(receiver_access),
                 receiver_place.cloned(),
-            ));
+            );
+            value.path = receiver_path.cloned().map(|path| path.field(name));
+            return Subject::Value(value);
         }
         if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
             tc.check_access_policy(
@@ -543,6 +558,7 @@ fn apply_value_field(
                     method.mode,
                     receiver_access,
                     receiver_place,
+                    receiver_path,
                     receiver_id,
                     name,
                 )),
@@ -583,6 +599,7 @@ fn apply_value_field(
                     method.mode,
                     receiver_access,
                     receiver_place,
+                    receiver_path,
                     receiver_id,
                     name,
                 );
@@ -927,10 +944,10 @@ fn apply_call(
         Subject::Callable {
             callee, receiver, ..
         } => {
-            if let Some(receiver) = receiver {
-                check_source_receiver(receiver, call.span, tc);
-            }
-            check_callable_call(callee, call, call_id, expected, tc)
+            let receiver_arg = receiver
+                .as_ref()
+                .and_then(|receiver| check_source_receiver(receiver, call.span, tc));
+            check_callable_call(callee, call, call_id, receiver_arg, expected, tc)
         }
         Subject::QualifiedExtend { module, name, span } => {
             check_qualified_extend_call(module, *name, *span, call, call_id, expected, tc)
@@ -981,15 +998,36 @@ fn apply_call(
     }
 }
 
-fn check_source_receiver(receiver: &SourceReceiver, span: Span, tc: &mut TypeChecker) {
+fn check_source_receiver(
+    receiver: &SourceReceiver,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Option<MutableArg> {
     if receiver.mutable {
-        if let Some(error) = receiver.access.mut_borrow_error(receiver.name, span) {
+        if let Some(error) = mutating_receiver_error(receiver.access, receiver.name, span) {
             tc.push_error(error);
-        } else if let Some(facts) = &receiver.facts {
+            return None;
+        }
+        if let Some(facts) = &receiver.facts {
             place::record_facts_write(receiver.expr_id, facts, tc);
         }
-    } else if let Some(facts) = &receiver.facts {
+        return receiver.path.clone().map(|path| MutableArg { path, span });
+    }
+    if let Some(facts) = &receiver.facts {
         place::record_facts_read(receiver.expr_id, facts, tc);
+    }
+    None
+}
+
+fn mutating_receiver_error(access: PlaceAccess, name: Ident, span: Span) -> Option<TypeError> {
+    match access {
+        PlaceAccess::Mutable => None,
+        PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+        PlaceAccess::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
+        PlaceAccess::Immutable
+        | PlaceAccess::Const
+        | PlaceAccess::ReadonlySelf
+        | PlaceAccess::NotPlace => Some(TypeError::MutatingMethodImmutableReceiver { name, span }),
     }
 }
 
@@ -1028,18 +1066,29 @@ struct CallParam {
     cast_accept: bool,
 }
 
+struct GenericCallSource<'a> {
+    args: &'a [ExprNode],
+    call_span: Span,
+    receiver_arg: Option<MutableArg>,
+    expected: Option<TypeHandle>,
+}
+
 fn solve_generic_call_with(
     generics: &GenericParams,
     seeds: &GenericSolverSeeds,
     template_params: &[FuncParam],
     required_params: usize,
     template_ret: &Type,
-    args: &[ExprNode],
-    call_span: Span,
-    expected: Option<TypeHandle>,
+    source: GenericCallSource<'_>,
     tc: &mut TypeChecker,
     add_constraints: impl FnOnce(&GenericSolverVars, &mut TypeChecker),
 ) -> Option<GenericCallInstantiation> {
+    let GenericCallSource {
+        args,
+        call_span,
+        receiver_arg,
+        expected,
+    } = source;
     if !check_arg_range(args, required_params, template_params.len(), call_span, tc) {
         return None;
     }
@@ -1064,7 +1113,7 @@ fn solve_generic_call_with(
     let mut failed = tc.solve_constraints();
 
     let params = instantiate_call_params(template_params, &vars, tc);
-    failed |= check_source_args(args, &params, tc);
+    failed |= check_source_args(args, &params, receiver_arg, tc);
     if !inferred_ret {
         let ret_handle = tc.solver.instantiate_generic_type(template_ret, &vars);
         failed |= constrain_expected_return(call_span, ret_handle, expected, tc);
@@ -1115,30 +1164,83 @@ fn instantiate_call_params(
         .collect()
 }
 
-fn check_source_args(args: &[ExprNode], params: &[CallParam], tc: &mut TypeChecker) -> bool {
+fn check_source_args(
+    args: &[ExprNode],
+    params: &[CallParam],
+    receiver_arg: Option<MutableArg>,
+    tc: &mut TypeChecker,
+) -> bool {
     let mut failed = false;
+    let mut mutable_args = receiver_arg.into_iter().collect::<Vec<_>>();
     for (arg, param) in args.iter().zip(params) {
-        failed |= check_source_arg(arg, param, tc);
+        let checked = check_source_arg(arg, param, tc);
+        failed |= checked.failed;
+        if let Some(path) = checked.mutable_path {
+            mutable_args.push(MutableArg {
+                path,
+                span: arg.span,
+            });
+        }
+    }
+    let alias_failed = validate_mutable_aliases(&mutable_args, tc);
+    failed || alias_failed
+}
+
+struct SourceArgCheck {
+    failed: bool,
+    mutable_path: Option<place::PlacePath>,
+}
+
+struct MutableArg {
+    path: place::PlacePath,
+    span: Span,
+}
+
+fn validate_mutable_aliases(args: &[MutableArg], tc: &mut TypeChecker) -> bool {
+    let mut failed = false;
+    for (index, arg) in args.iter().enumerate() {
+        for previous in &args[..index] {
+            if previous.path.conflicts_with(&arg.path) {
+                tc.push_error(TypeError::MutableAlias { span: arg.span });
+                failed = true;
+                break;
+            }
+        }
     }
     failed
 }
 
-fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> bool {
+fn var_arg_error(access: PlaceAccess, name: Ident, span: Span) -> Option<TypeError> {
+    match access {
+        PlaceAccess::Mutable => None,
+        PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+        PlaceAccess::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
+        PlaceAccess::Immutable | PlaceAccess::Const => {
+            Some(TypeError::VarArgImmutableBinding { name, span })
+        }
+        PlaceAccess::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
+        PlaceAccess::NotPlace => Some(TypeError::VarArgNonLvalue { span }),
+    }
+}
+
+fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
     if param.mutable {
-        let place = place::check_place(arg, tc);
-        if let Some(error) = place
-            .value
-            .access
-            .mut_borrow_error(super::assignment_target_name(arg), arg.span)
-        {
+        let mut place = place::check_place(arg, tc);
+        let name = super::assignment_target_name(arg);
+        let mut mutable_path = None;
+        if let Some(error) = var_arg_error(place.value.access, name, arg.span) {
             tc.push_error(error);
         } else {
+            mutable_path = place.value.path.take();
             place::record_write(arg.node.id, &place, tc);
         }
         let checked = place.into_checked();
         tc.reject_extern_any_escape(&checked, arg.span);
         tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
-        return tc.solve_constraints();
+        return SourceArgCheck {
+            failed: tc.solve_constraints(),
+            mutable_path,
+        };
     }
 
     if param.cast_accept {
@@ -1146,20 +1248,32 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
         tc.reject_extern_any_escape(&checked, arg.span);
         if can_assign_without_errors(arg.span, checked.handle.clone(), param.ty.clone(), tc) {
             tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
-            return tc.solve_constraints();
+            return SourceArgCheck {
+                failed: tc.solve_constraints(),
+                mutable_path: None,
+            };
         }
         let target = tc.handle_type(&param.ty);
         if tc.has_direct_conversion(&checked.ty, &target) {
-            return tc.solve_constraints();
+            return SourceArgCheck {
+                failed: tc.solve_constraints(),
+                mutable_path: None,
+            };
         }
         tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
-        return tc.solve_constraints();
+        return SourceArgCheck {
+            failed: tc.solve_constraints(),
+            mutable_path: None,
+        };
     }
 
     let checked = super::check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc);
     tc.reject_extern_any_escape(&checked, arg.span);
     tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
-    tc.solve_constraints()
+    SourceArgCheck {
+        failed: tc.solve_constraints(),
+        mutable_path: None,
+    }
 }
 
 fn can_assign_without_errors(
@@ -1249,6 +1363,7 @@ fn check_enum_variant_call(
         call.span,
         call_id,
         CallForm::Normal,
+        None,
         expected,
         tc,
     )
@@ -1258,6 +1373,7 @@ fn check_callable_call(
     callee: &CallableRef,
     call: &CallNode,
     call_id: ExprId,
+    receiver_arg: Option<MutableArg>,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
@@ -1271,6 +1387,7 @@ fn check_callable_call(
         call.span,
         call_id,
         CallForm::Normal,
+        receiver_arg,
         expected,
         tc,
     );
@@ -1291,6 +1408,7 @@ fn check_callable_call_with_args(
     call_span: Span,
     call_id: ExprId,
     form: CallForm,
+    receiver_arg: Option<MutableArg>,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
@@ -1313,9 +1431,12 @@ fn check_callable_call_with_args(
         &callee.def.sig.params,
         callee.def.sig.required_params,
         &callee.def.sig.ret,
-        args,
-        call_span,
-        expected,
+        GenericCallSource {
+            args,
+            call_span,
+            receiver_arg,
+            expected,
+        },
         tc,
         |vars, tc| constrain_callable_owner(callee, vars, call_span, tc),
     ) else {
@@ -1411,6 +1532,7 @@ fn check_qualified_extend_call(
         method.mode,
         receiver.access,
         receiver.facts.as_ref(),
+        receiver.path.as_ref(),
         receiver_expr.node.id,
         name,
     );
@@ -1430,7 +1552,7 @@ fn check_qualified_extend_call(
     let callee = tc
         .decls
         .callable_for_extend_method(receiver_ty, extend, name, method, owner_args);
-    check_source_receiver(&receiver_use, call.span, tc);
+    let receiver_arg = check_source_receiver(&receiver_use, call.span, tc);
     tc.set_type(
         call.node.func.node.id,
         func_type(&callee.def.sig.params, &callee.def.sig.ret),
@@ -1445,6 +1567,7 @@ fn check_qualified_extend_call(
         CallForm::QualifiedExtend {
             receiver: receiver_expr.node.id,
         },
+        receiver_arg,
         expected,
         tc,
     )
@@ -1722,5 +1845,5 @@ pub(super) fn check_args(
             cast_accept: param.cast_accept,
         })
         .collect::<Vec<_>>();
-    check_source_args(args, &params, tc);
+    check_source_args(args, &params, None, tc);
 }

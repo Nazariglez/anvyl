@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Mismatched types
+// @contains: Unexpected token 'd'
 
 fn main() {
     let x: float = 1.0d;

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @skip: todo -> trailing_comma_params
 
 struct Counter {
     value: int,

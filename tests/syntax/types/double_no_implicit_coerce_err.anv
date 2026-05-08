@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Mismatched types
+// @contains: Unknown type 'double'
 
 fn main() {
     let f = 1.5;

@@ -9,6 +9,7 @@ pub(crate) enum PatternCover {
     String(String),
     EnumVariant { key: NominalKey, variant: Ident },
     Tuple(Vec<PatternCover>),
+    Or(Vec<PatternCover>),
     Unsupported,
 }
 
@@ -40,6 +41,15 @@ pub(crate) struct PatternOutcome {
     pub(crate) cover: PatternCover,
     pub(crate) had_error: bool,
     pub(crate) refutability: Refutability,
+}
+
+pub(super) struct PatternPlace {
+    pub(super) expected_handle: TypeHandle,
+    pub(super) expected_ty: Type,
+    pub(super) access: PlaceAccess,
+    pub(super) facts: Option<PlaceUseFacts>,
+    pub(super) path: Option<PlacePath>,
+    pub(super) accepts_extern_any: bool,
 }
 
 impl PatternOutcome {
@@ -76,11 +86,37 @@ fn combine_refutability(left: Refutability, right: Refutability) -> Refutability
     }
 }
 
+fn or_refutability(alternatives: impl Iterator<Item = Refutability>) -> Refutability {
+    let mut saw_unknown = false;
+    for refutability in alternatives {
+        match refutability {
+            Refutability::Irrefutable => return Refutability::Irrefutable,
+            Refutability::Unknown => saw_unknown = true,
+            Refutability::Refutable => {}
+        }
+    }
+    if saw_unknown {
+        Refutability::Unknown
+    } else {
+        Refutability::Refutable
+    }
+}
+
+fn same_binding_names(left: &HashMap<Ident, VarInfo>, right: &HashMap<Ident, VarInfo>) -> bool {
+    left.len() == right.len() && left.keys().all(|name| right.contains_key(name))
+}
+
+struct OrAlternative {
+    outcome: PatternOutcome,
+    bindings: HashMap<Ident, VarInfo>,
+}
+
 struct PatternChecker<'tc> {
     tc: &'tc mut TypeChecker,
     extern_site: Option<ExprId>,
     context: PatternContext,
     mode: PatternBindMode,
+    bindings: HashSet<Ident>,
 }
 
 impl<'tc> PatternChecker<'tc> {
@@ -95,6 +131,7 @@ impl<'tc> PatternChecker<'tc> {
             extern_site,
             context,
             mode,
+            bindings: HashSet::new(),
         }
     }
 
@@ -109,15 +146,20 @@ impl<'tc> PatternChecker<'tc> {
         pattern: &PatternNode,
         expected_handle: TypeHandle,
         expected_ty: Type,
+        access: PlaceAccess,
+        facts: Option<PlaceUseFacts>,
+        path: Option<PlacePath>,
+        accepts_extern_any: bool,
     ) -> PatternOutcome {
         let mut outcome = match &pattern.node {
             Pattern::Ident(name) => {
                 self.define_ident(
                     *name,
                     expected_ty.clone(),
-                    PlaceAccess::Mutable,
-                    None,
-                    false,
+                    access,
+                    facts.clone(),
+                    path.clone(),
+                    accepts_extern_any,
                     pattern.span,
                 );
                 if let Some(type_id) = self.tc.lookup(*name).map(|info| info.type_id) {
@@ -131,7 +173,14 @@ impl<'tc> PatternChecker<'tc> {
                 }
                 PatternOutcome::irrefutable(PatternCover::CatchAll)
             }
-            _ => self.check(pattern, &expected_ty, PlaceAccess::Mutable),
+            _ => self.check_with_facts(
+                pattern,
+                &expected_ty,
+                access,
+                facts,
+                path,
+                accepts_extern_any,
+            ),
         };
         self.apply_context_policy(pattern, &expected_ty, &mut outcome);
         outcome
@@ -166,16 +215,21 @@ impl<'tc> PatternChecker<'tc> {
         ty: Type,
         access: PlaceAccess,
         facts: Option<PlaceUseFacts>,
+        path: Option<PlacePath>,
         accepts_extern_any: bool,
         span: Span,
     ) {
+        if !self.bindings.insert(name) {
+            self.tc.push_error(TypeError::DuplicateName { name, span });
+            return;
+        }
         if matches!(self.mode, PatternBindMode::Alias) {
             if !access.can_assign() {
                 self.tc
                     .push_error(TypeError::VarPatternRequiresMutablePlace { span });
             }
             self.tc
-                .define_alias_binding(name, ty, access, facts, accepts_extern_any);
+                .define_alias_binding(name, ty, access, facts, path, accepts_extern_any);
         } else if let PatternBindMode::Owned { mutable } = self.mode {
             self.tc.define_pattern_binding(name, ty, mutable);
         }
@@ -187,7 +241,7 @@ impl<'tc> PatternChecker<'tc> {
         expected: &Type,
         access: PlaceAccess,
     ) -> PatternOutcome {
-        self.check_with_facts(pattern, expected, access, None, false)
+        self.check_with_facts(pattern, expected, access, None, None, false)
     }
 
     fn check_with_facts(
@@ -196,6 +250,7 @@ impl<'tc> PatternChecker<'tc> {
         expected: &Type,
         access: PlaceAccess,
         facts: Option<PlaceUseFacts>,
+        path: Option<PlacePath>,
         accepts_extern_any: bool,
     ) -> PatternOutcome {
         match &pattern.node {
@@ -205,23 +260,24 @@ impl<'tc> PatternChecker<'tc> {
                     expected.clone(),
                     access,
                     facts,
+                    path,
                     accepts_extern_any,
                     pattern.span,
                 );
                 PatternOutcome::irrefutable(PatternCover::CatchAll)
             }
             Pattern::Wildcard => PatternOutcome::irrefutable(PatternCover::CatchAll),
-            Pattern::Tuple(elems) => self.check_tuple(elems, pattern.span, expected, access),
+            Pattern::Tuple(elems) => {
+                self.check_tuple(elems, pattern.span, expected, access, path.as_ref())
+            }
             Pattern::Lit(lit) => self.check_lit(pattern.span, lit, expected),
             Pattern::Nil => self.check_nil(pattern.span, expected),
-            Pattern::Optional(inner) => self.check_optional(inner, expected, access),
+            Pattern::Optional(inner) => self.check_optional(inner, expected, access, path.as_ref()),
             Pattern::Range { start, end, .. } => {
                 self.check_range(pattern.span, start.clone(), end.clone(), expected)
             }
-            Pattern::Or(_) => {
-                self.tc
-                    .push_error(TypeError::OrPatternUnsupported { span: pattern.span });
-                PatternOutcome::error()
+            Pattern::Or(alternatives) => {
+                self.check_or(alternatives, pattern.span, expected, access)
             }
             Pattern::Rest => self.unsupported_named("..", pattern.span),
             Pattern::Struct { name, fields } => self.check_struct(
@@ -231,6 +287,7 @@ impl<'tc> PatternChecker<'tc> {
                 expected,
                 access,
                 facts.as_ref(),
+                path.as_ref(),
             ),
             Pattern::EnumUnit { qualifier, variant } => {
                 self.check_enum_unit(Some(*qualifier), *variant, pattern.span, expected)
@@ -249,10 +306,17 @@ impl<'tc> PatternChecker<'tc> {
                 pattern.span,
                 expected,
                 access,
+                path.as_ref(),
             ),
-            Pattern::InferredEnumTuple { variant, fields } => {
-                self.check_enum_tuple(None, *variant, fields, pattern.span, expected, access)
-            }
+            Pattern::InferredEnumTuple { variant, fields } => self.check_enum_tuple(
+                None,
+                *variant,
+                fields,
+                pattern.span,
+                expected,
+                access,
+                path.as_ref(),
+            ),
             Pattern::EnumStruct {
                 qualifier,
                 variant,
@@ -266,6 +330,7 @@ impl<'tc> PatternChecker<'tc> {
                 pattern.span,
                 expected,
                 access,
+                path.as_ref(),
             ),
             Pattern::InferredEnumStruct {
                 variant,
@@ -279,7 +344,106 @@ impl<'tc> PatternChecker<'tc> {
                 pattern.span,
                 expected,
                 access,
+                path.as_ref(),
             ),
+        }
+    }
+
+    fn check_or(
+        &mut self,
+        alternatives: &[PatternNode],
+        span: Span,
+        expected: &Type,
+        access: PlaceAccess,
+    ) -> PatternOutcome {
+        let mut checked = Vec::with_capacity(alternatives.len());
+        for alternative in alternatives {
+            checked.push(self.check_or_alternative(alternative, expected, access));
+        }
+        let mut had_error = checked
+            .iter()
+            .any(|alternative| alternative.outcome.had_error);
+        if !self.validate_or_bindings(&checked, span) {
+            had_error = true;
+        }
+        let refutability = or_refutability(checked.iter().map(|alt| alt.outcome.refutability));
+        let covers = checked
+            .into_iter()
+            .map(|alternative| alternative.outcome.cover)
+            .collect();
+        let cover = PatternCover::Or(covers);
+        PatternOutcome {
+            cover,
+            had_error,
+            refutability,
+        }
+    }
+
+    fn check_or_alternative(
+        &mut self,
+        pattern: &PatternNode,
+        expected: &Type,
+        access: PlaceAccess,
+    ) -> OrAlternative {
+        self.tc.push_scope();
+        let outer_bindings = self.bindings.clone();
+        let outcome = self.check(pattern, expected, access);
+        self.bindings = outer_bindings;
+        let bindings = self.tc.scopes.last().cloned().unwrap_or_default();
+        self.tc.pop_scope();
+        OrAlternative { outcome, bindings }
+    }
+
+    fn validate_or_bindings(&mut self, alternatives: &[OrAlternative], span: Span) -> bool {
+        let Some((first, rest)) = alternatives.split_first() else {
+            return true;
+        };
+        let mut valid = true;
+        for alternative in rest {
+            if !same_binding_names(&first.bindings, &alternative.bindings) {
+                self.tc
+                    .push_error(TypeError::OrPatternBindingMismatch { span });
+                valid = false;
+                continue;
+            }
+            for (name, first_info) in &first.bindings {
+                let Some(info) = alternative.bindings.get(name) else {
+                    continue;
+                };
+                let expected = self.tc.solver.local_type_to_type(first_info.type_id);
+                let found = self.tc.solver.local_type_to_type(info.type_id);
+                if expected != found {
+                    self.tc.push_error(TypeError::OrPatternBindingTypeMismatch {
+                        name: *name,
+                        expected,
+                        found,
+                        span,
+                    });
+                    valid = false;
+                }
+            }
+        }
+        if valid && matches!(self.mode, PatternBindMode::Alias) && !first.bindings.is_empty() {
+            self.tc
+                .push_error(TypeError::OrPatternAliasBinding { span });
+            valid = false;
+        }
+        if valid {
+            self.install_or_bindings(&first.bindings, span);
+        }
+        valid
+    }
+
+    fn install_or_bindings(&mut self, bindings: &HashMap<Ident, VarInfo>, span: Span) {
+        for (name, info) in bindings {
+            if !self.bindings.insert(*name) {
+                self.tc
+                    .push_error(TypeError::DuplicateName { name: *name, span });
+                continue;
+            }
+            if let Some(scope) = self.tc.scopes.last_mut() {
+                scope.insert(*name, info.clone());
+            }
         }
     }
 
@@ -289,6 +453,7 @@ impl<'tc> PatternChecker<'tc> {
         span: Span,
         expected: &Type,
         access: PlaceAccess,
+        path: Option<&PlacePath>,
     ) -> PatternOutcome {
         let elem_tys = match expected {
             Type::Tuple(tys) => tys.clone(),
@@ -314,8 +479,10 @@ impl<'tc> PatternChecker<'tc> {
         let covers = elems
             .iter()
             .zip(elem_tys.iter())
-            .map(|(elem, elem_ty)| {
-                let outcome = self.check(elem, elem_ty, access);
+            .enumerate()
+            .map(|(index, (elem, elem_ty))| {
+                let elem_path = path.cloned().map(|path| path.tuple(index));
+                let outcome = self.check_with_facts(elem, elem_ty, access, None, elem_path, false);
                 had_error |= outcome.had_error;
                 refutability = combine_refutability(refutability, outcome.refutability);
                 outcome.cover
@@ -365,6 +532,7 @@ impl<'tc> PatternChecker<'tc> {
         inner: &PatternNode,
         expected: &Type,
         access: PlaceAccess,
+        path: Option<&PlacePath>,
     ) -> PatternOutcome {
         if matches!(inner.node, Pattern::Optional(_)) {
             self.tc
@@ -380,7 +548,10 @@ impl<'tc> PatternChecker<'tc> {
             self.check(inner, &Type::Infer, access);
             return PatternOutcome::error();
         };
-        let outcome = self.check(inner, inner_ty, access);
+        let inner_path = path
+            .cloned()
+            .map(|path| path.variant(Ident::new("Some")).tuple(0));
+        let outcome = self.check_with_facts(inner, inner_ty, access, None, inner_path, false);
         PatternOutcome {
             cover: self.option_cover(expected, "Some").unwrap_or(outcome.cover),
             had_error: outcome.had_error,
@@ -427,6 +598,7 @@ impl<'tc> PatternChecker<'tc> {
         expected: &Type,
         access: PlaceAccess,
         facts: Option<&PlaceUseFacts>,
+        path: Option<&PlacePath>,
     ) -> PatternOutcome {
         let Some(key) = self.tc.resolve_visible_type_key(None, name) else {
             self.tc.push_error(TypeError::UnknownType {
@@ -458,7 +630,7 @@ impl<'tc> PatternChecker<'tc> {
                 } else {
                     nominal_type(&key)
                 };
-                self.check_struct_fields(fields, owner_ty, &agg.fields, access, facts)
+                self.check_struct_fields(fields, owner_ty, &agg.fields, access, facts, path)
             }
             NominalKind::Extern => {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
@@ -480,7 +652,14 @@ impl<'tc> PatternChecker<'tc> {
                         )
                     })
                     .collect();
-                self.check_struct_fields(fields, nominal_type(&key), &field_schema, access, facts)
+                self.check_struct_fields(
+                    fields,
+                    nominal_type(&key),
+                    &field_schema,
+                    access,
+                    facts,
+                    path,
+                )
             }
             NominalKind::Enum => self.unsupported_named("Struct", span),
         }
@@ -493,6 +672,7 @@ impl<'tc> PatternChecker<'tc> {
         schema: &HashMap<Ident, FieldSchema>,
         access: PlaceAccess,
         receiver_facts: Option<&PlaceUseFacts>,
+        receiver_path: Option<&PlacePath>,
     ) -> PatternOutcome {
         let owner = field_check::FieldOwner::Nominal(owner_ty.clone());
         let shape = self.check_field_shape(
@@ -526,8 +706,9 @@ impl<'tc> PatternChecker<'tc> {
                 .unwrap_or(field.ty);
             let (facts, accepts_any) =
                 self.extern_field_alias_facts(&owner_ty, field.name, receiver_facts);
+            let path = receiver_path.cloned().map(|path| path.field(field.name));
             let outcome =
-                self.check_with_facts(pattern, &field_ty, field_access, facts, accepts_any);
+                self.check_with_facts(pattern, &field_ty, field_access, facts, path, accepts_any);
             had_error |= outcome.had_error;
             refutability = combine_refutability(refutability, outcome.refutability);
         }
@@ -629,6 +810,7 @@ impl<'tc> PatternChecker<'tc> {
         span: Span,
         expected: &Type,
         access: PlaceAccess,
+        path: Option<&PlacePath>,
     ) -> PatternOutcome {
         let Some(resolved) =
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, expected)
@@ -651,9 +833,12 @@ impl<'tc> PatternChecker<'tc> {
             return PatternOutcome::error();
         }
         let mut had_error = false;
-        for (field, payload) in fields.iter().zip(payloads) {
+        for (index, (field, payload)) in fields.iter().zip(payloads).enumerate() {
             let ty = self.payload_ty(payload, &resolved, expected, span);
-            had_error |= self.check(field, &ty, access).had_error;
+            let path = path.cloned().map(|path| path.variant(variant).tuple(index));
+            had_error |= self
+                .check_with_facts(field, &ty, access, None, path, false)
+                .had_error;
         }
         PatternOutcome {
             cover: PatternCover::EnumVariant {
@@ -674,6 +859,7 @@ impl<'tc> PatternChecker<'tc> {
         span: Span,
         expected: &Type,
         access: PlaceAccess,
+        path: Option<&PlacePath>,
     ) -> PatternOutcome {
         let Some(resolved) =
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, expected)
@@ -708,7 +894,12 @@ impl<'tc> PatternChecker<'tc> {
                 fields[field.index].1.span,
             );
             let ty = self.payload_ty(&field.ty, &resolved, expected, span);
-            had_error |= self.check(&fields[field.index].1, &ty, access).had_error;
+            let path = path
+                .cloned()
+                .map(|path| path.variant(variant).field(field.name));
+            had_error |= self
+                .check_with_facts(&fields[field.index].1, &ty, access, None, path, false)
+                .had_error;
         }
         PatternOutcome {
             cover: PatternCover::EnumVariant {
@@ -812,21 +1003,9 @@ pub(super) fn check(
     PatternChecker::new(tc, None, context, mode).check_root(pattern, expected)
 }
 
-pub(super) fn check_at(
+pub(super) fn check_place_at(
     pattern: &PatternNode,
-    expected: &Type,
-    mode: PatternBindMode,
-    site: ExprId,
-    context: PatternContext,
-    tc: &mut TypeChecker,
-) -> PatternOutcome {
-    PatternChecker::new(tc, Some(site), context, mode).check_root(pattern, expected)
-}
-
-pub(super) fn check_handle_at(
-    pattern: &PatternNode,
-    expected_handle: TypeHandle,
-    expected_ty: Type,
+    place: PatternPlace,
     mode: PatternBindMode,
     site: ExprId,
     context: PatternContext,
@@ -834,7 +1013,11 @@ pub(super) fn check_handle_at(
 ) -> PatternOutcome {
     PatternChecker::new(tc, Some(site), context, mode).check_from_handle_root(
         pattern,
-        expected_handle,
-        expected_ty,
+        place.expected_handle,
+        place.expected_ty,
+        place.access,
+        place.facts,
+        place.path,
+        place.accepts_extern_any,
     )
 }

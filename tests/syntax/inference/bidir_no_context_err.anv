@@ -2,8 +2,10 @@
 // @expect: error
 // @contains: Could not infer type
 
-import std.maps;
+fn make_map<K, V>() -> [K: V] {
+    [:]
+}
 
 fn main() {
-    var m = maps.ordered();
+    var m = make_map();
 }

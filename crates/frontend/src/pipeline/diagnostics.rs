@@ -456,6 +456,10 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             "recursive type inference is not allowed".to_string()
         }
         TypeError::CannotInferType { .. } => "Could not infer type".to_string(),
+        TypeError::CannotInferEnum { .. } => "cannot infer enum type".to_string(),
+        TypeError::GenericLocalFunction { name, .. } => {
+            format!("generic local function '{name}' is not supported")
+        }
         TypeError::InferReturnNonGeneric { .. } => {
             "inferred return type is only allowed on generic callables".to_string()
         }
@@ -512,6 +516,22 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ImmutableAssignment { name, .. } => {
             format!("cannot assign to immutable value '{name}'")
         }
+        TypeError::ConstAssignment { name, .. } => format!("cannot assign to constant '{name}'"),
+        TypeError::VarArgNonLvalue { .. } => {
+            "non-lvalue cannot be passed to var parameter".to_string()
+        }
+        TypeError::VarArgImmutableBinding { name, .. } => {
+            format!("immutable binding '{name}' cannot be passed to var parameter")
+        }
+        TypeError::MutatingMethodImmutableReceiver { name, .. } => {
+            format!("mutating method requires mutable receiver '{name}'")
+        }
+        TypeError::MutableAlias { .. } => {
+            "var arguments must not alias the same variable".to_string()
+        }
+        TypeError::InvalidFormatSpec { reason, .. } => {
+            format!("invalid format specifier: {reason}")
+        }
         TypeError::CannotMutateCapturedVariable { name, .. } => {
             format!("cannot mutate captured variable '{name}'")
         }
@@ -562,6 +582,10 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("type '{found}' cannot be iterated")
         }
         TypeError::ForIterationModifier { message, .. } => (*message).to_string(),
+        TypeError::InfiniteSize { name, .. } => {
+            format!("type '{name}' has infinite size")
+        }
+        TypeError::NotEquatable { ty, .. } => format!("type '{ty}' is not equatable"),
         TypeError::UnsupportedPattern { pattern, .. } => format!("Unsupported pattern: {pattern}"),
         TypeError::TuplePatternArityMismatch {
             expected, found, ..
@@ -571,7 +595,20 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::TuplePatternOnNonTuple { ty, .. } => {
             format!("cannot destructure non-tuple type '{ty}'")
         }
-        TypeError::OrPatternUnsupported { .. } => "or-patterns are not supported".to_string(),
+        TypeError::OrPatternBindingMismatch { .. } => {
+            "or-pattern alternatives must bind the same variables".to_string()
+        }
+        TypeError::OrPatternBindingTypeMismatch {
+            name,
+            expected,
+            found,
+            ..
+        } => format!(
+            "or-pattern binding '{name}' type mismatch: expected '{expected}', found '{found}'"
+        ),
+        TypeError::OrPatternAliasBinding { .. } => {
+            "or-patterns with bindings cannot be used as aliases".to_string()
+        }
         TypeError::EmptyMatch { .. } => "match expression must have at least one arm".to_string(),
         TypeError::NonExhaustiveMatch { .. } => "non-exhaustive match".to_string(),
         TypeError::UnsupportedMatchScrutinee { found, .. } => {
@@ -795,15 +832,47 @@ fn render_type_mismatch(expected: &Type, found: &Type) -> String {
 
 fn render_mismatch_type(ty: &Type, detailed: bool) -> String {
     if !detailed {
-        return ty.to_string();
+        return render_surface_type(ty);
     }
     render_detailed_type(ty)
+}
+
+fn render_surface_type(ty: &Type) -> String {
+    if let Some(inner) = ty.option_inner() {
+        return format!("{}?", render_surface_type(inner));
+    }
+    match ty {
+        Type::List { elem } => format!("[{}]", render_surface_type(elem)),
+        Type::Array { elem, len } => format!("[{}; {len}]", render_surface_type(elem)),
+        Type::Map { key, value } => {
+            format!(
+                "[{}: {}]",
+                render_surface_type(key),
+                render_surface_type(value)
+            )
+        }
+        Type::Slice { elem } => format!("slice[{}]", render_surface_type(elem)),
+        Type::Tuple(elems) => render_wrapped_types("(", ")", elems, render_surface_type),
+        Type::Func { .. }
+        | Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Var(_)
+        | Type::UnresolvedName(_)
+        | Type::UnresolvedNominal { .. }
+        | Type::Nominal(_) => ty.to_string(),
+    }
 }
 
 fn render_detailed_type(ty: &Type) -> String {
     match ty {
         Type::Func { params, ret } => render_detailed_func(params, ret),
-        Type::Tuple(elems) => render_wrapped_types("(", ")", elems),
+        Type::Tuple(elems) => render_wrapped_types("(", ")", elems, render_detailed_type),
         Type::Nominal(nominal) => {
             let mut rendered = nominal.origin.as_ref().map_or_else(
                 || nominal.name.to_string(),
@@ -863,12 +932,13 @@ fn render_detailed_func(params: &[FuncParam], ret: &Type) -> String {
     rendered
 }
 
-fn render_wrapped_types(open: &str, close: &str, elems: &[Type]) -> String {
-    let elems = elems
-        .iter()
-        .map(render_detailed_type)
-        .collect::<Vec<_>>()
-        .join(", ");
+fn render_wrapped_types(
+    open: &str,
+    close: &str,
+    elems: &[Type],
+    render: fn(&Type) -> String,
+) -> String {
+    let elems = elems.iter().map(render).collect::<Vec<_>>().join(", ");
     format!("{open}{elems}{close}")
 }
 
@@ -1244,6 +1314,7 @@ fn render_decl_error(error: &DeclError) -> String {
         DeclError::InternalOnToString { .. } => {
             "`@internal` cannot be applied to `to_string` methods".to_string()
         }
+        DeclError::InvalidToStringMethod { message, .. } => message.to_string(),
     }
 }
 
@@ -1776,6 +1847,13 @@ mod tests {
                 })),
                 "type 'Point' is re-exported by both 'alpha' and 'beta'",
             ),
+            (
+                diagnose_type_error(&TypeError::Decl(DeclError::InvalidToStringMethod {
+                    message: "to_string method must return 'string'",
+                    span: span(),
+                })),
+                "to_string method must return 'string'",
+            ),
         ];
 
         for (diagnostic, expected) in cases {
@@ -1809,6 +1887,14 @@ mod tests {
             ),
             (
                 diagnose_type_error(&TypeError::TypeMismatch {
+                    expected: Type::Tuple(vec![Type::option_of(Type::Int)]),
+                    found: Type::Tuple(vec![Type::option_of(Type::String)]),
+                    span: span(),
+                }),
+                "Mismatched types: expected '(int?)', found '(string?)'",
+            ),
+            (
+                diagnose_type_error(&TypeError::TypeMismatch {
                     expected: package_nominal("left", "Vec2"),
                     found: package_nominal("right", "Vec2"),
                     span: span(),
@@ -1829,6 +1915,86 @@ mod tests {
                     span: span(),
                 }),
                 "Invalid operand type: operator '-' cannot be applied to 'bool'",
+            ),
+            (
+                diagnose_type_error(&TypeError::ConstAssignment {
+                    name: ident("LIMIT"),
+                    span: span(),
+                }),
+                "cannot assign to constant 'LIMIT'",
+            ),
+            (
+                diagnose_type_error(&TypeError::CannotInferEnum { span: span() }),
+                "cannot infer enum type",
+            ),
+            (
+                diagnose_type_error(&TypeError::GenericLocalFunction {
+                    name: ident("id"),
+                    span: span(),
+                }),
+                "generic local function 'id' is not supported",
+            ),
+            (
+                diagnose_type_error(&TypeError::VarArgNonLvalue { span: span() }),
+                "non-lvalue cannot be passed to var parameter",
+            ),
+            (
+                diagnose_type_error(&TypeError::VarArgImmutableBinding {
+                    name: ident("x"),
+                    span: span(),
+                }),
+                "immutable binding 'x' cannot be passed to var parameter",
+            ),
+            (
+                diagnose_type_error(&TypeError::MutatingMethodImmutableReceiver {
+                    name: ident("self"),
+                    span: span(),
+                }),
+                "mutating method requires mutable receiver 'self'",
+            ),
+            (
+                diagnose_type_error(&TypeError::MutableAlias { span: span() }),
+                "var arguments must not alias the same variable",
+            ),
+            (
+                diagnose_type_error(&TypeError::InvalidFormatSpec {
+                    reason: "hex format requires int",
+                    span: span(),
+                }),
+                "invalid format specifier: hex format requires int",
+            ),
+            (
+                diagnose_type_error(&TypeError::InfiniteSize {
+                    name: ident("Node"),
+                    span: span(),
+                }),
+                "type 'Node' has infinite size",
+            ),
+            (
+                diagnose_type_error(&TypeError::NotEquatable {
+                    ty: Type::Slice {
+                        elem: Box::new(Type::Int),
+                    },
+                    span: span(),
+                }),
+                "type 'slice[int]' is not equatable",
+            ),
+            (
+                diagnose_type_error(&TypeError::OrPatternBindingMismatch { span: span() }),
+                "or-pattern alternatives must bind the same variables",
+            ),
+            (
+                diagnose_type_error(&TypeError::OrPatternBindingTypeMismatch {
+                    name: ident("x"),
+                    expected: Type::Int,
+                    found: Type::String,
+                    span: span(),
+                }),
+                "or-pattern binding 'x' type mismatch: expected 'int', found 'string'",
+            ),
+            (
+                diagnose_type_error(&TypeError::OrPatternAliasBinding { span: span() }),
+                "or-patterns with bindings cannot be used as aliases",
             ),
             (
                 diagnose_type_error(&TypeError::UnknownMember {

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown variable
+
+fn main() {
+    let f = 1;
+
+    fn f() {
+        missing;
+    }
+}
