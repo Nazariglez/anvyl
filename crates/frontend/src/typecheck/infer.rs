@@ -813,12 +813,6 @@ impl Solver {
         self.set_expr_type(id, span, Ty::from_recovery_type(ty));
     }
 
-    pub(super) fn expr_type_to_type(&self, id: ExprId) -> Option<(Span, Type)> {
-        self.expr_types
-            .get(&id)
-            .map(|(span, ty)| (*span, self.type_for_storage(ty)))
-    }
-
     pub(super) fn expr_types_to_types(&self) -> HashMap<ExprId, (Span, Type)> {
         self.expr_types
             .iter()

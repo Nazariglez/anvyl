@@ -17,7 +17,7 @@ fn stmt_diverges(stmt: &StmtNode) -> bool {
     }
 }
 
-fn expr_diverges(expr: &ExprNode) -> bool {
+pub(super) fn expr_diverges(expr: &ExprNode) -> bool {
     match &expr.node.kind {
         ExprKind::If(if_node) => {
             let Some(else_block) = &if_node.node.else_block else {

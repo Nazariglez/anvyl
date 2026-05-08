@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Mismatched types
+
+fn f(cond: bool) -> int {
+    if cond {
+        return 1;
+    }
+}
+
+fn main() {}

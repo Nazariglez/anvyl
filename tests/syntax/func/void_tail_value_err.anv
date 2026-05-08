@@ -1,7 +1,10 @@
 // @mode: check
 // @expect: error
+// @frontend: new
 // @contains: Mismatched types
 
-fn main() {
-    1 + 2
+fn f() -> void {
+    1
 }
+
+fn main() {}

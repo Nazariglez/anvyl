@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Mismatched types
+
+struct Counter { value: int }
+
+extend Counter {
+    fn tick(self) {
+        1
+    }
+}
+
+fn main() {}

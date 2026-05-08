@@ -292,9 +292,6 @@ pub(crate) enum TypeError {
     IfWithoutElseValue {
         span: Span,
     },
-    UnusedValue {
-        span: Span,
-    },
     IfConditionNotBool {
         found: Type,
         span: Span,
@@ -719,7 +716,6 @@ enum ReturnMode {
 
 struct ReturnFrame {
     mode: ReturnMode,
-    saw_return: bool,
 }
 
 struct LambdaFrame {
@@ -1101,10 +1097,6 @@ impl TypeChecker {
         has_errors
     }
 
-    fn get_type(&self, id: ExprId) -> Option<(Span, Type)> {
-        self.solver.expr_type_to_type(id)
-    }
-
     fn expr_types(&self) -> HashMap<ExprId, (Span, Type)> {
         self.solver.expr_types_to_types()
     }
@@ -1189,10 +1181,7 @@ impl TypeChecker {
     }
 
     fn push_return_frame(&mut self, mode: ReturnMode) {
-        self.returns.push(ReturnFrame {
-            mode,
-            saw_return: false,
-        });
+        self.returns.push(ReturnFrame { mode });
     }
 
     fn pop_return_frame(&mut self) -> Option<ReturnFrame> {
@@ -1203,16 +1192,6 @@ impl TypeChecker {
         match &self.returns.last()?.mode {
             ReturnMode::Explicit(ty) => Some(ty),
             ReturnMode::Infer { .. } => None,
-        }
-    }
-
-    fn saw_return(&self) -> bool {
-        self.returns.last().is_some_and(|frame| frame.saw_return)
-    }
-
-    fn mark_return(&mut self) {
-        if let Some(frame) = self.returns.last_mut() {
-            frame.saw_return = true;
         }
     }
 
@@ -3177,6 +3156,77 @@ fn check_method_generic_shadow(
     });
 }
 
+enum CallableBody<'a> {
+    Block(&'a BlockNode),
+    Expr(&'a ExprNode),
+}
+
+impl CallableBody<'_> {
+    fn span(&self) -> Span {
+        match self {
+            Self::Block(block) => block.span,
+            Self::Expr(expr) => expr.span,
+        }
+    }
+
+    fn diverges(&self) -> bool {
+        match self {
+            Self::Block(block) => control_flow::block_diverges(block),
+            Self::Expr(expr) => control_flow::expr_diverges(expr),
+        }
+    }
+
+    fn check_with_hint(&self, expected: Option<TypeHandle>, tc: &mut TypeChecker) -> CheckedType {
+        match self {
+            Self::Block(block) => check_block_checked_with_hint(block, expected, tc),
+            Self::Expr(expr) => check_expr_checked_with_hint(expr, expected, tc),
+        }
+    }
+}
+
+fn check_callable_body_with_return(
+    body: CallableBody<'_>,
+    expected_ret: Option<&Type>,
+    callable_span: Span,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let expected = expected_ret.map(|ret| tc.type_handle(ret));
+    let checked = body.check_with_hint(expected, tc);
+    finish_callable_body_return(body, &checked, expected_ret, callable_span, tc);
+    checked
+}
+
+fn finish_callable_body_return(
+    body: CallableBody<'_>,
+    checked: &CheckedType,
+    expected_ret: Option<&Type>,
+    callable_span: Span,
+    tc: &mut TypeChecker,
+) {
+    match expected_ret {
+        Some(ret) => {
+            if !checked.ty.is_void() {
+                tc.reject_extern_any_escape(checked, body.span());
+                let ret_handle = tc.type_handle(ret);
+                tc.expect_assignable(body.span(), checked.handle.clone(), ret_handle);
+            } else if !ret.is_void() && !body.diverges() {
+                tc.push_error(TypeError::MissingReturn {
+                    expected: ret.clone(),
+                    span: callable_span,
+                });
+            }
+        }
+        None => {
+            if !checked.ty.is_void() {
+                tc.reject_extern_any_escape(checked, body.span());
+                tc.push_inferred_return(body.span(), checked.handle.clone());
+            } else if !body.diverges() {
+                tc.push_inferred_return(callable_span, tc.type_handle(&Type::Void));
+            }
+        }
+    }
+}
+
 fn check_func_body(
     self_binding: Option<(MethodReceiver, Type)>,
     params: &[Param],
@@ -3214,40 +3264,8 @@ fn check_func_body(
             matches!(param.mutability, Mutability::Mutable),
         );
     }
-    let expects_value = !ret_ty.is_void() && !infer_return;
-    let body_checked = if expects_value {
-        let ret_handle = tc.type_handle(&ret_ty);
-        check_block_checked_with_hint(body, Some(ret_handle), tc)
-    } else {
-        check_block_checked(body, tc)
-    };
-    let body_is_void = body_checked.ty.is_void();
-    let saw_return = tc.saw_return();
-    let missing_implicit_return = body_is_void && !saw_return;
-    if infer_return {
-        if body_is_void && !saw_return {
-            tc.push_inferred_return(span, tc.type_handle(&Type::Void));
-        } else if !body_is_void {
-            tc.reject_extern_any_escape(&body_checked, span);
-            tc.push_inferred_return(span, body_checked.handle);
-        }
-    } else if expects_value {
-        if missing_implicit_return {
-            tc.push_error(TypeError::MissingReturn {
-                expected: ret_ty.clone(),
-                span,
-            });
-        } else if !body_is_void {
-            tc.reject_extern_any_escape(&body_checked, span);
-            let ret_handle = tc.type_handle(&ret_ty);
-            tc.expect_assignable(span, body_checked.handle, ret_handle);
-        }
-    } else if !body_is_void && let Some(tail) = &body.node.tail {
-        let span = tc
-            .get_type(tail.node.id)
-            .map_or_else(|| Span::new(0, 0), |(span, _)| span);
-        tc.push_error(TypeError::UnusedValue { span });
-    }
+    let expected_ret = (!infer_return).then_some(&ret_ty);
+    check_callable_body_with_return(CallableBody::Block(body), expected_ret, span, tc);
     let frame = tc.pop_return_frame();
     let inferred_ret = frame.and_then(|frame| infer_return_type(frame, tc));
     tc.pop_scope();
@@ -3771,7 +3789,6 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
         return;
     }
 
-    tc.mark_return();
     if let Some(expr) = &ret.value {
         if let Some(expected_ty) = tc.return_type().cloned() {
             let expected = tc.type_handle(&expected_ty);
@@ -4694,27 +4711,56 @@ fn check_bool_condition(kind: ConditionKind, cond: CheckedType, span: Span, tc: 
     }
 }
 
-fn join_branches_with_hint(
+struct CheckedBranch {
+    checked: CheckedType,
+    span: Span,
+    diverges: bool,
+}
+
+fn checked_branch_against_expected(
+    branch: CheckedBranch,
     expected: Option<TypeHandle>,
-    left: CheckedType,
-    left_span: Span,
-    right: CheckedType,
-    right_span: Span,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    if let Some(expected) = expected {
-        let contains_extern_any = left.contains_extern_any || right.contains_extern_any;
-        tc.expect_assignable(left_span, left.handle, expected.clone());
-        tc.expect_assignable(right_span, right.handle, expected.clone());
-        tc.solve_constraints();
-        return CheckedType {
-            ty: tc.handle_type(&expected),
-            handle: expected,
-            contains_extern_any,
-        };
+    let Some(expected) = expected else {
+        return branch.checked;
+    };
+    tc.expect_assignable(branch.span, branch.checked.handle, expected.clone());
+    tc.solve_constraints();
+    CheckedType {
+        ty: tc.handle_type(&expected),
+        handle: expected,
+        contains_extern_any: branch.checked.contains_extern_any,
     }
+}
 
-    join_checked(left, left_span, right, right_span, tc)
+fn join_branches_with_hint(
+    expected: Option<TypeHandle>,
+    left: CheckedBranch,
+    right: CheckedBranch,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match (left.diverges, right.diverges) {
+        (true, true) => checked_void(tc),
+        (true, false) => checked_branch_against_expected(right, expected, tc),
+        (false, true) => checked_branch_against_expected(left, expected, tc),
+        (false, false) => {
+            if let Some(expected) = expected {
+                let contains_extern_any =
+                    left.checked.contains_extern_any || right.checked.contains_extern_any;
+                tc.expect_assignable(left.span, left.checked.handle, expected.clone());
+                tc.expect_assignable(right.span, right.checked.handle, expected.clone());
+                tc.solve_constraints();
+                return CheckedType {
+                    ty: tc.handle_type(&expected),
+                    handle: expected,
+                    contains_extern_any,
+                };
+            }
+
+            join_checked(left.checked, left.span, right.checked, right.span, tc)
+        }
+    }
 }
 
 fn check_if_checked_with_hint(
@@ -4741,10 +4787,16 @@ fn check_if_checked_with_hint(
     let else_checked = check_block_checked_with_hint(else_block, expected.clone(), tc);
     join_branches_with_hint(
         expected,
-        then,
-        if_node.node.then_block.span,
-        else_checked,
-        else_block.span,
+        CheckedBranch {
+            checked: then,
+            span: if_node.node.then_block.span,
+            diverges: control_flow::block_diverges(&if_node.node.then_block),
+        },
+        CheckedBranch {
+            checked: else_checked,
+            span: else_block.span,
+            diverges: control_flow::block_diverges(else_block),
+        },
         tc,
     )
 }
@@ -4768,10 +4820,16 @@ fn check_ternary_checked_with_hint(
     let else_checked = check_value_expr_checked_with_hint(&node.else_expr, expected.clone(), tc);
     join_branches_with_hint(
         expected,
-        then,
-        node.then_expr.span,
-        else_checked,
-        node.else_expr.span,
+        CheckedBranch {
+            checked: then,
+            span: node.then_expr.span,
+            diverges: control_flow::expr_diverges(&node.then_expr),
+        },
+        CheckedBranch {
+            checked: else_checked,
+            span: node.else_expr.span,
+            diverges: control_flow::expr_diverges(&node.else_expr),
+        },
         tc,
     )
 }
@@ -4850,43 +4908,12 @@ fn check_lambda_expr(
     };
     tc.push_return_frame(return_mode);
 
-    let body_checked = match &expected_ret {
-        Some(ret) if !ret.is_void() => {
-            let ret_handle = tc.type_handle(ret);
-            check_expr_checked_with_hint(&lambda.node.body, Some(ret_handle), tc)
-        }
-        _ => check_expr_checked(&lambda.node.body, tc),
-    };
-
-    if let Some(ret) = &expected_ret {
-        let expects_value = !ret.is_void();
-        let missing_implicit_return = body_checked.ty.is_void() && !tc.saw_return();
-        if expects_value {
-            if missing_implicit_return {
-                tc.push_error(TypeError::MissingReturn {
-                    expected: ret.clone(),
-                    span: lambda.span,
-                });
-            } else if !body_checked.ty.is_void() {
-                tc.reject_extern_any_escape(&body_checked, lambda.node.body.span);
-                let ret_handle = tc.type_handle(ret);
-                tc.expect_assignable(
-                    lambda.node.body.span,
-                    body_checked.handle.clone(),
-                    ret_handle,
-                );
-            }
-        } else if !body_checked.ty.is_void() {
-            tc.push_error(TypeError::UnusedValue {
-                span: lambda.node.body.span,
-            });
-        }
-    } else if !body_checked.ty.is_void() {
-        tc.reject_extern_any_escape(&body_checked, lambda.node.body.span);
-        tc.push_inferred_return(lambda.node.body.span, body_checked.handle.clone());
-    } else if !tc.saw_return() {
-        tc.push_inferred_return(lambda.span, tc.type_handle(&Type::Void));
-    }
+    check_callable_body_with_return(
+        CallableBody::Expr(&lambda.node.body),
+        expected_ret.as_ref(),
+        lambda.span,
+        tc,
+    );
 
     let frame = tc.pop_return_frame();
     let inferred_ret = frame.and_then(|frame| infer_return_type(frame, tc));
@@ -6282,15 +6309,9 @@ fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
     let node = &let_else_node.node;
     let mode = mode_for_head(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
-    let saved_return_seen = tc.returns.last().map(|frame| frame.saw_return);
     tc.push_scope();
     check_block_checked(&node.else_block, tc);
     tc.pop_scope();
-    if let Some(saved) = saved_return_seen
-        && let Some(current) = tc.returns.last_mut()
-    {
-        current.saw_return = saved;
-    }
     if !control_flow::block_diverges(&node.else_block) {
         tc.push_error(TypeError::LetElseMustDiverge {
             span: node.else_block.span,

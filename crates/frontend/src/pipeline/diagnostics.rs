@@ -550,7 +550,6 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::IfWithoutElseValue { .. } => {
             "if expression used as value must have an else branch".to_string()
         }
-        TypeError::UnusedValue { .. } => "unused value".to_string(),
         TypeError::IfConditionNotBool { found, .. } => {
             format!("Condition of if expression must be bool: found '{found}'")
         }

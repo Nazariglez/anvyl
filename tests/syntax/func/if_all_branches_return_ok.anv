@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn f(cond: bool) -> int {
+    if cond {
+        return 1;
+    } else {
+        return 2;
+    }
+}
+
+fn main() {
+    let _x = f(true);
+}
