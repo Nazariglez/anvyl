@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn outer<T>(x: T) -> T {
+    fn id(y: T) -> T { y }
+    id(x)
+}
+
+fn main() {
+    let a: int = outer(1);
+    let b: string = outer("hi");
+}

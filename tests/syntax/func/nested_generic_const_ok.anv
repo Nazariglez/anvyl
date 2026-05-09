@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    fn same<N: int>(x: [int; N]) -> [int; N] { x }
+
+    let xs: [int; 3] = same([1, 2, 3]);
+}

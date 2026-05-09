@@ -169,7 +169,7 @@ pub(crate) enum TypeError {
     CannotInferEnum {
         span: Span,
     },
-    GenericLocalFunction {
+    NamedFunctionCapture {
         name: Ident,
         span: Span,
     },
@@ -692,11 +692,112 @@ struct VarInfo {
     alias: Option<AliasTarget>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+struct LocalCallableInfo {
+    type_id: LocalTypeId,
+    callee: CallableRef,
+}
+
+#[derive(Clone)]
+enum LocalSymbol {
+    Value(VarInfo),
+    Callable(Box<LocalCallableInfo>),
+}
+
+enum LocalSymbolLookup {
+    Found(LocalSymbol, usize),
+    Blocked,
+    Missing,
+}
+
+#[derive(Clone)]
+enum CallableTemplateEnv {
+    SourceModule,
+    Local(Vec<HashMap<Ident, LocalSymbol>>),
+}
+
+struct NamedFunctionFrame {
+    value_floor: usize,
+}
+
+#[derive(Clone, Default)]
+struct GenericOwnerFrame {
+    params: GenericParams,
+    args: GenericArgs,
+    generics: GenericTypeContext,
+}
+
+struct SourceFuncSig {
+    owner_generics: GenericParams,
+    owner_args: GenericArgs,
+    generics: GenericParams,
+    generic_context: GenericTypeContext,
+    params: Vec<FuncParam>,
+    required_params: usize,
+    ret: Type,
+    surface_ty: Type,
+}
+
+struct LocalFuncDecl {
+    id: CallableId,
+    sig: SourceFuncSig,
+    func: FuncNode,
+}
+
+impl LocalCallableInfo {
+    fn has_generics(&self) -> bool {
+        !self.callee.def.sig.owner_generics.is_empty() || !self.callee.def.sig.generics.is_empty()
+    }
+
+    fn value_error(&self, name: Ident, span: Span) -> Option<TypeError> {
+        if self.has_generics() {
+            Some(TypeError::UndefinedVariable { name, span })
+        } else if matches!(self.callee.def.sig.ret, Type::InferReturn) {
+            Some(TypeError::InferReturnValue { span })
+        } else {
+            None
+        }
+    }
+
+    fn value_view(&self) -> VarInfo {
+        VarInfo {
+            type_id: self.type_id,
+            kind: LocalBindingKind::Immutable,
+            const_value: None,
+            alias: None,
+        }
+    }
+}
+
+impl LocalSymbol {
+    fn as_value(&self) -> Option<&VarInfo> {
+        match self {
+            Self::Value(info) => Some(info),
+            Self::Callable(_) => None,
+        }
+    }
+
+    fn value_error(&self, name: Ident, span: Span) -> Option<TypeError> {
+        match self {
+            Self::Value(_) => None,
+            Self::Callable(info) => info.value_error(name, span),
+        }
+    }
+
+    fn value_view(&self) -> VarInfo {
+        match self {
+            Self::Value(info) => info.clone(),
+            Self::Callable(info) => info.value_view(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct CallableTemplate {
     span: Span,
     mode: MethodMode,
     generics: GenericTypeContext,
+    env: CallableTemplateEnv,
     params: Vec<Param>,
     ret: Type,
     ret_span: Span,
@@ -729,8 +830,9 @@ struct TypeChecker {
     extern_uses: ExternUseMap,
     decls: DeclarationIndex,
     externs: ExternCatalog,
-    scopes: Vec<HashMap<Ident, VarInfo>>,
+    scopes: Vec<HashMap<Ident, LocalSymbol>>,
     lambda_frames: Vec<LambdaFrame>,
+    named_function_frames: Vec<NamedFunctionFrame>,
     returns: Vec<ReturnFrame>,
     loop_depth: usize,
     defer_depth: usize,
@@ -742,6 +844,8 @@ struct TypeChecker {
     type_substs: Vec<TypeSubst>,
     const_substs: Vec<ConstSubst>,
     generic_contexts: Vec<GenericTypeContext>,
+    generic_owner_frames: Vec<GenericOwnerFrame>,
+    local_callables: HashMap<CallableId, LocalCallableInfo>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
     specializations: HashMap<SpecializationKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
@@ -812,6 +916,7 @@ impl TypeChecker {
             externs,
             scopes: vec![],
             lambda_frames: vec![],
+            named_function_frames: vec![],
             returns: vec![],
             loop_depth: 0,
             defer_depth: 0,
@@ -823,6 +928,8 @@ impl TypeChecker {
             type_substs: vec![],
             const_substs: vec![],
             generic_contexts: vec![],
+            generic_owner_frames: vec![],
+            local_callables: HashMap::new(),
             callable_templates: HashMap::new(),
             specializations: HashMap::new(),
             consts: HashMap::new(),
@@ -900,6 +1007,19 @@ impl TypeChecker {
         const_value: Option<ConstValue>,
         alias: Option<AliasTarget>,
     ) {
+        let type_id = self.solver.alloc_local_type(&ty);
+        self.define_local_symbol(
+            name,
+            LocalSymbol::Value(VarInfo {
+                type_id,
+                kind,
+                const_value,
+                alias,
+            }),
+        );
+    }
+
+    fn define_local_symbol(&mut self, name: Ident, symbol: LocalSymbol) {
         let Some(scope) = self.scopes.last() else {
             return;
         };
@@ -910,17 +1030,10 @@ impl TypeChecker {
             });
             return;
         }
-
-        let type_id = self.solver.alloc_local_type(&ty);
-        self.scopes.last_mut().expect("scope exists").insert(
-            name,
-            VarInfo {
-                type_id,
-                kind,
-                const_value,
-                alias,
-            },
-        );
+        self.scopes
+            .last_mut()
+            .expect("scope exists")
+            .insert(name, symbol);
     }
 
     fn define_shadowing_value_with_alias(
@@ -937,26 +1050,94 @@ impl TypeChecker {
         };
         scope.insert(
             name,
-            VarInfo {
+            LocalSymbol::Value(VarInfo {
                 type_id,
                 kind,
                 const_value,
                 alias,
-            },
+            }),
         );
     }
 
-    fn lookup(&self, name: Ident) -> Option<&VarInfo> {
+    fn define_local_callable(&mut self, name: Ident, callee: CallableRef, surface_ty: Type) {
+        let type_id = self.solver.alloc_local_type(&surface_ty);
+        let info = LocalCallableInfo { type_id, callee };
+        self.local_callables
+            .insert(info.callee.def.id.clone(), info.clone());
+        self.define_local_symbol(name, LocalSymbol::Callable(Box::new(info)));
+    }
+
+    fn lookup(&self, name: Ident) -> Option<VarInfo> {
         self.lookup_with_depth(name).map(|(info, _)| info)
     }
 
-    fn lookup_with_depth(&self, name: Ident) -> Option<(&VarInfo, usize)> {
+    fn lookup_with_depth(&self, name: Ident) -> Option<(VarInfo, usize)> {
+        self.lookup_local_symbol(name)
+            .map(|(symbol, depth)| (symbol.value_view(), depth))
+    }
+
+    fn lookup_local_symbol(&self, name: Ident) -> Option<(&LocalSymbol, usize)> {
         for (depth, scope) in self.scopes.iter().enumerate().rev() {
-            if let Some(info) = scope.get(&name) {
-                return Some((info, depth));
+            if let Some(symbol) = scope.get(&name) {
+                return Some((symbol, depth));
             }
         }
         None
+    }
+
+    fn local_callable(&self, id: &CallableId) -> Option<LocalCallableInfo> {
+        self.local_callables.get(id).cloned()
+    }
+
+    fn lookup_local_symbol_checked(&mut self, name: Ident, span: Span) -> LocalSymbolLookup {
+        let Some((symbol, depth)) = self
+            .lookup_local_symbol(name)
+            .map(|(symbol, depth)| (symbol.clone(), depth))
+        else {
+            return LocalSymbolLookup::Missing;
+        };
+        if self.blocks_named_capture(&symbol, depth) {
+            self.push_error(TypeError::NamedFunctionCapture { name, span });
+            return LocalSymbolLookup::Blocked;
+        }
+        LocalSymbolLookup::Found(symbol, depth)
+    }
+
+    fn lookup_local_value_checked(
+        &mut self,
+        name: Ident,
+        span: Span,
+    ) -> Result<Option<(VarInfo, usize)>, ()> {
+        match self.lookup_local_symbol_checked(name, span) {
+            LocalSymbolLookup::Found(symbol, depth) => {
+                if let Some(error) = symbol.value_error(name, span) {
+                    self.push_error(error);
+                    Err(())
+                } else {
+                    Ok(Some((symbol.value_view(), depth)))
+                }
+            }
+            LocalSymbolLookup::Blocked => Err(()),
+            LocalSymbolLookup::Missing => Ok(None),
+        }
+    }
+
+    fn blocks_named_capture(&self, symbol: &LocalSymbol, depth: usize) -> bool {
+        matches!(symbol, LocalSymbol::Value(_))
+            && self
+                .named_function_frames
+                .last()
+                .is_some_and(|frame| depth > 0 && depth < frame.value_floor)
+    }
+
+    fn enter_named_function(&mut self) {
+        self.named_function_frames.push(NamedFunctionFrame {
+            value_floor: self.scopes.len(),
+        });
+    }
+
+    fn exit_named_function(&mut self) {
+        self.named_function_frames.pop();
     }
 
     fn is_captured_local(&self, depth: usize) -> bool {
@@ -1469,6 +1650,21 @@ impl TypeChecker {
         self.generic_contexts.pop();
     }
 
+    fn push_generic_owner_frame(&mut self, frame: GenericOwnerFrame) {
+        self.generic_owner_frames.push(frame);
+    }
+
+    fn pop_generic_owner_frame(&mut self) {
+        self.generic_owner_frames.pop();
+    }
+
+    fn visible_generic_owner(&self) -> GenericOwnerFrame {
+        self.generic_owner_frames
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn substituted_type_param(&self, name: Ident) -> Option<Type> {
         let id = self
             .generic_contexts
@@ -1488,6 +1684,12 @@ impl TypeChecker {
 
     fn callable_template(&self, id: &CallableId) -> Option<&CallableTemplate> {
         self.callable_templates.get(id)
+    }
+
+    fn update_callable_template_env(&mut self, id: &CallableId, env: CallableTemplateEnv) {
+        if let Some(template) = self.callable_templates.get_mut(id) {
+            template.env = env;
+        }
     }
 
     fn specialization(&self, key: &SpecializationKey) -> Option<&SpecializationState> {
@@ -1726,13 +1928,10 @@ impl TypeChecker {
     }
 
     fn lookup_named_value(&self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
-        let contains_local = self
-            .scopes
-            .iter()
-            .skip(1)
-            .rev()
-            .any(|scope| scope.contains_key(&name));
-        if contains_local {
+        if self
+            .lookup_local_symbol(name)
+            .is_some_and(|(_, depth)| depth > 0)
+        {
             return None;
         }
         self.current_module_value(name)
@@ -2621,6 +2820,7 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                         span: func_node.span,
                         mode: MethodMode::Static,
                         generics,
+                        env: CallableTemplateEnv::SourceModule,
                         params: func.params.clone(),
                         ret: func.ret.clone(),
                         ret_span: func_node.span,
@@ -2667,6 +2867,7 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                             span: agg_node.span,
                             mode,
                             generics,
+                            env: CallableTemplateEnv::SourceModule,
                             params: method.sig.params.clone(),
                             ret: method.sig.ret.clone(),
                             ret_span: agg_node.span,
@@ -2715,6 +2916,7 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
                             span: method_node.span,
                             mode,
                             generics,
+                            env: CallableTemplateEnv::SourceModule,
                             params: method.sig.params.clone(),
                             ret: method.sig.ret.clone(),
                             ret_span: method_node.span,
@@ -2797,21 +2999,194 @@ fn check_stmts(stmts: &[StmtNode], tc: &mut TypeChecker) {
     }
 }
 
+fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncSig {
+    let owner = tc.visible_generic_owner();
+    let generics = generic_params(&func.type_params, &func.const_params);
+    let generic_context =
+        tc.extended_generic_context(&owner.generics, &func.type_params, &func.const_params, span);
+    check_param_order(&func.params, span, tc);
+    check_infer_return_allowed(
+        &func.ret,
+        !generics.is_empty() || !owner.params.is_empty(),
+        span,
+        tc,
+    );
+
+    tc.push_generic_context(generic_context.clone());
+    let params = func
+        .params
+        .iter()
+        .map(|param| {
+            FuncParam::new(
+                tc.resolve_type_for_tc_at(&param.ty, span),
+                matches!(param.mutability, Mutability::Mutable),
+                param.cast_accept,
+            )
+        })
+        .collect::<Vec<_>>();
+    let ret = tc.resolve_type_for_tc_at(&func.ret, span);
+    tc.pop_generic_context();
+
+    SourceFuncSig {
+        owner_generics: owner.params,
+        owner_args: owner.args,
+        generics,
+        generic_context,
+        required_params: required_param_count(&func.params),
+        surface_ty: Type::Func {
+            params: params.clone(),
+            ret: Box::new(ret.clone()),
+        },
+        params,
+        ret,
+    }
+}
+
 fn register_block_declarations(stmts: &[StmtNode], tc: &mut TypeChecker) {
+    let mut funcs = vec![];
     for stmt in stmts {
         let Stmt::Func(func_node) = &stmt.node else {
             continue;
         };
         let func = &func_node.node;
-        if is_generic(func) {
-            tc.push_error(TypeError::GenericLocalFunction {
-                name: func.name,
-                span: func_node.span,
-            });
-            continue;
+        let sig = source_func_sig(func, func_node.span, tc);
+        let id = CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+        let callee = CallableRef {
+            def: CallableDef {
+                id: id.clone(),
+                sig: CallableSig {
+                    owner_generics: sig.owner_generics.clone(),
+                    generics: sig.generics.clone(),
+                    params: sig.params.clone(),
+                    required_params: sig.required_params,
+                    ret: sig.ret.clone(),
+                },
+            },
+            receiver_ty: None,
+            owner_args: sig.owner_args.clone(),
+        };
+        tc.define_local_callable(func.name, callee, sig.surface_ty.clone());
+        funcs.push(LocalFuncDecl {
+            id,
+            sig,
+            func: func_node.clone(),
+        });
+    }
+
+    let mut funcs = funcs.into_iter();
+    let mut env = tc.scopes.clone();
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Func(_) => {
+                let decl = funcs.next().expect("function declaration was collected");
+                store_local_callable_template(decl, env.clone(), tc);
+            }
+            Stmt::Binding(binding) => add_pattern_capture_placeholders(
+                &binding.node.pattern,
+                LocalBindingKind::from_mutable(matches!(
+                    binding.node.mutability,
+                    Mutability::Mutable
+                )),
+                &mut env,
+                tc,
+            ),
+            Stmt::LetElse(let_else) => add_pattern_capture_placeholders(
+                &let_else.node.pattern,
+                LocalBindingKind::from_mutable(matches!(let_else.node.head, PatternHead::Var)),
+                &mut env,
+                tc,
+            ),
+            Stmt::Const(const_node) => {
+                add_capture_placeholder(
+                    const_node.node.name,
+                    LocalBindingKind::Const,
+                    &mut env,
+                    tc,
+                );
+            }
+            _ => {}
         }
-        let func_ty = tc.func_type_from_sig(&func.params, &func.ret);
-        tc.define_value(func.name, func_ty, LocalBindingKind::Immutable, None);
+    }
+}
+
+fn store_local_callable_template(
+    decl: LocalFuncDecl,
+    env: Vec<HashMap<Ident, LocalSymbol>>,
+    tc: &mut TypeChecker,
+) {
+    let has_template = is_generic(&decl.func.node)
+        || matches!(decl.func.node.ret, Type::InferReturn)
+        || !decl.sig.owner_generics.is_empty();
+    if !has_template {
+        return;
+    }
+    tc.store_callable_template(
+        decl.id,
+        CallableTemplate {
+            span: decl.func.span,
+            mode: MethodMode::Static,
+            generics: decl.sig.generic_context,
+            env: CallableTemplateEnv::Local(env),
+            params: decl.func.node.params.clone(),
+            ret: decl.func.node.ret.clone(),
+            ret_span: decl.func.span,
+            body: decl.func.node.body.clone(),
+        },
+    );
+}
+
+fn add_capture_placeholder(
+    name: Ident,
+    kind: LocalBindingKind,
+    env: &mut [HashMap<Ident, LocalSymbol>],
+    tc: &mut TypeChecker,
+) {
+    let Some(scope) = env.last_mut() else {
+        return;
+    };
+    let type_id = tc.solver.alloc_local_type(&Type::Infer);
+    scope.insert(
+        name,
+        LocalSymbol::Value(VarInfo {
+            type_id,
+            kind,
+            const_value: None,
+            alias: None,
+        }),
+    );
+}
+
+fn add_pattern_capture_placeholders(
+    pattern: &PatternNode,
+    kind: LocalBindingKind,
+    env: &mut [HashMap<Ident, LocalSymbol>],
+    tc: &mut TypeChecker,
+) {
+    match &pattern.node {
+        Pattern::Ident(name) => add_capture_placeholder(*name, kind, env, tc),
+        Pattern::Tuple(fields)
+        | Pattern::EnumTuple { fields, .. }
+        | Pattern::InferredEnumTuple { fields, .. }
+        | Pattern::Or(fields) => {
+            for field in fields {
+                add_pattern_capture_placeholders(field, kind, env, tc);
+            }
+        }
+        Pattern::Struct { fields, .. }
+        | Pattern::EnumStruct { fields, .. }
+        | Pattern::InferredEnumStruct { fields, .. } => {
+            for (_, field) in fields {
+                add_pattern_capture_placeholders(field, kind, env, tc);
+            }
+        }
+        Pattern::Optional(inner) => add_pattern_capture_placeholders(inner, kind, env, tc),
+        Pattern::Wildcard
+        | Pattern::EnumUnit { .. }
+        | Pattern::InferredEnumUnit { .. }
+        | Pattern::Range { .. }
+        | Pattern::Lit(_)
+        | Pattern::Rest
+        | Pattern::Nil => {}
     }
 }
 
@@ -2915,7 +3290,19 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
     match &stmt.node {
         Stmt::Func(func_node) => {
             let func = &func_node.node;
-            if is_generic(func) {
+            let id =
+                CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+            let local = tc.local_callable(&id);
+            if is_generic(func) && local.is_none() {
+                return;
+            }
+            if let Some(info) = local
+                && tc.callable_template(&info.callee.def.id).is_some()
+            {
+                tc.update_callable_template_env(
+                    &info.callee.def.id,
+                    CallableTemplateEnv::Local(tc.scopes.clone()),
+                );
                 return;
             }
             check_func(func_node, tc);
@@ -2981,25 +3368,36 @@ fn check_defer(defer_node: &DeferNode, tc: &mut TypeChecker) {
 
 fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
     let func = &func_node.node;
-    let registered_ty = tc
-        .lookup(func.name)
-        .map(|info| tc.solver.local_type_to_type(info.type_id));
-    let func_ty = match registered_ty {
-        Some(ty @ Type::Func { .. }) => ty,
-        _ => tc.func_type_from_sig(&func.params, &func.ret),
-    };
-    let Type::Func {
-        params: param_types,
-        ret,
-    } = &func_ty
-    else {
-        return;
+    let id = CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+    let local = tc.local_callable(&id);
+    let (param_types, ret) = match local.as_ref() {
+        Some(info) => (&info.callee.def.sig.params, &info.callee.def.sig.ret),
+        None => {
+            let func_ty = match tc.lookup(func.name) {
+                Some(info) => tc.solver.local_type_to_type(info.type_id),
+                None => tc.func_type_from_sig(&func.params, &func.ret),
+            };
+            let Type::Func { params, ret } = func_ty else {
+                return;
+            };
+            check_func_body(
+                None,
+                &func.params,
+                &params,
+                *ret,
+                &func.body,
+                func_node.span,
+                &[],
+                tc,
+            );
+            return;
+        }
     };
     check_func_body(
         None,
         &func.params,
         param_types,
-        (**ret).clone(),
+        ret.clone(),
         &func.body,
         func_node.span,
         &[],
@@ -3239,6 +3637,7 @@ fn check_func_body(
 ) -> Option<Type> {
     check_param_default_values(params, param_types, tc);
     let flow = tc.enter_function_control_flow();
+    tc.enter_named_function();
     tc.push_scope();
     for (name, value) in const_bindings {
         tc.define_const(*name, const_eval::const_type(value), value.clone());
@@ -3269,6 +3668,7 @@ fn check_func_body(
     let frame = tc.pop_return_frame();
     let inferred_ret = frame.and_then(|frame| infer_return_type(frame, tc));
     tc.pop_scope();
+    tc.exit_named_function();
     tc.exit_function_control_flow(flow);
     inferred_ret
 }
@@ -3307,6 +3707,25 @@ fn check_param_default_values(params: &[Param], param_types: &[FuncParam], tc: &
                 }
             }
             Err(error) => tc.push_error(error),
+        }
+    }
+}
+
+fn with_callable_body_env<R>(
+    module: &ModuleScope,
+    env: &CallableTemplateEnv,
+    tc: &mut TypeChecker,
+    f: impl FnOnce(&mut TypeChecker) -> R,
+) -> R {
+    match env {
+        CallableTemplateEnv::SourceModule => with_source_module_scope(module, tc, f),
+        CallableTemplateEnv::Local(scopes) => {
+            let previous_module = std::mem::replace(&mut tc.current_module, module.clone());
+            let previous_scopes = std::mem::replace(&mut tc.scopes, scopes.clone());
+            let ret = f(tc);
+            tc.scopes = previous_scopes;
+            tc.current_module = previous_module;
+            ret
         }
     }
 }
@@ -3350,8 +3769,13 @@ fn check_specialized_callable_body(
 
     let receiver = template.mode.receiver().zip(callee.receiver_ty.clone());
 
-    check_with_specialization(key, type_subst, const_subst, template.generics, tc, |tc| {
-        with_source_module_scope(&callee.def.id.module, tc, |tc| {
+    let owner_frame = GenericOwnerFrame {
+        params: combined_callable_params(callee),
+        args: args.clone(),
+        generics: template.generics.clone(),
+    };
+    check_with_specialization(key, type_subst, const_subst, owner_frame, tc, |tc| {
+        with_callable_body_env(&callee.def.id.module, &template.env, tc, |tc| {
             check_func_body(
                 receiver,
                 &template.params,
@@ -3366,11 +3790,22 @@ fn check_specialized_callable_body(
     })
 }
 
+fn combined_callable_params(callee: &CallableRef) -> GenericParams {
+    let mut params = callee.def.sig.owner_generics.clone();
+    params
+        .type_params
+        .extend(callee.def.sig.generics.type_params.clone());
+    params
+        .const_params
+        .extend(callee.def.sig.generics.const_params.clone());
+    params
+}
+
 fn check_with_specialization(
     key: SpecializationKey,
     type_subst: TypeSubst,
     const_subst: ConstSubst,
-    generics: GenericTypeContext,
+    owner_frame: GenericOwnerFrame,
     tc: &mut TypeChecker,
     check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
 ) -> Option<Type> {
@@ -3378,9 +3813,11 @@ fn check_with_specialization(
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
     tc.push_type_subst(type_subst);
     tc.push_const_subst(const_subst);
-    tc.push_generic_context(generics);
+    tc.push_generic_context(owner_frame.generics.clone());
+    tc.push_generic_owner_frame(owner_frame);
     let inferred_ret = check_body(tc);
     tc.solve_constraints();
+    tc.pop_generic_owner_frame();
     tc.pop_generic_context();
     tc.pop_const_subst();
     tc.pop_type_subst();
@@ -3972,11 +4409,8 @@ fn check_expr_checked_with_hint(
             }
             checked_from_type(expr, Type::Infer, tc)
         }
-        ExprKind::Ident(name) => match tc
-            .lookup_with_depth(*name)
-            .map(|(info, depth)| (info.clone(), depth))
-        {
-            Some((info, depth)) => {
+        ExprKind::Ident(name) => match tc.lookup_local_symbol_checked(*name, expr.span) {
+            LocalSymbolLookup::Found(LocalSymbol::Value(info), depth) => {
                 tc.record_capture(*name, depth);
                 if let Some((_, value_name, value)) = tc.lookup_named_value(*name) {
                     tc.warn_named_value_deprecated(&value, value_name, expr.span);
@@ -3997,7 +4431,17 @@ fn check_expr_checked_with_hint(
                     }
                 }
             }
-            None => {
+            LocalSymbolLookup::Found(LocalSymbol::Callable(info), _) => {
+                match info.value_error(*name, expr.span) {
+                    Some(error) => {
+                        tc.push_error(error);
+                        checked_from_type(expr, Type::Infer, tc)
+                    }
+                    None => checked_from_handle(expr, tc.local_handle(info.type_id), tc),
+                }
+            }
+            LocalSymbolLookup::Blocked => checked_from_type(expr, Type::Infer, tc),
+            LocalSymbolLookup::Missing => {
                 let named_value = tc.lookup_named_value(*name);
                 if let Some((_, value_name, value)) = &named_value {
                     tc.warn_named_value_deprecated(value, *value_name, expr.span);

@@ -457,8 +457,8 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         }
         TypeError::CannotInferType { .. } => "Could not infer type".to_string(),
         TypeError::CannotInferEnum { .. } => "cannot infer enum type".to_string(),
-        TypeError::GenericLocalFunction { name, .. } => {
-            format!("generic local function '{name}' is not supported")
+        TypeError::NamedFunctionCapture { name, .. } => {
+            format!("named functions cannot capture local value '{name}'")
         }
         TypeError::InferReturnNonGeneric { .. } => {
             "inferred return type is only allowed on generic callables".to_string()
@@ -1927,11 +1927,11 @@ mod tests {
                 "cannot infer enum type",
             ),
             (
-                diagnose_type_error(&TypeError::GenericLocalFunction {
-                    name: ident("id"),
+                diagnose_type_error(&TypeError::NamedFunctionCapture {
+                    name: ident("x"),
                     span: span(),
                 }),
-                "generic local function 'id' is not supported",
+                "named functions cannot capture local value 'x'",
             ),
             (
                 diagnose_type_error(&TypeError::VarArgNonLvalue { span: span() }),

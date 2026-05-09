@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: is not callable
+
+fn main() {
+    let before: int = f();
+
+    fn f() -> int { 1 }
+
+    let f = 2;
+    let after: int = f;
+    f();
+}

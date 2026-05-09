@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: capture
+
+fn main() {
+    let n = 1;
+    f(0);
+
+    fn f<T>(x: T) -> int {
+        n
+    }
+}

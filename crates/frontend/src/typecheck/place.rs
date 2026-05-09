@@ -166,29 +166,36 @@ pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> Ch
 }
 
 pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
-    if let ExprKind::Ident(name) = &expr.node.kind
-        && let Some((info, depth)) = tc
-            .lookup_with_depth(*name)
-            .map(|(info, depth)| (info.clone(), depth))
-    {
-        tc.record_capture(*name, depth);
-        let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
-        let access = if tc.is_captured_local(depth) {
-            PlaceAccess::Captured
-        } else {
-            info.alias
-                .as_ref()
-                .map_or_else(|| info.kind.place_access(), |alias| alias.access)
-        };
-        let mut place = CheckedPlace::new(checked, access);
-        place.value.path =
-            Some(PlacePath::root(*name)).filter(|_| place.value.access.can_mut_borrow());
-        if let Some(alias) = info.alias {
-            place.value.facts = alias.facts;
-            place.value.path = alias.path;
-            place.accepts_extern_any = alias.accepts_extern_any;
+    if let ExprKind::Ident(name) = &expr.node.kind {
+        match tc.lookup_local_value_checked(*name, expr.span) {
+            Ok(Some((info, depth))) => {
+                tc.record_capture(*name, depth);
+                let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
+                let access = if tc.is_captured_local(depth) {
+                    PlaceAccess::Captured
+                } else {
+                    info.alias
+                        .as_ref()
+                        .map_or_else(|| info.kind.place_access(), |alias| alias.access)
+                };
+                let mut place = CheckedPlace::new(checked, access);
+                place.value.path =
+                    Some(PlacePath::root(*name)).filter(|_| place.value.access.can_mut_borrow());
+                if let Some(alias) = info.alias {
+                    place.value.facts = alias.facts;
+                    place.value.path = alias.path;
+                    place.accepts_extern_any = alias.accepts_extern_any;
+                }
+                return place;
+            }
+            Err(()) => {
+                return CheckedPlace::new(
+                    super::checked_from_type(expr, Type::Infer, tc),
+                    PlaceAccess::NotPlace,
+                );
+            }
+            Ok(None) => {}
         }
-        return place;
     }
 
     if let ExprKind::Ident(name) = &expr.node.kind

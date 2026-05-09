@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: capture
+// @skip: FIXME: const are not caputred, they must be availabile unlike let/var
+
+fn main() {
+    const N = 1;
+
+    fn f() -> int {
+        N
+    }
+}

@@ -106,6 +106,13 @@ fn same_binding_names(left: &HashMap<Ident, VarInfo>, right: &HashMap<Ident, Var
     left.len() == right.len() && left.keys().all(|name| right.contains_key(name))
 }
 
+fn value_bindings(scope: &HashMap<Ident, LocalSymbol>) -> HashMap<Ident, VarInfo> {
+    scope
+        .iter()
+        .filter_map(|(name, symbol)| symbol.as_value().map(|info| (*name, info.clone())))
+        .collect()
+}
+
 struct OrAlternative {
     outcome: PatternOutcome,
     bindings: HashMap<Ident, VarInfo>,
@@ -389,7 +396,12 @@ impl<'tc> PatternChecker<'tc> {
         let outer_bindings = self.bindings.clone();
         let outcome = self.check(pattern, expected, access);
         self.bindings = outer_bindings;
-        let bindings = self.tc.scopes.last().cloned().unwrap_or_default();
+        let bindings = self
+            .tc
+            .scopes
+            .last()
+            .map(value_bindings)
+            .unwrap_or_default();
         self.tc.pop_scope();
         OrAlternative { outcome, bindings }
     }
@@ -442,7 +454,7 @@ impl<'tc> PatternChecker<'tc> {
                 continue;
             }
             if let Some(scope) = self.tc.scopes.last_mut() {
-                scope.insert(*name, info.clone());
+                scope.insert(*name, LocalSymbol::Value(info.clone()));
             }
         }
     }

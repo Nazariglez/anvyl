@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variable
+
+fn owner() {
+    fn id<T>(x: T) -> T { x }
+}
+
+fn main() {
+    id(1);
+}

@@ -108,6 +108,21 @@ pub(crate) struct NominalKey {
     pub(crate) name: Ident,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LocalCallableId {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+impl LocalCallableId {
+    pub(crate) fn new(span: Span) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallableId {
     pub(crate) module: ModuleScope,
@@ -131,6 +146,15 @@ impl CallableId {
             module,
             parent: None,
             kind: CallableKind::ExternFunction,
+            name,
+        }
+    }
+
+    pub(crate) fn local_function(module: ModuleScope, name: Ident, span: Span) -> Self {
+        Self {
+            module,
+            parent: Some(CallableParent::Local(LocalCallableId::new(span))),
+            kind: CallableKind::Function,
             name,
         }
     }
@@ -170,6 +194,7 @@ impl CallableId {
 pub(crate) enum CallableParent {
     Nominal(NominalKey),
     Extend(ExtendId),
+    Local(LocalCallableId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3293,14 +3318,17 @@ pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type
     .fold_type(ty)
 }
 
-fn generic_params(type_params: &[TypeParam], const_params: &[ConstParam]) -> GenericParams {
+pub(crate) fn generic_params(
+    type_params: &[TypeParam],
+    const_params: &[ConstParam],
+) -> GenericParams {
     GenericParams {
         type_params: type_params.to_vec(),
         const_params: const_params.to_vec(),
     }
 }
 
-fn func_type_from_params(params: &[Param], ret: &Type) -> Type {
+pub(crate) fn func_type_from_params(params: &[Param], ret: &Type) -> Type {
     let resolved_params = params
         .iter()
         .map(|p| {
@@ -3317,7 +3345,7 @@ fn func_type_from_params(params: &[Param], ret: &Type) -> Type {
     }
 }
 
-fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
+pub(crate) fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
     params
         .iter()
         .map(|p| {
@@ -3330,7 +3358,7 @@ fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
         .collect()
 }
 
-fn required_param_count(params: &[Param]) -> usize {
+pub(crate) fn required_param_count(params: &[Param]) -> usize {
     params
         .iter()
         .position(|param| param.default.is_some())

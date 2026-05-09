@@ -1,4 +1,4 @@
-use super::{DeprecatedUseKind, ModuleScope, TypeChecker, TypeError, ValueDecl};
+use super::{DeprecatedUseKind, LocalSymbol, ModuleScope, TypeChecker, TypeError, ValueDecl};
 use crate::{
     ast::{
         BinaryOp, CastNode, ConstValue, ExprKind, ExprNode, FieldAccessNode, Ident, Lit, Program,
@@ -199,19 +199,15 @@ impl TypeChecker {
         name: Ident,
         span: Span,
     ) -> Option<Result<ConstValue, TypeError>> {
-        for (index, scope) in self.scopes.iter().enumerate().rev() {
-            let Some(info) = scope.get(&name) else {
-                continue;
-            };
-            if let Some(value) = &info.const_value {
-                return Some(Ok(value.clone()));
+        if let Some((symbol, index)) = self.lookup_local_symbol(name) {
+            if let Some(value) = symbol.as_value().and_then(|info| info.const_value.clone()) {
+                return Some(Ok(value));
             }
             let scope_binding_blocks_const_lookup =
                 index != 0 || !self.has_top_const(&self.current_module, name);
             if scope_binding_blocks_const_lookup {
                 return None;
             }
-            break;
         }
 
         if self.has_top_const(&self.current_module, name) {
@@ -313,7 +309,7 @@ impl TypeChecker {
         let Some(scope) = self.scopes.first_mut() else {
             return;
         };
-        let Some(info) = scope.get_mut(&name) else {
+        let Some(LocalSymbol::Value(info)) = scope.get_mut(&name) else {
             return;
         };
         let type_id = info.type_id;
