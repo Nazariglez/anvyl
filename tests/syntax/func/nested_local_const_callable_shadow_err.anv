@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: not a constant expression
+
+fn main() {
+    const F = 3;
+
+    {
+        const N = F;
+
+        fn use(x: [int; N]) {}
+        fn F() -> int { 0 }
+    }
+}

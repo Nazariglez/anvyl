@@ -1,8 +1,11 @@
-use super::{DeprecatedUseKind, LocalSymbol, ModuleScope, TypeChecker, TypeError, ValueDecl};
+use super::{
+    CallableTemplateEnv, DeprecatedUseKind, LocalConstId, LocalConstInfo, LocalSymbol,
+    LocalSymbolLookup, ModuleScope, TypeChecker, TypeError, ValueDecl,
+};
 use crate::{
     ast::{
-        BinaryOp, CastNode, ConstValue, ExprKind, ExprNode, FieldAccessNode, Ident, Lit, Program,
-        Stmt, StringPart, Type, UnaryOp,
+        BinaryOp, CastNode, ConstDeclNode, ConstValue, ExprKind, ExprNode, FieldAccessNode, Ident,
+        Lit, Program, Stmt, StringPart, Type, UnaryOp,
     },
     span::Span,
 };
@@ -15,12 +18,31 @@ pub(super) struct ConstEntry {
     state: ConstState,
 }
 
+#[derive(Clone)]
+pub(super) struct LocalConstEntry {
+    info: LocalConstInfo,
+    name: Ident,
+    ty: Option<Type>,
+    value: ExprNode,
+    span: Span,
+    module: ModuleScope,
+    env: CallableTemplateEnv,
+    state: ConstState,
+}
+
 #[derive(Debug, Clone)]
 enum ConstState {
     Unevaluated,
     Evaluating,
     Evaluated(ConstValue),
     Failed,
+}
+
+pub(super) enum ConstNameLookup {
+    Value(ConstValue),
+    NotConstLocal,
+    Error(TypeError),
+    Missing,
 }
 
 pub(super) fn const_type(value: &ConstValue) -> Type {
@@ -65,6 +87,36 @@ impl TypeChecker {
         }
     }
 
+    pub(super) fn declare_local_const(
+        &mut self,
+        node: &ConstDeclNode,
+        env: CallableTemplateEnv,
+    ) -> LocalConstInfo {
+        let info = LocalConstInfo {
+            type_id: self.solver.alloc_local_type(&Type::Infer),
+            id: LocalConstId(self.local_consts.len() as u32),
+        };
+        self.local_consts.push(LocalConstEntry {
+            info,
+            name: node.node.name,
+            ty: node.node.ty.clone(),
+            value: node.node.value.clone(),
+            span: node.span,
+            module: self.current_module.clone(),
+            env,
+            state: ConstState::Unevaluated,
+        });
+        info
+    }
+
+    pub(super) fn set_local_const_env(&mut self, id: LocalConstId, env: CallableTemplateEnv) {
+        if let Some(entry) = self.local_consts.get_mut(id.0 as usize)
+            && matches!(entry.state, ConstState::Unevaluated)
+        {
+            entry.env = env;
+        }
+    }
+
     pub(super) fn eval_module_consts(&mut self, module: &ModuleScope) {
         let names = self
             .consts
@@ -89,11 +141,17 @@ impl TypeChecker {
                 if warn_deprecated {
                     self.warn_named_const_deprecated(*name, expr.span);
                 }
-                self.eval_visible_const(*name, expr.span)
-                    .unwrap_or(Err(TypeError::UnknownConst {
+                match self.lookup_visible_const_name(*name, expr.span) {
+                    ConstNameLookup::Value(value) => Ok(value),
+                    ConstNameLookup::NotConstLocal => {
+                        Err(TypeError::NonConstExpression { span: expr.span })
+                    }
+                    ConstNameLookup::Error(error) => Err(error),
+                    ConstNameLookup::Missing => Err(TypeError::UnknownConst {
                         name: *name,
                         span: expr.span,
-                    }))
+                    }),
+                }
             }
             ExprKind::Unary(node) => {
                 let value = self.eval_const_expr(&node.node.expr, warn_deprecated)?;
@@ -194,33 +252,114 @@ impl TypeChecker {
         }
     }
 
+    pub(super) fn lookup_visible_const_name(&mut self, name: Ident, span: Span) -> ConstNameLookup {
+        match self.lookup_local_symbol_checked(name, span) {
+            LocalSymbolLookup::Found(LocalSymbol::Value(info), depth) => {
+                if let Some(value) = info.const_value.clone() {
+                    return ConstNameLookup::Value(value);
+                }
+                if let Some(id) = info.local_const {
+                    return match self.eval_local_const(id, span) {
+                        Ok(value) => ConstNameLookup::Value(value),
+                        Err(error) => ConstNameLookup::Error(error),
+                    };
+                }
+                if depth != 0 || !self.has_top_const(&self.current_module, name) {
+                    return ConstNameLookup::NotConstLocal;
+                }
+            }
+            LocalSymbolLookup::Found(LocalSymbol::Callable(_), _) => {
+                return ConstNameLookup::NotConstLocal;
+            }
+            LocalSymbolLookup::Blocked(error) => return ConstNameLookup::Error(error),
+            LocalSymbolLookup::Missing => {}
+        }
+
+        if self.has_top_const(&self.current_module, name) {
+            let module = self.current_module.clone();
+            return match self.eval_top_const(&module, name, span) {
+                Ok(value) => ConstNameLookup::Value(value),
+                Err(error) => ConstNameLookup::Error(error),
+            };
+        }
+
+        match self.imported_value(name) {
+            Some((module, imported_name, ValueDecl::Const(_))) => {
+                match self.eval_top_const(&module, imported_name, span) {
+                    Ok(value) => ConstNameLookup::Value(value),
+                    Err(error) => ConstNameLookup::Error(error),
+                }
+            }
+            Some((_, _, ValueDecl::Func(_))) | None => ConstNameLookup::Missing,
+        }
+    }
+
     pub(super) fn eval_visible_const(
         &mut self,
         name: Ident,
         span: Span,
     ) -> Option<Result<ConstValue, TypeError>> {
-        if let Some((symbol, index)) = self.lookup_local_symbol(name) {
-            if let Some(value) = symbol.as_value().and_then(|info| info.const_value.clone()) {
-                return Some(Ok(value));
+        match self.lookup_visible_const_name(name, span) {
+            ConstNameLookup::Value(value) => Some(Ok(value)),
+            ConstNameLookup::Error(error) => Some(Err(error)),
+            ConstNameLookup::NotConstLocal | ConstNameLookup::Missing => None,
+        }
+    }
+
+    pub(super) fn eval_local_const(
+        &mut self,
+        id: LocalConstId,
+        span: Span,
+    ) -> Result<ConstValue, TypeError> {
+        let Some(entry) = self.local_consts.get(id.0 as usize) else {
+            return Err(TypeError::NonConstExpression { span });
+        };
+        match entry.state.clone() {
+            ConstState::Evaluated(value) => return Ok(value),
+            ConstState::Evaluating => {
+                return Err(TypeError::ConstCycle {
+                    name: entry.name,
+                    span,
+                });
             }
-            let scope_binding_blocks_const_lookup =
-                index != 0 || !self.has_top_const(&self.current_module, name);
-            if scope_binding_blocks_const_lookup {
-                return None;
-            }
+            ConstState::Failed => return Err(TypeError::NonConstExpression { span }),
+            ConstState::Unevaluated => {}
         }
 
-        if self.has_top_const(&self.current_module, name) {
-            let module = self.current_module.clone();
-            return Some(self.eval_top_const(&module, name, span));
-        }
+        let (info, ty, value_expr, decl_span, module, env) = {
+            let entry = self
+                .local_consts
+                .get_mut(id.0 as usize)
+                .expect("local const entry exists");
+            entry.state = ConstState::Evaluating;
+            (
+                entry.info,
+                entry.ty.clone(),
+                entry.value.clone(),
+                entry.span,
+                entry.module.clone(),
+                entry.env.clone(),
+            )
+        };
 
-        let imported = self.imported_value(name)?;
-        match imported {
-            (module, imported_name, ValueDecl::Const(_)) => {
-                Some(self.eval_top_const(&module, imported_name, span))
+        let result = super::with_callable_body_env(&module, &env, self, |tc| {
+            eval_const_decl(&ty, &value_expr, decl_span, tc)
+        });
+
+        match result {
+            Ok((value, ty)) => {
+                if let Some(entry) = self.local_consts.get_mut(id.0 as usize) {
+                    entry.state = ConstState::Evaluated(value.clone());
+                }
+                self.solver.set_local_type_from_type(info.type_id, &ty);
+                Ok(value)
             }
-            (_, _, ValueDecl::Func(_)) => None,
+            Err(err) => {
+                if let Some(entry) = self.local_consts.get_mut(id.0 as usize) {
+                    entry.state = ConstState::Failed;
+                }
+                Err(err)
+            }
         }
     }
 
@@ -253,26 +392,7 @@ impl TypeChecker {
 
         let previous_module = std::mem::replace(&mut self.current_module, module.clone());
         let saved_scopes = (previous_module != *module).then(|| std::mem::take(&mut self.scopes));
-        let expected_ty = ty.as_ref().map(|annot| self.resolve_type_for_tc(annot));
-        let expected_handle = expected_ty.as_ref().map(|ty| self.type_handle(ty));
-        let result = match super::validate_const_expr_type(&value_expr, expected_handle, self) {
-            Ok(_) => match self.eval_const_expr(&value_expr, false) {
-                Ok(value) => {
-                    let value_ty = const_type(&value);
-                    match expected_ty {
-                        Some(expected) if expected == value_ty => Ok((value, expected)),
-                        Some(expected) => Err(TypeError::ConstTypeMismatch {
-                            expected,
-                            found: value_ty,
-                            span: decl_span,
-                        }),
-                        None => Ok((value, value_ty)),
-                    }
-                }
-                Err(err) => Err(err),
-            },
-            Err(err) => Err(err),
-        };
+        let result = eval_const_decl(&ty, &value_expr, decl_span, self);
         if let Some(scopes) = saved_scopes {
             self.scopes = scopes;
         }
@@ -368,6 +488,28 @@ impl TypeChecker {
             return Err(TypeError::NonConstExpression { span });
         }
         Ok(ConstValue::String(out))
+    }
+}
+
+fn eval_const_decl(
+    ty: &Option<Type>,
+    value_expr: &ExprNode,
+    decl_span: Span,
+    tc: &mut TypeChecker,
+) -> Result<(ConstValue, Type), TypeError> {
+    let expected_ty = ty.as_ref().map(|annot| tc.resolve_type_for_tc(annot));
+    let expected_handle = expected_ty.as_ref().map(|ty| tc.type_handle(ty));
+    super::validate_const_expr_type(value_expr, expected_handle, tc)?;
+    let value = tc.eval_const_expr(value_expr, false)?;
+    let value_ty = const_type(&value);
+    match expected_ty {
+        Some(expected) if expected != value_ty => Err(TypeError::ConstTypeMismatch {
+            expected,
+            found: value_ty,
+            span: decl_span,
+        }),
+        Some(expected) => Ok((value, expected)),
+        None => Ok((value, value_ty)),
     }
 }
 

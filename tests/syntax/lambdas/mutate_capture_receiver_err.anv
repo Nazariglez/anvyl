@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot mutate captured variable
+
+struct Player {
+    hp: int,
+
+    fn reset(var self) {
+        self.hp = 0;
+    }
+}
+
+fn main() {
+    var p = Player { hp: 1 };
+    let f = || { p.reset(); };
+}

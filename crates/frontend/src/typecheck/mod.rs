@@ -666,6 +666,10 @@ impl LocalBindingKind {
         }
     }
 
+    fn requires_runtime_capture(self) -> bool {
+        !matches!(self, Self::Const)
+    }
+
     fn place_access(self) -> PlaceAccess {
         match self {
             Self::Immutable => PlaceAccess::Immutable,
@@ -689,6 +693,7 @@ struct VarInfo {
     type_id: LocalTypeId,
     kind: LocalBindingKind,
     const_value: Option<ConstValue>,
+    local_const: Option<LocalConstId>,
     alias: Option<AliasTarget>,
 }
 
@@ -706,8 +711,42 @@ enum LocalSymbol {
 
 enum LocalSymbolLookup {
     Found(LocalSymbol, usize),
-    Blocked,
+    Blocked(TypeError),
     Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LocalConstId(u32);
+
+#[derive(Clone, Copy)]
+struct LocalConstInfo {
+    type_id: LocalTypeId,
+    id: LocalConstId,
+}
+
+impl LocalConstInfo {
+    fn symbol(self) -> LocalSymbol {
+        LocalSymbol::Value(VarInfo {
+            type_id: self.type_id,
+            kind: LocalBindingKind::Const,
+            const_value: None,
+            local_const: Some(self.id),
+            alias: None,
+        })
+    }
+}
+
+struct LocalValue {
+    info: VarInfo,
+    depth: usize,
+    requires_runtime_capture: bool,
+}
+
+struct LocalPlaceAccess {
+    access: PlaceAccess,
+    facts: Option<PlaceUseFacts>,
+    path: Option<PlacePath>,
+    accepts_extern_any: bool,
 }
 
 #[derive(Clone)]
@@ -764,6 +803,7 @@ impl LocalCallableInfo {
             type_id: self.type_id,
             kind: LocalBindingKind::Immutable,
             const_value: None,
+            local_const: None,
             alias: None,
         }
     }
@@ -774,6 +814,13 @@ impl LocalSymbol {
         match self {
             Self::Value(info) => Some(info),
             Self::Callable(_) => None,
+        }
+    }
+
+    fn requires_runtime_capture(&self) -> bool {
+        match self {
+            Self::Value(info) => info.kind.requires_runtime_capture(),
+            Self::Callable(_) => false,
         }
     }
 
@@ -821,7 +868,6 @@ struct ReturnFrame {
 
 struct LambdaFrame {
     start_scope: usize,
-    captures: Vec<Ident>,
 }
 
 struct TypeChecker {
@@ -849,6 +895,7 @@ struct TypeChecker {
     callable_templates: HashMap<CallableId, CallableTemplate>,
     specializations: HashMap<SpecializationKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
+    local_consts: Vec<const_eval::LocalConstEntry>,
 }
 
 struct ConstNormalizer<'tc> {
@@ -933,6 +980,7 @@ impl TypeChecker {
             callable_templates: HashMap::new(),
             specializations: HashMap::new(),
             consts: HashMap::new(),
+            local_consts: vec![],
         }
     }
 
@@ -1014,6 +1062,7 @@ impl TypeChecker {
                 type_id,
                 kind,
                 const_value,
+                local_const: None,
                 alias,
             }),
         );
@@ -1054,6 +1103,7 @@ impl TypeChecker {
                 type_id,
                 kind,
                 const_value,
+                local_const: None,
                 alias,
             }),
         );
@@ -1089,7 +1139,7 @@ impl TypeChecker {
         self.local_callables.get(id).cloned()
     }
 
-    fn lookup_local_symbol_checked(&mut self, name: Ident, span: Span) -> LocalSymbolLookup {
+    fn lookup_local_symbol_checked(&self, name: Ident, span: Span) -> LocalSymbolLookup {
         let Some((symbol, depth)) = self
             .lookup_local_symbol(name)
             .map(|(symbol, depth)| (symbol.clone(), depth))
@@ -1097,8 +1147,7 @@ impl TypeChecker {
             return LocalSymbolLookup::Missing;
         };
         if self.blocks_named_capture(&symbol, depth) {
-            self.push_error(TypeError::NamedFunctionCapture { name, span });
-            return LocalSymbolLookup::Blocked;
+            return LocalSymbolLookup::Blocked(TypeError::NamedFunctionCapture { name, span });
         }
         LocalSymbolLookup::Found(symbol, depth)
     }
@@ -1107,23 +1156,30 @@ impl TypeChecker {
         &mut self,
         name: Ident,
         span: Span,
-    ) -> Result<Option<(VarInfo, usize)>, ()> {
+    ) -> Result<Option<LocalValue>, ()> {
         match self.lookup_local_symbol_checked(name, span) {
             LocalSymbolLookup::Found(symbol, depth) => {
                 if let Some(error) = symbol.value_error(name, span) {
                     self.push_error(error);
                     Err(())
                 } else {
-                    Ok(Some((symbol.value_view(), depth)))
+                    Ok(Some(LocalValue {
+                        info: symbol.value_view(),
+                        depth,
+                        requires_runtime_capture: symbol.requires_runtime_capture(),
+                    }))
                 }
             }
-            LocalSymbolLookup::Blocked => Err(()),
+            LocalSymbolLookup::Blocked(error) => {
+                self.push_error(error);
+                Err(())
+            }
             LocalSymbolLookup::Missing => Ok(None),
         }
     }
 
     fn blocks_named_capture(&self, symbol: &LocalSymbol, depth: usize) -> bool {
-        matches!(symbol, LocalSymbol::Value(_))
+        symbol.requires_runtime_capture()
             && self
                 .named_function_frames
                 .last()
@@ -1140,29 +1196,47 @@ impl TypeChecker {
         self.named_function_frames.pop();
     }
 
-    fn is_captured_local(&self, depth: usize) -> bool {
+    fn crosses_lambda_capture_boundary(&self, depth: usize) -> bool {
         self.lambda_frames
             .last()
             .is_some_and(|frame| depth > 0 && depth < frame.start_scope)
     }
 
+    fn captures_runtime_value(&self, value: &LocalValue) -> bool {
+        value.requires_runtime_capture && self.crosses_lambda_capture_boundary(value.depth)
+    }
+
+    fn local_value_access(&self, name: Ident, value: &LocalValue) -> LocalPlaceAccess {
+        let captured = self.captures_runtime_value(value);
+        let alias = value.info.alias.as_ref();
+        let access = if captured {
+            PlaceAccess::Captured
+        } else {
+            alias.map_or_else(|| value.info.kind.place_access(), |alias| alias.access)
+        };
+        let (facts, mut path, accepts_extern_any) = match alias {
+            Some(alias) => (
+                alias.facts.clone(),
+                alias.path.clone(),
+                alias.accepts_extern_any,
+            ),
+            None => (None, Some(PlacePath::root(name)), false),
+        };
+        if !access.can_mut_borrow() {
+            path = None;
+        }
+        LocalPlaceAccess {
+            access,
+            facts,
+            path,
+            accepts_extern_any,
+        }
+    }
+
     fn enter_lambda(&mut self) {
         self.lambda_frames.push(LambdaFrame {
             start_scope: self.scopes.len(),
-            captures: vec![],
         });
-    }
-
-    fn record_capture(&mut self, name: Ident, depth: usize) {
-        if !self.is_captured_local(depth) {
-            return;
-        }
-        let Some(frame) = self.lambda_frames.last_mut() else {
-            return;
-        };
-        if !frame.captures.contains(&name) {
-            frame.captures.push(name);
-        }
     }
 
     fn exit_lambda(&mut self) {
@@ -1686,12 +1760,6 @@ impl TypeChecker {
         self.callable_templates.get(id)
     }
 
-    fn update_callable_template_env(&mut self, id: &CallableId, env: CallableTemplateEnv) {
-        if let Some(template) = self.callable_templates.get_mut(id) {
-            template.env = env;
-        }
-    }
-
     fn specialization(&self, key: &SpecializationKey) -> Option<&SpecializationState> {
         self.specializations.get(key)
     }
@@ -1836,13 +1904,17 @@ impl TypeChecker {
                 if warn_deprecated {
                     self.warn_named_const_deprecated(name, span);
                 }
-                match self.eval_visible_const(name, span) {
-                    Some(Ok(value)) => Some(ConstTerm::Value(value)),
-                    Some(Err(err)) => {
-                        self.push_error(err);
+                match self.lookup_visible_const_name(name, span) {
+                    const_eval::ConstNameLookup::Value(value) => Some(ConstTerm::Value(value)),
+                    const_eval::ConstNameLookup::Error(error) => {
+                        self.push_error(error);
                         None
                     }
-                    None => {
+                    const_eval::ConstNameLookup::NotConstLocal => {
+                        self.push_error_once(TypeError::NonConstExpression { span });
+                        None
+                    }
+                    const_eval::ConstNameLookup::Missing => {
                         self.push_error_once(TypeError::UnknownConst { name, span });
                         None
                     }
@@ -2995,7 +3067,7 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
 
 fn check_stmts(stmts: &[StmtNode], tc: &mut TypeChecker) {
     for stmt in stmts {
-        check_stmt(stmt, tc);
+        check_stmt(stmt, None, tc);
     }
 }
 
@@ -3042,70 +3114,138 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     }
 }
 
-fn register_block_declarations(stmts: &[StmtNode], tc: &mut TypeChecker) {
+fn register_block_declarations(
+    stmts: &[StmtNode],
+    tc: &mut TypeChecker,
+) -> Vec<Option<LocalConstInfo>> {
+    let mut declarations = vec![None; stmts.len()];
     let mut funcs = vec![];
-    for stmt in stmts {
-        let Stmt::Func(func_node) = &stmt.node else {
-            continue;
-        };
-        let func = &func_node.node;
-        let sig = source_func_sig(func, func_node.span, tc);
-        let id = CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+    let mut sig_env = tc.scopes.clone();
+    add_callable_decl_placeholders(stmts, &mut sig_env, tc);
+    for (index, stmt) in stmts.iter().enumerate() {
+        match &stmt.node {
+            Stmt::Func(func_node) => {
+                let func = &func_node.node;
+                let module = tc.current_module.clone();
+                let env = CallableTemplateEnv::Local(sig_env.clone());
+                let sig = with_callable_body_env(&module, &env, tc, |tc| {
+                    source_func_sig(func, func_node.span, tc)
+                });
+                let id = CallableId::local_function(
+                    tc.current_module.clone(),
+                    func.name,
+                    func_node.span,
+                );
+                funcs.push(LocalFuncDecl {
+                    id,
+                    sig,
+                    func: func_node.clone(),
+                });
+            }
+            Stmt::Const(const_node) => {
+                let info =
+                    tc.declare_local_const(const_node, CallableTemplateEnv::Local(sig_env.clone()));
+                add_env_symbol(const_node.node.name, info.symbol(), &mut sig_env);
+                declarations[index] = Some(info);
+            }
+            _ => add_stmt_capture_blockers(&stmt.node, &mut sig_env, tc),
+        }
+    }
+
+    for decl in &funcs {
+        let func = &decl.func.node;
         let callee = CallableRef {
             def: CallableDef {
-                id: id.clone(),
+                id: decl.id.clone(),
                 sig: CallableSig {
-                    owner_generics: sig.owner_generics.clone(),
-                    generics: sig.generics.clone(),
-                    params: sig.params.clone(),
-                    required_params: sig.required_params,
-                    ret: sig.ret.clone(),
+                    owner_generics: decl.sig.owner_generics.clone(),
+                    generics: decl.sig.generics.clone(),
+                    params: decl.sig.params.clone(),
+                    required_params: decl.sig.required_params,
+                    ret: decl.sig.ret.clone(),
                 },
             },
             receiver_ty: None,
-            owner_args: sig.owner_args.clone(),
+            owner_args: decl.sig.owner_args.clone(),
         };
-        tc.define_local_callable(func.name, callee, sig.surface_ty.clone());
-        funcs.push(LocalFuncDecl {
-            id,
-            sig,
-            func: func_node.clone(),
-        });
+        tc.define_local_callable(func.name, callee, decl.sig.surface_ty.clone());
     }
 
     let mut funcs = funcs.into_iter();
     let mut env = tc.scopes.clone();
-    for stmt in stmts {
+    for (stmt, local_const) in stmts.iter().zip(declarations.iter().copied()) {
         match &stmt.node {
             Stmt::Func(_) => {
                 let decl = funcs.next().expect("function declaration was collected");
                 store_local_callable_template(decl, env.clone(), tc);
             }
-            Stmt::Binding(binding) => add_pattern_capture_placeholders(
-                &binding.node.pattern,
-                LocalBindingKind::from_mutable(matches!(
-                    binding.node.mutability,
-                    Mutability::Mutable
-                )),
-                &mut env,
-                tc,
-            ),
-            Stmt::LetElse(let_else) => add_pattern_capture_placeholders(
-                &let_else.node.pattern,
-                LocalBindingKind::from_mutable(matches!(let_else.node.head, PatternHead::Var)),
-                &mut env,
-                tc,
-            ),
             Stmt::Const(const_node) => {
-                add_capture_placeholder(
-                    const_node.node.name,
-                    LocalBindingKind::Const,
-                    &mut env,
-                    tc,
-                );
+                let Some(info) = local_const else {
+                    continue;
+                };
+                tc.set_local_const_env(info.id, CallableTemplateEnv::Local(env.clone()));
+                add_env_symbol(const_node.node.name, info.symbol(), &mut env);
             }
-            _ => {}
+            _ => add_stmt_capture_blockers(&stmt.node, &mut env, tc),
         }
+    }
+
+    declarations
+}
+
+fn add_stmt_capture_blockers(
+    stmt: &Stmt,
+    env: &mut [HashMap<Ident, LocalSymbol>],
+    tc: &mut TypeChecker,
+) {
+    match stmt {
+        Stmt::Binding(binding) => add_pattern_capture_blockers(
+            &binding.node.pattern,
+            LocalBindingKind::from_mutable(matches!(binding.node.mutability, Mutability::Mutable)),
+            env,
+            tc,
+        ),
+        Stmt::LetElse(let_else) => add_pattern_capture_blockers(
+            &let_else.node.pattern,
+            LocalBindingKind::from_mutable(matches!(let_else.node.head, PatternHead::Var)),
+            env,
+            tc,
+        ),
+        _ => {}
+    }
+}
+
+fn add_callable_decl_placeholders(
+    stmts: &[StmtNode],
+    env: &mut [HashMap<Ident, LocalSymbol>],
+    tc: &mut TypeChecker,
+) {
+    for stmt in stmts {
+        let Stmt::Func(func_node) = &stmt.node else {
+            continue;
+        };
+        let func = &func_node.node;
+        let id = CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+        let callee = CallableRef {
+            def: CallableDef {
+                id,
+                sig: CallableSig {
+                    owner_generics: GenericParams::default(),
+                    generics: GenericParams::default(),
+                    params: vec![],
+                    required_params: 0,
+                    ret: Type::Infer,
+                },
+            },
+            receiver_ty: None,
+            owner_args: GenericArgs::default(),
+        };
+        let type_id = tc.solver.alloc_local_type(&Type::Infer);
+        add_env_symbol(
+            func.name,
+            LocalSymbol::Callable(Box::new(LocalCallableInfo { type_id, callee })),
+            env,
+        );
     }
 }
 
@@ -3135,51 +3275,57 @@ fn store_local_callable_template(
     );
 }
 
-fn add_capture_placeholder(
+fn add_capture_blocker(
     name: Ident,
     kind: LocalBindingKind,
     env: &mut [HashMap<Ident, LocalSymbol>],
     tc: &mut TypeChecker,
 ) {
-    let Some(scope) = env.last_mut() else {
-        return;
-    };
+    debug_assert!(kind.requires_runtime_capture());
     let type_id = tc.solver.alloc_local_type(&Type::Infer);
-    scope.insert(
+    add_env_symbol(
         name,
         LocalSymbol::Value(VarInfo {
             type_id,
             kind,
             const_value: None,
+            local_const: None,
             alias: None,
         }),
+        env,
     );
 }
 
-fn add_pattern_capture_placeholders(
+fn add_env_symbol(name: Ident, symbol: LocalSymbol, env: &mut [HashMap<Ident, LocalSymbol>]) {
+    if let Some(scope) = env.last_mut() {
+        scope.insert(name, symbol);
+    }
+}
+
+fn add_pattern_capture_blockers(
     pattern: &PatternNode,
     kind: LocalBindingKind,
     env: &mut [HashMap<Ident, LocalSymbol>],
     tc: &mut TypeChecker,
 ) {
     match &pattern.node {
-        Pattern::Ident(name) => add_capture_placeholder(*name, kind, env, tc),
+        Pattern::Ident(name) => add_capture_blocker(*name, kind, env, tc),
         Pattern::Tuple(fields)
         | Pattern::EnumTuple { fields, .. }
         | Pattern::InferredEnumTuple { fields, .. }
         | Pattern::Or(fields) => {
             for field in fields {
-                add_pattern_capture_placeholders(field, kind, env, tc);
+                add_pattern_capture_blockers(field, kind, env, tc);
             }
         }
         Pattern::Struct { fields, .. }
         | Pattern::EnumStruct { fields, .. }
         | Pattern::InferredEnumStruct { fields, .. } => {
             for (_, field) in fields {
-                add_pattern_capture_placeholders(field, kind, env, tc);
+                add_pattern_capture_blockers(field, kind, env, tc);
             }
         }
-        Pattern::Optional(inner) => add_pattern_capture_placeholders(inner, kind, env, tc),
+        Pattern::Optional(inner) => add_pattern_capture_blockers(inner, kind, env, tc),
         Pattern::Wildcard
         | Pattern::EnumUnit { .. }
         | Pattern::InferredEnumUnit { .. }
@@ -3286,7 +3432,7 @@ fn check_module_bodies(module: &ModuleScope, program: &Program, tc: &mut TypeChe
     with_source_module_scope(module, tc, |tc| check_stmts(&program.stmts, tc));
 }
 
-fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
+fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut TypeChecker) {
     match &stmt.node {
         Stmt::Func(func_node) => {
             let func = &func_node.node;
@@ -3299,10 +3445,6 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
             if let Some(info) = local
                 && tc.callable_template(&info.callee.def.id).is_some()
             {
-                tc.update_callable_template_env(
-                    &info.callee.def.id,
-                    CallableTemplateEnv::Local(tc.scopes.clone()),
-                );
                 return;
             }
             check_func(func_node, tc);
@@ -3340,7 +3482,15 @@ fn check_stmt(stmt: &StmtNode, tc: &mut TypeChecker) {
         Stmt::Enum(_) => {}
         Stmt::Const(const_node) => {
             if tc.scopes.len() > 1 {
-                check_const(const_node, tc);
+                match local_const {
+                    Some(info) => {
+                        tc.define_local_symbol(const_node.node.name, info.symbol());
+                        if let Err(err) = tc.eval_local_const(info.id, const_node.span) {
+                            tc.push_error(err);
+                        }
+                    }
+                    None => check_const(const_node, tc),
+                }
             }
         }
         Stmt::LetElse(let_else_node) => {
@@ -3985,9 +4135,9 @@ fn check_block_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     tc.push_scope();
-    register_block_declarations(&block.node.stmts, tc);
-    for stmt in &block.node.stmts {
-        check_stmt(stmt, tc);
+    let declarations = register_block_declarations(&block.node.stmts, tc);
+    for (stmt, local_const) in block.node.stmts.iter().zip(declarations) {
+        check_stmt(stmt, local_const, tc);
     }
     let checked = match &block.node.tail {
         Some(expr) => check_expr_checked_with_hint(expr, expected, tc),
@@ -4410,8 +4560,7 @@ fn check_expr_checked_with_hint(
             checked_from_type(expr, Type::Infer, tc)
         }
         ExprKind::Ident(name) => match tc.lookup_local_symbol_checked(*name, expr.span) {
-            LocalSymbolLookup::Found(LocalSymbol::Value(info), depth) => {
-                tc.record_capture(*name, depth);
+            LocalSymbolLookup::Found(LocalSymbol::Value(info), _depth) => {
                 if let Some((_, value_name, value)) = tc.lookup_named_value(*name) {
                     tc.warn_named_value_deprecated(&value, value_name, expr.span);
                 }
@@ -4440,7 +4589,10 @@ fn check_expr_checked_with_hint(
                     None => checked_from_handle(expr, tc.local_handle(info.type_id), tc),
                 }
             }
-            LocalSymbolLookup::Blocked => checked_from_type(expr, Type::Infer, tc),
+            LocalSymbolLookup::Blocked(error) => {
+                tc.push_error(error);
+                checked_from_type(expr, Type::Infer, tc)
+            }
             LocalSymbolLookup::Missing => {
                 let named_value = tc.lookup_named_value(*name);
                 if let Some((_, value_name, value)) = &named_value {
@@ -5676,10 +5828,14 @@ fn check_array_fill_hint(
                 ArrayLen::Infer
             }
         },
-        Err(_) => {
+        Err(TypeError::NonConstExpression { .. }) => {
             tc.push_error(TypeError::ArrayFillLengthNotConst {
                 span: fill.node.len.span,
             });
+            ArrayLen::Infer
+        }
+        Err(err) => {
+            tc.push_error(err);
             ArrayLen::Infer
         }
     };

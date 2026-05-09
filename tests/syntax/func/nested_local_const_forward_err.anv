@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variable 'N'
+
+fn main() {
+    fn f<T>(x: T) -> int { N }
+
+    const N = 3;
+    let y: int = f(0);
+}

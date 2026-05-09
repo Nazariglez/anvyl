@@ -4,13 +4,13 @@
 // @contains: named functions cannot capture local value
 
 fn main() {
-    fn n() -> int { 0 }
+    const N = 1;
 
     {
-        let n = 1;
+        let N = 2;
 
         fn f() -> int {
-            n
+            N
         }
     }
 }

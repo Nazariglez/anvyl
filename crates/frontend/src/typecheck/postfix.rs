@@ -122,48 +122,67 @@ fn collect_steps_or_base(expr: &ExprNode) -> (&ExprNode, Vec<PostfixStep<'_>>) {
 fn local_value_subject(
     expr: &ExprNode,
     name: Ident,
-    info: super::VarInfo,
+    value: super::LocalValue,
     tc: &mut TypeChecker,
 ) -> Subject {
-    let checked = super::checked_from_handle(expr, tc.local_handle(info.type_id), tc);
-    let access = info
-        .alias
-        .as_ref()
-        .map_or_else(|| info.kind.place_access(), |alias| alias.access);
-    let mut value = PlaceValue::new(checked, access, Some(PlaceUseFacts::default()));
-    value.path = Some(place::PlacePath::root(name)).filter(|_| access.can_mut_borrow());
-    if let Some(alias) = info.alias {
-        value.facts = alias.facts;
-        value.path = alias.path;
-    }
+    let checked = super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
+    let access = tc.local_value_access(name, &value);
+    let mut value = PlaceValue::new(
+        checked,
+        access.access,
+        access.facts.or(Some(PlaceUseFacts::default())),
+    );
+    value.path = access.path;
     Subject::Value(value)
 }
 
 pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subject> {
     match &expr.node.kind {
         ExprKind::Ident(name) => {
-            let local = tc.lookup_local_symbol_checked(*name, expr.span);
-            match &local {
+            let local = match tc.lookup_local_symbol_checked(*name, expr.span) {
                 super::LocalSymbolLookup::Found(super::LocalSymbol::Callable(info), depth)
-                    if *depth > 0 =>
+                    if depth > 0 =>
                 {
                     return Some(callable_subject(info.callee.clone(), None));
                 }
                 super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth)
-                    if *depth > 0 =>
+                    if depth > 0 =>
                 {
-                    return Some(local_value_subject(expr, *name, info.clone(), tc));
+                    let requires_runtime_capture = info.kind.requires_runtime_capture();
+                    return Some(local_value_subject(
+                        expr,
+                        *name,
+                        super::LocalValue {
+                            info,
+                            depth,
+                            requires_runtime_capture,
+                        },
+                        tc,
+                    ));
                 }
-                super::LocalSymbolLookup::Blocked => return Some(Subject::Error),
-                super::LocalSymbolLookup::Found(_, _) | super::LocalSymbolLookup::Missing => {}
-            }
+                super::LocalSymbolLookup::Blocked(error) => {
+                    tc.push_error(error);
+                    return Some(Subject::Error);
+                }
+                local => local,
+            };
             if let Some((module, value_name, value)) = tc.lookup_named_value(*name) {
                 return Some(named_value_subject(
                     tc, module, value_name, &value, expr.span,
                 ));
             }
-            if let super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), 0) = local {
-                return Some(local_value_subject(expr, *name, info, tc));
+            if let super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth) = local {
+                let requires_runtime_capture = info.kind.requires_runtime_capture();
+                return Some(local_value_subject(
+                    expr,
+                    *name,
+                    super::LocalValue {
+                        info,
+                        depth,
+                        requires_runtime_capture,
+                    },
+                    tc,
+                ));
             }
             if let Some(scope) = tc.lookup_module_alias(*name) {
                 return Some(Subject::Module(scope));

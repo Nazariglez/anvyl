@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    const N = 3;
+
+    fn f() -> [int; 3] {
+        [0; N]
+    }
+
+    let xs: [int; 3] = f();
+}

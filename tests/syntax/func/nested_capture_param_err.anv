@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: capture
+// @contains: named functions cannot capture local value
 
 fn outer(n: int) {
     fn f() -> int {

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    const N = 3;
+    let a: int = f(0);
+
+    fn f<T>(x: T) -> int { N }
+
+    let b: int = f(1);
+}
