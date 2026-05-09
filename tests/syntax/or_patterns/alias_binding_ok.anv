@@ -1,8 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: cannot be used as aliases
-// @skip: FIXME: x should be a var ref to e, same as rust, this should be allowed
 
 enum E { A(int), B(int) }
 

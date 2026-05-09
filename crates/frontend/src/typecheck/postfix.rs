@@ -48,7 +48,7 @@ pub(super) enum Subject {
         method_ref: ExternMethodRef,
         receiver: ReceiverMode,
         receiver_access: PlaceAccess,
-        receiver_place: Option<PlaceUseFacts>,
+        receiver_place: PlaceUseFacts,
         receiver_id: ExprId,
         name: Ident,
         signature: ResolvedExternSignature,
@@ -79,8 +79,8 @@ pub(super) struct PostfixChain<'a> {
 pub(super) struct SourceReceiver {
     mutable: bool,
     access: PlaceAccess,
-    facts: Option<PlaceUseFacts>,
-    path: Option<place::PlacePath>,
+    facts: PlaceUseFacts,
+    identity: place::PlaceIdentity,
     expr_id: ExprId,
     name: Ident,
 }
@@ -127,12 +127,8 @@ fn local_value_subject(
 ) -> Subject {
     let checked = super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
     let access = tc.local_value_access(name, &value);
-    let mut value = PlaceValue::new(
-        checked,
-        access.access,
-        access.facts.or(Some(PlaceUseFacts::default())),
-    );
-    value.path = access.path;
+    let mut value = PlaceValue::new(checked, access.access, access.facts);
+    value.identity = access.identity;
     Subject::Value(value)
 }
 
@@ -393,8 +389,8 @@ fn apply_field(
         Subject::Value(value) => apply_value_field(
             value.checked.ty.clone(),
             value.access,
-            value.facts.as_ref(),
-            value.path.as_ref(),
+            &value.facts,
+            value.identity.clone(),
             field.node.target.node.id,
             field.node.field,
             field.span,
@@ -501,7 +497,7 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
             place::projected_field_access(target.value.access),
             target.value.facts,
         );
-        value.path = target.value.path.map(place::PlacePath::index);
+        value.identity = target.value.identity.index();
         return value;
     }
 
@@ -512,16 +508,16 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
 fn source_receiver(
     mode: MethodMode,
     access: PlaceAccess,
-    facts: Option<&PlaceUseFacts>,
-    path: Option<&place::PlacePath>,
+    facts: &PlaceUseFacts,
+    identity: place::PlaceIdentity,
     expr_id: ExprId,
     name: Ident,
 ) -> SourceReceiver {
     SourceReceiver {
         mutable: matches!(mode, MethodMode::Instance { mutable: true }),
         access,
-        facts: facts.cloned(),
-        path: path.cloned(),
+        facts: facts.clone(),
+        identity,
         expr_id,
         name,
     }
@@ -530,8 +526,8 @@ fn source_receiver(
 fn apply_value_field(
     receiver: Type,
     receiver_access: PlaceAccess,
-    receiver_place: Option<&PlaceUseFacts>,
-    receiver_path: Option<&place::PlacePath>,
+    receiver_place: &PlaceUseFacts,
+    receiver_identity: place::PlaceIdentity,
     receiver_id: ExprId,
     name: Ident,
     span: Span,
@@ -559,6 +555,7 @@ fn apply_value_field(
                 name,
                 receiver_access,
                 receiver_place,
+                receiver_identity.clone(),
                 receiver_id,
                 span,
                 kind,
@@ -577,9 +574,9 @@ fn apply_value_field(
             let mut value = PlaceValue::new(
                 checked_type(ty, tc),
                 place::projected_field_access(receiver_access),
-                receiver_place.cloned(),
+                receiver_place.clone(),
             );
-            value.path = receiver_path.cloned().map(|path| path.field(name));
+            value.identity = receiver_identity.clone().field(name);
             return Subject::Value(value);
         }
         if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
@@ -600,7 +597,7 @@ fn apply_value_field(
                     method.mode,
                     receiver_access,
                     receiver_place,
-                    receiver_path,
+                    receiver_identity.clone(),
                     receiver_id,
                     name,
                 )),
@@ -641,7 +638,7 @@ fn apply_value_field(
                     method.mode,
                     receiver_access,
                     receiver_place,
-                    receiver_path,
+                    receiver_identity.clone(),
                     receiver_id,
                     name,
                 );
@@ -674,7 +671,8 @@ fn extern_value_member_subject(
     owner: ExternTypeId,
     name: Ident,
     receiver_access: PlaceAccess,
-    receiver_place: Option<&PlaceUseFacts>,
+    receiver_place: &PlaceUseFacts,
+    receiver_identity: place::PlaceIdentity,
     receiver_id: ExprId,
     span: Span,
     kind: MemberAccessKind,
@@ -691,15 +689,17 @@ fn extern_value_member_subject(
             let ty = field.decl.ty.ty.clone();
             let contains_any = field.decl.ty.contains_any();
             let handle = tc.type_handle(&ty);
-            Subject::Value(PlaceValue::new(
+            let mut value = PlaceValue::new(
                 CheckedType {
                     ty,
                     handle,
                     contains_extern_any: contains_any,
                 },
                 access,
-                Some(PlaceUseFacts::for_extern_field(receiver_place, field_ref)),
-            ))
+                PlaceUseFacts::for_extern_field(receiver_place, field_ref),
+            );
+            value.identity = receiver_identity.field(name);
+            Subject::Value(value)
         }
         MemberAccessKind::Method => {
             let Some((method, decl)) = tc.externs.method(owner, name) else {
@@ -709,7 +709,7 @@ fn extern_value_member_subject(
                 method_ref: method,
                 receiver: decl.receiver,
                 receiver_access,
-                receiver_place: receiver_place.cloned(),
+                receiver_place: receiver_place.clone(),
                 receiver_id,
                 name: decl.name,
                 signature: decl.signature.clone(),
@@ -1010,7 +1010,7 @@ fn apply_call(
                 method_ref: *method_ref,
                 receiver: *receiver,
                 receiver_access: *receiver_access,
-                receiver_place: receiver_place.as_ref(),
+                receiver_place,
                 receiver_id: *receiver_id,
                 name: *name,
                 signature,
@@ -1050,14 +1050,13 @@ fn check_source_receiver(
             tc.push_error(error);
             return None;
         }
-        if let Some(facts) = &receiver.facts {
-            place::record_facts_write(receiver.expr_id, facts, tc);
-        }
-        return receiver.path.clone().map(|path| MutableArg { path, span });
+        place::record_facts_write(receiver.expr_id, &receiver.facts, tc);
+        return Some(MutableArg {
+            identity: receiver.identity.clone(),
+            span,
+        });
     }
-    if let Some(facts) = &receiver.facts {
-        place::record_facts_read(receiver.expr_id, facts, tc);
-    }
+    place::record_facts_read(receiver.expr_id, &receiver.facts, tc);
     None
 }
 
@@ -1088,7 +1087,7 @@ struct ExternMethodCall<'a> {
     method_ref: ExternMethodRef,
     receiver: ReceiverMode,
     receiver_access: PlaceAccess,
-    receiver_place: Option<&'a PlaceUseFacts>,
+    receiver_place: &'a PlaceUseFacts,
     receiver_id: ExprId,
     name: Ident,
     signature: &'a ResolvedExternSignature,
@@ -1217,9 +1216,9 @@ fn check_source_args(
     for (arg, param) in args.iter().zip(params) {
         let checked = check_source_arg(arg, param, tc);
         failed |= checked.failed;
-        if let Some(path) = checked.mutable_path {
+        if let Some(identity) = checked.mutable_identity {
             mutable_args.push(MutableArg {
-                path,
+                identity,
                 span: arg.span,
             });
         }
@@ -1230,11 +1229,11 @@ fn check_source_args(
 
 struct SourceArgCheck {
     failed: bool,
-    mutable_path: Option<place::PlacePath>,
+    mutable_identity: Option<place::PlaceIdentity>,
 }
 
 struct MutableArg {
-    path: place::PlacePath,
+    identity: place::PlaceIdentity,
     span: Span,
 }
 
@@ -1242,7 +1241,7 @@ fn validate_mutable_aliases(args: &[MutableArg], tc: &mut TypeChecker) -> bool {
     let mut failed = false;
     for (index, arg) in args.iter().enumerate() {
         for previous in &args[..index] {
-            if previous.path.conflicts_with(&arg.path) {
+            if previous.identity.conflicts_with(&arg.identity) {
                 tc.push_error(TypeError::MutableAlias { span: arg.span });
                 failed = true;
                 break;
@@ -1267,13 +1266,13 @@ fn var_arg_error(access: PlaceAccess, name: Ident, span: Span) -> Option<TypeErr
 
 fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
     if param.mutable {
-        let mut place = place::check_place(arg, tc);
+        let place = place::check_place(arg, tc);
         let name = super::assignment_target_name(arg);
-        let mut mutable_path = None;
+        let mut mutable_identity = None;
         if let Some(error) = var_arg_error(place.value.access, name, arg.span) {
             tc.push_error(error);
         } else {
-            mutable_path = place.value.path.take();
+            mutable_identity = Some(place.value.identity.clone());
             place::record_write(arg.node.id, &place, tc);
         }
         let checked = place.into_checked();
@@ -1281,7 +1280,7 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
         tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
-            mutable_path,
+            mutable_identity,
         };
     }
 
@@ -1292,20 +1291,20 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
             tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
             return SourceArgCheck {
                 failed: tc.solve_constraints(),
-                mutable_path: None,
+                mutable_identity: None,
             };
         }
         let target = tc.handle_type(&param.ty);
         if tc.has_cast_from_conversion(&checked.ty, &target) {
             return SourceArgCheck {
                 failed: tc.solve_constraints(),
-                mutable_path: None,
+                mutable_identity: None,
             };
         }
         tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
-            mutable_path: None,
+            mutable_identity: None,
         };
     }
 
@@ -1314,7 +1313,7 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
     tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
     SourceArgCheck {
         failed: tc.solve_constraints(),
-        mutable_path: None,
+        mutable_identity: None,
     }
 }
 
@@ -1573,8 +1572,8 @@ fn check_qualified_extend_call(
     let receiver_use = source_receiver(
         method.mode,
         receiver.access,
-        receiver.facts.as_ref(),
-        receiver.path.as_ref(),
+        &receiver.facts,
+        receiver.identity.clone(),
         receiver_expr.node.id,
         name,
     );
@@ -1673,14 +1672,12 @@ fn check_extern_method_call(
                 .mut_borrow_error(method.name, call.span)
             {
                 tc.push_error(error);
-            } else if let Some(facts) = method.receiver_place {
-                place::record_facts_write(method.receiver_id, facts, tc);
+            } else {
+                place::record_facts_write(method.receiver_id, method.receiver_place, tc);
             }
         }
         ReceiverMode::Value | ReceiverMode::Shared => {
-            if let Some(facts) = method.receiver_place {
-                place::record_facts_read(method.receiver_id, facts, tc);
-            }
+            place::record_facts_read(method.receiver_id, method.receiver_place, tc);
         }
     }
     check_extern_call(

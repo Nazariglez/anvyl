@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum E { A(int), B(int), C }
+
+fn main() {
+    var e = E.A(1);
+    while var E.A(x) | E.B(x) = e {
+        x = 2;
+        break;
+    }
+}

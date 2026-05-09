@@ -386,6 +386,61 @@ mod match_stmt {
     }
 }
 
+mod or_patterns {
+    use super::*;
+
+    #[test]
+    fn enum_tuple_alias_alternatives() {
+        assert_ty(
+            "enum E { A(int), B(int) } fn main() { var e = E.A(1); match var e { E.A(x) | E.B(x) => x }; }",
+            Type::Int,
+        );
+    }
+
+    #[test]
+    fn swapped_tuple_aliases() {
+        assert_err_count(
+            "fn touch(var a: int, var b: int) {} fn main() { var pair = (1, 2); match var pair { (x, y) | (y, x) => { touch(x, y); }, } }",
+            0,
+        );
+    }
+
+    #[test]
+    fn nested_alias_alternatives() {
+        assert_err_count(
+            "enum E { A((int, int)), B((int, int)) } fn main() { var e = E.A((1, 2)); match var e { E.A((x, _)) | E.B((_, x)) => {}, } }",
+            0,
+        );
+    }
+
+    #[test]
+    fn binding_name_mismatch() {
+        assert_single_error(
+            "enum E { A(int), B(int) } fn main() { let e = E.A(1); match e { E.A(x) | E.B(y) => {}, } }",
+            |err| matches!(err, TypeError::OrPatternBindingMismatch { .. }),
+        );
+    }
+
+    #[test]
+    fn binding_type_mismatch() {
+        assert_single_error(
+            "enum E { A(int), B(string) } fn main() { let e = E.A(1); match e { E.A(x) | E.B(x) => {}, } }",
+            |err| matches!(err, TypeError::OrPatternBindingTypeMismatch { .. }),
+        );
+    }
+
+    #[test]
+    fn duplicate_binding_in_alternative() {
+        let errors =
+            errors("fn main() { let pair = (1, 2); match pair { (x, x) | (_, _) => {}, } }");
+        assert!(
+            errors
+                .iter()
+                .any(|err| matches!(err, TypeError::DuplicateName { .. }))
+        );
+    }
+}
+
 mod enum_unit_patterns {
     use super::*;
 

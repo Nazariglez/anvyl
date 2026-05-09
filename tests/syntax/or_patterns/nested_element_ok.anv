@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let pair = (1, true);
+    match pair {
+        (1 | 2, flag) => { let _ = flag; },
+        _ => {},
+    }
+}

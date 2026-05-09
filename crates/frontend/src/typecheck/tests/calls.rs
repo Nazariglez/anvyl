@@ -495,3 +495,58 @@ fn unknown_module_member() {
     let result = check_mods(root, dep);
     assert!(result.is_err(), "expected error for unknown module member");
 }
+
+#[test]
+fn mutable_args_reject_root_and_field_alias() {
+    assert_single_error(
+        "fn set(var pair: (int, int), var item: int) {}
+         fn main() { var pair = (1, 2); set(pair, pair.0); }",
+        |err| matches!(err, TypeError::MutableAlias { .. }),
+    );
+}
+
+#[test]
+fn mutable_args_accept_distinct_tuple_fields() {
+    check(
+        "fn set(var left: int, var right: int) {}
+         fn main() { var pair = (1, 2); set(pair.0, pair.1); }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn mutable_args_reject_alias_binding_and_original_field() {
+    assert_single_error(
+        "struct Pair { a: int, b: int }
+         fn set(var left: int, var right: int) {}
+         fn main() { var pair = Pair { a: 1, b: 2 }; var Pair { a } = pair; set(a, pair.a); }",
+        |err| matches!(err, TypeError::MutableAlias { .. }),
+    );
+}
+
+#[test]
+fn mutable_args_accept_swapped_or_pattern_aliases() {
+    check(
+        "fn touch(var a: int, var b: int) {}
+         fn main() { var pair = (1, 2); match var pair { (x, y) | (y, x) => { touch(x, y); }, } }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn mutable_args_reject_or_pattern_whole_and_part_aliases() {
+    assert_single_error(
+        "fn touch_pair(var p: (int, int), var n: int) {}
+         fn main() { var pair = (1, 2); match var pair { (x, _) | (_, x) => { touch_pair(pair, x); }, } }",
+        |err| matches!(err, TypeError::MutableAlias { .. }),
+    );
+}
+
+#[test]
+fn mutable_args_reject_same_path_or_pattern_aliases() {
+    assert_single_error(
+        "fn touch(var a: int, var b: int) {}
+         fn main() { var pair = (1, 2); match var pair { (x, _) | (x, _) => { touch(x, x); }, } }",
+        |err| matches!(err, TypeError::MutableAlias { .. }),
+    );
+}

@@ -11,7 +11,10 @@ use self::{
         SolverRelationError, TypeHandle,
     },
     pattern::{PatternBindMode, PatternContext},
-    place::{PlaceAccess, PlacePath, PlaceUseFacts, check_alias_scrutinee, check_place},
+    place::{
+        AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee,
+        check_place,
+    },
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
     type_refs::{GenericParamError, GenericTypeContext},
@@ -373,9 +376,6 @@ pub(crate) enum TypeError {
         found: Type,
         span: Span,
     },
-    OrPatternAliasBinding {
-        span: Span,
-    },
     EmptyMatch {
         span: Span,
     },
@@ -681,20 +681,12 @@ impl LocalBindingKind {
 }
 
 #[derive(Clone)]
-struct AliasTarget {
-    access: PlaceAccess,
-    facts: Option<PlaceUseFacts>,
-    path: Option<PlacePath>,
-    accepts_extern_any: bool,
-}
-
-#[derive(Clone)]
 struct VarInfo {
     type_id: LocalTypeId,
     kind: LocalBindingKind,
     const_value: Option<ConstValue>,
     local_const: Option<LocalConstId>,
-    alias: Option<AliasTarget>,
+    alias: Option<place::AliasTarget>,
 }
 
 #[derive(Clone)]
@@ -744,8 +736,8 @@ struct LocalValue {
 
 struct LocalPlaceAccess {
     access: PlaceAccess,
-    facts: Option<PlaceUseFacts>,
-    path: Option<PlacePath>,
+    facts: PlaceUseFacts,
+    identity: PlaceIdentity,
     accepts_extern_any: bool,
 }
 
@@ -810,13 +802,6 @@ impl LocalCallableInfo {
 }
 
 impl LocalSymbol {
-    fn as_value(&self) -> Option<&VarInfo> {
-        match self {
-            Self::Value(info) => Some(info),
-            Self::Callable(_) => None,
-        }
-    }
-
     fn requires_runtime_capture(&self) -> bool {
         match self {
             Self::Value(info) => info.kind.requires_runtime_capture(),
@@ -896,6 +881,7 @@ struct TypeChecker {
     specializations: HashMap<SpecializationKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
     local_consts: Vec<const_eval::LocalConstEntry>,
+    next_alias_alt_group: u32,
 }
 
 struct ConstNormalizer<'tc> {
@@ -981,6 +967,7 @@ impl TypeChecker {
             specializations: HashMap::new(),
             consts: HashMap::new(),
             local_consts: vec![],
+            next_alias_alt_group: 0,
         }
     }
 
@@ -992,34 +979,43 @@ impl TypeChecker {
         self.scopes.pop();
     }
 
+    fn fresh_alias_alt_group(&mut self) -> AliasAltGroupId {
+        let id = self.next_alias_alt_group;
+        self.next_alias_alt_group += 1;
+        AliasAltGroupId::new(id)
+    }
+
     fn define(&mut self, name: Ident, ty: Type, mutable: bool) {
         self.define_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
     }
 
-    fn define_pattern_binding(&mut self, name: Ident, ty: Type, mutable: bool) {
-        self.define_shadowing_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
-    }
-
-    fn define_alias_binding(
+    fn define_pattern_binding_from_handle(
         &mut self,
         name: Ident,
-        ty: Type,
-        access: PlaceAccess,
-        facts: Option<PlaceUseFacts>,
-        path: Option<PlacePath>,
-        accepts_extern_any: bool,
+        handle: &TypeHandle,
+        mutable: bool,
     ) {
-        self.define_shadowing_value_with_alias(
+        self.define_shadowing_value_from_handle(
             name,
-            ty,
+            handle,
+            LocalBindingKind::from_mutable(mutable),
+            None,
+            None,
+        );
+    }
+
+    fn define_alias_binding_from_handle(
+        &mut self,
+        name: Ident,
+        handle: &TypeHandle,
+        target: place::AliasTarget,
+    ) {
+        self.define_shadowing_value_from_handle(
+            name,
+            handle,
             LocalBindingKind::Alias,
             None,
-            Some(AliasTarget {
-                access,
-                facts,
-                path,
-                accepts_extern_any,
-            }),
+            Some(target),
         );
     }
 
@@ -1037,23 +1033,13 @@ impl TypeChecker {
         self.define_value_with_alias(name, ty, kind, const_value, None);
     }
 
-    fn define_shadowing_value(
-        &mut self,
-        name: Ident,
-        ty: Type,
-        kind: LocalBindingKind,
-        const_value: Option<ConstValue>,
-    ) {
-        self.define_shadowing_value_with_alias(name, ty, kind, const_value, None);
-    }
-
     fn define_value_with_alias(
         &mut self,
         name: Ident,
         ty: Type,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
-        alias: Option<AliasTarget>,
+        alias: Option<place::AliasTarget>,
     ) {
         let type_id = self.solver.alloc_local_type(&ty);
         self.define_local_symbol(
@@ -1085,15 +1071,26 @@ impl TypeChecker {
             .insert(name, symbol);
     }
 
-    fn define_shadowing_value_with_alias(
+    fn define_shadowing_value_from_handle(
         &mut self,
         name: Ident,
-        ty: Type,
+        handle: &TypeHandle,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
-        alias: Option<AliasTarget>,
+        alias: Option<place::AliasTarget>,
     ) {
-        let type_id = self.solver.alloc_local_type(&ty);
+        let type_id = self.solver.alloc_local_type_from_handle(handle);
+        self.define_shadowing_local(name, type_id, kind, const_value, alias);
+    }
+
+    fn define_shadowing_local(
+        &mut self,
+        name: Ident,
+        type_id: LocalTypeId,
+        kind: LocalBindingKind,
+        const_value: Option<ConstValue>,
+        alias: Option<place::AliasTarget>,
+    ) {
         let Some(scope) = self.scopes.last_mut() else {
             return;
         };
@@ -1214,21 +1211,18 @@ impl TypeChecker {
         } else {
             alias.map_or_else(|| value.info.kind.place_access(), |alias| alias.access)
         };
-        let (facts, mut path, accepts_extern_any) = match alias {
+        let (facts, identity, accepts_extern_any) = match alias {
             Some(alias) => (
                 alias.facts.clone(),
-                alias.path.clone(),
+                alias.identity.clone(),
                 alias.accepts_extern_any,
             ),
-            None => (None, Some(PlacePath::root(name)), false),
+            None => (PlaceUseFacts::default(), PlaceIdentity::root(name), false),
         };
-        if !access.can_mut_borrow() {
-            path = None;
-        }
         LocalPlaceAccess {
             access,
             facts,
-            path,
+            identity,
             accepts_extern_any,
         }
     }
@@ -1270,10 +1264,6 @@ impl TypeChecker {
 
     fn set_type_from_handle(&mut self, id: ExprId, span: Span, handle: TypeHandle) -> TypeHandle {
         self.solver.set_expr_type_from_handle(id, span, handle)
-    }
-
-    fn set_local_type_from_handle(&mut self, id: LocalTypeId, handle: TypeHandle) {
-        self.solver.set_local_type_from_handle(id, handle);
     }
 
     fn fresh_temp_handle(&mut self, span: Span) -> TypeHandle {
@@ -4167,8 +4157,8 @@ fn mode_for_binding(binding: &Binding) -> PatternBindMode {
 struct PatternScrutinee {
     checked: CheckedType,
     access: PlaceAccess,
-    facts: Option<PlaceUseFacts>,
-    path: Option<PlacePath>,
+    facts: PlaceUseFacts,
+    identity: PlaceIdentity,
     accepts_extern_any: bool,
 }
 
@@ -4177,8 +4167,8 @@ impl PatternScrutinee {
         Self {
             checked,
             access: PlaceAccess::Mutable,
-            facts: None,
-            path: None,
+            facts: PlaceUseFacts::default(),
+            identity: PlaceIdentity::unknown(),
             accepts_extern_any: false,
         }
     }
@@ -4189,13 +4179,13 @@ impl PatternScrutinee {
             checked,
             access,
             facts,
-            path,
+            identity,
         } = place.value;
         Self {
             checked,
             access,
             facts,
-            path,
+            identity,
             accepts_extern_any,
         }
     }
@@ -4210,7 +4200,7 @@ impl PatternScrutinee {
             expected_ty,
             access: self.access,
             facts: self.facts.clone(),
-            path: self.path.clone(),
+            identity: self.identity.clone(),
             accepts_extern_any: self.accepts_extern_any,
         }
     }

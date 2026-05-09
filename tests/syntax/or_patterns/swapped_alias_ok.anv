@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn touch(var a: int, var b: int) {}
+
+fn main() {
+    var pair = (1, 2);
+    match var pair {
+        (x, y) | (y, x) => { touch(x, y); },
+    }
+}

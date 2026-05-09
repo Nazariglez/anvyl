@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: var arguments must not alias
+
+fn touch_pair(var p: (int, int), var n: int) {}
+
+fn main() {
+    var pair = (1, 2);
+    match var pair {
+        (x, _) | (_, x) => { touch_pair(pair, x); },
+    }
+}

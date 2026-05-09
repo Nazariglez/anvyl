@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum E { A(int), B(int), C }
+
+fn main() {
+    var e = E.A(1);
+    var E.A(x) | E.B(x) = e else { return; }
+    x = 2;
+}

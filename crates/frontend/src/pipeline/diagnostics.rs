@@ -605,9 +605,6 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         } => format!(
             "or-pattern binding '{name}' type mismatch: expected '{expected}', found '{found}'"
         ),
-        TypeError::OrPatternAliasBinding { .. } => {
-            "or-patterns with bindings cannot be used as aliases".to_string()
-        }
         TypeError::EmptyMatch { .. } => "match expression must have at least one arm".to_string(),
         TypeError::NonExhaustiveMatch { .. } => "non-exhaustive match".to_string(),
         TypeError::UnsupportedMatchScrutinee { found, .. } => {
@@ -1992,10 +1989,6 @@ mod tests {
                 "or-pattern binding 'x' type mismatch: expected 'int', found 'string'",
             ),
             (
-                diagnose_type_error(&TypeError::OrPatternAliasBinding { span: span() }),
-                "or-patterns with bindings cannot be used as aliases",
-            ),
-            (
                 diagnose_type_error(&TypeError::UnknownMember {
                     ty: Type::UnresolvedName(ident("Point")),
                     member: ident("z"),
@@ -2422,7 +2415,7 @@ mod tests {
         let descriptor =
             diagnose_extern_input_error(&ExternInputError::InvalidProviderDescriptor {
                 package: PackageId::synthetic_root(),
-                provider: anvyx_externs::ProviderId {
+                provider: ProviderId {
                     name: "host".to_string(),
                 },
                 error: ExternDescriptorError::InvalidOperatorReturn {

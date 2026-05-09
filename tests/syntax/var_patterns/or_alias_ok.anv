@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var pair = (1, 2);
+    var (x, _) | (_, x) = pair;
+    x = 3;
+}

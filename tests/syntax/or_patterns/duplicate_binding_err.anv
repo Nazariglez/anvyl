@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: already declared
+
+fn main() {
+    let pair = (1, 2);
+    match pair {
+        (x, x) | (_, _) => {},
+    }
+}

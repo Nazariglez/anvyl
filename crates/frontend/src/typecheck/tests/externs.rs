@@ -2271,6 +2271,64 @@ mod compound {
     }
 
     #[test]
+    fn records_tuple_alias_write_through_extern_field() {
+        let result = check(
+            r"
+            struct Wrapper { pair: (int, int) }
+            extern type Holder { wrapper: Wrapper; }
+            fn write(var holder: Holder) {
+                var Holder { wrapper: Wrapper { pair: (x, _) } } = holder;
+                x = 3;
+            }
+            ",
+        )
+        .expect("typecheck failed");
+        let owner = catalog_type(&result, ModuleScope::Root, "Holder");
+        let field = catalog_field(&result, owner, "wrapper");
+
+        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
+        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 1);
+    }
+
+    #[test]
+    fn records_user_struct_alias_write_through_extern_field() {
+        let result = check(
+            r"
+            struct Point { x: int, y: int }
+            extern type Holder { point: Point; }
+            fn write(var holder: Holder) {
+                var Holder { point: Point { x } } = holder;
+                x = 3;
+            }
+            ",
+        )
+        .expect("typecheck failed");
+        let owner = catalog_type(&result, ModuleScope::Root, "Holder");
+        let field = catalog_field(&result, owner, "point");
+
+        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
+        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 1);
+    }
+
+    #[test]
+    fn rejects_computed_tuple_field_alias_write() {
+        let errors = expect_type_errors(check(
+            r"
+            struct Wrapper { pair: (int, int) }
+            extern type Holder { computed wrapper: Wrapper; }
+            fn write(var holder: Holder) {
+                var Holder { wrapper: Wrapper { pair: (x, _) } } = holder;
+                x = 3;
+            }
+            ",
+        ));
+
+        assert_has_error(&errors, |error| {
+            matches!(error, TypeError::VarPatternRequiresMutablePlace { .. })
+        });
+    }
+
+    #[test]
     fn rejects_computed_write_through_immutable_receiver() {
         let errors = expect_type_errors(check(
             r"

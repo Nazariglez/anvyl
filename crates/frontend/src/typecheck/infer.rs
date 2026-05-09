@@ -739,11 +739,6 @@ impl Solver {
         self.expr_handle(id)
     }
 
-    pub(super) fn set_local_type_from_handle(&mut self, id: LocalTypeId, handle: TypeHandle) {
-        let ty = self.resolve_ref(&handle.0);
-        self.set_local_type(id, ty);
-    }
-
     pub(super) fn handle_to_type(&self, handle: &TypeHandle) -> Type {
         self.type_for_storage(&self.resolve_ref(&handle.0))
     }
@@ -799,6 +794,11 @@ impl Solver {
 
     pub(super) fn alloc_local_type(&mut self, ty: &Type) -> LocalTypeId {
         self.alloc_local(Ty::from_recovery_type(ty))
+    }
+
+    pub(super) fn alloc_local_type_from_handle(&mut self, handle: &TypeHandle) -> LocalTypeId {
+        let ty = self.resolve_ref(&handle.0);
+        self.alloc_local(ty)
     }
 
     pub(super) fn local_type_to_type(&self, id: LocalTypeId) -> Type {
