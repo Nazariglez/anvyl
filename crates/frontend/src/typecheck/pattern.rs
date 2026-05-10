@@ -319,7 +319,9 @@ impl BindingAlternatives {
         for alternative in alternatives {
             for env in &alternative.bindings.envs {
                 if !same_binding_names(expected, env) {
-                    tc.push_error(TypeError::OrPatternBindingMismatch { span });
+                    tc.push_error(TypeError::OrPatternBindingMismatch {
+                        span: tc.error_span(span),
+                    });
                     valid = false;
                     continue;
                 }
@@ -334,7 +336,7 @@ impl BindingAlternatives {
                             name,
                             expected: expected_ty,
                             found,
-                            span,
+                            span: tc.error_span(span),
                         });
                         valid = false;
                     }
@@ -374,7 +376,7 @@ impl BindingEnv {
         if self.binding(name).is_some() {
             tc.push_error(TypeError::DuplicateName {
                 name,
-                span: binding.span,
+                span: tc.error_span(binding.span),
             });
             return false;
         }
@@ -441,13 +443,15 @@ impl<'tc> PatternChecker<'tc> {
             PatternContext::IfLet | PatternContext::WhileLet | PatternContext::LetElse
                 if expected.is_option() && outcome.refutability == Refutability::Irrefutable =>
             {
-                self.tc
-                    .push_error(TypeError::RequiresUnwrappingPattern { span: pattern.span });
+                self.tc.push_error(TypeError::RequiresUnwrappingPattern {
+                    span: self.tc.error_span(pattern.span),
+                });
                 outcome.had_error = true;
             }
             PatternContext::LetElse if outcome.refutability == Refutability::Irrefutable => {
-                self.tc
-                    .push_error(TypeError::IrrefutableLetElse { span: pattern.span });
+                self.tc.push_error(TypeError::IrrefutableLetElse {
+                    span: self.tc.error_span(pattern.span),
+                });
                 outcome.had_error = true;
             }
             _ => {}
@@ -459,7 +463,9 @@ impl<'tc> PatternChecker<'tc> {
             PatternBindMode::Alias => {
                 if !input.access.can_assign() {
                     self.tc
-                        .push_error(TypeError::VarPatternRequiresMutablePlace { span });
+                        .push_error(TypeError::VarPatternRequiresMutablePlace {
+                            span: self.tc.error_span(span),
+                        });
                 }
                 PatternBindingKind::Alias(place::AliasTarget {
                     access: input.access,
@@ -582,8 +588,9 @@ impl<'tc> PatternChecker<'tc> {
         };
         for env in &bindings.envs[1..] {
             if !same_binding_names(first, env) {
-                self.tc
-                    .push_error(TypeError::OrPatternBindingMismatch { span });
+                self.tc.push_error(TypeError::OrPatternBindingMismatch {
+                    span: self.tc.error_span(span),
+                });
                 return;
             }
         }
@@ -623,7 +630,7 @@ impl<'tc> PatternChecker<'tc> {
             _ => {
                 self.tc.push_error(TypeError::TuplePatternOnNonTuple {
                     ty: input.expected_ty,
-                    span,
+                    span: self.tc.error_span(span),
                 });
                 return PatternCheckResult::empty(PatternOutcome::error());
             }
@@ -632,7 +639,7 @@ impl<'tc> PatternChecker<'tc> {
             self.tc.push_error(TypeError::TuplePatternArityMismatch {
                 expected: elem_tys.len(),
                 found: elems.len(),
-                span,
+                span: self.tc.error_span(span),
             });
             return PatternCheckResult::empty(PatternOutcome::error());
         }
@@ -664,7 +671,7 @@ impl<'tc> PatternChecker<'tc> {
             self.tc.push_error(TypeError::InvalidLiteralPattern {
                 expected: expected.clone(),
                 found: lit_ty,
-                span,
+                span: self.tc.error_span(span),
             });
             return PatternOutcome::error();
         }
@@ -680,8 +687,9 @@ impl<'tc> PatternChecker<'tc> {
 
     fn check_nil(&mut self, span: Span, expected: &Type) -> PatternOutcome {
         if !expected.is_option() && !matches!(expected, Type::Infer) {
-            self.tc
-                .push_error(TypeError::OptionalPatternOnNonOptional { span });
+            self.tc.push_error(TypeError::OptionalPatternOnNonOptional {
+                span: self.tc.error_span(span),
+            });
             return PatternOutcome::error();
         }
         PatternOutcome::refutable(
@@ -692,8 +700,9 @@ impl<'tc> PatternChecker<'tc> {
 
     fn check_optional(&mut self, inner: &PatternNode, input: PatternInput) -> PatternCheckResult {
         if matches!(inner.node, Pattern::Optional(_)) {
-            self.tc
-                .push_error(TypeError::NestedOptionalPattern { span: inner.span });
+            self.tc.push_error(TypeError::NestedOptionalPattern {
+                span: self.tc.error_span(inner.span),
+            });
             let recovery = input.project(
                 Type::Infer,
                 input.access,
@@ -707,8 +716,9 @@ impl<'tc> PatternChecker<'tc> {
         }
         let Some(inner_ty) = input.expected_ty.option_inner() else {
             if !matches!(input.expected_ty, Type::Infer) {
-                self.tc
-                    .push_error(TypeError::OptionalPatternOnNonOptional { span: inner.span });
+                self.tc.push_error(TypeError::OptionalPatternOnNonOptional {
+                    span: self.tc.error_span(inner.span),
+                });
             }
             let recovery = input.project(
                 Type::Infer,
@@ -758,7 +768,7 @@ impl<'tc> PatternChecker<'tc> {
                 self.tc.push_error(TypeError::InvalidLiteralPattern {
                     expected: expected.clone(),
                     found,
-                    span,
+                    span: self.tc.error_span(span),
                 });
                 return PatternOutcome::error();
             }
@@ -777,7 +787,7 @@ impl<'tc> PatternChecker<'tc> {
             self.tc.push_error(TypeError::UnknownType {
                 qualifier: None,
                 name,
-                span,
+                span: self.tc.error_span(span),
             });
             self.check_field_patterns(fields, input.access);
             return PatternCheckResult::empty(PatternOutcome::error());
@@ -788,7 +798,7 @@ impl<'tc> PatternChecker<'tc> {
             self.tc.push_error(TypeError::TypeMismatch {
                 expected: nominal_type(&key),
                 found: input.expected_ty,
-                span,
+                span: self.tc.error_span(span),
             });
             return PatternCheckResult::empty(PatternOutcome::error());
         }
@@ -844,7 +854,7 @@ impl<'tc> PatternChecker<'tc> {
             schema,
             &owner,
             field_check::MissingFields::None,
-            Span::new(0, 0),
+            None,
         );
         let mut had_error = shape.failed;
         let mut refutability = if shape.failed {
@@ -934,7 +944,7 @@ impl<'tc> PatternChecker<'tc> {
         schema: &HashMap<Ident, FieldSchema>,
         owner: &field_check::FieldOwner,
         missing: field_check::MissingFields,
-        span: Span,
+        span: Option<Span>,
     ) -> field_check::FieldShape {
         let uses = fields
             .iter()
@@ -1001,7 +1011,7 @@ impl<'tc> PatternChecker<'tc> {
             self.tc.push_error(TypeError::WrongArgCount {
                 expected: payloads.len(),
                 found: fields.len(),
-                span,
+                span: self.tc.error_span(span),
             });
             let bindings = self.check_tuple_fields_recovery(fields, input.access);
             return PatternCheckResult {
@@ -1061,7 +1071,7 @@ impl<'tc> PatternChecker<'tc> {
             schema,
             &owner,
             field_check::MissingFields::AllowRest { has_rest },
-            span,
+            Some(span),
         );
         let mut had_error = shape.failed;
         let mut bindings = BindingAlternatives::single_empty();
@@ -1172,8 +1182,10 @@ impl<'tc> PatternChecker<'tc> {
     }
 
     fn unsupported_named(&mut self, pattern: &'static str, span: Span) -> PatternOutcome {
-        self.tc
-            .push_error(TypeError::UnsupportedPattern { pattern, span });
+        self.tc.push_error(TypeError::UnsupportedPattern {
+            pattern,
+            span: self.tc.error_span(span),
+        });
         PatternOutcome::error()
     }
 }

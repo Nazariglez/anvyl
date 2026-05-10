@@ -6,11 +6,12 @@ use std::{
     path::PathBuf,
 };
 
-pub use diagnostics::{Diagnostic, DiagnosticSeverity};
-
 use self::diagnostics::{
     diagnose_extern_input_error, diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error,
     diagnose_type_error, diagnose_type_warning,
+};
+pub use crate::diagnostic::{
+    Diagnostic, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity, LabelStyle, Severity,
 };
 use crate::{
     ast::Program,
@@ -23,6 +24,7 @@ use crate::{
         ModuleLoader, PackageId, PackageInput as ResolvePackageInput, PackageKind, PreloadedModule,
         ResolveFailure, SystemPackages,
     },
+    source::{SourceId, SourceKind, SourceTable},
     typecheck,
 };
 
@@ -30,6 +32,7 @@ use crate::{
 pub struct Source {
     pub code: String,
     pub label: String,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,79 +94,101 @@ pub struct FrontendConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckOk {
-    pub diagnostics: Vec<Diagnostic>,
+    pub report: DiagnosticReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckError<E = std::convert::Infallible> {
     Lex {
         label: String,
-        diagnostics: Vec<Diagnostic>,
+        report: DiagnosticReport,
     },
     Parse {
         label: String,
-        diagnostics: Vec<Diagnostic>,
+        report: DiagnosticReport,
     },
     Resolve {
-        diagnostics: Vec<Diagnostic>,
+        report: DiagnosticReport,
     },
     Type {
-        diagnostics: Vec<Diagnostic>,
+        report: DiagnosticReport,
     },
     Extern {
-        diagnostics: Vec<Diagnostic>,
+        report: DiagnosticReport,
     },
     Source(Box<E>),
+}
+
+impl<E> CheckError<E> {
+    pub fn report(&self) -> Option<&DiagnosticReport> {
+        match self {
+            Self::Lex { report, .. }
+            | Self::Parse { report, .. }
+            | Self::Resolve { report }
+            | Self::Type { report }
+            | Self::Extern { report } => Some(report),
+            Self::Source(_) => None,
+        }
+    }
 }
 
 pub fn check_packages<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
 ) -> Result<CheckOk, CheckError<L::FatalError>> {
-    let root = parse_package_module(input.main, &config.context)?;
+    let mut sources = SourceTable::default();
+    let root = parse_package_module(&mut sources, input.main, SourceKind::Root, &config.context)?;
 
-    let packages = parse_package_inputs(input.packages, &config.context)?;
-    let preloaded_modules = parse_package_modules(input.preloaded_modules, &config.context)?;
+    let packages = parse_package_inputs(&mut sources, input.packages, &config.context)?;
+    let preloaded_modules =
+        parse_package_modules(&mut sources, input.preloaded_modules, &config.context)?;
 
-    let mut raw_externs = externs::ingest_providers(config.externs).map_err(extern_error)?;
+    let mut raw_externs = externs::ingest_providers(config.externs)
+        .map_err(|errors| extern_error(&sources, errors))?;
     let external_modules = externs::raw_extern_module_ids(&raw_externs);
 
-    let mut loader = InputModuleLoader::new(input.source_loader, config.context.clone());
-    loader.cache_loaded(root.clone());
-    for package in packages.values() {
-        if let Some(root) = &package.root {
-            loader.cache_loaded(root.clone());
+    let resolved = {
+        let mut loader =
+            InputModuleLoader::new(input.source_loader, &mut sources, config.context.clone());
+        loader.cache_loaded(root.clone());
+        for package in packages.values() {
+            if let Some(root) = &package.root {
+                loader.cache_loaded(root.clone());
+            }
         }
-    }
-    for module in &preloaded_modules {
-        loader.cache_loaded(LoadedModule {
-            module: module.module.clone(),
-            program: module.program.clone(),
-        });
-    }
-    let resolved = match resolve::resolve_package_modules(
-        root.clone(),
-        &packages,
-        preloaded_modules,
-        &mut loader,
-        &HashSet::new(),
-        &external_modules,
-        input.system.clone(),
-    ) {
+        for module in &preloaded_modules {
+            loader.cache_loaded(LoadedModule {
+                module: module.module.clone(),
+                source: module.source,
+                program: module.program.clone(),
+            });
+        }
+        resolve::resolve_package_modules(
+            root.clone(),
+            &packages,
+            preloaded_modules,
+            &mut loader,
+            &HashSet::new(),
+            &external_modules,
+            input.system.clone(),
+        )
+    };
+    let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(ResolveFailure::Fatal(error)) => return Err(error),
         Err(ResolveFailure::Resolve(errors)) => {
             return Err(CheckError::Resolve {
-                diagnostics: errors.iter().map(diagnose_resolve_error).collect(),
+                report: diagnostic_report(&sources, errors.iter().map(diagnose_resolve_error)),
             });
         }
     };
 
-    let source_externs =
-        externs::collect_source_externs(&root.program, &resolved).map_err(extern_error)?;
+    let source_externs = externs::collect_source_externs(&root.program, &resolved)
+        .map_err(|errors| extern_error(&sources, errors))?;
     raw_externs.append(source_externs);
-    externs::validate_raw_shapes(&raw_externs).map_err(extern_error)?;
-    externs::validate_raw_identities(&raw_externs).map_err(extern_error)?;
+    externs::validate_raw_shapes(&raw_externs).map_err(|errors| extern_error(&sources, errors))?;
+    externs::validate_raw_identities(&raw_externs)
+        .map_err(|errors| extern_error(&sources, errors))?;
 
     let typecheck_result = typecheck::check_with_modules(
         &root.program,
@@ -175,28 +200,43 @@ pub fn check_packages<L: PackageSourceLoader>(
         },
     )
     .map_err(|errors| CheckError::Type {
-        diagnostics: errors.iter().map(diagnose_type_error).collect(),
+        report: diagnostic_report(&sources, errors.iter().map(diagnose_type_error)),
     })?;
 
     Ok(CheckOk {
-        diagnostics: typecheck_result
-            .warnings()
-            .iter()
-            .map(diagnose_type_warning)
-            .collect(),
+        report: diagnostic_report(
+            &sources,
+            typecheck_result
+                .warnings()
+                .iter()
+                .map(diagnose_type_warning),
+        ),
     })
 }
 
-fn extern_error<E>(errors: Vec<externs::ExternInputError>) -> CheckError<E> {
+fn extern_error<E>(sources: &SourceTable, errors: Vec<externs::ExternInputError>) -> CheckError<E> {
     CheckError::Extern {
-        diagnostics: errors
-            .into_iter()
-            .map(|error| diagnose_extern_input_error(&error))
-            .collect(),
+        report: diagnostic_report(
+            sources,
+            errors
+                .into_iter()
+                .map(|error| diagnose_extern_input_error(&error)),
+        ),
+    }
+}
+
+fn diagnostic_report(
+    sources: &SourceTable,
+    diagnostics: impl IntoIterator<Item = Diagnostic>,
+) -> DiagnosticReport {
+    DiagnosticReport {
+        sources: sources.clone(),
+        diagnostics: diagnostics.into_iter().collect(),
     }
 }
 
 fn parse_package_inputs<E>(
+    sources: &mut SourceTable,
     packages: HashMap<PackageId, PackageSourceInput>,
     ctx: &CompilationContext,
 ) -> Result<HashMap<PackageId, ResolvePackageInput>, CheckError<E>> {
@@ -205,7 +245,16 @@ fn parse_package_inputs<E>(
         .map(|(id, package)| {
             let root = package
                 .root
-                .map(|module| parse_package_module(module, ctx))
+                .map(|module| {
+                    parse_package_module(
+                        sources,
+                        module,
+                        SourceKind::PackageRoot {
+                            package: id.clone(),
+                        },
+                        ctx,
+                    )
+                })
                 .transpose()?;
             Ok((
                 id,
@@ -220,59 +269,101 @@ fn parse_package_inputs<E>(
 }
 
 fn parse_package_module<E>(
+    sources: &mut SourceTable,
     module: PackageModuleInput,
+    kind: SourceKind,
     ctx: &CompilationContext,
 ) -> Result<LoadedModule, CheckError<E>> {
+    let parsed = parse_source(sources, &module.source, kind, ctx)?;
     Ok(LoadedModule {
         module: module.module,
-        program: parse_source(&module.source, ctx)?,
+        source: parsed.id,
+        program: parsed.program,
     })
 }
 
 fn parse_package_modules<E>(
+    sources: &mut SourceTable,
     modules: Vec<PackageModuleInput>,
     ctx: &CompilationContext,
 ) -> Result<Vec<PreloadedModule>, CheckError<E>> {
     modules
         .into_iter()
         .map(|module| {
+            let parsed = parse_source(sources, &module.source, SourceKind::Prelude, ctx)?;
             Ok(PreloadedModule {
                 module: module.module,
-                program: parse_source(&module.source, ctx)?,
+                source: parsed.id,
+                program: parsed.program,
             })
         })
         .collect()
 }
 
-fn parse_source<E>(source: &Source, ctx: &CompilationContext) -> Result<Program, CheckError<E>> {
+struct ParsedSource {
+    id: SourceId,
+    program: Program,
+}
+
+fn parse_source<E>(
+    sources: &mut SourceTable,
+    source: &Source,
+    kind: SourceKind,
+    ctx: &CompilationContext,
+) -> Result<ParsedSource, CheckError<E>> {
+    let source_id = register_module_source(sources, source, kind);
     let code = conditional::filter_with_context(&source.code, ctx).map_err(|errors| {
         CheckError::Parse {
             label: source.label.clone(),
-            diagnostics: errors.into_iter().map(Diagnostic::error).collect(),
+            report: diagnostic_report(sources, errors.into_iter().map(Diagnostic::error)),
         }
     })?;
 
-    let tokens = lexer::tokenize(&code).map_err(|errors| CheckError::Lex {
+    let tokens = lexer::tokenize(source_id, &code).map_err(|errors| CheckError::Lex {
         label: source.label.clone(),
-        diagnostics: errors.iter().map(diagnose_lex_error).collect(),
+        report: diagnostic_report(
+            sources,
+            errors
+                .iter()
+                .map(|error| diagnose_lex_error(source_id, source.code.len(), error)),
+        ),
     })?;
 
-    parser::parse_ast(&tokens).map_err(|errors| CheckError::Parse {
+    let program = parser::parse_ast(&tokens).map_err(|errors| CheckError::Parse {
         label: source.label.clone(),
-        diagnostics: errors.iter().map(diagnose_parse_error).collect(),
+        report: diagnostic_report(sources, errors.iter().map(diagnose_parse_error)),
+    })?;
+    Ok(ParsedSource {
+        id: source_id,
+        program,
     })
+}
+
+fn register_module_source(
+    sources: &mut SourceTable,
+    source: &Source,
+    kind: SourceKind,
+) -> SourceId {
+    sources.add(
+        kind,
+        source.label.clone(),
+        source.path.clone(),
+        source.code.clone(),
+    )
 }
 
 struct InputModuleLoader<'a, L: PackageSourceLoader> {
     loader: &'a mut L,
+    sources: &'a mut SourceTable,
     parsed: HashMap<ModuleId, LoadedModule>,
     context: CompilationContext,
 }
 
 impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
-    fn new(loader: &'a mut L, context: CompilationContext) -> Self {
+    fn new(loader: &'a mut L, sources: &'a mut SourceTable, context: CompilationContext) -> Self {
         Self {
             loader,
+            sources,
             parsed: HashMap::new(),
             context,
         }
@@ -289,7 +380,11 @@ impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
         if let Some(loaded) = self.parsed.get(&module.module) {
             return Ok(loaded.clone());
         }
-        let loaded = parse_package_module(module, &self.context).map_err(ModuleLoadError::Fatal)?;
+        let kind = SourceKind::Module {
+            module: module.module.clone(),
+        };
+        let loaded = parse_package_module(self.sources, module, kind, &self.context)
+            .map_err(ModuleLoadError::Fatal)?;
         self.cache_loaded(loaded.clone());
         Ok(loaded)
     }
@@ -342,13 +437,14 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        CheckError, CheckOk, Diagnostic, FrontendConfig, PackageModuleInput, PackageProgramInput,
-        PackageSourceInput, PackageSourceLoader, Source, SourceLoadError,
+        CheckError, CheckOk, Diagnostic, DiagnosticReport, FrontendConfig, PackageModuleInput,
+        PackageProgramInput, PackageSourceInput, PackageSourceLoader, Source, SourceLoadError,
         check_packages as pipeline_check,
     };
     use crate::{
         externs::{ExternInputs, PackageExternInputs},
         resolve::{ModuleId, ModulePath, PackageId, PackageKind, SystemPackages},
+        source::SourceKind,
     };
 
     #[derive(Default)]
@@ -370,6 +466,7 @@ mod tests {
                 Source {
                     code: code.to_string(),
                     label: path.join("."),
+                    path: None,
                 },
             );
         }
@@ -411,6 +508,7 @@ mod tests {
         Source {
             code: code.to_string(),
             label: label.to_string(),
+            path: None,
         }
     }
 
@@ -554,10 +652,10 @@ mod tests {
     }
 
     fn extern_messages(source: &str) -> Vec<String> {
-        let CheckError::Extern { diagnostics } = check_source(source).unwrap_err() else {
+        let CheckError::Extern { report } = check_source(source).unwrap_err() else {
             panic!("expected extern error");
         };
-        diagnostic_messages(&diagnostics)
+        diagnostic_messages(report.diagnostics())
     }
 
     #[test]
@@ -874,11 +972,11 @@ mod tests {
         )
         .unwrap_err();
 
-        let CheckError::Extern { diagnostics } = err else {
+        let CheckError::Extern { report } = err else {
             panic!("expected extern error");
         };
         assert_eq!(
-            diagnostic_messages(&diagnostics),
+            diagnostic_messages(report.diagnostics()),
             [
                 "invalid extern descriptor from provider 'math' in package '<root>': duplicate function 'dot' in module 'math'"
             ]
@@ -912,11 +1010,11 @@ mod tests {
         )
         .unwrap_err();
 
-        let CheckError::Extern { diagnostics } = err else {
+        let CheckError::Extern { report } = err else {
             panic!("expected extern error");
         };
         assert_eq!(
-            diagnostic_messages(&diagnostics),
+            diagnostic_messages(report.diagnostics()),
             [
                 "duplicate provider module 'math' in package '<root>' declared by providers 'math' and 'other_math'"
             ]
@@ -1072,58 +1170,161 @@ mod tests {
         assert!(!diagnostics.is_empty());
     }
 
+    fn assert_primary_label(report: &DiagnosticReport) {
+        let file = report.sources.iter().next().expect("expected source");
+        let label = &report.diagnostics()[0].labels()[0];
+        assert_eq!(label.span.source(), file.id());
+    }
+
     #[test]
     fn renders_lex_errors_through_check() {
         let err = check_source("fn main() { \"unterminated }").unwrap_err();
-        let CheckError::Lex { diagnostics, .. } = err else {
+        let CheckError::Lex { report, .. } = err else {
             panic!("expected lex error");
         };
-        assert_user_diagnostics(&diagnostics);
+        assert_user_diagnostics(report.diagnostics());
+        assert_primary_label(&report);
+    }
+
+    #[test]
+    fn lex_error_report_carries_registered_source() {
+        let err = check_source("fn main() { \"unterminated }").unwrap_err();
+        let CheckError::Lex { report, .. } = err else {
+            panic!("expected lex error");
+        };
+        let file = report.sources.iter().next().expect("expected source");
+
+        assert_eq!(report.sources.len(), 1);
+        assert_eq!(file.label(), "main.anv");
+        assert_eq!(file.text(), "fn main() { \"unterminated }");
     }
 
     #[test]
     fn renders_parse_errors_through_check() {
         let err = check_source("fn main( {}").unwrap_err();
-        let CheckError::Parse { diagnostics, .. } = err else {
+        let CheckError::Parse { report, .. } = err else {
             panic!("expected parse error");
         };
-        assert_user_diagnostics(&diagnostics);
+        assert_user_diagnostics(report.diagnostics());
+        assert_primary_label(&report);
+    }
+
+    #[test]
+    fn eof_parse_error_uses_empty_eof_label() {
+        let source = "fn";
+        let err = check_source(source).unwrap_err();
+        let CheckError::Parse { report, .. } = err else {
+            panic!("expected parse error");
+        };
+        assert_primary_label(&report);
+        let label = &report.diagnostics()[0].labels()[0];
+        assert_eq!(label.span.start(), source.len());
+        assert_eq!(label.span.end(), source.len());
     }
 
     #[test]
     fn renders_resolve_errors_through_check() {
         let err = check_source("import missing as m; fn main() {} ").unwrap_err();
-        let CheckError::Resolve { diagnostics } = err else {
+        let CheckError::Resolve { report } = err else {
             panic!("expected resolve error");
         };
-        assert!(diagnostics[0].message().contains("Cannot find module file"));
-        assert_user_diagnostics(&diagnostics);
+        assert!(
+            report.diagnostics()[0]
+                .message()
+                .contains("Cannot find module file")
+        );
+        assert_user_diagnostics(report.diagnostics());
+        assert_primary_label(&report);
     }
 
     #[test]
     fn renders_type_errors_through_check() {
         let err = check_source("fn main() { let x: int = true; } ").unwrap_err();
-        let CheckError::Type { diagnostics } = err else {
+        let CheckError::Type { report } = err else {
             panic!("expected type error");
         };
         assert_eq!(
-            diagnostics[0].message(),
+            report.diagnostics()[0].message(),
             "Mismatched types: expected 'int', found 'bool'"
         );
-        assert_user_diagnostics(&diagnostics);
+        assert_user_diagnostics(report.diagnostics());
+        assert_primary_label(&report);
     }
 
     #[test]
     fn missing_method_through_check_has_no_call_cascade() {
         let err = check_source("fn main() { 1.foo(); }").unwrap_err();
-        let CheckError::Type { diagnostics } = err else {
+        let CheckError::Type { report } = err else {
             panic!("expected type error");
         };
+        let diagnostics = report.diagnostics();
         assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
         assert_eq!(
             diagnostics[0].message(),
             "Unknown method 'foo' for type 'int'"
         );
+    }
+
+    #[test]
+    fn report_registers_package_roots_and_preloaded_modules() {
+        let game = PackageId::new("game");
+        let dep = PackageId::new("dep");
+        let mut loader = TestLoader::default();
+
+        let ok = check(PackageProgramInput {
+            root_package: game.clone(),
+            main: root_source(&game, "fn main() {}", "main.anv"),
+            system: SystemPackages::default(),
+            packages: HashMap::from([(dep.clone(), package_input(&dep, "", &[]))]),
+            preloaded_modules: vec![module(&["helper"], "pub fn h() -> int { 1 }")],
+            source_loader: &mut loader,
+        })
+        .unwrap();
+
+        assert_eq!(ok.report.sources.len(), 3);
+        assert!(
+            ok.report
+                .sources
+                .iter()
+                .any(|file| matches!(file.kind(), SourceKind::Root))
+        );
+        assert!(ok.report.sources.iter().any(|file| matches!(
+            file.kind(),
+            SourceKind::PackageRoot { package } if package == &dep
+        )));
+        assert!(
+            ok.report
+                .sources
+                .iter()
+                .any(|file| matches!(file.kind(), SourceKind::Prelude))
+        );
+    }
+
+    #[test]
+    fn repeated_module_load_reuses_source_id() {
+        let mut loader = TestLoader::default();
+        loader.source(&["foo"], "pub fn a() -> int { 1 } pub fn b() -> int { 2 }");
+
+        let ok = check(input(
+            &mut loader,
+            source(
+                "import foo { a }; import foo { b }; fn main() { let x: int = a() + b(); }",
+                "main.anv",
+            ),
+            None,
+            vec![],
+        ))
+        .unwrap();
+        let labels = ok
+            .report
+            .sources
+            .iter()
+            .map(|source| source.label())
+            .collect::<Vec<_>>();
+
+        assert_eq!(loader.loads, [vec!["foo".to_string()]]);
+        assert_eq!(ok.report.sources.len(), 2);
+        assert_eq!(labels.iter().filter(|label| **label == "foo").count(), 1);
     }
 
     #[test]
@@ -1182,11 +1383,11 @@ mod tests {
             vec![module(&["core_int"], ""), module(&["core_int"], "")],
         ))
         .unwrap_err();
-        let CheckError::Resolve { diagnostics } = err else {
+        let CheckError::Resolve { report } = err else {
             panic!("expected resolve error");
         };
         assert_eq!(
-            diagnostic_messages(&diagnostics),
+            diagnostic_messages(report.diagnostics()),
             ["module 'core_int' is preloaded more than once"]
         );
         assert!(loader.loads.is_empty());
@@ -1529,7 +1730,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, CheckError::Resolve { diagnostics } if diagnostics[0].message() == "import root 'std' is not supported yet")
+            matches!(err, CheckError::Resolve { report } if report.diagnostics()[0].message() == "import root 'std' is not supported yet")
         );
     }
 
@@ -1572,13 +1773,13 @@ mod tests {
             vec![],
         ))
         .unwrap_err();
-        let CheckError::Resolve { diagnostics } = err else {
+        let CheckError::Resolve { report } = err else {
             panic!("expected resolve error");
         };
         assert_eq!(
-            diagnostic_messages(&diagnostics),
+            diagnostic_messages(report.diagnostics()),
             ["Cannot load module 'broken': disk error"]
         );
-        assert_user_diagnostics(&diagnostics);
+        assert_user_diagnostics(report.diagnostics());
     }
 }

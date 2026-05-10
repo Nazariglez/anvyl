@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::support::{
-    InMemoryLoader, module_id, module_path, native_package_input, package, package_input,
-    package_root, parse_program, provider_id, resolve_errors, resolve_package, root_id, source_id,
+    InMemoryLoader, loaded_module, module_id, module_path, native_package_input, package,
+    package_input, package_root, parse_program, provider_id, resolve_errors, resolve_package,
+    root_id, source_id,
 };
 use crate::{
     resolve::{
@@ -166,6 +167,7 @@ fn duplicate_spans_keep_edges() {
     let result = crate::resolve::resolve_package_modules(
         LoadedModule {
             module: root_id(&game),
+            source: loaded_module(root_id(&game), "import a; import b;").source,
             program,
         },
         &packages([(game.clone(), PackageInput::default())]),
@@ -206,10 +208,10 @@ fn source_without_package_rejects_pkg() {
     let file = SourceFileId::new("/tmp/no-package/main.anv").unwrap();
     let mut loader = InMemoryLoader::default();
     let errors = resolve_errors(crate::resolve::resolve_package_modules(
-        LoadedModule {
-            module: ModuleId::source_without_package(file.clone()),
-            program: parse_program("import pkg:math;"),
-        },
+        loaded_module(
+            ModuleId::source_without_package(file.clone()),
+            "import pkg:math;",
+        ),
         &HashMap::new(),
         vec![],
         &mut loader,
@@ -275,10 +277,7 @@ fn native_only_dependency_provider_import_resolves() {
     let mut loader = InMemoryLoader::default();
     let provider_modules = HashSet::from([provider_id(&host, &["audio"])]);
     let result = crate::resolve::resolve_package_modules(
-        LoadedModule {
-            module: root_id(&game),
-            program: parse_program("import pkg:host.audio { play };"),
-        },
+        loaded_module(root_id(&game), "import pkg:host.audio { play };"),
         &packages([
             (game.clone(), package_input(&[("host", host.clone())])),
             (host.clone(), native_package_input(&[])),
@@ -375,10 +374,7 @@ fn root_aliases_source_entry() {
             (
                 math.clone(),
                 PackageInput {
-                    root: Some(LoadedModule {
-                        module: math_source.clone(),
-                        program: parse_program(""),
-                    }),
+                    root: Some(loaded_module(math_source.clone(), "")),
                     dependencies: HashMap::new(),
                     kind: crate::resolve::PackageKind::Source,
                 },

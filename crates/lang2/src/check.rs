@@ -14,14 +14,15 @@ use anvyx_frontend::{
 };
 
 use crate::{
-    CheckError, CheckResult, PackageSource, SourceBundle, SourceText,
-    source::{PackageSourceEnvironment, SourceOwnership, canonical_source_file},
+    CheckError, CheckResult, PackageSource, SourceBundle, SourceOverride, SourceText,
+    source::{PackageSourceEnvironment, SourceOwnership, source_file_id},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckFileInput {
     file: PathBuf,
     sources: SourceBundle,
+    source_overrides: Vec<SourceOverride>,
     config: FrontendConfig,
 }
 
@@ -37,12 +38,20 @@ impl CheckFileInput {
         Ok(Self {
             file,
             sources,
+            source_overrides: vec![],
             config: FrontendConfig::default(),
         })
     }
 
+    #[must_use]
     pub fn with_config(mut self, config: FrontendConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_overrides(mut self, source_overrides: Vec<SourceOverride>) -> Self {
+        self.source_overrides = source_overrides;
         self
     }
 
@@ -61,6 +70,7 @@ pub struct CheckPackageInput {
     root_file: PathBuf,
     packages: Vec<PackageSource>,
     sources: SourceBundle,
+    source_overrides: Vec<SourceOverride>,
     config: FrontendConfig,
 }
 
@@ -95,12 +105,20 @@ impl CheckPackageInput {
             root_file,
             packages,
             sources,
+            source_overrides: vec![],
             config: FrontendConfig::default(),
         })
     }
 
+    #[must_use]
     pub fn with_config(mut self, config: FrontendConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_overrides(mut self, source_overrides: Vec<SourceOverride>) -> Self {
+        self.source_overrides = source_overrides;
         self
     }
 }
@@ -109,15 +127,17 @@ pub fn check_file(input: CheckFileInput) -> CheckResult {
     let CheckFileInput {
         file,
         sources,
+        source_overrides,
         config,
     } = input;
-    let main_code = read_main(&file)?;
-    let root_file_id = canonical_source_file(&file)?;
+    let main_code = read_main(&file, &source_overrides)?;
+    let root_file_id = source_file_id(&file)?;
     let main = PackageModuleInput {
-        module: ModuleId::source_without_package(root_file_id),
+        module: ModuleId::source_without_package(root_file_id.clone()),
         source: FrontendSource {
             code: main_code,
             label: file.display().to_string(),
+            path: Some(root_file_id.path().to_path_buf()),
         },
     };
 
@@ -127,6 +147,7 @@ pub fn check_file(input: CheckFileInput) -> CheckResult {
         packages: HashMap::new(),
         cached_sources: vec![main],
         ownership: SourceOwnership::new(&[])?,
+        source_overrides,
         sources,
         config,
     })
@@ -138,23 +159,25 @@ pub fn check_package(input: CheckPackageInput) -> CheckResult {
         root_file,
         packages,
         sources,
+        source_overrides,
         config,
     } = input;
-    let main_code = read_main(&root_file)?;
+    let main_code = read_main(&root_file, &source_overrides)?;
     let ownership = SourceOwnership::new(&packages)?;
     let (root_owner, root_file_id) = ownership.validate_root_file(&root_file)?;
     let main = PackageModuleInput {
-        module: ModuleId::source(root_owner, root_file_id),
+        module: ModuleId::source(root_owner, root_file_id.clone()),
         source: FrontendSource {
             code: main_code,
             label: root_file.display().to_string(),
+            path: Some(root_file_id.path().to_path_buf()),
         },
     };
     let mut cached_sources = vec![main.clone()];
     let package_inputs = packages
         .iter()
         .map(|package| {
-            let root = package_root(package, &root_package, &ownership)?;
+            let root = package_root(package, &root_package, &ownership, &source_overrides)?;
             if let Some(root) = &root {
                 cached_sources.push(root.clone());
             }
@@ -175,6 +198,7 @@ pub fn check_package(input: CheckPackageInput) -> CheckResult {
         packages: package_inputs,
         cached_sources,
         ownership,
+        source_overrides,
         sources,
         config,
     })
@@ -186,6 +210,7 @@ struct PreparedCheck {
     packages: HashMap<PackageId, PackageSourceInput>,
     cached_sources: Vec<PackageModuleInput>,
     ownership: SourceOwnership,
+    source_overrides: Vec<SourceOverride>,
     sources: SourceBundle,
     config: FrontendConfig,
 }
@@ -197,6 +222,7 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
         mut packages,
         cached_sources,
         ownership,
+        source_overrides,
         sources,
         mut config,
     } = input;
@@ -207,6 +233,7 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
         packages.insert(PackageId::std(), std);
     }
     let mut source_loader = PackageSourceEnvironment::new(ownership, &sources);
+    source_loader.cache_overrides(source_overrides)?;
     source_loader.cache_sources(cached_sources);
 
     let ok = pipeline::check_packages(
@@ -230,17 +257,37 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
     Ok(ok.into())
 }
 
-fn read_main(file: &Path) -> Result<String, CheckError> {
+fn read_main(file: &Path, overrides: &[SourceOverride]) -> Result<String, CheckError> {
+    if let Some(source) = source_override(file, overrides)? {
+        return Ok(source.code().to_string());
+    }
     fs::read_to_string(file).map_err(|error| CheckError::ReadMain {
         path: file.to_path_buf(),
         message: error.to_string(),
     })
 }
 
+fn source_override<'a>(
+    file: &Path,
+    overrides: &'a [SourceOverride],
+) -> Result<Option<&'a SourceOverride>, CheckError> {
+    let Ok(source_file) = source_file_id(file) else {
+        return Ok(None);
+    };
+    for source in overrides {
+        let override_file = source_file_id(source.path())?;
+        if override_file == source_file {
+            return Ok(Some(source));
+        }
+    }
+    Ok(None)
+}
+
 fn package_root(
     package: &PackageSource,
     root_package: &PackageId,
     ownership: &SourceOwnership,
+    source_overrides: &[SourceOverride],
 ) -> Result<Option<PackageModuleInput>, CheckError> {
     if package.id() == root_package || package.kind() == PackageKind::NativeOnly {
         return Ok(None);
@@ -253,20 +300,26 @@ fn package_root(
     };
     let (owner, source_file) = ownership.validate_root_file(entry)?;
     Ok(Some(PackageModuleInput {
-        module: ModuleId::source(owner, source_file),
-        source: read_package_root(package)?.to_frontend_source(),
+        module: ModuleId::source(owner, source_file.clone()),
+        source: read_package_root(package, source_file.path(), source_overrides)?
+            .to_frontend_source(),
     }))
 }
 
-fn read_package_root(package: &PackageSource) -> Result<SourceText, CheckError> {
+fn read_package_root(
+    package: &PackageSource,
+    path: &Path,
+    source_overrides: &[SourceOverride],
+) -> Result<SourceText, CheckError> {
     let Some(entry) = package.entry() else {
         return Err(CheckError::InvalidInput(format!(
             "source package '{}' is missing an entry path",
             package.id()
         )));
     };
-    let code = read_main(entry)?;
+    let code = read_main(entry, source_overrides)?;
     SourceText::new(code, entry.display().to_string())
+        .map(|source| source.with_path(path.to_path_buf()))
 }
 
 fn system_externs(sources: &SourceBundle) -> ExternInputs {
@@ -306,14 +359,14 @@ fn system_package_input(
 
 fn preloaded_modules(sources: &SourceBundle) -> Vec<PackageModuleInput> {
     let mut modules = vec![];
-    preload_system_package(&mut modules, PackageId::core(), sources.core());
-    preload_system_package(&mut modules, PackageId::std(), sources.std());
+    preload_system_package(&mut modules, &PackageId::core(), sources.core());
+    preload_system_package(&mut modules, &PackageId::std(), sources.std());
     modules
 }
 
 fn preload_system_package(
     modules: &mut Vec<PackageModuleInput>,
-    package: PackageId,
+    package: &PackageId,
     source: Option<&crate::SystemPackageSource>,
 ) {
     let Some(source) = source else {
@@ -443,6 +496,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let game_main = write(&temp, "game/src/main.anv", "import pkg:math; fn main() {}");
             let math_root = write(&temp, "math/src/lib.anv", "pub fn add() -> int { 1 }");
+            let canonical_math_root = fs::canonicalize(&math_root).unwrap();
             let game = package_id("game");
             let math = package_id("math");
             let packages = vec![
@@ -462,7 +516,14 @@ mod tests {
             let input =
                 CheckPackageInput::new(game, game_main, packages, SourceBundle::default()).unwrap();
 
-            check_package(input).unwrap();
+            let ok = check_package(input).unwrap();
+
+            assert!(
+                ok.report
+                    .sources
+                    .iter()
+                    .any(|source| source.path() == Some(canonical_math_root.as_path()))
+            );
         }
 
         #[test]
@@ -535,8 +596,8 @@ mod tests {
 
             assert!(matches!(
                 error,
-                CheckError::Frontend(FrontendCheckError::Resolve { diagnostics })
-                    if diagnostics[0].message().contains("has no package dependency named 'math'")
+                CheckError::Frontend(FrontendCheckError::Resolve { report })
+                    if report.diagnostics()[0].message().contains("has no package dependency named 'math'")
             ));
         }
     }
@@ -548,8 +609,16 @@ mod tests {
         fn reads_main() {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "fn main() {}");
+            let canonical = fs::canonicalize(&main).unwrap();
 
-            check_file(empty_input(main)).unwrap();
+            let ok = check_file(empty_input(main)).unwrap();
+
+            assert!(
+                ok.report
+                    .sources
+                    .iter()
+                    .any(|source| source.path() == Some(canonical.as_path()))
+            );
         }
 
         #[test]
@@ -562,6 +631,41 @@ mod tests {
                 error,
                 CheckError::ReadMain { path, message } if path == missing && !message.is_empty()
             ));
+        }
+
+        #[test]
+        fn checks_missing_main_from_source_override() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = temp.path().join("main.anv");
+            let input = empty_input(main.clone()).with_source_overrides(vec![
+                SourceOverride::new(main.clone(), "fn main() {}").unwrap(),
+            ]);
+
+            let ok = check_file(input).unwrap();
+            let expected = source_file_id(&main).unwrap().path().to_path_buf();
+
+            assert!(
+                ok.report
+                    .sources
+                    .iter()
+                    .any(|source| source.path() == Some(expected.as_path()))
+            );
+        }
+
+        #[test]
+        fn imports_missing_module_from_source_override() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(
+                &temp,
+                "main.anv",
+                "import helper { value }; fn main() { let x: int = value(); }",
+            );
+            let helper = temp.path().join("helper.anv");
+            let input = empty_input(main).with_source_overrides(vec![
+                SourceOverride::new(helper, "pub fn value() -> int { 1 }").unwrap(),
+            ]);
+
+            check_file(input).unwrap();
         }
 
         #[test]
@@ -588,7 +692,15 @@ mod tests {
             let prelude = SourceText::new("pub fn prelude_value() -> int { 1 }", "<core>").unwrap();
             let sources = bundle(Some(prelude), vec![], vec![]);
 
-            check_file(input(main, sources)).unwrap();
+            let ok = check_file(input(main, sources)).unwrap();
+
+            assert!(
+                ok.report
+                    .sources
+                    .iter()
+                    .filter(|source| source.label().starts_with("<core"))
+                    .all(|source| source.path().is_none())
+            );
         }
 
         #[test]
@@ -639,9 +751,17 @@ mod tests {
                 "main.anv",
                 "import helper { value }; fn main() { let x: int = value(); }",
             );
-            write(&temp, "helper.anv", "pub fn value() -> int { 1 }");
+            let helper = write(&temp, "helper.anv", "pub fn value() -> int { 1 }");
+            let helper = fs::canonicalize(helper).unwrap();
 
-            check_file(empty_input(main)).unwrap();
+            let ok = check_file(empty_input(main)).unwrap();
+
+            assert!(
+                ok.report
+                    .sources
+                    .iter()
+                    .any(|source| source.path() == Some(helper.as_path()))
+            );
         }
 
         #[test]
@@ -727,8 +847,8 @@ mod tests {
 
             assert!(matches!(
                 error,
-                CheckError::Frontend(FrontendCheckError::Type { diagnostics })
-                    if diagnostics.iter().any(|diagnostic| {
+                CheckError::Frontend(FrontendCheckError::Type { report })
+                    if report.diagnostics().iter().any(|diagnostic| {
                         let message = diagnostic.message();
                         message.contains("a.anv") && message.contains("b.anv")
                     })
@@ -854,6 +974,22 @@ mod tests {
                 CheckError::Frontend(FrontendCheckError::Lex { label, .. })
                     if label == broken.display().to_string()
             ));
+        }
+
+        #[test]
+        fn loaded_declaration_errors_use_loaded_source() {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", "import helper; fn main() {}");
+            let helper = write(&temp, "helper.anv", "pub fn bad(a: int = 1, b: int) {}");
+            let helper = fs::canonicalize(helper).unwrap();
+            let error = unwrap_error(check_file(empty_input(main)));
+            let CheckError::Frontend(FrontendCheckError::Type { report }) = error else {
+                panic!("expected type error");
+            };
+            let label = report.diagnostics()[0].labels()[0].span;
+            let file = report.sources.get(label.source()).unwrap();
+
+            assert_eq!(file.path(), Some(helper.as_path()));
         }
 
         #[test]

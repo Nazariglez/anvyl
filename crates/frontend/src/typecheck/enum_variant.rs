@@ -45,7 +45,7 @@ pub(super) fn resolve_use(
         tc.push_error(TypeError::UnknownEnumVariant {
             enum_name: key.name,
             variant,
-            span,
+            span: tc.error_span(span),
         });
         return None;
     };
@@ -55,7 +55,7 @@ pub(super) fn resolve_use(
         variant,
         &schema.policy,
         &variant_schema.policy,
-        span,
+        tc.source_span(span),
     );
     if let Some(warning) = warning {
         tc.push_warning(warning);
@@ -73,7 +73,7 @@ fn resolved_use_warning(
     variant: Ident,
     enum_policy: &AccessPolicy,
     variant_policy: &AccessPolicy,
-    span: Span,
+    span: crate::span::SourceSpan,
 ) -> Option<TypeWarning> {
     if variant_policy.has_deprecated() {
         return Some(TypeWarning::DeprecatedAccess {
@@ -127,7 +127,7 @@ fn resolve_explicit_pattern(
                 tc.push_error(TypeError::EnumPatternTypeMismatch {
                     expected: nominal_type(expected_key),
                     found: nominal_type(&visible),
-                    span,
+                    span: tc.error_span(span),
                 });
                 return None;
             }
@@ -139,7 +139,7 @@ fn resolve_explicit_pattern(
         tc.push_error(TypeError::EnumPatternTypeMismatch {
             expected: expected.clone(),
             found: nominal_type(&visible),
-            span,
+            span: tc.error_span(span),
         });
         return None;
     }
@@ -151,7 +151,7 @@ fn resolve_explicit_pattern(
     tc.push_error(TypeError::UnknownType {
         qualifier: None,
         name,
-        span,
+        span: tc.error_span(span),
     });
     None
 }
@@ -164,7 +164,9 @@ fn resolve_inferred_pattern(
     match expected_key {
         Some(key) => Some(key),
         None => {
-            tc.push_error(TypeError::CannotInferEnum { span });
+            tc.push_error(TypeError::CannotInferEnum {
+                span: tc.error_span(span),
+            });
             None
         }
     }
@@ -180,7 +182,7 @@ pub(super) fn push_shape_mismatch(
         enum_name: resolved.key.name,
         variant: resolved.variant,
         expected,
-        span,
+        span: tc.error_span(span),
     });
 }
 
@@ -197,6 +199,6 @@ pub(super) fn push_arg_count_mismatch(
         variant,
         expected,
         found,
-        span,
+        span: tc.error_span(span),
     });
 }

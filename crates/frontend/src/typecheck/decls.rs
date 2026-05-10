@@ -19,7 +19,8 @@ use crate::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
     },
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveResult, SourceFileId},
-    span::Span,
+    source::SourceId,
+    span::{SourceSpan, Span},
     typecheck::annotation::AccessPolicy,
 };
 
@@ -298,24 +299,24 @@ pub(crate) enum DeclError {
     DuplicateValue {
         module: ModuleScope,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateType {
         module: ModuleScope,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MissingImportMember {
         module: ModuleScope,
         imported: ModuleScope,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     PrivateImportMember {
         module: ModuleScope,
         imported: ModuleScope,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ImportConflict {
         module: ModuleScope,
@@ -323,62 +324,62 @@ pub(crate) enum DeclError {
         namespace: BindingNamespace,
         first: BindingOrigin,
         second: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateModuleBinding {
         module: ModuleScope,
         name: Ident,
         first: BindingOrigin,
         second: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateGenericParam {
         module: ModuleScope,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateAggregateMethod {
         owner: NominalKey,
         name: Ident,
         surface: MethodSurface,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateExtendMethod {
         name: Ident,
         surface: MethodSurface,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateCastFrom {
         target: Type,
         source: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     PointlessCastFrom {
         ty: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     CastFromReturnMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnsupportedExtendTarget {
         ty: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnusedExtendTypeParam {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnusedExtendConstParam {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ExtendMethodConflict {
         ty: Type,
         name: Ident,
         surface: MethodSurface,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ReexportConflict {
         module: ModuleScope,
@@ -386,39 +387,39 @@ pub(crate) enum DeclError {
         namespace: BindingNamespace,
         first: BindingOrigin,
         second: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownType {
         module: ModuleScope,
         qualifier: Option<Ident>,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownAnnotation {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidAnnotationTarget {
         name: Ident,
         target: String,
         valid_targets: String,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateAnnotation {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidAnnotationArgs {
         name: Ident,
         message: String,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InternalOnToString {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidToStringMethod {
         message: &'static str,
-        span: Span,
+        span: Option<SourceSpan>,
     },
 }
 
@@ -652,7 +653,7 @@ impl ImportScopeBuilder {
         source: ModuleScope,
         default_name: Ident,
         dep: Option<&ModuleDecls>,
-        span: Span,
+        span: Option<SourceSpan>,
         validate_members: bool,
     ) {
         match kind {
@@ -706,7 +707,7 @@ impl ImportScopeBuilder {
         origin_module: &ModuleScope,
         source_name: Ident,
         target_name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
         validate_members: bool,
     ) {
         let mut found = false;
@@ -739,7 +740,12 @@ impl ImportScopeBuilder {
         }
     }
 
-    fn push_private_member(&mut self, imported: ModuleScope, name: Ident, span: Span) {
+    fn push_private_member(
+        &mut self,
+        imported: ModuleScope,
+        name: Ident,
+        span: Option<SourceSpan>,
+    ) {
         self.errors.push(DeclError::PrivateImportMember {
             module: self.module.clone(),
             imported,
@@ -748,7 +754,12 @@ impl ImportScopeBuilder {
         });
     }
 
-    fn push_missing_member(&mut self, imported: ModuleScope, name: Ident, span: Span) {
+    fn push_missing_member(
+        &mut self,
+        imported: ModuleScope,
+        name: Ident,
+        span: Option<SourceSpan>,
+    ) {
         self.errors.push(DeclError::MissingImportMember {
             module: self.module.clone(),
             imported,
@@ -761,7 +772,7 @@ impl ImportScopeBuilder {
         &mut self,
         source: &Namespace,
         origin_module: &ModuleScope,
-        span: Span,
+        span: Option<SourceSpan>,
     ) {
         for (name, key) in &source.types {
             self.insert_type(*name, key.clone(), self.origin(origin_module.clone()), span);
@@ -789,7 +800,7 @@ impl ImportScopeBuilder {
         name: Ident,
         value: ResolvedValue,
         origin: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> bool {
         if !self.claim_origin(BindingNamespace::Value, name, origin, span) {
             return false;
@@ -803,7 +814,7 @@ impl ImportScopeBuilder {
         name: Ident,
         key: NominalKey,
         origin: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> bool {
         if !self.claim_origin(BindingNamespace::Type, name, origin, span) {
             return false;
@@ -817,7 +828,7 @@ impl ImportScopeBuilder {
         name: Ident,
         module: ModuleScope,
         origin: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> bool {
         if !self.claim_origin(BindingNamespace::Module, name, origin, span) {
             return false;
@@ -831,7 +842,7 @@ impl ImportScopeBuilder {
         namespace: BindingNamespace,
         name: Ident,
         second: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> bool {
         let Some(first) = self.origins.get(&(namespace, name)).cloned() else {
             self.origins.insert((namespace, name), second);
@@ -847,7 +858,7 @@ impl ImportScopeBuilder {
         namespace: BindingNamespace,
         first: BindingOrigin,
         second: BindingOrigin,
-        span: Span,
+        span: Option<SourceSpan>,
     ) {
         let error = match namespace {
             BindingNamespace::Module => DeclError::DuplicateModuleBinding {
@@ -1009,14 +1020,14 @@ pub(crate) struct ExtendSchema {
     pub(crate) generics: GenericParams,
     pub(crate) methods: HashMap<MethodKey, ExtendMethodSchema>,
     pub(crate) cast_froms: Vec<CastConversionSchema>,
-    pub(crate) span: Span,
+    pub(crate) span: SourceSpan,
 }
 
 #[derive(Clone)]
 pub(crate) struct CastConversionSchema {
     pub(crate) source: Type,
     pub(crate) ret: Option<Type>,
-    pub(crate) span: Span,
+    pub(crate) span: SourceSpan,
 }
 
 #[derive(Clone)]
@@ -1057,6 +1068,12 @@ pub(crate) struct GenericContextError {
     pub(crate) span: Span,
 }
 
+struct ModuleProgram<'a> {
+    scope: ModuleScope,
+    source: SourceId,
+    program: &'a Program,
+}
+
 impl DeclarationIndex {
     pub(crate) fn from_root_and_modules(
         root: &Program,
@@ -1066,11 +1083,12 @@ impl DeclarationIndex {
         let mut index = Self::default();
         let modules = Self::module_programs(root, resolved);
         let mut source_extern_policies = SourceExternPolicies::default();
-        for (scope, program) in &modules {
+        for module in &modules {
             index.collect_module(
-                program,
-                scope.clone(),
-                Self::is_export_all_scope(scope, resolved),
+                module.program,
+                module.scope.clone(),
+                module.source,
+                Self::is_export_all_scope(&module.scope, resolved),
                 &mut source_extern_policies,
             );
         }
@@ -1084,14 +1102,22 @@ impl DeclarationIndex {
     fn module_programs<'a>(
         root: &'a Program,
         resolved: &'a ResolveResult,
-    ) -> Vec<(ModuleScope, &'a Program)> {
-        let mut modules = vec![(ModuleScope::from_module_id(&resolved.root), root)];
+    ) -> Vec<ModuleProgram<'a>> {
+        let mut modules = vec![ModuleProgram {
+            scope: ModuleScope::from_module_id(&resolved.root),
+            source: resolved.root_source,
+            program: root,
+        }];
         for group in &resolved.module_groups {
             for module in group {
                 if module.key == resolved.root {
                     continue;
                 }
-                modules.push((ModuleScope::from_module_id(&module.key), &module.program));
+                modules.push(ModuleProgram {
+                    scope: ModuleScope::from_module_id(&module.key),
+                    source: module.source,
+                    program: &module.program,
+                });
             }
         }
         modules
@@ -1145,7 +1171,9 @@ impl DeclarationIndex {
 
         let aggregate_keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
         for key in aggregate_keys {
-            let span = self.type_span_or_default(&key);
+            let Some(span) = self.type_span(&key) else {
+                continue;
+            };
             let Some(schema) = self.aggregates.get_mut(&key) else {
                 continue;
             };
@@ -1192,7 +1220,9 @@ impl DeclarationIndex {
 
         let enum_keys = self.enums.keys().cloned().collect::<Vec<_>>();
         for key in enum_keys {
-            let span = self.type_span_or_default(&key);
+            let Some(span) = self.type_span(&key) else {
+                continue;
+            };
             let Some(schema) = self.enums.get_mut(&key) else {
                 continue;
             };
@@ -1232,7 +1262,7 @@ impl DeclarationIndex {
 
         for index in 0..self.extends.len() {
             let origin = self.extends[index].origin.clone();
-            let span = self.extends[index].span;
+            let span = self.extends[index].span.byte();
             let extend = &mut self.extends[index];
             let generics = generic_context(
                 origin.clone(),
@@ -1274,7 +1304,7 @@ impl DeclarationIndex {
             for cast in &mut extend.cast_froms {
                 let site = DeclTypeSite {
                     module: origin.clone(),
-                    span: cast.span,
+                    span: cast.span.byte(),
                     generics: generics.clone(),
                 };
                 cast.source = f(site.clone(), cast.source.clone());
@@ -1290,11 +1320,13 @@ impl DeclarationIndex {
                 continue;
             };
             for value in decls.locals.values.values_mut() {
-                let span = self
+                let Some(span) = self
                     .value_spans
                     .get(&(value.module.clone(), value.name))
                     .copied()
-                    .unwrap_or(Span::new(0, 0));
+                else {
+                    continue;
+                };
                 let generics = match &value.decl {
                     ValueDecl::Func(sig) => generic_context(
                         value.module.clone(),
@@ -1322,8 +1354,8 @@ impl DeclarationIndex {
         errors
     }
 
-    pub(crate) fn type_span_or_default(&self, key: &NominalKey) -> Span {
-        self.type_spans.get(key).copied().unwrap_or(Span::new(0, 0))
+    pub(crate) fn type_span(&self, key: &NominalKey) -> Option<Span> {
+        self.type_spans.get(key).copied()
     }
 
     fn sync_value_projections(&mut self) {
@@ -1347,7 +1379,7 @@ impl DeclarationIndex {
         name: Ident,
         value: ResolvedValue,
         exported: bool,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> bool {
         if decls.locals.values.contains_key(&name) {
             self.errors.push(DeclError::DuplicateValue {
@@ -1361,7 +1393,9 @@ impl DeclarationIndex {
         if exported {
             decls.exports.insert_value(name, value);
         }
-        self.value_spans.insert((scope.clone(), name), span);
+        if let Some(span) = span {
+            self.value_spans.insert((scope.clone(), name), span.byte());
+        }
         true
     }
 
@@ -1372,7 +1406,7 @@ impl DeclarationIndex {
         name: Ident,
         key: NominalKey,
         exported: bool,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> bool {
         if decls.locals.types.contains_key(&name) {
             self.errors.push(DeclError::DuplicateType {
@@ -1389,7 +1423,7 @@ impl DeclarationIndex {
         true
     }
 
-    fn validate_to_string_method(&mut self, sig: &MethodSig, span: Span) {
+    fn validate_to_string_method(&mut self, sig: &MethodSig, span: SourceSpan) {
         let message = match sig.receiver {
             None => Some("to_string method must have a 'self' receiver"),
             Some(MethodReceiver::Var) => Some("to_string method must be 'self', not 'var self'"),
@@ -1402,8 +1436,10 @@ impl DeclarationIndex {
             Some(MethodReceiver::Value) => None,
         };
         if let Some(message) = message {
-            self.errors
-                .push(DeclError::InvalidToStringMethod { message, span });
+            self.errors.push(DeclError::InvalidToStringMethod {
+                message,
+                span: Some(span),
+            });
         }
     }
 
@@ -1411,6 +1447,7 @@ impl DeclarationIndex {
         &mut self,
         program: &Program,
         scope: ModuleScope,
+        source: SourceId,
         export_all: bool,
         source_extern_policies: &mut SourceExternPolicies,
     ) {
@@ -1423,6 +1460,7 @@ impl DeclarationIndex {
                 Stmt::Func(func_node) => {
                     let func = &func_node.node;
                     let policy = annotation::normalize_annotations(
+                        source,
                         &func.annotations,
                         annotation::AnnotationTarget::Func,
                         &mut self.errors,
@@ -1445,7 +1483,7 @@ impl DeclarationIndex {
                         func.name,
                         value,
                         exported,
-                        func_node.span,
+                        Some(SourceSpan::from_byte_span(source, func_node.span)),
                     );
                 }
                 Stmt::Aggregate(agg_node) => {
@@ -1460,6 +1498,7 @@ impl DeclarationIndex {
                         AggregateKind::DataRef => annotation::AnnotationTarget::DataRef,
                     };
                     let policy = annotation::normalize_annotations(
+                        source,
                         &agg.annotations,
                         target,
                         &mut self.errors,
@@ -1467,6 +1506,7 @@ impl DeclarationIndex {
                     let mut fields = HashMap::new();
                     for field in &agg.fields {
                         let policy = annotation::normalize_annotations(
+                            source,
                             &field.annotations,
                             annotation::AnnotationTarget::Field,
                             &mut self.errors,
@@ -1483,6 +1523,7 @@ impl DeclarationIndex {
                     let mut methods = HashMap::new();
                     for method in &agg.methods {
                         let policy = annotation::normalize_annotations(
+                            source,
                             &method.annotations,
                             annotation::AnnotationTarget::InlineMethod,
                             &mut self.errors,
@@ -1490,10 +1531,13 @@ impl DeclarationIndex {
                         if method.sig.name == Ident::new("to_string") {
                             if policy.has_internal() {
                                 self.errors.push(DeclError::InternalOnToString {
-                                    span: agg_node.span,
+                                    span: Some(SourceSpan::from_byte_span(source, agg_node.span)),
                                 });
                             }
-                            self.validate_to_string_method(&method.sig, agg_node.span);
+                            self.validate_to_string_method(
+                                &method.sig,
+                                SourceSpan::from_byte_span(source, agg_node.span),
+                            );
                         }
                         let mode = MethodMode::from_receiver(method.sig.receiver);
                         let method_key = MethodKey::new(method.sig.name, mode.surface());
@@ -1514,7 +1558,7 @@ impl DeclarationIndex {
                                     owner: key.clone(),
                                     name: method.sig.name,
                                     surface: entry.key().surface,
-                                    span: agg_node.span,
+                                    span: Some(SourceSpan::from_byte_span(source, agg_node.span)),
                                 });
                             }
                             Entry::Vacant(entry) => {
@@ -1528,7 +1572,7 @@ impl DeclarationIndex {
                         agg.name,
                         key.clone(),
                         exported,
-                        agg_node.span,
+                        Some(SourceSpan::from_byte_span(source, agg_node.span)),
                     ) {
                         self.type_spans.insert(key.clone(), agg_node.span);
                         self.aggregates.insert(
@@ -1551,6 +1595,7 @@ impl DeclarationIndex {
                         name: enm.name,
                     };
                     let policy = annotation::normalize_annotations(
+                        source,
                         &enm.annotations,
                         annotation::AnnotationTarget::Enum,
                         &mut self.errors,
@@ -1558,6 +1603,7 @@ impl DeclarationIndex {
                     let mut variants = HashMap::new();
                     for variant in &enm.variants {
                         let variant_policy = annotation::normalize_annotations(
+                            source,
                             &variant.annotations,
                             annotation::AnnotationTarget::Variant,
                             &mut self.errors,
@@ -1569,6 +1615,7 @@ impl DeclarationIndex {
                                 let mut field_map = HashMap::new();
                                 for f in fields {
                                     let policy = annotation::normalize_annotations(
+                                        source,
                                         &f.annotations,
                                         annotation::AnnotationTarget::Field,
                                         &mut self.errors,
@@ -1599,7 +1646,7 @@ impl DeclarationIndex {
                         enm.name,
                         key.clone(),
                         exported,
-                        enum_node.span,
+                        Some(SourceSpan::from_byte_span(source, enum_node.span)),
                     ) {
                         self.type_spans.insert(key.clone(), enum_node.span);
                         self.enums.insert(
@@ -1615,6 +1662,7 @@ impl DeclarationIndex {
                 Stmt::Const(const_node) => {
                     let c = &const_node.node;
                     let policy = annotation::normalize_annotations(
+                        source,
                         &c.annotations,
                         annotation::AnnotationTarget::Const,
                         &mut self.errors,
@@ -1633,11 +1681,12 @@ impl DeclarationIndex {
                         c.name,
                         value,
                         exported,
-                        const_node.span,
+                        Some(SourceSpan::from_byte_span(source, const_node.span)),
                     );
                 }
                 Stmt::ExternFunc(func_node) => {
                     let policy = annotation::normalize_annotations(
+                        source,
                         &func_node.node.annotations,
                         annotation::AnnotationTarget::ExternFunc,
                         &mut self.errors,
@@ -1648,6 +1697,7 @@ impl DeclarationIndex {
                 }
                 Stmt::ExternType(ty_node) => {
                     let policy = annotation::normalize_annotations(
+                        source,
                         &ty_node.node.annotations,
                         annotation::AnnotationTarget::ExternType,
                         &mut self.errors,
@@ -1671,6 +1721,7 @@ impl DeclarationIndex {
                     for method_node in &ext.methods {
                         let m = &method_node.node;
                         let policy = annotation::normalize_annotations(
+                            source,
                             &m.annotations,
                             annotation::AnnotationTarget::ExtendMethod,
                             &mut self.errors,
@@ -1700,7 +1751,7 @@ impl DeclarationIndex {
                             self.errors.push(DeclError::DuplicateExtendMethod {
                                 name: m.sig.name,
                                 surface: key.surface,
-                                span: method_node.span,
+                                span: Some(SourceSpan::from_byte_span(source, method_node.span)),
                             });
                         } else {
                             methods.insert(key, schema);
@@ -1712,7 +1763,7 @@ impl DeclarationIndex {
                         .map(|cast| CastConversionSchema {
                             source: cast.node.param.ty.clone(),
                             ret: cast.node.ret.clone(),
-                            span: cast.span,
+                            span: SourceSpan::from_byte_span(source, cast.span),
                         })
                         .collect();
                     self.extends.push(ExtendSchema {
@@ -1722,7 +1773,7 @@ impl DeclarationIndex {
                         generics,
                         methods,
                         cast_froms,
-                        span: extend_node.span,
+                        span: SourceSpan::from_byte_span(source, extend_node.span),
                     });
                 }
                 _ => {}
@@ -1763,9 +1814,11 @@ impl DeclarationIndex {
                 kind: NominalKind::Extern,
                 name,
             };
-            let span = ty.site.span.unwrap_or(Span::new(0, 0));
+            let span = ty.site.span;
             if self.insert_local_type(&mut decls, &scope, name, key.clone(), ty.exported, span) {
-                self.type_spans.insert(key.clone(), span);
+                if let Some(span) = span {
+                    self.type_spans.insert(key.clone(), span.byte());
+                }
                 let policy = source_policies
                     .and_then(|policies| policies.types.get(&(scope.clone(), name)))
                     .cloned()
@@ -1800,7 +1853,7 @@ impl DeclarationIndex {
                 name,
                 value,
                 func.exported,
-                func.site.span.unwrap_or(Span::new(0, 0)),
+                func.site.span,
             );
         }
 
@@ -1811,7 +1864,7 @@ impl DeclarationIndex {
         &mut self,
         current: &ModuleScope,
         ordinal: usize,
-        span: Span,
+        span: SourceSpan,
         resolved: &ResolveResult,
     ) -> Option<ImportTargetScope> {
         let current_module = module_id_for_scope(current);
@@ -1837,7 +1890,7 @@ impl DeclarationIndex {
         current: &ModuleScope,
         mut module: ModuleScope,
         path: &[Ident],
-        span: Span,
+        span: SourceSpan,
     ) -> Option<ImportTargetScope> {
         let mut default_name = None;
         for segment in path {
@@ -1849,7 +1902,7 @@ impl DeclarationIndex {
                         module: current.clone(),
                         imported: module,
                         name: *segment,
-                        span,
+                        span: Some(span),
                     });
                     return None;
                 }
@@ -1863,21 +1916,34 @@ impl DeclarationIndex {
 
     fn apply_public_import_reexports(
         &mut self,
-        modules: &[(ModuleScope, &Program)],
+        modules: &[ModuleProgram<'_>],
         resolved: &ResolveResult,
     ) {
-        for (scope, program) in modules {
-            let Some(exports) = self.modules.get(scope).map(|decls| decls.exports.clone()) else {
+        for module in modules {
+            let Some(exports) = self
+                .modules
+                .get(&module.scope)
+                .map(|decls| decls.exports.clone())
+            else {
                 continue;
             };
 
-            let mut builder =
-                ImportScopeBuilder::with_namespace(scope.clone(), exports, ImportMode::Reexport);
-            self.apply_program_imports(scope, program, resolved, &mut builder);
+            let mut builder = ImportScopeBuilder::with_namespace(
+                module.scope.clone(),
+                exports,
+                ImportMode::Reexport,
+            );
+            self.apply_program_imports(
+                &module.scope,
+                module.source,
+                module.program,
+                resolved,
+                &mut builder,
+            );
 
             let (exports, active_modules, errors) = builder.finish_reexport_scope();
             self.errors.extend(errors);
-            if let Some(decls) = self.modules.get_mut(scope) {
+            if let Some(decls) = self.modules.get_mut(&module.scope) {
                 decls.exports = exports;
                 decls.exported_active_modules = active_modules;
             }
@@ -1930,23 +1996,25 @@ impl DeclarationIndex {
         }
     }
 
-    fn build_import_scopes(
-        &mut self,
-        modules: &[(ModuleScope, &Program)],
-        resolved: &ResolveResult,
-    ) {
-        for (scope, program) in modules.iter().skip(1).chain(modules.first()) {
-            let mut builder = ImportScopeBuilder::new(scope.clone(), ImportMode::Import);
-            if let Some(decls) = self.modules.get(scope) {
+    fn build_import_scopes(&mut self, modules: &[ModuleProgram<'_>], resolved: &ResolveResult) {
+        for module in modules.iter().skip(1).chain(modules.first()) {
+            let mut builder = ImportScopeBuilder::new(module.scope.clone(), ImportMode::Import);
+            if let Some(decls) = self.modules.get(&module.scope) {
                 builder.seed_origins(&decls.locals, &BindingOrigin::Local);
             }
-            self.apply_core_prelude_import(scope, resolved, &mut builder);
-            self.apply_program_imports(scope, program, resolved, &mut builder);
+            self.apply_core_prelude_import(&module.scope, resolved, &mut builder);
+            self.apply_program_imports(
+                &module.scope,
+                module.source,
+                module.program,
+                resolved,
+                &mut builder,
+            );
             let (mut imports, errors) = builder.finish_import_scope();
             self.errors.extend(errors);
             imports.activate_imported_origins();
             self.expand_active_modules(&mut imports.active_modules);
-            if let Some(decls) = self.modules.get_mut(scope) {
+            if let Some(decls) = self.modules.get_mut(&module.scope) {
                 decls.imports = imports;
             }
         }
@@ -1968,13 +2036,14 @@ impl DeclarationIndex {
         let Some(decls) = self.modules.get(&core) else {
             return;
         };
-        builder.copy_wildcard_members(&decls.exports, &core, Span::new(0, 0));
+        builder.copy_wildcard_members(&decls.exports, &core, None);
         builder.active_modules.insert(core);
     }
 
     fn apply_program_imports(
         &mut self,
         scope: &ModuleScope,
+        source: SourceId,
         program: &Program,
         resolved: &ResolveResult,
         builder: &mut ImportScopeBuilder,
@@ -1990,8 +2059,9 @@ impl DeclarationIndex {
             if builder.mode == ImportMode::Reexport && !is_public {
                 continue;
             }
+            let import_span = SourceSpan::from_byte_span(source, import.span);
             let Some(target) =
-                self.resolve_import_target(scope, import_ordinal, import.span, resolved)
+                self.resolve_import_target(scope, import_ordinal, import_span, resolved)
             else {
                 continue;
             };
@@ -2003,7 +2073,7 @@ impl DeclarationIndex {
                 target.module,
                 target.default_name,
                 dep,
-                import.span,
+                Some(import_span),
                 validate_members,
             );
         }
@@ -2885,7 +2955,7 @@ fn match_cast_conversion(
     target_template: &Type,
     target: &Type,
 ) -> Option<GenericTemplateMatch> {
-    let span = Span::new(0, 0);
+    let span = None;
     if generics.is_empty() {
         return (source_template == source && target_template == target)
             .then(|| Ok(GenericArgs::default()));

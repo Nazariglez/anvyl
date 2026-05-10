@@ -3,7 +3,8 @@ use std::{collections::HashSet, fmt};
 use super::decls::DeclError;
 use crate::{
     ast::{AnnotationArgs, AnnotationNode, Ident, Lit},
-    span::Span,
+    source::SourceId,
+    span::{SourceSpan, Span},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -140,6 +141,7 @@ fn spec(name: Ident) -> Option<AnnotationSpec> {
 }
 
 pub(crate) fn normalize_annotations(
+    source: SourceId,
     annotations: &[AnnotationNode],
     target: AnnotationTarget,
     errors: &mut Vec<DeclError>,
@@ -149,11 +151,9 @@ pub(crate) fn normalize_annotations(
 
     for annotation in annotations {
         let name = annotation.node.name;
+        let span = Some(SourceSpan::from_byte_span(source, annotation.span));
         let Some(spec) = spec(name) else {
-            errors.push(DeclError::UnknownAnnotation {
-                name,
-                span: annotation.span,
-            });
+            errors.push(DeclError::UnknownAnnotation { name, span });
             continue;
         };
 
@@ -162,16 +162,13 @@ pub(crate) fn normalize_annotations(
                 name,
                 target: target.to_string(),
                 valid_targets: valid_targets(spec.targets),
-                span: annotation.span,
+                span,
             });
             continue;
         }
 
         if !seen.insert(name) {
-            errors.push(DeclError::DuplicateAnnotation {
-                name,
-                span: annotation.span,
-            });
+            errors.push(DeclError::DuplicateAnnotation { name, span });
             continue;
         }
 
@@ -179,6 +176,7 @@ pub(crate) fn normalize_annotations(
             &annotation.node.args,
             name,
             spec.args,
+            source,
             annotation.span,
             errors,
         ) else {
@@ -203,6 +201,7 @@ fn annotation_reason(
     args: &AnnotationArgs,
     name: Ident,
     shape: ArgShape,
+    source: SourceId,
     span: Span,
     errors: &mut Vec<DeclError>,
 ) -> Option<AnnotationReason> {
@@ -212,7 +211,7 @@ fn annotation_reason(
             errors.push(DeclError::InvalidAnnotationArgs {
                 name,
                 message: "this annotation does not accept arguments".to_string(),
-                span,
+                span: Some(SourceSpan::from_byte_span(source, span)),
             });
             None
         }
@@ -225,7 +224,7 @@ fn annotation_reason(
             errors.push(DeclError::InvalidAnnotationArgs {
                 name,
                 message: "expected no arguments or a string argument".to_string(),
-                span,
+                span: Some(SourceSpan::from_byte_span(source, span)),
             });
             None
         }

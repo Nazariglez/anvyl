@@ -9,7 +9,7 @@ use chumsky::{
 };
 use internment::Intern;
 
-use crate::{ast, span::Span};
+use crate::{ast, source::SourceId, span::SourceSpan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -32,7 +32,14 @@ pub enum Token {
     DocComment(Intern<String>),
 }
 
-pub type SpannedToken = (Token, Span);
+pub type LexedToken = (Token, SourceSpan);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenStream {
+    pub source: SourceId,
+    pub eoi: SourceSpan,
+    pub tokens: Vec<LexedToken>,
+}
 
 impl Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -254,30 +261,44 @@ impl Display for Op {
     }
 }
 
-pub fn tokenize(program: &str) -> Result<Vec<SpannedToken>, Vec<Rich<'_, char>>> {
-    lexer().parse(program).into_result()
+pub fn tokenize(source: SourceId, text: &str) -> Result<TokenStream, Vec<Rich<'_, char>>> {
+    tokenize_at(source, text, 0)
 }
 
 pub fn is_source_ident(text: &str) -> bool {
-    let Ok(tokens) = tokenize(text) else {
-        return false;
-    };
-
     matches!(
-        tokens.as_slice(),
-        [(Token::Ident(_), span)] if span.start == 0 && span.end == text.len()
+        ident().then_ignore(end()).parse(text).into_result(),
+        Ok(Token::Ident(_))
     )
 }
 
 type Extra<'src> = extra::Full<Rich<'src, char>, (), ()>;
 type LexErr<'src> = Rich<'src, char>;
 
-fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<SpannedToken>, Extra<'src>> {
+fn tokenize_at(
+    source: SourceId,
+    text: &str,
+    base_offset: usize,
+) -> Result<TokenStream, Vec<Rich<'_, char>>> {
+    lexer(source, base_offset)
+        .parse(text)
+        .into_result()
+        .map(|tokens| TokenStream {
+            source,
+            eoi: SourceSpan::empty(source, base_offset + text.len()),
+            tokens,
+        })
+}
+
+fn lexer<'src>(
+    source: SourceId,
+    base_offset: usize,
+) -> impl Parser<'src, &'src str, Vec<LexedToken>, Extra<'src>> {
     choice((
-        doc_comment(),
+        doc_comment(source, base_offset),
         line_comment().to(vec![]),
-        string_literal(),
-        token().map(|t| vec![t]),
+        string_literal(source, base_offset),
+        token(source, base_offset).map(|t| vec![t]),
     ))
     .padded()
     .repeated()
@@ -286,17 +307,16 @@ fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<SpannedToken>, Extra<'src>>
     .then_ignore(end())
 }
 
-fn token<'src>() -> impl Parser<'src, &'src str, SpannedToken, Extra<'src>> {
-    choice((delimiter(), literal(), ident(), op(), punctuation())).map_with(|tok, e| {
-        let span = e.span();
-        (
-            tok,
-            Span {
-                start: span.start,
-                end: span.end,
-            },
-        )
-    })
+fn token<'src>(
+    source: SourceId,
+    base_offset: usize,
+) -> impl Parser<'src, &'src str, LexedToken, Extra<'src>> {
+    choice((delimiter(), literal(), ident(), op(), punctuation()))
+        .map_with(move |tok, e| (tok, source_span(source, base_offset, e.span())))
+}
+
+fn source_span(source: SourceId, base_offset: usize, span: SimpleSpan<usize>) -> SourceSpan {
+    SourceSpan::new(source, base_offset + span.start, base_offset + span.end)
 }
 
 fn scan_escape<'src, 'p>(
@@ -413,22 +433,12 @@ fn scan_interp_body<'src, 'p>(
 fn tokenize_interp_expr<'src, 'p>(
     input: &mut InputRef<'src, 'p, &'src str, Extra<'src>>,
     str_open: &Cursor<'src, 'p, &'src str>,
+    source: SourceId,
     expr_str: &str,
     expr_start_offset: usize,
-) -> Result<Vec<SpannedToken>, LexErr<'src>> {
-    match tokenize(expr_str) {
-        Ok(expr_tokens) => Ok(expr_tokens
-            .into_iter()
-            .map(|(tok, span)| {
-                (
-                    tok,
-                    Span {
-                        start: span.start + expr_start_offset,
-                        end: span.end + expr_start_offset,
-                    },
-                )
-            })
-            .collect()),
+) -> Result<Vec<LexedToken>, LexErr<'src>> {
+    match tokenize_at(source, expr_str, expr_start_offset) {
+        Ok(expr_tokens) => Ok(expr_tokens.tokens),
         Err(_) => Err(Rich::custom(
             input.span_since(str_open),
             "invalid expression in string interpolation",
@@ -436,154 +446,156 @@ fn tokenize_interp_expr<'src, 'p>(
     }
 }
 
-fn string_literal<'src>() -> impl Parser<'src, &'src str, Vec<SpannedToken>, Extra<'src>> {
-    custom(|input: &mut InputRef<'src, '_, &'src str, Extra<'src>>| {
-        let str_open = input.cursor();
-        let formatted = match input.peek() {
-            Some('"') => {
-                input.skip();
-                false
-            }
-            Some('f') => {
-                let checkpoint = input.save();
-                input.skip(); // consume 'f'
-                if let Some('"') = input.peek() {
-                    input.skip(); // consume '"'
-                    true
-                } else {
-                    input.rewind(checkpoint);
+fn string_literal<'src>(
+    source: SourceId,
+    base_offset: usize,
+) -> impl Parser<'src, &'src str, Vec<LexedToken>, Extra<'src>> {
+    custom(
+        move |input: &mut InputRef<'src, '_, &'src str, Extra<'src>>| {
+            let str_open = input.cursor();
+            let formatted = match input.peek() {
+                Some('"') => {
+                    input.skip();
+                    false
+                }
+                Some('f') => {
+                    let checkpoint = input.save();
+                    input.skip(); // consume 'f'
+                    if let Some('"') = input.peek() {
+                        input.skip(); // consume '"'
+                        true
+                    } else {
+                        input.rewind(checkpoint);
+                        return Err(Rich::custom(
+                            input.span_since(&str_open),
+                            "expected string literal",
+                        ));
+                    }
+                }
+                _ => {
                     return Err(Rich::custom(
                         input.span_since(&str_open),
                         "expected string literal",
                     ));
                 }
-            }
-            _ => {
-                return Err(Rich::custom(
-                    input.span_since(&str_open),
-                    "expected string literal",
-                ));
-            }
-        };
+            };
 
-        let mut tokens: Vec<SpannedToken> = vec![];
-        let mut text_buf = String::new();
-        let mut text_src_start = input.span_since(&str_open).end;
-        let mut is_interpolated = false;
+            let mut tokens: Vec<LexedToken> = vec![];
+            let mut text_buf = String::new();
+            let mut text_src_start = input.span_since(&str_open).end;
+            let mut is_interpolated = false;
 
-        loop {
-            let char_cursor = input.cursor();
-            match input.next() {
-                None => {
-                    return Err(Rich::custom(
-                        input.span_since(&str_open),
-                        "unterminated string literal",
-                    ));
-                }
-                Some('"') => break,
-                Some('\\') => scan_escape(input, &char_cursor, &mut text_buf, formatted)?,
-                Some('{') if formatted => {
-                    is_interpolated = true;
-                    let after_brace = input.span_since(&str_open);
-                    let brace_pos = after_brace.end - 1;
-
-                    if !text_buf.is_empty() {
-                        tokens.push((
-                            Token::Interp(InterpToken::Text(Intern::new(std::mem::take(
-                                &mut text_buf,
-                            )))),
-                            Span {
-                                start: text_src_start,
-                                end: brace_pos,
-                            },
+            loop {
+                let char_cursor = input.cursor();
+                match input.next() {
+                    None => {
+                        return Err(Rich::custom(
+                            input.span_since(&str_open),
+                            "unterminated string literal",
                         ));
                     }
-                    tokens.push((
-                        Token::Interp(InterpToken::ExprStart),
-                        Span {
-                            start: brace_pos,
-                            end: brace_pos + 1,
-                        },
-                    ));
+                    Some('"') => break,
+                    Some('\\') => scan_escape(input, &char_cursor, &mut text_buf, formatted)?,
+                    Some('{') if formatted => {
+                        is_interpolated = true;
+                        let after_brace = input.span_since(&str_open);
+                        let brace_pos = after_brace.end - 1;
 
-                    let expr_start_offset = after_brace.end;
-                    let (expr_str, fmt_spec) = scan_interp_body(input, &str_open)?;
-
-                    let after_close = input.span_since(&str_open);
-                    let close_pos = after_close.end - 1;
-
-                    let expr_tokens =
-                        tokenize_interp_expr(input, &str_open, &expr_str, expr_start_offset)?;
-                    tokens.extend(expr_tokens);
-
-                    let expr_end_pos = expr_start_offset + expr_str.len();
-                    tokens.push((
-                        Token::Interp(InterpToken::ExprEnd),
-                        Span {
-                            start: expr_end_pos,
-                            end: expr_end_pos + 1,
-                        },
-                    ));
-
-                    if let Some(spec) = fmt_spec {
-                        let spec_start = expr_end_pos + 1;
+                        if !text_buf.is_empty() {
+                            tokens.push((
+                                Token::Interp(InterpToken::Text(Intern::new(std::mem::take(
+                                    &mut text_buf,
+                                )))),
+                                SourceSpan::new(
+                                    source,
+                                    base_offset + text_src_start,
+                                    base_offset + brace_pos,
+                                ),
+                            ));
+                        }
                         tokens.push((
-                            Token::Interp(InterpToken::FormatSpec(spec)),
-                            Span {
-                                start: spec_start,
-                                end: close_pos,
-                            },
+                            Token::Interp(InterpToken::ExprStart),
+                            SourceSpan::new(
+                                source,
+                                base_offset + brace_pos,
+                                base_offset + brace_pos + 1,
+                            ),
                         ));
+
+                        let expr_start_offset = after_brace.end;
+                        let (expr_str, fmt_spec) = scan_interp_body(input, &str_open)?;
+
+                        let after_close = input.span_since(&str_open);
+                        let close_pos = after_close.end - 1;
+
+                        let expr_tokens = tokenize_interp_expr(
+                            input,
+                            &str_open,
+                            source,
+                            &expr_str,
+                            base_offset + expr_start_offset,
+                        )?;
+                        tokens.extend(expr_tokens);
+
+                        let expr_end_pos = expr_start_offset + expr_str.len();
+                        tokens.push((
+                            Token::Interp(InterpToken::ExprEnd),
+                            SourceSpan::new(
+                                source,
+                                base_offset + expr_end_pos,
+                                base_offset + expr_end_pos + 1,
+                            ),
+                        ));
+
+                        if let Some(spec) = fmt_spec {
+                            let spec_start = expr_end_pos + 1;
+                            tokens.push((
+                                Token::Interp(InterpToken::FormatSpec(spec)),
+                                SourceSpan::new(
+                                    source,
+                                    base_offset + spec_start,
+                                    base_offset + close_pos,
+                                ),
+                            ));
+                        }
+
+                        text_src_start = after_close.end;
                     }
-
-                    text_src_start = after_close.end;
+                    Some('{') => text_buf.push('{'),
+                    Some(c) => text_buf.push(c),
                 }
-                Some('{') => text_buf.push('{'),
-                Some(c) => text_buf.push(c),
             }
-        }
 
-        let full = input.span_since(&str_open);
-        let full_span = Span {
-            start: full.start,
-            end: full.end,
-        };
+            let full = input.span_since(&str_open);
+            let full_span = source_span(source, base_offset, full);
 
-        if is_interpolated {
-            if !text_buf.is_empty() {
-                let text_end = full_span.end - 1;
-                tokens.push((
-                    Token::Interp(InterpToken::Text(Intern::new(text_buf))),
-                    Span {
-                        start: text_src_start,
-                        end: text_end,
-                    },
+            if is_interpolated {
+                if !text_buf.is_empty() {
+                    let text_end = full_span.end() - 1;
+                    tokens.push((
+                        Token::Interp(InterpToken::Text(Intern::new(text_buf))),
+                        SourceSpan::new(source, base_offset + text_src_start, text_end),
+                    ));
+                }
+                let prefix_len = if formatted { 2 } else { 1 };
+                let mut result = vec![(
+                    Token::Interp(InterpToken::Start),
+                    SourceSpan::new(source, full_span.start(), full_span.start() + prefix_len),
+                )];
+                result.extend(tokens);
+                result.push((
+                    Token::Interp(InterpToken::End),
+                    SourceSpan::new(source, full_span.end() - 1, full_span.end()),
                 ));
+                Ok(result)
+            } else {
+                Ok(vec![(
+                    Token::Literal(LitToken::String(Intern::new(text_buf))),
+                    full_span,
+                )])
             }
-            let prefix_len = if formatted { 2 } else { 1 };
-            let mut result = vec![(
-                Token::Interp(InterpToken::Start),
-                Span {
-                    start: full_span.start,
-                    end: full_span.start + prefix_len,
-                },
-            )];
-            result.extend(tokens);
-            result.push((
-                Token::Interp(InterpToken::End),
-                Span {
-                    start: full_span.end - 1,
-                    end: full_span.end,
-                },
-            ));
-            Ok(result)
-        } else {
-            Ok(vec![(
-                Token::Literal(LitToken::String(Intern::new(text_buf))),
-                full_span,
-            )])
-        }
-    })
+        },
+    )
 }
 
 fn delimiter<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
@@ -973,19 +985,18 @@ fn op<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
     complex.or(simple).map(Token::Op)
 }
 
-fn doc_comment<'src>() -> impl Parser<'src, &'src str, Vec<SpannedToken>, Extra<'src>> {
+fn doc_comment<'src>(
+    source: SourceId,
+    base_offset: usize,
+) -> impl Parser<'src, &'src str, Vec<LexedToken>, Extra<'src>> {
     just("///")
         .then_ignore(just("/").rewind().not())
         .ignore_then(none_of("\n").repeated().collect::<String>())
-        .map_with(|content, e| -> Vec<SpannedToken> {
-            let span: SimpleSpan<usize> = e.span();
+        .map_with(move |content, e| -> Vec<LexedToken> {
             let stripped = content.strip_prefix(' ').unwrap_or(&content).to_string();
             vec![(
                 Token::DocComment(Intern::new(stripped)),
-                Span {
-                    start: span.start,
-                    end: span.end,
-                },
+                source_span(source, base_offset, e.span()),
             )]
         })
 }
@@ -1011,18 +1022,29 @@ fn punctuation<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::{SourceKind, SourceTable};
+
+    fn source_id(src: &str) -> SourceId {
+        let mut sources = SourceTable::default();
+        sources.add(SourceKind::Virtual, "test", None, src)
+    }
+
+    fn tokenize_test(src: &str) -> Result<TokenStream, Vec<Rich<'_, char>>> {
+        tokenize(source_id(src), src)
+    }
 
     fn tokenize_string(src: &str) -> Result<String, ()> {
-        let tokens = tokenize(src).map_err(|_| ())?;
-        match tokens.into_iter().next() {
+        let tokens = tokenize_test(src).map_err(|_| ())?;
+        match tokens.tokens.into_iter().next() {
             Some((Token::Literal(LitToken::String(s)), _)) => Ok(s.to_string()),
             _ => Err(()),
         }
     }
 
     fn tokenize_tokens(src: &str) -> Vec<Token> {
-        tokenize(src)
+        tokenize_test(src)
             .unwrap_or_else(|_| panic!("tokenize failed for: {src}"))
+            .tokens
             .into_iter()
             .map(|(t, _)| t)
             .collect()
@@ -1030,6 +1052,49 @@ mod tests {
 
     fn ident_tok(name: &str) -> Token {
         Token::Ident(ast::Ident(Intern::new(name.to_string())))
+    }
+
+    #[test]
+    fn token_stream_tracks_eof_span() {
+        let stream = tokenize_test("let x = 1;").unwrap();
+
+        assert_eq!(stream.eoi, SourceSpan::empty(stream.source, 10));
+    }
+
+    #[test]
+    fn token_spans_use_byte_offsets_after_non_ascii() {
+        let stream = tokenize_test("// é\nlet x = 1;").unwrap();
+
+        assert_eq!(stream.tokens[0].0, Token::Keyword(Keyword::Let));
+        assert_eq!(stream.tokens[0].1, SourceSpan::new(stream.source, 6, 9));
+    }
+
+    #[test]
+    fn interpolation_offsets_are_source_offsets() {
+        let stream = tokenize_test(r#"f"a {x} b""#).unwrap();
+        let spans = stream
+            .tokens
+            .iter()
+            .map(|(_, span)| span.byte())
+            .collect::<Vec<_>>();
+
+        assert_eq!(spans[0], crate::span::ByteSpan::new(0, 2));
+        assert_eq!(spans[1], crate::span::ByteSpan::new(2, 4));
+        assert_eq!(spans[2], crate::span::ByteSpan::new(4, 5));
+        assert_eq!(spans[3], crate::span::ByteSpan::new(5, 6));
+        assert_eq!(spans[4], crate::span::ByteSpan::new(6, 7));
+        assert_eq!(spans[5], crate::span::ByteSpan::new(7, 9));
+        assert_eq!(spans[6], crate::span::ByteSpan::new(9, 10));
+    }
+
+    #[test]
+    fn interpolation_expression_offsets_include_non_ascii_bytes() {
+        let stream = tokenize_test("f\"{é + x}\"").unwrap();
+
+        assert_eq!(stream.tokens[2].0, ident_tok("é"));
+        assert_eq!(stream.tokens[2].1, SourceSpan::new(stream.source, 3, 5));
+        assert_eq!(stream.tokens[4].0, ident_tok("x"));
+        assert_eq!(stream.tokens[4].1, SourceSpan::new(stream.source, 8, 9));
     }
 
     #[test]
@@ -1095,7 +1160,7 @@ mod tests {
 
     #[test]
     fn test_str_brace_plain_err() {
-        assert!(tokenize(r#""\{""#).is_err());
+        assert!(tokenize_test(r#""\{""#).is_err());
     }
 
     #[test]
@@ -1110,7 +1175,7 @@ mod tests {
 
     #[test]
     fn test_str_invalid_escape_err() {
-        assert!(tokenize(r#""hello\z""#).is_err());
+        assert!(tokenize_test(r#""hello\z""#).is_err());
     }
 
     #[test]
@@ -1225,7 +1290,7 @@ mod tests {
 
     #[test]
     fn test_fstr_unterminated_err() {
-        assert!(tokenize(r#"f"hello {oops""#).is_err());
+        assert!(tokenize_test(r#"f"hello {oops""#).is_err());
     }
 
     fn fmt_spec(s: &str) -> Token {
@@ -1348,17 +1413,17 @@ mod tests {
     }
 
     fn tokenize_lit(src: &str) -> Result<LitToken, ()> {
-        let tokens = tokenize(src).map_err(|_| ())?;
-        match tokens.into_iter().next() {
+        let tokens = tokenize_test(src).map_err(|_| ())?;
+        match tokens.tokens.into_iter().next() {
             Some((Token::Literal(lit), _)) => Ok(lit),
             _ => Err(()),
         }
     }
 
     fn all_tokens(src: &str) -> Result<Vec<Token>, ()> {
-        tokenize(src)
+        tokenize_test(src)
             .map_err(|_| ())
-            .map(|ts| ts.into_iter().map(|(t, _)| t).collect())
+            .map(|stream| stream.tokens.into_iter().map(|(t, _)| t).collect())
     }
 
     #[test]
@@ -1400,17 +1465,17 @@ mod tests {
 
     #[test]
     fn test_underscore_consecutive_err() {
-        assert!(tokenize("1__000").is_err());
+        assert!(tokenize_test("1__000").is_err());
     }
 
     #[test]
     fn test_underscore_trailing_err() {
-        assert!(tokenize("1_").is_err());
+        assert!(tokenize_test("1_").is_err());
     }
 
     #[test]
     fn test_underscore_before_dot_err() {
-        assert!(tokenize("1_.5").is_err());
+        assert!(tokenize_test("1_.5").is_err());
     }
 
     #[test]
@@ -1588,42 +1653,42 @@ mod tests {
 
     #[test]
     fn test_hex_invalid_digit_err() {
-        assert!(tokenize("0xZZ").is_err());
+        assert!(tokenize_test("0xZZ").is_err());
     }
 
     #[test]
     fn test_bin_invalid_digit_err() {
-        assert!(tokenize("0b12").is_err());
+        assert!(tokenize_test("0b12").is_err());
     }
 
     #[test]
     fn test_oct_invalid_digit_err() {
-        assert!(tokenize("0o89").is_err());
+        assert!(tokenize_test("0o89").is_err());
     }
 
     #[test]
     fn test_hex_empty_body_err() {
-        assert!(tokenize("0x ").is_err());
+        assert!(tokenize_test("0x ").is_err());
     }
 
     #[test]
     fn test_bin_empty_body_err() {
-        assert!(tokenize("0b ").is_err());
+        assert!(tokenize_test("0b ").is_err());
     }
 
     #[test]
     fn test_oct_empty_body_err() {
-        assert!(tokenize("0o ").is_err());
+        assert!(tokenize_test("0o ").is_err());
     }
 
     #[test]
     fn test_hex_underscore_consecutive_err() {
-        assert!(tokenize("0xFF__FF").is_err());
+        assert!(tokenize_test("0xFF__FF").is_err());
     }
 
     #[test]
     fn test_hex_underscore_trailing_err() {
-        assert!(tokenize("0xFF_").is_err());
+        assert!(tokenize_test("0xFF_").is_err());
     }
 
     #[test]

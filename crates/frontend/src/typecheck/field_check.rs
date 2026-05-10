@@ -46,7 +46,7 @@ pub(super) fn check(
     schema: &HashMap<Ident, FieldSchema>,
     owner: &FieldOwner,
     missing: MissingFields,
-    span: Span,
+    span: Option<Span>,
     tc: &mut TypeChecker,
 ) -> FieldShape {
     let mut seen = HashSet::new();
@@ -57,7 +57,7 @@ pub(super) fn check(
         if !seen.insert(field.name) {
             tc.push_error(TypeError::DuplicateField {
                 name: field.name,
-                span: field.span,
+                span: tc.error_span(field.span),
             });
             failed = true;
             continue;
@@ -81,6 +81,9 @@ pub(super) fn check(
             if seen.contains(name) || missing_default_ok(missing, field) {
                 continue;
             }
+            let Some(span) = span else {
+                continue;
+            };
             push_missing(owner, *name, span, tc);
             failed = true;
         }
@@ -107,14 +110,14 @@ fn push_unknown(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecke
             ty: ty.clone(),
             member: name,
             kind: MemberAccessKind::Field,
-            span,
+            span: tc.error_span(span),
         }),
         FieldOwner::Variant { key, variant } => {
             tc.push_error(TypeError::UnknownVariantField {
                 enum_name: key.name,
                 variant: *variant,
                 field: name,
-                span,
+                span: tc.error_span(span),
             });
         }
     }
@@ -122,13 +125,16 @@ fn push_unknown(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecke
 
 fn push_missing(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecker) {
     match owner {
-        FieldOwner::Nominal(_) => tc.push_error(TypeError::MissingField { name, span }),
+        FieldOwner::Nominal(_) => tc.push_error(TypeError::MissingField {
+            name,
+            span: tc.error_span(span),
+        }),
         FieldOwner::Variant { key, variant } => {
             tc.push_error(TypeError::MissingVariantField {
                 enum_name: key.name,
                 variant: *variant,
                 field: name,
-                span,
+                span: tc.error_span(span),
             });
         }
     }

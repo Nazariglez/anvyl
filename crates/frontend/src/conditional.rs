@@ -33,7 +33,7 @@ pub(crate) fn filter_with_context(
                     taken: cond,
                     else_state: ElseState::Open,
                 });
-                blank_line(line, &mut out);
+                mask_line(line, &mut out);
             }
             Some(Directive::Elif(cond)) => {
                 let cond = eval_condition(cond, ctx, &mut errors).unwrap_or(false);
@@ -47,7 +47,7 @@ pub(crate) fn filter_with_context(
                     }
                     None => errors.push("#elif without matching #if".into()),
                 }
-                blank_line(line, &mut out);
+                mask_line(line, &mut out);
             }
             Some(Directive::Else) => {
                 match stack.last_mut() {
@@ -61,22 +61,24 @@ pub(crate) fn filter_with_context(
                     }
                     None => errors.push("#else without matching #if".into()),
                 }
-                blank_line(line, &mut out);
+                mask_line(line, &mut out);
             }
             Some(Directive::End) => {
                 if stack.pop().is_none() {
                     errors.push("#end without matching #if".into());
                 }
-                blank_line(line, &mut out);
+                mask_line(line, &mut out);
             }
             None if active(&stack) => out.push_str(line),
-            None => blank_line(line, &mut out),
+            None => mask_line(line, &mut out),
         }
     }
 
     if !stack.is_empty() {
         errors.push("unterminated #if".into());
     }
+
+    debug_assert_eq!(out.len(), source.len());
 
     if errors.is_empty() {
         Ok(out)
@@ -89,9 +91,12 @@ fn active(stack: &[Frame]) -> bool {
     stack.last().is_none_or(|frame| frame.active)
 }
 
-fn blank_line(line: &str, out: &mut String) {
-    if line.ends_with('\n') {
-        out.push('\n');
+fn mask_line(line: &str, out: &mut String) {
+    for byte in line.bytes() {
+        match byte {
+            b'\r' | b'\n' => out.push(byte as char),
+            _ => out.push(' '),
+        }
     }
 }
 
@@ -177,12 +182,50 @@ mod tests {
         filter(source).expect("filter failed")
     }
 
+    fn assert_masked(out: &str, source: &str, text: &str) {
+        let start = source.find(text).expect("missing segment");
+        let end = start + text.len();
+        assert!(out[start..end].bytes().all(|byte| byte == b' '));
+    }
+
     #[test]
-    fn removes_inactive_branch() {
+    fn masks_inactive_branch_without_shifting_offsets() {
         let source = "fn main() {\n#if profile(release)\nbroken();\n#else\nok();\n#end\n}\n";
         let out = filtered(source);
-        assert!(!out.contains("broken"));
+        assert_eq!(out.len(), source.len());
+        assert_masked(&out, source, "#if profile(release)");
+        assert_masked(&out, source, "broken();");
+        assert_masked(&out, source, "#else");
+        assert_masked(&out, source, "#end");
         assert!(out.contains("ok();"));
+    }
+
+    #[test]
+    fn masks_multibyte_inactive_bytes_and_preserves_crlf() {
+        let source = "#if profile(release)\r\né();\r\n#else\r\nok();\r\n#end\r\n";
+        let out = filtered(source);
+
+        assert_eq!(out.len(), source.len());
+        assert_eq!(out.matches("\r\n").count(), source.matches("\r\n").count());
+        assert_masked(&out, source, "é();");
+        assert!(out.contains("ok();"));
+    }
+
+    #[test]
+    fn filtered_spans_still_slice_original_source() {
+        let source = "#if profile(release)\nééé();\n#end\nfn main( {}\n";
+        let out = filtered(source);
+        let mut sources = crate::source::SourceTable::default();
+        let source_id = sources.add(crate::source::SourceKind::Virtual, "test", None, source);
+        let tokens = crate::lexer::tokenize(source_id, &out).expect("lex failed");
+        let fn_span = tokens.tokens[0].1.byte();
+        let errors = crate::parser::parse_ast(&tokens).expect_err("expected parse error");
+
+        assert_eq!(&source[fn_span.start..fn_span.end], "fn");
+        assert!(errors.iter().any(|error| {
+            let span = error.span().byte();
+            &source[span.start..span.end] == "{"
+        }));
     }
 
     #[test]

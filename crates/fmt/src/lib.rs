@@ -1,7 +1,12 @@
 mod printer;
 mod trivia;
 
-use anvyx_frontend::{lexer, parser};
+use anvyx_frontend::{
+    lexer::{self, Token},
+    parser,
+    source::{SourceKind, SourceTable},
+    span::SourceSpan,
+};
 use chumsky::error::{Rich, RichPattern};
 
 pub enum FormatError {
@@ -48,14 +53,14 @@ fn format_lex_errors(errors: &[Rich<'_, char>]) -> String {
         .join("\n")
 }
 
-fn format_parse_errors(errors: &[Rich<'_, lexer::SpannedToken>]) -> String {
+fn format_parse_errors(errors: &[Rich<'_, Token, SourceSpan>]) -> String {
     errors
         .iter()
         .take(5)
         .map(|e| {
             let found = e
                 .found()
-                .map_or("end of input".to_string(), |(tok, _)| format!("{tok:?}"));
+                .map_or("end of input".to_string(), |tok| format!("{tok:?}"));
             let context = extract_context_label(e);
             let prefix = if context.is_empty() {
                 String::new()
@@ -68,7 +73,7 @@ fn format_parse_errors(errors: &[Rich<'_, lexer::SpannedToken>]) -> String {
         .join("\n")
 }
 
-fn extract_context_label<T>(rich: &Rich<'_, T>) -> String {
+fn extract_context_label<T, S>(rich: &Rich<'_, T, S>) -> String {
     rich.contexts()
         .filter_map(|(pat, _)| match pat {
             RichPattern::Label(s) => Some(s.to_string()),
@@ -79,14 +84,16 @@ fn extract_context_label<T>(rich: &Rich<'_, T>) -> String {
 }
 
 pub fn format_source(source: &str) -> Result<String, FormatError> {
-    let tokens =
-        lexer::tokenize(source).map_err(|errors| FormatError::Lex(format_lex_errors(&errors)))?;
+    let mut sources = SourceTable::default();
+    let source_id = sources.add(SourceKind::Virtual, "formatter", None, source);
+    let tokens = lexer::tokenize(source_id, source)
+        .map_err(|errors| FormatError::Lex(format_lex_errors(&errors)))?;
 
     let ast = parser::parse_ast(&tokens)
         .map_err(|errors| FormatError::Parse(format_parse_errors(&errors)))?;
 
-    let trivia = trivia::scan_trivia(source, &tokens);
-    let mut printer = printer::Printer::new(source, &tokens, &trivia);
+    let trivia = trivia::scan_trivia(source, &tokens.tokens);
+    let mut printer = printer::Printer::new(source, &trivia);
     printer.format_program(&ast);
     Ok(printer.finish())
 }
@@ -102,7 +109,9 @@ mod tests {
 
     fn formatted_program(source: &str) -> anvyx_frontend::ast::Program {
         let formatted = format_source(source).expect("format failed");
-        let tokens = lexer::tokenize(&formatted).expect("lex failed");
+        let mut sources = SourceTable::default();
+        let source = sources.add(SourceKind::Virtual, "formatter", None, formatted.as_str());
+        let tokens = lexer::tokenize(source, &formatted).expect("lex failed");
         parser::parse_ast(&tokens).expect("parse failed")
     }
 
@@ -118,6 +127,14 @@ mod tests {
         assert!(formatted.contains("// comment"));
         assert!(formatted.contains("fn foo()"));
         assert!(formatted.contains("fn bar()"));
+    }
+
+    #[test]
+    fn preserves_comment_after_non_ascii() {
+        assert_fmt(
+            "fn main() { let café = 1; // comment\ncafé; }",
+            "fn main() {\n    let café = 1; // comment\n    café;\n}\n",
+        );
     }
 
     #[test]

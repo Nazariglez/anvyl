@@ -4,14 +4,15 @@ mod clean;
 mod fmt;
 mod frontend_sources;
 mod init;
+mod lsp;
 mod manifest;
 mod progress;
 mod run;
 mod std_support;
 
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{collections::HashMap, path::PathBuf};
 
-use anvyx_lang::{CompilationContext, LintConfig, LintLevel, Profile};
+use anvyx_lang::{CompilationContext, LintConfig, Profile};
 use clap::{Parser, Subcommand};
 
 use crate::manifest::Manifest;
@@ -48,6 +49,8 @@ enum Command {
         file: Option<PathBuf>,
         #[arg(long)]
         new_frontend: bool,
+        #[arg(long, default_value = "text")]
+        format: check::CheckOutputFormat,
         #[arg(long, value_name = "KEY=VALUE")]
         lint: Vec<String>,
         #[arg(long, value_delimiter = ',')]
@@ -57,6 +60,8 @@ enum Command {
     },
     #[command(about = "Create a new Anvyx project")]
     Init { name: Option<String> },
+    #[command(about = "Run the Anvyx language server")]
+    Lsp,
     #[command(about = "Build an Anvyx project for distribution")]
     Build {
         #[arg(long)]
@@ -175,6 +180,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Check {
             file,
             new_frontend,
+            format,
             lint,
             feature,
             cfg,
@@ -188,12 +194,15 @@ fn run(cli: Cli) -> Result<(), String> {
                 let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
                 check::reject_new_frontend_inputs(manifest.as_ref())?;
                 progress::status("Checking", &format!("{}...", path.display()));
-                check::new_frontend_cmd(&path, lint_config, &compilation_ctx)?;
+                check::new_frontend_cmd(&path, lint_config, &compilation_ctx, format)?;
                 progress::status(
                     "Finished",
                     &format!("{} checked successfully", path.display()),
                 );
                 return Ok(());
+            }
+            if format != check::CheckOutputFormat::Text {
+                return Err("--format json requires --new-frontend".to_string());
             }
             let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
 
@@ -216,17 +225,16 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Init { name } => {
             init::cmd(name.as_deref())?;
         }
+        Command::Lsp => {
+            lsp::cmd()?;
+        }
         Command::Clean => {
             clean::cmd()?;
         }
         Command::Fmt { path, check, stdin } => {
             fmt::cmd(path, check, stdin)?;
         }
-        Command::Build {
-            release,
-            feature,
-            cfg,
-        } => {
+        Command::Build { release, .. } => {
             let manifest =
                 manifest::parse_manifest()?.ok_or("anvyx build requires an anvyx.toml manifest")?;
             let cwd = std::env::current_dir()
@@ -247,8 +255,6 @@ fn run(cli: Cli) -> Result<(), String> {
             let dist_dir = build::assemble_dist(&cwd, &project_name)?;
             build::bundle_sources(&cwd, &dist_dir, &manifest)?;
             progress::status("Finished", &format!("{}", dist_dir.display()));
-
-            let _ = (&feature, &cfg);
         }
     }
 
@@ -306,7 +312,7 @@ fn resolve_lint_config(
                 "invalid --lint format: '{pair}'. Expected key=value (e.g. --lint internal_access=error)"
             )
         })?;
-        let level = LintLevel::from_str(value)?;
+        let level = value.parse()?;
         match key.trim() {
             "internal_access" => config.internal_access = level,
             other => {

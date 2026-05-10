@@ -9,7 +9,7 @@ use crate::{
         ArrayLen, ConstArg, ConstParamId, ExprId, FuncParam, GenericArg, Ident, ModuleOrigin,
         NominalKind, NominalType, Type, TypeVarId,
     },
-    span::Span,
+    span::{SourceSpan, Span},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -381,22 +381,22 @@ pub(super) enum SolverRelationError {
     TypeMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstMismatch {
         expected: ConstDiagnostic,
         found: ConstDiagnostic,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     RecursiveInference {
-        span: Span,
+        span: Option<SourceSpan>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SolverFinalizeError {
-    UnresolvedType { span: Span },
-    UnresolvedConst { span: Span },
+    UnresolvedType { span: Option<SourceSpan> },
+    UnresolvedConst { span: Option<SourceSpan> },
 }
 
 impl TypeRef {
@@ -425,7 +425,7 @@ enum TyRelation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Constraint {
-    span: Span,
+    span: Option<SourceSpan>,
     kind: ConstraintKind,
 }
 
@@ -450,37 +450,37 @@ enum SolveError {
     TypeMismatch {
         expected: Ty,
         found: Ty,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstMismatch {
         expected: ConstTerm,
         found: ConstTerm,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TypeAlreadyBound {
         var: InferVarId,
         existing: Ty,
         found: Ty,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TypeOccurs {
         var: InferVarId,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstAlreadyBound {
         var: ConstInferVarId,
         existing: ConstTerm,
         found: ConstTerm,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstOccurs {
         var: ConstInferVarId,
-        span: Span,
+        span: Option<SourceSpan>,
     },
 }
 
 impl SolveError {
-    fn type_mismatch(expected: Ty, found: Ty, span: Span) -> Self {
+    fn type_mismatch(expected: Ty, found: Ty, span: Option<SourceSpan>) -> Self {
         Self::TypeMismatch {
             expected,
             found,
@@ -488,7 +488,7 @@ impl SolveError {
         }
     }
 
-    fn const_mismatch(expected: ConstTerm, found: ConstTerm, span: Span) -> Self {
+    fn const_mismatch(expected: ConstTerm, found: ConstTerm, span: Option<SourceSpan>) -> Self {
         Self::ConstMismatch {
             expected,
             found,
@@ -496,7 +496,11 @@ impl SolveError {
         }
     }
 
-    fn func_param_mismatch(expected: TyFuncParam, found: TyFuncParam, span: Span) -> Self {
+    fn func_param_mismatch(
+        expected: TyFuncParam,
+        found: TyFuncParam,
+        span: Option<SourceSpan>,
+    ) -> Self {
         Self::type_mismatch(
             Ty::Func {
                 params: vec![expected],
@@ -513,8 +517,8 @@ impl SolveError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferError {
-    UnresolvedType { span: Span },
-    UnresolvedConst { span: Span },
+    UnresolvedType { span: Option<SourceSpan> },
+    UnresolvedConst { span: Option<SourceSpan> },
 }
 
 struct FinalizeCx<'a> {
@@ -523,18 +527,20 @@ struct FinalizeCx<'a> {
     seen_consts: &'a mut HashSet<ConstInferVarId>,
 }
 
+pub(super) type SourceExprTypes = HashMap<ExprId, (Option<SourceSpan>, Type)>;
+
 #[derive(Debug, Default, Clone)]
 pub(super) struct Solver {
     next_type_var: u32,
     next_const_var: u32,
-    type_spans: HashMap<InferVarId, Span>,
-    const_spans: HashMap<ConstInferVarId, Span>,
+    type_spans: HashMap<InferVarId, SourceSpan>,
+    const_spans: HashMap<ConstInferVarId, SourceSpan>,
     type_bindings: HashMap<InferVarId, Ty>,
     const_bindings: HashMap<ConstInferVarId, ConstTerm>,
     nil_vars: HashSet<InferVarId>,
     local_types: Vec<Ty>,
     temp_types: Vec<Ty>,
-    expr_types: HashMap<ExprId, (Span, Ty)>,
+    expr_types: HashMap<ExprId, (Option<SourceSpan>, Ty)>,
     constraints: Vec<Constraint>,
 }
 
@@ -553,7 +559,7 @@ impl Solver {
         &mut self,
         generics: &GenericParams,
         seeds: &GenericSolverSeeds,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> GenericSolverVars {
         let types = generics
             .type_params
@@ -647,7 +653,7 @@ impl Solver {
         TypeHandle(TypeRef::expr(id))
     }
 
-    pub(super) fn fresh_temp_handle(&mut self, span: Span) -> TypeHandle {
+    pub(super) fn fresh_temp_handle(&mut self, span: Option<SourceSpan>) -> TypeHandle {
         let ty = self.fresh_type(span);
         self.temp_handle(ty)
     }
@@ -709,21 +715,21 @@ impl Solver {
         self.temp_handle(Ty::Tuple(elems))
     }
 
-    pub(super) fn nil_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
+    pub(super) fn nil_expr_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle {
         let ty = self.fresh_nil_type(span);
         self.set_expr_handle(id, span, ty)
     }
 
-    pub(super) fn fresh_nil_handle(&mut self, span: Span) -> TypeHandle {
+    pub(super) fn fresh_nil_handle(&mut self, span: Option<SourceSpan>) -> TypeHandle {
         let ty = self.fresh_nil_type(span);
         self.temp_handle(ty)
     }
 
-    pub(super) fn error_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
+    pub(super) fn error_expr_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle {
         self.set_expr_handle(id, span, Ty::Error)
     }
 
-    fn set_expr_handle(&mut self, id: ExprId, span: Span, ty: Ty) -> TypeHandle {
+    fn set_expr_handle(&mut self, id: ExprId, span: Option<SourceSpan>, ty: Ty) -> TypeHandle {
         self.set_expr_type(id, span, ty);
         self.expr_handle(id)
     }
@@ -731,7 +737,7 @@ impl Solver {
     pub(super) fn set_expr_type_from_handle(
         &mut self,
         id: ExprId,
-        span: Span,
+        span: Option<SourceSpan>,
         handle: TypeHandle,
     ) -> TypeHandle {
         let ty = self.resolve_ref(&handle.0);
@@ -743,15 +749,25 @@ impl Solver {
         self.type_for_storage(&self.resolve_ref(&handle.0))
     }
 
-    pub(super) fn add_handle_equal(&mut self, span: Span, left: TypeHandle, right: TypeHandle) {
+    pub(super) fn add_handle_equal(
+        &mut self,
+        span: Option<SourceSpan>,
+        left: TypeHandle,
+        right: TypeHandle,
+    ) {
         self.add_equal(span, left.0, right.0);
     }
 
-    pub(super) fn add_handle_assignable(&mut self, span: Span, from: TypeHandle, to: TypeHandle) {
+    pub(super) fn add_handle_assignable(
+        &mut self,
+        span: Option<SourceSpan>,
+        from: TypeHandle,
+        to: TypeHandle,
+    ) {
         self.add_assignable(span, from.0, to.0);
     }
 
-    pub(super) fn type_assignable(&self, span: Span, from: &Type, to: &Type) -> bool {
+    pub(super) fn type_assignable(&self, span: Option<SourceSpan>, from: &Type, to: &Type) -> bool {
         let mut probe = self.clone();
         probe
             .constrain_tys_assignable(
@@ -769,9 +785,7 @@ impl Solver {
             .collect()
     }
 
-    pub(super) fn finalize_expr_types(
-        &self,
-    ) -> (HashMap<ExprId, (Span, Type)>, Vec<SolverFinalizeError>) {
+    pub(super) fn finalize_expr_types(&self) -> (SourceExprTypes, Vec<SolverFinalizeError>) {
         let mut errors = Vec::new();
         let mut seen_types = HashSet::new();
         let mut seen_consts = HashSet::new();
@@ -809,14 +823,22 @@ impl Solver {
         self.set_local_type(id, Ty::from_recovery_type(ty));
     }
 
-    pub(super) fn set_expr_type_from_type(&mut self, id: ExprId, span: Span, ty: &Type) {
+    pub(super) fn set_expr_type_from_type(
+        &mut self,
+        id: ExprId,
+        span: Option<SourceSpan>,
+        ty: &Type,
+    ) {
         self.set_expr_type(id, span, Ty::from_recovery_type(ty));
     }
 
     pub(super) fn expr_types_to_types(&self) -> HashMap<ExprId, (Span, Type)> {
         self.expr_types
             .iter()
-            .map(|(id, (span, ty))| (*id, (*span, self.type_for_storage(ty))))
+            .map(|(id, (span, ty))| {
+                let span = span.expect("expression type missing source span").byte();
+                (*id, (span, self.type_for_storage(ty)))
+            })
             .collect()
     }
 
@@ -968,14 +990,14 @@ impl Solver {
         }
     }
 
-    fn add_equal(&mut self, span: Span, left: TypeRef, right: TypeRef) {
+    fn add_equal(&mut self, span: Option<SourceSpan>, left: TypeRef, right: TypeRef) {
         self.constraints.push(Constraint {
             span,
             kind: ConstraintKind::Equal(left, right),
         });
     }
 
-    fn add_assignable(&mut self, span: Span, from: TypeRef, to: TypeRef) {
+    fn add_assignable(&mut self, span: Option<SourceSpan>, from: TypeRef, to: TypeRef) {
         self.constraints.push(Constraint {
             span,
             kind: ConstraintKind::Assignable { from, to },
@@ -1010,7 +1032,12 @@ impl Solver {
         errors
     }
 
-    fn unify_equal(&mut self, span: Span, left: TypeRef, right: TypeRef) -> Result<Ty, SolveError> {
+    fn unify_equal(
+        &mut self,
+        span: Option<SourceSpan>,
+        left: TypeRef,
+        right: TypeRef,
+    ) -> Result<Ty, SolveError> {
         let left = self.resolve_ref(&left);
         let right = self.resolve_ref(&right);
         self.unify_tys_equal(span, left, right)
@@ -1018,7 +1045,7 @@ impl Solver {
 
     fn constrain_assignable(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         from: TypeRef,
         to: TypeRef,
     ) -> Result<Ty, SolveError> {
@@ -1027,21 +1054,25 @@ impl Solver {
         self.constrain_tys_assignable(span, from, to)
     }
 
-    fn fresh_type(&mut self, span: Span) -> Ty {
+    fn fresh_type(&mut self, span: Option<SourceSpan>) -> Ty {
         let id = InferVarId(self.next_type_var);
         self.next_type_var += 1;
-        self.type_spans.insert(id, span);
+        if let Some(span) = span {
+            self.type_spans.insert(id, span);
+        }
         Ty::Infer(id)
     }
 
-    fn fresh_const(&mut self, span: Span) -> ConstTerm {
+    fn fresh_const(&mut self, span: Option<SourceSpan>) -> ConstTerm {
         let id = ConstInferVarId(self.next_const_var);
         self.next_const_var += 1;
-        self.const_spans.insert(id, span);
+        if let Some(span) = span {
+            self.const_spans.insert(id, span);
+        }
         ConstTerm::Infer(id)
     }
 
-    fn fresh_nil_type(&mut self, span: Span) -> Ty {
+    fn fresh_nil_type(&mut self, span: Option<SourceSpan>) -> Ty {
         let ty = self.fresh_type(span);
         let Ty::Infer(id) = ty else {
             unreachable!();
@@ -1082,13 +1113,13 @@ impl Solver {
         self.expr_types.get(&id).map(|(_, ty)| ty)
     }
 
-    fn set_expr_type(&mut self, id: ExprId, span: Span, ty: Ty) {
+    fn set_expr_type(&mut self, id: ExprId, span: Option<SourceSpan>, ty: Ty) {
         self.expr_types.insert(id, (span, ty));
     }
 
     fn relate_tys(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         expected: Ty,
         found: Ty,
         relation: TyRelation,
@@ -1101,7 +1132,7 @@ impl Solver {
 
     fn relate_boxed(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         expected: Ty,
         found: Ty,
         relation: TyRelation,
@@ -1111,7 +1142,7 @@ impl Solver {
 
     fn relate_boxed_assignable(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         expected_elem: Ty,
         found_elem: Ty,
         expected: &Ty,
@@ -1132,7 +1163,7 @@ impl Solver {
         mismatch: bool,
         expected: &Ty,
         found: &Ty,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> Result<T, SolveError> {
         match result {
             Ok(value) => Ok(value),
@@ -1147,7 +1178,7 @@ impl Solver {
 
     fn relate_ty_lists(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         expected: Vec<Ty>,
         found: Vec<Ty>,
         relation: TyRelation,
@@ -1161,7 +1192,7 @@ impl Solver {
 
     fn unify_func_invariant(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         expected_func: TyFuncParts,
         found_func: TyFuncParts,
         expected: Ty,
@@ -1198,7 +1229,12 @@ impl Solver {
         })
     }
 
-    fn unify_tys_equal(&mut self, span: Span, left: Ty, right: Ty) -> Result<Ty, SolveError> {
+    fn unify_tys_equal(
+        &mut self,
+        span: Option<SourceSpan>,
+        left: Ty,
+        right: Ty,
+    ) -> Result<Ty, SolveError> {
         let left = self.resolve_ty(&left);
         let right = self.resolve_ty(&right);
         if left == right {
@@ -1307,7 +1343,12 @@ impl Solver {
         }
     }
 
-    fn constrain_tys_assignable(&mut self, span: Span, from: Ty, to: Ty) -> Result<Ty, SolveError> {
+    fn constrain_tys_assignable(
+        &mut self,
+        span: Option<SourceSpan>,
+        from: Ty,
+        to: Ty,
+    ) -> Result<Ty, SolveError> {
         let from = self.resolve_ty(&from);
         let to = self.resolve_ty(&to);
         if from == to {
@@ -1401,7 +1442,7 @@ impl Solver {
 
     fn assign_nil_origin(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         from: &Ty,
         to: &Ty,
     ) -> Option<Result<Ty, SolveError>> {
@@ -1424,7 +1465,7 @@ impl Solver {
 
     fn unify_nominal_equal(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         left: TyNominal,
         right: TyNominal,
         expected: Ty,
@@ -1447,7 +1488,7 @@ impl Solver {
 
     fn constrain_nominal_assignable(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         from: TyNominal,
         to: TyNominal,
         expected: Ty,
@@ -1479,7 +1520,7 @@ impl Solver {
 
     fn unify_generic_args_equal(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         left: Vec<TyGenericArg>,
         right: Vec<TyGenericArg>,
         expected: Ty,
@@ -1505,7 +1546,7 @@ impl Solver {
 
     fn relate_const_arg_lists(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         expected: Vec<ConstTerm>,
         found: Vec<ConstTerm>,
     ) -> Result<Vec<ConstTerm>, SolveError> {
@@ -1518,7 +1559,7 @@ impl Solver {
 
     fn unify_const_equal(
         &mut self,
-        span: Span,
+        span: Option<SourceSpan>,
         left: ConstTerm,
         right: ConstTerm,
     ) -> Result<ConstTerm, SolveError> {
@@ -1547,7 +1588,7 @@ impl Solver {
         found_len: usize,
         expected: Ty,
         found: Ty,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> Result<(), SolveError> {
         if expected_len == found_len {
             Ok(())
@@ -1556,7 +1597,12 @@ impl Solver {
         }
     }
 
-    fn bind_type(&mut self, var: InferVarId, ty: Ty, span: Span) -> Result<(), SolveError> {
+    fn bind_type(
+        &mut self,
+        var: InferVarId,
+        ty: Ty,
+        span: Option<SourceSpan>,
+    ) -> Result<(), SolveError> {
         let found = self.resolve_ty(&ty);
         let binds_to_self = matches!(found, Ty::Infer(other) if other == var);
         if binds_to_self {
@@ -1586,7 +1632,7 @@ impl Solver {
         &mut self,
         var: InferVarId,
         found: &Ty,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> Result<(), SolveError> {
         if self.is_nil_var(var) {
             match found {
@@ -1615,7 +1661,7 @@ impl Solver {
         &mut self,
         var: ConstInferVarId,
         found: ConstTerm,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> Result<(), SolveError> {
         let found = self.resolve_const(&found);
         if found.is_self_binding(var) {
@@ -1957,18 +2003,14 @@ impl Solver {
 
     fn push_unresolved_type(&self, id: InferVarId, cx: &mut FinalizeCx<'_>) {
         if cx.seen_types.insert(id) {
-            let span = self.type_spans.get(&id).copied().unwrap_or(Span::new(0, 0));
+            let span = self.type_spans.get(&id).copied();
             cx.errors.push(InferError::UnresolvedType { span });
         }
     }
 
     fn push_unresolved_const(&self, id: ConstInferVarId, cx: &mut FinalizeCx<'_>) {
         if cx.seen_consts.insert(id) {
-            let span = self
-                .const_spans
-                .get(&id)
-                .copied()
-                .unwrap_or(Span::new(0, 0));
+            let span = self.const_spans.get(&id).copied();
             cx.errors.push(InferError::UnresolvedConst { span });
         }
     }
@@ -2011,7 +2053,7 @@ impl Solver {
         &self,
         expected: &ConstTerm,
         found: &ConstTerm,
-        span: Span,
+        span: Option<SourceSpan>,
     ) -> SolverRelationError {
         SolverRelationError::ConstMismatch {
             expected: self.const_diagnostic(expected),
@@ -2036,8 +2078,13 @@ impl From<InferError> for SolverFinalizeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
-    use crate::ast::ConstValue;
+    use crate::{
+        ast::ConstValue,
+        source::{SourceId, SourceKind, SourceTable},
+    };
 
     fn ident(name: &str) -> Ident {
         Ident::new(name)
@@ -2052,8 +2099,16 @@ mod tests {
         ))
     }
 
-    fn span(start: usize, end: usize) -> Span {
-        Span::new(start, end)
+    fn source() -> SourceId {
+        static SOURCE: OnceLock<SourceId> = OnceLock::new();
+        *SOURCE.get_or_init(|| {
+            let mut sources = SourceTable::default();
+            sources.add(SourceKind::Virtual, "test", None, "")
+        })
+    }
+
+    fn span(start: usize, end: usize) -> Option<SourceSpan> {
+        Some(SourceSpan::new(source(), start, end))
     }
 
     fn type_var(id: u32) -> TypeVarId {
@@ -2086,12 +2141,12 @@ mod tests {
     }
 
     trait SolverTestExt {
-        fn fresh_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle;
+        fn fresh_expr_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle;
         fn finalize_handle(&self, handle: &TypeHandle) -> (Type, Vec<SolverFinalizeError>);
     }
 
     impl SolverTestExt for Solver {
-        fn fresh_expr_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
+        fn fresh_expr_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle {
             let ty = self.fresh_type(span);
             self.set_expr_handle(id, span, ty)
         }

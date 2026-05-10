@@ -11,7 +11,7 @@ use super::{
 use crate::{
     ast,
     lexer::{Keyword, Op, Token},
-    span::{Span, Spanned},
+    span::{SourceSpan, Spanned},
 };
 
 pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
@@ -30,13 +30,13 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
 
         let let_else = let_or_var_head()
             .then(pattern())
-            .then_ignore(select! { (Token::Op(Op::Assign), _) => () })
+            .then_ignore(select! { Token::Op(Op::Assign) => () })
             .then(expression(stmt.clone()))
-            .then_ignore(select! { (Token::Keyword(Keyword::Else), _) => () })
+            .then_ignore(select! { Token::Keyword(Keyword::Else) => () })
             .then(block_stmt(stmt.clone(), expr.clone()))
             .map_with(|(((head, pat), value), else_block), e| {
                 let s = e.span();
-                let span = Span::new(s.start, s.end);
+                let span = s.byte();
                 Spanned::new(
                     ast::Stmt::LetElse(Spanned::new(
                         ast::LetElse {
@@ -52,33 +52,33 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             });
 
         let at_stmt_start = select! {
-            (Token::Keyword(Keyword::Let), _) => (),
-            (Token::Keyword(Keyword::Var), _) => (),
-            (Token::Keyword(Keyword::Return), _) => (),
-            (Token::Keyword(Keyword::Fn), _) => (),
-            (Token::Keyword(Keyword::Pub), _) => (),
-            (Token::Keyword(Keyword::If), _) => (),
-            (Token::Keyword(Keyword::Match), _) => (),
-            (Token::Keyword(Keyword::Struct), _) => (),
-            (Token::Keyword(Keyword::While), _) => (),
-            (Token::Keyword(Keyword::For), _) => (),
-            (Token::Keyword(Keyword::Break), _) => (),
-            (Token::Keyword(Keyword::Continue), _) => (),
-            (Token::Keyword(Keyword::Defer), _) => (),
-            (Token::Keyword(Keyword::Const), _) => (),
+            Token::Keyword(Keyword::Let) => (),
+            Token::Keyword(Keyword::Var) => (),
+            Token::Keyword(Keyword::Return) => (),
+            Token::Keyword(Keyword::Fn) => (),
+            Token::Keyword(Keyword::Pub) => (),
+            Token::Keyword(Keyword::If) => (),
+            Token::Keyword(Keyword::Match) => (),
+            Token::Keyword(Keyword::Struct) => (),
+            Token::Keyword(Keyword::While) => (),
+            Token::Keyword(Keyword::For) => (),
+            Token::Keyword(Keyword::Break) => (),
+            Token::Keyword(Keyword::Continue) => (),
+            Token::Keyword(Keyword::Defer) => (),
+            Token::Keyword(Keyword::Const) => (),
         }
         .rewind();
 
-        let at_assign_start = select! { (Token::Ident(_), _) => () }
+        let at_assign_start = select! { Token::Ident(_) => () }
             .then(select! {
-                (Token::Op(Op::Assign), _) => (),
-                (Token::Op(Op::AddAssign), _) => (),
-                (Token::Op(Op::SubAssign), _) => (),
-                (Token::Op(Op::MulAssign), _) => (),
-                (Token::Op(Op::DivAssign), _) => (),
-                (Token::Op(Op::CaretAssign), _) => (),
-                (Token::Op(Op::BitAndAssign), _) => (),
-                (Token::Op(Op::BitOrAssign), _) => (),
+                Token::Op(Op::Assign) => (),
+                Token::Op(Op::AddAssign) => (),
+                Token::Op(Op::SubAssign) => (),
+                Token::Op(Op::MulAssign) => (),
+                Token::Op(Op::DivAssign) => (),
+                Token::Op(Op::CaretAssign) => (),
+                Token::Op(Op::BitAndAssign) => (),
+                Token::Op(Op::BitOrAssign) => (),
             })
             .to(())
             .rewind();
@@ -86,7 +86,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let expr_stmt = expr
             .clone()
             .then_ignore(
-                select! { (Token::Semicolon, _) => () }
+                select! { Token::Semicolon => () }
                     .or(at_stmt_start)
                     .or(at_assign_start),
             )
@@ -95,14 +95,14 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
                 Spanned::new(ast::Stmt::Expr(expr_node), span)
             });
 
-        let if_as_stmt = select! { (Token::Keyword(Keyword::If), _) => () }
+        let if_as_stmt = select! { Token::Keyword(Keyword::If) => () }
             .rewind()
             .ignore_then(expr)
             .then_ignore(
                 select! {
-                    (Token::Keyword(_), _) => (),
-                    (Token::Ident(_), _) => (),
-                    (Token::Literal(_), _) => (),
+                    Token::Keyword(_) => (),
+                    Token::Ident(_) => (),
+                    Token::Literal(_) => (),
                 }
                 .rewind(),
             )
@@ -140,25 +140,25 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
 
 fn binding<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src, ast::BindingNode> {
     let mutability = select! {
-        (Token::Keyword(Keyword::Let), _) => ast::Mutability::Immutable,
-        (Token::Keyword(Keyword::Var), _) => ast::Mutability::Mutable,
+        Token::Keyword(Keyword::Let) => ast::Mutability::Immutable,
+        Token::Keyword(Keyword::Var) => ast::Mutability::Mutable,
     };
 
     mutability
         .then(pattern())
         .then(
             select! {
-                (Token::Colon, _) => (),
+                Token::Colon => (),
             }
             .ignore_then(type_ident())
             .or_not(),
         )
         .then_ignore(select! {
-            (Token::Op(Op::Assign), _) => (),
+            Token::Op(Op::Assign) => (),
         })
         .then(expression(stmt))
         .then_ignore(select! {
-            (Token::Semicolon, _) => (),
+            Token::Semicolon => (),
         })
         .map_with(|(((mutability, pat), ty), value), e| {
             let s = e.span();
@@ -169,26 +169,26 @@ fn binding<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src,
                     mutability,
                     value,
                 },
-                Span::new(s.start, s.end),
+                s.byte(),
             )
         })
         .boxed()
 }
 
 fn const_stmt<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src, ast::StmtNode> {
-    select! { (Token::Keyword(Keyword::Const), _) => () }
+    select! { Token::Keyword(Keyword::Const) => () }
         .ignore_then(identifier())
         .then(
-            select! { (Token::Colon, _) => () }
+            select! { Token::Colon => () }
                 .ignore_then(type_ident())
                 .or_not(),
         )
-        .then_ignore(select! { (Token::Op(Op::Assign), _) => () })
+        .then_ignore(select! { Token::Op(Op::Assign) => () })
         .then(expression(stmt))
-        .then_ignore(select! { (Token::Semicolon, _) => () })
+        .then_ignore(select! { Token::Semicolon => () })
         .map_with(|((name, ty), value), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let node = Spanned::new(
                 ast::ConstDecl {
                     annotations: vec![],
@@ -214,13 +214,13 @@ fn while_stmt<'src>(
     let cond_expr = cond_expression();
 
     select! {
-        (Token::Keyword(Keyword::While), _) => (),
+        Token::Keyword(Keyword::While) => (),
     }
     .ignore_then(cond_expr)
     .then(block_stmt(stmt, expr))
     .map_with(|(cond, body), e| {
         let s = e.span();
-        let span = Span::new(s.start, s.end);
+        let span = s.byte();
         let while_node = Spanned::new(ast::While { cond, body }, span);
         Spanned::new(ast::Stmt::While(while_node), span)
     })
@@ -233,15 +233,15 @@ fn while_let_stmt<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
-    select! { (Token::Keyword(Keyword::While), _) => () }
+    select! { Token::Keyword(Keyword::While) => () }
         .ignore_then(let_or_var_head())
         .then(pattern())
-        .then_ignore(select! { (Token::Op(Op::Assign), _) => () })
+        .then_ignore(select! { Token::Op(Op::Assign) => () })
         .then(cond_expression())
         .then(block_stmt(stmt, expr))
         .map_with(|(((head, pat), value), body), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let node = Spanned::new(
                 ast::WhileLet {
                     head,
@@ -261,7 +261,7 @@ fn while_let_stmt<'src>(
 // rev key is only valid on for loops
 fn contextual_rev<'src>() -> BoxedParser<'src, bool> {
     select! {
-        (Token::Ident(ident), _) if ident.0.as_ref() == "rev" => true,
+        Token::Ident(ident) if ident.0.as_ref() == "rev" => true,
     }
     .or_not()
     .map(|o| o.unwrap_or(false))
@@ -273,7 +273,7 @@ fn contextual_step<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, Option<ast::ExprNode>> {
     select! {
-        (Token::Ident(ident), _) if ident.0.as_ref() == "step" => (),
+        Token::Ident(ident) if ident.0.as_ref() == "step" => (),
     }
     .ignore_then(for_header_expression(stmt))
     .or_not()
@@ -285,11 +285,11 @@ fn for_stmt<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
     select! {
-        (Token::Keyword(Keyword::For), _) => (),
+        Token::Keyword(Keyword::For) => (),
     }
     .ignore_then(pattern())
     .then_ignore(select! {
-        (Token::Keyword(Keyword::In), _) => (),
+        Token::Keyword(Keyword::In) => (),
     })
     .then(contextual_rev())
     .then(for_header_expression(stmt.clone()))
@@ -297,7 +297,7 @@ fn for_stmt<'src>(
     .then(block_stmt(stmt, expr))
     .map_with(|((((pat, reversed), iterable), step), body), e| {
         let s = e.span();
-        let span = Span::new(s.start, s.end);
+        let span = s.byte();
         let for_node = Spanned::new(
             ast::For {
                 pattern: pat,
@@ -317,14 +317,14 @@ fn for_stmt<'src>(
 
 fn break_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
     select! {
-        (Token::Keyword(Keyword::Break), _) => (),
+        Token::Keyword(Keyword::Break) => (),
     }
     .then_ignore(select! {
-        (Token::Semicolon, _) => (),
+        Token::Semicolon => (),
     })
     .map_with(|(), e| {
-        let s: SimpleSpan<usize> = e.span();
-        let span = Span::new(s.start, s.end);
+        let span: SourceSpan = e.span();
+        let span = span.byte();
         Spanned::new(ast::Stmt::Break, span)
     })
     .labelled("break statement")
@@ -334,14 +334,14 @@ fn break_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
 
 fn continue_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
     select! {
-        (Token::Keyword(Keyword::Continue), _) => (),
+        Token::Keyword(Keyword::Continue) => (),
     }
     .then_ignore(select! {
-        (Token::Semicolon, _) => (),
+        Token::Semicolon => (),
     })
     .map_with(|(), e| {
-        let s: SimpleSpan<usize> = e.span();
-        let span = Span::new(s.start, s.end);
+        let span: SourceSpan = e.span();
+        let span = span.byte();
         Spanned::new(ast::Stmt::Continue, span)
     })
     .labelled("continue statement")
@@ -353,15 +353,15 @@ fn return_stmt<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
     select! {
-        (Token::Keyword(Keyword::Return), _) => (),
+        Token::Keyword(Keyword::Return) => (),
     }
     .ignore_then(expression(stmt).or_not())
     .then_ignore(select! {
-        (Token::Semicolon, _) => (),
+        Token::Semicolon => (),
     })
     .map_with(|value_opt, e| {
         let s = e.span();
-        let span = Span::new(s.start, s.end);
+        let span = s.byte();
         let ret = ast::Return { value: value_opt };
         Spanned::new(ast::Stmt::Return(Spanned::new(ret, span)), span)
     })
@@ -376,14 +376,14 @@ fn defer_stmt<'src>(
 ) -> BoxedParser<'src, ast::StmtNode> {
     let block_body = block_stmt(stmt.clone(), expr.clone()).map(ast::DeferBody::Block);
     let expr_body = expression(stmt)
-        .then_ignore(select! { (Token::Semicolon, _) => () })
+        .then_ignore(select! { Token::Semicolon => () })
         .map(ast::DeferBody::Expr);
 
-    select! { (Token::Keyword(Keyword::Defer), _) => () }
+    select! { Token::Keyword(Keyword::Defer) => () }
         .ignore_then(block_body.or(expr_body))
         .map_with(|body, e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let defer = ast::Defer { body };
             Spanned::new(ast::Stmt::Defer(Spanned::new(defer, span)), span)
         })

@@ -7,13 +7,13 @@ use super::{
 use crate::{
     ast,
     lexer::{Delimiter, Keyword, Op, Token},
-    span::{Span, Spanned},
+    span::{SourceSpan, Spanned},
 };
 
 pub(super) fn let_or_var_head<'src>() -> BoxedParser<'src, ast::PatternHead> {
     select! {
-        (Token::Keyword(Keyword::Let), _) => ast::PatternHead::Let,
-        (Token::Keyword(Keyword::Var), _) => ast::PatternHead::Var,
+        Token::Keyword(Keyword::Let) => ast::PatternHead::Let,
+        Token::Keyword(Keyword::Var) => ast::PatternHead::Var,
     }
     .boxed()
 }
@@ -22,7 +22,7 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
     recursive(|pat| {
         let ident_or_wildcard = identifier().map_with(|ident, e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             if ident.0.as_ref() == "_" {
                 Spanned::new(ast::Pattern::Wildcard, span)
             } else {
@@ -31,16 +31,20 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
         });
 
         let rest_pat = select! {
-            (Token::Range, s) => Spanned::new(ast::Pattern::Rest, s)
-        };
+            Token::Range => ast::Pattern::Rest
+        }
+        .map_with(|pattern, e| {
+            let span: SourceSpan = e.span();
+            Spanned::new(pattern, span.byte())
+        });
 
         let var_pat = select! {
-            (Token::Keyword(Keyword::Var), _) => ()
+            Token::Keyword(Keyword::Var) => ()
         }
         .ignore_then(identifier())
         .validate(|name, e, emitter| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             emitter.emit(Rich::custom(
                 s,
                 "`var` is only allowed before the whole pattern",
@@ -49,10 +53,14 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
         });
 
         let nil_pat = select! {
-            (Token::Keyword(Keyword::Nil), s) => Spanned::new(ast::Pattern::Nil, s)
-        };
+            Token::Keyword(Keyword::Nil) => ast::Pattern::Nil
+        }
+        .map_with(|pattern, e| {
+            let span: SourceSpan = e.span();
+            Spanned::new(pattern, span.byte())
+        });
 
-        let minus = select! { (Token::Op(Op::Sub), _) => () };
+        let minus = select! { Token::Op(Op::Sub) => () };
         let num_lit =
             minus
                 .or_not()
@@ -65,15 +73,15 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
                 });
 
         let range_op = select! {
-            (Token::Range, _) => false,
-            (Token::RangeEq, _) => true,
+            Token::Range => false,
+            Token::RangeEq => true,
         };
 
         let prefix_range_pat = range_op
             .then(num_lit.clone())
             .map_with(|(inclusive, end), e| {
                 let s = e.span();
-                let span = Span::new(s.start, s.end);
+                let span = s.byte();
                 Spanned::new(
                     ast::Pattern::Range {
                         start: None,
@@ -85,10 +93,10 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
             });
 
         let range_suffix = choice((
-            select! { (Token::RangeEq, _) => true }
+            select! { Token::RangeEq => true }
                 .then(num_lit.clone())
                 .map(|(inc, end)| (inc, Some(end))),
-            select! { (Token::Range, _) => false }
+            select! { Token::Range => false }
                 .then(num_lit.clone().or_not())
                 .map(|(inc, end)| (inc, end)),
         ));
@@ -99,7 +107,7 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
                 .then(range_suffix.or_not())
                 .map_with(|(start, rest), e| {
                     let s = e.span();
-                    let span = Span::new(s.start, s.end);
+                    let span = s.byte();
                     match rest {
                         Some((inclusive, Some(end))) => Spanned::new(
                             ast::Pattern::Range {
@@ -127,7 +135,7 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
         let inferred_enum_pat = inferred_enum_pattern(pat.clone());
         let struct_pat = struct_pattern(pat);
 
-        let question = select! { (Token::Question, _) => () };
+        let question = select! { Token::Question => () };
 
         let atom = choice((
             prefix_range_pat,
@@ -145,20 +153,20 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
         .map_with(|(pat, q), e| {
             if q.is_some() {
                 let s = e.span();
-                let span = Span::new(s.start, s.end);
+                let span = s.byte();
                 Spanned::new(ast::Pattern::Optional(Box::new(pat)), span)
             } else {
                 pat
             }
         });
 
-        let pipe = select! { (Token::Op(Op::BitOr), _) => () };
+        let pipe = select! { Token::Op(Op::BitOr) => () };
         atom.separated_by(pipe)
             .at_least(1)
             .collect::<Vec<_>>()
             .map_with(|mut patterns, e| {
                 let s = e.span();
-                let span = Span::new(s.start, s.end);
+                let span = s.byte();
                 if patterns.len() == 1 {
                     patterns.remove(0)
                 } else {
@@ -174,10 +182,10 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
 fn struct_pattern<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, ast::PatternNode> {
-    let comma = select! { (Token::Comma, _) => () };
-    let colon = select! { (Token::Colon, _) => () };
-    let open_brace = select! { (Token::Open(Delimiter::Brace), _) => () };
-    let close_brace = select! { (Token::Close(Delimiter::Brace), _) => () };
+    let comma = select! { Token::Comma => () };
+    let colon = select! { Token::Colon => () };
+    let open_brace = select! { Token::Open(Delimiter::Brace) => () };
+    let close_brace = select! { Token::Close(Delimiter::Brace) => () };
 
     let field_with_pattern = identifier()
         .then_ignore(colon)
@@ -186,7 +194,7 @@ fn struct_pattern<'src>(
 
     let field_shorthand = identifier().map_with(|name, e| {
         let s = e.span();
-        let span = Span::new(s.start, s.end);
+        let span = s.byte();
         (name, Spanned::new(ast::Pattern::Ident(name), span))
     });
 
@@ -205,7 +213,7 @@ fn struct_pattern<'src>(
         )
         .map_with(|(name, fields), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             Spanned::new(ast::Pattern::Struct { name, fields }, span)
         })
         .labelled("struct pattern")
@@ -223,7 +231,7 @@ enum EnumPatternKind {
 fn enum_pattern<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, ast::PatternNode> {
-    let dot = select! { (Token::Dot, _) => () };
+    let dot = select! { Token::Dot => () };
 
     let qualified_name = identifier().then_ignore(dot).then(identifier());
 
@@ -235,7 +243,7 @@ fn enum_pattern<'src>(
         )))
         .map_with(|((qualifier, variant), kind), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let pattern = match kind {
                 EnumPatternKind::Unit => ast::Pattern::EnumUnit { qualifier, variant },
                 EnumPatternKind::Tuple(fields) => ast::Pattern::EnumTuple {
@@ -260,7 +268,7 @@ fn enum_pattern<'src>(
 fn inferred_enum_pattern<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, ast::PatternNode> {
-    let dot = select! { (Token::Dot, _) => () };
+    let dot = select! { Token::Dot => () };
 
     dot.ignore_then(identifier())
         .then(choice((
@@ -270,7 +278,7 @@ fn inferred_enum_pattern<'src>(
         )))
         .map_with(|(variant, kind), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let pattern = match kind {
                 EnumPatternKind::Unit => ast::Pattern::InferredEnumUnit { variant },
                 EnumPatternKind::Tuple(fields) => {
@@ -292,9 +300,9 @@ fn inferred_enum_pattern<'src>(
 fn enum_tuple_payload<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, EnumPatternKind> {
-    let comma = select! { (Token::Comma, _) => () };
-    let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
-    let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
+    let comma = select! { Token::Comma => () };
+    let open_paren = select! { Token::Open(Delimiter::Parent) => () };
+    let close_paren = select! { Token::Close(Delimiter::Parent) => () };
 
     open_paren
         .ignore_then(pat.separated_by(comma).allow_trailing().collect::<Vec<_>>())
@@ -306,11 +314,11 @@ fn enum_tuple_payload<'src>(
 fn enum_struct_payload<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, EnumPatternKind> {
-    let comma = select! { (Token::Comma, _) => () };
-    let colon = select! { (Token::Colon, _) => () };
-    let open_brace = select! { (Token::Open(Delimiter::Brace), _) => () };
-    let close_brace = select! { (Token::Close(Delimiter::Brace), _) => () };
-    let rest = select! { (Token::Range, _) => () };
+    let comma = select! { Token::Comma => () };
+    let colon = select! { Token::Colon => () };
+    let open_brace = select! { Token::Open(Delimiter::Brace) => () };
+    let close_brace = select! { Token::Close(Delimiter::Brace) => () };
+    let rest = select! { Token::Range => () };
 
     let field_with_pattern = identifier()
         .then_ignore(colon)
@@ -319,7 +327,7 @@ fn enum_struct_payload<'src>(
 
     let field_shorthand = identifier().map_with(|name, e| {
         let s = e.span();
-        let span = Span::new(s.start, s.end);
+        let span = s.byte();
         (name, Spanned::new(ast::Pattern::Ident(name), span))
     });
 
@@ -358,10 +366,10 @@ impl TuplePatternElem {
 fn tuple_pattern<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, ast::PatternNode> {
-    let comma = select! { (Token::Comma, _) => () };
-    let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
-    let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
-    let colon = select! { (Token::Colon, _) => () };
+    let comma = select! { Token::Comma => () };
+    let open_paren = select! { Token::Open(Delimiter::Parent) => () };
+    let close_paren = select! { Token::Close(Delimiter::Parent) => () };
+    let colon = select! { Token::Colon => () };
 
     let labelled_elem = identifier()
         .then_ignore(colon)
@@ -381,7 +389,7 @@ fn tuple_pattern<'src>(
         .then_ignore(close_paren)
         .validate(|((first, rest), trailing_comma), e, emitter| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let wildcard = || Spanned::new(ast::Pattern::Wildcard, span);
 
             let has_label = first.as_ref().is_some_and(TuplePatternElem::is_labelled)

@@ -11,7 +11,7 @@ use super::{
 use crate::{
     ast,
     lexer::{Delimiter, Keyword, LitToken, Op, Token},
-    span::{Span, Spanned},
+    span::Spanned,
 };
 
 pub const SELF_TYPE: &str = "Self";
@@ -19,10 +19,10 @@ pub const SELF_ITEM: &str = "self";
 
 fn annotation_value<'src>() -> BoxedParser<'src, ast::Lit> {
     select! {
-        (Token::Literal(LitToken::String(s)), _) => ast::Lit::String(s.to_string()),
-        (Token::Literal(LitToken::Number(n)), _) => ast::Lit::Int(n),
-        (Token::Keyword(Keyword::True), _) => ast::Lit::Bool(true),
-        (Token::Keyword(Keyword::False), _) => ast::Lit::Bool(false),
+        Token::Literal(LitToken::String(s)) => ast::Lit::String(s.to_string()),
+        Token::Literal(LitToken::Number(n)) => ast::Lit::Int(n),
+        Token::Keyword(Keyword::True) => ast::Lit::Bool(true),
+        Token::Keyword(Keyword::False) => ast::Lit::Bool(false),
     }
     .labelled("annotation value")
     .as_context()
@@ -30,13 +30,13 @@ fn annotation_value<'src>() -> BoxedParser<'src, ast::Lit> {
 }
 
 fn parse_annotation_args<'src>() -> BoxedParser<'src, ast::AnnotationArgs> {
-    let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
-    let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
-    let comma = select! { (Token::Comma, _) => () };
-    let eq = select! { (Token::Op(Op::Assign), _) => () };
+    let open_paren = select! { Token::Open(Delimiter::Parent) => () };
+    let close_paren = select! { Token::Close(Delimiter::Parent) => () };
+    let comma = select! { Token::Comma => () };
+    let eq = select! { Token::Op(Op::Assign) => () };
 
     let positional = select! {
-        (Token::Literal(LitToken::String(s)), _) => ast::Lit::String(s.to_string()),
+        Token::Literal(LitToken::String(s)) => ast::Lit::String(s.to_string()),
     }
     .map(ast::AnnotationArgs::Positional);
 
@@ -64,12 +64,12 @@ fn parse_annotation_args<'src>() -> BoxedParser<'src, ast::AnnotationArgs> {
 }
 
 fn parse_annotation<'src>() -> BoxedParser<'src, ast::AnnotationNode> {
-    select! { (Token::At, _) => () }
+    select! { Token::At => () }
         .ignore_then(identifier())
         .then(parse_annotation_args())
         .map_with(|(name, args), e| {
             let s = e.span();
-            Spanned::new(ast::Annotation { name, args }, Span::new(s.start, s.end))
+            Spanned::new(ast::Annotation { name, args }, s.byte())
         })
         .boxed()
 }
@@ -79,7 +79,7 @@ pub(super) fn annotations<'src>() -> BoxedParser<'src, Vec<ast::AnnotationNode>>
 }
 
 pub(super) fn doc_comment_block<'src>() -> BoxedParser<'src, Option<String>> {
-    select! { (Token::DocComment(s), _) => s.to_string() }
+    select! { Token::DocComment(s) => s.to_string() }
         .repeated()
         .at_least(1)
         .collect::<Vec<_>>()
@@ -101,8 +101,8 @@ enum GenericParamItem {
 }
 
 fn required_generic_params<'src>() -> BoxedParser<'src, GenericParams> {
-    let colon = select! { (Token::Colon, _) => () };
-    let int_kw = select! { (Token::Keyword(Keyword::Int), _) => () };
+    let colon = select! { Token::Colon => () };
+    let int_kw = select! { Token::Keyword(Keyword::Int) => () };
 
     let generic_param = identifier()
         .then(colon.ignore_then(int_kw).or_not())
@@ -116,14 +116,14 @@ fn required_generic_params<'src>() -> BoxedParser<'src, GenericParams> {
             }
         });
 
-    select! { (Token::Op(Op::LessThan), _) => () }
+    select! { Token::Op(Op::LessThan) => () }
         .ignore_then(
             generic_param
-                .separated_by(select! { (Token::Comma, _) => () })
+                .separated_by(select! { Token::Comma => () })
                 .allow_trailing()
                 .collect::<Vec<_>>(),
         )
-        .then_ignore(select! { (Token::Op(Op::GreaterThan), _) => () })
+        .then_ignore(select! { Token::Op(Op::GreaterThan) => () })
         .validate(|items, extra, emitter| {
             let mut type_params = vec![];
             let mut const_params = vec![];
@@ -184,19 +184,19 @@ fn local_import_target(dot_count: usize, path: Vec<ast::Ident>) -> ast::ImportTa
 }
 
 pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
-    let import_kw = select! { (Token::Keyword(Keyword::Import), _) => () };
-    let dot = select! { (Token::Dot, _) => () };
+    let import_kw = select! { Token::Keyword(Keyword::Import) => () };
+    let dot = select! { Token::Dot => () };
     let leading_dot = select! {
-        (Token::Dot, _) => 1,
-        (Token::Range, _) => 2,
+        Token::Dot => 1,
+        Token::Range => 2,
     };
-    let colon = select! { (Token::Colon, _) => () };
-    let semicolon = select! { (Token::Semicolon, _) => () };
-    let as_kw = select! { (Token::Keyword(Keyword::As), _) => () };
-    let open_brace = select! { (Token::Open(Delimiter::Brace), _) => () };
-    let close_brace = select! { (Token::Close(Delimiter::Brace), _) => () };
-    let star = select! { (Token::Op(Op::Mul), _) => () };
-    let comma = select! { (Token::Comma, _) => () };
+    let colon = select! { Token::Colon => () };
+    let semicolon = select! { Token::Semicolon => () };
+    let as_kw = select! { Token::Keyword(Keyword::As) => () };
+    let open_brace = select! { Token::Open(Delimiter::Brace) => () };
+    let close_brace = select! { Token::Close(Delimiter::Brace) => () };
+    let star = select! { Token::Op(Op::Mul) => () };
+    let comma = select! { Token::Comma => () };
 
     let import_segment = identifier();
 
@@ -233,7 +233,7 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
     let import_target = colon_target.or(local_target);
 
     let self_item = select! {
-        (Token::Ident(i), _) if i.0.as_ref() == SELF_ITEM => ast::ImportItemKind::SelfModule
+        Token::Ident(i) if i.0.as_ref() == SELF_ITEM => ast::ImportItemKind::SelfModule
     };
 
     let import_item = self_item
@@ -268,7 +268,7 @@ pub(super) fn import_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
         .then(import_tail)
         .map_with(|((visibility, target), kind), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let node = Spanned::new(
                 ast::Import {
                     visibility,
@@ -288,7 +288,7 @@ pub(super) fn extern_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
     visibility()
-        .then_ignore(select! { (Token::Keyword(Keyword::Extern), _) => () })
+        .then_ignore(select! { Token::Keyword(Keyword::Extern) => () })
         .then(choice((
             extern_func_declaration(stmt.clone()),
             extern_type_declaration(stmt),
@@ -309,16 +309,16 @@ pub(super) fn extern_declaration<'src>(
 fn extern_func_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
-    let semicolon = select! { (Token::Semicolon, _) => () };
+    let semicolon = select! { Token::Semicolon => () };
 
-    select! { (Token::Keyword(Keyword::Fn), _) => () }
+    select! { Token::Keyword(Keyword::Fn) => () }
         .ignore_then(identifier())
         .then(params(stmt))
         .then(return_type())
         .then_ignore(semicolon)
         .map_with(|((name, params), ret), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let node = Spanned::new(
                 ast::ExternFunc {
                     annotations: vec![],
@@ -336,7 +336,7 @@ fn extern_func_declaration<'src>(
 }
 
 fn contextual_ident<'src>(word: &'static str) -> BoxedParser<'src, ()> {
-    select! { (Token::Ident(ident), _) if ident.0.as_ref() == word => () }.boxed()
+    select! { Token::Ident(ident) if ident.0.as_ref() == word => () }.boxed()
 }
 
 fn extern_type_rep<'src>() -> BoxedParser<'src, ast::ExternTypeRep> {
@@ -351,9 +351,9 @@ fn extern_type_rep<'src>() -> BoxedParser<'src, ast::ExternTypeRep> {
 fn extern_type_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
-    let semicolon = select! { (Token::Semicolon, _) => () };
+    let semicolon = select! { Token::Semicolon => () };
 
-    select! { (Token::Keyword(Keyword::Type), _) => () }
+    select! { Token::Keyword(Keyword::Type) => () }
         .ignore_then(identifier())
         .then(extern_type_rep().or_not())
         .then(choice((
@@ -380,7 +380,7 @@ fn extern_type_declaration<'src>(
                     init,
                     members: resolved_members,
                 },
-                Span::new(s.start, s.end),
+                s.byte(),
             );
             let span = node.span;
             Spanned::new(ast::Stmt::ExternType(node), span)
@@ -525,7 +525,7 @@ fn extern_type_body<'src>(
         Init(ast::ExternInit),
     }
 
-    let semicolon = select! { (Token::Semicolon, _) => () };
+    let semicolon = select! { Token::Semicolon => () };
     let init_item = contextual_ident("init")
         .ignore_then(params(stmt.clone()).or_not())
         .then_ignore(semicolon)
@@ -536,13 +536,13 @@ fn extern_type_body<'src>(
         });
     let member_item = extern_type_member(stmt).map(Box::new).map(BodyItem::Member);
 
-    select! { (Token::Open(Delimiter::Brace), _) => () }
+    select! { Token::Open(Delimiter::Brace) => () }
         .ignore_then(
             choice((init_item, member_item))
                 .repeated()
                 .collect::<Vec<_>>(),
         )
-        .then_ignore(select! { (Token::Close(Delimiter::Brace), _) => () })
+        .then_ignore(select! { Token::Close(Delimiter::Brace) => () })
         .validate(|items, extra, emitter| {
             let mut members = vec![];
             let mut init = None;
@@ -569,7 +569,7 @@ fn extern_type_body<'src>(
 fn extern_type_member<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::ExternTypeMember> {
-    let semicolon = select! { (Token::Semicolon, _) => () };
+    let semicolon = select! { Token::Semicolon => () };
 
     choice((
         extern_type_op_member().then_ignore(semicolon),
@@ -584,24 +584,24 @@ fn is_self_type(ty: &ast::Type) -> bool {
 }
 
 fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
-    let op_kw = select! { (Token::Ident(ident), _) if ident.0.as_ref() == "op" => () };
-    let arrow = select! { (Token::Op(Op::ThinArrow), _) => () };
+    let op_kw = select! { Token::Ident(ident) if ident.0.as_ref() == "op" => () };
+    let arrow = select! { Token::Op(Op::ThinArrow) => () };
 
     let binary_op_tok = select! {
-        (Token::Op(Op::Add), _) => ast::BinaryOp::Add,
-        (Token::Op(Op::Sub), _) => ast::BinaryOp::Sub,
-        (Token::Op(Op::Mul), _) => ast::BinaryOp::Mul,
-        (Token::Op(Op::Div), _) => ast::BinaryOp::Div,
-        (Token::Op(Op::Rem), _) => ast::BinaryOp::Rem,
-        (Token::Op(Op::Eq), _) => ast::BinaryOp::Eq,
-        (Token::Op(Op::NotEq), _) => ast::BinaryOp::NotEq,
-        (Token::Op(Op::LessThan), _) => ast::BinaryOp::LessThan,
-        (Token::Op(Op::GreaterThan), _) => ast::BinaryOp::GreaterThan,
-        (Token::Op(Op::LessThanEq), _) => ast::BinaryOp::LessThanEq,
-        (Token::Op(Op::GreaterThanEq), _) => ast::BinaryOp::GreaterThanEq,
+        Token::Op(Op::Add) => ast::BinaryOp::Add,
+        Token::Op(Op::Sub) => ast::BinaryOp::Sub,
+        Token::Op(Op::Mul) => ast::BinaryOp::Mul,
+        Token::Op(Op::Div) => ast::BinaryOp::Div,
+        Token::Op(Op::Rem) => ast::BinaryOp::Rem,
+        Token::Op(Op::Eq) => ast::BinaryOp::Eq,
+        Token::Op(Op::NotEq) => ast::BinaryOp::NotEq,
+        Token::Op(Op::LessThan) => ast::BinaryOp::LessThan,
+        Token::Op(Op::GreaterThan) => ast::BinaryOp::GreaterThan,
+        Token::Op(Op::LessThanEq) => ast::BinaryOp::LessThanEq,
+        Token::Op(Op::GreaterThanEq) => ast::BinaryOp::GreaterThanEq,
     };
 
-    let unary = select! { (Token::Op(Op::Sub), _) => () }
+    let unary = select! { Token::Op(Op::Sub) => () }
         .ignore_then(type_ident())
         .then_ignore(arrow)
         .then(type_ident())
@@ -644,7 +644,7 @@ fn extern_type_field_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> 
     doc_comment_block()
         .then(contextual_ident("computed").or_not())
         .then(identifier())
-        .then_ignore(select! { (Token::Colon, _) => () })
+        .then_ignore(select! { Token::Colon => () })
         .then(type_ident())
         .map(
             |(((doc, computed), name), ty)| ast::ExternTypeMember::Field {
@@ -662,7 +662,7 @@ fn extern_type_method_member<'src>(
 ) -> BoxedParser<'src, ast::ExternTypeMember> {
     doc_comment_block()
         .then(
-            select! { (Token::Keyword(Keyword::Fn), _) => () }
+            select! { Token::Keyword(Keyword::Fn) => () }
                 .ignore_then(field_name_ident())
                 .then(extern_method_params(stmt))
                 .then(return_type()),
@@ -691,13 +691,13 @@ fn extern_type_method_member<'src>(
 fn extern_method_params<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, (Option<ast::ExternReceiverMode>, Vec<ast::Param>)> {
-    select! { (Token::Open(Delimiter::Parent), _) => () }
+    select! { Token::Open(Delimiter::Parent) => () }
         .ignore_then(
             extern_method_param_list(stmt)
                 .or_not()
                 .map(Option::unwrap_or_default),
         )
-        .then_ignore(select! { (Token::Close(Delimiter::Parent), _) => () })
+        .then_ignore(select! { Token::Close(Delimiter::Parent) => () })
         .boxed()
 }
 
@@ -706,7 +706,7 @@ fn extern_self_param<'src>() -> BoxedParser<'src, ast::ExternReceiverMode> {
     let shared_self = contextual_ident("shared")
         .ignore_then(self_ident())
         .to(ast::ExternReceiverMode::Shared);
-    let mutable_self = select! { (Token::Keyword(Keyword::Var), _) => () }
+    let mutable_self = select! { Token::Keyword(Keyword::Var) => () }
         .ignore_then(self_ident())
         .to(ast::ExternReceiverMode::Mutable);
 
@@ -717,7 +717,7 @@ fn extern_method_param_list<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, (Option<ast::ExternReceiverMode>, Vec<ast::Param>)> {
     let regular_params = param(stmt)
-        .separated_by(select! { (Token::Comma, _) => () })
+        .separated_by(select! { Token::Comma => () })
         .allow_trailing()
         .collect::<Vec<_>>()
         .validate(|params, extra, emitter| {
@@ -733,7 +733,7 @@ fn extern_method_param_list<'src>(
     choice((
         extern_self_param()
             .then(
-                select! { (Token::Comma, _) => () }
+                select! { Token::Comma => () }
                     .ignore_then(
                         regular_params
                             .clone()
@@ -751,7 +751,7 @@ fn extern_method_param_list<'src>(
 
 fn visibility<'src>() -> BoxedParser<'src, ast::Visibility> {
     select! {
-        (Token::Keyword(Keyword::Pub), _) => ast::Visibility::Public,
+        Token::Keyword(Keyword::Pub) => ast::Visibility::Public,
     }
     .or_not()
     .map(|v| v.unwrap_or(ast::Visibility::Private))
@@ -764,7 +764,7 @@ pub(super) fn function<'src>(
     let tail_expr = expression(stmt.clone());
     visibility()
         .then_ignore(select! {
-            (Token::Keyword(Keyword::Fn), _) => (),
+            Token::Keyword(Keyword::Fn) => (),
         })
         .then(identifier())
         .then(generic_params())
@@ -813,7 +813,7 @@ pub(super) fn function<'src>(
                     ret: resolved_ret,
                     body,
                 },
-                Span::new(s.start, s.end),
+                s.byte(),
             )
         })
         .labelled("function")
@@ -828,11 +828,11 @@ fn struct_field<'src>(
         .then(annotations())
         .then(identifier())
         .then_ignore(select! {
-            (Token::Colon, _) => (),
+            Token::Colon => (),
         })
         .then(type_ident())
         .then(
-            select! { (Token::Op(Op::Assign), _) => () }
+            select! { Token::Op(Op::Assign) => () }
                 .ignore_then(expression(stmt))
                 .or_not(),
         )
@@ -864,15 +864,12 @@ fn struct_method<'src>(
         .then(doc_comment_block())
         .then(method_sig(stmt.clone(), MethodSigPolicy::Aggregate))
         .then(block_stmt(stmt, tail_expr))
-        .map_with(|(((annots, doc), sig), body), e| {
-            let s = e.span();
-            ast::Method {
-                annotations: annots,
-                doc,
-                visibility: ast::Visibility::Private,
-                sig,
-                body: Spanned::new(body.node, Span::new(s.start, s.end)),
-            }
+        .map(|(((annots, doc), sig), body)| ast::Method {
+            annotations: annots,
+            doc,
+            visibility: ast::Visibility::Private,
+            sig,
+            body,
         })
         .labelled("method")
         .as_context()
@@ -888,7 +885,7 @@ fn method_sig<'src>(
         MethodSigPolicy::Extend => field_name_ident().boxed(),
     };
 
-    select! { (Token::Keyword(Keyword::Fn), _) => () }
+    select! { Token::Keyword(Keyword::Fn) => () }
         .ignore_then(name)
         .then(generic_params())
         .then(method_params(stmt))
@@ -914,7 +911,7 @@ fn method_params<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, (Option<ast::MethodReceiver>, Vec<ast::Param>)> {
     select! {
-        (Token::Open(Delimiter::Parent), _) => (),
+        Token::Open(Delimiter::Parent) => (),
     }
     .ignore_then(
         method_param_list(stmt)
@@ -922,20 +919,20 @@ fn method_params<'src>(
             .map(Option::unwrap_or_default),
     )
     .then_ignore(select! {
-        (Token::Close(Delimiter::Parent), _) => (),
+        Token::Close(Delimiter::Parent) => (),
     })
     .boxed()
 }
 
 fn method_self_param<'src>() -> BoxedParser<'src, ast::MethodReceiver> {
     let value_self = self_ident().to(ast::MethodReceiver::Value);
-    let mutable_self = select! { (Token::Keyword(Keyword::Var), _) => () }
+    let mutable_self = select! { Token::Keyword(Keyword::Var) => () }
         .ignore_then(self_ident())
         .to(ast::MethodReceiver::Var);
 
     choice((mutable_self, value_self))
         .then(
-            select! { (Token::Colon, _) => () }
+            select! { Token::Colon => () }
                 .ignore_then(type_ident())
                 .or_not(),
         )
@@ -967,7 +964,7 @@ fn method_param_list<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, (Option<ast::MethodReceiver>, Vec<ast::Param>)> {
     let regular_params = param(stmt)
-        .separated_by(select! { (Token::Comma, _) => () })
+        .separated_by(select! { Token::Comma => () })
         .allow_trailing()
         .collect::<Vec<_>>()
         .validate(|params, extra, emitter| {
@@ -983,7 +980,7 @@ fn method_param_list<'src>(
     choice((
         method_self_param()
             .then(
-                select! { (Token::Comma, _) => () }
+                select! { Token::Comma => () }
                     .ignore_then(
                         regular_params
                             .clone()
@@ -1004,7 +1001,7 @@ fn aggregate_declaration<'src>(
     kind: ast::AggregateKind,
 ) -> BoxedParser<'src, ast::AggregateDeclNode> {
     visibility()
-        .then_ignore(any().filter(move |(t, _)| match kind {
+        .then_ignore(any().filter(move |t| match kind {
             ast::AggregateKind::Struct => matches!(t, Token::Keyword(Keyword::Struct)),
             ast::AggregateKind::DataRef => matches!(t, Token::Keyword(Keyword::DataRef)),
         }))
@@ -1012,17 +1009,17 @@ fn aggregate_declaration<'src>(
         .then(generic_params())
         .then(
             select! {
-                (Token::Open(Delimiter::Brace), _) => (),
+                Token::Open(Delimiter::Brace) => (),
             }
             .ignore_then(
                 struct_field(stmt.clone())
-                    .separated_by(select! { (Token::Comma, _) => () })
+                    .separated_by(select! { Token::Comma => () })
                     .allow_trailing()
                     .collect::<Vec<_>>(),
             )
             .then(struct_method(stmt).repeated().collect::<Vec<_>>())
             .then_ignore(select! {
-                (Token::Close(Delimiter::Brace), _) => (),
+                Token::Close(Delimiter::Brace) => (),
             }),
         )
         .map_with(move |(((vis, name), gp), (raw_fields, raw_methods)), e| {
@@ -1132,7 +1129,7 @@ fn aggregate_declaration<'src>(
                     fields,
                     methods,
                 },
-                Span::new(s.start, s.end),
+                s.byte(),
             )
         })
         .labelled(match kind {
@@ -1156,14 +1153,14 @@ pub(super) fn dataref_declaration<'src>(
 }
 
 fn enum_variant_tuple_payload<'src>() -> BoxedParser<'src, ast::VariantKind> {
-    select! { (Token::Open(Delimiter::Parent), _) => () }
+    select! { Token::Open(Delimiter::Parent) => () }
         .ignore_then(
             type_ident()
-                .separated_by(select! { (Token::Comma, _) => () })
+                .separated_by(select! { Token::Comma => () })
                 .allow_trailing()
                 .collect::<Vec<_>>(),
         )
-        .then_ignore(select! { (Token::Close(Delimiter::Parent), _) => () })
+        .then_ignore(select! { Token::Close(Delimiter::Parent) => () })
         .map(ast::VariantKind::Tuple)
         .boxed()
 }
@@ -1171,14 +1168,14 @@ fn enum_variant_tuple_payload<'src>() -> BoxedParser<'src, ast::VariantKind> {
 fn enum_variant_struct_payload<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::VariantKind> {
-    select! { (Token::Open(Delimiter::Brace), _) => () }
+    select! { Token::Open(Delimiter::Brace) => () }
         .ignore_then(
             struct_field(stmt)
-                .separated_by(select! { (Token::Comma, _) => () })
+                .separated_by(select! { Token::Comma => () })
                 .allow_trailing()
                 .collect::<Vec<_>>(),
         )
-        .then_ignore(select! { (Token::Close(Delimiter::Brace), _) => () })
+        .then_ignore(select! { Token::Close(Delimiter::Brace) => () })
         .map(ast::VariantKind::Struct)
         .boxed()
 }
@@ -1209,18 +1206,18 @@ pub(super) fn enum_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::EnumDeclNode> {
     visibility()
-        .then_ignore(select! { (Token::Keyword(Keyword::Enum), _) => () })
+        .then_ignore(select! { Token::Keyword(Keyword::Enum) => () })
         .then(identifier())
         .then(generic_params())
         .then(
-            select! { (Token::Open(Delimiter::Brace), _) => () }
+            select! { Token::Open(Delimiter::Brace) => () }
                 .ignore_then(
                     enum_variant(stmt)
-                        .separated_by(select! { (Token::Comma, _) => () })
+                        .separated_by(select! { Token::Comma => () })
                         .allow_trailing()
                         .collect::<Vec<_>>(),
                 )
-                .then_ignore(select! { (Token::Close(Delimiter::Brace), _) => () }),
+                .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
         )
         .map_with(|(((vis, name), gp), variants), e| {
             let s = e.span();
@@ -1285,7 +1282,7 @@ pub(super) fn enum_declaration<'src>(
                     const_params,
                     variants: resolved_variants,
                 },
-                Span::new(s.start, s.end),
+                s.byte(),
             )
         })
         .labelled("enum declaration")
@@ -1308,9 +1305,9 @@ fn extend_method<'src>(
                     annotations: annots,
                     doc,
                     sig,
-                    body: Spanned::new(body.node, Span::new(s.start, s.end)),
+                    body,
                 },
-                Span::new(s.start, s.end),
+                s.byte(),
             )
         })
         .labelled("extend method")
@@ -1322,8 +1319,8 @@ fn cast_from_decl<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::CastFromNode> {
     let tail_expr = expression(stmt.clone());
-    let cast_kw = select! { (Token::Ident(id), _) if id.0.as_ref() == "cast" => () };
-    let from_kw = select! { (Token::Ident(id), _) if id.0.as_ref() == "from" => () };
+    let cast_kw = select! { Token::Ident(id) if id.0.as_ref() == "cast" => () };
+    let from_kw = select! { Token::Ident(id) if id.0.as_ref() == "from" => () };
 
     cast_kw
         .ignore_then(from_kw)
@@ -1360,14 +1357,7 @@ fn cast_from_decl<'src>(
                     "cast from parameter cannot use the `as` modifier",
                 ));
             }
-            Spanned::new(
-                ast::CastFrom {
-                    param,
-                    ret,
-                    body: Spanned::new(body.node, Span::new(s.start, s.end)),
-                },
-                Span::new(s.start, s.end),
-            )
+            Spanned::new(ast::CastFrom { param, ret, body }, s.byte())
         })
         .labelled("cast from declaration")
         .as_context()
@@ -1388,7 +1378,7 @@ pub(super) fn extend_declaration<'src>(
             .then(extend_type_ident())
             .map(|(gp, ty)| (ty, gp)),
         // dataref keyword followed by identifier targets that dataref type
-        select! { (Token::Keyword(Keyword::DataRef), _) => () }
+        select! { Token::Keyword(Keyword::DataRef) => () }
             .ignore_then(identifier())
             .then(generic_params())
             .map(|(name, gp)| {
@@ -1403,11 +1393,11 @@ pub(super) fn extend_declaration<'src>(
 
     visibility()
         .then_ignore(select! {
-            (Token::Keyword(Keyword::Extend), _) => (),
+            Token::Keyword(Keyword::Extend) => (),
         })
         .then(extend_head)
         .then(
-            select! { (Token::Open(Delimiter::Brace), _) => () }
+            select! { Token::Open(Delimiter::Brace) => () }
                 .ignore_then(
                     choice((
                         cast_from_decl(stmt.clone()).map(|cf| ExtendMember::CastFrom(Box::new(cf))),
@@ -1416,7 +1406,7 @@ pub(super) fn extend_declaration<'src>(
                     .repeated()
                     .collect::<Vec<_>>(),
                 )
-                .then_ignore(select! { (Token::Close(Delimiter::Brace), _) => () }),
+                .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
         )
         .map_with(|((vis, (ty, gp)), members), e| {
             let s = e.span();
@@ -1441,7 +1431,7 @@ pub(super) fn extend_declaration<'src>(
                     methods,
                     cast_froms,
                 },
-                Span::new(s.start, s.end),
+                s.byte(),
             )
         })
         .labelled("extend declaration")
@@ -1454,20 +1444,20 @@ pub(super) fn const_decl<'src>(
 ) -> BoxedParser<'src, ast::StmtNode> {
     visibility()
         .then_ignore(select! {
-            (Token::Keyword(Keyword::Const), _) => (),
+            Token::Keyword(Keyword::Const) => (),
         })
         .then(identifier())
         .then(
-            select! { (Token::Colon, _) => () }
+            select! { Token::Colon => () }
                 .ignore_then(type_ident())
                 .or_not(),
         )
-        .then_ignore(select! { (Token::Op(Op::Assign), _) => () })
+        .then_ignore(select! { Token::Op(Op::Assign) => () })
         .then(expression(stmt))
-        .then_ignore(select! { (Token::Semicolon, _) => () })
+        .then_ignore(select! { Token::Semicolon => () })
         .map_with(|(((vis, name), ty), value), e| {
             let s = e.span();
-            let span = Span::new(s.start, s.end);
+            let span = s.byte();
             let node = Spanned::new(
                 ast::ConstDecl {
                     annotations: vec![],

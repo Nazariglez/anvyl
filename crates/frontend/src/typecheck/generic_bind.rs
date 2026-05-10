@@ -151,8 +151,8 @@ struct TypeCheckerGenericBinder<'tc> {
 }
 
 impl ExplicitGenericBinder for TypeCheckerGenericBinder<'_> {
-    fn resolve_type_arg(&mut self, ty: &Type, _: Span) -> Option<Type> {
-        Some(self.tc.resolve_type_for_tc(ty))
+    fn resolve_type_arg(&mut self, ty: &Type, span: Span) -> Option<Type> {
+        Some(self.tc.resolve_type_for_tc_at(ty, span))
     }
 
     fn eval_const_arg(&mut self, term: ConstTerm, span: Span) -> Option<ConstTerm> {
@@ -168,8 +168,10 @@ impl ExplicitGenericBinder for TypeCheckerGenericBinder<'_> {
     }
 
     fn push_kind_error(&mut self, expected: &'static str, span: Span) {
-        self.tc
-            .push_error(TypeError::GenericArgKindMismatch { expected, span });
+        self.tc.push_error(TypeError::GenericArgKindMismatch {
+            expected,
+            span: self.tc.error_span(span),
+        });
     }
 }
 
@@ -178,8 +180,8 @@ mod tests {
     use super::*;
     use crate::{
         ast::{ConstArg, ConstParam, ConstValue, Ident, Program, TypeParam},
-        lexer::tokenize,
-        parser,
+        lexer, parser,
+        source::{SourceId, SourceKind, SourceTable},
         test_support::empty_resolved,
         typecheck::{DeclarationIndex, ModuleScope, TypecheckConfig},
     };
@@ -235,13 +237,16 @@ mod tests {
         GenericArg::Type(ty)
     }
 
-    fn parse(source: &str) -> Program {
-        let tokens = tokenize(source).expect("lexer error");
-        parser::parse_ast(&tokens).expect("parse error")
+    fn parse(source: &str) -> (SourceId, Program) {
+        let mut sources = SourceTable::default();
+        let source_id = sources.add(SourceKind::Virtual, "test", None, source);
+        let tokens = lexer::tokenize(source_id, source).expect("lexer error");
+        let program = parser::parse_ast(&tokens).expect("parse error");
+        (source_id, program)
     }
 
     fn tc(source: &str) -> TypeChecker {
-        let program = parse(source);
+        let (source_id, program) = parse(source);
         let resolved = empty_resolved();
         let decls = DeclarationIndex::from_root_and_modules(
             &program,
@@ -253,6 +258,7 @@ mod tests {
             crate::externs::catalog::ExternCatalog::default(),
             TypecheckConfig::default(),
         );
+        tc.module_sources.insert(ModuleScope::Root, source_id);
         tc.collect_const_decls(&ModuleScope::Root, &program);
         tc.push_scope();
         tc
@@ -350,7 +356,7 @@ mod tests {
         assert!(matches!(
             tc.errors.first(),
             Some(TypeError::UnknownConst { name, span: err_span })
-                if *name == ident("N") && *err_span == span()
+                if *name == ident("N") && err_span.map(|span| span.byte()) == Some(span())
         ));
     }
 
@@ -363,7 +369,7 @@ mod tests {
         assert!(matches!(
             tc.errors.first(),
             Some(TypeError::GenericArgKindMismatch { expected: "type", span: err_span })
-                if *err_span == span()
+                if err_span.map(|span| span.byte()) == Some(span())
         ));
     }
 
@@ -379,7 +385,7 @@ mod tests {
         assert!(matches!(
             tc.errors.first(),
             Some(TypeError::GenericArgKindMismatch { expected: "const", span: err_span })
-                if *err_span == span()
+                if err_span.map(|span| span.byte()) == Some(span())
         ));
     }
 

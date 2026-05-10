@@ -129,7 +129,16 @@ pub(crate) fn check_with_raw_externs(
         raw_externs,
         typecheck::TypecheckConfig::default(),
     )?;
-    let types = tc.finish()?;
+    let source_types = tc.finish()?;
+    let types = source_types
+        .into_iter()
+        .map(|(id, (span, ty))| {
+            let span = span
+                .expect("test expression type missing source span")
+                .byte();
+            (id, (span, ty))
+        })
+        .collect();
     Ok(TypecheckTestResult {
         types,
         calls: tc.calls,

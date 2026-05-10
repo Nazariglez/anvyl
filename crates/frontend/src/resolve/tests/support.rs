@@ -11,11 +11,30 @@ use crate::{
         PackageInput, PackageKind, PreloadedModule, ResolveError, ResolveFailure, ResolveResult,
         SourceFileId,
     },
+    source::{SourceId, SourceKind, SourceTable},
 };
 
+fn parse_source(src: &str) -> (SourceId, Program) {
+    let mut sources = SourceTable::default();
+    let source = sources.add(SourceKind::Virtual, "test", None, src);
+    let tokens =
+        lexer::tokenize(source, src).unwrap_or_else(|errs| panic!("failed to tokenize: {errs:?}"));
+    let program =
+        parser::parse_ast(&tokens).unwrap_or_else(|errs| panic!("failed to parse: {errs:?}"));
+    (source, program)
+}
+
 pub fn parse_program(src: &str) -> Program {
-    let tokens = lexer::tokenize(src).unwrap_or_else(|errs| panic!("failed to tokenize: {errs:?}"));
-    parser::parse_ast(&tokens).unwrap_or_else(|errs| panic!("failed to parse: {errs:?}"))
+    parse_source(src).1
+}
+
+pub fn loaded_module(module: ModuleId, source: &str) -> LoadedModule {
+    let (source, program) = parse_source(source);
+    LoadedModule {
+        module,
+        source,
+        program,
+    }
 }
 
 pub fn package(name: &str) -> PackageId {
@@ -81,10 +100,7 @@ pub fn package_root(
     dependencies: &[(&str, PackageId)],
 ) -> PackageInput {
     PackageInput {
-        root: Some(LoadedModule {
-            module: ModuleId::root(package.clone()),
-            program: parse_program(source),
-        }),
+        root: Some(loaded_module(ModuleId::root(package.clone()), source)),
         dependencies: dependencies
             .iter()
             .map(|(alias, package)| ((*alias).to_string(), package.clone()))
@@ -99,7 +115,7 @@ pub fn ignored_roots(roots: &[&str]) -> HashSet<String> {
 
 #[derive(Default)]
 pub struct InMemoryLoader {
-    modules: HashMap<ModuleId, Program>,
+    modules: HashMap<ModuleId, LoadedModule>,
     missing: Vec<ModuleId>,
     failures: HashMap<ModuleId, String>,
     loads: Vec<ModuleId>,
@@ -112,9 +128,9 @@ impl InMemoryLoader {
     }
 
     pub fn add_package_source(&mut self, package: &PackageId, path: ModulePath, source: &str) {
-        let program = parse_program(source);
+        let module = ModuleId::named(package.clone(), path);
         self.modules
-            .insert(ModuleId::named(package.clone(), path), program);
+            .insert(module.clone(), loaded_module(module, source));
     }
 
     pub fn add_missing(&mut self, path: ModulePath) {
@@ -160,14 +176,7 @@ impl ModuleLoader for InMemoryLoader {
         if self.missing.iter().any(|missing| missing == module) {
             return Ok(None);
         }
-        Ok(self
-            .modules
-            .get(module)
-            .cloned()
-            .map(|program| LoadedModule {
-                module: module.clone(),
-                program,
-            }))
+        Ok(self.modules.get(module).cloned())
     }
 }
 
@@ -176,7 +185,7 @@ pub fn resolve(
     loader: &mut InMemoryLoader,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_modules(
-        parse_program(source),
+        loaded_module(ModuleId::root(root_package()), source),
         vec![],
         loader,
         &HashSet::new(),
@@ -190,7 +199,7 @@ pub fn resolve_with_ignored(
     ignored: &HashSet<String>,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_modules(
-        parse_program(source),
+        loaded_module(ModuleId::root(root_package()), source),
         vec![],
         loader,
         ignored,
@@ -205,10 +214,7 @@ pub fn resolve_package(
     loader: &mut InMemoryLoader,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_package_modules(
-        LoadedModule {
-            module: ModuleId::root(root_package),
-            program: parse_program(source),
-        },
+        loaded_module(ModuleId::root(root_package), source),
         &packages,
         vec![],
         loader,
@@ -219,9 +225,11 @@ pub fn resolve_package(
 }
 
 pub fn preloaded(path: &[&str], source: &str) -> PreloadedModule {
+    let (source, program) = parse_source(source);
     PreloadedModule {
         module: module_id(&root_package(), path),
-        program: parse_program(source),
+        source,
+        program,
     }
 }
 
@@ -239,7 +247,7 @@ pub fn resolve_with_external(
     external_modules: &HashSet<ModulePath>,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_modules(
-        parse_program(source),
+        loaded_module(ModuleId::root(root_package()), source),
         vec![],
         loader,
         &HashSet::new(),
@@ -254,7 +262,7 @@ pub fn resolve_with_preloaded_and_external(
     external_modules: &HashSet<ModulePath>,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_modules(
-        parse_program(source),
+        loaded_module(ModuleId::root(root_package()), source),
         preloaded_modules,
         loader,
         &HashSet::new(),

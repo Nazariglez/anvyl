@@ -233,7 +233,11 @@ impl PlaceAccess {
         matches!(self, Self::Mutable)
     }
 
-    pub(super) fn assign_error(self, name: Ident, span: crate::span::Span) -> Option<TypeError> {
+    pub(super) fn assign_error(
+        self,
+        name: Ident,
+        span: Option<crate::span::SourceSpan>,
+    ) -> Option<TypeError> {
         match self {
             Self::Mutable | Self::Settable => None,
             Self::Const => Some(TypeError::ConstAssignment { name, span }),
@@ -246,7 +250,7 @@ impl PlaceAccess {
     pub(super) fn mut_borrow_error(
         self,
         name: Ident,
-        span: crate::span::Span,
+        span: Option<crate::span::SourceSpan>,
     ) -> Option<TypeError> {
         match self {
             Self::Mutable => None,
@@ -365,7 +369,9 @@ pub(super) struct ExternFieldPlace<'a> {
 pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     let place = check_place(expr, tc);
     if !place.value.access.can_assign() {
-        tc.push_error(TypeError::VarPatternRequiresMutablePlace { span: expr.span });
+        tc.push_error(TypeError::VarPatternRequiresMutablePlace {
+            span: tc.error_span(expr.span),
+        });
     }
     record_value_read(expr.node.id, &place.value, tc);
     place
@@ -437,7 +443,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
                     ty: owner_ty,
                     member: field.node.field,
                     kind: MemberAccessKind::Field,
-                    span: field.span,
+                    span: tc.error_span(field.span),
                 });
                 let checked = super::checked_from_type(expr, Type::Infer, tc);
                 return CheckedPlace::new(checked, PlaceAccess::NotPlace);
@@ -478,7 +484,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
                 ty: nominal_type(&key),
                 member: field.node.field,
                 kind: MemberAccessKind::Field,
-                span: field.span,
+                span: tc.error_span(field.span),
             });
             let checked = super::checked_from_type(expr, Type::Infer, tc);
             return CheckedPlace::new(checked, PlaceAccess::NotPlace);

@@ -2,17 +2,26 @@ use std::{collections::HashMap, fs, path::Path};
 
 use anvyx_lang::{CompilationContext, LintConfig, LintLevel, Profile, TargetArch, TargetOs};
 use anvyx_lang2::{
-    CheckFileInput, CheckOk as FrontendCheckOk, CheckPackageInput,
-    CompilationContext as FrontendCompilationContext, Diagnostic, DiagnosticSeverity,
-    FrontendConfig, LintConfig as FrontendLintConfig, LintLevel as FrontendLintLevel,
+    CheckError as FrontendCheckError, CheckFileInput, CheckPackageInput,
+    CompilationContext as FrontendCompilationContext, Diagnostic, DiagnosticLabel,
+    DiagnosticReport, DiagnosticSeverity, FrontendConfig, LabelStyle,
+    LintConfig as FrontendLintConfig, LintLevel as FrontendLintLevel,
     PackageId as FrontendPackageId, PackageSource, Profile as FrontendProfile, SourceBundle,
-    TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs,
+    TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs, render_rich_report,
 };
+use clap::ValueEnum;
+use serde::Serialize;
 
 use crate::{
     manifest::{Manifest, PackageGraph, PackageId},
     std_support::{collect_core, collect_std},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CheckOutputFormat {
+    Text,
+    Json,
+}
 
 pub fn cmd(
     file: &Path,
@@ -42,22 +51,33 @@ pub fn new_frontend_cmd(
     file: &Path,
     lint: LintConfig,
     ctx: &CompilationContext,
+    format: CheckOutputFormat,
 ) -> Result<(), String> {
     let sources = new_frontend_source_bundle()?;
     let manifest_path = Path::new("anvyx.toml");
-    let ok = if manifest_path.exists() {
+    let result = if manifest_path.exists() {
         let graph = crate::manifest::load_package_graph(manifest_path)?;
         let input =
             package_check_input(&graph, file, sources)?.with_config(new_frontend_config(lint, ctx));
-        anvyx_lang2::check_package(input).map_err(|error| error.to_string())?
+        anvyx_lang2::check_package(input)
     } else {
         let input = CheckFileInput::new(file.to_path_buf(), sources)
             .map_err(|error| error.to_string())?
             .with_config(new_frontend_config(lint, ctx));
-        anvyx_lang2::check_file(input).map_err(|error| error.to_string())?
+        anvyx_lang2::check_file(input)
     };
-    emit_new_frontend_diagnostics(&ok);
-    Ok(())
+
+    match result {
+        Ok(ok) => emit_report(&ok.report, format),
+        Err(error) => {
+            emit_new_frontend_error(&error, format)?;
+            if frontend_error_report(&error).is_some() {
+                Err(error.summary())
+            } else {
+                Err(error.to_string())
+            }
+        }
+    }
 }
 
 fn new_frontend_config(lint: LintConfig, ctx: &CompilationContext) -> FrontendConfig {
@@ -96,18 +116,155 @@ fn new_frontend_context(ctx: &CompilationContext) -> FrontendCompilationContext 
     }
 }
 
-fn emit_new_frontend_diagnostics(ok: &FrontendCheckOk) {
-    for diagnostic in &ok.diagnostics {
-        eprintln!("{}", render_new_frontend_diagnostic(diagnostic));
+fn emit_report(report: &DiagnosticReport, format: CheckOutputFormat) -> Result<(), String> {
+    match format {
+        CheckOutputFormat::Text => emit_text_report(report),
+        CheckOutputFormat::Json => println!("{}", render_json_report(report)?),
+    }
+    Ok(())
+}
+
+fn emit_new_frontend_error(
+    error: &FrontendCheckError,
+    format: CheckOutputFormat,
+) -> Result<(), String> {
+    match format {
+        CheckOutputFormat::Text => {
+            if let Some(report) = frontend_error_report(error) {
+                emit_text_report(report);
+            }
+        }
+        CheckOutputFormat::Json => {
+            let json = match frontend_error_report(error) {
+                Some(report) => render_json_report(report)?,
+                None => render_json_report(&message_report(error.to_string()))?,
+            };
+            println!("{json}");
+        }
+    }
+    Ok(())
+}
+
+fn emit_text_report(report: &DiagnosticReport) {
+    let rendered = render_rich_report(report);
+    if rendered.is_empty() {
+        return;
+    }
+    eprint!("{rendered}");
+    if !rendered.ends_with('\n') {
+        eprintln!();
     }
 }
 
-fn render_new_frontend_diagnostic(diagnostic: &Diagnostic) -> String {
-    let prefix = match diagnostic.severity() {
+fn frontend_error_report(error: &FrontendCheckError) -> Option<&DiagnosticReport> {
+    match error {
+        FrontendCheckError::Frontend(error) => error.report(),
+        FrontendCheckError::InvalidInput(_)
+        | FrontendCheckError::ReadMain { .. }
+        | FrontendCheckError::ReadModule { .. } => None,
+    }
+}
+
+fn message_report(message: String) -> DiagnosticReport {
+    DiagnosticReport {
+        diagnostics: vec![Diagnostic::error(message)],
+        ..DiagnosticReport::default()
+    }
+}
+
+fn render_json_report(report: &DiagnosticReport) -> Result<String, String> {
+    serde_json::to_string_pretty(&JsonReport::from(report))
+        .map_err(|error| format!("failed to serialize diagnostics: {error}"))
+}
+
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    sources: Vec<JsonSource<'a>>,
+    diagnostics: Vec<JsonDiagnostic<'a>>,
+}
+
+#[derive(Serialize)]
+struct JsonSource<'a> {
+    id: usize,
+    label: &'a str,
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonDiagnostic<'a> {
+    severity: &'static str,
+    message: &'a str,
+    labels: Vec<JsonLabel<'a>>,
+    notes: &'a [String],
+    help: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct JsonLabel<'a> {
+    style: &'static str,
+    source_id: usize,
+    start: usize,
+    end: usize,
+    message: Option<&'a str>,
+}
+
+impl<'a> From<&'a DiagnosticReport> for JsonReport<'a> {
+    fn from(report: &'a DiagnosticReport) -> Self {
+        Self {
+            sources: report
+                .sources
+                .iter()
+                .map(|source| JsonSource {
+                    id: source.id().index(),
+                    label: source.label(),
+                    path: source.path().map(|path| path.display().to_string()),
+                })
+                .collect(),
+            diagnostics: report
+                .diagnostics()
+                .iter()
+                .map(JsonDiagnostic::from)
+                .collect(),
+        }
+    }
+}
+
+impl<'a> From<&'a Diagnostic> for JsonDiagnostic<'a> {
+    fn from(diagnostic: &'a Diagnostic) -> Self {
+        Self {
+            severity: json_severity(diagnostic.severity()),
+            message: diagnostic.message(),
+            labels: diagnostic.labels().iter().map(JsonLabel::from).collect(),
+            notes: diagnostic.notes(),
+            help: diagnostic.help(),
+        }
+    }
+}
+
+impl<'a> From<&'a DiagnosticLabel> for JsonLabel<'a> {
+    fn from(label: &'a DiagnosticLabel) -> Self {
+        Self {
+            style: json_label_style(label.style),
+            source_id: label.span.source().index(),
+            start: label.span.start(),
+            end: label.span.end(),
+            message: label.message.as_deref(),
+        }
+    }
+}
+
+fn json_severity(severity: DiagnosticSeverity) -> &'static str {
+    match severity {
         DiagnosticSeverity::Error => "error",
         DiagnosticSeverity::Warning => "warning",
-    };
-    format!("{prefix}: {}", diagnostic.message())
+    }
+}
+
+fn json_label_style(style: LabelStyle) -> &'static str {
+    match style {
+        LabelStyle::Primary => "primary",
+        LabelStyle::Secondary => "secondary",
+    }
 }
 
 fn package_check_input(
@@ -178,11 +335,18 @@ mod tests {
     use crate::manifest::{DependencyEntry, ExternEntry, Project};
 
     fn check_new_frontend(file: &Path) -> Result<(), String> {
-        super::new_frontend_cmd(
+        new_frontend_cmd(
             file,
             LintConfig::default(),
             &CompilationContext::from_host(Profile::Debug),
+            CheckOutputFormat::Text,
         )
+    }
+
+    fn check_new_frontend_error(file: &Path) -> String {
+        let sources = new_frontend_source_bundle().unwrap();
+        let input = CheckFileInput::new(file.to_path_buf(), sources).unwrap();
+        anvyx_lang2::check_file(input).unwrap_err().to_string()
     }
 
     fn source(code: &str) -> StdModuleSource {
@@ -243,6 +407,19 @@ mod tests {
                 .collect::<Vec<_>>();
             paths.sort();
             paths
+        }
+
+        fn check_error_report(code: &str) -> DiagnosticReport {
+            let temp = tempfile::tempdir().unwrap();
+            let main = write(&temp, "main.anv", code);
+            let sources = new_frontend_source_bundle().unwrap();
+            let input = CheckFileInput::new(main, sources).unwrap();
+            let error = anvyx_lang2::check_file(input).unwrap_err();
+            frontend_error_report(&error).unwrap().clone()
+        }
+
+        fn json_value(report: &DiagnosticReport) -> serde_json::Value {
+            serde_json::from_str(&render_json_report(report).unwrap()).unwrap()
         }
 
         mod bundle {
@@ -544,7 +721,7 @@ mod tests {
             fn core_helper_externs_are_not_visible_to_user_modules() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "fn main() { int_abs(1); }");
-                let error = check_new_frontend(&main).unwrap_err();
+                let error = check_new_frontend_error(&main);
 
                 assert!(error.contains("int_abs"));
             }
@@ -553,7 +730,7 @@ mod tests {
             fn core_primitive_wrapper_modules_are_not_preluded() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "fn main() { core_int.abs(1); }");
-                let error = check_new_frontend(&main).unwrap_err();
+                let error = check_new_frontend_error(&main);
 
                 assert!(error.contains("core_int"));
             }
@@ -586,7 +763,7 @@ mod tests {
             fn std_declarations_are_not_preluded() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "fn main() { collect_cycles(); }");
-                let error = check_new_frontend(&main).unwrap_err();
+                let error = check_new_frontend_error(&main);
 
                 assert!(error.contains("collect_cycles"));
             }
@@ -595,7 +772,7 @@ mod tests {
             fn old_std_dot_import_is_local_source_syntax() {
                 let temp = tempfile::tempdir().unwrap();
                 let main = write(&temp, "main.anv", "import std.mem; fn main() {}");
-                let error = check_new_frontend(&main).unwrap_err();
+                let error = check_new_frontend_error(&main);
 
                 assert!(error.contains("std/mem.anv") || error.contains("std\\mem.anv"));
             }
@@ -689,11 +866,80 @@ mod tests {
         }
 
         #[test]
-        fn renders_success_diagnostic() {
-            assert_eq!(
-                render_new_frontend_diagnostic(&Diagnostic::warning("careful")),
-                "warning: careful"
+        fn json_report_includes_sources_labels_and_byte_offsets() {
+            let code = "// café\nfn main() { let x: int = true; }";
+            let report = check_error_report(code);
+            let json = json_value(&report);
+            let diagnostic = &json["diagnostics"][0];
+            let label = &diagnostic["labels"][0];
+            let source_id = label["source_id"].as_u64().unwrap();
+            let source = json["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|source| source["id"].as_u64() == Some(source_id))
+                .unwrap();
+
+            assert_eq!(diagnostic["severity"], "error");
+            assert_eq!(label["style"], "primary");
+            let start = label["start"].as_u64().unwrap() as usize;
+            let end = label["end"].as_u64().unwrap() as usize;
+            assert_eq!(start, code.find("let x").unwrap());
+            assert!(end > start);
+            assert!(code[..start].contains("café"));
+            assert!(source["path"].as_str().unwrap().ends_with("main.anv"));
+            assert!(
+                !diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("TypeError")
             );
+        }
+
+        #[test]
+        fn json_report_serializes_lex_and_parse_errors() {
+            for code in ["fn main() { \"unterminated }", "fn"] {
+                let report = check_error_report(code);
+                let json = json_value(&report);
+                assert_eq!(json["diagnostics"][0]["severity"], "error");
+                assert!(
+                    !json["diagnostics"][0]["labels"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+
+        #[test]
+        fn json_report_serializes_message_only_diagnostics() {
+            let report = message_report("provider failed".to_string());
+            let json = json_value(&report);
+
+            assert!(json["sources"].as_array().unwrap().is_empty());
+            assert_eq!(json["diagnostics"][0]["message"], "provider failed");
+            assert!(
+                json["diagnostics"][0]["labels"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn json_report_serializes_warnings_notes_and_help() {
+            let diagnostic = Diagnostic::warning("careful")
+                .with_note("first note")
+                .with_help("try this");
+            let report = DiagnosticReport {
+                sources: Default::default(),
+                diagnostics: vec![diagnostic],
+            };
+            let json = json_value(&report);
+
+            assert_eq!(json["diagnostics"][0]["severity"], "warning");
+            assert_eq!(json["diagnostics"][0]["notes"][0], "first note");
+            assert_eq!(json["diagnostics"][0]["help"], "try this");
         }
 
         mod unsupported {

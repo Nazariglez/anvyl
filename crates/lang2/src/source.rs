@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anvyx_frontend::{
@@ -18,6 +19,7 @@ use crate::CheckError;
 pub struct SourceText {
     code: String,
     label: String,
+    path: Option<PathBuf>,
 }
 
 impl SourceText {
@@ -28,6 +30,7 @@ impl SourceText {
         Ok(Self {
             code: code.into(),
             label,
+            path: None,
         })
     }
 
@@ -39,11 +42,46 @@ impl SourceText {
         &self.label
     }
 
+    pub(crate) fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
     pub(crate) fn to_frontend_source(&self) -> FrontendSource {
         FrontendSource {
             code: self.code.clone(),
             label: self.label.clone(),
+            path: self.path.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceOverride {
+    path: PathBuf,
+    code: String,
+}
+
+impl SourceOverride {
+    pub fn new(path: impl Into<PathBuf>, code: impl Into<String>) -> Result<Self, CheckError> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(CheckError::InvalidInput(
+                "source override path must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            path,
+            code: code.into(),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
     }
 }
 
@@ -87,6 +125,7 @@ impl ModuleSource {
         FrontendSource {
             code: self.code.clone(),
             label: self.label.clone(),
+            path: None,
         }
     }
 }
@@ -310,7 +349,7 @@ impl SourceOwnership {
         &self,
         file: &Path,
     ) -> Result<(PackageId, SourceFileId), CheckError> {
-        let source_file = canonical_source_file(file)?;
+        let source_file = source_file_id(file)?;
         match self.source_owner(&source_file)? {
             SourceOwner::Package(package) => Ok((package, source_file)),
             SourceOwner::None => Err(CheckError::InvalidInput(format!(
@@ -351,6 +390,33 @@ impl<'a> PackageSourceEnvironment<'a> {
         }
     }
 
+    pub(crate) fn cache_overrides(
+        &mut self,
+        sources: impl IntoIterator<Item = SourceOverride>,
+    ) -> Result<(), CheckError> {
+        for source in sources {
+            let source_file = source_file_id(source.path())?;
+            let owner = self.ownership.source_owner(&source_file)?;
+            let source_text = SourceText::new(
+                source.code().to_string(),
+                source.path().display().to_string(),
+            )?;
+            self.source_cache.insert(
+                source_file.clone(),
+                PackageModuleInput {
+                    module: ModuleId::source_with_context(
+                        owner.package_context().cloned(),
+                        source_file.clone(),
+                    ),
+                    source: source_text
+                        .with_path(source_file.path().to_path_buf())
+                        .to_frontend_source(),
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn load_source(&mut self, module: &ModuleId) -> Result<Option<PackageModuleInput>, CheckError> {
         let Some(path) = module.named_path() else {
             return Ok(None);
@@ -375,17 +441,7 @@ impl<'a> PackageSourceEnvironment<'a> {
         &mut self,
         file: PathBuf,
     ) -> Result<Option<PackageModuleInput>, CheckError> {
-        let source_file = match fs::canonicalize(&file) {
-            Ok(canonical) => SourceFileId::new(canonical)
-                .map_err(|error| CheckError::InvalidInput(error.to_string()))?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(CheckError::ReadModule {
-                    path: file,
-                    message: error.to_string(),
-                });
-            }
-        };
+        let source_file = source_file_id(&file)?;
         if let Some(source) = self.source_cache.get(&source_file) {
             return Ok(Some(source.clone()));
         }
@@ -398,7 +454,9 @@ impl<'a> PackageSourceEnvironment<'a> {
                             owner.package_context().cloned(),
                             source_file.clone(),
                         ),
-                        source: source.to_frontend_source(),
+                        source: source
+                            .with_path(source_file.path().to_path_buf())
+                            .to_frontend_source(),
                     }
                 })?;
                 self.source_cache.insert(source_file, source.clone());
@@ -462,14 +520,75 @@ fn local_source_file(request: &LocalSourceRequest) -> Result<PathBuf, CheckError
     Ok(dir)
 }
 
-pub(crate) fn canonical_source_file(path: &Path) -> Result<SourceFileId, CheckError> {
-    let canonical = fs::canonicalize(path).map_err(|error| {
-        CheckError::InvalidInput(format!(
-            "failed to canonicalize source file '{}': {error}",
-            path.display()
-        ))
-    })?;
-    SourceFileId::new(canonical).map_err(|error| CheckError::InvalidInput(error.to_string()))
+pub(crate) fn source_file_id(path: &Path) -> Result<SourceFileId, CheckError> {
+    let path = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => missing_source_path(path)?,
+        Err(error) => {
+            return Err(CheckError::InvalidInput(format!(
+                "failed to canonicalize source file '{}': {error}",
+                path.display()
+            )));
+        }
+    };
+    SourceFileId::new(path).map_err(|error| CheckError::InvalidInput(error.to_string()))
+}
+
+fn missing_source_path(path: &Path) -> Result<PathBuf, CheckError> {
+    let absolute = absolute_path(path)?;
+    let mut missing = Vec::<OsString>::new();
+    let mut cursor = absolute.as_path();
+
+    loop {
+        match fs::canonicalize(cursor) {
+            Ok(mut existing) => {
+                for component in missing.iter().rev() {
+                    existing.push(component);
+                }
+                return Ok(existing);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name() else {
+                    return Ok(absolute);
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = cursor.parent() else {
+                    return Ok(absolute);
+                };
+                cursor = parent;
+            }
+            Err(error) => {
+                return Err(CheckError::InvalidInput(format!(
+                    "failed to canonicalize source file '{}': {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, CheckError> {
+    if path.is_absolute() {
+        return Ok(normalize_path(path));
+    }
+    let path = std::env::current_dir()
+        .map_err(|error| CheckError::InvalidInput(error.to_string()))?
+        .join(path);
+    Ok(normalize_path(&path))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn module_file(root: &Path, module_path: &[String]) -> PathBuf {
@@ -730,7 +849,7 @@ mod tests {
             )
             .unwrap();
             let ownership = SourceOwnership::new(&[package]).unwrap();
-            let file = canonical_source_file(&temp.path().join("src/main.anv")).unwrap();
+            let file = source_file_id(&temp.path().join("src/main.anv")).unwrap();
 
             assert_eq!(
                 ownership.source_owner(&file).unwrap(),
@@ -744,7 +863,7 @@ mod tests {
             write(&temp, "src/main.anv", "fn main() {}");
             let package = PackageSource::native_only(PackageId::new("host"), HashMap::new());
             let ownership = SourceOwnership::new(&[package]).unwrap();
-            let file = canonical_source_file(&temp.path().join("src/main.anv")).unwrap();
+            let file = source_file_id(&temp.path().join("src/main.anv")).unwrap();
 
             assert_eq!(ownership.source_owner(&file).unwrap(), SourceOwner::None);
         }
@@ -762,7 +881,7 @@ mod tests {
             )
             .unwrap();
             let ownership = SourceOwnership::new(&[package]).unwrap();
-            let file = canonical_source_file(&temp.path().join("outside.anv")).unwrap();
+            let file = source_file_id(&temp.path().join("outside.anv")).unwrap();
 
             assert_eq!(ownership.source_owner(&file).unwrap(), SourceOwner::None);
         }
@@ -786,7 +905,7 @@ mod tests {
             )
             .unwrap();
             let ownership = SourceOwnership::new(&[outer, inner]).unwrap();
-            let file = canonical_source_file(&temp.path().join("root/nested/main.anv")).unwrap();
+            let file = source_file_id(&temp.path().join("root/nested/main.anv")).unwrap();
             let message = invalid_message(ownership.source_owner(&file));
 
             assert!(message.contains("owned by multiple package source roots"));
@@ -832,8 +951,10 @@ mod tests {
                 source.module.source_file().unwrap().path(),
                 fs::canonicalize(&file).unwrap()
             );
+            let canonical = fs::canonicalize(&file).unwrap();
             assert_eq!(source.source.code, "const VALUE = 1;");
             assert_eq!(source.source.label, file.display().to_string());
+            assert_eq!(source.source.path.as_deref(), Some(canonical.as_path()));
         }
 
         #[test]
@@ -866,7 +987,7 @@ mod tests {
             write(&temp, "src/ui/helper.anv", "const VALUE = 1;");
             let bundle = SourceBundle::default();
             let mut env = package_env(&temp.path().join("src"), &bundle);
-            let importer = canonical_source_file(&temp.path().join("src/ui/button.anv")).unwrap();
+            let importer = source_file_id(&temp.path().join("src/ui/button.anv")).unwrap();
 
             let source = loaded_source(
                 PackageSourceLoader::load_local_source(
@@ -894,7 +1015,7 @@ mod tests {
             write(&temp, "src/common.anv", "const VALUE = 1;");
             let bundle = SourceBundle::default();
             let mut env = package_env(&temp.path().join("src"), &bundle);
-            let importer = canonical_source_file(&temp.path().join("src/ui/button.anv")).unwrap();
+            let importer = source_file_id(&temp.path().join("src/ui/button.anv")).unwrap();
 
             let source = loaded_source(
                 PackageSourceLoader::load_local_source(
@@ -922,7 +1043,7 @@ mod tests {
             write(&temp, "src/ui/helper.anv", "const VALUE = 1;");
             let bundle = SourceBundle::default();
             let mut env = package_env(&temp.path().join("src"), &bundle);
-            let importer = canonical_source_file(&temp.path().join("src/ui/button.anv")).unwrap();
+            let importer = source_file_id(&temp.path().join("src/ui/button.anv")).unwrap();
             let request = LocalSourceRequest {
                 importer: importer.clone(),
                 ascend: 0,
@@ -1018,6 +1139,7 @@ mod tests {
 
             assert_eq!(source.source.code, "const PI = 3;");
             assert_eq!(source.source.label, "<std.math>");
+            assert_eq!(source.source.path, None);
         }
 
         #[test]

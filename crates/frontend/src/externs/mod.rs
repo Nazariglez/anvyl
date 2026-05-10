@@ -63,7 +63,7 @@ mod tests {
         resolve::{
             ModuleId, ModulePath as ResolveModulePath, PackageId, ResolveResult, ResolvedModule,
         },
-        test_support::{empty_resolved, parse_program, resolved_modules, root_id},
+        test_support::{empty_resolved, parse_program, resolved_modules, root_id, test_source_id},
     };
 
     fn provider(name: &str, modules: Vec<ExternModuleDescriptor>) -> ProviderDescriptor {
@@ -427,10 +427,12 @@ mod tests {
             resolved.module_groups = vec![vec![
                 ResolvedModule {
                     key: ModuleId::named(left, resolve_path(&["math"])),
+                    source: test_source_id(),
                     program: parse("extern fn dot() -> void;"),
                 },
                 ResolvedModule {
                     key: ModuleId::named(right, resolve_path(&["math"])),
+                    source: test_source_id(),
                     program: parse("extern fn dot() -> void;"),
                 },
             ]];

@@ -1361,7 +1361,7 @@ mod tests {
         ast::{Ident, ModuleOrigin, NominalKind, Program},
         externs::RawExternScope,
         resolve::PackageId,
-        test_support::{parse_program, resolved_modules, root_id},
+        test_support::{parse_program, resolved_modules, root_id, test_source_id},
         typecheck::DeclarationIndex,
     };
 
@@ -1609,6 +1609,7 @@ mod tests {
             .module_groups
             .push(vec![crate::resolve::ResolvedModule {
                 key: option_module,
+                source: test_source_id(),
                 program: parse("pub enum Option<T> { None, Some(T) }"),
             }]);
         DeclarationIndex::from_root_and_modules(&root, &resolved, raw)

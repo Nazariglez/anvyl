@@ -1,4 +1,4 @@
-use anvyx_frontend::{lexer::SpannedToken, span::Span};
+use anvyx_frontend::{lexer::LexedToken, span::Span};
 
 pub struct TriviaItem {
     pub kind: TriviaKind,
@@ -13,7 +13,7 @@ pub enum TriviaKind {
 }
 
 // doc comments (`///`) are tokenized separately and won't appear in the gaps we scan here
-pub fn scan_trivia(source: &str, tokens: &[SpannedToken]) -> Vec<TriviaItem> {
+pub fn scan_trivia(source: &str, tokens: &[LexedToken]) -> Vec<TriviaItem> {
     let mut items = Vec::new();
 
     if tokens.is_empty() {
@@ -21,13 +21,13 @@ pub fn scan_trivia(source: &str, tokens: &[SpannedToken]) -> Vec<TriviaItem> {
         return items;
     }
 
-    scan_gap(source, 0, tokens[0].1.start, &mut items);
+    scan_gap(source, 0, tokens[0].1.start(), &mut items);
 
     for pair in tokens.windows(2) {
-        scan_gap(source, pair[0].1.end, pair[1].1.start, &mut items);
+        scan_gap(source, pair[0].1.end(), pair[1].1.start(), &mut items);
     }
 
-    let start = tokens.last().unwrap().1.end;
+    let start = tokens.last().unwrap().1.end();
     scan_gap(source, start, source.len(), &mut items);
 
     items
@@ -93,8 +93,17 @@ mod tests {
 
     use super::*;
 
-    fn tokenize_test(source: &str) -> Vec<SpannedToken> {
-        lexer::tokenize(source).expect("tokenize failed")
+    fn tokenize_test(source: &str) -> Vec<LexedToken> {
+        let mut sources = anvyx_frontend::source::SourceTable::default();
+        let source_id = sources.add(
+            anvyx_frontend::source::SourceKind::Virtual,
+            "test",
+            None,
+            source,
+        );
+        lexer::tokenize(source_id, source)
+            .expect("tokenize failed")
+            .tokens
     }
 
     #[test]

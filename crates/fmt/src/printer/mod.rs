@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Write};
 
-use anvyx_frontend::{ast, lexer::SpannedToken, span::Span};
+use anvyx_frontend::ast;
 
 use super::trivia::{TriviaItem, TriviaKind};
 
@@ -52,7 +52,6 @@ fn needs_blank_line_between(a: &ast::Stmt, b: &ast::Stmt) -> bool {
 
 pub struct Printer<'a> {
     source: &'a str,
-    tokens: &'a [SpannedToken],
     trivia: &'a [TriviaItem],
     trivia_cursor: usize,
     buf: String,
@@ -62,11 +61,10 @@ pub struct Printer<'a> {
 }
 
 impl<'a> Printer<'a> {
-    pub fn new(source: &'a str, tokens: &'a [SpannedToken], trivia: &'a [TriviaItem]) -> Self {
+    pub fn new(source: &'a str, trivia: &'a [TriviaItem]) -> Self {
         let estimated_capacity = source.len() + source.len() / 4;
         Self {
             source,
-            tokens,
             trivia,
             trivia_cursor: 0,
             buf: String::with_capacity(estimated_capacity),
@@ -260,23 +258,6 @@ impl<'a> Printer<'a> {
         }
     }
 
-    // the parser gives token-index spans,not byte offsets
-    // convert before comparing with source positions
-    fn tok_to_byte(&self, tok_span: Span) -> Span {
-        if self.tokens.is_empty() || tok_span.start >= self.tokens.len() {
-            let end = self.source.len();
-            return Span::new(end, end);
-        }
-        let byte_start = self.tokens[tok_span.start].1.start;
-        let end_tok = tok_span.end.min(self.tokens.len());
-        let byte_end = if end_tok == 0 {
-            0
-        } else {
-            self.tokens[end_tok - 1].1.end
-        };
-        Span::new(byte_start, byte_end)
-    }
-
     fn emit_trivia_before(&mut self, pos: usize) {
         while self.trivia_cursor < self.trivia.len() {
             let item = &self.trivia[self.trivia_cursor];
@@ -359,17 +340,12 @@ impl<'a> Printer<'a> {
     }
 
     fn format_block_inner(&mut self, block: &ast::BlockNode, allow_compact: bool) {
-        let close_brace_byte_start = if block.span.end > 0 && block.span.end <= self.tokens.len() {
-            self.tokens[block.span.end - 1].1.start
-        } else {
-            self.source.len()
-        };
-
-        let open_brace_byte_end = if block.span.start < self.tokens.len() {
-            self.tokens[block.span.start].1.end
-        } else {
-            0
-        };
+        debug_assert!(block.span.start < block.span.end);
+        debug_assert!(block.span.end <= self.source.len());
+        debug_assert_eq!(self.source.as_bytes().get(block.span.start), Some(&b'{'));
+        debug_assert_eq!(self.source.as_bytes().get(block.span.end - 1), Some(&b'}'));
+        let close_brace_byte_start = block.span.end - 1;
+        let open_brace_byte_end = block.span.start + 1;
 
         // skip trivia before `{` so outer scope items don't leak in (like blank lines in struct bodies)
         while self.trivia_cursor < self.trivia.len()
@@ -419,26 +395,24 @@ impl<'a> Printer<'a> {
 
         let stmts_len = block.node.stmts.len();
         for (i, stmt_node) in block.node.stmts.iter().enumerate() {
-            let byte_span = self.tok_to_byte(stmt_node.span);
-            self.emit_trivia_before(byte_span.start);
+            self.emit_trivia_before(stmt_node.span.start);
             self.format_stmt(stmt_node);
             let next_byte_start = if i + 1 < stmts_len {
-                self.tok_to_byte(block.node.stmts[i + 1].span).start
+                block.node.stmts[i + 1].span.start
             } else if let Some(tail) = &block.node.tail {
-                self.tok_to_byte(tail.span).start
+                tail.span.start
             } else {
                 close_brace_byte_start
             };
-            self.emit_trailing_trivia(byte_span.end, next_byte_start);
+            self.emit_trailing_trivia(stmt_node.span.end, next_byte_start);
         }
 
         if let Some(tail) = &block.node.tail {
-            let byte_span = self.tok_to_byte(tail.span);
-            self.emit_trivia_before(byte_span.start);
+            self.emit_trivia_before(tail.span.start);
             self.write_indent();
             self.format_expr(&tail.node);
             self.writeln();
-            self.emit_trailing_trivia(byte_span.end, close_brace_byte_start);
+            self.emit_trailing_trivia(tail.span.end, close_brace_byte_start);
         }
 
         self.emit_trivia_before(close_brace_byte_start);
@@ -449,17 +423,16 @@ impl<'a> Printer<'a> {
 
     pub fn format_program(&mut self, program: &ast::Program) {
         for (i, stmt) in program.stmts.iter().enumerate() {
-            let byte_span = self.tok_to_byte(stmt.span);
-            self.emit_trivia_before(byte_span.start);
+            self.emit_trivia_before(stmt.span.start);
 
             self.format_stmt(stmt);
 
             let next_byte_start = if i + 1 < program.stmts.len() {
-                self.tok_to_byte(program.stmts[i + 1].span).start
+                program.stmts[i + 1].span.start
             } else {
                 self.source.len()
             };
-            self.emit_trailing_trivia(byte_span.end, next_byte_start);
+            self.emit_trailing_trivia(stmt.span.end, next_byte_start);
 
             if i + 1 < program.stmts.len()
                 && needs_blank_line_between(&stmt.node, &program.stmts[i + 1].node)

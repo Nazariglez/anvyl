@@ -8,7 +8,7 @@ use self::{
     generic_bind::bind_exact_generic_args,
     infer::{
         GenericSolverSeeds, GenericSolverVars, LocalTypeId, Solver, SolverFinalizeError,
-        SolverRelationError, TypeHandle,
+        SolverRelationError, SourceExprTypes, TypeHandle,
     },
     pattern::{PatternBindMode, PatternContext},
     place::{
@@ -33,7 +33,8 @@ use crate::{
         },
     },
     resolve::ResolveResult,
-    span::Span,
+    source::SourceId,
+    span::{SourceSpan, Span},
 };
 
 mod annotation;
@@ -130,18 +131,18 @@ pub(crate) enum TypeWarning {
         kind: DeprecatedUseKind,
         name: Ident,
         reason: Option<String>,
-        span: Span,
+        span: SourceSpan,
     },
     InternalAccess {
         kind: MemberAccessKind,
         name: Ident,
         owner: Type,
         reason: Option<String>,
-        span: Span,
+        span: SourceSpan,
     },
     CompileMessage {
         message: String,
-        span: Span,
+        span: SourceSpan,
     },
 }
 
@@ -151,491 +152,491 @@ pub(crate) enum TypeError {
     ExternCatalog(ExternCatalogError),
     UndefinedVariable {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TypeMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstMismatch {
         expected: ConstDiagnostic,
         found: ConstDiagnostic,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     RecursiveInference {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     CannotInferType {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     CannotInferEnum {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NamedFunctionCapture {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     AllNilArrayLiteral {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ArrayFillLengthNotConst {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InferReturnNonGeneric {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InferReturnExtern {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InferReturnValue {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InferReturnMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InferReturnRecursive {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownType {
         qualifier: Option<Ident>,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TypeUsedAsValue {
         ty: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     CannotInferConst {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NotCallable {
         ty: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     WrongArgCount {
         expected: usize,
         found: usize,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     WrongArgRange {
         min: usize,
         max: usize,
         found: usize,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     LambdaParamCountMismatch {
         expected: usize,
         found: usize,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     RequiredParamAfterDefault {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     EnumVariantArgCount {
         enum_name: Ident,
         variant: Ident,
         expected: usize,
         found: usize,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateName {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ImmutableAssignment {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstAssignment {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     VarArgNonLvalue {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     VarArgImmutableBinding {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MutatingMethodImmutableReceiver {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MutableAlias {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidFormatSpec {
         reason: &'static str,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     CannotMutateCapturedVariable {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     RequiresMutablePlace {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     VarPatternRequiresMutablePlace {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidOperand {
         op: String,
         operand_type: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MissingReturn {
         expected: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IfWithoutElseValue {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IfConditionNotBool {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TernaryConditionNotBool {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     WhileConditionNotBool {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     BreakOutsideLoop {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ContinueOutsideLoop {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ReturnInsideDefer {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     BreakInsideDefer {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ContinueInsideDefer {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TryOnNonResult {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TryOutsideResultFunction {
         found: Option<Type>,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TryErrorMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TryInsideDefer {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ForIterableNotSupported {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ForIterationModifier {
         message: &'static str,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InfiniteSize {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NotEquatable {
         ty: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnsupportedPattern {
         pattern: &'static str,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TuplePatternArityMismatch {
         expected: usize,
         found: usize,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TuplePatternOnNonTuple {
         ty: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     OrPatternBindingMismatch {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     OrPatternBindingTypeMismatch {
         name: Ident,
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     EmptyMatch {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NonExhaustiveMatch {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnsupportedMatchScrutinee {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidLiteralPattern {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     OptionalPatternOnNonOptional {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     OptionalChainingOnNonOptional {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NestedOptionalPattern {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MatchArmTypeMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     RequiresUnwrappingPattern {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IrrefutableLetElse {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     LetElseMustDiverge {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MemberAccessOnNonAggregate {
         ty: Type,
         member: Ident,
         kind: MemberAccessKind,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownMember {
         ty: Type,
         member: Ident,
         kind: MemberAccessKind,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InstanceMethodOnType {
         ty: Type,
         method: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     StaticMethodOnValue {
         ty: Type,
         method: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ReadonlyMethodMutation {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InternalAccess {
         kind: MemberAccessKind,
         name: Ident,
         owner: Type,
         reason: Option<String>,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownIntrinsic {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IntrinsicArgCount {
         name: Ident,
         expected: usize,
         found: usize,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IntrinsicExpectedIdent {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IntrinsicExpectedString {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownIntrinsicValue {
         predicate: Ident,
         value: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     CompileError {
         message: String,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MethodGenericShadow {
         owner_kind: AggregateKind,
         method_param: GenericParamKind,
         owner_param: GenericParamKind,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TupleIndexOnNonTuple {
         ty: Type,
         index: u32,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     TupleIndexOutOfBounds {
         index: u32,
         len: usize,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IndexNotInt {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     IndexOnNonIndexable {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     RangeIndexNotInt {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     RangeIndexUnsupported {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NonKeyableMapKey {
         ty: Type,
         field: Option<Ident>,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateMapKey {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UndefinedModuleMember {
         module: ModuleScope,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     PrivateModuleMember {
         module: ModuleScope,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     AmbiguousExtendMethod {
         receiver: Type,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateField {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MissingField {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownVariantField {
         enum_name: Ident,
         variant: Ident,
         field: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     MissingVariantField {
         enum_name: Ident,
         variant: Ident,
         field: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidStructLiteral {
         name: Ident,
         kind: String,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownStructLiteral {
         qualifier: Option<Ident>,
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownEnumVariant {
         enum_name: Ident,
         variant: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     EnumPatternTypeMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     EnumVariantShapeMismatch {
         enum_name: Ident,
         variant: Ident,
         expected: VariantShape,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     GenericArity(ArityError),
     UnboundGenericParam {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     UnknownConst {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstCycle {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NonConstExpression {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     GenericFieldDefault {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstTypeMismatch {
         expected: Type,
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidConstCast {
         from: Type,
         to: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     InvalidCast {
         from: Type,
         to: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstDivisionByZero {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ConstOverflow {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ExpectedIntConst {
         found: Type,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     NegativeArrayLength {
         value: i64,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     GenericArgKindMismatch {
         expected: &'static str,
-        span: Span,
+        span: Option<SourceSpan>,
     },
     ExternAnyEscape {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     AnyOutsideExternBoundary {
-        span: Span,
+        span: Option<SourceSpan>,
     },
     DuplicateGenericParam {
         name: Ident,
-        span: Span,
+        span: Option<SourceSpan>,
     },
 }
 
@@ -780,7 +781,7 @@ impl LocalCallableInfo {
         !self.callee.def.sig.owner_generics.is_empty() || !self.callee.def.sig.generics.is_empty()
     }
 
-    fn value_error(&self, name: Ident, span: Span) -> Option<TypeError> {
+    fn value_error(&self, name: Ident, span: Option<SourceSpan>) -> Option<TypeError> {
         if self.has_generics() {
             Some(TypeError::UndefinedVariable { name, span })
         } else if matches!(self.callee.def.sig.ret, Type::InferReturn) {
@@ -809,7 +810,7 @@ impl LocalSymbol {
         }
     }
 
-    fn value_error(&self, name: Ident, span: Span) -> Option<TypeError> {
+    fn value_error(&self, name: Ident, span: Option<SourceSpan>) -> Option<TypeError> {
         match self {
             Self::Value(_) => None,
             Self::Callable(info) => info.value_error(name, span),
@@ -871,6 +872,7 @@ struct TypeChecker {
     warnings: Vec<TypeWarning>,
     config: TypecheckConfig,
     current_module: ModuleScope,
+    module_sources: HashMap<ModuleScope, SourceId>,
     module_programs: HashMap<ModuleScope, Rc<Program>>,
     type_substs: Vec<TypeSubst>,
     const_substs: Vec<ConstSubst>,
@@ -957,6 +959,7 @@ impl TypeChecker {
             warnings: vec![],
             config,
             current_module: ModuleScope::Root,
+            module_sources: HashMap::new(),
             module_programs: HashMap::new(),
             type_substs: vec![],
             const_substs: vec![],
@@ -969,6 +972,38 @@ impl TypeChecker {
             local_consts: vec![],
             next_alias_alt_group: 0,
         }
+    }
+
+    fn source_id(&self) -> SourceId {
+        self.module_sources
+            .get(&self.current_module)
+            .copied()
+            .expect("source module has no SourceId")
+    }
+
+    fn source_span(&self, span: Span) -> SourceSpan {
+        SourceSpan::from_byte_span(self.source_id(), span)
+    }
+
+    fn error_span(&self, span: Span) -> Option<SourceSpan> {
+        self.module_error_span(&self.current_module, span)
+    }
+
+    fn module_error_span(&self, module: &ModuleScope, span: Span) -> Option<SourceSpan> {
+        self.module_sources
+            .get(module)
+            .map(|source| SourceSpan::from_byte_span(*source, span))
+    }
+
+    fn with_current_module<R>(
+        &mut self,
+        module: &ModuleScope,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = std::mem::replace(&mut self.current_module, module.clone());
+        let ret = f(self);
+        self.current_module = previous;
+        ret
     }
 
     fn push_scope(&mut self) {
@@ -1059,10 +1094,8 @@ impl TypeChecker {
             return;
         };
         if scope.contains_key(&name) {
-            self.errors.push(TypeError::DuplicateName {
-                name,
-                span: Span::new(0, 0),
-            });
+            self.errors
+                .push(TypeError::DuplicateName { name, span: None });
             return;
         }
         self.scopes
@@ -1144,7 +1177,10 @@ impl TypeChecker {
             return LocalSymbolLookup::Missing;
         };
         if self.blocks_named_capture(&symbol, depth) {
-            return LocalSymbolLookup::Blocked(TypeError::NamedFunctionCapture { name, span });
+            return LocalSymbolLookup::Blocked(TypeError::NamedFunctionCapture {
+                name,
+                span: self.error_span(span),
+            });
         }
         LocalSymbolLookup::Found(symbol, depth)
     }
@@ -1156,7 +1192,7 @@ impl TypeChecker {
     ) -> Result<Option<LocalValue>, ()> {
         match self.lookup_local_symbol_checked(name, span) {
             LocalSymbolLookup::Found(symbol, depth) => {
-                if let Some(error) = symbol.value_error(name, span) {
+                if let Some(error) = symbol.value_error(name, self.error_span(span)) {
                     self.push_error(error);
                     Err(())
                 } else {
@@ -1246,6 +1282,7 @@ impl TypeChecker {
     }
 
     fn set_type(&mut self, id: ExprId, ty: Type, span: Span) -> TypeHandle {
+        let span = self.error_span(span);
         if matches!(ty, Type::Infer) {
             self.solver.error_expr_type(id, span)
         } else {
@@ -1255,19 +1292,20 @@ impl TypeChecker {
     }
 
     fn set_nil_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
-        self.solver.nil_expr_type(id, span)
+        self.solver.nil_expr_type(id, self.error_span(span))
     }
 
     fn fresh_nil_handle(&mut self, span: Span) -> TypeHandle {
-        self.solver.fresh_nil_handle(span)
+        self.solver.fresh_nil_handle(self.error_span(span))
     }
 
     fn set_type_from_handle(&mut self, id: ExprId, span: Span, handle: TypeHandle) -> TypeHandle {
-        self.solver.set_expr_type_from_handle(id, span, handle)
+        self.solver
+            .set_expr_type_from_handle(id, self.error_span(span), handle)
     }
 
     fn fresh_temp_handle(&mut self, span: Span) -> TypeHandle {
-        self.solver.fresh_temp_handle(span)
+        self.solver.fresh_temp_handle(self.error_span(span))
     }
 
     fn array_handle(&mut self, elem: TypeHandle, len: ArrayLen) -> TypeHandle {
@@ -1291,11 +1329,13 @@ impl TypeChecker {
     }
 
     fn expect_assignable(&mut self, span: Span, from: TypeHandle, to: TypeHandle) {
-        self.solver.add_handle_assignable(span, from, to);
+        self.solver
+            .add_handle_assignable(self.error_span(span), from, to);
     }
 
     fn expect_equal(&mut self, span: Span, left: TypeHandle, right: TypeHandle) {
-        self.solver.add_handle_equal(span, left, right);
+        self.solver
+            .add_handle_equal(self.error_span(span), left, right);
     }
 
     fn solve_constraints(&mut self) -> bool {
@@ -1360,7 +1400,9 @@ impl TypeChecker {
 
     fn reject_extern_any_escape_fact(&mut self, contains_extern_any: bool, span: Span) {
         if contains_extern_any {
-            self.push_error(TypeError::ExternAnyEscape { span });
+            self.push_error(TypeError::ExternAnyEscape {
+                span: self.error_span(span),
+            });
         }
     }
 
@@ -1368,18 +1410,20 @@ impl TypeChecker {
         if !type_closure_facts(ty).contains_any {
             return false;
         }
-        self.push_error(TypeError::AnyOutsideExternBoundary { span });
+        self.push_error(TypeError::AnyOutsideExternBoundary {
+            span: self.error_span(span),
+        });
         true
     }
 
     fn validate_map_key_type(&mut self, ty: &Type, span: Span) {
-        if let Some(err) = map_key_type_error(&self.decls, ty, span) {
+        if let Some(err) = map_key_type_error(&self.decls, ty, self.error_span(span)) {
             self.push_error(err);
         }
     }
 
     fn validate_map_key_type_in(&mut self, decls: &DeclarationIndex, ty: &Type, span: Span) {
-        if let Some(err) = map_key_type_error(decls, ty, span) {
+        if let Some(err) = map_key_type_error(decls, ty, self.error_span(span)) {
             self.push_error(err);
         }
     }
@@ -1543,7 +1587,7 @@ impl TypeChecker {
             kind: DeprecatedUseKind::ExternType,
             name: key.name,
             reason,
-            span,
+            span: self.source_span(span),
         });
     }
 
@@ -1554,7 +1598,8 @@ impl TypeChecker {
         name: Ident,
         span: Span,
     ) {
-        if let Some(warning) = deprecated_access_warning(policy, kind, name, span) {
+        if let Some(warning) = deprecated_access_warning(policy, kind, name, self.source_span(span))
+        {
             self.push_warning(warning);
         }
     }
@@ -1566,7 +1611,9 @@ impl TypeChecker {
         if let Some(inner) = self.decls.core_option_inner(ty) {
             return inner.clone();
         }
-        self.push_error(TypeError::OptionalChainingOnNonOptional { span });
+        self.push_error(TypeError::OptionalChainingOnNonOptional {
+            span: self.error_span(span),
+        });
         ty.clone()
     }
 
@@ -1594,6 +1641,7 @@ impl TypeChecker {
             origin,
             span,
             &mut AccessPolicyOutput {
+                source: self.source_id(),
                 current_module: &self.current_module,
                 config: &self.config,
                 warnings: &mut self.warnings,
@@ -1610,7 +1658,10 @@ impl TypeChecker {
 
     fn push_unbound_generic_errors(&mut self, names: Vec<Ident>, span: Span) {
         for name in names {
-            self.push_error(TypeError::UnboundGenericParam { name, span });
+            self.push_error(TypeError::UnboundGenericParam {
+                name,
+                span: self.error_span(span),
+            });
         }
     }
 
@@ -1684,7 +1735,7 @@ impl TypeChecker {
         match GenericTypeContext::try_from_params(type_params, const_params) {
             Ok(generics) => generics,
             Err(error) => {
-                self.push_error(generic_param_type_error(error, span));
+                self.push_error(generic_param_type_error(error, self.error_span(span)));
                 GenericTypeContext::default()
             }
         }
@@ -1700,7 +1751,7 @@ impl TypeChecker {
         match owner.try_with_shadowing_params(type_params, const_params) {
             Ok(generics) => generics,
             Err(error) => {
-                self.push_error(generic_param_type_error(error, span));
+                self.push_error(generic_param_type_error(error, self.error_span(span)));
                 owner.clone()
             }
         }
@@ -1824,10 +1875,6 @@ impl TypeChecker {
             .map(Self::resolved_value)
     }
 
-    fn resolve_type_for_tc(&mut self, ty: &Type) -> Type {
-        self.resolve_type_for_tc_at(ty, Span::new(0, 0))
-    }
-
     fn resolve_type_subject(&mut self, ty: &Type, span: Span) -> Option<Type> {
         let ty = self.resolve_type_for_tc_at(ty, span);
         (!matches!(ty, Type::Infer)).then_some(ty)
@@ -1841,7 +1888,7 @@ impl TypeChecker {
         {
             Ok(ty) => ty,
             Err(error) => {
-                self.push_error_once(type_ref_error(error, span));
+                self.push_error_once(type_ref_error(error, self.error_span(span)));
                 return Type::Infer;
             }
         };
@@ -1901,11 +1948,16 @@ impl TypeChecker {
                         None
                     }
                     const_eval::ConstNameLookup::NotConstLocal => {
-                        self.push_error_once(TypeError::NonConstExpression { span });
+                        self.push_error_once(TypeError::NonConstExpression {
+                            span: self.error_span(span),
+                        });
                         None
                     }
                     const_eval::ConstNameLookup::Missing => {
-                        self.push_error_once(TypeError::UnknownConst { name, span });
+                        self.push_error_once(TypeError::UnknownConst {
+                            name,
+                            span: self.error_span(span),
+                        });
                         None
                     }
                 }
@@ -1933,7 +1985,8 @@ impl TypeChecker {
         warn_deprecated: bool,
     ) -> Option<usize> {
         match self.eval_const_term_inner(term, span, warn_deprecated)? {
-            ConstTerm::Value(value) => match const_eval::const_usize(&value, span) {
+            ConstTerm::Value(value) => match const_eval::const_usize(&value, self.error_span(span))
+            {
                 Ok(value) => Some(value),
                 Err(err) => {
                     self.push_error(err);
@@ -1941,7 +1994,10 @@ impl TypeChecker {
                 }
             },
             ConstTerm::Name(name) => {
-                self.push_error(TypeError::UnknownConst { name, span });
+                self.push_error(TypeError::UnknownConst {
+                    name,
+                    span: self.error_span(span),
+                });
                 None
             }
             ConstTerm::Param(_) | ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
@@ -2022,25 +2078,25 @@ impl TypeChecker {
         Some(nominal_type(&key))
     }
 
-    fn func_type_from_sig(&mut self, params: &[Param], ret: &Type) -> Type {
+    fn func_type_from_sig(&mut self, params: &[Param], ret: &Type, span: Span) -> Type {
         let resolved_params: Vec<FuncParam> = params
             .iter()
             .map(|p| {
                 FuncParam::new(
-                    self.resolve_type_for_tc_at(&p.ty, Span::new(0, 0)),
+                    self.resolve_type_for_tc_at(&p.ty, span),
                     matches!(p.mutability, Mutability::Mutable),
                     p.cast_accept,
                 )
             })
             .collect();
-        let resolved_ret = Box::new(self.resolve_type_for_tc_at(ret, Span::new(0, 0)));
+        let resolved_ret = Box::new(self.resolve_type_for_tc_at(ret, span));
         Type::Func {
             params: resolved_params,
             ret: resolved_ret,
         }
     }
 
-    fn finish(&mut self) -> Result<HashMap<ExprId, (Span, Type)>, Vec<TypeError>> {
+    fn finish(&mut self) -> Result<SourceExprTypes, Vec<TypeError>> {
         self.solve_constraints();
         if !self.errors.is_empty() {
             return Err(std::mem::take(&mut self.errors));
@@ -2067,15 +2123,13 @@ impl TypeChecker {
         })
     }
 
-    fn result_closure_errors(&self, types: &HashMap<ExprId, (Span, Type)>) -> Vec<TypeError> {
+    fn result_closure_errors(&self, types: &SourceExprTypes) -> Vec<TypeError> {
         let mut errors = vec![];
         for (span, ty) in types.values() {
             push_type_closure_error(&mut errors, ty, *span);
         }
         for (id, target) in &self.calls {
-            let span = types
-                .get(id)
-                .map_or_else(|| Span::new(0, 0), |(span, _)| *span);
+            let span = types.get(id).and_then(|(span, _)| *span);
             push_call_target_closure_error(&mut errors, target, span);
         }
         self.externs.for_each_resolved_ty(|ty, site| {
@@ -2166,7 +2220,8 @@ impl TypeChecker {
             ty
         });
         for error in generic_errors {
-            self.push_error(generic_param_decl_type_error(error));
+            let source = self.module_sources.get(&error.module).copied();
+            self.push_error(generic_param_decl_type_error(error, source));
         }
         validate_extend_decls(&decls, &mut self.errors);
         self.current_module = saved_module;
@@ -2186,12 +2241,12 @@ impl TypeChecker {
                     module: site.module,
                     qualifier,
                     name,
-                    span: site.span,
+                    span: Some(self.source_span(site.span)),
                 }));
                 Type::Infer
             }
             Err(error) => {
-                self.push_error(type_ref_error(error, site.span));
+                self.push_error(type_ref_error(error, self.error_span(site.span)));
                 Type::Infer
             }
         }
@@ -2299,7 +2354,11 @@ impl TypeChecker {
     }
 }
 
-fn map_key_type_error(decls: &DeclarationIndex, ty: &Type, span: Span) -> Option<TypeError> {
+fn map_key_type_error(
+    decls: &DeclarationIndex,
+    ty: &Type,
+    span: Option<SourceSpan>,
+) -> Option<TypeError> {
     let err = decls.map_key_error(ty)?;
     Some(TypeError::NonKeyableMapKey {
         ty: err.ty,
@@ -2312,7 +2371,7 @@ fn deprecated_access_warning(
     policy: &annotation::AccessPolicy,
     kind: DeprecatedUseKind,
     name: Ident,
-    span: Span,
+    span: SourceSpan,
 ) -> Option<TypeWarning> {
     policy
         .has_deprecated()
@@ -2325,6 +2384,7 @@ fn deprecated_access_warning(
 }
 
 struct AccessPolicyOutput<'a> {
+    source: SourceId,
     current_module: &'a ModuleScope,
     config: &'a TypecheckConfig,
     warnings: &'a mut Vec<TypeWarning>,
@@ -2340,9 +2400,12 @@ fn emit_access_policy(
     span: Span,
     out: &mut AccessPolicyOutput<'_>,
 ) {
-    if let Some(warning) =
-        deprecated_access_warning(policy, DeprecatedUseKind::from(kind), name, span)
-    {
+    if let Some(warning) = deprecated_access_warning(
+        policy,
+        DeprecatedUseKind::from(kind),
+        name,
+        SourceSpan::from_byte_span(out.source, span),
+    ) {
         out.warnings.push(warning);
     }
 
@@ -2361,14 +2424,14 @@ fn emit_access_policy(
             name,
             owner: owner.clone(),
             reason,
-            span,
+            span: SourceSpan::from_byte_span(out.source, span),
         }),
         LintLevel::Error => out.errors.push(TypeError::InternalAccess {
             kind,
             name,
             owner: owner.clone(),
             reason,
-            span,
+            span: Some(SourceSpan::from_byte_span(out.source, span)),
         }),
     }
 }
@@ -2402,9 +2465,13 @@ fn typechecker_for_modules(
 
     let mut tc = TypeChecker::new(decls, catalog, config);
     let root_scope = ModuleScope::from_module_id(&resolved.root);
+    let root_source = resolved.root_source;
     tc.current_module = root_scope.clone();
-    tc.collect_const_decls(&root_scope, program);
-    collect_callable_templates(root_scope.clone(), program, &mut tc);
+    tc.module_sources.insert(root_scope.clone(), root_source);
+    tc.with_current_module(&root_scope, |tc| {
+        tc.collect_const_decls(&root_scope, program);
+        collect_callable_templates(root_scope.clone(), program, tc);
+    });
 
     let mut module_bodies = vec![];
     for group in &resolved.module_groups {
@@ -2414,22 +2481,29 @@ fn typechecker_for_modules(
             }
             let scope = ModuleScope::from_module_id(&module.key);
             let program = Rc::new(module.program.clone());
+            tc.module_sources.insert(scope.clone(), module.source);
             tc.module_programs
                 .insert(scope.clone(), Rc::clone(&program));
-            tc.collect_const_decls(&scope, program.as_ref());
-            collect_callable_templates(scope.clone(), program.as_ref(), &mut tc);
+            tc.with_current_module(&scope, |tc| {
+                tc.collect_const_decls(&scope, program.as_ref());
+                collect_callable_templates(scope.clone(), program.as_ref(), tc);
+            });
             module_bodies.push((scope, program));
         }
     }
 
-    tc.eval_module_consts(&root_scope);
+    tc.with_current_module(&root_scope, |tc| tc.eval_module_consts(&root_scope));
     tc.finalize_declarations();
     check_finite_size_cycles(&mut tc);
-    check_decl_param_order(program, &mut tc);
-    check_infer_return_decls(program, &mut tc);
-    for (_, program) in &module_bodies {
-        check_decl_param_order(program.as_ref(), &mut tc);
-        check_infer_return_decls(program.as_ref(), &mut tc);
+    tc.with_current_module(&root_scope, |tc| {
+        check_decl_param_order(program, tc);
+        check_infer_return_decls(program, tc);
+    });
+    for (module, program) in &module_bodies {
+        tc.with_current_module(module, |tc| {
+            check_decl_param_order(program.as_ref(), tc);
+            check_infer_return_decls(program.as_ref(), tc);
+        });
     }
     if !tc.errors.is_empty() {
         return Err(tc.errors);
@@ -2475,9 +2549,13 @@ fn check_finite_size_key(
     }
     if !visiting.insert(key.clone()) {
         if reported.insert(key.clone()) {
+            let span = tc
+                .decls
+                .type_span(key)
+                .and_then(|span| tc.module_error_span(&key.module, span));
             tc.push_error(TypeError::InfiniteSize {
                 name: key.name,
-                span: tc.decls.type_span_or_default(key),
+                span,
             });
         }
         return;
@@ -2571,15 +2649,21 @@ fn finite_size_edges(ty: &Type, decls: &DeclarationIndex, edges: &mut Vec<Nomina
     }
 }
 
-fn generic_param_decl_type_error(error: GenericContextError) -> TypeError {
+fn generic_param_decl_type_error(
+    error: GenericContextError,
+    source: Option<SourceId>,
+) -> TypeError {
     TypeError::Decl(DeclError::DuplicateGenericParam {
         module: error.module,
         name: error.error.name(),
-        span: error.span,
+        span: source.map(|source| SourceSpan {
+            source,
+            span: error.span,
+        }),
     })
 }
 
-fn generic_param_type_error(error: GenericParamError, span: Span) -> TypeError {
+fn generic_param_type_error(error: GenericParamError, span: Option<SourceSpan>) -> TypeError {
     TypeError::DuplicateGenericParam {
         name: error.name(),
         span,
@@ -2595,14 +2679,14 @@ fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) 
         if unsupported_extend_target(&extend.target, &facts) {
             errors.push(TypeError::Decl(DeclError::UnsupportedExtendTarget {
                 ty: extend.target.clone(),
-                span: extend.span,
+                span: Some(extend.span),
             }));
         }
         for param in &extend.generics.type_params {
             if !facts.type_params.contains(&param.id) {
                 errors.push(TypeError::Decl(DeclError::UnusedExtendTypeParam {
                     name: param.name,
-                    span: extend.span,
+                    span: Some(extend.span),
                 }));
             }
         }
@@ -2610,7 +2694,7 @@ fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) 
             if !facts.const_params.contains(&param.id) {
                 errors.push(TypeError::Decl(DeclError::UnusedExtendConstParam {
                     name: param.name,
-                    span: extend.span,
+                    span: Some(extend.span),
                 }));
             }
         }
@@ -2633,7 +2717,7 @@ fn validate_cast_froms(
         ) {
             errors.push(TypeError::Decl(DeclError::PointlessCastFrom {
                 ty: cast.source.clone(),
-                span: cast.span,
+                span: Some(cast.span),
             }));
         }
         if let Some(ret) = &cast.ret
@@ -2642,14 +2726,14 @@ fn validate_cast_froms(
             errors.push(TypeError::Decl(DeclError::CastFromReturnMismatch {
                 expected: extend.target.clone(),
                 found: ret.clone(),
-                span: cast.span,
+                span: Some(cast.span),
             }));
         }
         if has_duplicate_cast_from(decls, extend, cast) {
             errors.push(TypeError::Decl(DeclError::DuplicateCastFrom {
                 target: extend.target.clone(),
                 source: cast.source.clone(),
-                span: cast.span,
+                span: Some(cast.span),
             }));
         }
     }
@@ -2743,7 +2827,7 @@ fn push_extend_method_conflict(
         ty: extend.target.clone(),
         name: method_key.name,
         surface: method_key.surface,
-        span: extend.span,
+        span: Some(extend.span),
     }));
 }
 
@@ -2787,7 +2871,7 @@ fn extend_target_facts(ty: &Type) -> ExtendTargetFacts {
     facts
 }
 
-fn type_ref_error(error: TypeRefError, span: Span) -> TypeError {
+fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> TypeError {
     match error {
         TypeRefError::Unknown { qualifier, name } => TypeError::UnknownType {
             qualifier,
@@ -2825,7 +2909,7 @@ fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) {
             Stmt::ExternFunc(func_node) => {
                 if matches!(func_node.node.ret, Type::InferReturn) {
                     tc.push_error(TypeError::InferReturnExtern {
-                        span: func_node.span,
+                        span: tc.error_span(func_node.span),
                     });
                 }
             }
@@ -2860,7 +2944,9 @@ fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) {
 
 fn check_infer_return_allowed(ret: &Type, generic: bool, span: Span, tc: &mut TypeChecker) {
     if matches!(ret, Type::InferReturn) && !generic {
-        tc.push_error(TypeError::InferReturnNonGeneric { span });
+        tc.push_error(TypeError::InferReturnNonGeneric {
+            span: tc.error_span(span),
+        });
     }
 }
 
@@ -3037,7 +3123,7 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                 if is_generic(func) {
                     continue;
                 }
-                let func_ty = tc.func_type_from_sig(&func.params, &func.ret);
+                let func_ty = tc.func_type_from_sig(&func.params, &func.ret, func_node.span);
                 tc.define(func.name, func_ty, false);
             }
             Stmt::Aggregate(_) | Stmt::Enum(_) => {}
@@ -3353,7 +3439,7 @@ fn check_param_order(params: &[Param], span: Span, tc: &mut TypeChecker) {
         } else if saw_default {
             tc.push_error(TypeError::RequiredParamAfterDefault {
                 name: param.name,
-                span,
+                span: tc.error_span(span),
             });
         }
     }
@@ -3388,7 +3474,9 @@ fn check_aggregate_field_defaults(
             continue;
         };
         if type_depends_on_generics(&schema.ty) {
-            tc.push_error(TypeError::GenericFieldDefault { span: default.span });
+            tc.push_error(TypeError::GenericFieldDefault {
+                span: tc.error_span(default.span),
+            });
             continue;
         }
         let expected = tc.type_handle(&schema.ty);
@@ -3515,7 +3603,7 @@ fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
         None => {
             let func_ty = match tc.lookup(func.name) {
                 Some(info) => tc.solver.local_type_to_type(info.type_id),
-                None => tc.func_type_from_sig(&func.params, &func.ret),
+                None => tc.func_type_from_sig(&func.params, &func.ret, func_node.span),
             };
             let Type::Func { params, ret } = func_ty else {
                 return;
@@ -3690,7 +3778,7 @@ fn check_method_generic_shadow(
         method_param,
         owner_param,
         name,
-        span,
+        span: tc.error_span(span),
     });
 }
 
@@ -3750,7 +3838,7 @@ fn finish_callable_body_return(
             } else if !ret.is_void() && !body.diverges() {
                 tc.push_error(TypeError::MissingReturn {
                     expected: ret.clone(),
-                    span: callable_span,
+                    span: tc.error_span(callable_span),
                 });
             }
         }
@@ -3827,7 +3915,7 @@ fn infer_return_type(frame: ReturnFrame, tc: &mut TypeChecker) -> Option<Type> {
             tc.push_error(TypeError::InferReturnMismatch {
                 expected: inferred.clone(),
                 found,
-                span,
+                span: tc.error_span(span),
             });
         }
     }
@@ -3895,7 +3983,7 @@ fn check_specialized_callable_body(
     match tc.specialization(&key).cloned() {
         Some(SpecializationState::InProgress) if inferred => {
             tc.push_error(TypeError::InferReturnRecursive {
-                span: template.ret_span,
+                span: tc.error_span(template.ret_span),
             });
             return Some(Type::Infer);
         }
@@ -4089,7 +4177,7 @@ fn join_checked(
             tc.push_error(TypeError::TypeMismatch {
                 expected: right.ty,
                 found: Type::Void,
-                span: left_span,
+                span: tc.error_span(left_span),
             });
             return checked_void(tc);
         }
@@ -4097,7 +4185,7 @@ fn join_checked(
             tc.push_error(TypeError::TypeMismatch {
                 expected: left.ty,
                 found: Type::Void,
-                span: right_span,
+                span: tc.error_span(right_span),
             });
             return checked_void(tc);
         }
@@ -4343,7 +4431,7 @@ fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
                 tc.push_error(TypeError::ConstTypeMismatch {
                     expected: annot_ty.clone(),
                     found: value_ty,
-                    span: const_node.span,
+                    span: tc.error_span(const_node.span),
                 });
             }
             annot_ty
@@ -4357,7 +4445,7 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
     let ret = &ret_node.node;
     if tc.in_defer() {
         tc.push_error(TypeError::ReturnInsideDefer {
-            span: ret_node.span,
+            span: tc.error_span(ret_node.span),
         });
         if let Some(expr) = &ret.value {
             let actual = check_value_expr_checked_with_hint(expr, None, tc);
@@ -4381,7 +4469,7 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
         if !expected_ty.is_void() {
             tc.push_error(TypeError::MissingReturn {
                 expected: expected_ty,
-                span: ret_node.span,
+                span: tc.error_span(ret_node.span),
             });
         }
     } else {
@@ -4397,7 +4485,9 @@ fn reject_if_without_else_value(expr: &ExprNode, tc: &mut TypeChecker) {
     if let ExprKind::If(node) = &expr.node.kind
         && node.node.else_block.is_none()
     {
-        tc.push_error(TypeError::IfWithoutElseValue { span: expr.span });
+        tc.push_error(TypeError::IfWithoutElseValue {
+            span: tc.error_span(expr.span),
+        });
     }
 }
 
@@ -4502,14 +4592,14 @@ fn check_arg_range(
         tc.push_error(TypeError::WrongArgCount {
             expected: max,
             found: args.len(),
-            span: call_span,
+            span: tc.error_span(call_span),
         });
     } else {
         tc.push_error(TypeError::WrongArgRange {
             min,
             max,
             found: args.len(),
-            span: call_span,
+            span: tc.error_span(call_span),
         });
     }
     for arg in args {
@@ -4544,7 +4634,7 @@ fn check_expr_checked_with_hint(
             if let Some(ty) = tc.resolve_type_subject(ty, expr.span) {
                 tc.push_error(TypeError::TypeUsedAsValue {
                     ty,
-                    span: expr.span,
+                    span: tc.error_span(expr.span),
                 });
             }
             checked_from_type(expr, Type::Infer, tc)
@@ -4571,7 +4661,7 @@ fn check_expr_checked_with_hint(
                 }
             }
             LocalSymbolLookup::Found(LocalSymbol::Callable(info), _) => {
-                match info.value_error(*name, expr.span) {
+                match info.value_error(*name, tc.error_span(expr.span)) {
                     Some(error) => {
                         tc.push_error(error);
                         checked_from_type(expr, Type::Infer, tc)
@@ -4596,7 +4686,9 @@ fn check_expr_checked_with_hint(
                     })
                     && matches!(callee.def.sig.ret, Type::InferReturn)
                 {
-                    tc.push_error(TypeError::InferReturnValue { span: expr.span });
+                    tc.push_error(TypeError::InferReturnValue {
+                        span: tc.error_span(expr.span),
+                    });
                     checked_from_type(expr, Type::Infer, tc)
                 } else {
                     let ty = match tc.eval_visible_const(*name, expr.span) {
@@ -4611,12 +4703,12 @@ fn check_expr_checked_with_hint(
                                 if let Some(ty) = tc.visible_type_subject(*name, expr.span) {
                                     tc.push_error(TypeError::TypeUsedAsValue {
                                         ty,
-                                        span: expr.span,
+                                        span: tc.error_span(expr.span),
                                     });
                                 } else {
                                     tc.push_error(TypeError::UndefinedVariable {
                                         name: *name,
-                                        span: expr.span,
+                                        span: tc.error_span(expr.span),
                                     });
                                 }
                                 Type::Infer
@@ -4716,7 +4808,7 @@ fn check_intrinsic_call(
     let Some(kind) = intrinsic_kind(name) else {
         tc.push_error(TypeError::UnknownIntrinsic {
             name,
-            span: call.span,
+            span: tc.error_span(call.span),
         });
         return checked_from_type(expr, Type::Infer, tc);
     };
@@ -4735,12 +4827,12 @@ fn check_intrinsic_call(
             if kind == IntrinsicKind::Error {
                 tc.push_error(TypeError::CompileError {
                     message,
-                    span: call.span,
+                    span: tc.error_span(call.span),
                 });
             } else {
                 tc.push_warning(TypeWarning::CompileMessage {
                     message,
-                    span: call.span,
+                    span: tc.source_span(call.span),
                 });
             }
             checked_from_type(expr, Type::Void, tc)
@@ -4768,7 +4860,7 @@ fn intrinsic_ident_arg(
     let ExprKind::Ident(arg) = args[0].node.kind else {
         tc.push_error(TypeError::IntrinsicExpectedIdent {
             name,
-            span: args[0].span,
+            span: tc.error_span(args[0].span),
         });
         return None;
     };
@@ -4787,7 +4879,7 @@ fn intrinsic_string_arg(
     let ExprKind::Lit(Lit::String(message)) = &args[0].node.kind else {
         tc.push_error(TypeError::IntrinsicExpectedString {
             name,
-            span: args[0].span,
+            span: tc.error_span(args[0].span),
         });
         return None;
     };
@@ -4808,7 +4900,7 @@ fn check_intrinsic_arg_count(
         name,
         expected,
         found: args.len(),
-        span,
+        span: tc.error_span(span),
     });
     false
 }
@@ -4829,7 +4921,7 @@ fn eval_intrinsic_predicate(
             tc.push_error(TypeError::UnknownIntrinsicValue {
                 predicate: name,
                 value: arg,
-                span,
+                span: tc.error_span(span),
             });
             None
         }
@@ -4890,13 +4982,13 @@ fn check_try(
 
     if tc.in_defer() {
         tc.push_error(TypeError::TryInsideDefer {
-            span: try_node.span,
+            span: tc.error_span(try_node.span),
         });
     }
     if return_parts.is_none() {
         tc.push_error(TypeError::TryOutsideResultFunction {
             found: return_ty.clone(),
-            span: try_node.span,
+            span: tc.error_span(try_node.span),
         });
     }
 
@@ -4927,7 +5019,7 @@ fn check_try(
             tc.push_error(TypeError::TryErrorMismatch {
                 expected: return_parts.err.clone(),
                 found,
-                span: try_node.span,
+                span: tc.error_span(try_node.span),
             });
         }
         return checked_type(Type::Infer, tc);
@@ -4935,7 +5027,7 @@ fn check_try(
     let Some(operand_parts) = tc.core_result_parts(&operand_ty) else {
         tc.push_error(TypeError::TryOnNonResult {
             found: operand_ty,
-            span: try_node.span,
+            span: tc.error_span(try_node.span),
         });
         return checked_type(Type::Infer, tc);
     };
@@ -4946,7 +5038,7 @@ fn check_try(
         tc.push_error(TypeError::TryErrorMismatch {
             expected: return_parts.err,
             found: operand_parts.err,
-            span: try_node.span,
+            span: tc.error_span(try_node.span),
         });
         return checked_type(Type::Infer, tc);
     }
@@ -5001,7 +5093,7 @@ fn check_coalesce(
         tc.push_error(TypeError::InvalidOperand {
             op: BinaryOp::Coalesce.to_string(),
             operand_type: left.ty,
-            span,
+            span: tc.error_span(span),
         });
         check_expr_checked(right_expr, tc);
         return checked_type(Type::Infer, tc);
@@ -5188,7 +5280,7 @@ fn emit_binary_failure(failure: BinaryTypeFailure, span: Span, tc: &mut TypeChec
             tc.push_error(TypeError::InvalidOperand {
                 op,
                 operand_type,
-                span,
+                span: tc.error_span(span),
             });
             fallback
         }
@@ -5200,12 +5292,15 @@ fn emit_binary_failure(failure: BinaryTypeFailure, span: Span, tc: &mut TypeChec
             tc.push_error(TypeError::TypeMismatch {
                 expected,
                 found,
-                span,
+                span: tc.error_span(span),
             });
             fallback
         }
         BinaryTypeFailure::NotEquatable { ty, fallback } => {
-            tc.push_error(TypeError::NotEquatable { ty, span });
+            tc.push_error(TypeError::NotEquatable {
+                ty,
+                span: tc.error_span(span),
+            });
             fallback
         }
     }
@@ -5265,7 +5360,7 @@ fn emit_unary_failure(failure: UnaryTypeFailure, span: Span, tc: &mut TypeChecke
     tc.push_error(TypeError::InvalidOperand {
         op: failure.op,
         operand_type: failure.operand_type,
-        span,
+        span: tc.error_span(span),
     });
     Type::Infer
 }
@@ -5277,7 +5372,7 @@ enum ConditionKind {
     While,
 }
 
-fn condition_not_bool(kind: ConditionKind, found: Type, span: Span) -> TypeError {
+fn condition_not_bool(kind: ConditionKind, found: Type, span: Option<SourceSpan>) -> TypeError {
     match kind {
         ConditionKind::If => TypeError::IfConditionNotBool { found, span },
         ConditionKind::Ternary => TypeError::TernaryConditionNotBool { found, span },
@@ -5293,7 +5388,7 @@ fn check_bool_condition(kind: ConditionKind, cond: CheckedType, span: Span, tc: 
         let bool_handle = tc.type_handle(&Type::Bool);
         tc.expect_assignable(span, cond.handle, bool_handle);
     } else {
-        tc.push_error(condition_not_bool(kind, cond.ty, span));
+        tc.push_error(condition_not_bool(kind, cond.ty, tc.error_span(span)));
     }
 }
 
@@ -5447,7 +5542,7 @@ fn check_lambda_expr(
         tc.push_error(TypeError::LambdaParamCountMismatch {
             expected: params.len(),
             found: lambda.node.params.len(),
-            span: lambda.span,
+            span: tc.error_span(lambda.span),
         });
         return checked_from_type(expr, Type::Infer, tc);
     }
@@ -5465,7 +5560,9 @@ fn check_lambda_expr(
                     .and_then(|(params, _)| params.get(index))
                     .map_or_else(
                         || {
-                            tc.push_error(TypeError::CannotInferType { span: lambda.span });
+                            tc.push_error(TypeError::CannotInferType {
+                                span: tc.error_span(lambda.span),
+                            });
                             Type::Infer
                         },
                         |param| param.ty.clone(),
@@ -5594,7 +5691,7 @@ fn check_cast_expr(expr: &ExprNode, cast: &CastNode, tc: &mut TypeChecker) -> Ch
         tc.push_error(TypeError::InvalidCast {
             from,
             to: target,
-            span: cast.span,
+            span: tc.error_span(cast.span),
         });
         Type::Infer
     };
@@ -5687,7 +5784,10 @@ fn validate_format_spec(ty: &Type, spec: &FormatSpec, span: Span, tc: &mut TypeC
         _ => None,
     };
     if let Some(reason) = reason {
-        tc.push_error(TypeError::InvalidFormatSpec { reason, span });
+        tc.push_error(TypeError::InvalidFormatSpec {
+            reason,
+            span: tc.error_span(span),
+        });
     }
 }
 
@@ -5720,7 +5820,9 @@ fn check_duplicate_map_keys(lit: &MapLiteralNode, tc: &mut TypeChecker) {
             continue;
         };
         if !keys.insert(key_value) {
-            tc.push_error(TypeError::DuplicateMapKey { span: key.span });
+            tc.push_error(TypeError::DuplicateMapKey {
+                span: tc.error_span(key.span),
+            });
         }
     }
 }
@@ -5742,7 +5844,9 @@ fn check_map_lit_hint(
     };
 
     if lit.node.entries.is_empty() && !has_hint {
-        tc.push_error(TypeError::CannotInferType { span: lit.span });
+        tc.push_error(TypeError::CannotInferType {
+            span: tc.error_span(lit.span),
+        });
         return checked_from_type(expr, Type::Infer, tc);
     }
 
@@ -5779,7 +5883,9 @@ fn check_array_lit_hint(
             .iter()
             .all(|element| matches!(element.node.kind, ExprKind::Lit(Lit::Nil)))
     {
-        tc.push_error(TypeError::AllNilArrayLiteral { span: lit.span });
+        tc.push_error(TypeError::AllNilArrayLiteral {
+            span: tc.error_span(lit.span),
+        });
     }
     let (elem, kind) = expected_collection
         .unwrap_or_else(|| (tc.fresh_temp_handle(lit.span), CollectionLiteralKind::Array));
@@ -5811,16 +5917,18 @@ fn check_array_fill_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let len = match tc.eval_const_expr(&fill.node.len, true) {
-        Ok(const_value) => match const_eval::const_usize(&const_value, fill.node.len.span) {
-            Ok(len) => ArrayLen::Fixed(len),
-            Err(err) => {
-                tc.push_error(err);
-                ArrayLen::Infer
+        Ok(const_value) => {
+            match const_eval::const_usize(&const_value, tc.error_span(fill.node.len.span)) {
+                Ok(len) => ArrayLen::Fixed(len),
+                Err(err) => {
+                    tc.push_error(err);
+                    ArrayLen::Infer
+                }
             }
-        },
+        }
         Err(TypeError::NonConstExpression { .. }) => {
             tc.push_error(TypeError::ArrayFillLengthNotConst {
-                span: fill.node.len.span,
+                span: tc.error_span(fill.node.len.span),
             });
             ArrayLen::Infer
         }
@@ -5891,7 +5999,7 @@ fn check_tuple_index_access(
         tc.push_error(TypeError::TupleIndexOnNonTuple {
             ty: target.ty.clone(),
             index: node.node.index,
-            span: node.span,
+            span: tc.error_span(node.span),
         });
         return checked_from_type(expr, Type::Infer, tc);
     };
@@ -5900,7 +6008,7 @@ fn check_tuple_index_access(
         tc.push_error(TypeError::TupleIndexOutOfBounds {
             index: node.node.index,
             len: elems.len(),
-            span: node.span,
+            span: tc.error_span(node.span),
         });
         return checked_from_type(expr, Type::Infer, tc);
     };
@@ -5993,7 +6101,7 @@ fn check_index_access_inner(
             if !matches!(index.ty, Type::Infer | Type::Int) {
                 tc.push_error(TypeError::IndexNotInt {
                     found: index.ty.clone(),
-                    span: node.node.index.span,
+                    span: tc.error_span(node.node.index.span),
                 });
             }
             CheckedIndex::same((**elem).clone(), target, &index)
@@ -6023,7 +6131,7 @@ fn check_index_access_inner(
             if !found.is_void() {
                 tc.push_error(TypeError::IndexOnNonIndexable {
                     found: found.clone(),
-                    span: node.span,
+                    span: tc.error_span(node.span),
                 });
             }
             CheckedIndex::infer(target, &index)
@@ -6045,7 +6153,7 @@ fn check_range_index_access(
             ) {
                 tc.push_error(TypeError::RangeIndexNotInt {
                     found: index.ty.clone(),
-                    span: node.node.index.span,
+                    span: tc.error_span(node.node.index.span),
                 });
             }
             CheckedIndex::new(
@@ -6059,7 +6167,7 @@ fn check_range_index_access(
         found => {
             tc.push_error(TypeError::RangeIndexUnsupported {
                 found: found.clone(),
-                span: node.span,
+                span: tc.error_span(node.span),
             });
             CheckedIndex::infer(target, &index)
         }
@@ -6097,7 +6205,9 @@ impl NominalLiteralSolver {
         tc: &mut TypeChecker,
     ) -> Self {
         Self {
-            vars: tc.solver.generic_solver_vars(generics, seeds, span),
+            vars: tc
+                .solver
+                .generic_solver_vars(generics, seeds, tc.error_span(span)),
         }
     }
 
@@ -6173,7 +6283,7 @@ fn check_struct_lit_hint(
         tc.push_error(TypeError::InvalidStructLiteral {
             name: key.name,
             kind: kind.to_string(),
-            span: lit.span,
+            span: tc.error_span(lit.span),
         });
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return checked_from_type(expr, Type::Infer, tc);
@@ -6284,7 +6394,7 @@ fn check_extern_lit(
         tc.push_error(TypeError::InvalidStructLiteral {
             name: key.name,
             kind: "extern".to_string(),
-            span: lit.span,
+            span: tc.error_span(lit.span),
         });
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return checked_from_type(expr, Type::Infer, tc);
@@ -6303,7 +6413,7 @@ fn check_extern_lit(
         tc.push_error(TypeError::InvalidStructLiteral {
             name: key.name,
             kind: "extern".to_string(),
-            span: lit.span,
+            span: tc.error_span(lit.span),
         });
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return checked_from_type(expr, Type::Infer, tc);
@@ -6344,7 +6454,7 @@ fn check_extern_literal_fields(
         if seen.insert(*name, value.span).is_some() {
             tc.push_error(TypeError::DuplicateField {
                 name: *name,
-                span: value.span,
+                span: tc.error_span(value.span),
             });
             failed = true;
         }
@@ -6354,7 +6464,7 @@ fn check_extern_literal_fields(
                 ty: owner_ty.clone(),
                 member: *name,
                 kind: MemberAccessKind::Field,
-                span: value.span,
+                span: tc.error_span(value.span),
             });
             check_expr_checked(value, tc);
             failed = true;
@@ -6370,7 +6480,7 @@ fn check_extern_literal_fields(
         if !allowed {
             tc.push_error(TypeError::ImmutableAssignment {
                 name: *name,
-                span: value.span,
+                span: tc.error_span(value.span),
             });
             failed = true;
         }
@@ -6381,7 +6491,10 @@ fn check_extern_literal_fields(
 
     for name in required_extern_literal_fields(owner, explicit_init, tc) {
         if !seen.contains_key(&name) {
-            tc.push_error(TypeError::MissingField { name, span });
+            tc.push_error(TypeError::MissingField {
+                name,
+                span: tc.error_span(span),
+            });
             failed = true;
         }
     }
@@ -6522,7 +6635,9 @@ fn cannot_infer_inferred_enum(
     node: &InferredEnumNode,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    tc.push_error(TypeError::CannotInferEnum { span: node.span });
+    tc.push_error(TypeError::CannotInferEnum {
+        span: tc.error_span(node.span),
+    });
     check_inferred_enum_args(&node.node.args, tc);
     checked_from_type(expr, Type::Infer, tc)
 }
@@ -6593,7 +6708,7 @@ fn check_expr_fields(
             index,
         })
         .collect::<Vec<_>>();
-    let shape = field_check::check(&uses, schema, &owner, missing, span, tc);
+    let shape = field_check::check(&uses, schema, &owner, missing, Some(span), tc);
     let valid = shape
         .fields
         .iter()
@@ -6678,7 +6793,7 @@ fn resolve_struct_key(lit: &StructLiteralNode, tc: &mut TypeChecker) -> Option<N
         tc.push_error(TypeError::UnknownStructLiteral {
             qualifier: lit.node.qualifier,
             name: lit.node.name,
-            span: lit.span,
+            span: tc.error_span(lit.span),
         });
     }
     key
@@ -6688,7 +6803,7 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
     let target = check_place(&assign.node.target, tc);
     if let Some(error) = target.value.access.assign_error(
         assignment_target_name(&assign.node.target),
-        assign.node.target.span,
+        tc.error_span(assign.node.target.span),
     ) {
         tc.push_error(error);
     }
@@ -6820,7 +6935,7 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     let item_ty = iterable_item_type(&iterable_ty, &tc.decls).unwrap_or_else(|| {
         tc.push_error(TypeError::ForIterableNotSupported {
             found: iterable_ty.clone(),
-            span: node.iterable.span,
+            span: tc.error_span(node.iterable.span),
         });
         Type::Infer
     });
@@ -6841,22 +6956,33 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
 }
 
 fn push_for_modifier_error(tc: &mut TypeChecker, message: &'static str, span: Span) {
-    tc.push_error(TypeError::ForIterationModifier { message, span });
+    tc.push_error(TypeError::ForIterationModifier {
+        message,
+        span: tc.error_span(span),
+    });
 }
 
 fn check_break(span: Span, tc: &mut TypeChecker) {
     if tc.in_defer() {
-        tc.push_error(TypeError::BreakInsideDefer { span });
+        tc.push_error(TypeError::BreakInsideDefer {
+            span: tc.error_span(span),
+        });
     } else if !tc.in_loop() {
-        tc.push_error(TypeError::BreakOutsideLoop { span });
+        tc.push_error(TypeError::BreakOutsideLoop {
+            span: tc.error_span(span),
+        });
     }
 }
 
 fn check_continue(span: Span, tc: &mut TypeChecker) {
     if tc.in_defer() {
-        tc.push_error(TypeError::ContinueInsideDefer { span });
+        tc.push_error(TypeError::ContinueInsideDefer {
+            span: tc.error_span(span),
+        });
     } else if !tc.in_loop() {
-        tc.push_error(TypeError::ContinueOutsideLoop { span });
+        tc.push_error(TypeError::ContinueOutsideLoop {
+            span: tc.error_span(span),
+        });
     }
 }
 
@@ -6914,7 +7040,7 @@ fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
     tc.pop_scope();
     if !control_flow::block_diverges(&node.else_block) {
         tc.push_error(TypeError::LetElseMustDiverge {
-            span: node.else_block.span,
+            span: tc.error_span(node.else_block.span),
         });
     }
     pattern::check_place_at(
@@ -6988,7 +7114,7 @@ fn check_match_checked_with_hint(
     let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
     if node.arms.is_empty() {
         tc.push_error(TypeError::EmptyMatch {
-            span: match_node.span,
+            span: tc.error_span(match_node.span),
         });
         return checked_void(tc);
     }
@@ -7014,7 +7140,7 @@ fn check_match_checked_with_hint(
                 tc.push_error(TypeError::MatchArmTypeMismatch {
                     expected: expected_ty,
                     found: body.ty.clone(),
-                    span: arm.node.body.span,
+                    span: tc.error_span(arm.node.body.span),
                 });
             }
         }
@@ -7087,19 +7213,23 @@ pub(crate) fn call_target_closure_facts(target: &CallTarget) -> CallTargetClosur
     facts
 }
 
-fn extern_site_span(site: crate::externs::RawExternSite) -> Span {
-    site.span.unwrap_or_else(|| Span::new(0, 0))
+fn extern_site_span(site: crate::externs::RawExternSite) -> Option<SourceSpan> {
+    site.span
 }
 
 fn push_extern_ty_closure_error(
     errors: &mut Vec<TypeError>,
     ty: &crate::externs::catalog::ResolvedExternTy,
-    span: Span,
+    span: Option<SourceSpan>,
 ) {
     push_type_closure_error(errors, &ty.ty, span);
 }
 
-fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarget, span: Span) {
+fn push_call_target_closure_error(
+    errors: &mut Vec<TypeError>,
+    target: &CallTarget,
+    span: Option<SourceSpan>,
+) {
     let facts = call_target_closure_facts(target);
     if facts.is_empty() {
         return;
@@ -7112,7 +7242,7 @@ fn push_call_target_closure_error(errors: &mut Vec<TypeError>, target: &CallTarg
     }
 }
 
-fn push_type_closure_error(errors: &mut Vec<TypeError>, ty: &Type, span: Span) {
+fn push_type_closure_error(errors: &mut Vec<TypeError>, ty: &Type, span: Option<SourceSpan>) {
     let facts = type_closure_facts(ty);
     if let Some(unresolved) = facts.first_unresolved {
         errors.push(TypeError::UnknownType {

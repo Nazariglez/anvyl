@@ -4,7 +4,6 @@ use super::support::{
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
-    span::Span,
     typecheck::{
         ArityError, CallTarget, CallableId, ConstDiagnostic, DeprecatedUseKind, GenericArgs,
         ModuleScope, TypeError, call_target_closure_facts,
@@ -390,7 +389,7 @@ fn call_target_const_infer_error() {
             const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
         },
     );
-    let span = Span::new(1, 2);
+    let span = None;
     let mut errors = vec![];
 
     super::super::push_call_target_closure_error(&mut errors, &target, span);

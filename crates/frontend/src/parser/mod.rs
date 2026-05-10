@@ -15,6 +15,7 @@ use chumsky::{
     Boxed,
     error::Rich,
     extra::{self, SimpleState},
+    input::{Input as _, MappedInput},
     prelude::*,
 };
 use decl::{
@@ -25,8 +26,8 @@ use stmt::statement;
 
 use crate::{
     ast::{self, ConstParamId, ExprId, TypeVarId},
-    lexer::SpannedToken,
-    span::Spanned,
+    lexer::{LexedToken, Token, TokenStream},
+    span::{SourceSpan, Spanned},
 };
 
 static NEXT_EXPR_ID: AtomicU64 = AtomicU64::new(0);
@@ -55,8 +56,14 @@ impl ParserState {
     }
 }
 
-pub(super) type Input<'src> = &'src [SpannedToken];
-pub(super) type Extra<'src> = extra::Full<Rich<'src, SpannedToken>, SimpleState<ParserState>, ()>;
+pub(super) type Input<'src> = MappedInput<
+    Token,
+    SourceSpan,
+    &'src [LexedToken],
+    fn(&'src LexedToken) -> (&'src Token, &'src SourceSpan),
+>;
+pub(super) type Extra<'src> =
+    extra::Full<Rich<'src, Token, SourceSpan>, SimpleState<ParserState>, ()>;
 pub(super) trait AnvParser<'src, T>:
     Parser<'src, Input<'src>, T, Extra<'src>> + Clone + 'src
 {
@@ -66,14 +73,21 @@ impl<'src, T, P> AnvParser<'src, T> for P where
 {
 }
 
-// It seems tht rustc chokes trying to compile the parser types, so we need to box them
-// in order to reduce the chusmky generic types :(
-// I feel this is fine for now, the parser should still be fast enough for my tiny lang
 pub(super) type BoxedParser<'src, T> = Boxed<'src, 'src, Input<'src>, T, Extra<'src>>;
 
-pub fn parse_ast(tokens: &[SpannedToken]) -> Result<ast::Program, Vec<Rich<'_, SpannedToken>>> {
+pub fn parse_ast(tokens: &TokenStream) -> Result<ast::Program, Vec<Rich<'_, Token, SourceSpan>>> {
     let mut state = SimpleState(ParserState::default());
-    parser().parse_with_state(tokens, &mut state).into_result()
+    parser()
+        .parse_with_state(token_input(tokens), &mut state)
+        .into_result()
+}
+
+pub(super) fn token_input(tokens: &TokenStream) -> Input<'_> {
+    tokens.tokens.as_slice().map(tokens.eoi, map_token)
+}
+
+fn map_token((token, span): &LexedToken) -> (&Token, &SourceSpan) {
+    (token, span)
 }
 
 fn parser<'src>() -> BoxedParser<'src, ast::Program> {

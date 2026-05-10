@@ -4,7 +4,7 @@ use anvyx_externs::{
     ExternStaticDescriptor, ModulePath, ProviderDescriptor, ProviderId,
 };
 
-use crate::{resolve::ModuleId, span::Span};
+use crate::{resolve::ModuleId, span::SourceSpan};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternInputs {
@@ -70,7 +70,7 @@ pub(crate) struct RawExternMemberKey {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RawExternSite {
-    pub span: Option<Span>,
+    pub span: Option<SourceSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +155,7 @@ pub(crate) enum ExternInputError {
         duplicate: RawExternDecl,
     },
     UnsupportedSource {
-        span: Span,
+        span: SourceSpan,
         kind: UnsupportedSourceKind,
     },
 }

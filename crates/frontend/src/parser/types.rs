@@ -79,16 +79,16 @@ fn generic_arg_contains_slice(arg: &ast::GenericArg) -> bool {
 
 fn const_value_arg<'src>() -> BoxedParser<'src, ast::ConstArg> {
     select! {
-        (Token::Literal(LitToken::Number(n)), _) => ast::ConstArg::Value(ast::ConstValue::Int(n)),
-        (Token::Literal(LitToken::Float(s)), _) => {
+        Token::Literal(LitToken::Number(n)) => ast::ConstArg::Value(ast::ConstValue::Int(n)),
+        Token::Literal(LitToken::Float(s)) => {
             let value = s.as_ref().parse::<f64>().unwrap_or(0.0);
             ast::ConstArg::Value(ast::ConstValue::Float(value))
         },
-        (Token::Literal(LitToken::String(s)), _) => {
+        Token::Literal(LitToken::String(s)) => {
             ast::ConstArg::Value(ast::ConstValue::String(s.to_string()))
         },
-        (Token::Keyword(Keyword::True), _) => ast::ConstArg::Value(ast::ConstValue::Bool(true)),
-        (Token::Keyword(Keyword::False), _) => ast::ConstArg::Value(ast::ConstValue::Bool(false)),
+        Token::Keyword(Keyword::True) => ast::ConstArg::Value(ast::ConstValue::Bool(true)),
+        Token::Keyword(Keyword::False) => ast::ConstArg::Value(ast::ConstValue::Bool(false)),
     }
     .labelled("const argument")
     .as_context()
@@ -108,15 +108,15 @@ pub(super) fn generic_arg<'src>(
 fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
     recursive(move |type_parser| {
         let builtin_typ = select! {
-            (Token::Keyword(Keyword::Int), _) => Type::Int,
-            (Token::Keyword(Keyword::Float), _) => Type::Float,
-            (Token::Keyword(Keyword::Bool), _) => Type::Bool,
-            (Token::Keyword(Keyword::String), _) => Type::String,
-            (Token::Keyword(Keyword::Void), _) => Type::Void,
-            (Token::Keyword(Keyword::Any), _) => Type::Any,
+            Token::Keyword(Keyword::Int) => Type::Int,
+            Token::Keyword(Keyword::Float) => Type::Float,
+            Token::Keyword(Keyword::Bool) => Type::Bool,
+            Token::Keyword(Keyword::String) => Type::String,
+            Token::Keyword(Keyword::Void) => Type::Void,
+            Token::Keyword(Keyword::Any) => Type::Any,
         };
 
-        let generic_args = select! { (Token::Op(Op::LessThan), _) => () }
+        let generic_args = select! { Token::Op(Op::LessThan) => () }
             .ignore_then(
                 generic_arg(type_parser.clone())
                     .validate(|arg, extra, emitter| {
@@ -128,15 +128,15 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
                         }
                         arg
                     })
-                    .separated_by(select! { (Token::Comma, _) => () })
+                    .separated_by(select! { Token::Comma => () })
                     .allow_trailing()
                     .collect::<Vec<_>>(),
             )
-            .then_ignore(select! { (Token::Op(Op::GreaterThan), _) => () });
+            .then_ignore(select! { Token::Op(Op::GreaterThan) => () });
 
         let type_name_ref = identifier()
             .then(
-                select! { (Token::Dot, _) => () }
+                select! { Token::Dot => () }
                     .ignore_then(identifier())
                     .or_not(),
             )
@@ -155,14 +155,14 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
 
         let paren_type = paren_or_tuple_type(type_parser.clone());
 
-        let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
-        let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
-        let comma = select! { (Token::Comma, _) => () };
-        let arrow = select! { (Token::Op(Op::ThinArrow), _) => () };
-        let open_bracket = select! { (Token::Open(Delimiter::Bracket), _) => () };
-        let close_bracket = select! { (Token::Close(Delimiter::Bracket), _) => () };
-        let semicolon = select! { (Token::Semicolon, _) => () };
-        let colon = select! { (Token::Colon, _) => () };
+        let open_paren = select! { Token::Open(Delimiter::Parent) => () };
+        let close_paren = select! { Token::Close(Delimiter::Parent) => () };
+        let comma = select! { Token::Comma => () };
+        let arrow = select! { Token::Op(Op::ThinArrow) => () };
+        let open_bracket = select! { Token::Open(Delimiter::Bracket) => () };
+        let close_bracket = select! { Token::Close(Delimiter::Bracket) => () };
+        let semicolon = select! { Token::Semicolon => () };
+        let colon = select! { Token::Colon => () };
 
         let param_type_parser: BoxedParser<'src, Type> = if context.allows_slice() {
             type_parser.clone().boxed()
@@ -171,7 +171,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
         };
 
         let array_len_fixed =
-            select! { (Token::Literal(LitToken::Number(n)), _) => ast::ArrayLen::Fixed(n as usize) };
+            select! { Token::Literal(LitToken::Number(n)) => ast::ArrayLen::Fixed(n as usize) };
         let array_len_ident = identifier().map(|ident| {
             if ident.0.as_ref() == "_" {
                 ast::ArrayLen::Infer
@@ -206,7 +206,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
                 len,
             });
 
-        let slice_type = select! { (Token::Ident(i), _) if i.0.as_ref() == "slice" => () }
+        let slice_type = select! { Token::Ident(i) if i.0.as_ref() == "slice" => () }
             .ignore_then(open_bracket)
             .ignore_then(type_parser.clone())
             .then_ignore(close_bracket)
@@ -222,7 +222,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
 
         let bracketed_type = choice((array_type, choice((map_type, list_type))));
 
-        let var_kw = select! { (Token::Keyword(Keyword::Var), _) => () }
+        let var_kw = select! { Token::Keyword(Keyword::Var) => () }
             .or_not()
             .map(|opt| opt.is_some());
 
@@ -230,7 +230,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
             .then(param_type_parser)
             .map(|(mutable, ty)| ast::FuncParam::new(ty, mutable, false));
 
-        let fn_type = select! { (Token::Keyword(Keyword::Fn), _) => () }
+        let fn_type = select! { Token::Keyword(Keyword::Fn) => () }
             .ignore_then(
                 open_paren
                     .ignore_then(
@@ -250,8 +250,15 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
                 ret: ret.boxed(),
             });
 
-        let primary_type = choice((builtin_typ, slice_type, type_name_ref, paren_type, bracketed_type, fn_type));
-        let optional_suffix = select! { (Token::Question, _) => TypeSuffix::Optional };
+        let primary_type = choice((
+            builtin_typ,
+            slice_type,
+            type_name_ref,
+            paren_type,
+            bracketed_type,
+            fn_type,
+        ));
+        let optional_suffix = select! { Token::Question => TypeSuffix::Optional };
         let type_suffix = optional_suffix;
 
         primary_type
@@ -285,10 +292,10 @@ impl TupleTypeElem {
 }
 
 fn paren_or_tuple_type<'src>(type_parser: impl AnvParser<'src, Type>) -> BoxedParser<'src, Type> {
-    let comma = select! { (Token::Comma, _) => () };
-    let open_paren = select! { (Token::Open(Delimiter::Parent), _) => () };
-    let close_paren = select! { (Token::Close(Delimiter::Parent), _) => () };
-    let colon = select! { (Token::Colon, _) => () };
+    let comma = select! { Token::Comma => () };
+    let open_paren = select! { Token::Open(Delimiter::Parent) => () };
+    let close_paren = select! { Token::Close(Delimiter::Parent) => () };
+    let colon = select! { Token::Colon => () };
 
     let labelled_elem = identifier()
         .then_ignore(colon)

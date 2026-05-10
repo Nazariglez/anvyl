@@ -7,28 +7,35 @@ use crate::{
         expr::expression,
         parser,
         stmt::statement,
+        token_input,
         types::{param_type_ident, type_ident},
     },
+    source::{SourceKind, SourceTable},
 };
 
+fn tokens(src: &str) -> lexer::TokenStream {
+    let mut sources = SourceTable::default();
+    let source = sources.add(SourceKind::Virtual, "test", None, src);
+    lexer::tokenize(source, src)
+        .unwrap_or_else(|errs| panic!("failed to tokenize '{src}': {errs:?}"))
+}
+
 pub(super) fn parse_expr(src: &str) -> ast::ExprNode {
-    let tokens =
-        lexer::tokenize(src).unwrap_or_else(|errs| panic!("failed to tokenize '{src}': {errs:?}"));
+    let tokens = tokens(src);
     let stmt_parser = statement();
     let expr_parser = expression(stmt_parser.clone()).then_ignore(end());
     let mut state = SimpleState(ParserState::default());
     expr_parser
-        .parse_with_state(&tokens, &mut state)
+        .parse_with_state(token_input(&tokens), &mut state)
         .into_result()
         .unwrap_or_else(|errs| panic!("failed to parse '{src}': {errs:?}"))
 }
 
 pub(super) fn parse_program(src: &str) -> ast::Program {
-    let tokens =
-        lexer::tokenize(src).unwrap_or_else(|errs| panic!("failed to tokenize '{src}': {errs:?}"));
+    let tokens = tokens(src);
     let mut state = SimpleState(ParserState::default());
     parser()
-        .parse_with_state(&tokens, &mut state)
+        .parse_with_state(token_input(&tokens), &mut state)
         .into_result()
         .unwrap_or_else(|errs| panic!("failed to parse '{src}': {errs:?}"))
 }
@@ -57,14 +64,14 @@ pub(super) fn assert_local_import(imp: &ast::Import, ascend: usize, expected: &[
 }
 
 pub(super) fn parse_expr_err(src: &str) {
-    let Ok(tokens) = lexer::tokenize(src) else {
+    let Ok(tokens) = try_tokens(src) else {
         return;
     };
     let stmt_parser = statement();
     let expr_parser = expression(stmt_parser.clone()).then_ignore(end());
     let mut state = SimpleState(ParserState::default());
     let result = expr_parser
-        .parse_with_state(&tokens, &mut state)
+        .parse_with_state(token_input(&tokens), &mut state)
         .into_result();
     assert!(
         result.is_err(),
@@ -73,11 +80,13 @@ pub(super) fn parse_expr_err(src: &str) {
 }
 
 pub(super) fn parse_program_err(src: &str) {
-    let Ok(tokens) = lexer::tokenize(src) else {
+    let Ok(tokens) = try_tokens(src) else {
         return; // lex error is also acceptable
     };
     let mut state = SimpleState(ParserState::default());
-    let result = parser().parse_with_state(&tokens, &mut state).into_result();
+    let result = parser()
+        .parse_with_state(token_input(&tokens), &mut state)
+        .into_result();
     assert!(
         result.is_err(),
         "expected parse error for '{src}' but it succeeded"
@@ -85,13 +94,13 @@ pub(super) fn parse_program_err(src: &str) {
 }
 
 pub(super) fn parse_type_err(src: &str) {
-    let Ok(tokens) = lexer::tokenize(src) else {
+    let Ok(tokens) = try_tokens(src) else {
         return;
     };
     let mut state = SimpleState(ParserState::default());
     let result = type_ident()
         .then_ignore(end())
-        .parse_with_state(&tokens, &mut state)
+        .parse_with_state(token_input(&tokens), &mut state)
         .into_result();
     assert!(
         result.is_err(),
@@ -100,25 +109,29 @@ pub(super) fn parse_type_err(src: &str) {
 }
 
 pub(super) fn parse_type(src: &str) -> ast::Type {
-    let tokens = lexer::tokenize(src)
-        .unwrap_or_else(|errs| panic!("failed to tokenize type '{src}': {errs:?}"));
+    let tokens = tokens(src);
     let mut state = SimpleState(ParserState::default());
     type_ident()
         .then_ignore(end())
-        .parse_with_state(&tokens, &mut state)
+        .parse_with_state(token_input(&tokens), &mut state)
         .into_result()
         .unwrap_or_else(|errs| panic!("failed to parse type '{src}': {errs:?}"))
 }
 
 pub(super) fn parse_param_type(src: &str) -> ast::Type {
-    let tokens = lexer::tokenize(src)
-        .unwrap_or_else(|errs| panic!("failed to tokenize type '{src}': {errs:?}"));
+    let tokens = tokens(src);
     let mut state = SimpleState(ParserState::default());
     param_type_ident()
         .then_ignore(end())
-        .parse_with_state(&tokens, &mut state)
+        .parse_with_state(token_input(&tokens), &mut state)
         .into_result()
         .unwrap_or_else(|errs| panic!("failed to parse param type '{src}': {errs:?}"))
+}
+
+fn try_tokens(src: &str) -> Result<lexer::TokenStream, Vec<Rich<'_, char>>> {
+    let mut sources = SourceTable::default();
+    let source = sources.add(SourceKind::Virtual, "test", None, src);
+    lexer::tokenize(source, src)
 }
 
 pub(super) fn expect_nominal<'a>(ty: &'a ast::Type, expected: &str) -> &'a [ast::GenericArg] {

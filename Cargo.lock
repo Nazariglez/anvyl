@@ -130,6 +130,7 @@ name = "anvyx-frontend"
 version = "0.1.0"
 dependencies = [
  "anvyx-externs",
+ "ariadne",
  "chumsky",
  "internment",
 ]

@@ -75,7 +75,7 @@ pub(super) fn check_binary(
         }
     }
 
-    select_binary_candidate(expr_id, op, candidates, rejected, right, span, tc)
+    select_binary_candidate(expr_id, op, &candidates, rejected, right, span, tc)
 }
 
 struct BinaryCandidate<'a> {
@@ -112,13 +112,13 @@ fn binary_candidate<'a>(
 fn select_binary_candidate(
     expr_id: ExprId,
     op: anvyx_externs::BinaryOp,
-    candidates: Vec<BinaryCandidate<'_>>,
+    candidates: &[BinaryCandidate<'_>],
     rejected: Option<Type>,
     fallback_operand: &CheckedType,
     span: Span,
     tc: &mut TypeChecker,
 ) -> Option<CheckedType> {
-    match candidates.as_slice() {
+    match candidates {
         [candidate] => Some(apply_binary_candidate(expr_id, candidate, tc)),
         [] => rejected.map(|operand_type| invalid_operand(op, operand_type, span, tc)),
         _ => Some(invalid_operand(op, fallback_operand.ty.clone(), span, tc)),
@@ -155,7 +155,7 @@ fn invalid_operand(
     tc.push_error(TypeError::InvalidOperand {
         op: binary_op_text(op).to_string(),
         operand_type,
-        span,
+        span: tc.error_span(span),
     });
     checked_type(Type::Infer, tc)
 }

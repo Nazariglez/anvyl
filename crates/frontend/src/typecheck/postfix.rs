@@ -206,7 +206,7 @@ pub(super) fn check_postfix_chain(
         if let ExprKind::Ident(name) = &chain.base.node.kind {
             tc.push_error(TypeError::UndefinedVariable {
                 name: *name,
-                span: chain.base.span,
+                span: tc.error_span(chain.base.span),
             });
         }
         tc.set_type(chain.base.node.id, Type::Infer, chain.base.span);
@@ -259,7 +259,9 @@ pub(super) fn check_postfix_chain(
     if let Subject::Callable { callee, .. } = &subject
         && matches!(callee.def.sig.ret, Type::InferReturn)
     {
-        tc.push_error(TypeError::InferReturnValue { span: expr.span });
+        tc.push_error(TypeError::InferReturnValue {
+            span: tc.error_span(expr.span),
+        });
     }
 
     if let Subject::Value(value) = &subject {
@@ -269,7 +271,7 @@ pub(super) fn check_postfix_chain(
     if let Subject::Type(ty) = &subject {
         tc.push_error(TypeError::TypeUsedAsValue {
             ty: ty.clone(),
-            span: expr.span,
+            span: tc.error_span(expr.span),
         });
         return super::checked_from_type(expr, Type::Infer, tc);
     }
@@ -345,7 +347,9 @@ fn expected_for_chain(
 
 fn safe_subject(subject: &Subject, span: Span, tc: &mut TypeChecker) -> Subject {
     let Subject::Value(value) = subject else {
-        tc.push_error(TypeError::OptionalChainingOnNonOptional { span });
+        tc.push_error(TypeError::OptionalChainingOnNonOptional {
+            span: tc.error_span(span),
+        });
         return Subject::Error;
     };
     if matches!(value.checked.ty, Type::Infer) {
@@ -421,7 +425,7 @@ fn field_access_on_non_aggregate(
         ty: subject_type(subject),
         member,
         kind,
-        span,
+        span: tc.error_span(span),
     });
     Subject::Error
 }
@@ -545,7 +549,7 @@ fn apply_value_field(
             tc.push_error(TypeError::StaticMethodOnValue {
                 ty: receiver,
                 method: name,
-                span,
+                span: tc.error_span(span),
             });
             return Subject::Error;
         }
@@ -616,6 +620,7 @@ fn apply_value_field(
             Ok((extend, method, receiver_ty, owner_args)) => {
                 check_extend_method_access(
                     &mut super::AccessPolicyOutput {
+                        source: tc.source_id(),
                         current_module: &tc.current_module,
                         config: &tc.config,
                         warnings: &mut tc.warnings,
@@ -657,7 +662,7 @@ fn apply_value_field(
         tc.push_error(TypeError::StaticMethodOnValue {
             ty: receiver,
             method: name,
-            span,
+            span: tc.error_span(span),
         });
         Subject::Error
     } else if key.is_some() {
@@ -769,7 +774,7 @@ fn push_extend_method_error(tc: &mut TypeChecker, error: ExtendMethodError, span
             tc.push_error(TypeError::AmbiguousExtendMethod {
                 receiver,
                 name,
-                span,
+                span: tc.error_span(span),
             });
         }
     }
@@ -815,13 +820,13 @@ fn apply_module_field(
         tc.push_error(TypeError::PrivateModuleMember {
             module: scope.clone(),
             name,
-            span,
+            span: tc.error_span(span),
         });
     } else {
         tc.push_error(TypeError::UndefinedModuleMember {
             module: scope.clone(),
             name,
-            span,
+            span: tc.error_span(span),
         });
     }
     Subject::Error
@@ -897,7 +902,7 @@ fn apply_type_field(
         tc.push_error(TypeError::InstanceMethodOnType {
             ty: target.clone(),
             method: name,
-            span,
+            span: tc.error_span(span),
         });
         return Subject::Error;
     }
@@ -915,7 +920,7 @@ fn static_extend_conflict(ty: &Type, name: Ident, span: Span, tc: &mut TypeCheck
         ty: ty.clone(),
         name,
         surface: MethodSurface::Static,
-        span,
+        span: Some(tc.source_span(span)),
     }));
     Subject::Error
 }
@@ -951,6 +956,7 @@ fn static_extend_subject(
         Ok((extend, method, _, owner_args)) => {
             check_extend_method_access(
                 &mut super::AccessPolicyOutput {
+                    source: tc.source_id(),
                     current_module: &tc.current_module,
                     config: &tc.config,
                     warnings: &mut tc.warnings,
@@ -1046,7 +1052,9 @@ fn check_source_receiver(
     tc: &mut TypeChecker,
 ) -> Option<MutableArg> {
     if receiver.mutable {
-        if let Some(error) = mutating_receiver_error(receiver.access, receiver.name, span) {
+        if let Some(error) =
+            mutating_receiver_error(receiver.access, receiver.name, tc.error_span(span))
+        {
             tc.push_error(error);
             return None;
         }
@@ -1060,7 +1068,11 @@ fn check_source_receiver(
     None
 }
 
-fn mutating_receiver_error(access: PlaceAccess, name: Ident, span: Span) -> Option<TypeError> {
+fn mutating_receiver_error(
+    access: PlaceAccess,
+    name: Ident,
+    span: Option<crate::span::SourceSpan>,
+) -> Option<TypeError> {
     match access {
         PlaceAccess::Mutable => None,
         PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
@@ -1149,7 +1161,9 @@ fn solve_generic_call_with(
         return None;
     }
 
-    let vars = tc.solver.generic_solver_vars(generics, seeds, call_span);
+    let vars = tc
+        .solver
+        .generic_solver_vars(generics, seeds, tc.error_span(call_span));
     add_constraints(&vars, tc);
     let mut failed = tc.solve_constraints();
 
@@ -1242,7 +1256,9 @@ fn validate_mutable_aliases(args: &[MutableArg], tc: &mut TypeChecker) -> bool {
     for (index, arg) in args.iter().enumerate() {
         for previous in &args[..index] {
             if previous.identity.conflicts_with(&arg.identity) {
-                tc.push_error(TypeError::MutableAlias { span: arg.span });
+                tc.push_error(TypeError::MutableAlias {
+                    span: tc.error_span(arg.span),
+                });
                 failed = true;
                 break;
             }
@@ -1251,7 +1267,11 @@ fn validate_mutable_aliases(args: &[MutableArg], tc: &mut TypeChecker) -> bool {
     failed
 }
 
-fn var_arg_error(access: PlaceAccess, name: Ident, span: Span) -> Option<TypeError> {
+fn var_arg_error(
+    access: PlaceAccess,
+    name: Ident,
+    span: Option<crate::span::SourceSpan>,
+) -> Option<TypeError> {
     match access {
         PlaceAccess::Mutable => None,
         PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
@@ -1269,7 +1289,7 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
         let place = place::check_place(arg, tc);
         let name = super::assignment_target_name(arg);
         let mut mutable_identity = None;
-        if let Some(error) = var_arg_error(place.value.access, name, arg.span) {
+        if let Some(error) = var_arg_error(place.value.access, name, tc.error_span(arg.span)) {
             tc.push_error(error);
         } else {
             mutable_identity = Some(place.value.identity.clone());
@@ -1324,7 +1344,7 @@ fn can_assign_without_errors(
     tc: &TypeChecker,
 ) -> bool {
     let mut solver = tc.solver.clone();
-    solver.add_handle_assignable(span, from, to);
+    solver.add_handle_assignable(tc.error_span(span), from, to);
     solver.solve_pending().is_empty()
 }
 
@@ -1539,7 +1559,7 @@ fn check_qualified_extend_call(
         tc.push_error(TypeError::WrongArgCount {
             expected: 1,
             found: 0,
-            span: call.span,
+            span: tc.error_span(call.span),
         });
         return checked_type(Type::Infer, tc);
     };
@@ -1555,7 +1575,7 @@ fn check_qualified_extend_call(
             ty: receiver.checked.ty.clone(),
             member: name,
             kind: MemberAccessKind::Method,
-            span,
+            span: tc.error_span(span),
         });
         return check_unhinted_args(args, tc);
     };
@@ -1579,6 +1599,7 @@ fn check_qualified_extend_call(
     );
     check_extend_method_access(
         &mut super::AccessPolicyOutput {
+            source: tc.source_id(),
             current_module: &tc.current_module,
             config: &tc.config,
             warnings: &mut tc.warnings,
@@ -1639,7 +1660,7 @@ fn check_extern_function_call(
                 params: callee.def.sig.params.clone(),
                 ret: Box::new(callee.def.sig.ret.clone()),
             },
-            span: call.span,
+            span: tc.error_span(call.span),
         });
         for arg in &call.node.args {
             check_expr_checked(arg, tc);
@@ -1669,7 +1690,7 @@ fn check_extern_method_call(
         ReceiverMode::Mutable => {
             if let Some(error) = method
                 .receiver_access
-                .mut_borrow_error(method.name, call.span)
+                .mut_borrow_error(method.name, tc.error_span(call.span))
             {
                 tc.push_error(error);
             } else {
@@ -1819,7 +1840,7 @@ fn split_generic_args(
 fn not_callable(ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
     tc.push_error(TypeError::NotCallable {
         ty,
-        span: call.span,
+        span: tc.error_span(call.span),
     });
     for arg in &call.node.args {
         check_expr_checked(arg, tc);
@@ -1845,7 +1866,7 @@ fn non_aggregate_member(
         ty,
         member,
         kind,
-        span,
+        span: tc.error_span(span),
     });
     Subject::Error
 }
@@ -1861,7 +1882,7 @@ fn unknown_member(
         ty,
         member,
         kind,
-        span,
+        span: tc.error_span(span),
     });
     Subject::Error
 }

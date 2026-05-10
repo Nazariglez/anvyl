@@ -9,12 +9,12 @@ use super::{
 use crate::{
     ast,
     lexer::{Delimiter, Keyword, LitToken, Op, Token},
-    span::{Span, Spanned},
+    span::Spanned,
 };
 
 pub(super) fn identifier<'src>() -> BoxedParser<'src, ast::Ident> {
     select! {
-        (Token::Ident(ident), _) => ident,
+        Token::Ident(ident) => ident,
     }
     .labelled("identifier")
     .as_context()
@@ -23,7 +23,7 @@ pub(super) fn identifier<'src>() -> BoxedParser<'src, ast::Ident> {
 
 pub(super) fn keyword_as_ident<'src>() -> BoxedParser<'src, ast::Ident> {
     select! {
-        (Token::Keyword(kw), _) => ast::Ident(Intern::new(kw.to_string()))
+        Token::Keyword(kw) => ast::Ident(Intern::new(kw.to_string()))
     }
     .labelled("identifier")
     .boxed()
@@ -35,7 +35,7 @@ pub(super) fn field_name_ident<'src>() -> BoxedParser<'src, ast::Ident> {
 
 pub(super) fn literal<'src>() -> BoxedParser<'src, ast::Lit> {
     select! {
-        (Token::Literal(lit), _) => match lit {
+        Token::Literal(lit) => match lit {
             LitToken::Number(n) => ast::Lit::Int(n),
             LitToken::Float(s) => {
                 let value = s.as_ref().parse::<f64>().unwrap_or(0.0);
@@ -43,9 +43,9 @@ pub(super) fn literal<'src>() -> BoxedParser<'src, ast::Lit> {
             }
             LitToken::String(s) => ast::Lit::String(s.to_string()),
         },
-        (Token::Keyword(Keyword::True), _) => ast::Lit::Bool(true),
-        (Token::Keyword(Keyword::False), _) => ast::Lit::Bool(false),
-        (Token::Keyword(Keyword::Nil), _) => ast::Lit::Nil,
+        Token::Keyword(Keyword::True) => ast::Lit::Bool(true),
+        Token::Keyword(Keyword::False) => ast::Lit::Bool(false),
+        Token::Keyword(Keyword::Nil) => ast::Lit::Nil,
     }
     .labelled("literal")
     .as_context()
@@ -56,12 +56,12 @@ pub(super) fn params<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, Vec<ast::Param>> {
     select! {
-        (Token::Open(Delimiter::Parent), _) => (),
+        Token::Open(Delimiter::Parent) => (),
     }
     .ignore_then(
         param(stmt)
             .separated_by(select! {
-                (Token::Comma, _) => (),
+                Token::Comma => (),
             })
             .allow_trailing()
             .collect::<Vec<_>>()
@@ -69,7 +69,7 @@ pub(super) fn params<'src>(
             .map(Option::unwrap_or_default),
     )
     .then_ignore(select! {
-        (Token::Close(Delimiter::Parent), _) => (),
+        Token::Close(Delimiter::Parent) => (),
     })
     .boxed()
 }
@@ -78,7 +78,7 @@ pub(super) fn param<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::Param> {
     let var_kw = select! {
-        (Token::Keyword(Keyword::Var), _) => (),
+        Token::Keyword(Keyword::Var) => (),
     }
     .or_not()
     .map(|opt| match opt {
@@ -87,7 +87,7 @@ pub(super) fn param<'src>(
     });
 
     let as_kw = select! {
-        (Token::Keyword(Keyword::As), _) => (),
+        Token::Keyword(Keyword::As) => (),
     }
     .or_not()
     .map(|opt| opt.is_some());
@@ -95,12 +95,12 @@ pub(super) fn param<'src>(
     var_kw
         .then(identifier())
         .then_ignore(select! {
-            (Token::Colon, _) => (),
+            Token::Colon => (),
         })
         .then(as_kw)
         .then(param_type_ident())
         .then(
-            select! { (Token::Op(Op::Assign), _) => () }
+            select! { Token::Op(Op::Assign) => () }
                 .ignore_then(expression(stmt))
                 .or_not(),
         )
@@ -120,10 +120,10 @@ pub(super) fn param<'src>(
 
 pub(super) fn return_type<'src>() -> BoxedParser<'src, Option<ast::Type>> {
     let inferred =
-        select! { (Token::Ident(ident), _) if ident.0.as_ref() == "_" => ast::Type::InferReturn };
+        select! { Token::Ident(ident) if ident.0.as_ref() == "_" => ast::Type::InferReturn };
 
     select! {
-        (Token::Op(Op::ThinArrow), _) => (),
+        Token::Op(Op::ThinArrow) => (),
     }
     .ignore_then(choice((inferred, type_ident())))
     .or_not()
@@ -137,12 +137,12 @@ pub(super) fn block_stmt<'src>(
     tail_expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::BlockNode> {
     select! {
-        (Token::Open(Delimiter::Brace), _) => (),
+        Token::Open(Delimiter::Brace) => (),
     }
     .ignore_then(stmt.repeated().collect::<Vec<_>>())
     .then(tail_expr.or_not())
     .then_ignore(select! {
-        (Token::Close(Delimiter::Brace), _) => (),
+        Token::Close(Delimiter::Brace) => (),
     })
     .map_with(|(stmts, tail), e| {
         let s = e.span();
@@ -151,7 +151,7 @@ pub(super) fn block_stmt<'src>(
                 stmts,
                 tail: tail.map(Box::new),
             },
-            Span::new(s.start, s.end),
+            s.byte(),
         )
     })
     .labelled("block")

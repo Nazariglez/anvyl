@@ -61,7 +61,11 @@ pub(super) fn check_arg_place(
     let is_mutable = checked.value.access.can_mut_borrow();
     if !is_mutable {
         let name = place_error_name(arg, param);
-        if let Some(error) = checked.value.access.mut_borrow_error(name, arg.span) {
+        if let Some(error) = checked
+            .value
+            .access
+            .mut_borrow_error(name, tc.error_span(arg.span))
+        {
             tc.push_error(error);
         }
     }
@@ -97,7 +101,8 @@ pub(super) fn type_fits_boundary(
     span: Span,
     tc: &TypeChecker,
 ) -> bool {
-    tc.solver.type_assignable(span, found, &boundary.ty)
+    tc.solver
+        .type_assignable(tc.error_span(span), found, &boundary.ty)
 }
 
 fn place_error_name(arg: &ExprNode, param: &ResolvedExternParam) -> Ident {

@@ -6,6 +6,7 @@ use chumsky::error::{Rich, RichReason};
 
 use crate::{
     ast::{ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, Type},
+    diagnostic::Diagnostic,
     externs::{
         ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey,
         RawExternIdentityKey, RawExternMemberKey, RawExternScope, RawExternTypeKey,
@@ -15,75 +16,45 @@ use crate::{
         },
         raw_module_scope,
     },
-    lexer::SpannedToken,
+    lexer::Token,
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError, SourceFileId},
+    source::SourceId,
+    span::SourceSpan,
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, DeprecatedUseKind,
         MemberAccessKind, ModuleScope, TypeError, TypeWarning, VariantShape,
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticSeverity {
-    Error,
-    Warning,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Diagnostic {
-    severity: DiagnosticSeverity,
-    message: String,
-}
-
-impl Diagnostic {
-    pub fn error(message: impl Into<String>) -> Self {
-        Self::new(DiagnosticSeverity::Error, message)
-    }
-
-    pub fn warning(message: impl Into<String>) -> Self {
-        Self::new(DiagnosticSeverity::Warning, message)
-    }
-
-    fn new(severity: DiagnosticSeverity, message: impl Into<String>) -> Self {
-        Self {
-            severity,
-            message: message.into(),
-        }
-    }
-
-    pub fn severity(&self) -> DiagnosticSeverity {
-        self.severity
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl std::fmt::Display for Diagnostic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-pub(super) fn diagnose_lex_error(error: &Rich<'_, char>) -> Diagnostic {
-    Diagnostic::error(match error.reason() {
+pub(super) fn diagnose_lex_error(
+    source: SourceId,
+    source_len: usize,
+    error: &Rich<'_, char>,
+) -> Diagnostic {
+    let diagnostic = Diagnostic::error(match error.reason() {
         RichReason::Custom(message) => message.clone(),
         RichReason::ExpectedFound { found, .. } => match found.as_deref() {
             Some(found) => format!("Unexpected character '{found}'"),
             None => "Unexpected end of input".to_string(),
         },
-    })
+    });
+    let span = error.span();
+    if span.start <= span.end && span.end <= source_len {
+        diagnostic.with_primary(SourceSpan::new(source, span.start, span.end))
+    } else {
+        diagnostic
+    }
 }
 
-pub(super) fn diagnose_parse_error(error: &Rich<'_, SpannedToken>) -> Diagnostic {
+pub(super) fn diagnose_parse_error(error: &Rich<'_, Token, SourceSpan>) -> Diagnostic {
     Diagnostic::error(match error.reason() {
         RichReason::Custom(message) => message.clone(),
         RichReason::ExpectedFound { found, .. } => match found.as_deref() {
-            Some((token, _)) => format!("Unexpected token '{token}'"),
+            Some(token) => format!("Unexpected token '{token}'"),
             None => "Unexpected end of input".to_string(),
         },
     })
+    .with_primary(*error.span())
 }
 
 pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
@@ -158,7 +129,11 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
             format!("native-only dependency '{alias}' ({package}) has no source root to import")
         }
     };
-    Diagnostic::error(message)
+    let diagnostic = Diagnostic::error(message);
+    match error.span() {
+        Some(span) => diagnostic.with_primary(span),
+        None => diagnostic,
+    }
 }
 
 pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnostic {
@@ -202,7 +177,23 @@ pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnosti
         ),
         ExternInputError::UnsupportedSource { kind, .. } => render_unsupported_source(kind),
     };
-    Diagnostic::error(message)
+    let diagnostic = Diagnostic::error(message);
+    match extern_input_error_span(error) {
+        Some(span) => diagnostic.with_primary(span),
+        None => diagnostic,
+    }
+}
+
+fn extern_input_error_span(error: &ExternInputError) -> Option<SourceSpan> {
+    match error {
+        ExternInputError::InvalidRawDescriptor { decl, .. } => decl.site.span,
+        ExternInputError::DuplicateRawIdentity {
+            first, duplicate, ..
+        } => duplicate.site.span.or(first.site.span),
+        ExternInputError::UnsupportedSource { span, .. } => Some(*span),
+        ExternInputError::InvalidProviderDescriptor { .. }
+        | ExternInputError::DuplicateProviderModule { .. } => None,
+    }
 }
 
 fn render_unsupported_source(kind: &UnsupportedSourceKind) -> String {
@@ -426,10 +417,19 @@ pub(super) fn diagnose_type_warning(warning: &TypeWarning) -> Diagnostic {
         } => render_internal_access(*kind, *name, owner, reason.as_deref()),
         TypeWarning::CompileMessage { message, .. } => message.clone(),
     })
+    .with_primary(type_warning_span(warning))
+}
+
+fn type_warning_span(warning: &TypeWarning) -> SourceSpan {
+    match warning {
+        TypeWarning::DeprecatedAccess { span, .. }
+        | TypeWarning::InternalAccess { span, .. }
+        | TypeWarning::CompileMessage { span, .. } => *span,
+    }
 }
 
 pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
-    Diagnostic::error(match error {
+    let diagnostic = Diagnostic::error(match error {
         TypeError::Decl(error) => render_decl_error(error),
         TypeError::ExternCatalog(error) => render_extern_catalog_error(error),
         TypeError::UndefinedVariable { name, .. } => format!("Unknown variable '{name}'"),
@@ -808,7 +808,179 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::DuplicateGenericParam { name, .. } => {
             format!("duplicate generic parameter '{name}'")
         }
-    })
+    });
+    match type_error_span(error) {
+        Some(span) => diagnostic.with_primary(span),
+        None => diagnostic,
+    }
+}
+
+fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
+    match error {
+        TypeError::Decl(error) => decl_error_span(error),
+        TypeError::ExternCatalog(error) => extern_catalog_error_span(error),
+        TypeError::UndefinedVariable { span, .. }
+        | TypeError::TypeMismatch { span, .. }
+        | TypeError::ConstMismatch { span, .. }
+        | TypeError::RecursiveInference { span, .. }
+        | TypeError::CannotInferType { span, .. }
+        | TypeError::CannotInferEnum { span, .. }
+        | TypeError::NamedFunctionCapture { span, .. }
+        | TypeError::AllNilArrayLiteral { span, .. }
+        | TypeError::ArrayFillLengthNotConst { span, .. }
+        | TypeError::InferReturnNonGeneric { span, .. }
+        | TypeError::InferReturnExtern { span, .. }
+        | TypeError::InferReturnValue { span, .. }
+        | TypeError::InferReturnMismatch { span, .. }
+        | TypeError::InferReturnRecursive { span, .. }
+        | TypeError::UnknownType { span, .. }
+        | TypeError::TypeUsedAsValue { span, .. }
+        | TypeError::CannotInferConst { span, .. }
+        | TypeError::NotCallable { span, .. }
+        | TypeError::WrongArgCount { span, .. }
+        | TypeError::WrongArgRange { span, .. }
+        | TypeError::LambdaParamCountMismatch { span, .. }
+        | TypeError::RequiredParamAfterDefault { span, .. }
+        | TypeError::EnumVariantArgCount { span, .. }
+        | TypeError::DuplicateName { span, .. }
+        | TypeError::ImmutableAssignment { span, .. }
+        | TypeError::ConstAssignment { span, .. }
+        | TypeError::VarArgNonLvalue { span, .. }
+        | TypeError::VarArgImmutableBinding { span, .. }
+        | TypeError::MutatingMethodImmutableReceiver { span, .. }
+        | TypeError::MutableAlias { span, .. }
+        | TypeError::InvalidFormatSpec { span, .. }
+        | TypeError::CannotMutateCapturedVariable { span, .. }
+        | TypeError::RequiresMutablePlace { span, .. }
+        | TypeError::VarPatternRequiresMutablePlace { span, .. }
+        | TypeError::InvalidOperand { span, .. }
+        | TypeError::MissingReturn { span, .. }
+        | TypeError::IfWithoutElseValue { span, .. }
+        | TypeError::IfConditionNotBool { span, .. }
+        | TypeError::TernaryConditionNotBool { span, .. }
+        | TypeError::WhileConditionNotBool { span, .. }
+        | TypeError::BreakOutsideLoop { span, .. }
+        | TypeError::ContinueOutsideLoop { span, .. }
+        | TypeError::ReturnInsideDefer { span, .. }
+        | TypeError::BreakInsideDefer { span, .. }
+        | TypeError::ContinueInsideDefer { span, .. }
+        | TypeError::TryOnNonResult { span, .. }
+        | TypeError::TryOutsideResultFunction { span, .. }
+        | TypeError::TryErrorMismatch { span, .. }
+        | TypeError::TryInsideDefer { span, .. }
+        | TypeError::ForIterableNotSupported { span, .. }
+        | TypeError::ForIterationModifier { span, .. }
+        | TypeError::InfiniteSize { span, .. }
+        | TypeError::NotEquatable { span, .. }
+        | TypeError::UnsupportedPattern { span, .. }
+        | TypeError::TuplePatternArityMismatch { span, .. }
+        | TypeError::TuplePatternOnNonTuple { span, .. }
+        | TypeError::OrPatternBindingMismatch { span, .. }
+        | TypeError::OrPatternBindingTypeMismatch { span, .. }
+        | TypeError::EmptyMatch { span, .. }
+        | TypeError::NonExhaustiveMatch { span, .. }
+        | TypeError::UnsupportedMatchScrutinee { span, .. }
+        | TypeError::InvalidLiteralPattern { span, .. }
+        | TypeError::OptionalPatternOnNonOptional { span, .. }
+        | TypeError::OptionalChainingOnNonOptional { span, .. }
+        | TypeError::NestedOptionalPattern { span, .. }
+        | TypeError::MatchArmTypeMismatch { span, .. }
+        | TypeError::RequiresUnwrappingPattern { span, .. }
+        | TypeError::IrrefutableLetElse { span, .. }
+        | TypeError::LetElseMustDiverge { span, .. }
+        | TypeError::MemberAccessOnNonAggregate { span, .. }
+        | TypeError::UnknownMember { span, .. }
+        | TypeError::InstanceMethodOnType { span, .. }
+        | TypeError::StaticMethodOnValue { span, .. }
+        | TypeError::ReadonlyMethodMutation { span, .. }
+        | TypeError::InternalAccess { span, .. }
+        | TypeError::UnknownIntrinsic { span, .. }
+        | TypeError::IntrinsicArgCount { span, .. }
+        | TypeError::IntrinsicExpectedIdent { span, .. }
+        | TypeError::IntrinsicExpectedString { span, .. }
+        | TypeError::UnknownIntrinsicValue { span, .. }
+        | TypeError::CompileError { span, .. }
+        | TypeError::MethodGenericShadow { span, .. }
+        | TypeError::TupleIndexOnNonTuple { span, .. }
+        | TypeError::TupleIndexOutOfBounds { span, .. }
+        | TypeError::IndexNotInt { span, .. }
+        | TypeError::IndexOnNonIndexable { span, .. }
+        | TypeError::RangeIndexNotInt { span, .. }
+        | TypeError::RangeIndexUnsupported { span, .. }
+        | TypeError::NonKeyableMapKey { span, .. }
+        | TypeError::DuplicateMapKey { span, .. }
+        | TypeError::UndefinedModuleMember { span, .. }
+        | TypeError::PrivateModuleMember { span, .. }
+        | TypeError::AmbiguousExtendMethod { span, .. }
+        | TypeError::DuplicateField { span, .. }
+        | TypeError::MissingField { span, .. }
+        | TypeError::UnknownVariantField { span, .. }
+        | TypeError::MissingVariantField { span, .. }
+        | TypeError::InvalidStructLiteral { span, .. }
+        | TypeError::UnknownStructLiteral { span, .. }
+        | TypeError::UnknownEnumVariant { span, .. }
+        | TypeError::EnumPatternTypeMismatch { span, .. }
+        | TypeError::EnumVariantShapeMismatch { span, .. }
+        | TypeError::UnboundGenericParam { span, .. }
+        | TypeError::UnknownConst { span, .. }
+        | TypeError::ConstCycle { span, .. }
+        | TypeError::NonConstExpression { span, .. }
+        | TypeError::GenericFieldDefault { span, .. }
+        | TypeError::ConstTypeMismatch { span, .. }
+        | TypeError::InvalidConstCast { span, .. }
+        | TypeError::InvalidCast { span, .. }
+        | TypeError::ConstDivisionByZero { span, .. }
+        | TypeError::ConstOverflow { span, .. }
+        | TypeError::ExpectedIntConst { span, .. }
+        | TypeError::NegativeArrayLength { span, .. }
+        | TypeError::GenericArgKindMismatch { span, .. }
+        | TypeError::ExternAnyEscape { span, .. }
+        | TypeError::AnyOutsideExternBoundary { span, .. }
+        | TypeError::DuplicateGenericParam { span, .. } => *span,
+        TypeError::GenericArity(_) => None,
+    }
+}
+
+fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
+    match error {
+        DeclError::DuplicateValue { span, .. }
+        | DeclError::DuplicateType { span, .. }
+        | DeclError::MissingImportMember { span, .. }
+        | DeclError::PrivateImportMember { span, .. }
+        | DeclError::ImportConflict { span, .. }
+        | DeclError::DuplicateModuleBinding { span, .. }
+        | DeclError::DuplicateGenericParam { span, .. }
+        | DeclError::DuplicateAggregateMethod { span, .. }
+        | DeclError::DuplicateExtendMethod { span, .. }
+        | DeclError::DuplicateCastFrom { span, .. }
+        | DeclError::PointlessCastFrom { span, .. }
+        | DeclError::CastFromReturnMismatch { span, .. }
+        | DeclError::UnsupportedExtendTarget { span, .. }
+        | DeclError::UnusedExtendTypeParam { span, .. }
+        | DeclError::UnusedExtendConstParam { span, .. }
+        | DeclError::ExtendMethodConflict { span, .. }
+        | DeclError::ReexportConflict { span, .. }
+        | DeclError::UnknownType { span, .. }
+        | DeclError::UnknownAnnotation { span, .. }
+        | DeclError::InvalidAnnotationTarget { span, .. }
+        | DeclError::DuplicateAnnotation { span, .. }
+        | DeclError::InvalidAnnotationArgs { span, .. }
+        | DeclError::InternalOnToString { span }
+        | DeclError::InvalidToStringMethod { span, .. } => *span,
+    }
+}
+
+fn extern_catalog_error_span(error: &ExternCatalogError) -> Option<SourceSpan> {
+    match error {
+        ExternCatalogError::UnknownType { site, .. }
+        | ExternCatalogError::GenericArity { site, .. }
+        | ExternCatalogError::GenericArgKindMismatch { site, .. }
+        | ExternCatalogError::InvalidType { site, .. }
+        | ExternCatalogError::UnknownInitField { site, .. }
+        | ExternCatalogError::ComputedInitField { site, .. }
+        | ExternCatalogError::UnsupportedInitParams { site, .. }
+        | ExternCatalogError::InvalidOperatorReturn { site, .. } => site.span,
+    }
 }
 
 fn render_variant_shape(shape: VariantShape) -> &'static str {
@@ -1574,8 +1746,10 @@ mod tests {
     use crate::{
         ast::{Ident, Type},
         externs::RawExternSite,
-        lexer::Token,
-        span::Span,
+        lexer::{Keyword, Token, TokenStream},
+        parser,
+        source::{SourceKind, SourceTable},
+        span::{SourceSpan, Span},
     };
 
     fn ident(name: &str) -> Ident {
@@ -1641,6 +1815,40 @@ mod tests {
         Span::new(0, 1)
     }
 
+    fn test_source(text: &str) -> SourceId {
+        let mut sources = SourceTable::default();
+        sources.add(SourceKind::Virtual, "test", None, text)
+    }
+
+    fn token_span() -> SourceSpan {
+        SourceSpan::new(test_source(";"), 0, 1)
+    }
+
+    fn lex_source() -> SourceId {
+        test_source("!")
+    }
+
+    fn resolve_span() -> SourceSpan {
+        SourceSpan::new(test_source("x"), 0, 1)
+    }
+
+    fn type_span() -> Option<SourceSpan> {
+        Some(resolve_span())
+    }
+
+    fn token_stream(tokens: Vec<(Token, SourceSpan)>) -> TokenStream {
+        let source = tokens
+            .first()
+            .map(|(_, span)| span.source())
+            .unwrap_or_else(|| test_source(""));
+        let len = tokens.iter().map(|(_, span)| span.end()).max().unwrap_or(0);
+        TokenStream {
+            source,
+            eoi: SourceSpan::empty(source, len),
+            tokens,
+        }
+    }
+
     fn assert_msg(diagnostic: impl std::fmt::Display, expected: &str) {
         let message = diagnostic.to_string();
         assert_eq!(message, expected);
@@ -1695,7 +1903,7 @@ mod tests {
                     kind,
                     name: ident("old"),
                     reason: None,
-                    span: span(),
+                    span: resolve_span(),
                 }),
                 expected,
             );
@@ -1705,10 +1913,19 @@ mod tests {
                 kind: DeprecatedUseKind::DataRef,
                 name: ident("old"),
                 reason: Some("use new".to_string()),
-                span: span(),
+                span: resolve_span(),
             }),
             "use of deprecated dataref 'old': use new",
         );
+
+        let span = resolve_span();
+        let diagnostic = diagnose_type_warning(&TypeWarning::DeprecatedAccess {
+            kind: DeprecatedUseKind::Function,
+            name: ident("old"),
+            reason: None,
+            span,
+        });
+        assert_eq!(diagnostic.labels()[0].span, span);
     }
 
     #[test]
@@ -1717,14 +1934,14 @@ mod tests {
             (
                 diagnose_resolve_error(&ResolveError::ModuleNotFound {
                     module: module_id(&["foo", "bar"]),
-                    span: span(),
+                    span: resolve_span(),
                 }),
                 "Cannot find module file for module 'foo.bar'",
             ),
             (
                 diagnose_resolve_error(&ResolveError::LoadFailed {
                     module: module_id(&["foo", "bar"]),
-                    span: span(),
+                    span: resolve_span(),
                     message: "permission denied".to_string(),
                 }),
                 "Cannot load module 'foo.bar': permission denied",
@@ -1740,6 +1957,13 @@ mod tests {
         for (diagnostic, expected) in cases {
             assert_msg(diagnostic, expected);
         }
+
+        let span = resolve_span();
+        let diagnostic = diagnose_resolve_error(&ResolveError::ModuleNotFound {
+            module: module_id(&["foo"]),
+            span,
+        });
+        assert_eq!(diagnostic.labels()[0].span, span);
     }
 
     #[test]
@@ -1749,7 +1973,7 @@ mod tests {
                 diagnose_type_error(&TypeError::Decl(DeclError::DuplicateType {
                     module: ModuleScope::Root,
                     name: ident("Point"),
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "type 'Point' is already defined",
             ),
@@ -1758,7 +1982,7 @@ mod tests {
                     module: ModuleScope::Root,
                     imported: module_scope(&["tools"]),
                     name: ident("Point"),
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "Unknown member 'Point' in module 'tools'",
             ),
@@ -1767,7 +1991,7 @@ mod tests {
                     module: ModuleScope::Root,
                     imported: module_scope(&["tools"]),
                     name: ident("secret"),
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "member 'secret' in module 'tools' is private",
             ),
@@ -1776,7 +2000,7 @@ mod tests {
                     module: ModuleScope::Root,
                     imported: source_module_scope("/tmp/lib.anv"),
                     name: ident("missing"),
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "Unknown member 'missing' in module 'lib'",
             ),
@@ -1788,7 +2012,7 @@ mod tests {
                     second: BindingOrigin::Import {
                         source: module_scope(&["tools"]),
                     },
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "module binding 'tools' is already in use",
             ),
@@ -1796,7 +2020,7 @@ mod tests {
                 diagnose_type_error(&TypeError::Decl(DeclError::DuplicateGenericParam {
                     module: ModuleScope::Root,
                     name: ident("T"),
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "duplicate generic parameter 'T'",
             ),
@@ -1809,7 +2033,7 @@ mod tests {
                     second: BindingOrigin::Import {
                         source: module_scope(&["shapes"]),
                     },
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "imported type 'Point' conflicts with a locally defined type",
             ),
@@ -1824,7 +2048,7 @@ mod tests {
                     second: BindingOrigin::Import {
                         source: module_scope(&["beta"]),
                     },
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "imported type 'Point' conflicts with a previously imported name",
             ),
@@ -1839,14 +2063,14 @@ mod tests {
                     second: BindingOrigin::Reexport {
                         source: module_scope(&["beta"]),
                     },
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "type 'Point' is re-exported by both 'alpha' and 'beta'",
             ),
             (
                 diagnose_type_error(&TypeError::Decl(DeclError::InvalidToStringMethod {
                     message: "to_string method must return 'string'",
-                    span: span(),
+                    span: Some(resolve_span()),
                 })),
                 "to_string method must return 'string'",
             ),
@@ -1877,7 +2101,7 @@ mod tests {
                 diagnose_type_error(&TypeError::TypeMismatch {
                     expected: Type::Int,
                     found: Type::Bool,
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Mismatched types: expected 'int', found 'bool'",
             ),
@@ -1885,7 +2109,7 @@ mod tests {
                 diagnose_type_error(&TypeError::TypeMismatch {
                     expected: Type::Tuple(vec![Type::option_of(Type::Int)]),
                     found: Type::Tuple(vec![Type::option_of(Type::String)]),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Mismatched types: expected '(int?)', found '(string?)'",
             ),
@@ -1893,14 +2117,14 @@ mod tests {
                 diagnose_type_error(&TypeError::TypeMismatch {
                     expected: package_nominal("left", "Vec2"),
                     found: package_nominal("right", "Vec2"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Mismatched types: expected 'left:<root>.Vec2', found 'right:<root>.Vec2'",
             ),
             (
                 diagnose_type_error(&TypeError::UndefinedVariable {
                     name: ident("x"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Unknown variable 'x'",
             ),
@@ -1908,61 +2132,61 @@ mod tests {
                 diagnose_type_error(&TypeError::InvalidOperand {
                     op: "-".to_string(),
                     operand_type: Type::Bool,
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Invalid operand type: operator '-' cannot be applied to 'bool'",
             ),
             (
                 diagnose_type_error(&TypeError::ConstAssignment {
                     name: ident("LIMIT"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "cannot assign to constant 'LIMIT'",
             ),
             (
-                diagnose_type_error(&TypeError::CannotInferEnum { span: span() }),
+                diagnose_type_error(&TypeError::CannotInferEnum { span: type_span() }),
                 "cannot infer enum type",
             ),
             (
                 diagnose_type_error(&TypeError::NamedFunctionCapture {
                     name: ident("x"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "named functions cannot capture local value 'x'",
             ),
             (
-                diagnose_type_error(&TypeError::VarArgNonLvalue { span: span() }),
+                diagnose_type_error(&TypeError::VarArgNonLvalue { span: type_span() }),
                 "non-lvalue cannot be passed to var parameter",
             ),
             (
                 diagnose_type_error(&TypeError::VarArgImmutableBinding {
                     name: ident("x"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "immutable binding 'x' cannot be passed to var parameter",
             ),
             (
                 diagnose_type_error(&TypeError::MutatingMethodImmutableReceiver {
                     name: ident("self"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "mutating method requires mutable receiver 'self'",
             ),
             (
-                diagnose_type_error(&TypeError::MutableAlias { span: span() }),
+                diagnose_type_error(&TypeError::MutableAlias { span: type_span() }),
                 "var arguments must not alias the same variable",
             ),
             (
                 diagnose_type_error(&TypeError::InvalidFormatSpec {
                     reason: "hex format requires int",
-                    span: span(),
+                    span: type_span(),
                 }),
                 "invalid format specifier: hex format requires int",
             ),
             (
                 diagnose_type_error(&TypeError::InfiniteSize {
                     name: ident("Node"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "type 'Node' has infinite size",
             ),
@@ -1971,12 +2195,12 @@ mod tests {
                     ty: Type::Slice {
                         elem: Box::new(Type::Int),
                     },
-                    span: span(),
+                    span: type_span(),
                 }),
                 "type 'slice[int]' is not equatable",
             ),
             (
-                diagnose_type_error(&TypeError::OrPatternBindingMismatch { span: span() }),
+                diagnose_type_error(&TypeError::OrPatternBindingMismatch { span: type_span() }),
                 "or-pattern alternatives must bind the same variables",
             ),
             (
@@ -1984,7 +2208,7 @@ mod tests {
                     name: ident("x"),
                     expected: Type::Int,
                     found: Type::String,
-                    span: span(),
+                    span: type_span(),
                 }),
                 "or-pattern binding 'x' type mismatch: expected 'int', found 'string'",
             ),
@@ -1993,7 +2217,7 @@ mod tests {
                     ty: Type::UnresolvedName(ident("Point")),
                     member: ident("z"),
                     kind: MemberAccessKind::Field,
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Unknown field 'z' for type 'Point'",
             ),
@@ -2002,7 +2226,7 @@ mod tests {
                     ty: Type::UnresolvedName(ident("Counter")),
                     member: ident("reset"),
                     kind: MemberAccessKind::Method,
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Unknown method 'reset' for type 'Counter'",
             ),
@@ -2011,7 +2235,7 @@ mod tests {
                     ty: Type::Int,
                     member: ident("y"),
                     kind: MemberAccessKind::Field,
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Unknown field 'y' for type 'int'",
             ),
@@ -2025,14 +2249,14 @@ mod tests {
             (
                 diagnose_type_error(&TypeError::UnboundGenericParam {
                     name: ident("T"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Could not infer type parameter 'T'",
             ),
             (
                 diagnose_type_error(&TypeError::DuplicateGenericParam {
                     name: ident("T"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "duplicate generic parameter 'T'",
             ),
@@ -2040,7 +2264,7 @@ mod tests {
                 diagnose_type_error(&TypeError::UnknownStructLiteral {
                     qualifier: None,
                     name: ident("Point"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Unknown struct 'Point'",
             ),
@@ -2048,16 +2272,16 @@ mod tests {
                 diagnose_type_error(&TypeError::UnknownStructLiteral {
                     qualifier: Some(ident("shapes")),
                     name: ident("Point"),
-                    span: span(),
+                    span: type_span(),
                 }),
                 "Unknown struct 'shapes.Point'",
             ),
             (
-                diagnose_type_error(&TypeError::AnyOutsideExternBoundary { span: span() }),
+                diagnose_type_error(&TypeError::AnyOutsideExternBoundary { span: type_span() }),
                 "any is only allowed in extern boundary signatures",
             ),
             (
-                diagnose_type_error(&TypeError::ExternAnyEscape { span: span() }),
+                diagnose_type_error(&TypeError::ExternAnyEscape { span: type_span() }),
                 "extern 'any' value cannot escape an extern boundary",
             ),
         ];
@@ -2065,6 +2289,40 @@ mod tests {
         for (diagnostic, expected) in cases {
             assert_msg(diagnostic, expected);
         }
+
+        let span = resolve_span();
+        let diagnostic = diagnose_type_error(&TypeError::UndefinedVariable {
+            name: ident("x"),
+            span: Some(span),
+        });
+        assert_eq!(diagnostic.labels()[0].span, span);
+    }
+
+    #[test]
+    fn omits_labels_without_source_span() {
+        let diagnostic = diagnose_type_error(&TypeError::CannotInferType { span: None });
+        assert!(diagnostic.labels().is_empty());
+
+        let diagnostic = diagnose_type_error(&TypeError::Decl(DeclError::DuplicateType {
+            module: ModuleScope::Root,
+            name: ident("Point"),
+            span: None,
+        }));
+        assert!(diagnostic.labels().is_empty());
+
+        let diagnostic =
+            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+                context: catalog_context(
+                    &["host"],
+                    ExternContextItem::Function {
+                        name: ident("tick"),
+                    },
+                ),
+                module: None,
+                name: ident("Missing"),
+                site: RawExternSite::default(),
+            }));
+        assert!(diagnostic.labels().is_empty());
     }
 
     #[test]
@@ -2458,7 +2716,11 @@ mod tests {
     #[test]
     fn renders_lex_errors() {
         assert_msg(
-            diagnose_lex_error(&Rich::custom((0..1).into(), "invalid escape sequence")),
+            diagnose_lex_error(
+                lex_source(),
+                1,
+                &Rich::custom((0..1).into(), "invalid escape sequence"),
+            ),
             "invalid escape sequence",
         );
 
@@ -2468,29 +2730,29 @@ mod tests {
                 Some('!'.into()),
                 (0..1).into(),
             );
-        assert_msg(diagnose_lex_error(&error), "Unexpected character '!'");
+        let source = lex_source();
+        let diagnostic = diagnose_lex_error(source, 1, &error);
+        assert_msg(&diagnostic, "Unexpected character '!'");
+        assert_eq!(diagnostic.labels()[0].span, SourceSpan::new(source, 0, 1));
     }
 
     #[test]
     fn renders_parse_errors() {
         assert_msg(
-            diagnose_parse_error(&Rich::custom((0..1).into(), "custom parser message")),
+            diagnose_parse_error(&Rich::custom(token_span(), "custom parser message")),
             "custom parser message",
         );
 
-        let token = (Token::Semicolon, span());
-        let error = <Rich<'_, SpannedToken> as LabelError<
-            '_,
-            &'_ [SpannedToken],
-            RichPattern<'_, SpannedToken>,
-        >>::expected_found([], Some(token.into()), (0..1).into());
-        assert_msg(diagnose_parse_error(&error), "Unexpected token ';'");
+        let stream = token_stream(vec![(Token::Semicolon, token_span())]);
+        let errors = parser::parse_ast(&stream).expect_err("expected parse error");
+        assert_msg(diagnose_parse_error(&errors[0]), "Unexpected token ';'");
 
-        let error = <Rich<'_, SpannedToken> as LabelError<
-            '_,
-            &'_ [SpannedToken],
-            RichPattern<'_, SpannedToken>,
-        >>::expected_found([], None, (0..1).into());
-        assert_msg(diagnose_parse_error(&error), "Unexpected end of input");
+        let source = test_source("fn");
+        let stream = token_stream(vec![(
+            Token::Keyword(Keyword::Fn),
+            SourceSpan::new(source, 0, 2),
+        )]);
+        let errors = parser::parse_ast(&stream).expect_err("expected parse error");
+        assert_msg(diagnose_parse_error(&errors[0]), "Unexpected end of input");
     }
 }

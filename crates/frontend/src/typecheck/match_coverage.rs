@@ -32,7 +32,7 @@ pub(super) fn check(
     if let MatchSubject::Unsupported(found) = &subject {
         tc.push_error(TypeError::UnsupportedMatchScrutinee {
             found: found.clone(),
-            span,
+            span: tc.error_span(span),
         });
         return;
     }
@@ -50,7 +50,9 @@ pub(super) fn check(
         MatchSubject::Bool => check_bool(outcomes, span, tc),
         MatchSubject::Enum { key, variants } => check_enum(&key, &variants, outcomes, span, tc),
         MatchSubject::Int | MatchSubject::Float | MatchSubject::String => {
-            tc.push_error(TypeError::NonExhaustiveMatch { span });
+            tc.push_error(TypeError::NonExhaustiveMatch {
+                span: tc.error_span(span),
+            });
         }
         MatchSubject::Tuple => {}
         MatchSubject::Unknown | MatchSubject::Unsupported(_) => {}
@@ -87,7 +89,9 @@ fn check_bool(outcomes: &[PatternOutcome], span: Span, tc: &mut TypeChecker) {
     let has_true = covers_bool(outcomes, true);
     let has_false = covers_bool(outcomes, false);
     if !has_true || !has_false {
-        tc.push_error(TypeError::NonExhaustiveMatch { span });
+        tc.push_error(TypeError::NonExhaustiveMatch {
+            span: tc.error_span(span),
+        });
     }
 }
 
@@ -125,7 +129,9 @@ fn check_enum(
             .iter()
             .any(|outcome| cover_matches_enum(&outcome.cover, key, *variant));
         if !covered {
-            tc.push_error(TypeError::NonExhaustiveMatch { span });
+            tc.push_error(TypeError::NonExhaustiveMatch {
+                span: tc.error_span(span),
+            });
             return;
         }
     }

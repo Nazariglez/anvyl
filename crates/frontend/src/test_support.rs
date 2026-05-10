@@ -6,10 +6,17 @@ use crate::{
     resolve::{
         self, ModuleId, ModulePath, PackageId, ResolveResult, ResolvedImportTarget, ResolvedModule,
     },
+    source::{SourceId, SourceKind, SourceTable},
 };
 
+pub(crate) fn test_source_id() -> SourceId {
+    SourceTable::default().add(SourceKind::Virtual, "test", None, "")
+}
+
 pub(crate) fn parse_program(source: &str) -> Program {
-    let tokens = lexer::tokenize(source).expect("lexer error");
+    let mut sources = SourceTable::default();
+    let source_id = sources.add(SourceKind::Virtual, "test", None, source);
+    let tokens = lexer::tokenize(source_id, source).expect("lexer error");
     parser::parse_ast(&tokens).expect("parse error")
 }
 
@@ -24,6 +31,7 @@ pub(crate) fn module_path(path: &str) -> ModulePath {
 pub(crate) fn empty_resolved() -> ResolveResult {
     ResolveResult {
         root: root_id(),
+        root_source: test_source_id(),
         module_groups: vec![],
         dependencies: HashMap::new(),
         system: resolve::SystemPackages::default(),
@@ -41,10 +49,11 @@ pub(crate) fn resolved_modules_with_external(
     modules: &[(&str, &str)],
     external_modules: &HashSet<ModuleId>,
 ) -> ResolveResult {
+    let root_source = test_source_id();
     let mut import_edges = HashMap::new();
     import_edges.insert(
         root_id(),
-        import_targets(&root_id(), root, external_modules),
+        import_targets(&root_id(), root, root_source, external_modules),
     );
 
     let module_groups = vec![
@@ -53,17 +62,23 @@ pub(crate) fn resolved_modules_with_external(
             .map(|(name, source)| {
                 let key = ModuleId::named(PackageId::synthetic_root(), module_path(name));
                 let program = parse_program(source);
+                let source = test_source_id();
                 import_edges.insert(
                     key.clone(),
-                    import_targets(&key, &program, external_modules),
+                    import_targets(&key, &program, source, external_modules),
                 );
-                ResolvedModule { key, program }
+                ResolvedModule {
+                    key,
+                    source,
+                    program,
+                }
             })
             .collect(),
     ];
 
     ResolveResult {
         root: root_id(),
+        root_source,
         module_groups,
         dependencies: HashMap::new(),
         system: resolve::SystemPackages::default(),
@@ -75,6 +90,7 @@ pub(crate) fn resolved_modules_with_external(
 fn import_targets(
     module: &ModuleId,
     program: &Program,
+    source: SourceId,
     external_modules: &HashSet<ModuleId>,
 ) -> Vec<ResolvedImportTarget> {
     let mut errors = vec![];
@@ -89,6 +105,7 @@ fn import_targets(
             resolve::resolve_import_target(
                 module,
                 import,
+                crate::span::SourceSpan::new(source, import.span.start, import.span.end),
                 &HashMap::new(),
                 &HashMap::new(),
                 None,
