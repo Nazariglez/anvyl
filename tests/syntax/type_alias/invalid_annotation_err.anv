@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: is not valid on type alias
+
+@deprecated
+type Id = int;

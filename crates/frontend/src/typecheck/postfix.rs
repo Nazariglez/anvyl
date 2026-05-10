@@ -7,7 +7,8 @@ use super::{
     decls::{
         CallableKind, CallableParent, CallableRef, DeclError, ExtendMethodMatch,
         ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface, ModuleMemberLookup,
-        ModuleScope, ResolvedValue, ValueDecl, VariantPayload, nominal_type, owner_template,
+        ModuleScope, ResolvedValue, TypeBinding, ValueDecl, VariantPayload, nominal_type,
+        owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
@@ -802,9 +803,15 @@ fn apply_module_field(
         ModuleMemberLookup::Missing => {}
     }
     match tc.decls.module_type(scope, name) {
-        ModuleMemberLookup::Found(key) => {
+        ModuleMemberLookup::Found(TypeBinding::Nominal(key)) => {
             tc.warn_extern_type_deprecated(&key, span);
             return Subject::Type(nominal_type(&key));
+        }
+        ModuleMemberLookup::Found(binding @ TypeBinding::Alias(_)) => {
+            let ty = tc.resolve_type_binding_for_tc_at(binding, &[], span);
+            if !matches!(ty, Type::Infer) {
+                return Subject::Type(ty);
+            }
         }
         ModuleMemberLookup::Private => private = true,
         ModuleMemberLookup::Missing => {}

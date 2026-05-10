@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Numbers = [int];
+extend<T> [T] { fn empty() -> [T] { [] } }
+fn f() -> Numbers { Numbers.empty() }

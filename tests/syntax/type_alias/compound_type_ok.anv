@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Numbers = [int];
+type Table = [string: Numbers];
+type Fixed = [int; 3];
+type Pair = (int, string);
+fn f(xs: Numbers, table: Table, fixed: Fixed, pair: Pair) {}

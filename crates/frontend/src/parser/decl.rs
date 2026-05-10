@@ -1439,6 +1439,52 @@ pub(super) fn extend_declaration<'src>(
         .boxed()
 }
 
+fn type_alias_with_visibility<'src>(
+    visibility: impl AnvParser<'src, ast::Visibility>,
+) -> BoxedParser<'src, ast::StmtNode> {
+    visibility
+        .then_ignore(select! { Token::Keyword(Keyword::Type) => () })
+        .then(identifier())
+        .then(generic_params())
+        .then_ignore(select! { Token::Op(Op::Assign) => () })
+        .then(type_ident())
+        .then_ignore(select! { Token::Semicolon => () })
+        .map_with(|(((visibility, name), gp), aliased), e| {
+            let GenericParams {
+                type_params,
+                const_params,
+            } = gp;
+            let type_param_map = type_params.iter().map(|tp| (tp.name, tp.id)).collect();
+            let const_param_map = const_params.iter().map(|cp| (cp.name, cp.id)).collect();
+            let aliased = resolve_type_params(&aliased, &type_param_map, &const_param_map);
+            let span = e.span().byte();
+            let node = Spanned::new(
+                ast::TypeAliasDecl {
+                    annotations: vec![],
+                    doc: None,
+                    visibility,
+                    name,
+                    type_params,
+                    const_params,
+                    aliased,
+                },
+                span,
+            );
+            Spanned::new(ast::Stmt::TypeAlias(node), span)
+        })
+        .labelled("type alias declaration")
+        .as_context()
+        .boxed()
+}
+
+pub(super) fn type_alias_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
+    type_alias_with_visibility(visibility())
+}
+
+pub(super) fn local_type_alias_statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
+    type_alias_with_visibility(empty().to(ast::Visibility::Private))
+}
+
 pub(super) fn const_decl<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {

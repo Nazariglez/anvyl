@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import ids { * };
+fn f(x: Id) -> int { x }

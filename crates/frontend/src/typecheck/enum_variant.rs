@@ -118,8 +118,10 @@ fn resolve_explicit_pattern(
     expected: &Type,
     span: Span,
 ) -> Option<NominalKey> {
-    let visible = tc
-        .resolve_visible_type_key(None, name)
+    let visible_ty = tc.visible_type_subject(name, span);
+    let visible = visible_ty
+        .as_ref()
+        .and_then(|ty| tc.decls.key_for_type(ty))
         .filter(|key| key.kind == NominalKind::Enum);
     if let Some(visible) = visible {
         if let Some(expected_key) = expected_key {

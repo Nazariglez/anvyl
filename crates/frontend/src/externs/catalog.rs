@@ -6,7 +6,7 @@ use anvyx_externs::{
 };
 
 use crate::{
-    ast::{FuncParam, Ident, NominalKind, Type},
+    ast::{FuncParam, GenericArg, Ident, NominalKind, Type},
     externs::{
         extern_module_path, extern_module_scope,
         raw::{
@@ -16,7 +16,10 @@ use crate::{
         raw_module_scope,
     },
     resolve::{ModuleId, ModulePath},
-    typecheck::{DeclarationIndex, ModuleScope, NominalKey, TypeRefError, type_closure_facts},
+    typecheck::{
+        DeclarationIndex, GenericTypeContext, ModuleScope, NominalKey, TypeRefError,
+        type_closure_facts,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -941,22 +944,11 @@ impl<'a> CatalogBuilder<'a> {
         args: &[ExternTypeExpr],
     ) -> Type {
         let name = Ident::new(name);
-        if matches!(ctx.context.provenance, ExternProvenance::Source { .. })
-            && module.is_none()
-            && name.as_str() == "Self"
-            && let Some(owner) = ctx.owner
-        {
-            return self.finalize_named(ctx.context, owner, vec![], ctx.site);
+        if matches!(ctx.context.provenance, ExternProvenance::Source { .. }) {
+            return self.resolve_source_type_ref(ctx, module, name, args);
         }
 
-        let key = match ctx.context.provenance {
-            ExternProvenance::Provider { .. } => {
-                self.resolve_provider_named(ctx.scope, module, name)
-            }
-            ExternProvenance::Source { .. } => self.resolve_source_named(ctx.scope, module, name),
-        };
-
-        let Some(key) = key else {
+        let Some(key) = self.resolve_provider_named(ctx.scope, module, name) else {
             self.errors.push(ExternCatalogError::UnknownType {
                 context: ctx.context.clone(),
                 module: module.map(|module| missing_type_module(ctx.scope, ctx.context, module)),
@@ -973,6 +965,51 @@ impl<'a> CatalogBuilder<'a> {
         self.finalize_named(ctx.context, &key, args, ctx.site)
     }
 
+    fn resolve_source_type_ref(
+        &mut self,
+        ctx: ResolveCtx<'_>,
+        module: Option<&anvyx_externs::ModulePath>,
+        name: Ident,
+        args: &[ExternTypeExpr],
+    ) -> Type {
+        if module.is_none()
+            && name.as_str() == "Self"
+            && let Some(owner) = ctx.owner
+        {
+            return self.finalize_named(ctx.context, owner, vec![], ctx.site);
+        }
+
+        let qualifier = match module {
+            Some(module) if module.segments.len() == 1 => Some(Ident::new(&module.segments[0])),
+            Some(module) => {
+                self.errors.push(ExternCatalogError::UnknownType {
+                    context: ctx.context.clone(),
+                    module: Some(missing_type_module(ctx.scope, ctx.context, module)),
+                    name,
+                    site: ctx.site,
+                });
+                return Type::UnresolvedName(name);
+            }
+            None => None,
+        };
+        let generic_args = args
+            .iter()
+            .map(|arg| GenericArg::Type(self.resolve_ty(ctx, arg).ty))
+            .collect();
+        let ty = Type::UnresolvedNominal {
+            qualifier,
+            name,
+            generic_args,
+        };
+        match self
+            .decls
+            .finalize_type_ref(&ctx.context.module, &GenericTypeContext::default(), &ty)
+        {
+            Ok(ty) => ty,
+            Err(error) => self.type_ref_error(ctx.context, name, error, ctx.site),
+        }
+    }
+
     fn resolve_provider_named(
         &self,
         scope: &ModuleScope,
@@ -982,32 +1019,69 @@ impl<'a> CatalogBuilder<'a> {
         match module {
             Some(module) => self
                 .decls
-                .exported_type(&provider_module_scope(scope, module), name)
+                .exported_nominal_type(&provider_module_scope(scope, module), name)
                 .or_else(|| {
                     self.decls
-                        .exported_type(&provider_source_module_scope(scope, module), name)
+                        .exported_nominal_type(&provider_source_module_scope(scope, module), name)
                 }),
-            None => self.decls.local_type(scope, name).or_else(|| {
+            None => self.decls.local_nominal_type(scope, name).or_else(|| {
                 self.decls
-                    .local_type(&provider_source_current_scope(scope)?, name)
+                    .local_nominal_type(&provider_source_current_scope(scope)?, name)
             }),
         }
     }
 
-    fn resolve_source_named(
-        &self,
-        scope: &ModuleScope,
-        module: Option<&anvyx_externs::ModulePath>,
-        name: Ident,
-    ) -> Option<NominalKey> {
-        match module {
-            Some(module) if module.segments.len() == 1 => {
-                let qualifier = Ident::new(&module.segments[0]);
-                self.decls
-                    .resolve_visible_type_key(scope, Some(qualifier), name)
+    fn type_ref_error(
+        &mut self,
+        context: &ExternCatalogContext,
+        fallback: Ident,
+        error: TypeRefError,
+        site: RawExternSite,
+    ) -> Type {
+        match error {
+            TypeRefError::GenericArity { expected, found } => {
+                self.errors.push(ExternCatalogError::GenericArity {
+                    context: context.clone(),
+                    name: fallback,
+                    expected,
+                    found,
+                    site,
+                });
+                Type::UnresolvedName(fallback)
             }
-            Some(_) => None,
-            None => self.decls.resolve_visible_type_key(scope, None, name),
+            TypeRefError::GenericArgKindMismatch { expected } => {
+                self.errors
+                    .push(ExternCatalogError::GenericArgKindMismatch {
+                        context: context.clone(),
+                        name: fallback,
+                        expected,
+                        site,
+                    });
+                Type::UnresolvedName(fallback)
+            }
+            TypeRefError::Unknown { qualifier, name } => {
+                self.errors.push(ExternCatalogError::UnknownType {
+                    context: context.clone(),
+                    module: qualifier.map(|qualifier| {
+                        ModuleScope::Named(
+                            ModulePath::new(vec![qualifier.to_string()])
+                                .expect("single segment module path is valid"),
+                        )
+                    }),
+                    name,
+                    site,
+                });
+                Type::UnresolvedName(name)
+            }
+            TypeRefError::AliasCycle { name } => {
+                self.errors.push(ExternCatalogError::UnknownType {
+                    context: context.clone(),
+                    module: None,
+                    name,
+                    site,
+                });
+                Type::UnresolvedName(name)
+            }
         }
     }
 
@@ -1023,40 +1097,7 @@ impl<'a> CatalogBuilder<'a> {
             .finalize_nominal_type_args(&context.module, key, args)
         {
             Ok(ty) => ty,
-            Err(TypeRefError::GenericArity { expected, found }) => {
-                self.errors.push(ExternCatalogError::GenericArity {
-                    context: context.clone(),
-                    name: key.name,
-                    expected,
-                    found,
-                    site,
-                });
-                Type::UnresolvedName(key.name)
-            }
-            Err(TypeRefError::GenericArgKindMismatch { expected }) => {
-                self.errors
-                    .push(ExternCatalogError::GenericArgKindMismatch {
-                        context: context.clone(),
-                        name: key.name,
-                        expected,
-                        site,
-                    });
-                Type::UnresolvedName(key.name)
-            }
-            Err(TypeRefError::Unknown { qualifier, name }) => {
-                self.errors.push(ExternCatalogError::UnknownType {
-                    context: context.clone(),
-                    module: qualifier.map(|qualifier| {
-                        ModuleScope::Named(
-                            ModulePath::new(vec![qualifier.to_string()])
-                                .expect("single segment module path is valid"),
-                        )
-                    }),
-                    name,
-                    site,
-                });
-                Type::UnresolvedName(name)
-            }
+            Err(error) => self.type_ref_error(context, key.name, error, site),
         }
     }
 }

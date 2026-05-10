@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: wrong number of type parameters
+
+struct Box<T> { value: T }
+type Bad = Box;

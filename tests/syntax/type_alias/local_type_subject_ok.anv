@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Team { Red, Blue }
+extend<T> [T] { fn empty() -> [T] { [] } }
+
+fn f() -> [int] {
+    type Numbers = [int];
+    Numbers.empty()
+}
+
+fn g(t: Team) -> bool {
+    type Side = Team;
+    match t {
+        Side.Red => true,
+        Side.Blue => false,
+    }
+}
+
+fn h() { type Side = Team; Side.Red; }

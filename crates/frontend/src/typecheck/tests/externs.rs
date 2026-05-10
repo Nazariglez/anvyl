@@ -2610,7 +2610,8 @@ mod provider_imports {
         assert_eq!(
             result
                 .decls()
-                .imported_type(&ModuleScope::Root, Ident::new("Handle")),
+                .imported_type_binding(&ModuleScope::Root, Ident::new("Handle"))
+                .and_then(typecheck::TypeBinding::into_nominal),
             Some(ty.nominal.clone())
         );
         let id = result

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Pair<T> = (T, T);
+type Fixed<T, N: int> = [Pair<T>; N];
+fn first<T, N: int>(xs: Fixed<T, N>) -> Pair<T> { xs[0] }

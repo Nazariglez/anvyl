@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unused type parameter 'Tag'
+
+type Id<Tag> = int;

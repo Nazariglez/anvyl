@@ -400,10 +400,10 @@ impl TypeChecker {
         };
 
         let previous_module = std::mem::replace(&mut self.current_module, module.clone());
-        let saved_scopes = (previous_module != *module).then(|| std::mem::take(&mut self.scopes));
+        let saved_state = (previous_module != *module).then(|| self.take_scope_state());
         let result = eval_const_decl(ty.as_ref(), &value_expr, decl_span, self);
-        if let Some(scopes) = saved_scopes {
-            self.scopes = scopes;
+        if let Some(state) = saved_state {
+            self.restore_scope_state(state);
         }
         self.current_module = previous_module;
 

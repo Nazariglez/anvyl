@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> { value: T }
+type IntBox = Box<int>;
+type BoxAlias<T> = Box<T>;
+fn f() { let a = IntBox { value: 1 }; let b = BoxAlias<int> { value: 2 }; }

@@ -3,7 +3,7 @@ use chumsky::prelude::*;
 use super::{
     AnvParser, BoxedParser,
     common::{block_stmt, identifier},
-    decl::function,
+    decl::{function, local_type_alias_statement},
     expr::{cond_expression, expression, for_header_expression},
     pattern::{let_or_var_head, pattern},
     types::type_ident,
@@ -20,6 +20,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let func = function(stmt.clone());
         let bind = binding(stmt.clone());
         let const_s = const_stmt(stmt.clone());
+        let type_alias = local_type_alias_statement();
         let ret = return_stmt(stmt.clone());
         let while_let_s = while_let_stmt(stmt.clone(), expr.clone());
         let while_s = while_stmt(stmt.clone(), expr.clone());
@@ -66,6 +67,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             Token::Keyword(Keyword::Continue) => (),
             Token::Keyword(Keyword::Defer) => (),
             Token::Keyword(Keyword::Const) => (),
+            Token::Keyword(Keyword::Type) => (),
         }
         .rewind();
 
@@ -122,6 +124,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
                 Spanned::new(ast::Stmt::Binding(bind_node), span)
             }),
             const_s,
+            type_alias,
             ret,
             while_let_s,
             while_s,

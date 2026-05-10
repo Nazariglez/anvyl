@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: type 'Id' is already defined
+
+type Id = int;
+struct Id { value: int }

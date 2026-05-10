@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Pair<T> = (T, T);
+fn same<T>(a: T, b: T) -> Pair<T> { (a, b) }

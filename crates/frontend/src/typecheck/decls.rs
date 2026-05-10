@@ -6,12 +6,12 @@ use super::{
     const_term::ConstTerm,
     infer::{GenericSolverSeeds, Solver},
     substitute,
-    type_ops::{TypeFolder, bare_type_name},
-    type_refs::{GenericParamError, GenericTypeContext},
+    type_ops::TypeFolder,
+    type_refs::{GenericParamError, GenericTypeContext, TypeRefError, TypeRefResolver},
 };
 use crate::{
     ast::{
-        AggregateKind, ArrayLen, ConstArg, ConstParam, ConstParamId, FuncParam, GenericArg, Ident,
+        AggregateKind, ArrayLen, ConstArg, ConstParam, FuncParam, GenericArg, Ident,
         ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
         NominalKind, Param, Program, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
@@ -107,6 +107,41 @@ pub(crate) struct NominalKey {
     pub(crate) module: ModuleScope,
     pub(crate) kind: NominalKind,
     pub(crate) name: Ident,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TypeAliasKey {
+    pub(crate) module: ModuleScope,
+    pub(crate) name: Ident,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum TypeBinding {
+    Nominal(NominalKey),
+    Alias(TypeAliasKey),
+}
+
+impl TypeBinding {
+    pub(crate) fn module(&self) -> &ModuleScope {
+        match self {
+            Self::Nominal(key) => &key.module,
+            Self::Alias(key) => &key.module,
+        }
+    }
+
+    pub(crate) fn as_nominal(&self) -> Option<&NominalKey> {
+        match self {
+            Self::Nominal(key) => Some(key),
+            Self::Alias(_) => None,
+        }
+    }
+
+    pub(crate) fn into_nominal(self) -> Option<NominalKey> {
+        match self {
+            Self::Nominal(key) => Some(key),
+            Self::Alias(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -375,6 +410,19 @@ pub(crate) enum DeclError {
         name: Ident,
         span: Option<SourceSpan>,
     },
+    UnusedAliasTypeParam {
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
+    UnusedAliasConstParam {
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
+    PublicAliasPrivateType {
+        name: Ident,
+        ty: Type,
+        span: Option<SourceSpan>,
+    },
     ExtendMethodConflict {
         ty: Type,
         name: Ident,
@@ -452,6 +500,7 @@ pub(crate) struct DeclarationIndex {
     aggregates: HashMap<NominalKey, AggregateSchema>,
     enums: HashMap<NominalKey, EnumSchema>,
     extends: Vec<ExtendSchema>,
+    type_aliases: HashMap<TypeAliasKey, TypeAliasSchema>,
     extern_type_policies: HashMap<NominalKey, AccessPolicy>,
     value_spans: HashMap<(ModuleScope, Ident), Span>,
     type_spans: HashMap<NominalKey, Span>,
@@ -474,7 +523,7 @@ pub(crate) struct ResolvedValue {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Namespace {
     pub(crate) values: HashMap<Ident, ResolvedValue>,
-    pub(crate) types: HashMap<Ident, NominalKey>,
+    pub(crate) types: HashMap<Ident, TypeBinding>,
     pub(crate) modules: HashMap<Ident, ModuleScope>,
 }
 
@@ -568,7 +617,7 @@ impl Namespace {
         self.values.get(&name)
     }
 
-    fn ty(&self, name: Ident) -> Option<&NominalKey> {
+    fn ty(&self, name: Ident) -> Option<&TypeBinding> {
         self.types.get(&name)
     }
 
@@ -586,8 +635,8 @@ impl Namespace {
         self.values.insert(visible, value);
     }
 
-    fn insert_type(&mut self, visible: Ident, key: NominalKey) {
-        self.types.insert(visible, key);
+    fn insert_type(&mut self, visible: Ident, binding: TypeBinding) {
+        self.types.insert(visible, binding);
     }
 
     fn insert_module(&mut self, visible: Ident, module: ModuleScope) {
@@ -812,14 +861,14 @@ impl ImportScopeBuilder {
     fn insert_type(
         &mut self,
         name: Ident,
-        key: NominalKey,
+        binding: TypeBinding,
         origin: BindingOrigin,
         span: Option<SourceSpan>,
     ) -> bool {
         if !self.claim_origin(BindingNamespace::Type, name, origin, span) {
             return false;
         }
-        self.namespace.insert_type(name, key);
+        self.namespace.insert_type(name, binding);
         true
     }
 
@@ -913,8 +962,12 @@ impl ImportScope {
                 .values()
                 .map(|value| value.module.clone()),
         );
-        self.active_modules
-            .extend(self.namespace.types.values().map(|key| key.module.clone()));
+        self.active_modules.extend(
+            self.namespace
+                .types
+                .values()
+                .map(|binding| binding.module().clone()),
+        );
         self.active_modules
             .extend(self.namespace.modules.values().cloned());
     }
@@ -973,6 +1026,15 @@ pub(crate) struct AggregateSchema {
     pub(crate) fields: HashMap<Ident, FieldSchema>,
     pub(crate) methods: HashMap<MethodKey, MethodSchema>,
     pub(crate) policy: AccessPolicy,
+}
+
+#[derive(Clone)]
+pub(crate) struct TypeAliasSchema {
+    pub(crate) key: TypeAliasKey,
+    pub(crate) generics: GenericParams,
+    pub(crate) aliased: Type,
+    pub(crate) visibility: Visibility,
+    pub(crate) span: SourceSpan,
 }
 
 #[derive(Clone)]
@@ -1260,6 +1322,26 @@ impl DeclarationIndex {
             }
         }
 
+        let alias_keys = self.type_aliases.keys().cloned().collect::<Vec<_>>();
+        for key in alias_keys {
+            let Some(schema) = self.type_aliases.get_mut(&key) else {
+                continue;
+            };
+            let generics = generic_context(
+                key.module.clone(),
+                &schema.generics.type_params,
+                &schema.generics.const_params,
+                schema.span.byte(),
+                &mut errors,
+            );
+            let site = DeclTypeSite {
+                module: key.module,
+                span: schema.span.byte(),
+                generics,
+            };
+            schema.aliased = f(site, schema.aliased.clone());
+        }
+
         for index in 0..self.extends.len() {
             let origin = self.extends[index].origin.clone();
             let span = self.extends[index].span.byte();
@@ -1404,7 +1486,7 @@ impl DeclarationIndex {
         decls: &mut ModuleDecls,
         scope: &ModuleScope,
         name: Ident,
-        key: NominalKey,
+        binding: TypeBinding,
         exported: bool,
         span: Option<SourceSpan>,
     ) -> bool {
@@ -1416,9 +1498,9 @@ impl DeclarationIndex {
             });
             return false;
         }
-        decls.locals.insert_type(name, key.clone());
+        decls.locals.insert_type(name, binding.clone());
         if exported {
-            decls.exports.insert_type(name, key);
+            decls.exports.insert_type(name, binding);
         }
         true
     }
@@ -1570,7 +1652,7 @@ impl DeclarationIndex {
                         &mut decls,
                         &scope,
                         agg.name,
-                        key.clone(),
+                        TypeBinding::Nominal(key.clone()),
                         exported,
                         Some(SourceSpan::from_byte_span(source, agg_node.span)),
                     ) {
@@ -1644,7 +1726,7 @@ impl DeclarationIndex {
                         &mut decls,
                         &scope,
                         enm.name,
-                        key.clone(),
+                        TypeBinding::Nominal(key.clone()),
                         exported,
                         Some(SourceSpan::from_byte_span(source, enum_node.span)),
                     ) {
@@ -1683,6 +1765,38 @@ impl DeclarationIndex {
                         exported,
                         Some(SourceSpan::from_byte_span(source, const_node.span)),
                     );
+                }
+                Stmt::TypeAlias(alias_node) => {
+                    let alias = &alias_node.node;
+                    annotation::normalize_annotations(
+                        source,
+                        &alias.annotations,
+                        annotation::AnnotationTarget::TypeAlias,
+                        &mut self.errors,
+                    );
+                    let key = TypeAliasKey {
+                        module: scope.clone(),
+                        name: alias.name,
+                    };
+                    if self.insert_local_type(
+                        &mut decls,
+                        &scope,
+                        alias.name,
+                        TypeBinding::Alias(key.clone()),
+                        exported,
+                        Some(SourceSpan::from_byte_span(source, alias_node.span)),
+                    ) {
+                        self.type_aliases.insert(
+                            key.clone(),
+                            TypeAliasSchema {
+                                key,
+                                generics: generic_params(&alias.type_params, &alias.const_params),
+                                aliased: alias.aliased.clone(),
+                                visibility: alias.visibility,
+                                span: SourceSpan::from_byte_span(source, alias_node.span),
+                            },
+                        );
+                    }
                 }
                 Stmt::ExternFunc(func_node) => {
                     let policy = annotation::normalize_annotations(
@@ -1815,7 +1929,14 @@ impl DeclarationIndex {
                 name,
             };
             let span = ty.site.span;
-            if self.insert_local_type(&mut decls, &scope, name, key.clone(), ty.exported, span) {
+            if self.insert_local_type(
+                &mut decls,
+                &scope,
+                name,
+                TypeBinding::Nominal(key.clone()),
+                ty.exported,
+                span,
+            ) {
                 if let Some(span) = span {
                     self.type_spans.insert(key.clone(), span.byte());
                 }
@@ -2083,8 +2204,20 @@ impl DeclarationIndex {
         self.modules.get(module)?.locals.value(name).cloned()
     }
 
-    pub(crate) fn local_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+    pub(crate) fn local_type_binding(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<TypeBinding> {
         self.modules.get(module)?.locals.ty(name).cloned()
+    }
+
+    pub(crate) fn local_nominal_type(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<NominalKey> {
+        self.local_type_binding(module, name)?.into_nominal()
     }
 
     pub(crate) fn exported_value(
@@ -2095,8 +2228,20 @@ impl DeclarationIndex {
         self.modules.get(module)?.exports.value(name).cloned()
     }
 
-    pub(crate) fn exported_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+    pub(crate) fn exported_type_binding(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<TypeBinding> {
         self.modules.get(module)?.exports.ty(name).cloned()
+    }
+
+    pub(crate) fn exported_nominal_type(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<NominalKey> {
+        self.exported_type_binding(module, name)?.into_nominal()
     }
 
     pub(crate) fn exported_module(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope> {
@@ -2126,7 +2271,7 @@ impl DeclarationIndex {
         &self,
         module: &ModuleScope,
         name: Ident,
-    ) -> ModuleMemberLookup<NominalKey> {
+    ) -> ModuleMemberLookup<TypeBinding> {
         let Some(decls) = self.modules.get(module) else {
             return ModuleMemberLookup::Missing;
         };
@@ -2173,7 +2318,11 @@ impl DeclarationIndex {
             .cloned()
     }
 
-    pub(crate) fn imported_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
+    pub(crate) fn imported_type_binding(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<TypeBinding> {
         self.modules
             .get(module)?
             .imports
@@ -2191,24 +2340,38 @@ impl DeclarationIndex {
             .cloned()
     }
 
-    pub(crate) fn visible_type(&self, module: &ModuleScope, name: Ident) -> Option<NominalKey> {
-        self.local_type(module, name)
-            .or_else(|| self.imported_type(module, name))
+    pub(crate) fn visible_type_binding(
+        &self,
+        module: &ModuleScope,
+        name: Ident,
+    ) -> Option<TypeBinding> {
+        self.local_type_binding(module, name)
+            .or_else(|| self.imported_type_binding(module, name))
     }
 
-    pub(crate) fn resolve_visible_type_key(
+    pub(crate) fn resolve_visible_type_binding(
+        &self,
+        module: &ModuleScope,
+        qualifier: Option<Ident>,
+        name: Ident,
+    ) -> Option<TypeBinding> {
+        match qualifier {
+            Some(alias) => {
+                let target = self.imported_module(module, alias)?;
+                self.exported_type_binding(&target, name)
+            }
+            None => self.visible_type_binding(module, name),
+        }
+    }
+
+    pub(crate) fn resolve_visible_nominal_key(
         &self,
         module: &ModuleScope,
         qualifier: Option<Ident>,
         name: Ident,
     ) -> Option<NominalKey> {
-        match qualifier {
-            Some(alias) => {
-                let target = self.imported_module(module, alias)?;
-                self.exported_type(&target, name)
-            }
-            None => self.visible_type(module, name),
-        }
+        self.resolve_visible_type_binding(module, qualifier, name)?
+            .into_nominal()
     }
 
     pub(crate) fn imports_module(&self, module: &ModuleScope, imported: &ModuleScope) -> bool {
@@ -2262,7 +2425,15 @@ impl DeclarationIndex {
         self.extern_type_policies.get(key)
     }
 
-    fn nominal_generics(&self, key: &NominalKey) -> Option<GenericParams> {
+    pub(crate) fn type_alias(&self, key: &TypeAliasKey) -> Option<&TypeAliasSchema> {
+        self.type_aliases.get(key)
+    }
+
+    pub(crate) fn type_aliases(&self) -> impl Iterator<Item = &TypeAliasSchema> {
+        self.type_aliases.values()
+    }
+
+    pub(crate) fn nominal_generics(&self, key: &NominalKey) -> Option<GenericParams> {
         match key.kind {
             NominalKind::Struct | NominalKind::DataRef => {
                 self.aggregate(key).map(|schema| schema.generics.clone())
@@ -2272,7 +2443,9 @@ impl DeclarationIndex {
                 .modules
                 .get(&key.module)?
                 .locals
-                .ty(key.name)
+                .ty(key.name)?
+                .as_nominal()
+                .filter(|found| *found == key)
                 .map(|_| GenericParams::default()),
         }
     }
@@ -2285,7 +2458,7 @@ impl DeclarationIndex {
             Some(origin) => ModuleScope::from_nominal_origin(origin),
             None => ModuleScope::Root,
         };
-        self.local_type(&scope, nominal.name)
+        self.local_nominal_type(&scope, nominal.name)
             .filter(|key| key.kind == nominal.kind)
     }
 
@@ -2419,13 +2592,13 @@ impl DeclarationIndex {
 
     fn core_range_key(&self, kind: CoreRangeKind) -> Option<NominalKey> {
         let name = Ident::new(kind.name());
-        self.local_type(&core_module_scope("range"), name)
+        self.local_nominal_type(&core_module_scope("range"), name)
             .filter(|key| key.kind == NominalKind::Struct && key.name == name)
     }
 
     fn core_enum_key(&self, module: &str, name: &str) -> Option<NominalKey> {
         let name = Ident::new(name);
-        self.local_type(&core_module_scope(module), name)
+        self.local_nominal_type(&core_module_scope(module), name)
             .filter(|key| key.kind == NominalKind::Enum && key.name == name)
     }
 
@@ -3008,21 +3181,6 @@ fn more_specific(a: &Type, b: &Type) -> bool {
     compare_specificity(a, b) == Specificity::MoreSpecific
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TypeRefError {
-    Unknown {
-        qualifier: Option<Ident>,
-        name: Ident,
-    },
-    GenericArity {
-        expected: usize,
-        found: usize,
-    },
-    GenericArgKindMismatch {
-        expected: &'static str,
-    },
-}
-
 impl DeclarationIndex {
     pub(crate) fn finalize_type_ref(
         &self,
@@ -3030,116 +3188,7 @@ impl DeclarationIndex {
         generics: &GenericTypeContext,
         ty: &Type,
     ) -> Result<Type, TypeRefError> {
-        match ty {
-            Type::UnresolvedName(name) => {
-                if let Some(id) = generics.type_param(*name) {
-                    return Ok(Type::Var(id));
-                }
-                if generics.has_const_param(*name) {
-                    return Err(TypeRefError::Unknown {
-                        qualifier: None,
-                        name: *name,
-                    });
-                }
-                self.resolve_visible_type_key(module, None, *name)
-                    .map(|key| nominal_type(&key))
-                    .ok_or(TypeRefError::Unknown {
-                        qualifier: None,
-                        name: *name,
-                    })
-            }
-            Type::UnresolvedNominal {
-                qualifier,
-                name,
-                generic_args,
-            } => {
-                if qualifier.is_none() && generic_args.is_empty() {
-                    if let Some(id) = generics.type_param(*name) {
-                        return Ok(Type::Var(id));
-                    }
-                    if generics.has_const_param(*name) {
-                        return Err(TypeRefError::Unknown {
-                            qualifier: None,
-                            name: *name,
-                        });
-                    }
-                }
-                let key = self
-                    .resolve_visible_type_key(module, *qualifier, *name)
-                    .ok_or(TypeRefError::Unknown {
-                        qualifier: *qualifier,
-                        name: *name,
-                    })?;
-                self.finalize_nominal_type_ref(module, generics, &key, generic_args)
-            }
-            Type::Func { params, ret } => Ok(Type::Func {
-                params: params
-                    .iter()
-                    .map(|param| {
-                        Ok(FuncParam::new(
-                            self.finalize_type_ref(module, generics, &param.ty)?,
-                            param.mutable,
-                            param.cast_accept,
-                        ))
-                    })
-                    .collect::<Result<_, _>>()?,
-                ret: Box::new(self.finalize_type_ref(module, generics, ret)?),
-            }),
-            Type::Tuple(elems) => elems
-                .iter()
-                .map(|ty| self.finalize_type_ref(module, generics, ty))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Type::Tuple),
-            Type::Nominal(nominal) => {
-                let type_args = nominal
-                    .type_args
-                    .iter()
-                    .map(|ty| self.finalize_type_ref(module, generics, ty))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let const_args = nominal
-                    .const_args
-                    .iter()
-                    .map(|arg| Self::finalize_const_arg(generics, arg))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if nominal.origin.is_none()
-                    && let Some(key) = self
-                        .resolve_visible_type_key(module, None, nominal.name)
-                        .filter(|key| key.kind == nominal.kind)
-                {
-                    return Ok(nominal_type_with_args(&key, &type_args, &const_args));
-                }
-                Ok(Type::nominal_with_origin(
-                    nominal.kind,
-                    nominal.name,
-                    type_args,
-                    const_args,
-                    nominal.origin.clone(),
-                ))
-            }
-            Type::List { elem } => Ok(Type::List {
-                elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
-            }),
-            Type::Slice { elem } => Ok(Type::Slice {
-                elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
-            }),
-            Type::Array { elem, len } => Ok(Type::Array {
-                elem: Box::new(self.finalize_type_ref(module, generics, elem)?),
-                len: Self::finalize_array_len(generics, *len)?,
-            }),
-            Type::Map { key, value } => Ok(Type::Map {
-                key: Box::new(self.finalize_type_ref(module, generics, key)?),
-                value: Box::new(self.finalize_type_ref(module, generics, value)?),
-            }),
-            Type::Infer
-            | Type::InferReturn
-            | Type::Any
-            | Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Void
-            | Type::Var(_) => Ok(ty.clone()),
-        }
+        TypeRefResolver::module_only(self).finalize(module, generics, ty)
     }
 
     pub(crate) fn finalize_nominal_type_args(
@@ -3149,110 +3198,7 @@ impl DeclarationIndex {
         args: Vec<Type>,
     ) -> Result<Type, TypeRefError> {
         let args = args.into_iter().map(GenericArg::Type).collect::<Vec<_>>();
-        self.finalize_nominal_type_ref(module, &GenericTypeContext::default(), key, &args)
-    }
-
-    fn finalize_nominal_type_ref(
-        &self,
-        module: &ModuleScope,
-        generics: &GenericTypeContext,
-        key: &NominalKey,
-        args: &[GenericArg],
-    ) -> Result<Type, TypeRefError> {
-        let params = self.nominal_generics(key).unwrap_or_default();
-        let type_len = params.type_params.len();
-        let expected = type_len + params.const_params.len();
-        if args.len() != expected {
-            return Err(TypeRefError::GenericArity {
-                expected,
-                found: args.len(),
-            });
-        }
-
-        let mut type_args = Vec::with_capacity(type_len);
-        let mut const_args = Vec::with_capacity(params.const_params.len());
-        for (index, arg) in args.iter().enumerate() {
-            if index < type_len {
-                let GenericArg::Type(ty) = arg else {
-                    return Err(TypeRefError::GenericArgKindMismatch { expected: "type" });
-                };
-                type_args.push(self.finalize_type_ref(module, generics, ty)?);
-            } else {
-                const_args.push(self.finalize_generic_const_arg(module, generics, arg)?);
-            }
-        }
-        Ok(nominal_type_with_args(key, &type_args, &const_args))
-    }
-
-    fn finalize_generic_const_arg(
-        &self,
-        module: &ModuleScope,
-        generics: &GenericTypeContext,
-        arg: &GenericArg,
-    ) -> Result<ConstArg, TypeRefError> {
-        match arg {
-            GenericArg::Const(arg) => Self::finalize_const_arg(generics, arg),
-            GenericArg::Type(ty) => match bare_type_name(ty) {
-                Some(name) => Self::finalize_const_name_arg(generics, name),
-                None => {
-                    let ty = self.finalize_type_ref(module, generics, ty)?;
-                    match ty {
-                        Type::Var(id) => {
-                            let name = generics.type_param_name(id).unwrap_or(Ident::new("_"));
-                            Err(TypeRefError::Unknown {
-                                qualifier: None,
-                                name,
-                            })
-                        }
-                        _ => Err(TypeRefError::GenericArgKindMismatch { expected: "const" }),
-                    }
-                }
-            },
-        }
-    }
-
-    fn finalize_const_arg(
-        generics: &GenericTypeContext,
-        arg: &ConstArg,
-    ) -> Result<ConstArg, TypeRefError> {
-        match arg {
-            ConstArg::Name(name) => Self::finalize_const_name_arg(generics, *name),
-            ConstArg::Value(_) | ConstArg::Param(_) => Ok(arg.clone()),
-        }
-    }
-
-    fn finalize_const_name_arg(
-        generics: &GenericTypeContext,
-        name: Ident,
-    ) -> Result<ConstArg, TypeRefError> {
-        Ok(
-            Self::finalize_const_name(generics, name)?
-                .map_or(ConstArg::Name(name), ConstArg::Param),
-        )
-    }
-
-    fn finalize_const_name(
-        generics: &GenericTypeContext,
-        name: Ident,
-    ) -> Result<Option<ConstParamId>, TypeRefError> {
-        if generics.has_type_param(name) {
-            return Err(TypeRefError::Unknown {
-                qualifier: None,
-                name,
-            });
-        }
-        Ok(generics.const_param(name))
-    }
-
-    fn finalize_array_len(
-        generics: &GenericTypeContext,
-        len: ArrayLen,
-    ) -> Result<ArrayLen, TypeRefError> {
-        match len {
-            ArrayLen::Named(name) => Ok(Self::finalize_const_name(generics, name)?
-                .map_or(ArrayLen::Named(name), ArrayLen::Param)),
-            ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Param(_) => Ok(len),
-        }
+        TypeRefResolver::module_only(self).finalize_nominal_args(module, key, &args)
     }
 }
 
@@ -3444,6 +3390,7 @@ fn stmt_visibility(stmt: &StmtNode) -> Visibility {
         Stmt::Aggregate(n) => n.node.visibility,
         Stmt::Enum(n) => n.node.visibility,
         Stmt::Const(n) => n.node.visibility,
+        Stmt::TypeAlias(n) => n.node.visibility,
         _ => Visibility::Private,
     }
 }
@@ -3674,7 +3621,7 @@ mod tests {
             &[],
         );
         let key = index
-            .local_type(&ModuleScope::Root, ident("OldPoint"))
+            .local_nominal_type(&ModuleScope::Root, ident("OldPoint"))
             .expect("missing aggregate");
         let agg = index.aggregate(&key).expect("missing aggregate schema");
 
@@ -3688,7 +3635,7 @@ mod tests {
             &[],
         );
         let key = index
-            .local_type(&ModuleScope::Root, ident("Status"))
+            .local_nominal_type(&ModuleScope::Root, ident("Status"))
             .expect("missing enum");
         let enm = index.enum_schema(&key).expect("missing enum schema");
         let variant = enm
@@ -3707,7 +3654,7 @@ mod tests {
             &[],
         );
         let key = index
-            .local_type(&ModuleScope::Root, ident("Event"))
+            .local_nominal_type(&ModuleScope::Root, ident("Event"))
             .expect("missing enum");
         let enm = index.enum_schema(&key).expect("missing enum schema");
         let variant = enm.variants.get(&ident("Move")).expect("missing variant");
@@ -3865,7 +3812,7 @@ mod tests {
             ],
         );
         let key = index
-            .exported_type(&scope("facade"), ident("P"))
+            .exported_nominal_type(&scope("facade"), ident("P"))
             .expect("missing reexport");
 
         assert_eq!(key.module, scope("tools"));
@@ -3940,12 +3887,12 @@ mod tests {
         );
         assert!(
             index
-                .imported_type(&ModuleScope::Root, ident("Point"))
+                .imported_type_binding(&ModuleScope::Root, ident("Point"))
                 .is_none()
         );
         assert!(
             index
-                .visible_type(&ModuleScope::Root, ident("Point"))
+                .visible_type_binding(&ModuleScope::Root, ident("Point"))
                 .is_none()
         );
     }
@@ -3957,7 +3904,7 @@ mod tests {
             &[("shapes", "pub struct Point { x: int }")],
         );
         let key = index
-            .exported_type(&scope("shapes"), ident("Point"))
+            .exported_nominal_type(&scope("shapes"), ident("Point"))
             .expect("missing export");
 
         assert_eq!(key.module, scope("shapes"));
@@ -3973,7 +3920,7 @@ mod tests {
         );
 
         let key = index
-            .resolve_visible_type_key(&ModuleScope::Root, Some(ident("shapes")), ident("Point"))
+            .resolve_visible_nominal_key(&ModuleScope::Root, Some(ident("shapes")), ident("Point"))
             .expect("missing qualified type");
 
         assert_eq!(key.module, scope("shapes"));
@@ -3987,7 +3934,11 @@ mod tests {
 
         assert!(
             index
-                .resolve_visible_type_key(&ModuleScope::Root, Some(ident("shapes")), ident("Point"))
+                .resolve_visible_nominal_key(
+                    &ModuleScope::Root,
+                    Some(ident("shapes")),
+                    ident("Point")
+                )
                 .is_none()
         );
     }
@@ -4135,7 +4086,8 @@ mod tests {
         );
         let host = provider_scope("host");
         let ty = index
-            .imported_type(&ModuleScope::Root, ident("Handle"))
+            .imported_type_binding(&ModuleScope::Root, ident("Handle"))
+            .and_then(TypeBinding::into_nominal)
             .expect("missing provider type import");
         let value = index
             .imported_value(&ModuleScope::Root, ident("load"))
@@ -4212,10 +4164,14 @@ mod tests {
         );
 
         assert!(index.errors().is_empty());
-        assert!(index.local_type(&scope("host"), ident("Handle")).is_some());
         assert!(
             index
-                .local_type(&provider_scope("host"), ident("Handle"))
+                .local_nominal_type(&scope("host"), ident("Handle"))
+                .is_some()
+        );
+        assert!(
+            index
+                .local_nominal_type(&provider_scope("host"), ident("Handle"))
                 .is_some()
         );
         assert!(index.local_value(&scope("host"), ident("load")).is_some());
@@ -4250,7 +4206,9 @@ mod tests {
             "struct Box<T> { value: T, fn make(value: T) -> T { value } fn get(self, fallback: T) -> T { self.value } }",
             &[],
         );
-        let key = index.local_type(&ModuleScope::Root, ident("Box")).unwrap();
+        let key = index
+            .local_nominal_type(&ModuleScope::Root, ident("Box"))
+            .unwrap();
         let aggregate = index.aggregate(&key).unwrap();
         let receiver = Type::nominal(
             NominalKind::Struct,
@@ -4326,7 +4284,9 @@ mod tests {
     #[test]
     fn enum_variant_callables() {
         let index = index("enum E<T> { A, B(T), C { x: T } }", &[]);
-        let key = index.local_type(&ModuleScope::Root, ident("E")).unwrap();
+        let key = index
+            .local_nominal_type(&ModuleScope::Root, ident("E"))
+            .unwrap();
         let enm = index.enum_schema(&key).unwrap();
 
         let unit = index

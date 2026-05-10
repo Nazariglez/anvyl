@@ -17,10 +17,15 @@ use self::{
     },
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
-    type_refs::{GenericParamError, GenericTypeContext},
+    type_refs::{GenericParamError, LocalTypeAlias, LocalTypeScopes, TypeRefResolver},
 };
 pub(crate) use self::{
-    decls::*, generic::*, result::*, semantic_use::*, type_ops::type_closure_facts,
+    decls::*,
+    generic::*,
+    result::*,
+    semantic_use::*,
+    type_ops::type_closure_facts,
+    type_refs::{GenericTypeContext, TypeRefError},
 };
 use crate::{
     ast::*,
@@ -745,7 +750,7 @@ struct LocalPlaceAccess {
 #[derive(Clone)]
 enum CallableTemplateEnv {
     SourceModule,
-    Local(Vec<HashMap<Ident, LocalSymbol>>),
+    Local(ScopeState),
 }
 
 struct NamedFunctionFrame {
@@ -856,6 +861,12 @@ struct LambdaFrame {
     start_scope: usize,
 }
 
+#[derive(Clone)]
+struct ScopeState {
+    scopes: Vec<HashMap<Ident, LocalSymbol>>,
+    local_type_scopes: LocalTypeScopes,
+}
+
 struct TypeChecker {
     solver: Solver,
     calls: CallMap,
@@ -863,6 +874,7 @@ struct TypeChecker {
     decls: DeclarationIndex,
     externs: ExternCatalog,
     scopes: Vec<HashMap<Ident, LocalSymbol>>,
+    local_type_scopes: LocalTypeScopes,
     lambda_frames: Vec<LambdaFrame>,
     named_function_frames: Vec<NamedFunctionFrame>,
     returns: Vec<ReturnFrame>,
@@ -950,6 +962,7 @@ impl TypeChecker {
             decls,
             externs,
             scopes: vec![],
+            local_type_scopes: LocalTypeScopes::default(),
             lambda_frames: vec![],
             named_function_frames: vec![],
             returns: vec![],
@@ -1008,10 +1021,41 @@ impl TypeChecker {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.local_type_scopes.push_scope();
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.local_type_scopes.pop_scope();
+    }
+
+    fn scope_state_from(&self, scopes: Vec<HashMap<Ident, LocalSymbol>>) -> ScopeState {
+        ScopeState {
+            scopes,
+            local_type_scopes: self.local_type_scopes.clone(),
+        }
+    }
+
+    fn take_scope_state(&mut self) -> ScopeState {
+        ScopeState {
+            scopes: std::mem::take(&mut self.scopes),
+            local_type_scopes: std::mem::take(&mut self.local_type_scopes),
+        }
+    }
+
+    fn restore_scope_state(&mut self, state: ScopeState) {
+        self.scopes = state.scopes;
+        self.local_type_scopes = state.local_type_scopes;
+    }
+
+    fn replace_scope_state(&mut self, state: ScopeState) -> ScopeState {
+        ScopeState {
+            scopes: std::mem::replace(&mut self.scopes, state.scopes),
+            local_type_scopes: std::mem::replace(
+                &mut self.local_type_scopes,
+                state.local_type_scopes,
+            ),
+        }
     }
 
     fn fresh_alias_alt_group(&mut self) -> AliasAltGroupId {
@@ -1882,16 +1926,46 @@ impl TypeChecker {
 
     fn resolve_type_for_tc_at(&mut self, ty: &Type, span: Span) -> Type {
         let generics = self.generic_contexts.last().cloned().unwrap_or_default();
-        let finalized = match self
-            .decls
-            .finalize_type_ref(&self.current_module, &generics, ty)
-        {
-            Ok(ty) => ty,
+        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+        let result = resolver.finalize(&self.current_module, &generics, ty);
+        self.finish_type_ref_result(result, span)
+    }
+
+    fn resolve_type_binding_for_tc_at(
+        &mut self,
+        binding: TypeBinding,
+        args: &[GenericArg],
+        span: Span,
+    ) -> Type {
+        let generics = self.generic_contexts.last().cloned().unwrap_or_default();
+        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+        let result = resolver.finalize_type_binding(&self.current_module, &generics, binding, args);
+        self.finish_type_ref_result(result, span)
+    }
+
+    fn resolve_module_alias_target_for_tc_at(&mut self, key: &TypeAliasKey, span: Span) -> Type {
+        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+        let result = resolver.finalize_module_alias_target(key);
+        self.finish_type_ref_result(result, span)
+    }
+
+    fn resolve_local_alias_target_for_tc_at(&mut self, alias: &LocalTypeAlias, span: Span) -> Type {
+        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+        let result = resolver.finalize_local_alias_target(alias);
+        self.finish_type_ref_result(result, span)
+    }
+
+    fn finish_type_ref_result(&mut self, result: Result<Type, TypeRefError>, span: Span) -> Type {
+        match result {
+            Ok(ty) => self.finish_resolved_type(ty, span),
             Err(error) => {
                 self.push_error_once(type_ref_error(error, self.error_span(span)));
-                return Type::Infer;
+                Type::Infer
             }
-        };
+        }
+    }
+
+    fn finish_resolved_type(&mut self, finalized: Type, span: Span) -> Type {
         self.validate_nominal_uses(&finalized, span);
         let substituted = match self.type_substs.last().cloned() {
             Some(ts) => {
@@ -2060,22 +2134,36 @@ impl TypeChecker {
         self.decls.imported_module(&self.current_module, name)
     }
 
-    fn resolve_visible_type_key(
-        &self,
-        qualifier: Option<Ident>,
-        name: Ident,
-    ) -> Option<NominalKey> {
-        self.decls
-            .resolve_visible_type_key(&self.current_module, qualifier, name)
-    }
-
     fn visible_type_subject(&mut self, name: Ident, span: Span) -> Option<Type> {
         if let Some(ty) = self.substituted_type_param(name) {
             return Some(ty);
         }
-        let key = self.resolve_visible_type_key(None, name)?;
-        self.warn_extern_type_deprecated(&key, span);
-        Some(nominal_type(&key))
+        if let Some(alias) = self.local_type_scopes.visible(name, None).cloned() {
+            if !alias.generics.is_empty() {
+                let generics = &alias.generics;
+                let expected = generics.type_params.len() + generics.const_params.len();
+                self.push_error_once(type_ref_error(
+                    TypeRefError::GenericArity { expected, found: 0 },
+                    self.error_span(span),
+                ));
+                return None;
+            }
+            let ty = self.resolve_local_alias_target_for_tc_at(&alias, span);
+            return (!matches!(ty, Type::Infer)).then_some(ty);
+        }
+        let binding = self
+            .decls
+            .resolve_visible_type_binding(&self.current_module, None, name)?;
+        match binding {
+            TypeBinding::Nominal(key) => {
+                self.warn_extern_type_deprecated(&key, span);
+                Some(nominal_type(&key))
+            }
+            TypeBinding::Alias(_) => {
+                let ty = self.resolve_type_binding_for_tc_at(binding, &[], span);
+                (!matches!(ty, Type::Infer)).then_some(ty)
+            }
+        }
     }
 
     fn func_type_from_sig(&mut self, params: &[Param], ret: &Type, span: Span) -> Type {
@@ -2223,6 +2311,7 @@ impl TypeChecker {
             let source = self.module_sources.get(&error.module).copied();
             self.push_error(generic_param_decl_type_error(error, source));
         }
+        validate_type_alias_decls(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
         self.current_module = saved_module;
         self.decls = decls;
@@ -2670,12 +2759,96 @@ fn generic_param_type_error(error: GenericParamError, span: Option<SourceSpan>) 
     }
 }
 
+fn validate_type_alias_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
+    for alias in decls.type_aliases() {
+        if matches!(alias.aliased, Type::Infer) {
+            continue;
+        }
+        push_unused_alias_params(&alias.generics, &alias.aliased, alias.span, errors);
+        if matches!(alias.visibility, Visibility::Public)
+            && let Some(ty) = private_alias_type(decls, &alias.aliased)
+        {
+            errors.push(TypeError::Decl(DeclError::PublicAliasPrivateType {
+                name: alias.key.name,
+                ty,
+                span: Some(alias.span),
+            }));
+        }
+    }
+}
+
+fn push_unused_alias_params(
+    generics: &GenericParams,
+    ty: &Type,
+    span: SourceSpan,
+    errors: &mut Vec<TypeError>,
+) {
+    let facts = target_facts(ty);
+    for param in &generics.type_params {
+        if !facts.type_params.contains(&param.id) {
+            errors.push(TypeError::Decl(DeclError::UnusedAliasTypeParam {
+                name: param.name,
+                span: Some(span),
+            }));
+        }
+    }
+    for param in &generics.const_params {
+        if !facts.const_params.contains(&param.id) {
+            errors.push(TypeError::Decl(DeclError::UnusedAliasConstParam {
+                name: param.name,
+                span: Some(span),
+            }));
+        }
+    }
+}
+
+fn private_alias_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Nominal(nominal) => {
+            let key = decls.key_for_type(ty)?;
+            let exported = decls
+                .exported_nominal_type(&key.module, key.name)
+                .is_some_and(|exported| exported == key);
+            if !exported {
+                return Some(ty.clone());
+            }
+            nominal
+                .type_args
+                .iter()
+                .find_map(|ty| private_alias_type(decls, ty))
+        }
+        Type::Func { params, ret } => params
+            .iter()
+            .find_map(|param| private_alias_type(decls, &param.ty))
+            .or_else(|| private_alias_type(decls, ret)),
+        Type::Tuple(elems) => elems.iter().find_map(|ty| private_alias_type(decls, ty)),
+        Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
+            private_alias_type(decls, elem)
+        }
+        Type::Map { key, value } => {
+            private_alias_type(decls, key).or_else(|| private_alias_type(decls, value))
+        }
+        Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Var(_)
+        | Type::UnresolvedName(_)
+        | Type::UnresolvedNominal { .. } => None,
+    }
+}
+
 fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
+    validate_duplicate_extend_methods(decls, errors);
     for extend in decls.extends() {
         if matches!(extend.target, Type::Infer) {
             continue;
         }
-        let facts = extend_target_facts(&extend.target);
+        let facts = target_facts(&extend.target);
         if unsupported_extend_target(&extend.target, &facts) {
             errors.push(TypeError::Decl(DeclError::UnsupportedExtendTarget {
                 ty: extend.target.clone(),
@@ -2700,6 +2873,33 @@ fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) 
         }
         validate_extend_method_conflicts(decls, extend, errors);
         validate_cast_froms(decls, extend, errors);
+    }
+}
+
+fn validate_duplicate_extend_methods(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
+    let extends = decls.extends().collect::<Vec<_>>();
+    for (index, extend) in extends.iter().enumerate() {
+        for prior in &extends[..index] {
+            if prior.origin != extend.origin
+                || !same_extend_target(
+                    &prior.target,
+                    &prior.generics,
+                    &extend.target,
+                    &extend.generics,
+                )
+            {
+                continue;
+            }
+            for method_key in extend.methods.keys() {
+                if prior.methods.contains_key(method_key) {
+                    errors.push(TypeError::Decl(DeclError::DuplicateExtendMethod {
+                        name: method_key.name,
+                        surface: method_key.surface,
+                        span: Some(extend.span),
+                    }));
+                }
+            }
+        }
     }
 }
 
@@ -2785,7 +2985,7 @@ fn has_duplicate_cast_from(
     false
 }
 
-fn unsupported_extend_target(ty: &Type, facts: &ExtendTargetFacts) -> bool {
+fn unsupported_extend_target(ty: &Type, facts: &TargetFacts) -> bool {
     matches!(ty, Type::Void | Type::Func { .. } | Type::InferReturn) || facts.contains_void
 }
 
@@ -2832,13 +3032,13 @@ fn push_extend_method_conflict(
 }
 
 #[derive(Default)]
-struct ExtendTargetFacts {
+struct TargetFacts {
     contains_void: bool,
     type_params: HashSet<TypeVarId>,
     const_params: HashSet<ConstParamId>,
 }
 
-impl TypeVisitor for ExtendTargetFacts {
+impl TypeVisitor for TargetFacts {
     fn visit_type_leaf(&mut self, ty: &Type) -> bool {
         match ty {
             Type::Void => self.contains_void = true,
@@ -2865,8 +3065,8 @@ impl TypeVisitor for ExtendTargetFacts {
     }
 }
 
-fn extend_target_facts(ty: &Type) -> ExtendTargetFacts {
-    let mut facts = ExtendTargetFacts::default();
+fn target_facts(ty: &Type) -> TargetFacts {
+    let mut facts = TargetFacts::default();
     facts.visit_type(ty);
     facts
 }
@@ -2884,6 +3084,10 @@ fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> TypeError {
         TypeRefError::GenericArgKindMismatch { expected } => {
             TypeError::GenericArgKindMismatch { expected, span }
         }
+        TypeRefError::AliasCycle { name } => TypeError::CompileError {
+            message: format!("type alias '{name}' depends on itself"),
+            span,
+        },
     }
 }
 
@@ -3190,12 +3394,45 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     }
 }
 
+fn register_local_type_aliases(stmts: &[StmtNode], tc: &mut TypeChecker) {
+    for stmt in stmts {
+        let Stmt::TypeAlias(alias_node) = &stmt.node else {
+            continue;
+        };
+        let alias = &alias_node.node;
+        let owner = tc.generic_contexts.last().cloned().unwrap_or_default();
+        let generic_context = tc.extended_generic_context(
+            &owner,
+            &alias.type_params,
+            &alias.const_params,
+            alias_node.span,
+        );
+        let local = LocalTypeAlias {
+            key: alias_node.span,
+            module: tc.current_module.clone(),
+            name: alias.name,
+            generics: generic_params(&alias.type_params, &alias.const_params),
+            generic_context,
+            aliased: alias.aliased.clone(),
+            visible_depth: tc.local_type_scopes.depth(),
+        };
+        if !tc.local_type_scopes.insert(local) {
+            tc.push_error(TypeError::Decl(DeclError::DuplicateType {
+                module: tc.current_module.clone(),
+                name: alias.name,
+                span: tc.error_span(alias_node.span),
+            }));
+        }
+    }
+}
+
 fn register_block_declarations(
     stmts: &[StmtNode],
     tc: &mut TypeChecker,
 ) -> Vec<Option<LocalConstInfo>> {
     let mut declarations = vec![None; stmts.len()];
     let mut funcs = vec![];
+    register_local_type_aliases(stmts, tc);
     let mut sig_env = tc.scopes.clone();
     add_callable_decl_placeholders(stmts, &mut sig_env, tc);
     for (index, stmt) in stmts.iter().enumerate() {
@@ -3203,7 +3440,7 @@ fn register_block_declarations(
             Stmt::Func(func_node) => {
                 let func = &func_node.node;
                 let module = tc.current_module.clone();
-                let env = CallableTemplateEnv::Local(sig_env.clone());
+                let env = CallableTemplateEnv::Local(tc.scope_state_from(sig_env.clone()));
                 let sig = with_callable_body_env(&module, &env, tc, |tc| {
                     source_func_sig(func, func_node.span, tc)
                 });
@@ -3219,8 +3456,10 @@ fn register_block_declarations(
                 });
             }
             Stmt::Const(const_node) => {
-                let info =
-                    tc.declare_local_const(const_node, CallableTemplateEnv::Local(sig_env.clone()));
+                let info = tc.declare_local_const(
+                    const_node,
+                    CallableTemplateEnv::Local(tc.scope_state_from(sig_env.clone())),
+                );
                 add_env_symbol(const_node.node.name, info.symbol(), &mut sig_env);
                 declarations[index] = Some(info);
             }
@@ -3259,7 +3498,10 @@ fn register_block_declarations(
                 let Some(info) = local_const else {
                     continue;
                 };
-                tc.set_local_const_env(info.id, CallableTemplateEnv::Local(env.clone()));
+                tc.set_local_const_env(
+                    info.id,
+                    CallableTemplateEnv::Local(tc.scope_state_from(env.clone())),
+                );
                 add_env_symbol(const_node.node.name, info.symbol(), &mut env);
             }
             _ => add_stmt_capture_blockers(&stmt.node, &mut env, tc),
@@ -3342,7 +3584,7 @@ fn store_local_callable_template(
             span: decl.func.span,
             mode: MethodMode::Static,
             generics: decl.sig.generic_context,
-            env: CallableTemplateEnv::Local(env),
+            env: CallableTemplateEnv::Local(tc.scope_state_from(env)),
             params: decl.func.node.params.clone(),
             ret: decl.func.node.ret.clone(),
             ret_span: decl.func.span,
@@ -3570,6 +3812,9 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
                     None => check_const(const_node, tc),
                 }
             }
+        }
+        Stmt::TypeAlias(alias_node) => {
+            check_type_alias(alias_node, tc);
         }
         Stmt::LetElse(let_else_node) => {
             check_let_else(let_else_node, tc);
@@ -3947,11 +4192,11 @@ fn with_callable_body_env<R>(
 ) -> R {
     match env {
         CallableTemplateEnv::SourceModule => with_source_module_scope(module, tc, f),
-        CallableTemplateEnv::Local(scopes) => {
+        CallableTemplateEnv::Local(state) => {
             let previous_module = std::mem::replace(&mut tc.current_module, module.clone());
-            let previous_scopes = std::mem::replace(&mut tc.scopes, scopes.clone());
+            let previous_state = tc.replace_scope_state(state.clone());
             let ret = f(tc);
-            tc.scopes = previous_scopes;
+            tc.restore_scope_state(previous_state);
             tc.current_module = previous_module;
             ret
         }
@@ -4106,10 +4351,10 @@ fn specialization_key(id: CallableId, args: &GenericArgs) -> SpecializationKey {
 }
 
 fn with_global_scope<R>(tc: &mut TypeChecker, f: impl FnOnce(&mut TypeChecker) -> R) -> R {
-    let scopes = std::mem::take(&mut tc.scopes);
-    tc.scopes = scopes.first().cloned().into_iter().collect();
+    let state = tc.take_scope_state();
+    tc.scopes = state.scopes.first().cloned().into_iter().collect();
     let ret = f(tc);
-    tc.scopes = scopes;
+    tc.restore_scope_state(state);
     ret
 }
 
@@ -4122,7 +4367,7 @@ fn with_source_module_scope<R>(
     let ret = match module {
         ModuleScope::Root => with_global_scope(tc, f),
         ModuleScope::Named(_) | ModuleScope::Package(_) => {
-            let scopes = std::mem::take(&mut tc.scopes);
+            let state = tc.take_scope_state();
             tc.scopes = vec![];
             push_source_scope(tc);
             if let Some(program) = tc.module_programs.get(module).map(Rc::clone) {
@@ -4130,7 +4375,7 @@ fn with_source_module_scope<R>(
                 tc.eval_module_consts(module);
             }
             let ret = f(tc);
-            tc.scopes = scopes;
+            tc.restore_scope_state(state);
             ret
         }
     };
@@ -4411,6 +4656,29 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             );
         }
     }
+}
+
+fn check_type_alias(alias_node: &TypeAliasDeclNode, tc: &mut TypeChecker) {
+    let alias = &alias_node.node;
+    let owner = tc.generic_contexts.last().cloned().unwrap_or_default();
+    let generics = tc.extended_generic_context(
+        &owner,
+        &alias.type_params,
+        &alias.const_params,
+        alias_node.span,
+    );
+    tc.push_generic_context(generics);
+    let aliased = tc.resolve_type_for_tc_at(&alias.aliased, alias_node.span);
+    tc.pop_generic_context();
+    if matches!(aliased, Type::Infer) {
+        return;
+    }
+    push_unused_alias_params(
+        &generic_params(&alias.type_params, &alias.const_params),
+        &aliased,
+        tc.source_span(alias_node.span),
+        &mut tc.errors,
+    );
 }
 
 fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
@@ -6264,10 +6532,11 @@ fn check_struct_lit_hint(
         return checked;
     }
 
-    let Some(key) = resolve_struct_key(lit, tc) else {
+    let Some(target) = resolve_struct_target(lit, tc) else {
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return checked_from_type(expr, Type::Infer, tc);
     };
+    let key = target.key.clone();
 
     if key.kind == NominalKind::Extern {
         return check_extern_lit(expr, lit, &key, expected, tc);
@@ -6301,10 +6570,17 @@ fn check_struct_lit_hint(
     };
     tc.warn_deprecated(&agg.policy, kind, key.name, lit.span);
     let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
-    let Some(inf) = NominalLiteralSolver::new(&agg.generics, &lit.node.generic_args, lit.span, tc)
-    else {
-        check_unknown_nominal_fields(&lit.node.fields, tc);
-        return checked_from_type(expr, Type::Infer, tc);
+    let inf = match &target.seeds {
+        Some(seeds) => NominalLiteralSolver::from_seeds(&agg.generics, seeds, lit.span, tc),
+        None => {
+            let Some(inf) =
+                NominalLiteralSolver::new(&agg.generics, &lit.node.generic_args, lit.span, tc)
+            else {
+                check_unknown_nominal_fields(&lit.node.fields, tc);
+                return checked_from_type(expr, Type::Infer, tc);
+            };
+            inf
+        }
     };
     let expected_ok = inf.bind_expected(&key, &agg.generics, expected_ty.as_ref(), lit.span, tc);
     let field_check = check_nominal_fields(
@@ -6335,8 +6611,10 @@ fn check_enum_struct_variant_lit(
     tc: &mut TypeChecker,
 ) -> Option<CheckedType> {
     let qualifier = lit.node.qualifier?;
+    let subject = tc.visible_type_subject(qualifier, lit.span)?;
     let key = tc
-        .resolve_visible_type_key(None, qualifier)
+        .decls
+        .key_for_type(&subject)
         .filter(|key| key.kind == NominalKind::Enum)?;
     let Some(resolved) = enum_variant::resolve_use(tc, &key, lit.node.name, lit.span) else {
         check_unknown_nominal_fields(&lit.node.fields, tc);
@@ -6787,16 +7065,97 @@ fn nominal_literal_type(
     nominal_type_with_args(key, &type_args, &const_args)
 }
 
-fn resolve_struct_key(lit: &StructLiteralNode, tc: &mut TypeChecker) -> Option<NominalKey> {
-    let key = tc.resolve_visible_type_key(lit.node.qualifier, lit.node.name);
-    if key.is_none() {
+struct StructLiteralTarget {
+    key: NominalKey,
+    seeds: Option<GenericSolverSeeds>,
+}
+
+fn resolve_struct_target(
+    lit: &StructLiteralNode,
+    tc: &mut TypeChecker,
+) -> Option<StructLiteralTarget> {
+    if lit.node.qualifier.is_none()
+        && let Some(alias) = tc.local_type_scopes.visible(lit.node.name, None).cloned()
+    {
+        let expanded = if lit.node.generic_args.is_empty() {
+            tc.resolve_local_alias_target_for_tc_at(&alias, lit.span)
+        } else {
+            let ty = Type::UnresolvedNominal {
+                qualifier: None,
+                name: lit.node.name,
+                generic_args: lit.node.generic_args.clone(),
+            };
+            tc.resolve_type_for_tc_at(&ty, lit.span)
+        };
+        return struct_literal_target_from_expanded(lit, expanded, tc);
+    }
+
+    let Some(binding) = tc.decls.resolve_visible_type_binding(
+        &tc.current_module,
+        lit.node.qualifier,
+        lit.node.name,
+    ) else {
         tc.push_error(TypeError::UnknownStructLiteral {
             qualifier: lit.node.qualifier,
             name: lit.node.name,
             span: tc.error_span(lit.span),
         });
+        return None;
+    };
+    match binding {
+        TypeBinding::Nominal(key) => Some(StructLiteralTarget { key, seeds: None }),
+        TypeBinding::Alias(key) => {
+            let expanded = if lit.node.generic_args.is_empty() {
+                tc.resolve_module_alias_target_for_tc_at(&key, lit.span)
+            } else {
+                let ty = Type::UnresolvedNominal {
+                    qualifier: lit.node.qualifier,
+                    name: lit.node.name,
+                    generic_args: lit.node.generic_args.clone(),
+                };
+                tc.resolve_type_for_tc_at(&ty, lit.span)
+            };
+            struct_literal_target_from_expanded(lit, expanded, tc)
+        }
     }
-    key
+}
+
+fn struct_literal_target_from_expanded(
+    lit: &StructLiteralNode,
+    expanded: Type,
+    tc: &mut TypeChecker,
+) -> Option<StructLiteralTarget> {
+    let Some(key) = tc.decls.key_for_type(&expanded) else {
+        tc.push_error(TypeError::InvalidStructLiteral {
+            name: lit.node.name,
+            kind: expanded.to_string(),
+            span: tc.error_span(lit.span),
+        });
+        return None;
+    };
+    let seeds = tc
+        .decls
+        .nominal_generics(&key)
+        .map(|generics| literal_target_seeds(&generics, &expanded));
+    Some(StructLiteralTarget { key, seeds })
+}
+
+fn literal_target_seeds(generics: &GenericParams, expanded: &Type) -> GenericSolverSeeds {
+    let Some(args) = nominal_generic_args(expanded) else {
+        return GenericSolverSeeds::default();
+    };
+    let mut seeds = GenericSolverSeeds::default();
+    for (param, ty) in generics.type_params.iter().zip(args.type_args) {
+        if !type_depends_on_generics(&ty) {
+            seeds.type_args.insert(param.id, ty);
+        }
+    }
+    for (param, term) in generics.const_params.iter().zip(args.const_args) {
+        if !matches!(term, ConstTerm::Param(_)) {
+            seeds.const_args.insert(param.id, term);
+        }
+    }
+    seeds
 }
 
 fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {

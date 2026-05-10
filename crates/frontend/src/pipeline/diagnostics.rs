@@ -1176,6 +1176,9 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::UnsupportedExtendTarget { span, .. }
         | DeclError::UnusedExtendTypeParam { span, .. }
         | DeclError::UnusedExtendConstParam { span, .. }
+        | DeclError::UnusedAliasTypeParam { span, .. }
+        | DeclError::UnusedAliasConstParam { span, .. }
+        | DeclError::PublicAliasPrivateType { span, .. }
         | DeclError::ExtendMethodConflict { span, .. }
         | DeclError::ReexportConflict { span, .. }
         | DeclError::UnknownType { span, .. }
@@ -1668,6 +1671,15 @@ fn render_decl_error(error: &DeclError) -> String {
         }
         DeclError::UnusedExtendConstParam { name, .. } => {
             format!("unused const parameter '{name}' in extend target")
+        }
+        DeclError::UnusedAliasTypeParam { name, .. } => {
+            format!("unused type parameter '{name}' in type alias")
+        }
+        DeclError::UnusedAliasConstParam { name, .. } => {
+            format!("unused const parameter '{name}' in type alias")
+        }
+        DeclError::PublicAliasPrivateType { name, ty, .. } => {
+            format!("public type alias '{name}' exposes private type '{ty}'")
         }
         DeclError::ExtendMethodConflict {
             ty, name, surface, ..

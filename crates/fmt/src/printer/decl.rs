@@ -363,6 +363,22 @@ impl Printer<'_> {
         self.writeln();
     }
 
+    pub(super) fn format_type_alias(&mut self, alias: &ast::TypeAliasDecl) {
+        self.format_annotations(&alias.annotations);
+        self.format_doc_comment(alias.doc.as_ref());
+        self.write_indent();
+        self.format_visibility(alias.visibility);
+        self.write("type ");
+        self.write_fmt(alias.name);
+        self.format_type_params(&alias.type_params, &alias.const_params);
+        self.write(" = ");
+        self.with_extended_type_param_names(&alias.type_params, &alias.const_params, |p| {
+            p.format_type(&alias.aliased);
+        });
+        self.write(";");
+        self.writeln();
+    }
+
     fn format_struct_field(&mut self, field: &ast::StructField) {
         self.format_annotations(&field.annotations);
         self.format_doc_comment(field.doc.as_ref());
@@ -423,23 +439,22 @@ impl Printer<'_> {
     }
 
     pub(super) fn format_method(&mut self, method: &ast::Method) {
-        let saved_type_vars = self.type_var_names.clone();
-        let saved_const_params = self.const_param_names.clone();
-        self.extend_type_param_names(&method.sig.type_params, &method.sig.const_params);
-
-        self.format_annotations(&method.annotations);
-        self.format_doc_comment(method.doc.as_ref());
-        self.write_indent();
-        self.format_visibility(method.visibility);
-        self.write("fn ");
-        self.format_method_sig(&method.sig);
-        self.format_return_type(&method.sig.ret);
-        self.write(" ");
-        self.format_block(&method.body);
-        self.writeln();
-
-        self.type_var_names = saved_type_vars;
-        self.const_param_names = saved_const_params;
+        self.with_extended_type_param_names(
+            &method.sig.type_params,
+            &method.sig.const_params,
+            |p| {
+                p.format_annotations(&method.annotations);
+                p.format_doc_comment(method.doc.as_ref());
+                p.write_indent();
+                p.format_visibility(method.visibility);
+                p.write("fn ");
+                p.format_method_sig(&method.sig);
+                p.format_return_type(&method.sig.ret);
+                p.write(" ");
+                p.format_block(&method.body);
+                p.writeln();
+            },
+        );
     }
 
     pub(super) fn format_aggregate(&mut self, decl: &ast::StructDecl) {

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> { value: T }
+type BoxAlias<T> = Box<T>;
+
+fn f() { let b = BoxAlias { value: 2 }; }
+
+fn g() {
+    type LocalBox<T> = Box<T>;
+    let b = LocalBox { value: 3 };
+}

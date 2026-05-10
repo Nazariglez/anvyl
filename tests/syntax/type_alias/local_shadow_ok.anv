@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Item = int;
+struct Outer { a: int }
+struct Inner { b: int }
+
+fn f(x: string) -> string { type Item = string; let y: Item = x; y }
+
+fn g() {
+    type Outer = Inner;
+    let x = Outer { b: 1 };
+}

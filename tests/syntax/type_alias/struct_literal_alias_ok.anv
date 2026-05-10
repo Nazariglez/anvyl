@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Vec2 { x: float, y: float }
+type Pos2 = Vec2;
+fn f() { let p = Pos2 { x: 1.0, y: 2.0 }; }

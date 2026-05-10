@@ -189,6 +189,21 @@ mod tests {
     }
 
     #[test]
+    fn exact_type_aliases() {
+        assert_fmt("type Id=int;", "type Id = int;\n");
+        assert_fmt("type Pair<T> = (T,T);", "type Pair<T> = (T, T);\n");
+        assert_fmt(
+            "type Fixed<T,N:int> = [T;N];",
+            "type Fixed<T, N: int> = [T; N];\n",
+        );
+        assert_fmt("/// ids\npub type Id=int;", "/// ids\npub type Id = int;\n");
+        assert_fmt(
+            "fn f<T>(x:T)->T{type Item=T;let y:Item=x;y}",
+            "fn f<T>(x: T) -> T {\n    type Item = T;\n    let y: Item = x;\n    y\n}\n",
+        );
+    }
+
+    #[test]
     fn exact_frontend_extern_members() {
         assert_fmt(
             "extern type T { init; ro: int; rw: int; computed cached: int; computed live: int; fn a(self); fn b(shared self); fn c(var self); }",

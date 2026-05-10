@@ -258,6 +258,20 @@ impl<'a> Printer<'a> {
         }
     }
 
+    fn with_extended_type_param_names(
+        &mut self,
+        type_params: &[ast::TypeParam],
+        const_params: &[ast::ConstParam],
+        f: impl FnOnce(&mut Self),
+    ) {
+        let saved_type_vars = self.type_var_names.clone();
+        let saved_const_params = self.const_param_names.clone();
+        self.extend_type_param_names(type_params, const_params);
+        f(self);
+        self.type_var_names = saved_type_vars;
+        self.const_param_names = saved_const_params;
+    }
+
     fn emit_trivia_before(&mut self, pos: usize) {
         while self.trivia_cursor < self.trivia.len() {
             let item = &self.trivia[self.trivia_cursor];

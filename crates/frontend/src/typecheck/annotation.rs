@@ -59,6 +59,7 @@ pub(crate) enum AnnotationTarget {
     Const,
     ExternFunc,
     ExternType,
+    TypeAlias,
     InlineMethod,
     ExtendMethod,
 }
@@ -75,6 +76,7 @@ impl fmt::Display for AnnotationTarget {
             Self::Const => "const",
             Self::ExternFunc => "extern function",
             Self::ExternType => "extern type",
+            Self::TypeAlias => "type alias",
             Self::InlineMethod => "inline method",
             Self::ExtendMethod => "extend method",
         };

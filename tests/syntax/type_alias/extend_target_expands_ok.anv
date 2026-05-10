@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Id = int;
+extend Id { fn doubled(self) -> int { self * 2 } }
+fn f(x: int) -> int { x.doubled() }

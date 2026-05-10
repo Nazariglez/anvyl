@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: does not support struct literal construction
+
+type Numbers = [int];
+fn f() { Numbers { value: 1 }; }

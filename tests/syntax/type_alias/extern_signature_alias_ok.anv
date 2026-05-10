@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Id = int;
+extern fn load(id: Id) -> Id;
+fn f(x: Id) -> int { load(x) }

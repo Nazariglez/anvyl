@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: depends on itself
+
+type A = B;
+type B = A;

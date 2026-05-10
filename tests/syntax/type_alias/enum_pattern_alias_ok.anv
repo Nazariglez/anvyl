@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Team { Red, Blue }
+type Side = Team;
+fn f(side: Side) -> int { match side { Side.Red => 1, Side.Blue => 2 } }

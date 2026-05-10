@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Point { x: int, y: int }
+type Pos = Point;
+
+struct Box<T> { value: T }
+type IntBox = Box<int>;
+
+fn point(p: Pos) -> int {
+    let Pos { x, y } = p;
+    x + y
+}
+
+fn local(p: Point) -> int {
+    type LocalPos = Point;
+    let LocalPos { x, y } = p;
+    x + y
+}
+
+fn boxed(b: IntBox) -> int {
+    let IntBox { value } = b;
+    value
+}

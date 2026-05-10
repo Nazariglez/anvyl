@@ -776,6 +776,33 @@ impl<'tc> PatternChecker<'tc> {
         self.unsupported_named("range", span)
     }
 
+    fn resolve_struct_pattern_target(
+        &mut self,
+        name: Ident,
+        span: Span,
+    ) -> Option<(NominalKey, Type)> {
+        if let Some(alias) = self.tc.local_type_scopes.visible(name, None).cloned() {
+            let expanded = self.tc.resolve_local_alias_target_for_tc_at(&alias, span);
+            let key = self.tc.decls.key_for_type(&expanded)?;
+            return Some((key, expanded));
+        }
+        let binding =
+            self.tc
+                .decls
+                .resolve_visible_type_binding(&self.tc.current_module, None, name)?;
+        match binding {
+            TypeBinding::Nominal(key) => {
+                let ty = nominal_type(&key);
+                Some((key, ty))
+            }
+            TypeBinding::Alias(key) => {
+                let expanded = self.tc.resolve_module_alias_target_for_tc_at(&key, span);
+                let key = self.tc.decls.key_for_type(&expanded)?;
+                Some((key, expanded))
+            }
+        }
+    }
+
     fn check_struct(
         &mut self,
         name: Ident,
@@ -783,7 +810,7 @@ impl<'tc> PatternChecker<'tc> {
         span: Span,
         input: PatternInput,
     ) -> PatternCheckResult {
-        let Some(key) = self.tc.resolve_visible_type_key(None, name) else {
+        let Some((key, head_ty)) = self.resolve_struct_pattern_target(name, span) else {
             self.tc.push_error(TypeError::UnknownType {
                 qualifier: None,
                 name,
@@ -796,7 +823,7 @@ impl<'tc> PatternChecker<'tc> {
         let expected_key = self.tc.decls.key_for_type(&input.expected_ty);
         if expected_key.as_ref() != Some(&key) && !matches!(input.expected_ty, Type::Infer) {
             self.tc.push_error(TypeError::TypeMismatch {
-                expected: nominal_type(&key),
+                expected: head_ty,
                 found: input.expected_ty,
                 span: self.tc.error_span(span),
             });
@@ -811,7 +838,7 @@ impl<'tc> PatternChecker<'tc> {
                 let owner_ty = if matches!(expected_key.as_ref(), Some(found) if found == &key) {
                     input.expected_ty.clone()
                 } else {
-                    nominal_type(&key)
+                    head_ty
                 };
                 self.check_struct_fields(fields, owner_ty, &agg.fields, input)
             }
