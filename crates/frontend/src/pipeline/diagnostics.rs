@@ -6,6 +6,7 @@ use chumsky::error::{Rich, RichReason};
 
 use crate::{
     ast::{ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, Type},
+    conditional::ConditionalError,
     diagnostic::Diagnostic,
     externs::{
         ExternInputError, ExternProvenance, RawExternDecl, RawExternFunctionKey,
@@ -31,108 +32,162 @@ pub(super) fn diagnose_lex_error(
     source_len: usize,
     error: &Rich<'_, char>,
 ) -> Diagnostic {
-    let diagnostic = Diagnostic::error(match error.reason() {
-        RichReason::Custom(message) => message.clone(),
+    let (message, label) = match error.reason() {
+        RichReason::Custom(message) => (message.clone(), message.clone()),
         RichReason::ExpectedFound { found, .. } => match found.as_deref() {
-            Some(found) => format!("Unexpected character '{found}'"),
-            None => "Unexpected end of input".to_string(),
+            Some(found) => (
+                format!("Unexpected character '{found}'"),
+                "unexpected character".to_string(),
+            ),
+            None => (
+                "Unexpected end of input".to_string(),
+                "end of file".to_string(),
+            ),
         },
-    });
+    };
+    let diagnostic = Diagnostic::error(message);
     let span = error.span();
     if span.start <= span.end && span.end <= source_len {
-        diagnostic.with_primary(SourceSpan::new(source, span.start, span.end))
+        diagnostic.with_primary_message(SourceSpan::new(source, span.start, span.end), label)
     } else {
         diagnostic
     }
 }
 
 pub(super) fn diagnose_parse_error(error: &Rich<'_, Token, SourceSpan>) -> Diagnostic {
-    Diagnostic::error(match error.reason() {
-        RichReason::Custom(message) => message.clone(),
+    let (message, label) = match error.reason() {
+        RichReason::Custom(message) => (message.clone(), message.clone()),
         RichReason::ExpectedFound { found, .. } => match found.as_deref() {
-            Some(token) => format!("Unexpected token '{token}'"),
-            None => "Unexpected end of input".to_string(),
+            Some(token) => (
+                format!("Unexpected token '{token}'"),
+                "unexpected token".to_string(),
+            ),
+            None => (
+                "Unexpected end of input".to_string(),
+                "end of file".to_string(),
+            ),
         },
-    })
-    .with_primary(*error.span())
+    };
+    Diagnostic::error(message).with_primary_message(*error.span(), label)
+}
+
+pub(super) fn diagnose_conditional_error(source: SourceId, error: &ConditionalError) -> Diagnostic {
+    Diagnostic::error(error.message.clone()).with_primary_message(
+        SourceSpan::from_byte_span(source, error.span),
+        error.label.clone(),
+    )
 }
 
 pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
-    let message = match error {
-        ResolveError::ModuleNotFound { module, .. } => {
+    let (message, note) = match error {
+        ResolveError::ModuleNotFound { module, .. } => (
             format!(
                 "Cannot find module file for module '{}'",
                 render_module_id(module)
-            )
-        }
+            ),
+            None,
+        ),
         ResolveError::SourceImportNotFound {
             importer,
             path,
             candidate,
             ..
-        } => match candidate {
-            Some(candidate) => format!(
-                "Cannot find source import '{}' from '{}' at '{}'",
-                render_module_path(path),
-                importer,
-                candidate.display()
-            ),
-            None => format!(
+        } => (
+            format!(
                 "Cannot find source import '{}' from '{}'",
                 render_module_path(path),
                 importer
             ),
-        },
+            candidate
+                .as_ref()
+                .map(|candidate| format!("looked for '{}'", candidate.display())),
+        ),
         ResolveError::LoadFailed {
             module, message, ..
-        } => {
+        } => (
             format!(
                 "Cannot load module '{}': {message}",
                 render_module_id(module)
-            )
-        }
-        ResolveError::DuplicatePreloadedModule { module } => {
+            ),
+            None,
+        ),
+        ResolveError::DuplicatePreloadedModule { module } => (
             format!(
                 "module '{}' is preloaded more than once",
                 render_module_id(module)
-            )
-        }
-        ResolveError::UnknownDependency { alias, package, .. } => {
-            format!("package '{package}' has no dependency named '{alias}'")
-        }
-        ResolveError::PackageImportUnavailable { file, alias, .. } => {
-            format!("source file '{file}' has no package dependency named '{alias}'")
-        }
+            ),
+            None,
+        ),
+        ResolveError::UnknownDependency { alias, package, .. } => (
+            format!("package '{package}' has no dependency named '{alias}'"),
+            None,
+        ),
+        ResolveError::PackageImportUnavailable { file, alias, .. } => (
+            format!("source file '{file}' has no package dependency named '{alias}'"),
+            None,
+        ),
         ResolveError::UnsupportedImportRoot { root, .. } => {
-            format!("import root '{root}' is not supported yet")
+            (format!("import root '{root}' is not supported yet"), None)
         }
-        ResolveError::NativeProviderUnavailable { package, .. } => match package {
-            Some(package) => format!("package '{package}' has no native provider modules"),
-            None => "native provider imports require a package context".to_string(),
-        },
+        ResolveError::NativeProviderUnavailable { package, .. } => (
+            match package {
+                Some(package) => format!("package '{package}' has no native provider modules"),
+                None => "native provider imports require a package context".to_string(),
+            },
+            None,
+        ),
         ResolveError::UnknownNativeProviderModule {
             package, module, ..
-        } => format!(
-            "package '{package}' has no native provider module '{}'",
-            render_module_path(module)
+        } => (
+            format!(
+                "package '{package}' has no native provider module '{}'",
+                render_module_path(module)
+            ),
+            None,
         ),
         ResolveError::UnknownNativeDepProviderModule {
             package,
             alias,
             module,
             ..
-        } => format!(
-            "native-only dependency '{alias}' ({package}) has no native provider module '{}'",
-            render_module_path(module)
+        } => (
+            format!(
+                "native-only dependency '{alias}' ({package}) has no native provider module '{}'",
+                render_module_path(module)
+            ),
+            None,
         ),
-        ResolveError::NativeOnlyPkgRootImport { package, alias, .. } => {
-            format!("native-only dependency '{alias}' ({package}) has no source root to import")
-        }
+        ResolveError::NativeOnlyPkgRootImport { package, alias, .. } => (
+            format!("native-only dependency '{alias}' ({package}) has no source root to import"),
+            None,
+        ),
     };
     let diagnostic = Diagnostic::error(message);
-    match error.span() {
-        Some(span) => diagnostic.with_primary(span),
+    let diagnostic = match note {
+        Some(note) => diagnostic.with_note(note),
         None => diagnostic,
+    };
+    match error.span() {
+        Some(span) => diagnostic.with_primary_message(span, resolve_error_label(error)),
+        None => diagnostic,
+    }
+}
+
+fn resolve_error_label(error: &ResolveError) -> &'static str {
+    match error {
+        ResolveError::ModuleNotFound { .. } => "module file not found",
+        ResolveError::SourceImportNotFound { .. } => "import resolved to no source file",
+        ResolveError::LoadFailed { .. } => "module requested here",
+        ResolveError::DuplicatePreloadedModule { .. } => "duplicate preloaded module",
+        ResolveError::UnknownDependency { .. } => "unknown package dependency",
+        ResolveError::PackageImportUnavailable { .. } => "package dependency unavailable here",
+        ResolveError::UnsupportedImportRoot { .. } => "unsupported import root",
+        ResolveError::NativeProviderUnavailable { .. } => "native provider requested here",
+        ResolveError::UnknownNativeProviderModule { .. }
+        | ResolveError::UnknownNativeDepProviderModule { .. } => {
+            "native provider module requested here"
+        }
+        ResolveError::NativeOnlyPkgRootImport { .. } => "native-only package imported here",
     }
 }
 
@@ -177,22 +232,43 @@ pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnosti
         ),
         ExternInputError::UnsupportedSource { kind, .. } => render_unsupported_source(kind),
     };
-    let diagnostic = Diagnostic::error(message);
-    match extern_input_error_span(error) {
-        Some(span) => diagnostic.with_primary(span),
-        None => diagnostic,
+    label_extern_input_error(Diagnostic::error(message), error)
+}
+
+fn label_extern_input_error(diagnostic: Diagnostic, error: &ExternInputError) -> Diagnostic {
+    match error {
+        ExternInputError::InvalidRawDescriptor { decl, .. } => match decl.site.span {
+            Some(span) => diagnostic.with_primary_message(span, "invalid extern declaration here"),
+            None => diagnostic,
+        },
+        ExternInputError::DuplicateRawIdentity {
+            first, duplicate, ..
+        } => match (first.site.span, duplicate.site.span) {
+            (Some(first), Some(duplicate)) => diagnostic
+                .with_primary_message(duplicate, "duplicate extern declaration")
+                .with_secondary_message(first, "first declared here"),
+            (Some(span), None) | (None, Some(span)) => {
+                diagnostic.with_primary_message(span, "duplicate extern declaration")
+            }
+            (None, None) => diagnostic,
+        },
+        ExternInputError::UnsupportedSource { kind, span } => {
+            diagnostic.with_primary_message(*span, unsupported_source_label(kind))
+        }
+        ExternInputError::InvalidProviderDescriptor { .. }
+        | ExternInputError::DuplicateProviderModule { .. } => diagnostic,
     }
 }
 
-fn extern_input_error_span(error: &ExternInputError) -> Option<SourceSpan> {
-    match error {
-        ExternInputError::InvalidRawDescriptor { decl, .. } => decl.site.span,
-        ExternInputError::DuplicateRawIdentity {
-            first, duplicate, ..
-        } => duplicate.site.span.or(first.site.span),
-        ExternInputError::UnsupportedSource { span, .. } => Some(*span),
-        ExternInputError::InvalidProviderDescriptor { .. }
-        | ExternInputError::DuplicateProviderModule { .. } => None,
+fn unsupported_source_label(kind: &UnsupportedSourceKind) -> &'static str {
+    match kind {
+        UnsupportedSourceKind::Type(_) => "unsupported source extern type here",
+        UnsupportedSourceKind::InferReturn => "inferred return type used here",
+        UnsupportedSourceKind::Operator(_) => "unsupported source extern operator here",
+        UnsupportedSourceKind::Param { .. } => "unsupported source extern parameter here",
+        UnsupportedSourceKind::CallbackParam { .. } => {
+            "unsupported source extern callback parameter here"
+        }
     }
 }
 
@@ -417,7 +493,19 @@ pub(super) fn diagnose_type_warning(warning: &TypeWarning) -> Diagnostic {
         } => render_internal_access(*kind, *name, owner, reason.as_deref()),
         TypeWarning::CompileMessage { message, .. } => message.clone(),
     })
-    .with_primary(type_warning_span(warning))
+    .with_primary_message(type_warning_span(warning), type_warning_label(warning))
+}
+
+fn type_warning_label(warning: &TypeWarning) -> String {
+    match warning {
+        TypeWarning::DeprecatedAccess { kind, .. } => {
+            format!("deprecated {} used here", render_deprecated_use_kind(*kind))
+        }
+        TypeWarning::InternalAccess { kind, .. } => {
+            format!("internal {} used here", render_member_access_kind(*kind))
+        }
+        TypeWarning::CompileMessage { .. } => "compile warning emitted here".to_string(),
+    }
 }
 
 fn type_warning_span(warning: &TypeWarning) -> SourceSpan {
@@ -429,6 +517,11 @@ fn type_warning_span(warning: &TypeWarning) -> SourceSpan {
 }
 
 pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
+    let span = type_error_span(error);
+    if let (Some(span), Some((message, label))) = (span, type_error_rich_message(error)) {
+        return Diagnostic::error(message).with_primary_message(span, label);
+    }
+
     let diagnostic = Diagnostic::error(match error {
         TypeError::Decl(error) => render_decl_error(error),
         TypeError::ExternCatalog(error) => render_extern_catalog_error(error),
@@ -809,10 +902,135 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("duplicate generic parameter '{name}'")
         }
     });
-    match type_error_span(error) {
+    with_primary_if_known(diagnostic, span)
+}
+
+fn with_primary_if_known(diagnostic: Diagnostic, span: Option<SourceSpan>) -> Diagnostic {
+    match span {
         Some(span) => diagnostic.with_primary(span),
         None => diagnostic,
     }
+}
+
+fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> {
+    let message = match error {
+        TypeError::TypeMismatch {
+            expected, found, ..
+        } => {
+            let (expected, found) = render_type_mismatch_parts(expected, found);
+            ("Mismatched types", expected_found_label(&expected, &found))
+        }
+        TypeError::ConstMismatch {
+            expected, found, ..
+        } => (
+            "Mismatched types",
+            format!(
+                "expected const '{}', found '{}'",
+                render_const_diagnostic(expected),
+                render_const_diagnostic(found)
+            ),
+        ),
+        TypeError::UndefinedVariable { name, .. } => {
+            ("Unknown variable", format!("Unknown variable '{name}'"))
+        }
+        TypeError::InvalidOperand {
+            op, operand_type, ..
+        } => (
+            "Invalid operand type",
+            format!(
+                "operator '{op}' cannot be applied to '{}'",
+                render_surface_type(operand_type)
+            ),
+        ),
+        TypeError::WrongArgCount {
+            expected, found, ..
+        } => (
+            "Wrong number of arguments",
+            format!("expected {expected}, found {found}"),
+        ),
+        TypeError::WrongArgRange {
+            min, max, found, ..
+        } => (
+            "Wrong number of arguments",
+            format!("expected between {min} and {max}, found {found}"),
+        ),
+        TypeError::IfConditionNotBool { found, .. } => (
+            "If condition must be bool",
+            condition_type_label("if expression", found),
+        ),
+        TypeError::TernaryConditionNotBool { found, .. } => (
+            "Ternary condition must be bool",
+            condition_type_label("ternary expression", found),
+        ),
+        TypeError::WhileConditionNotBool { found, .. } => (
+            "While condition must be bool",
+            condition_type_label("while", found),
+        ),
+        TypeError::ImmutableAssignment { name, .. } => (
+            "Cannot assign to immutable value",
+            format!("cannot assign to immutable value '{name}'"),
+        ),
+        TypeError::ConstAssignment { name, .. } => (
+            "Cannot assign to constant",
+            format!("cannot assign to constant '{name}'"),
+        ),
+        TypeError::NotCallable { ty, .. } => (
+            "Not callable",
+            format!("type '{}' is not callable", render_surface_type(ty)),
+        ),
+        TypeError::TupleIndexOnNonTuple { ty, index, .. } => (
+            "Invalid tuple index",
+            format!(
+                "cannot index non-tuple type with .{index}; found '{}'",
+                render_surface_type(ty)
+            ),
+        ),
+        TypeError::TupleIndexOutOfBounds { index, len, .. } => (
+            "Tuple index out of bounds",
+            format!("tuple index {index} is out of bounds for length {len}"),
+        ),
+        TypeError::IndexNotInt { found, .. } => (
+            "Invalid index type",
+            format!(
+                "index must be an integer; found '{}'",
+                render_surface_type(found)
+            ),
+        ),
+        TypeError::IndexOnNonIndexable { found, .. } => (
+            "Not indexable",
+            format!(
+                "cannot index non-array type '{}'",
+                render_surface_type(found)
+            ),
+        ),
+        TypeError::RangeIndexNotInt { found, .. } => (
+            "Invalid range index type",
+            format!(
+                "range index bounds must be integers; found '{}'",
+                render_surface_type(found)
+            ),
+        ),
+        TypeError::RangeIndexUnsupported { found, .. } => (
+            "Range indexing unsupported",
+            format!(
+                "range indexing is not supported for type '{}'",
+                render_surface_type(found)
+            ),
+        ),
+        _ => return None,
+    };
+    Some(message)
+}
+
+fn expected_found_label(expected: &str, found: &str) -> String {
+    format!("expected '{expected}', found '{found}'")
+}
+
+fn condition_type_label(kind: &str, found: &Type) -> String {
+    format!(
+        "Condition of {kind} must be bool; found '{}'",
+        render_surface_type(found)
+    )
 }
 
 fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
@@ -992,10 +1210,19 @@ fn render_variant_shape(shape: VariantShape) -> &'static str {
 }
 
 fn render_type_mismatch(expected: &Type, found: &Type) -> String {
+    let (expected, found) = render_type_mismatch_parts(expected, found);
+    format!(
+        "Mismatched types: {}",
+        expected_found_label(&expected, &found)
+    )
+}
+
+fn render_type_mismatch_parts(expected: &Type, found: &Type) -> (String, String) {
     let ambiguous = expected != found && expected.to_string() == found.to_string();
-    let expected = render_mismatch_type(expected, ambiguous);
-    let found = render_mismatch_type(found, ambiguous);
-    format!("Mismatched types: expected '{expected}', found '{found}'")
+    (
+        render_mismatch_type(expected, ambiguous),
+        render_mismatch_type(found, ambiguous),
+    )
 }
 
 fn render_mismatch_type(ty: &Type, detailed: bool) -> String {
@@ -1749,7 +1976,7 @@ mod tests {
         lexer::{Keyword, Token, TokenStream},
         parser,
         source::{SourceKind, SourceTable},
-        span::{SourceSpan, Span},
+        span::SourceSpan,
     };
 
     fn ident(name: &str) -> Ident {
@@ -1799,6 +2026,13 @@ mod tests {
         }
     }
 
+    fn source_decl_with_span(module: RawExternScope, span: SourceSpan) -> RawExternDecl {
+        RawExternDecl {
+            provenance: ExternProvenance::Source { module },
+            site: RawExternSite { span: Some(span) },
+        }
+    }
+
     fn provider_decl(name: &str) -> RawExternDecl {
         RawExternDecl {
             provenance: ExternProvenance::Provider {
@@ -1809,10 +2043,6 @@ mod tests {
             },
             site: RawExternSite::default(),
         }
-    }
-
-    fn span() -> Span {
-        Span::new(0, 1)
     }
 
     fn test_source(text: &str) -> SourceId {
@@ -1832,15 +2062,14 @@ mod tests {
         SourceSpan::new(test_source("x"), 0, 1)
     }
 
-    fn type_span() -> Option<SourceSpan> {
-        Some(resolve_span())
+    fn type_span() -> SourceSpan {
+        resolve_span()
     }
 
     fn token_stream(tokens: Vec<(Token, SourceSpan)>) -> TokenStream {
         let source = tokens
             .first()
-            .map(|(_, span)| span.source())
-            .unwrap_or_else(|| test_source(""));
+            .map_or_else(|| test_source(""), |(_, span)| span.source());
         let len = tokens.iter().map(|(_, span)| span.end()).max().unwrap_or(0);
         TokenStream {
             source,
@@ -1926,6 +2155,31 @@ mod tests {
             span,
         });
         assert_eq!(diagnostic.labels()[0].span, span);
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("deprecated function used here")
+        );
+
+        let diagnostic = diagnose_type_warning(&TypeWarning::InternalAccess {
+            kind: MemberAccessKind::Field,
+            name: ident("secret"),
+            owner: Type::Int,
+            reason: None,
+            span,
+        });
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("internal field used here")
+        );
+
+        let diagnostic = diagnose_type_warning(&TypeWarning::CompileMessage {
+            message: "careful".to_string(),
+            span,
+        });
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("compile warning emitted here")
+        );
     }
 
     #[test]
@@ -1964,6 +2218,22 @@ mod tests {
             span,
         });
         assert_eq!(diagnostic.labels()[0].span, span);
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("module file not found")
+        );
+
+        let diagnostic = diagnose_resolve_error(&ResolveError::SourceImportNotFound {
+            importer: SourceFileId::new("/tmp/main.anv").unwrap(),
+            path: module_path(&["missing"]),
+            candidate: Some(std::path::PathBuf::from("missing.anv")),
+            span,
+        });
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("import resolved to no source file")
+        );
+        assert_eq!(diagnostic.notes(), &["looked for 'missing.anv'"]);
     }
 
     #[test]
@@ -2101,92 +2371,98 @@ mod tests {
                 diagnose_type_error(&TypeError::TypeMismatch {
                     expected: Type::Int,
                     found: Type::Bool,
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
-                "Mismatched types: expected 'int', found 'bool'",
+                "Mismatched types",
             ),
             (
                 diagnose_type_error(&TypeError::TypeMismatch {
                     expected: Type::Tuple(vec![Type::option_of(Type::Int)]),
                     found: Type::Tuple(vec![Type::option_of(Type::String)]),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
-                "Mismatched types: expected '(int?)', found '(string?)'",
+                "Mismatched types",
             ),
             (
                 diagnose_type_error(&TypeError::TypeMismatch {
                     expected: package_nominal("left", "Vec2"),
                     found: package_nominal("right", "Vec2"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
-                "Mismatched types: expected 'left:<root>.Vec2', found 'right:<root>.Vec2'",
+                "Mismatched types",
             ),
             (
                 diagnose_type_error(&TypeError::UndefinedVariable {
                     name: ident("x"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
-                "Unknown variable 'x'",
+                "Unknown variable",
             ),
             (
                 diagnose_type_error(&TypeError::InvalidOperand {
                     op: "-".to_string(),
                     operand_type: Type::Bool,
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
-                "Invalid operand type: operator '-' cannot be applied to 'bool'",
+                "Invalid operand type",
             ),
             (
                 diagnose_type_error(&TypeError::ConstAssignment {
                     name: ident("LIMIT"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
-                "cannot assign to constant 'LIMIT'",
+                "Cannot assign to constant",
             ),
             (
-                diagnose_type_error(&TypeError::CannotInferEnum { span: type_span() }),
+                diagnose_type_error(&TypeError::CannotInferEnum {
+                    span: Some(type_span()),
+                }),
                 "cannot infer enum type",
             ),
             (
                 diagnose_type_error(&TypeError::NamedFunctionCapture {
                     name: ident("x"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "named functions cannot capture local value 'x'",
             ),
             (
-                diagnose_type_error(&TypeError::VarArgNonLvalue { span: type_span() }),
+                diagnose_type_error(&TypeError::VarArgNonLvalue {
+                    span: Some(type_span()),
+                }),
                 "non-lvalue cannot be passed to var parameter",
             ),
             (
                 diagnose_type_error(&TypeError::VarArgImmutableBinding {
                     name: ident("x"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "immutable binding 'x' cannot be passed to var parameter",
             ),
             (
                 diagnose_type_error(&TypeError::MutatingMethodImmutableReceiver {
                     name: ident("self"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "mutating method requires mutable receiver 'self'",
             ),
             (
-                diagnose_type_error(&TypeError::MutableAlias { span: type_span() }),
+                diagnose_type_error(&TypeError::MutableAlias {
+                    span: Some(type_span()),
+                }),
                 "var arguments must not alias the same variable",
             ),
             (
                 diagnose_type_error(&TypeError::InvalidFormatSpec {
                     reason: "hex format requires int",
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "invalid format specifier: hex format requires int",
             ),
             (
                 diagnose_type_error(&TypeError::InfiniteSize {
                     name: ident("Node"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "type 'Node' has infinite size",
             ),
@@ -2195,12 +2471,14 @@ mod tests {
                     ty: Type::Slice {
                         elem: Box::new(Type::Int),
                     },
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "type 'slice[int]' is not equatable",
             ),
             (
-                diagnose_type_error(&TypeError::OrPatternBindingMismatch { span: type_span() }),
+                diagnose_type_error(&TypeError::OrPatternBindingMismatch {
+                    span: Some(type_span()),
+                }),
                 "or-pattern alternatives must bind the same variables",
             ),
             (
@@ -2208,7 +2486,7 @@ mod tests {
                     name: ident("x"),
                     expected: Type::Int,
                     found: Type::String,
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "or-pattern binding 'x' type mismatch: expected 'int', found 'string'",
             ),
@@ -2217,7 +2495,7 @@ mod tests {
                     ty: Type::UnresolvedName(ident("Point")),
                     member: ident("z"),
                     kind: MemberAccessKind::Field,
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "Unknown field 'z' for type 'Point'",
             ),
@@ -2226,7 +2504,7 @@ mod tests {
                     ty: Type::UnresolvedName(ident("Counter")),
                     member: ident("reset"),
                     kind: MemberAccessKind::Method,
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "Unknown method 'reset' for type 'Counter'",
             ),
@@ -2235,7 +2513,7 @@ mod tests {
                     ty: Type::Int,
                     member: ident("y"),
                     kind: MemberAccessKind::Field,
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "Unknown field 'y' for type 'int'",
             ),
@@ -2249,14 +2527,14 @@ mod tests {
             (
                 diagnose_type_error(&TypeError::UnboundGenericParam {
                     name: ident("T"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "Could not infer type parameter 'T'",
             ),
             (
                 diagnose_type_error(&TypeError::DuplicateGenericParam {
                     name: ident("T"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "duplicate generic parameter 'T'",
             ),
@@ -2264,7 +2542,7 @@ mod tests {
                 diagnose_type_error(&TypeError::UnknownStructLiteral {
                     qualifier: None,
                     name: ident("Point"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "Unknown struct 'Point'",
             ),
@@ -2272,16 +2550,20 @@ mod tests {
                 diagnose_type_error(&TypeError::UnknownStructLiteral {
                     qualifier: Some(ident("shapes")),
                     name: ident("Point"),
-                    span: type_span(),
+                    span: Some(type_span()),
                 }),
                 "Unknown struct 'shapes.Point'",
             ),
             (
-                diagnose_type_error(&TypeError::AnyOutsideExternBoundary { span: type_span() }),
+                diagnose_type_error(&TypeError::AnyOutsideExternBoundary {
+                    span: Some(type_span()),
+                }),
                 "any is only allowed in extern boundary signatures",
             ),
             (
-                diagnose_type_error(&TypeError::ExternAnyEscape { span: type_span() }),
+                diagnose_type_error(&TypeError::ExternAnyEscape {
+                    span: Some(type_span()),
+                }),
                 "extern 'any' value cannot escape an extern boundary",
             ),
         ];
@@ -2296,11 +2578,69 @@ mod tests {
             span: Some(span),
         });
         assert_eq!(diagnostic.labels()[0].span, span);
+        assert_eq!(
+            diagnostic.labels()[0].message.as_deref(),
+            Some("Unknown variable 'x'")
+        );
+
+        let diagnostic = diagnose_type_error(&TypeError::TypeMismatch {
+            expected: Type::Int,
+            found: Type::Bool,
+            span: Some(type_span()),
+        });
+        assert_eq!(diagnostic.message(), "Mismatched types");
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("expected 'int', found 'bool'")
+        );
+
+        let diagnostic = diagnose_type_error(&TypeError::InvalidOperand {
+            op: "-".to_string(),
+            operand_type: Type::Bool,
+            span: Some(type_span()),
+        });
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("operator '-' cannot be applied to 'bool'")
+        );
+
+        let diagnostic = diagnose_type_error(&TypeError::WrongArgRange {
+            min: 1,
+            max: 3,
+            found: 4,
+            span: Some(type_span()),
+        });
+        assert_eq!(diagnostic.message(), "Wrong number of arguments");
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("expected between 1 and 3, found 4")
+        );
+
+        let diagnostic = diagnose_type_error(&TypeError::IfConditionNotBool {
+            found: Type::Int,
+            span: Some(type_span()),
+        });
+        assert_eq!(diagnostic.message(), "If condition must be bool");
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("Condition of if expression must be bool; found 'int'")
+        );
     }
 
     #[test]
     fn omits_labels_without_source_span() {
         let diagnostic = diagnose_type_error(&TypeError::CannotInferType { span: None });
+        assert!(diagnostic.labels().is_empty());
+
+        let diagnostic = diagnose_type_error(&TypeError::TypeMismatch {
+            expected: Type::Int,
+            found: Type::Bool,
+            span: None,
+        });
+        assert_msg(
+            &diagnostic,
+            "Mismatched types: expected 'int', found 'bool'",
+        );
         assert!(diagnostic.labels().is_empty());
 
         let diagnostic = diagnose_type_error(&TypeError::Decl(DeclError::DuplicateType {
@@ -2612,6 +2952,72 @@ mod tests {
     }
 
     #[test]
+    fn extern_input_errors_label_source_spans() {
+        let span = resolve_span();
+        let decl = source_decl_with_span(raw_root_scope(), span);
+        let diagnostic = diagnose_extern_input_error(&ExternInputError::InvalidRawDescriptor {
+            decl,
+            scope: raw_root_scope(),
+            error: ExternDescriptorError::VoidType {
+                context: TypeContext::Param,
+            },
+        });
+        assert_eq!(diagnostic.labels()[0].span, span);
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("invalid extern declaration here")
+        );
+
+        let diagnostic = diagnose_extern_input_error(&ExternInputError::UnsupportedSource {
+            kind: UnsupportedSourceKind::Operator("+".to_string()),
+            span,
+        });
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("unsupported source extern operator here")
+        );
+    }
+
+    #[test]
+    fn duplicate_source_extern_identities_use_related_labels() {
+        let first = resolve_span();
+        let duplicate = SourceSpan::new(first.source(), 2, 3);
+        let diagnostic = diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
+            key: RawExternIdentityKey::Function(RawExternFunctionKey {
+                module: raw_root_scope(),
+                name: "tick".to_string(),
+            }),
+            first: source_decl_with_span(raw_root_scope(), first),
+            duplicate: source_decl_with_span(raw_root_scope(), duplicate),
+        });
+
+        assert_eq!(diagnostic.labels()[0].span, duplicate);
+        assert_eq!(
+            diagnostic.labels()[0].message.as_deref(),
+            Some("duplicate extern declaration")
+        );
+        assert_eq!(diagnostic.labels()[1].span, first);
+        assert_eq!(
+            diagnostic.labels()[1].message.as_deref(),
+            Some("first declared here")
+        );
+    }
+
+    #[test]
+    fn provider_extern_input_errors_stay_message_only() {
+        let diagnostic =
+            diagnose_extern_input_error(&ExternInputError::InvalidProviderDescriptor {
+                package: PackageId::synthetic_root(),
+                provider: ProviderId {
+                    name: "host".to_string(),
+                },
+                error: ExternDescriptorError::EmptyModulePath,
+            });
+
+        assert!(diagnostic.labels().is_empty());
+    }
+
+    #[test]
     fn renders_source_extern_catalog_context_without_source_module_prefix() {
         let module = ModuleId::source_without_package(
             SourceFileId::new("/tmp/unresolved_callback_param_err.anv").unwrap(),
@@ -2734,6 +3140,23 @@ mod tests {
         let diagnostic = diagnose_lex_error(source, 1, &error);
         assert_msg(&diagnostic, "Unexpected character '!'");
         assert_eq!(diagnostic.labels()[0].span, SourceSpan::new(source, 0, 1));
+        assert_eq!(
+            diagnostic.labels()[0].message.as_deref(),
+            Some("unexpected character")
+        );
+
+        let error =
+            <Rich<'_, char> as LabelError<'_, &'_ str, RichPattern<'_, char>>>::expected_found(
+                [],
+                None,
+                (1..1).into(),
+            );
+        let diagnostic = diagnose_lex_error(source, 1, &error);
+        assert_msg(&diagnostic, "Unexpected end of input");
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("end of file")
+        );
     }
 
     #[test]
@@ -2745,7 +3168,12 @@ mod tests {
 
         let stream = token_stream(vec![(Token::Semicolon, token_span())]);
         let errors = parser::parse_ast(&stream).expect_err("expected parse error");
-        assert_msg(diagnose_parse_error(&errors[0]), "Unexpected token ';'");
+        let diagnostic = diagnose_parse_error(&errors[0]);
+        assert_msg(&diagnostic, "Unexpected token ';'");
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("unexpected token")
+        );
 
         let source = test_source("fn");
         let stream = token_stream(vec![(
@@ -2753,6 +3181,11 @@ mod tests {
             SourceSpan::new(source, 0, 2),
         )]);
         let errors = parser::parse_ast(&stream).expect_err("expected parse error");
-        assert_msg(diagnose_parse_error(&errors[0]), "Unexpected end of input");
+        let diagnostic = diagnose_parse_error(&errors[0]);
+        assert_msg(&diagnostic, "Unexpected end of input");
+        assert_eq!(
+            diagnostic.primary_label().unwrap().message.as_deref(),
+            Some("end of file")
+        );
     }
 }

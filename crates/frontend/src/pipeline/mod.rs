@@ -7,8 +7,8 @@ use std::{
 };
 
 use self::diagnostics::{
-    diagnose_extern_input_error, diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error,
-    diagnose_type_error, diagnose_type_warning,
+    diagnose_conditional_error, diagnose_extern_input_error, diagnose_lex_error,
+    diagnose_parse_error, diagnose_resolve_error, diagnose_type_error, diagnose_type_warning,
 };
 pub use crate::diagnostic::{
     Diagnostic, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity, LabelStyle, Severity,
@@ -315,7 +315,12 @@ fn parse_source<E>(
     let code = conditional::filter_with_context(&source.code, ctx).map_err(|errors| {
         CheckError::Parse {
             label: source.label.clone(),
-            report: diagnostic_report(sources, errors.into_iter().map(Diagnostic::error)),
+            report: diagnostic_report(
+                sources,
+                errors
+                    .iter()
+                    .map(|error| diagnose_conditional_error(source_id, error)),
+            ),
         }
     })?;
 
@@ -444,7 +449,7 @@ mod tests {
     use crate::{
         externs::{ExternInputs, PackageExternInputs},
         resolve::{ModuleId, ModulePath, PackageId, PackageKind, SystemPackages},
-        source::SourceKind,
+        source::{SourceFile, SourceKind},
     };
 
     #[derive(Default)]
@@ -1176,6 +1181,17 @@ mod tests {
         assert_eq!(label.span.source(), file.id());
     }
 
+    fn assert_primary_label_message(report: &DiagnosticReport, message: &str) {
+        assert_eq!(
+            report.diagnostics()[0]
+                .primary_label()
+                .unwrap()
+                .message
+                .as_deref(),
+            Some(message)
+        );
+    }
+
     #[test]
     fn renders_lex_errors_through_check() {
         let err = check_source("fn main() { \"unterminated }").unwrap_err();
@@ -1207,6 +1223,23 @@ mod tests {
         };
         assert_user_diagnostics(report.diagnostics());
         assert_primary_label(&report);
+    }
+
+    #[test]
+    fn conditional_errors_have_source_labels() {
+        let source = "#if platform(macos)\n#end\nfn main() {}";
+        let err = check_source(source).unwrap_err();
+        let CheckError::Parse { report, .. } = err else {
+            panic!("expected parse error");
+        };
+        let label = report.diagnostics()[0].primary_label().unwrap();
+
+        assert_eq!(
+            report.diagnostics()[0].message(),
+            "unknown conditional predicate"
+        );
+        assert_eq!(label.message.as_deref(), Some("unknown predicate"));
+        assert_eq!(&source[label.span.start()..label.span.end()], "platform");
     }
 
     #[test]
@@ -1243,12 +1276,10 @@ mod tests {
         let CheckError::Type { report } = err else {
             panic!("expected type error");
         };
-        assert_eq!(
-            report.diagnostics()[0].message(),
-            "Mismatched types: expected 'int', found 'bool'"
-        );
+        assert_eq!(report.diagnostics()[0].message(), "Mismatched types");
         assert_user_diagnostics(report.diagnostics());
         assert_primary_label(&report);
+        assert_primary_label_message(&report, "expected 'int', found 'bool'");
     }
 
     #[test]
@@ -1319,7 +1350,7 @@ mod tests {
             .report
             .sources
             .iter()
-            .map(|source| source.label())
+            .map(SourceFile::label)
             .collect::<Vec<_>>();
 
         assert_eq!(loader.loads, [vec!["foo".to_string()]]);

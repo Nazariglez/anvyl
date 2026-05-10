@@ -6,10 +6,7 @@ use super::{Diagnostic, DiagnosticReport, LabelStyle, Severity};
 use crate::source::{SourceFile, SourceId};
 
 pub fn render_plain_diagnostic(diagnostic: &Diagnostic) -> String {
-    let severity = match diagnostic.severity() {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-    };
+    let severity = diagnostic.severity().as_str();
     format!("{severity}: {}", diagnostic.message())
 }
 
@@ -34,22 +31,10 @@ pub fn render_rich_report(report: &DiagnosticReport) -> String {
 }
 
 fn render_rich_diagnostic(report: &DiagnosticReport, diagnostic: &Diagnostic) -> String {
-    let anchor = diagnostic
-        .labels()
-        .iter()
-        .find(|label| {
-            label.style == LabelStyle::Primary && report.sources.get(label.span.source()).is_some()
-        })
-        .or_else(|| {
-            diagnostic
-                .labels()
-                .iter()
-                .find(|label| report.sources.get(label.span.source()).is_some())
-        });
-    let Some(anchor) = anchor else {
+    let Some(anchor) = report.anchor_label(diagnostic) else {
         return render_plain_diagnostic(diagnostic);
     };
-    let Some(anchor_file) = report.sources.get(anchor.span.source()) else {
+    let Some(anchor_file) = report.source(anchor.span.source()) else {
         return render_plain_diagnostic(diagnostic);
     };
 
@@ -68,7 +53,7 @@ fn render_rich_diagnostic(report: &DiagnosticReport, diagnostic: &Diagnostic) ->
         .with_message(diagnostic.message());
 
     for label in diagnostic.labels() {
-        let Some(file) = report.sources.get(label.span.source()) else {
+        let Some(file) = report.source(label.span.source()) else {
             continue;
         };
         let color = match label.style {
@@ -116,18 +101,16 @@ impl fmt::Display for RenderSource {
 }
 
 fn source_key(file: &SourceFile) -> RenderSource {
-    let name = match file.path() {
-        Some(path) => path.display().to_string(),
-        None => file.label().to_string(),
-    };
     RenderSource {
         id: file.id(),
-        name,
+        name: file.label().to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{render_plain_diagnostic, render_rich_report};
     use crate::{
         diagnostic::{Diagnostic, DiagnosticReport},
@@ -165,7 +148,22 @@ mod tests {
     }
 
     #[test]
-    fn renders_primary_label() {
+    fn renders_primary_label_message() {
+        let report = report_with_source("let x = true;", |source| {
+            Diagnostic::error("bad bool")
+                .with_primary_message(SourceSpan::new(source, 8, 12), "expected int, found bool")
+        });
+
+        let rendered = render_rich_report(&report);
+
+        assert!(rendered.contains("Error: bad bool"), "{rendered}");
+        assert!(rendered.contains("main.anv"), "{rendered}");
+        assert!(rendered.contains("let x = true;"), "{rendered}");
+        assert!(rendered.contains("expected int, found bool"), "{rendered}");
+    }
+
+    #[test]
+    fn renders_source_label_without_message() {
         let report = report_with_source("let x = true;", |source| {
             Diagnostic::error("bad bool").with_primary(SourceSpan::new(source, 8, 12))
         });
@@ -175,6 +173,41 @@ mod tests {
         assert!(rendered.contains("Error: bad bool"), "{rendered}");
         assert!(rendered.contains("main.anv"), "{rendered}");
         assert!(rendered.contains("let x = true;"), "{rendered}");
+    }
+
+    #[test]
+    fn renders_secondary_anchor_when_no_primary_exists() {
+        let report = report_with_source("let x = true;", |source| {
+            Diagnostic::error("bad bool")
+                .with_secondary_message(SourceSpan::new(source, 8, 12), "related bool")
+        });
+
+        let rendered = render_rich_report(&report);
+
+        assert!(rendered.contains("Error: bad bool"), "{rendered}");
+        assert!(rendered.contains("related bool"), "{rendered}");
+    }
+
+    #[test]
+    fn rich_renderer_uses_source_label_not_machine_path() {
+        let mut sources = SourceTable::default();
+        let source = sources.add(
+            SourceKind::Root,
+            "typed/main.anv",
+            Some(PathBuf::from("/canonical/main.anv")),
+            "let x = true;",
+        );
+        let diagnostic = Diagnostic::error("bad bool")
+            .with_primary_message(SourceSpan::new(source, 8, 12), "expected int, found bool");
+        let report = DiagnosticReport {
+            sources,
+            diagnostics: vec![diagnostic],
+        };
+
+        let rendered = render_rich_report(&report);
+
+        assert!(rendered.contains("typed/main.anv"), "{rendered}");
+        assert!(!rendered.contains("/canonical/main.anv"), "{rendered}");
     }
 
     #[test]

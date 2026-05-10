@@ -4,6 +4,7 @@ use super::support::{
 };
 use crate::{
     ast::{ArrayLen, ConstArg, ConstValue, FuncParam, GenericArg, Ident, NominalKind, Type},
+    span::SourceSpan,
     typecheck::{ArityError, DeclError, TypeError, type_closure_facts},
 };
 
@@ -53,14 +54,39 @@ mod storage {
 
 mod constraints {
     use super::*;
+
+    fn assert_error_span(
+        source: &str,
+        needle: &str,
+        error_span: impl FnOnce(&TypeError) -> Option<SourceSpan>,
+    ) {
+        let errors = errors(source);
+        assert_eq!(errors.len(), 1, "unexpected errors: {errors:?}");
+        assert_eq!(
+            error_span(&errors[0]).map(SourceSpan::start),
+            Some(source.find(needle).expect("missing span needle"))
+        );
+    }
+
+    fn type_mismatch_span(error: &TypeError) -> Option<SourceSpan> {
+        let TypeError::TypeMismatch { span, .. } = error else {
+            return None;
+        };
+        *span
+    }
+
     #[test]
     fn annotated_binding_mismatch() {
-        assert_err_count("fn main() { let x: int = true; }", 1);
+        assert_error_span(
+            "fn main() { let x: int = true; }",
+            "true",
+            type_mismatch_span,
+        );
     }
 
     #[test]
     fn explicit_return_mismatch() {
-        assert_err_count("fn f() -> int { return true; }", 1);
+        assert_error_span("fn f() -> int { return true; }", "true", type_mismatch_span);
     }
 
     #[test]
@@ -70,7 +96,21 @@ mod constraints {
 
     #[test]
     fn assignment_mismatch() {
-        assert_err_count("fn main() { var x = 1; x = true; }", 1);
+        assert_error_span(
+            "fn main() { var x = 1; x = true; }",
+            "true",
+            type_mismatch_span,
+        );
+    }
+
+    #[test]
+    fn immutable_assignment_blames_target() {
+        assert_error_span("fn main() { let x = 1; x = 2; }", "x = 2", |error| {
+            let TypeError::ImmutableAssignment { span, .. } = error else {
+                return None;
+            };
+            *span
+        });
     }
 
     #[test]
@@ -87,8 +127,38 @@ mod constraints {
 
     #[test]
     fn compound_assignment_rejects_non_assignable_binary_result() {
-        assert_single_error("fn main() { var x = 1; x += \" apples\"; }", |error| {
-            matches!(error, TypeError::TypeMismatch { .. })
+        assert_error_span(
+            "fn main() { var x = 1; x += \" apples\"; }",
+            "\" apples\"",
+            type_mismatch_span,
+        );
+    }
+
+    #[test]
+    fn call_argument_mismatch_blames_argument() {
+        assert_error_span(
+            "fn takes(x: int) {} fn main() { takes(true); }",
+            "true",
+            type_mismatch_span,
+        );
+    }
+
+    #[test]
+    fn field_initializer_mismatch_blames_value() {
+        assert_error_span(
+            "struct Point { x: int } fn main() { Point { x: true }; }",
+            "true",
+            type_mismatch_span,
+        );
+    }
+
+    #[test]
+    fn index_type_mismatch_blames_index() {
+        assert_error_span("fn main() { let xs = [1]; xs[true]; }", "true", |error| {
+            let TypeError::IndexNotInt { span, .. } = error else {
+                return None;
+            };
+            *span
         });
     }
 
@@ -112,8 +182,31 @@ mod constraints {
 
     #[test]
     fn ternary_condition_must_be_bool() {
-        assert_single_error("fn main() { 1 ? 2 : 3; }", |err| {
-            matches!(err, TypeError::TernaryConditionNotBool { .. })
+        assert_error_span("fn main() { 1 ? 2 : 3; }", "1", |error| {
+            let TypeError::TernaryConditionNotBool { span, .. } = error else {
+                return None;
+            };
+            *span
+        });
+    }
+
+    #[test]
+    fn if_condition_must_be_bool() {
+        assert_error_span("fn main() { if 1 {} }", "1", |error| {
+            let TypeError::IfConditionNotBool { span, .. } = error else {
+                return None;
+            };
+            *span
+        });
+    }
+
+    #[test]
+    fn while_condition_must_be_bool() {
+        assert_error_span("fn main() { while 1 {} }", "1", |error| {
+            let TypeError::WhileConditionNotBool { span, .. } = error else {
+                return None;
+            };
+            *span
         });
     }
 

@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: range index bounds must be int
+// @contains: range index bounds
 
 fn main() {
     let xs = [1, 2, 3];

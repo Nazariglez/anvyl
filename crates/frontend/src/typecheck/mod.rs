@@ -4381,7 +4381,7 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             };
             tc.reject_extern_any_escape(&value.checked, binding.value.span);
             tc.expect_assignable(
-                binding_node.span,
+                binding.value.span,
                 value.checked.handle.clone(),
                 annot_handle,
             );
@@ -4459,7 +4459,7 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
             let expected = tc.type_handle(&expected_ty);
             let actual = check_value_expr_checked_with_hint(expr, Some(expected.clone()), tc);
             tc.reject_extern_any_escape(&actual, expr.span);
-            tc.expect_assignable(ret_node.span, actual.handle, expected);
+            tc.expect_assignable(expr.span, actual.handle, expected);
         } else {
             let actual = check_value_expr_checked_with_hint(expr, None, tc);
             tc.reject_extern_any_escape(&actual, expr.span);
@@ -6847,7 +6847,11 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
                 tc,
             );
             if !target.checked().ty.is_void() && !result.ty.is_void() {
-                tc.expect_assignable(assign.span, result.handle, target.checked().handle.clone());
+                tc.expect_assignable(
+                    assign.node.value.span,
+                    result.handle,
+                    target.checked().handle.clone(),
+                );
             }
             if target.value.access.can_assign() {
                 place::record_compound_write(assign.node.target.node.id, &target, tc);

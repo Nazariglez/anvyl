@@ -4,10 +4,10 @@ use anvyx_lang::{CompilationContext, LintConfig, LintLevel, Profile, TargetArch,
 use anvyx_lang2::{
     CheckError as FrontendCheckError, CheckFileInput, CheckPackageInput,
     CompilationContext as FrontendCompilationContext, Diagnostic, DiagnosticLabel,
-    DiagnosticReport, DiagnosticSeverity, FrontendConfig, LabelStyle,
-    LintConfig as FrontendLintConfig, LintLevel as FrontendLintLevel,
-    PackageId as FrontendPackageId, PackageSource, Profile as FrontendProfile, SourceBundle,
-    TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs, render_rich_report,
+    DiagnosticReport, FrontendConfig, LintConfig as FrontendLintConfig,
+    LintLevel as FrontendLintLevel, PackageId as FrontendPackageId, PackageSource,
+    Profile as FrontendProfile, SourceBundle, TargetArch as FrontendTargetArch,
+    TargetOs as FrontendTargetOs, render_rich_report,
 };
 use clap::ValueEnum;
 use serde::Serialize;
@@ -70,8 +70,8 @@ pub fn new_frontend_cmd(
     match result {
         Ok(ok) => emit_report(&ok.report, format),
         Err(error) => {
-            emit_new_frontend_error(&error, format)?;
-            if frontend_error_report(&error).is_some() {
+            emit_error_report(&error, format)?;
+            if error.report().is_some() {
                 Err(error.summary())
             } else {
                 Err(error.to_string())
@@ -124,45 +124,36 @@ fn emit_report(report: &DiagnosticReport, format: CheckOutputFormat) -> Result<(
     Ok(())
 }
 
-fn emit_new_frontend_error(
-    error: &FrontendCheckError,
-    format: CheckOutputFormat,
-) -> Result<(), String> {
-    match format {
-        CheckOutputFormat::Text => {
-            if let Some(report) = frontend_error_report(error) {
-                emit_text_report(report);
-            }
-        }
-        CheckOutputFormat::Json => {
-            let json = match frontend_error_report(error) {
-                Some(report) => render_json_report(report)?,
-                None => render_json_report(&message_report(error.to_string()))?,
-            };
-            println!("{json}");
+fn emit_error_report(error: &FrontendCheckError, format: CheckOutputFormat) -> Result<(), String> {
+    match (format, error.report()) {
+        (CheckOutputFormat::Text, Some(report)) => emit_text_report(report),
+        (CheckOutputFormat::Text, None) => {}
+        (CheckOutputFormat::Json, Some(report)) => println!("{}", render_json_report(report)?),
+        (CheckOutputFormat::Json, None) => {
+            println!(
+                "{}",
+                render_json_report(&message_report(error.to_string()))?
+            );
         }
     }
     Ok(())
 }
 
 fn emit_text_report(report: &DiagnosticReport) {
-    let rendered = render_rich_report(report);
-    if rendered.is_empty() {
-        return;
-    }
-    eprint!("{rendered}");
-    if !rendered.ends_with('\n') {
-        eprintln!();
+    if let Some(rendered) = render_text_report(report) {
+        eprint!("{rendered}");
     }
 }
 
-fn frontend_error_report(error: &FrontendCheckError) -> Option<&DiagnosticReport> {
-    match error {
-        FrontendCheckError::Frontend(error) => error.report(),
-        FrontendCheckError::InvalidInput(_)
-        | FrontendCheckError::ReadMain { .. }
-        | FrontendCheckError::ReadModule { .. } => None,
+fn render_text_report(report: &DiagnosticReport) -> Option<String> {
+    let mut rendered = render_rich_report(report);
+    if rendered.is_empty() {
+        return None;
     }
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Some(rendered)
 }
 
 fn message_report(message: String) -> DiagnosticReport {
@@ -232,7 +223,7 @@ impl<'a> From<&'a DiagnosticReport> for JsonReport<'a> {
 impl<'a> From<&'a Diagnostic> for JsonDiagnostic<'a> {
     fn from(diagnostic: &'a Diagnostic) -> Self {
         Self {
-            severity: json_severity(diagnostic.severity()),
+            severity: diagnostic.severity().as_str(),
             message: diagnostic.message(),
             labels: diagnostic.labels().iter().map(JsonLabel::from).collect(),
             notes: diagnostic.notes(),
@@ -244,26 +235,12 @@ impl<'a> From<&'a Diagnostic> for JsonDiagnostic<'a> {
 impl<'a> From<&'a DiagnosticLabel> for JsonLabel<'a> {
     fn from(label: &'a DiagnosticLabel) -> Self {
         Self {
-            style: json_label_style(label.style),
+            style: label.style.as_str(),
             source_id: label.span.source().index(),
             start: label.span.start(),
             end: label.span.end(),
             message: label.message.as_deref(),
         }
-    }
-}
-
-fn json_severity(severity: DiagnosticSeverity) -> &'static str {
-    match severity {
-        DiagnosticSeverity::Error => "error",
-        DiagnosticSeverity::Warning => "warning",
-    }
-}
-
-fn json_label_style(style: LabelStyle) -> &'static str {
-    match style {
-        LabelStyle::Primary => "primary",
-        LabelStyle::Secondary => "secondary",
     }
 }
 
@@ -409,13 +386,20 @@ mod tests {
             paths
         }
 
-        fn check_error_report(code: &str) -> DiagnosticReport {
+        fn frontend_error(code: &str) -> FrontendCheckError {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", code);
             let sources = new_frontend_source_bundle().unwrap();
             let input = CheckFileInput::new(main, sources).unwrap();
-            let error = anvyx_lang2::check_file(input).unwrap_err();
-            frontend_error_report(&error).unwrap().clone()
+            anvyx_lang2::check_file(input).unwrap_err()
+        }
+
+        fn render_error_text_report(error: &FrontendCheckError) -> Option<String> {
+            render_text_report(error.report()?)
+        }
+
+        fn check_error_report(code: &str) -> DiagnosticReport {
+            frontend_error(code).report().unwrap().clone()
         }
 
         fn json_value(report: &DiagnosticReport) -> serde_json::Value {
@@ -866,10 +850,75 @@ mod tests {
         }
 
         #[test]
+        fn text_type_error_renders_rich_report_and_short_summary() {
+            let code = "fn main() { let hp: int = true; }";
+            let error = frontend_error(code);
+            let rendered = render_error_text_report(&error).unwrap();
+
+            assert!(rendered.contains("Error: Mismatched types"), "{rendered}");
+            assert!(rendered.contains("main.anv"), "{rendered}");
+            assert!(rendered.contains(code), "{rendered}");
+            assert!(
+                rendered.contains("expected 'int', found 'bool'"),
+                "{rendered}"
+            );
+            assert_eq!(error.summary(), "Failed to typecheck program");
+            assert!(
+                !rendered.contains("frontend typecheck failed"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("\n- Mismatched types"), "{rendered}");
+        }
+
+        #[test]
+        fn text_parse_error_renders_label_and_short_summary() {
+            let error = frontend_error("fn");
+            let rendered = render_error_text_report(&error).unwrap();
+
+            assert!(rendered.contains("Unexpected end of input"), "{rendered}");
+            assert!(rendered.contains("end of file"), "{rendered}");
+            assert_eq!(error.summary(), "Failed to parse program");
+        }
+
+        #[test]
+        fn text_message_only_error_has_no_rich_report() {
+            let error = FrontendCheckError::InvalidInput("bad path".to_string());
+
+            assert!(render_error_text_report(&error).is_none());
+            assert_eq!(error.to_string(), "invalid input: bad path");
+        }
+
+        #[test]
+        fn text_warning_report_uses_rich_renderer() {
+            let mut sources = anvyx_lang2::SourceTable::default();
+            let source = sources.add(
+                anvyx_lang2::SourceKind::Virtual,
+                "main.anv",
+                None,
+                "fn main() {}",
+            );
+            let report = DiagnosticReport {
+                sources,
+                diagnostics: vec![Diagnostic::warning("careful").with_primary_message(
+                    anvyx_lang2::SourceSpan::new(source, 0, 2),
+                    "compile warning emitted here",
+                )],
+            };
+            let rendered = render_text_report(&report).unwrap();
+
+            assert!(rendered.contains("Warning: careful"), "{rendered}");
+            assert!(
+                rendered.contains("compile warning emitted here"),
+                "{rendered}"
+            );
+        }
+
+        #[test]
         fn json_report_includes_sources_labels_and_byte_offsets() {
             let code = "// café\nfn main() { let x: int = true; }";
             let report = check_error_report(code);
-            let json = json_value(&report);
+            let rendered = render_json_report(&report).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
             let diagnostic = &json["diagnostics"][0];
             let label = &diagnostic["labels"][0];
             let source_id = label["source_id"].as_u64().unwrap();
@@ -884,10 +933,14 @@ mod tests {
             assert_eq!(label["style"], "primary");
             let start = label["start"].as_u64().unwrap() as usize;
             let end = label["end"].as_u64().unwrap() as usize;
-            assert_eq!(start, code.find("let x").unwrap());
+            assert_eq!(start, code.find("true").unwrap());
             assert!(end > start);
             assert!(code[..start].contains("café"));
             assert!(source["path"].as_str().unwrap().ends_with("main.anv"));
+            assert!(source.get("text").is_none());
+            assert_eq!(label["message"], "expected 'int', found 'bool'");
+            assert!(!rendered.contains(code));
+            assert!(!rendered.contains("╭"));
             assert!(
                 !diagnostic["message"]
                     .as_str()
@@ -927,19 +980,36 @@ mod tests {
         }
 
         #[test]
-        fn json_report_serializes_warnings_notes_and_help() {
+        fn json_report_serializes_warnings_labels_notes_and_help() {
+            let mut sources = anvyx_lang2::SourceTable::default();
+            let source = sources.add(
+                anvyx_lang2::SourceKind::Virtual,
+                "main.anv",
+                None,
+                "fn main() {}",
+            );
             let diagnostic = Diagnostic::warning("careful")
+                .with_primary_message(
+                    anvyx_lang2::SourceSpan::new(source, 0, 2),
+                    "compile warning emitted here",
+                )
                 .with_note("first note")
                 .with_help("try this");
             let report = DiagnosticReport {
-                sources: Default::default(),
+                sources,
                 diagnostics: vec![diagnostic],
             };
-            let json = json_value(&report);
+            let json_text = render_json_report(&report).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
 
             assert_eq!(json["diagnostics"][0]["severity"], "warning");
+            assert_eq!(
+                json["diagnostics"][0]["labels"][0]["message"],
+                "compile warning emitted here"
+            );
             assert_eq!(json["diagnostics"][0]["notes"][0], "first note");
             assert_eq!(json["diagnostics"][0]["help"], "try this");
+            assert!(!json_text.contains("fn main() {}"));
         }
 
         mod unsupported {

@@ -272,11 +272,10 @@ impl LspAdapter {
             .with_source_overrides(self.documents.source_overrides()?);
         let report = match anvyx_lang2::check_file(input) {
             Ok(ok) => ok.report,
-            Err(anvyx_lang2::CheckError::Frontend(error)) => match error.report() {
+            Err(error) => match error.report() {
                 Some(report) => report.clone(),
-                None => return Err("frontend error has no diagnostic report".to_string()),
+                None => return Err(error.to_string()),
             },
-            Err(error) => return Err(error.to_string()),
         };
         Ok(self.publish_report(&report))
     }
@@ -422,10 +421,10 @@ pub fn diagnostics_by_uri(
 ) -> Vec<PublishDiagnostics> {
     let mut diagnostics = HashMap::<String, Vec<LspDiagnostic>>::new();
     for diagnostic in report.diagnostics() {
-        let Some(primary) = primary_label(diagnostic) else {
+        let Some(primary) = report.anchor_label(diagnostic) else {
             continue;
         };
-        let Some(file) = report.sources.get(primary.span.source()) else {
+        let Some(file) = report.source(primary.span.source()) else {
             continue;
         };
         let Some(uri) = file.path().map(|path| documents.uri_for_source(path)) else {
@@ -437,8 +436,8 @@ pub fn diagnostics_by_uri(
         diagnostics.entry(uri).or_default().push(LspDiagnostic {
             range,
             severity: lsp_severity(diagnostic.severity()),
-            message: lsp_message(diagnostic),
-            related_information: related_information(report, documents, diagnostic),
+            message: lsp_message(diagnostic, primary),
+            related_information: related_information(report, documents, diagnostic, primary),
         });
     }
 
@@ -450,25 +449,18 @@ pub fn diagnostics_by_uri(
     publishes
 }
 
-fn primary_label(diagnostic: &Diagnostic) -> Option<&DiagnosticLabel> {
-    diagnostic
-        .labels()
-        .iter()
-        .find(|label| label.style == LabelStyle::Primary)
-        .or_else(|| diagnostic.labels().first())
-}
-
 fn related_information(
     report: &DiagnosticReport,
     documents: &DocumentStore,
     diagnostic: &Diagnostic,
+    anchor: &DiagnosticLabel,
 ) -> Vec<LspRelatedInformation> {
     diagnostic
         .labels()
         .iter()
-        .filter(|label| label.style == LabelStyle::Secondary)
+        .filter(|label| label.style == LabelStyle::Secondary && !std::ptr::eq(*label, anchor))
         .filter_map(|label| {
-            let file = report.sources.get(label.span.source())?;
+            let file = report.source(label.span.source())?;
             let uri = documents.uri_for_source(file.path()?);
             let range = label_range(report, label)?;
             Some(LspRelatedInformation {
@@ -480,7 +472,7 @@ fn related_information(
 }
 
 fn label_range(report: &DiagnosticReport, label: &DiagnosticLabel) -> Option<LspRange> {
-    let file = report.sources.get(label.span.source())?;
+    let file = report.source(label.span.source())?;
     let start = file.line_index().byte_to_lsp_position(label.span.start())?;
     let end = file.line_index().byte_to_lsp_position(label.span.end())?;
     Some(LspRange {
@@ -502,8 +494,14 @@ fn lsp_severity(severity: DiagnosticSeverity) -> u8 {
     }
 }
 
-fn lsp_message(diagnostic: &Diagnostic) -> String {
+fn lsp_message(diagnostic: &Diagnostic, anchor: &DiagnosticLabel) -> String {
     let mut message = diagnostic.message().to_string();
+    if let Some(label) = anchor.message.as_deref()
+        && label != diagnostic.message()
+    {
+        message.push_str(": ");
+        message.push_str(label);
+    }
     for note in diagnostic.notes() {
         message.push_str("\nnote: ");
         message.push_str(note);
@@ -763,6 +761,10 @@ mod tests {
 
         assert_eq!(publishes[0].uri, uri);
         assert_eq!(publishes[0].diagnostics[0].severity, 1);
+        assert_eq!(
+            publishes[0].diagnostics[0].message,
+            "Mismatched types: expected 'int', found 'bool'"
+        );
 
         let clears = adapter
             .change_document(&uri, Some(2), "fn main() {}")
@@ -817,6 +819,52 @@ mod tests {
         assert_eq!(publishes[0].diagnostics[0].range.start.line, 0);
         assert_eq!(publishes[0].diagnostics[0].range.start.character, 12);
         assert_eq!(publishes[0].diagnostics[0].range.end.character, 15);
+    }
+
+    #[test]
+    fn secondary_anchor_maps_to_range_when_no_primary_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("main.anv");
+        let text = "fn main() { bad; }";
+        let report = report(path.clone(), text, |source| {
+            Diagnostic::error("bad")
+                .with_secondary_message(SourceSpan::new(source, 12, 15), "related")
+        });
+        let mut store = DocumentStore::default();
+        store.open(path_uri(&path), Some(1), text);
+
+        let diagnostic = diagnostics_by_uri(&report, &store)
+            .remove(0)
+            .diagnostics
+            .remove(0);
+
+        assert_eq!(diagnostic.range.start.character, 12);
+        assert_eq!(diagnostic.range.end.character, 15);
+        assert_eq!(diagnostic.message, "bad: related");
+        assert!(diagnostic.related_information.is_empty());
+    }
+
+    #[test]
+    fn includes_notes_and_help_in_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("main.anv");
+        let text = "fn main() { bad; }";
+        let report = report(path.clone(), text, |source| {
+            Diagnostic::error("bad")
+                .with_primary(SourceSpan::new(source, 12, 15))
+                .with_note("check this")
+                .with_help("try that")
+        });
+        let mut store = DocumentStore::default();
+        store.open(path_uri(&path), Some(1), text);
+
+        let message = diagnostics_by_uri(&report, &store)
+            .remove(0)
+            .diagnostics
+            .remove(0)
+            .message;
+
+        assert_eq!(message, "bad\nnote: check this\nhelp: try that");
     }
 
     #[test]

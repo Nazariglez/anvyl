@@ -25,6 +25,14 @@ pub enum CheckError {
 
 impl CheckError {
     #[must_use]
+    pub fn report(&self) -> Option<&DiagnosticReport> {
+        match self {
+            Self::Frontend(error) => error.report(),
+            Self::InvalidInput(_) | Self::ReadMain { .. } | Self::ReadModule { .. } => None,
+        }
+    }
+
+    #[must_use]
     pub fn summary(&self) -> String {
         match self {
             Self::InvalidInput(message) => format!("invalid input: {message}"),
@@ -80,11 +88,11 @@ fn display_frontend_error(
 
 fn frontend_error_summary(error: &FCheckError<CheckError>) -> String {
     match error {
-        FCheckError::Lex { label, .. } => format!("frontend lex failed in {label}"),
-        FCheckError::Parse { label, .. } => format!("frontend parse failed in {label}"),
-        FCheckError::Resolve { .. } => "frontend resolve failed".to_string(),
-        FCheckError::Type { .. } => "frontend typecheck failed".to_string(),
-        FCheckError::Extern { .. } => "frontend extern input failed".to_string(),
+        FCheckError::Lex { .. } => "Failed to lex program".to_string(),
+        FCheckError::Parse { .. } => "Failed to parse program".to_string(),
+        FCheckError::Resolve { .. } => "Failed to resolve program".to_string(),
+        FCheckError::Type { .. } => "Failed to typecheck program".to_string(),
+        FCheckError::Extern { .. } => "Failed to ingest extern inputs".to_string(),
         FCheckError::Source(error) => error.summary(),
     }
 }
@@ -96,7 +104,27 @@ fn write_diagnostics(
 ) -> fmt::Result {
     write!(f, "{header}:")?;
     for diagnostic in diagnostics {
-        write!(f, "\n- {diagnostic}")?;
+        write!(f, "\n- ")?;
+        write_diagnostic(f, diagnostic)?;
+    }
+    Ok(())
+}
+
+fn write_diagnostic(f: &mut fmt::Formatter<'_>, diagnostic: &Diagnostic) -> fmt::Result {
+    f.write_str(diagnostic.message())?;
+    match diagnostic
+        .primary_label()
+        .or_else(|| diagnostic.labels().first())
+        .and_then(|label| label.message.as_deref())
+    {
+        Some(label) if label != diagnostic.message() => write!(f, ": {label}")?,
+        _ => {}
+    }
+    for note in diagnostic.notes() {
+        write!(f, " (note: {note})")?;
+    }
+    if let Some(help) = diagnostic.help() {
+        write!(f, " (help: {help})")?;
     }
     Ok(())
 }
@@ -148,7 +176,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "frontend resolve failed:\n- missing module"
+            "Failed to resolve program:\n- missing module"
         );
     }
 
@@ -159,11 +187,11 @@ mod tests {
         };
         let error = CheckError::Frontend(frontend);
 
-        assert_eq!(error.summary(), "frontend typecheck failed");
+        assert_eq!(error.summary(), "Failed to typecheck program");
     }
 
     #[test]
-    fn display_frontend_parse_error_includes_label() {
+    fn display_frontend_parse_error_uses_user_summary() {
         let frontend = anvyx_frontend::pipeline::CheckError::Parse {
             label: "main.anv".to_string(),
             report: report([Diagnostic::error("expected expression")]),
@@ -172,7 +200,38 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "frontend parse failed in main.anv:\n- expected expression"
+            "Failed to parse program:\n- expected expression"
+        );
+    }
+
+    #[test]
+    fn display_frontend_error_uses_first_label_when_no_primary_exists() {
+        let diagnostic = Diagnostic::error("bad")
+            .with_secondary_message(SourceSpan::new(source_id(), 0, 1), "related here");
+        let frontend = anvyx_frontend::pipeline::CheckError::Type {
+            report: report([diagnostic]),
+        };
+        let error = CheckError::Frontend(frontend);
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to typecheck program:\n- bad: related here"
+        );
+    }
+
+    #[test]
+    fn display_frontend_error_includes_notes_and_help_without_label() {
+        let diagnostic = Diagnostic::error("bad")
+            .with_note("check this")
+            .with_help("try that");
+        let frontend = anvyx_frontend::pipeline::CheckError::Type {
+            report: report([diagnostic]),
+        };
+        let error = CheckError::Frontend(frontend);
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to typecheck program:\n- bad (note: check this) (help: try that)"
         );
     }
 
@@ -198,29 +257,85 @@ mod tests {
     }
 
     #[test]
-    fn frontend_conversion_preserves_sources_and_labels() {
+    fn report_preserves_sources_and_labels() {
+        for frontend in report_errors() {
+            let error = CheckError::Frontend(frontend);
+            let report = error.report().expect("frontend report should be preserved");
+
+            assert_eq!(report.sources.len(), 1);
+            assert_eq!(report.diagnostics()[0].message(), "bad");
+            assert_eq!(report.diagnostics()[0].labels()[0].span.start(), 0);
+        }
+    }
+
+    #[test]
+    fn non_frontend_errors_have_no_report() {
+        let errors = [
+            CheckError::InvalidInput("bad".to_string()),
+            CheckError::ReadMain {
+                path: PathBuf::from("main.anv"),
+                message: "missing".to_string(),
+            },
+            CheckError::ReadModule {
+                path: PathBuf::from("mod.anv"),
+                message: "missing".to_string(),
+            },
+        ];
+
+        for error in errors {
+            assert!(error.report().is_none());
+        }
+    }
+
+    #[test]
+    fn frontend_conversion_preserves_report() {
+        let frontend = anvyx_frontend::pipeline::CheckError::Type {
+            report: labelled_report(),
+        };
+        let error = CheckError::from(frontend);
+
+        assert!(error.report().is_some());
+    }
+
+    fn report_errors() -> [FCheckError<CheckError>; 5] {
+        [
+            FCheckError::Lex {
+                label: "main.anv".to_string(),
+                report: labelled_report(),
+            },
+            FCheckError::Parse {
+                label: "main.anv".to_string(),
+                report: labelled_report(),
+            },
+            FCheckError::Resolve {
+                report: labelled_report(),
+            },
+            FCheckError::Type {
+                report: labelled_report(),
+            },
+            FCheckError::Extern {
+                report: labelled_report(),
+            },
+        ]
+    }
+
+    fn labelled_report() -> DiagnosticReport {
         let mut sources = SourceTable::default();
         let source = sources.add(SourceKind::Virtual, "main.anv", None, "x");
         let span = SourceSpan::new(source, 0, 1);
-        let report = DiagnosticReport {
+        DiagnosticReport {
             sources,
             diagnostics: vec![Diagnostic::error("bad").with_primary(span)],
-        };
-        let frontend = anvyx_frontend::pipeline::CheckError::Type {
-            report: report.clone(),
-        };
+        }
+    }
 
-        let error = CheckError::from(frontend);
-        let CheckError::Frontend(FCheckError::Type { report: converted }) = error else {
-            panic!("expected frontend type error");
-        };
-        assert_eq!(converted.sources.len(), 1);
-        assert_eq!(converted.diagnostics()[0].labels()[0].span, span);
+    fn source_id() -> anvyx_frontend::source::SourceId {
+        SourceTable::default().add(SourceKind::Virtual, "main.anv", None, "x")
     }
 
     fn report(diagnostics: impl IntoIterator<Item = Diagnostic>) -> DiagnosticReport {
         DiagnosticReport {
-            sources: Default::default(),
+            sources: SourceTable::default(),
             diagnostics: diagnostics.into_iter().collect(),
         }
     }

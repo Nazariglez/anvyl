@@ -849,7 +849,10 @@ mod tests {
                 error,
                 CheckError::Frontend(FrontendCheckError::Type { report })
                     if report.diagnostics().iter().any(|diagnostic| {
-                        let message = diagnostic.message();
+                        let message = diagnostic
+                            .primary_label()
+                            .and_then(|label| label.message.as_deref())
+                            .unwrap_or_else(|| diagnostic.message());
                         message.contains("a.anv") && message.contains("b.anv")
                     })
             ));

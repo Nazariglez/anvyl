@@ -2,12 +2,25 @@ use std::fmt;
 
 pub mod render;
 
-use crate::{source::SourceTable, span::SourceSpan};
+use crate::{
+    source::{SourceFile, SourceId, SourceTable},
+    span::SourceSpan,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
+}
+
+impl Severity {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
 }
 
 pub use Severity as DiagnosticSeverity;
@@ -16,6 +29,16 @@ pub use Severity as DiagnosticSeverity;
 pub enum LabelStyle {
     Primary,
     Secondary,
+}
+
+impl LabelStyle {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +67,26 @@ impl DiagnosticReport {
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    #[must_use]
+    pub fn source(&self, id: SourceId) -> Option<&SourceFile> {
+        self.sources.get(id)
+    }
+
+    #[must_use]
+    pub fn anchor_label<'a>(&'a self, diagnostic: &'a Diagnostic) -> Option<&'a DiagnosticLabel> {
+        let mut fallback = None;
+        for label in diagnostic.labels() {
+            if self.source(label.span.source()).is_none() {
+                continue;
+            }
+            if label.style == LabelStyle::Primary {
+                return Some(label);
+            }
+            fallback = fallback.or(Some(label));
+        }
+        fallback
     }
 }
 
@@ -108,6 +151,13 @@ impl Diagnostic {
     #[must_use]
     pub fn labels(&self) -> &[DiagnosticLabel] {
         &self.labels
+    }
+
+    #[must_use]
+    pub fn primary_label(&self) -> Option<&DiagnosticLabel> {
+        self.labels
+            .iter()
+            .find(|label| label.style == LabelStyle::Primary)
     }
 
     #[must_use]
@@ -176,6 +226,17 @@ mod tests {
     }
 
     #[test]
+    fn primary_label_skips_secondary_labels() {
+        let secondary = span(1, 3);
+        let primary = span(5, 8);
+        let diagnostic = Diagnostic::error("bad")
+            .with_secondary_message(secondary, "related")
+            .with_primary(primary);
+
+        assert_eq!(diagnostic.primary_label().unwrap().span, primary);
+    }
+
+    #[test]
     fn note_and_help_builders_append_adapter_data() {
         let diagnostic = Diagnostic::warning("deprecated")
             .with_note("since 1.0")
@@ -184,6 +245,50 @@ mod tests {
 
         assert_eq!(diagnostic.notes(), &["since 1.0", "use the new API"]);
         assert_eq!(diagnostic.help(), Some("rename it"));
+    }
+
+    #[test]
+    fn report_anchor_prefers_valid_primary_label() {
+        let mut sources = SourceTable::default();
+        let source = sources.add(SourceKind::Virtual, "test", None, "abcdef");
+        let primary = SourceSpan::new(source, 0, 1);
+        let secondary = SourceSpan::new(source, 2, 3);
+        let diagnostic = Diagnostic::error("bad")
+            .with_secondary_message(secondary, "related")
+            .with_primary(primary);
+        let report = DiagnosticReport {
+            sources,
+            diagnostics: vec![diagnostic],
+        };
+
+        assert_eq!(report.source(source).unwrap().label(), "test");
+        assert_eq!(
+            report.anchor_label(&report.diagnostics[0]).unwrap().span,
+            primary
+        );
+    }
+
+    #[test]
+    fn report_anchor_falls_back_to_valid_secondary_label() {
+        let mut report_sources = SourceTable::default();
+        let valid_source = report_sources.add(SourceKind::Virtual, "test", None, "abcdef");
+        let mut other_sources = SourceTable::default();
+        other_sources.add(SourceKind::Virtual, "other", None, "x");
+        let invalid_source = other_sources.add(SourceKind::Virtual, "missing", None, "x");
+        let primary = SourceSpan::new(invalid_source, 0, 1);
+        let secondary = SourceSpan::new(valid_source, 2, 3);
+        let diagnostic = Diagnostic::error("bad")
+            .with_primary(primary)
+            .with_secondary_message(secondary, "related");
+        let report = DiagnosticReport {
+            sources: report_sources,
+            diagnostics: vec![diagnostic],
+        };
+
+        assert_eq!(
+            report.anchor_label(&report.diagnostics[0]).unwrap().span,
+            secondary
+        );
     }
 
     #[test]
