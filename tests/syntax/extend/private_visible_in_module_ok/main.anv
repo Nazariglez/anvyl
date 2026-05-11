@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+import helper { use_private_extend };
+
+fn main() {
+    let x: int = use_private_extend();
+}

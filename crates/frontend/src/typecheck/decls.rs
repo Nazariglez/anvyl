@@ -1205,6 +1205,7 @@ pub(crate) enum VariantPayload {
 pub(crate) struct ExtendSchema {
     pub(crate) id: ExtendId,
     pub(crate) origin: ModuleScope,
+    pub(crate) exported: bool,
     pub(crate) target: Type,
     pub(crate) generics: GenericParams,
     pub(crate) methods: HashMap<MethodKey, ExtendMethodSchema>,
@@ -2067,9 +2068,6 @@ impl DeclarationIndex {
                         index: extend_index,
                     };
                     extend_index += 1;
-                    if !exported {
-                        continue;
-                    }
                     let ext = &extend_node.node;
                     let generics = generic_params(&ext.type_params, &ext.const_params);
                     let mut methods = HashMap::new();
@@ -2124,6 +2122,7 @@ impl DeclarationIndex {
                     self.extends.push(ExtendSchema {
                         id,
                         origin: scope.clone(),
+                        exported,
                         target: ext.ty.clone(),
                         generics,
                         methods,
@@ -3000,7 +2999,8 @@ impl DeclarationIndex {
         name: Ident,
     ) -> bool {
         self.extends().any(|ext| {
-            ext.methods.contains_key(&MethodKey::instance(name))
+            ext.exported
+                && ext.methods.contains_key(&MethodKey::instance(name))
                 && self.module_surface_contains(module, &ext.origin)
         })
     }
@@ -3012,7 +3012,7 @@ impl DeclarationIndex {
         name: Ident,
     ) -> Option<ExtendMethodMatch<'_>> {
         self.find_instance_extend_method(receiver, name, |ext| {
-            self.module_surface_contains(module, &ext.origin)
+            ext.exported && self.module_surface_contains(module, &ext.origin)
         })
     }
 

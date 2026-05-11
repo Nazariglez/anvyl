@@ -1,0 +1,9 @@
+// @helper
+
+extend int {
+    fn plus_one(self) -> int { self + 1 }
+}
+
+pub fn use_private_extend() -> int {
+    1.plus_one()
+}

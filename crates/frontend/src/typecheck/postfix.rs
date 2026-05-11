@@ -911,7 +911,7 @@ fn static_extend_subject(
     let decls = &tc.decls;
     let current_module = &tc.current_module;
     let matched = decls.find_static_extend_method(target, name, |ext| {
-        TypeChecker::extend_visible_in(decls, current_module, &ext.origin)
+        TypeChecker::extend_visible_in(decls, current_module, ext)
     })?;
     let subject = match member::extend_method_parts(target.clone(), name, &matched) {
         Ok((extend, method, _, owner_args)) => {

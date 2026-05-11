@@ -1997,21 +1997,22 @@ impl TypeChecker {
         (value.module, value.name, value.decl)
     }
 
-    fn extend_visible(&self, origin: &ModuleScope) -> bool {
-        Self::extend_visible_in(&self.decls, &self.current_module, origin)
+    fn extend_visible(&self, extend: &ExtendSchema) -> bool {
+        Self::extend_visible_in(&self.decls, &self.current_module, extend)
     }
 
     fn extend_visible_in(
         decls: &DeclarationIndex,
         current_module: &ModuleScope,
-        origin: &ModuleScope,
+        extend: &ExtendSchema,
     ) -> bool {
-        origin == current_module || decls.imports_module(current_module, origin)
+        extend.origin == *current_module
+            || (extend.exported && decls.imports_module(current_module, &extend.origin))
     }
 
     fn find_extend_method(&self, receiver: &Type, name: Ident) -> Option<ExtendMethodMatch<'_>> {
         self.decls
-            .find_instance_extend_method(receiver, name, |ext| self.extend_visible(&ext.origin))
+            .find_instance_extend_method(receiver, name, |ext| self.extend_visible(ext))
     }
 
     fn find_static_extend_method(
@@ -2020,7 +2021,7 @@ impl TypeChecker {
         name: Ident,
     ) -> Option<ExtendMethodMatch<'_>> {
         self.decls
-            .find_static_extend_method(target, name, |ext| self.extend_visible(&ext.origin))
+            .find_static_extend_method(target, name, |ext| self.extend_visible(ext))
     }
 
     fn has_explicit_cast_conversion(&self, source: &Type, target: &Type) -> bool {
@@ -2032,7 +2033,7 @@ impl TypeChecker {
     fn has_cast_from_conversion(&self, source: &Type, target: &Type) -> bool {
         matches!(
             self.decls
-                .find_cast_conversion(source, target, |ext| self.extend_visible(&ext.origin)),
+                .find_cast_conversion(source, target, |ext| self.extend_visible(ext)),
             Some(CastConversionMatch::Match)
         )
     }

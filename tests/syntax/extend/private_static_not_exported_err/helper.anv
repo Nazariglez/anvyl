@@ -1,0 +1,5 @@
+// @helper
+
+extend int {
+    fn secret() -> int { 1 }
+}

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: plus_one
+
+import helper;
+
+fn main() {
+    let x = helper.plus_one(1);
+}
