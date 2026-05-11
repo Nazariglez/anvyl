@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Failed to parse program
+
+struct Entity { id: int }
+
+enum Event {
+    Spawn { embed entity: Entity },
+}

@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Health {
+    hp: int,
+
+    fn damage(var self, amount: int) {
+        self.hp -= amount;
+    }
+}
+
+struct Enemy {
+    embed health: Health,
+}
+
+fn test(var enemy: Enemy) {
+    enemy.damage(3);
+}

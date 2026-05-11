@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use super::{const_term::ConstTerm, decls::CallableId, type_ops::TypeFolder};
+use super::{
+    ArgumentProjectionMap, CallMap, ExternUseMap, MemberPathMap, const_term::ConstTerm,
+    decls::CallableId, type_ops::TypeFolder,
+};
 use crate::{
     ast::{
         ArrayLen, ConstArg, ConstParam, ConstParamId, ExprId, GenericArg, Type, TypeParam,
@@ -65,16 +68,25 @@ pub(crate) struct SpecializationKey {
 
 pub(crate) type SpecializedBodyTypes = HashMap<ExprId, (Span, Type)>;
 
+#[derive(Clone, Default)]
+pub(crate) struct SpecializedBodyFacts {
+    pub(crate) types: SpecializedBodyTypes,
+    pub(crate) calls: CallMap,
+    pub(crate) extern_uses: ExternUseMap,
+    pub(crate) member_paths: MemberPathMap,
+    pub(crate) argument_projections: ArgumentProjectionMap,
+}
+
 #[derive(Clone)]
 pub(crate) struct SpecializedBody {
-    pub(crate) types: SpecializedBodyTypes,
+    pub(crate) facts: SpecializedBodyFacts,
     pub(crate) inferred_ret: Option<Type>,
 }
 
 #[derive(Clone)]
 pub(crate) enum SpecializationState {
     InProgress,
-    Done(SpecializedBody),
+    Done(Box<SpecializedBody>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

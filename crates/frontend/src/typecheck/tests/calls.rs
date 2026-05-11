@@ -113,6 +113,167 @@ fn generic_fn_call_target() {
 }
 
 #[test]
+fn cached_generic_specialization_restores_call_targets() {
+    let result = check(
+        r#"
+        fn id<T>(x: T) -> T { x }
+        fn wrap<T>(x: T) -> T { id(x) }
+        fn main() {
+            wrap(1);
+            wrap("x");
+            wrap(2);
+        }
+        "#,
+    )
+    .unwrap();
+    let id = CallableId::function(ModuleScope::Root, Ident::new("id"));
+    let target = result
+        .calls()
+        .values()
+        .find(|target| target.id == id)
+        .expect("missing nested call target");
+    assert_eq!(
+        target,
+        &CallTarget::new(
+            id,
+            GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![],
+            }
+        )
+    );
+}
+
+#[test]
+fn projected_var_as_records_argument_projection() {
+    let result = check(
+        r#"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        fn move_entity(var entity: as Entity) { entity.x += 1; }
+        fn main() {
+            var enemy = Enemy { entity: Entity { x: 1 } };
+            move_entity(enemy);
+        }
+        "#,
+    )
+    .unwrap();
+    let fact = result
+        .argument_projections()
+        .values()
+        .next()
+        .expect("missing projection fact");
+
+    assert_eq!(fact.arg_index, 0);
+    assert_eq!(fact.path, vec![Ident::new("entity")]);
+    assert_eq!(
+        fact.target_ty,
+        Type::nominal(
+            NominalKind::Struct,
+            Ident::new("Entity"),
+            vec![],
+            vec![],
+            None
+        )
+    );
+}
+
+#[test]
+fn dependent_projected_var_as_records_specialized_argument_projection() {
+    let result = check(
+        r#"
+        struct Entity { x: int }
+        struct Box<T> { @as embed value: T }
+        fn move_entity(var entity: as Entity) { entity.x += 1; }
+        fn move_box<T>(var box: Box<T>) { move_entity(box); }
+        fn main() {
+            var box = Box<Entity> { value: Entity { x: 1 } };
+            move_box<Entity>(box);
+            move_box<Entity>(box);
+        }
+        "#,
+    )
+    .unwrap();
+    let fact = result
+        .argument_projections()
+        .values()
+        .next()
+        .expect("missing projection fact");
+
+    assert_eq!(fact.arg_index, 0);
+    assert_eq!(fact.path, vec![Ident::new("value")]);
+    assert_eq!(
+        fact.target_ty,
+        Type::nominal(
+            NominalKind::Struct,
+            Ident::new("Entity"),
+            vec![],
+            vec![],
+            None
+        )
+    );
+}
+
+#[test]
+fn exact_var_as_records_no_projection() {
+    let result = check(
+        r#"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        fn move_entity(var entity: as Entity) { entity.x += 1; }
+        fn main() {
+            var enemy = Enemy { entity: Entity { x: 1 } };
+            move_entity(enemy.entity);
+        }
+        "#,
+    )
+    .unwrap();
+
+    assert!(result.argument_projections().is_empty());
+}
+
+#[test]
+fn by_value_as_records_no_projection() {
+    let result = check(
+        r#"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        extend Entity {
+            cast from(enemy: Enemy) { enemy.entity }
+        }
+        fn take(entity: as Entity) {}
+        fn main() {
+            let enemy = Enemy { entity: Entity { x: 1 } };
+            take(enemy);
+        }
+        "#,
+    )
+    .unwrap();
+
+    assert!(result.argument_projections().is_empty());
+}
+
+#[test]
+fn explicit_cast_records_no_projection() {
+    let result = check(
+        r#"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        extend Entity {
+            cast from(enemy: Enemy) { enemy.entity }
+        }
+        fn main() {
+            let enemy = Enemy { entity: Entity { x: 1 } };
+            let entity: Entity = enemy as Entity;
+        }
+        "#,
+    )
+    .unwrap();
+
+    assert!(result.argument_projections().is_empty());
+}
+
+#[test]
 fn explicit_prefix_call_target() {
     let result = check(
         "enum Option<T> { Some(T), None } fn make<T, U>(x: T) -> Option<U> { nil } fn main() -> Option<string> { make<int>(1) }",

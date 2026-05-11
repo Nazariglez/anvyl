@@ -397,14 +397,19 @@ fn trailing_comma_params() {
     assert_eq!(params[1].mutability, Mutability::Mutable);
 }
 
-fn parse_aggregate_method(source: &str) -> ast::Method {
+fn parse_aggregate(source: &str) -> ast::StructDecl {
     let mut prog = parse_program(source);
     assert_eq!(prog.stmts.len(), 1);
-    let ast::Stmt::Aggregate(struct_node) = prog.stmts.pop().unwrap().node else {
+    let ast::Stmt::Aggregate(node) = prog.stmts.pop().unwrap().node else {
         panic!("expected Aggregate");
     };
-    assert_eq!(struct_node.node.methods.len(), 1);
-    struct_node.node.methods.into_iter().next().unwrap()
+    node.node
+}
+
+fn parse_aggregate_method(source: &str) -> ast::Method {
+    let aggregate = parse_aggregate(source);
+    assert_eq!(aggregate.methods.len(), 1);
+    aggregate.methods.into_iter().next().unwrap()
 }
 
 fn parse_extend_method(source: &str) -> ast::ExtendMethod {
@@ -424,6 +429,86 @@ fn parse_extend(source: &str) -> ast::ExtendDecl {
         panic!("expected Extend");
     };
     extend_node.node
+}
+
+#[test]
+fn embed_field() {
+    let aggregate = parse_aggregate("struct S { embed transform: Transform }");
+    let field = &aggregate.fields[0];
+    assert_eq!(field.name.0.as_ref(), "transform");
+    assert!(matches!(
+        field.embed,
+        Some(ast::EmbedSpec { selector: None })
+    ));
+}
+
+#[test]
+fn embed_selector_and_default() {
+    let aggregate = parse_aggregate(
+        "struct S { embed health: Health { hp, max_hp as max, fn damage as hit } = Health {} }",
+    );
+    let field = &aggregate.fields[0];
+    let selector = field
+        .embed
+        .as_ref()
+        .and_then(|embed| embed.selector.as_ref())
+        .expect("missing selector");
+    assert_eq!(selector.items.len(), 3);
+    assert_eq!(selector.items[0].kind, ast::EmbedSelectorKind::Field);
+    assert_eq!(selector.items[0].name.0.as_ref(), "hp");
+    assert_eq!(selector.items[1].alias.unwrap().0.as_ref(), "max");
+    assert_eq!(selector.items[2].kind, ast::EmbedSelectorKind::Method);
+    assert_eq!(selector.items[2].alias.unwrap().0.as_ref(), "hit");
+    assert!(field.default.is_some());
+}
+
+#[test]
+fn dataref_embed_field() {
+    let aggregate = parse_aggregate("dataref S { embed body: Body }");
+    assert_eq!(aggregate.kind, ast::AggregateKind::DataRef);
+    assert!(aggregate.fields[0].embed.is_some());
+}
+
+#[test]
+fn enum_payload_rejects_embed() {
+    parse_program_err("enum E { V { embed body: Body } }");
+}
+
+#[test]
+fn empty_embed_selector_fails() {
+    parse_program_err("struct S { embed body: Body {} }");
+}
+
+#[test]
+fn selector_without_embed_fails() {
+    parse_program_err("struct S { body: Body { hp } }");
+}
+
+#[test]
+fn embed_is_identifier_outside_field_prefix() {
+    parse_program("fn main() { let embed = 1; embed; }");
+}
+
+#[test]
+fn as_annotation_parses() {
+    let aggregate = parse_aggregate("struct S { @as\n embed body: Body }");
+    let annotation = &aggregate.fields[0].annotations[0].node;
+    assert_eq!(annotation.name.0.as_ref(), "as");
+    assert_eq!(annotation.args, ast::AnnotationArgs::None);
+}
+
+#[test]
+fn non_as_keyword_annotation_fails() {
+    parse_program_err("struct S { @fn field: int }");
+}
+
+#[test]
+fn as_parameter_syntax_still_parses() {
+    let prog = parse_program("fn f(x: as int) {}");
+    let ast::Stmt::Func(func) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    assert!(func.node.params[0].cast_accept);
 }
 
 #[test]

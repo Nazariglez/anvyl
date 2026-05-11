@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity {
+    x: int,
+}
+
+type Body = Entity;
+
+struct Enemy {
+    @as embed entity: Body,
+}
+
+fn move_entity(var entity: as Entity) {
+    entity.x += 1;
+}
+
+fn test() {
+    var enemy = Enemy { entity: Entity { x: 1 } };
+    move_entity(enemy);
+}

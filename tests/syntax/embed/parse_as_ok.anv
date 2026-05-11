@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { id: int }
+
+struct Enemy {
+    @as
+    embed entity: Entity,
+}

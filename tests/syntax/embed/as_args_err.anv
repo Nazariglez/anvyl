@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: invalid arguments for `@as`
+
+struct Entity { id: int }
+
+struct Enemy {
+    @as("entity")
+    embed entity: Entity,
+}

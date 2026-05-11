@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unknown embed field selector 'hp'
+
+struct Box<T> {
+    embed value: T { hp },
+}
+
+fn test(box: Box<int>) {
+    box.hp;
+}

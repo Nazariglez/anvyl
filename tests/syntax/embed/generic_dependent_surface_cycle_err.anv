@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: embedded field surface for 'A' is recursive
+
+dataref A<T> {
+    embed b: B<T>,
+}
+
+dataref B<T> {
+    embed a: A<T>,
+    x: int,
+}
+
+fn test(a: A<int>) {
+    a.x;
+}

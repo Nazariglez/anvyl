@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type HostStats {
+    fn hp(self) -> int;
+    fn damage(var self, amount: int);
+}
+
+struct Enemy {
+    embed stats: HostStats,
+}
+
+fn test(var enemy: Enemy) {
+    let hp: int = enemy.hp();
+    enemy.damage(1);
+}

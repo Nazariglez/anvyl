@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: embed method selector 'fn hp' names a field; remove `fn`
+
+struct Health {
+    hp: int,
+}
+
+struct Enemy {
+    embed health: Health { fn hp },
+}

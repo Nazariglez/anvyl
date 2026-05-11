@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct A { x: int }
+struct B { v: string }
+
+struct Outer {
+    embed a: A { x as v },
+    embed b: B,
+}
+
+fn test(outer: Outer) {
+    let v: int = outer.v;
+}

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Marker {
+    embed: int,
+}
+
+fn test() {
+    let marker = Marker { embed: 1 };
+    let x: int = marker.embed;
+}

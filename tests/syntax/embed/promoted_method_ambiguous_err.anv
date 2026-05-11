@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: promoted method 'tick' for type 'Enemy' is ambiguous: a, b
+
+struct A {
+    fn tick(self) {}
+}
+
+struct B {
+    fn tick(self) {}
+}
+
+struct Enemy {
+    embed a: A,
+    embed b: B,
+}
+
+fn test(enemy: Enemy) {
+    enemy.tick();
+}

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Invalid cast
+
+struct Entity {
+    x: int,
+}
+
+struct Enemy {
+    @as embed entity: Entity,
+}
+
+fn test() {
+    let enemy = Enemy { entity: Entity { x: 1 } };
+    let entity: Entity = enemy as Entity;
+}

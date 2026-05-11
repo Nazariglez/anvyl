@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: promoted field 'x' for type 'Enemy' is ambiguous: a.x, b.x
+
+struct A { x: int }
+struct B { x: int }
+
+struct Enemy {
+    embed a: A,
+    embed b: B,
+}
+
+fn test(enemy: Enemy) {
+    let _x = enemy.x;
+}

@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Health {
+    hp: int,
+
+    fn damage(self) -> int {
+        self.hp
+    }
+}
+
+struct Box<T> {
+    embed value: T { hp as current, fn damage as hit },
+}
+
+fn test(box: Box<Health>) {
+    let hp: int = box.current;
+    let damage: int = box.hit();
+}

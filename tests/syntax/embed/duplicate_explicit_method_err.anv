@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate explicit promoted method 'tick' on 'Enemy'
+
+struct A {
+    fn tick(self) {}
+}
+
+struct B {
+    fn tick(self) {}
+}
+
+struct Enemy {
+    embed a: A { fn tick },
+    embed b: B { fn tick },
+}

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Rating {
+    score: int,
+
+    fn score(self) -> int { self.score }
+}
+
+struct Review {
+    embed rating: Rating { score, fn score as score_fn },
+}
+
+fn test(review: Review) {
+    let score: int = review.score;
+}

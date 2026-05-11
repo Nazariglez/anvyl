@@ -1,0 +1,14 @@
+// @helper
+
+pub struct Health {
+    fn damage(self) {}
+}
+
+pub struct Enemy {
+    @internal
+    embed health: Health { fn damage },
+}
+
+pub fn enemy() -> Enemy {
+    Enemy { health: Health {} }
+}

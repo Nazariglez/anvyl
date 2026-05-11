@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State { Idle }
+
+struct Enemy {
+    embed state: State,
+}

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    hash::Hash,
     rc::Rc,
 };
 
@@ -27,6 +28,7 @@ pub(crate) use self::{
     generic::*,
     result::*,
     semantic_use::*,
+    surface::*,
     type_ops::type_closure_facts,
     type_refs::{GenericTypeContext, TypeRefError},
 };
@@ -58,11 +60,13 @@ mod generic;
 mod generic_bind;
 mod infer;
 mod match_coverage;
+mod member;
 mod pattern;
 mod place;
 mod postfix;
 mod result;
 mod semantic_use;
+mod surface;
 mod type_ops;
 mod type_refs;
 
@@ -454,6 +458,42 @@ pub(crate) enum TypeError {
         ty: Type,
         member: Ident,
         kind: MemberAccessKind,
+        span: Option<SourceSpan>,
+    },
+    AmbiguousPromotedField {
+        ty: Type,
+        member: Ident,
+        candidates: Vec<Vec<Ident>>,
+        span: Option<SourceSpan>,
+    },
+    AmbiguousPromotedMethod {
+        ty: Type,
+        member: Ident,
+        candidates: Vec<Vec<Ident>>,
+        span: Option<SourceSpan>,
+    },
+    PromotedFieldNotStored {
+        ty: Type,
+        field: Ident,
+        paths: Vec<Vec<Ident>>,
+        span: Option<SourceSpan>,
+    },
+    DuplicateProjectionTarget {
+        source: Type,
+        target: Type,
+        paths: Vec<Vec<Ident>>,
+        span: Option<SourceSpan>,
+    },
+    ChainedProjection {
+        source: Type,
+        target: Type,
+        via: Vec<Ident>,
+        span: Option<SourceSpan>,
+    },
+    MissingProjection {
+        source: Type,
+        target: Type,
+        paths: Vec<Vec<Ident>>,
         span: Option<SourceSpan>,
     },
     InstanceMethodOnType {
@@ -895,8 +935,11 @@ struct TypeChecker {
     solver: Solver,
     calls: CallMap,
     extern_uses: ExternUseMap,
+    member_paths: MemberPathMap,
+    argument_projections: ArgumentProjectionMap,
     decls: DeclarationIndex,
     externs: ExternCatalog,
+    promoted_surfaces: HashMap<CanonicalTypeKey, PromotedSurface>,
     scopes: Vec<HashMap<Ident, LocalSymbol>>,
     local_type_scopes: LocalTypeScopes,
     lambda_frames: Vec<LambdaFrame>,
@@ -983,8 +1026,11 @@ impl TypeChecker {
             solver: Solver::default(),
             calls: HashMap::new(),
             extern_uses: HashMap::new(),
+            member_paths: HashMap::new(),
+            argument_projections: HashMap::new(),
             decls,
             externs,
+            promoted_surfaces: HashMap::new(),
             scopes: vec![],
             local_type_scopes: LocalTypeScopes::default(),
             lambda_frames: vec![],
@@ -1462,6 +1508,28 @@ impl TypeChecker {
         self.extern_uses.entry(expr_id).or_default().push(target);
     }
 
+    pub(crate) fn record_member_path(&mut self, fact: MemberPathFact) {
+        self.member_paths.insert(fact.expr_id, fact);
+    }
+
+    pub(crate) fn record_argument_projection(&mut self, fact: ArgumentProjectionFact) {
+        self.argument_projections
+            .insert((fact.call_id, fact.arg_index), fact);
+    }
+
+    fn promoted_surface_for(&mut self, receiver: &Type) -> Option<PromotedSurface> {
+        let key = CanonicalTypeKey(receiver.clone());
+        if let Some(surface) = self.promoted_surfaces.get(&key) {
+            return Some(surface.clone());
+        }
+        let (surface, errors) = self.decls.promoted_surface_for(receiver, &self.externs)?;
+        for error in errors {
+            self.push_error_once(TypeError::Decl(error));
+        }
+        self.promoted_surfaces.insert(key, surface.clone());
+        Some(surface)
+    }
+
     fn reject_extern_any_escape(&mut self, checked: &CheckedType, span: Span) {
         self.reject_extern_any_escape_fact(checked.contains_extern_any, span);
     }
@@ -1571,12 +1639,6 @@ impl TypeChecker {
 
     fn push_warning(&mut self, warning: TypeWarning) {
         self.warnings.push(warning);
-    }
-
-    fn check_field_access_policy(&mut self, owner: &Type, name: Ident, span: Span) {
-        if let Some((origin, policy)) = self.decls.aggregate_field_policy(owner, name) {
-            self.check_access_policy(&policy, MemberAccessKind::Field, name, owner, &origin, span);
-        }
     }
 
     fn check_matched_field_access_policy(
@@ -1719,6 +1781,33 @@ impl TypeChecker {
                 errors: &mut self.errors,
             },
         );
+    }
+
+    fn check_stored_field_path_access(&mut self, owner: &Type, path: &[Ident], span: Span) {
+        let mut owner = owner.clone();
+        for name in path {
+            let Some(key) = self.decls.key_for_type(&owner) else {
+                return;
+            };
+            let Some(aggregate) = self.decls.aggregate(&key) else {
+                return;
+            };
+            let Some(field) = aggregate.fields.get(name) else {
+                return;
+            };
+            let policy = field.policy.clone();
+            let field_ty = substitute_aggregate_member(&owner, &aggregate.generics, &field.ty);
+            let origin = key.module;
+            self.check_access_policy(
+                &policy,
+                MemberAccessKind::Field,
+                *name,
+                &owner,
+                &origin,
+                span,
+            );
+            owner = field_ty;
+        }
     }
 
     fn push_error_once(&mut self, err: TypeError) {
@@ -1880,9 +1969,27 @@ impl TypeChecker {
         self.specializations.insert(key, state);
     }
 
-    fn restore_specialization(&mut self, body_types: SpecializedBodyTypes) {
-        for (id, (span, ty)) in body_types {
+    fn specialization_facts(&self) -> SpecializedBodyFacts {
+        SpecializedBodyFacts {
+            types: self.expr_types(),
+            calls: self.calls.clone(),
+            extern_uses: self.extern_uses.clone(),
+            member_paths: self.member_paths.clone(),
+            argument_projections: self.argument_projections.clone(),
+        }
+    }
+
+    fn restore_specialization(&mut self, facts: SpecializedBodyFacts) {
+        for (id, (span, ty)) in facts.types {
             self.set_type(id, ty, span);
+        }
+        self.calls.extend(facts.calls);
+        self.extern_uses.extend(facts.extern_uses);
+        for fact in facts.member_paths.into_values() {
+            self.record_member_path(fact);
+        }
+        for fact in facts.argument_projections.into_values() {
+            self.record_argument_projection(fact);
         }
     }
 
@@ -2367,6 +2474,12 @@ impl TypeChecker {
         }
         validate_type_alias_decls(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
+        for error in decls.build_projection_entries() {
+            self.push_error(TypeError::Decl(error));
+        }
+        for error in decls.build_promoted_surfaces(&self.externs) {
+            self.push_error(TypeError::Decl(error));
+        }
         self.current_module = saved_module;
         self.decls = decls;
     }
@@ -4318,7 +4431,7 @@ fn check_specialized_callable_body(
         }
         Some(SpecializationState::InProgress) => return None,
         Some(SpecializationState::Done(body)) => {
-            tc.restore_specialization(body.types);
+            tc.restore_specialization(body.facts);
             return body.inferred_ret;
         }
         None => {}
@@ -4366,7 +4479,7 @@ fn check_with_specialization(
     tc: &mut TypeChecker,
     check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
 ) -> Option<Type> {
-    let old_types = tc.expr_types();
+    let old_facts = tc.specialization_facts();
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
     tc.push_type_subst(type_subst);
     tc.push_const_subst(const_subst);
@@ -4380,10 +4493,10 @@ fn check_with_specialization(
     tc.pop_type_subst();
     tc.store_specialization(
         key,
-        SpecializationState::Done(SpecializedBody {
-            types: specialized_body_types(&old_types, &tc.expr_types()),
+        SpecializationState::Done(Box::new(SpecializedBody {
+            facts: specialized_body_facts(&old_facts, &tc.specialization_facts()),
             inferred_ret: inferred_ret.clone(),
-        }),
+        })),
     );
     inferred_ret
 }
@@ -4414,15 +4527,29 @@ fn callable_const_bindings(
     bindings
 }
 
-fn specialized_body_types(
-    old_types: &HashMap<ExprId, (Span, Type)>,
-    types: &HashMap<ExprId, (Span, Type)>,
-) -> SpecializedBodyTypes {
-    types
+fn specialized_body_facts(
+    old: &SpecializedBodyFacts,
+    current: &SpecializedBodyFacts,
+) -> SpecializedBodyFacts {
+    SpecializedBodyFacts {
+        types: map_delta(&old.types, &current.types),
+        calls: map_delta(&old.calls, &current.calls),
+        extern_uses: map_delta(&old.extern_uses, &current.extern_uses),
+        member_paths: map_delta(&old.member_paths, &current.member_paths),
+        argument_projections: map_delta(&old.argument_projections, &current.argument_projections),
+    }
+}
+
+fn map_delta<K, V>(old: &HashMap<K, V>, current: &HashMap<K, V>) -> HashMap<K, V>
+where
+    K: Copy + Eq + Hash,
+    V: Clone + PartialEq,
+{
+    current
         .iter()
-        .filter_map(|(id, ty)| match old_types.get(id) {
-            Some(old) if old == ty => None,
-            _ => Some((*id, ty.clone())),
+        .filter_map(|(id, item)| match old.get(id) {
+            Some(old_item) if old_item == item => None,
+            _ => Some((*id, item.clone())),
         })
         .collect()
 }

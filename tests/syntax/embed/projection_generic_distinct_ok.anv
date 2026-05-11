@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Pair<T, U> {
+    @as embed left: T,
+    @as embed right: U,
+}
+
+fn take_int(var x: as int) {
+    x += 1;
+}
+
+fn take_string(var x: as string) {
+    x = x + "!";
+}
+
+fn test() {
+    var pair = Pair<int, string> { left: 1, right: "x" };
+    take_int(pair);
+    take_string(pair);
+}

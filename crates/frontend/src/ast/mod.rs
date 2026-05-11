@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use internment::Intern;
 
-use crate::span::Spanned;
+use crate::span::{Span, Spanned};
 
 pub type ModulePath = std::rc::Rc<[String]>;
 
@@ -808,8 +808,34 @@ pub enum ExternTypeMember {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EmbedSpec {
+    pub selector: Option<EmbedSelector>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbedSelector {
+    pub items: Vec<EmbedSelectorItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbedSelectorItem {
+    pub kind: EmbedSelectorKind,
+    pub name: Ident,
+    pub alias: Option<Ident>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedSelectorKind {
+    Field,
+    Method,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
     pub annotations: Vec<AnnotationNode>,
+    pub embed: Option<EmbedSpec>,
+    pub span: Span,
     pub name: Ident,
     pub ty: Type,
     pub default: Option<ExprNode>,

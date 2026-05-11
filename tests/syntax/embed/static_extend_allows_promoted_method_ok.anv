@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Part {
+    fn tick(self) {}
+}
+
+struct Actor {
+    embed part: Part,
+}
+
+extend Actor {
+    fn tick() {}
+}
+
+fn main() {
+    let actor = Actor { part: Part {} };
+    actor.tick();
+    Actor.tick();
+}

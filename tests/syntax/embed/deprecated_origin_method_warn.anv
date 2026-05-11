@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: use hit
+
+struct Health {
+    @deprecated("use hit")
+    fn damage(self) {}
+}
+
+struct Enemy {
+    embed health: Health,
+}
+
+fn test(enemy: Enemy) {
+    enemy.damage();
+}

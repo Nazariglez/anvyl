@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unknown embed field selector 'missing'
+
+struct Health { hp: int }
+
+struct Enemy {
+    embed health: Health { missing },
+}

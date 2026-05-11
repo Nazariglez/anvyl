@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn touch(var x: as int) {
+    x = x + 1;
+}
+
+fn main() {
+    var x = 1;
+    touch(x);
+}

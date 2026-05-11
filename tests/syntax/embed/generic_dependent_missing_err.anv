@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown field 'hp' for type 'Box<int>'
+
+struct Box<T> {
+    embed value: T,
+}
+
+fn test(box: Box<int>) {
+    box.hp;
+}

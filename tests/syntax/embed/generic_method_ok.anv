@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> {
+    value: T,
+
+    fn get(self) -> T {
+        self.value
+    }
+
+    fn keep<U>(self, value: U) -> U {
+        value
+    }
+}
+
+struct Enemy {
+    embed health: Box<int>,
+}
+
+fn test(enemy: Enemy) {
+    let hp: int = enemy.get();
+    let label: string = enemy.keep<string>("hp");
+}

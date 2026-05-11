@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: explicit promoted field 'hp' conflicts with direct field on 'Enemy'
+
+struct Health { hp: int }
+
+struct Enemy {
+    hp: int,
+    embed health: Health { hp },
+}

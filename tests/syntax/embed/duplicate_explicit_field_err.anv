@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate explicit promoted field 'x' on 'Enemy'
+
+struct A { x: int }
+struct B { x: int }
+
+struct Enemy {
+    embed a: A { x },
+    embed b: B { x },
+}

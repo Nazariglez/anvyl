@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected 'Entity'
+
+struct Entity {
+    x: int,
+}
+
+struct Enemy {
+    @as embed entity: Entity,
+}
+
+fn move_entity(var entity: Entity) {
+    entity.x += 1;
+}
+
+fn test() {
+    var enemy = Enemy { entity: Entity { x: 1 } };
+    move_entity(enemy);
+}

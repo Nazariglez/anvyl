@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: same variable
+
+struct Entity {
+    x: int,
+}
+
+struct Enemy {
+    @as embed entity: Entity,
+}
+
+fn touch(var a: as Entity, var b: as Entity) {}
+
+fn test() {
+    var enemy = Enemy { entity: Entity { x: 1 } };
+    touch(enemy, enemy.entity);
+}

@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Health {
+    hp: int,
+}
+
+struct Box<T> {
+    embed value: T,
+}
+
+struct Wrapper<T> {
+    embed box: Box<T>,
+}
+
+fn test(wrapper: Wrapper<Health>) {
+    let hp: int = wrapper.hp;
+}

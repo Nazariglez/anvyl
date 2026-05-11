@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Health {
+    hp: int,
+    max_hp: int,
+
+    fn damage(self) {}
+}
+
+struct Enemy {
+    embed health: Health { hp, max_hp as max, fn damage as hit },
+}

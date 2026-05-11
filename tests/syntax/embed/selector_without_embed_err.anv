@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: embed selectors require an embedded field
+
+struct Health { hp: int }
+
+struct Enemy {
+    health: Health { hp },
+}

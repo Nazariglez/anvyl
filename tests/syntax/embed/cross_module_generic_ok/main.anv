@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import lib { health_box };
+
+fn test() {
+    let box = health_box();
+    let hp: int = box.hp;
+}

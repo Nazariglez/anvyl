@@ -882,6 +882,8 @@ impl<'tc> PatternChecker<'tc> {
                                 ty: field.ty.ty.clone(),
                                 has_default: false,
                                 policy: annotation::AccessPolicy::default(),
+                                span: None,
+                                embed: None,
                             },
                         )
                     })

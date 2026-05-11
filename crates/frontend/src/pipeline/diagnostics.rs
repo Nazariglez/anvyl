@@ -5,7 +5,7 @@ use anvyx_externs::{
 use chumsky::error::{Rich, RichReason};
 
 use crate::{
-    ast::{ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, Type},
+    ast::{self, ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, Type},
     conditional::ConditionalError,
     diagnostic::Diagnostic,
     externs::{
@@ -742,6 +742,60 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             let kind = render_member_access_kind(*kind);
             format!("Unknown {kind} '{member}' for type '{ty}'")
         }
+        TypeError::AmbiguousPromotedField {
+            ty,
+            member,
+            candidates,
+            ..
+        } => {
+            let candidates = render_ident_paths(candidates);
+            format!("promoted field '{member}' for type '{ty}' is ambiguous: {candidates}")
+        }
+        TypeError::AmbiguousPromotedMethod {
+            ty,
+            member,
+            candidates,
+            ..
+        } => {
+            let candidates = render_ident_paths(candidates);
+            format!("promoted method '{member}' for type '{ty}' is ambiguous: {candidates}")
+        }
+        TypeError::PromotedFieldNotStored {
+            ty, field, paths, ..
+        } => {
+            let paths = render_ident_paths(paths);
+            format!(
+                "promoted field '{field}' is not a stored field of '{ty}'; use stored path {paths}"
+            )
+        }
+        TypeError::DuplicateProjectionTarget {
+            source,
+            target,
+            paths,
+            ..
+        } => {
+            let paths = render_ident_paths(paths);
+            format!(
+                "projection from '{source}' to '{target}' is ambiguous; direct @as embed paths: {paths}"
+            )
+        }
+        TypeError::ChainedProjection {
+            source,
+            target,
+            via,
+            ..
+        } => {
+            let via = render_ident_path(via);
+            format!(
+                "projection from '{source}' to '{target}' would require chaining through '{via}'; declare a direct `@as embed` field"
+            )
+        }
+        TypeError::MissingProjection {
+            source,
+            target,
+            paths,
+            ..
+        } => render_missing_projection(source, target, paths),
         TypeError::InstanceMethodOnType { ty, method, .. } => {
             format!("instance method '{method}' requires a value of type '{ty}'")
         }
@@ -1116,6 +1170,12 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::LetElseMustDiverge { span, .. }
         | TypeError::MemberAccessOnNonAggregate { span, .. }
         | TypeError::UnknownMember { span, .. }
+        | TypeError::AmbiguousPromotedField { span, .. }
+        | TypeError::AmbiguousPromotedMethod { span, .. }
+        | TypeError::PromotedFieldNotStored { span, .. }
+        | TypeError::DuplicateProjectionTarget { span, .. }
+        | TypeError::ChainedProjection { span, .. }
+        | TypeError::MissingProjection { span, .. }
         | TypeError::InstanceMethodOnType { span, .. }
         | TypeError::StaticMethodOnValue { span, .. }
         | TypeError::ReadonlyMethodMutation { span, .. }
@@ -1194,8 +1254,26 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::InvalidAnnotationTarget { span, .. }
         | DeclError::DuplicateAnnotation { span, .. }
         | DeclError::InvalidAnnotationArgs { span, .. }
+        | DeclError::AsProjectionWithoutEmbed { span }
+        | DeclError::AsProjectionWithArgs { span }
         | DeclError::InternalOnToString { span }
-        | DeclError::InvalidToStringMethod { span, .. } => *span,
+        | DeclError::InvalidToStringMethod { span, .. }
+        | DeclError::EmptyEmbedSelector { span }
+        | DeclError::DuplicateEmbedSelector { span, .. }
+        | DeclError::EmbedSurfaceCycle { span, .. }
+        | DeclError::UnknownEmbedFieldSelector { span, .. }
+        | DeclError::EmbedFieldSelectorNamesMethod { span, .. }
+        | DeclError::AmbiguousEmbedFieldSelector { span, .. }
+        | DeclError::EmbedFieldConflictsWithDirect { span, .. }
+        | DeclError::DuplicateExplicitEmbedField { span, .. }
+        | DeclError::UnknownEmbedMethodSelector { span, .. }
+        | DeclError::EmbedMethodSelectorNamesField { span, .. }
+        | DeclError::EmbedMethodSelectorNamesStatic { span, .. }
+        | DeclError::EmbedMethodSelectorNamesToString { span }
+        | DeclError::AmbiguousEmbedMethodSelector { span, .. }
+        | DeclError::EmbedMethodConflictsWithDirect { span, .. }
+        | DeclError::DuplicateExplicitEmbedMethod { span, .. }
+        | DeclError::DuplicateProjectionTarget { span, .. } => *span,
     }
 }
 
@@ -1359,10 +1437,10 @@ fn render_detailed_generic_args(rendered: &mut String, types: &[Type], consts: &
     rendered.push('>');
 }
 
-fn render_detailed_generic_arg(arg: &crate::ast::GenericArg) -> String {
+fn render_detailed_generic_arg(arg: &ast::GenericArg) -> String {
     match arg {
-        crate::ast::GenericArg::Type(ty) => render_detailed_type(ty),
-        crate::ast::GenericArg::Const(arg) => arg.to_string(),
+        ast::GenericArg::Type(ty) => render_detailed_type(ty),
+        ast::GenericArg::Const(arg) => arg.to_string(),
     }
 }
 
@@ -1610,6 +1688,34 @@ fn render_qualified_name(qualifier: Option<Ident>, name: Ident) -> String {
     }
 }
 
+fn render_ident_path(path: &[Ident]) -> String {
+    path.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn render_ident_paths(paths: &[Vec<Ident>]) -> String {
+    paths
+        .iter()
+        .map(|path| render_ident_path(path))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_missing_projection(source: &Type, target: &Type, paths: &[Vec<Ident>]) -> String {
+    if paths.is_empty() {
+        return format!(
+            "no direct `@as embed` projection from '{source}' to '{target}'; pass a mutable '{target}' place or declare a direct `@as embed` field"
+        );
+    }
+
+    format!(
+        "no direct `@as embed` projection from '{source}' to '{target}'; pass stored path {} or mark it with `@as embed`",
+        render_ident_paths(paths)
+    )
+}
+
 fn render_decl_error(error: &DeclError) -> String {
     match error {
         DeclError::DuplicateValue { name, .. } => format!("value '{name}' is already declared"),
@@ -1727,10 +1833,83 @@ fn render_decl_error(error: &DeclError) -> String {
         DeclError::InvalidAnnotationArgs { name, message, .. } => {
             format!("invalid arguments for `@{name}`: {message}")
         }
+        DeclError::AsProjectionWithoutEmbed { .. } => {
+            "`@as` is not valid on field declarations: can only be applied to embedded fields"
+                .to_string()
+        }
+        DeclError::AsProjectionWithArgs { .. } => {
+            "invalid arguments for `@as`: this annotation does not accept arguments".to_string()
+        }
         DeclError::InternalOnToString { .. } => {
             "`@internal` cannot be applied to `to_string` methods".to_string()
         }
         DeclError::InvalidToStringMethod { message, .. } => message.to_string(),
+        DeclError::EmptyEmbedSelector { .. } => "embed selector cannot be empty".to_string(),
+        DeclError::DuplicateEmbedSelector { name, kind, .. } => {
+            let namespace = match kind {
+                ast::EmbedSelectorKind::Field => "field",
+                ast::EmbedSelectorKind::Method => "method",
+            };
+            format!("duplicate embed {namespace} selector '{name}'")
+        }
+        DeclError::EmbedSurfaceCycle { owner, .. } => {
+            format!("embedded field surface for '{}' is recursive", owner.name)
+        }
+        DeclError::UnknownEmbedFieldSelector { name, .. } => {
+            format!("unknown embed field selector '{name}'")
+        }
+        DeclError::EmbedFieldSelectorNamesMethod { name, .. } => {
+            format!("embed field selector '{name}' names a method; use `fn {name}`")
+        }
+        DeclError::AmbiguousEmbedFieldSelector { name, .. } => {
+            format!("embed field selector '{name}' is ambiguous")
+        }
+        DeclError::EmbedFieldConflictsWithDirect { owner, name, .. } => {
+            format!(
+                "explicit promoted field '{name}' conflicts with direct field on '{}'",
+                owner.name
+            )
+        }
+        DeclError::DuplicateExplicitEmbedField { owner, name, .. } => {
+            format!(
+                "duplicate explicit promoted field '{name}' on '{}'",
+                owner.name
+            )
+        }
+        DeclError::UnknownEmbedMethodSelector { name, .. } => {
+            format!("unknown embed method selector '{name}'")
+        }
+        DeclError::EmbedMethodSelectorNamesField { name, .. } => {
+            format!("embed method selector 'fn {name}' names a field; remove `fn`")
+        }
+        DeclError::EmbedMethodSelectorNamesStatic { name, .. } => {
+            format!("embed method selector 'fn {name}' names a static method")
+        }
+        DeclError::EmbedMethodSelectorNamesToString { .. } => {
+            "`to_string` is not promoted; use the explicit path or define it on the outer type"
+                .to_string()
+        }
+        DeclError::AmbiguousEmbedMethodSelector { name, .. } => {
+            format!("embed method selector 'fn {name}' is ambiguous")
+        }
+        DeclError::EmbedMethodConflictsWithDirect { owner, name, .. } => {
+            format!(
+                "explicit promoted method '{name}' conflicts with direct method on '{}'",
+                owner.name
+            )
+        }
+        DeclError::DuplicateExplicitEmbedMethod { owner, name, .. } => {
+            format!(
+                "duplicate explicit promoted method '{name}' on '{}'",
+                owner.name
+            )
+        }
+        DeclError::DuplicateProjectionTarget { owner, target, .. } => {
+            format!(
+                "duplicate `@as embed` projection target '{target}' on '{}'",
+                owner.name
+            )
+        }
     }
 }
 

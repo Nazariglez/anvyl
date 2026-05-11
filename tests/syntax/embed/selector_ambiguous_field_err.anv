@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: embed field selector 'x' is ambiguous
+
+struct A { x: int }
+struct B { x: int }
+struct Both {
+    embed a: A,
+    embed b: B,
+}
+
+struct Outer {
+    embed both: Both { x },
+}

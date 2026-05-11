@@ -1,19 +1,20 @@
 use anvyx_externs::ReceiverMode;
 
 use super::{
-    CallForm, CallTarget, CheckedType, ConstSubst, ExternUseTarget, GenericArgs, GenericParams,
-    MemberAccessKind, PlaceAccess, TypeChecker, TypeError, TypeSubst, VariantShape,
-    check_arg_count, check_arg_range, check_expr_checked, checked_type,
+    ArgumentProjectionFact, CallForm, CallTarget, CheckedType, ConstSubst, Exposure,
+    ExternUseTarget, GenericArgs, GenericParams, MemberAccessKind, MemberPathFact, MemberPathKind,
+    PlaceAccess, TypeChecker, TypeError, TypeSubst, VariantShape, check_arg_count, check_arg_range,
+    check_expr_checked, checked_type,
     decls::{
-        CallableKind, CallableParent, CallableRef, DeclError, ExtendMethodMatch,
-        ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface, ModuleMemberLookup,
-        ModuleScope, ResolvedValue, TypeBinding, ValueDecl, VariantPayload, nominal_type,
-        owner_template,
+        CallableKind, CallableParent, CallableRef, DeclError, ExtendMethodSchema, ExtendSchema,
+        MethodKey, MethodMode, MethodSurface, ModuleMemberLookup, ModuleScope, ProjectionLookup,
+        ResolvedValue, TypeBinding, ValueDecl, VariantPayload, nominal_type, owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
     generic_bind::bind_prefix_generic_seeds,
     infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
+    member,
     place::{self, PlaceUseFacts, PlaceValue},
 };
 use crate::{
@@ -123,11 +124,11 @@ fn collect_steps_or_base(expr: &ExprNode) -> (&ExprNode, Vec<PostfixStep<'_>>) {
 fn local_value_subject(
     expr: &ExprNode,
     name: Ident,
-    value: super::LocalValue,
+    value: &super::LocalValue,
     tc: &mut TypeChecker,
 ) -> Subject {
     let checked = super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
-    let access = tc.local_value_access(name, &value);
+    let access = tc.local_value_access(name, value);
     let mut value = PlaceValue::new(checked, access.access, access.facts);
     value.identity = access.identity;
     Subject::Value(value)
@@ -149,7 +150,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
                     return Some(local_value_subject(
                         expr,
                         *name,
-                        super::LocalValue {
+                        &super::LocalValue {
                             info,
                             depth,
                             requires_runtime_capture,
@@ -173,7 +174,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
                 return Some(local_value_subject(
                     expr,
                     *name,
-                    super::LocalValue {
+                    &super::LocalValue {
                         info,
                         depth,
                         requires_runtime_capture,
@@ -229,8 +230,14 @@ pub(super) fn check_postfix_chain(
                 let field_expected = (is_last_step && !next_is_call)
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
-                let subject =
-                    apply_field(&subject, node, next_is_call, field_expected.as_ref(), tc);
+                let subject = apply_field(
+                    &subject,
+                    node,
+                    *id,
+                    next_is_call,
+                    field_expected.as_ref(),
+                    tc,
+                );
                 tc.set_type(*id, chain_type(&subject, optional_chain, tc), node.span);
                 subject
             }
@@ -380,6 +387,7 @@ fn subject_contains_extern_any(subject: &Subject) -> bool {
 fn apply_field(
     subject: &Subject,
     field: &FieldAccessNode,
+    field_id: ExprId,
     next_is_call: bool,
     expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
@@ -392,11 +400,9 @@ fn apply_field(
 
     match subject {
         Subject::Value(value) => apply_value_field(
-            value.checked.ty.clone(),
-            value.access,
-            &value.facts,
-            value.identity.clone(),
+            value,
             field.node.target.node.id,
+            field_id,
             field.node.field,
             field.span,
             kind,
@@ -529,96 +535,60 @@ fn source_receiver(
 }
 
 fn apply_value_field(
-    receiver: Type,
-    receiver_access: PlaceAccess,
-    receiver_place: &PlaceUseFacts,
-    receiver_identity: place::PlaceIdentity,
+    receiver: &PlaceValue,
     receiver_id: ExprId,
+    field_id: ExprId,
     name: Ident,
     span: Span,
     kind: MemberAccessKind,
     tc: &mut TypeChecker,
 ) -> Subject {
-    let key = tc.decls.key_for_type(&receiver);
+    let receiver_ty = &receiver.checked.ty;
+    let receiver_access = receiver.access;
+    let receiver_place = &receiver.facts;
+    let receiver_identity = receiver.identity.clone();
 
-    if let Some(owner) = tc.extern_type_id(&receiver) {
-        let static_on_value = kind == MemberAccessKind::Method
-            && tc.externs.method(owner, name).is_none()
-            && (tc.externs.static_method(owner, name).is_some()
-                || tc.find_static_extend_method(&receiver, name).is_some());
-        if static_on_value {
-            tc.push_error(TypeError::StaticMethodOnValue {
-                ty: receiver,
-                method: name,
-                span: tc.error_span(span),
-            });
-            return Subject::Error;
+    match kind {
+        MemberAccessKind::Field => {
+            match place::field_value(None, receiver, field_id, name, span, tc) {
+                place::FieldValueResult::Value(value, _) => Subject::Value(value),
+                place::FieldValueResult::StaticOnValue(ty) => {
+                    tc.push_error(TypeError::StaticMethodOnValue {
+                        ty,
+                        method: name,
+                        span: tc.error_span(span),
+                    });
+                    Subject::Error
+                }
+                place::FieldValueResult::NonAggregate(ty) => {
+                    non_aggregate_member(ty, name, kind, span, tc)
+                }
+                place::FieldValueResult::Error => Subject::Error,
+            }
         }
-        if kind == MemberAccessKind::Field || tc.externs.method(owner, name).is_some() {
-            return extern_value_member_subject(
-                owner,
-                name,
-                receiver_access,
-                receiver_place,
-                receiver_identity.clone(),
-                receiver_id,
-                span,
-                kind,
-                tc,
-            );
-        }
-    }
-    let mut static_method_on_value = false;
-    if let Some(key) = key.as_ref()
-        && let Some(agg) = tc.decls.aggregate(key).cloned()
-    {
-        if kind == MemberAccessKind::Field
-            && let Some(ty) = tc.decls.aggregate_field_type(&receiver, name)
-        {
-            tc.check_field_access_policy(&receiver, name, span);
-            let mut value = PlaceValue::new(
-                checked_type(ty, tc),
-                place::projected_field_access(receiver_access),
-                receiver_place.clone(),
-            );
-            value.identity = receiver_identity.clone().field(name);
-            return Subject::Value(value);
-        }
-        if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
-            tc.check_access_policy(
-                &method.policy,
-                MemberAccessKind::Method,
-                name,
-                &receiver,
-                &key.module,
-                span,
-            );
-            let callee =
-                tc.decls
-                    .callable_for_aggregate_method(&agg, name, method, receiver.clone());
-            return callable_subject(
-                callee,
-                Some(source_receiver(
-                    method.mode,
-                    receiver_access,
-                    receiver_place,
-                    receiver_identity.clone(),
-                    receiver_id,
+        MemberAccessKind::Method => match member::resolve_method(receiver_ty, name, tc) {
+            member::MethodResolution::Direct(method) => {
+                tc.check_access_policy(
+                    &method.policy,
+                    MemberAccessKind::Method,
                     name,
-                )),
-            );
-        }
-        static_method_on_value = agg.methods.contains_key(&MethodKey::static_(name));
-    }
-
-    let decls = &tc.decls;
-    let current_module = &tc.current_module;
-    if let Some(matched) = decls.find_instance_extend_method(&receiver, name, |ext| {
-        TypeChecker::extend_visible_in(decls, current_module, &ext.origin)
-    }) {
-        let parts = extend_method_parts(receiver.clone(), name, &matched);
-        return match parts {
-            Ok((extend, method, receiver_ty, owner_args)) => {
+                    receiver_ty,
+                    &method.origin,
+                    span,
+                );
+                callable_subject(
+                    method.callee,
+                    Some(source_receiver(
+                        method.mode,
+                        receiver_access,
+                        receiver_place,
+                        receiver_identity,
+                        receiver_id,
+                        name,
+                    )),
+                )
+            }
+            member::MethodResolution::Extend(method) => {
                 check_extend_method_access(
                     &mut super::AccessPolicyOutput {
                         source: tc.source_id(),
@@ -627,125 +597,109 @@ fn apply_value_field(
                         warnings: &mut tc.warnings,
                         errors: &mut tc.errors,
                     },
-                    extend,
-                    method,
-                    &receiver,
+                    &method.extend,
+                    &method.method,
+                    receiver_ty,
                     name,
                     span,
                 );
-                let callee = tc.decls.callable_for_extend_method(
-                    receiver_ty,
-                    extend,
-                    name,
-                    method,
-                    owner_args,
-                );
-                let receiver = source_receiver(
-                    method.mode,
-                    receiver_access,
-                    receiver_place,
-                    receiver_identity.clone(),
-                    receiver_id,
-                    name,
-                );
-                callable_subject(callee, Some(receiver))
+                callable_subject(
+                    method.callee,
+                    Some(source_receiver(
+                        method.mode,
+                        receiver_access,
+                        receiver_place,
+                        receiver_identity,
+                        receiver_id,
+                        name,
+                    )),
+                )
             }
-            Err(error) => {
-                push_extend_method_error(tc, error, span);
+            member::MethodResolution::Promoted(promoted) => {
+                tc.record_member_path(MemberPathFact {
+                    expr_id: field_id,
+                    kind: MemberPathKind::MethodReceiver,
+                    path: promoted.path.clone(),
+                    origin_owner: promoted.origin_owner.clone(),
+                    origin_member: promoted.origin_method,
+                });
+                if promoted.exposure == Exposure::Implicit {
+                    tc.check_stored_field_path_access(receiver_ty, &promoted.path, span);
+                }
+                let promoted_access = place::projected_field_access(receiver_access);
+                let promoted_identity = receiver_identity.fields(&promoted.path);
+                match promoted.target {
+                    member::PromotedMethodTarget::Aggregate(method) => {
+                        tc.check_access_policy(
+                            &method.policy,
+                            MemberAccessKind::Method,
+                            promoted.origin_method,
+                            &promoted.origin_owner,
+                            &method.origin,
+                            span,
+                        );
+                        callable_subject(
+                            method.callee,
+                            Some(source_receiver(
+                                method.mode,
+                                promoted_access,
+                                receiver_place,
+                                promoted_identity,
+                                field_id,
+                                name,
+                            )),
+                        )
+                    }
+                    member::PromotedMethodTarget::Extern(method) => Subject::ExternMethod {
+                        method_ref: method.method_ref,
+                        receiver: method.receiver,
+                        receiver_access: promoted_access,
+                        receiver_place: receiver_place.clone(),
+                        receiver_id: field_id,
+                        name,
+                        signature: method.signature,
+                    },
+                }
+            }
+            member::MethodResolution::AmbiguousPromoted {
+                ty,
+                name,
+                candidates,
+            } => {
+                tc.push_error(TypeError::AmbiguousPromotedMethod {
+                    ty,
+                    member: name,
+                    candidates,
+                    span: tc.error_span(span),
+                });
                 Subject::Error
             }
-        };
-    }
-
-    static_method_on_value |= tc.find_static_extend_method(&receiver, name).is_some();
-
-    if static_method_on_value {
-        tc.push_error(TypeError::StaticMethodOnValue {
-            ty: receiver,
-            method: name,
-            span: tc.error_span(span),
-        });
-        Subject::Error
-    } else if key.is_some() {
-        unknown_member(receiver, name, kind, span, tc)
-    } else {
-        non_aggregate_member(receiver, name, kind, span, tc)
-    }
-}
-
-fn extern_value_member_subject(
-    owner: ExternTypeId,
-    name: Ident,
-    receiver_access: PlaceAccess,
-    receiver_place: &PlaceUseFacts,
-    receiver_identity: place::PlaceIdentity,
-    receiver_id: ExprId,
-    span: Span,
-    kind: MemberAccessKind,
-    tc: &mut TypeChecker,
-) -> Subject {
-    let owner_ty = nominal_type(&tc.extern_type(owner).nominal);
-    match kind {
-        MemberAccessKind::Field => {
-            let Some(field) = place::resolve_extern_field(owner, name, receiver_access, tc) else {
-                return unknown_member(owner_ty, name, kind, span, tc);
-            };
-            let field_ref = field.field_ref;
-            let access = field.access;
-            let ty = field.decl.ty.ty.clone();
-            let contains_any = field.decl.ty.contains_any();
-            let handle = tc.type_handle(&ty);
-            let mut value = PlaceValue::new(
-                CheckedType {
-                    ty,
-                    handle,
-                    contains_extern_any: contains_any,
-                },
-                access,
-                PlaceUseFacts::for_extern_field(receiver_place, field_ref),
-            );
-            value.identity = receiver_identity.field(name);
-            Subject::Value(value)
-        }
-        MemberAccessKind::Method => {
-            let Some((method, decl)) = tc.externs.method(owner, name) else {
-                return unknown_member(owner_ty, name, kind, span, tc);
-            };
-            Subject::ExternMethod {
-                method_ref: method,
-                receiver: decl.receiver,
+            member::MethodResolution::Extern(method) => Subject::ExternMethod {
+                method_ref: method.method_ref,
+                receiver: method.receiver,
                 receiver_access,
                 receiver_place: receiver_place.clone(),
                 receiver_id,
-                name: decl.name,
-                signature: decl.signature.clone(),
+                name: method.name,
+                signature: method.signature,
+            },
+            member::MethodResolution::StaticOnValue { ty } => {
+                tc.push_error(TypeError::StaticMethodOnValue {
+                    ty,
+                    method: name,
+                    span: tc.error_span(span),
+                });
+                Subject::Error
             }
-        }
-    }
-}
-
-enum ExtendMethodError {
-    Unbound(Vec<Ident>),
-    Ambiguous { receiver: Type, name: Ident },
-}
-
-fn extend_method_parts<'a>(
-    receiver: Type,
-    name: Ident,
-    matched: &'a ExtendMethodMatch<'a>,
-) -> Result<(&'a ExtendSchema, &'a ExtendMethodSchema, Type, GenericArgs), ExtendMethodError> {
-    match matched {
-        ExtendMethodMatch::Match {
-            extend,
-            method,
-            receiver_ty,
-            owner_args: Ok(owner_args),
-        } => Ok((extend, method, receiver_ty.clone(), owner_args.clone())),
-        ExtendMethodMatch::Match {
-            owner_args: Err(unbound),
-            ..
-        } => Err(ExtendMethodError::Unbound(unbound.clone())),
-        ExtendMethodMatch::Ambiguous => Err(ExtendMethodError::Ambiguous { receiver, name }),
+            member::MethodResolution::ExtendError(error) => {
+                push_extend_method_error(tc, error, span);
+                Subject::Error
+            }
+            member::MethodResolution::Missing { ty } => unknown_member(ty, name, kind, span, tc),
+            member::MethodResolution::NonAggregate { ty } => {
+                non_aggregate_member(ty, name, kind, span, tc)
+            }
+        },
     }
 }
 
@@ -768,10 +722,10 @@ fn check_extend_method_access(
     );
 }
 
-fn push_extend_method_error(tc: &mut TypeChecker, error: ExtendMethodError, span: Span) {
+fn push_extend_method_error(tc: &mut TypeChecker, error: member::ExtendMethodError, span: Span) {
     match error {
-        ExtendMethodError::Unbound(names) => tc.push_unbound_generic_errors(names, span),
-        ExtendMethodError::Ambiguous { receiver, name } => {
+        member::ExtendMethodError::Unbound(names) => tc.push_unbound_generic_errors(names, span),
+        member::ExtendMethodError::Ambiguous { receiver, name } => {
             tc.push_error(TypeError::AmbiguousExtendMethod {
                 receiver,
                 name,
@@ -959,7 +913,7 @@ fn static_extend_subject(
     let matched = decls.find_static_extend_method(target, name, |ext| {
         TypeChecker::extend_visible_in(decls, current_module, &ext.origin)
     })?;
-    let subject = match extend_method_parts(target.clone(), name, &matched) {
+    let subject = match member::extend_method_parts(target.clone(), name, &matched) {
         Ok((extend, method, _, owner_args)) => {
             check_extend_method_access(
                 &mut super::AccessPolicyOutput {
@@ -1039,7 +993,7 @@ fn apply_call(
         } => check_extern_static_call(*static_ref, signature, call, call_id, expected, tc),
         Subject::Value(value) => {
             place::record_value_read(call.node.func.node.id, value, tc);
-            checked_type(call_value(value.checked.ty.clone(), call, tc), tc)
+            checked_type(call_value(value.checked.ty.clone(), call, call_id, tc), tc)
         }
         Subject::Module(_) | Subject::Type(_) => {
             checked_type(not_callable(subject_type(subject), call, tc), tc)
@@ -1091,10 +1045,10 @@ fn mutating_receiver_error(
     }
 }
 
-fn call_value(callee_ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
+fn call_value(callee_ty: Type, call: &CallNode, call_id: ExprId, tc: &mut TypeChecker) -> Type {
     match &callee_ty {
         Type::Func { params, ret } => {
-            check_args(&call.node.args, params, call.span, tc);
+            check_args(&call.node.args, params, call.span, call_id, tc);
             (**ret).clone()
         }
         _ => not_callable(callee_ty, call, tc),
@@ -1129,6 +1083,7 @@ struct CallParam {
 struct GenericCallSource<'a> {
     args: &'a [ExprNode],
     call_span: Span,
+    call_id: ExprId,
     receiver_arg: Option<MutableArg>,
     expected: Option<TypeHandle>,
 }
@@ -1146,6 +1101,7 @@ fn solve_generic_call_with(
     let GenericCallSource {
         args,
         call_span,
+        call_id,
         receiver_arg,
         expected,
     } = source;
@@ -1175,7 +1131,7 @@ fn solve_generic_call_with(
     let mut failed = tc.solve_constraints();
 
     let params = instantiate_call_params(template_params, &vars, tc);
-    failed |= check_source_args(args, &params, receiver_arg, tc);
+    failed |= check_source_args(args, &params, call_id, receiver_arg, tc);
     if !inferred_ret {
         let ret_handle = tc.solver.instantiate_generic_type(template_ret, &vars);
         failed |= constrain_expected_return(call_span, ret_handle, expected, tc);
@@ -1229,13 +1185,14 @@ fn instantiate_call_params(
 fn check_source_args(
     args: &[ExprNode],
     params: &[CallParam],
+    call_id: ExprId,
     receiver_arg: Option<MutableArg>,
     tc: &mut TypeChecker,
 ) -> bool {
     let mut failed = false;
     let mut mutable_args = receiver_arg.into_iter().collect::<Vec<_>>();
-    for (arg, param) in args.iter().zip(params) {
-        let checked = check_source_arg(arg, param, tc);
+    for (index, (arg, param)) in args.iter().zip(params).enumerate() {
+        let checked = check_source_arg(arg, param, call_id, index, tc);
         failed |= checked.failed;
         if let Some(identity) = checked.mutable_identity {
             mutable_args.push(MutableArg {
@@ -1291,43 +1248,51 @@ fn var_arg_error(
     }
 }
 
-fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
-    if param.mutable {
-        let place = place::check_place(arg, tc);
-        let name = super::assignment_target_name(arg);
-        let mut mutable_identity = None;
-        if let Some(error) = var_arg_error(place.value.access, name, tc.error_span(arg.span)) {
-            tc.push_error(error);
-        } else {
-            mutable_identity = Some(place.value.identity.clone());
-            place::record_write(arg.node.id, &place, tc);
-        }
-        let checked = place.into_checked();
-        tc.reject_extern_any_escape(&checked, arg.span);
-        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
-        return SourceArgCheck {
-            failed: tc.solve_constraints(),
-            mutable_identity,
-        };
+fn check_source_arg(
+    arg: &ExprNode,
+    param: &CallParam,
+    call_id: ExprId,
+    arg_index: usize,
+    tc: &mut TypeChecker,
+) -> SourceArgCheck {
+    match (param.mutable, param.cast_accept) {
+        (true, true) => check_projecting_var_arg(arg, param, call_id, arg_index, tc),
+        (true, false) => check_var_arg(arg, param, tc),
+        (false, true) => check_cast_accept_arg(arg, param, tc),
+        (false, false) => check_value_arg(arg, param, tc),
+    }
+}
+
+fn check_var_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
+    let place = place::check_place(arg, tc);
+    let name = super::assignment_target_name(arg);
+    let error = var_arg_error(place.value.access, name, tc.error_span(arg.span));
+    finish_var_arg(arg, param, place, error, tc)
+}
+
+fn check_projecting_var_arg(
+    arg: &ExprNode,
+    param: &CallParam,
+    call_id: ExprId,
+    arg_index: usize,
+    tc: &mut TypeChecker,
+) -> SourceArgCheck {
+    let place = place::check_place(arg, tc);
+    let name = super::assignment_target_name(arg);
+    let mutability_error = var_arg_error(place.value.access, name, tc.error_span(arg.span));
+    if can_assign_without_errors(
+        arg.span,
+        place.value.checked.handle.clone(),
+        param.ty.clone(),
+        tc,
+    ) {
+        return finish_var_arg(arg, param, place, mutability_error, tc);
     }
 
-    if param.cast_accept {
-        let checked = super::check_value_expr_checked_with_hint(arg, None, tc);
+    if let Some(error) = mutability_error {
+        tc.push_error(error);
+        let checked = place.into_checked();
         tc.reject_extern_any_escape(&checked, arg.span);
-        if can_assign_without_errors(arg.span, checked.handle.clone(), param.ty.clone(), tc) {
-            tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
-            return SourceArgCheck {
-                failed: tc.solve_constraints(),
-                mutable_identity: None,
-            };
-        }
-        let target = tc.handle_type(&param.ty);
-        if tc.has_cast_from_conversion(&checked.ty, &target) {
-            return SourceArgCheck {
-                failed: tc.solve_constraints(),
-                mutable_identity: None,
-            };
-        }
         tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
@@ -1335,6 +1300,125 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
         };
     }
 
+    let target = tc.handle_type(&param.ty);
+    let projection = match tc.decls.projection_from(&place.value.checked.ty, &target) {
+        ProjectionLookup::Match(projection) => projection,
+        ProjectionLookup::Missing => {
+            if let Some(entry) = tc
+                .decls
+                .chained_projection_from(&place.value.checked.ty, &target)
+            {
+                tc.push_error(TypeError::ChainedProjection {
+                    source: place.value.checked.ty.clone(),
+                    target: target.clone(),
+                    via: entry.field_path,
+                    span: tc.error_span(arg.span),
+                });
+                return SourceArgCheck {
+                    failed: true,
+                    mutable_identity: None,
+                };
+            }
+            tc.push_error(TypeError::MissingProjection {
+                source: place.value.checked.ty.clone(),
+                target: target.clone(),
+                paths: tc
+                    .decls
+                    .field_paths_to_type(&place.value.checked.ty, &target),
+                span: tc.error_span(arg.span),
+            });
+            return SourceArgCheck {
+                failed: true,
+                mutable_identity: None,
+            };
+        }
+        ProjectionLookup::Conflict(conflict) => {
+            tc.push_error(TypeError::DuplicateProjectionTarget {
+                source: place.value.checked.ty.clone(),
+                target: conflict.target,
+                paths: conflict.paths,
+                span: tc.error_span(arg.span),
+            });
+            return SourceArgCheck {
+                failed: true,
+                mutable_identity: None,
+            };
+        }
+    };
+
+    let mut projected = PlaceValue::new(
+        checked_type(projection.target_ty.clone(), tc),
+        place::projected_field_access(place.value.access),
+        place.value.facts.clone(),
+    );
+    projected.identity = place.value.identity.fields(&projection.field_path);
+    tc.reject_extern_any_escape(&projected.checked, arg.span);
+    tc.expect_assignable(arg.span, projected.checked.handle.clone(), param.ty.clone());
+    place::record_value_write(arg.node.id, &projected, tc);
+    tc.record_argument_projection(ArgumentProjectionFact {
+        call_id,
+        arg_index,
+        path: projection.field_path,
+        target_ty: target,
+    });
+    SourceArgCheck {
+        failed: tc.solve_constraints(),
+        mutable_identity: Some(projected.identity),
+    }
+}
+
+fn finish_var_arg(
+    arg: &ExprNode,
+    param: &CallParam,
+    place: place::CheckedPlace,
+    mutability_error: Option<TypeError>,
+    tc: &mut TypeChecker,
+) -> SourceArgCheck {
+    let mutable_identity = if let Some(error) = mutability_error {
+        tc.push_error(error);
+        None
+    } else {
+        place::record_write(arg.node.id, &place, tc);
+        Some(place.value.identity.clone())
+    };
+    let checked = place.into_checked();
+    tc.reject_extern_any_escape(&checked, arg.span);
+    tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+    SourceArgCheck {
+        failed: tc.solve_constraints(),
+        mutable_identity,
+    }
+}
+
+fn check_cast_accept_arg(
+    arg: &ExprNode,
+    param: &CallParam,
+    tc: &mut TypeChecker,
+) -> SourceArgCheck {
+    let checked = super::check_value_expr_checked_with_hint(arg, None, tc);
+    tc.reject_extern_any_escape(&checked, arg.span);
+    if can_assign_without_errors(arg.span, checked.handle.clone(), param.ty.clone(), tc) {
+        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+        return SourceArgCheck {
+            failed: tc.solve_constraints(),
+            mutable_identity: None,
+        };
+    }
+    let target = tc.handle_type(&param.ty);
+    if tc.has_cast_from_conversion(&checked.ty, &target) {
+        return SourceArgCheck {
+            failed: tc.solve_constraints(),
+            mutable_identity: None,
+        };
+    }
+    tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+    SourceArgCheck {
+        failed: tc.solve_constraints(),
+        mutable_identity: None,
+    }
+}
+
+fn check_value_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
     let checked = super::check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc);
     tc.reject_extern_any_escape(&checked, arg.span);
     tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
@@ -1502,6 +1586,7 @@ fn check_callable_call_with_args(
         GenericCallSource {
             args,
             call_span,
+            call_id,
             receiver_arg,
             expected,
         },
@@ -1588,7 +1673,7 @@ fn check_qualified_extend_call(
     };
 
     let (extend, method, receiver_ty, owner_args) =
-        match extend_method_parts(receiver.checked.ty.clone(), name, &matched) {
+        match member::extend_method_parts(receiver.checked.ty.clone(), name, &matched) {
             Ok(parts) => parts,
             Err(error) => {
                 push_extend_method_error(tc, error, span);
@@ -1898,6 +1983,7 @@ pub(super) fn check_args(
     args: &[ExprNode],
     params: &[FuncParam],
     call_span: Span,
+    call_id: ExprId,
     tc: &mut TypeChecker,
 ) {
     if !check_arg_count(args, params.len(), call_span, tc) {
@@ -1912,5 +1998,5 @@ pub(super) fn check_args(
             cast_accept: param.cast_accept,
         })
         .collect::<Vec<_>>();
-    check_source_args(args, &params, None, tc);
+    check_source_args(args, &params, call_id, None, tc);
 }

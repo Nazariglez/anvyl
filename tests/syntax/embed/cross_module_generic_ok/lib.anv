@@ -1,0 +1,13 @@
+// @helper
+
+struct Health {
+    hp: int,
+}
+
+pub struct Box<T> {
+    embed value: T,
+}
+
+pub fn health_box() -> Box<Health> {
+    Box { value: Health { hp: 1 } }
+}

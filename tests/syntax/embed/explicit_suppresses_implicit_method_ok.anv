@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct A {
+    fn tick(self) -> int { 1 }
+}
+
+struct B {
+    fn tick(self) -> int { 2 }
+}
+
+struct Enemy {
+    embed a: A,
+    embed b: B { fn tick },
+}
+
+fn test(enemy: Enemy) {
+    let amount: int = enemy.tick();
+}

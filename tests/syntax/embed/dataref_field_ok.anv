@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+dataref Stats { hp: int }
+
+struct Enemy {
+    embed stats: Stats,
+}
+
+fn test(enemy: Enemy) {
+    let hp: int = enemy.hp;
+}

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: embedded field surface for 'A' is recursive
+
+dataref A { embed b: B }
+dataref B { embed a: A }

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: embed field selector 'damage' names a method; use `fn damage`
+
+struct Health {
+    hp: int,
+    fn damage(self) {}
+}
+
+struct Enemy {
+    embed health: Health { damage },
+}

@@ -1,10 +1,12 @@
 use super::{
-    CheckedType, ExternUseTarget, MemberAccessKind, TypeChecker, TypeError, ValueDecl,
-    check_expr_checked, check_index_access, check_tuple_index_access, decls::nominal_type,
+    CheckedType, Exposure, ExternUseTarget, MemberAccessKind, MemberPathFact, MemberPathKind,
+    TypeChecker, TypeError, ValueDecl, check_expr_checked, check_index_access,
+    check_tuple_index_access, member,
 };
 use crate::{
     ast::{ExprId, ExprKind, ExprNode, Ident, Type},
-    externs::catalog::{ExternField, ExternFieldRef, ExternTypeId},
+    externs::catalog::ExternFieldRef,
+    span::Span,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,13 @@ impl PlaceIdentity {
 
     pub(super) fn field(self, field: Ident) -> Self {
         self.project(&|path| path.field(field))
+    }
+
+    pub(super) fn fields(mut self, fields: &[Ident]) -> Self {
+        for field in fields {
+            self = self.field(*field);
+        }
+        self
     }
 
     pub(super) fn tuple(self, index: usize) -> Self {
@@ -360,10 +369,156 @@ impl PlaceValue {
     }
 }
 
-pub(super) struct ExternFieldPlace<'a> {
-    pub(super) field_ref: ExternFieldRef,
-    pub(super) decl: &'a ExternField,
-    pub(super) access: PlaceAccess,
+pub(super) enum FieldValueResult {
+    Value(PlaceValue, bool),
+    StaticOnValue(Type),
+    NonAggregate(Type),
+    Error,
+}
+
+pub(super) fn field_value(
+    expr: Option<&ExprNode>,
+    receiver: &PlaceValue,
+    field_id: ExprId,
+    name: Ident,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> FieldValueResult {
+    match member::resolve_field(&receiver.checked.ty, name, receiver.access, tc) {
+        member::FieldResolution::Direct(field) => {
+            tc.check_access_policy(
+                &field.policy,
+                MemberAccessKind::Field,
+                name,
+                &receiver.checked.ty,
+                &field.origin,
+                span,
+            );
+            let mut value = PlaceValue::new(
+                field_checked(expr, field.ty, false, tc),
+                projected_field_access(receiver.access),
+                receiver.facts.clone(),
+            );
+            value.identity = receiver.identity.clone().field(name);
+            FieldValueResult::Value(value, false)
+        }
+        member::FieldResolution::Promoted(promoted) => {
+            promoted_field_value(expr, receiver, field_id, span, promoted, tc)
+        }
+        member::FieldResolution::AmbiguousPromoted {
+            ty,
+            name,
+            candidates,
+        } => {
+            tc.push_error(TypeError::AmbiguousPromotedField {
+                ty,
+                member: name,
+                candidates,
+                span: tc.error_span(span),
+            });
+            FieldValueResult::Error
+        }
+        member::FieldResolution::Extern(field) => extern_field_value(
+            expr,
+            receiver,
+            receiver.identity.clone().field(name),
+            field,
+            tc,
+        ),
+        member::FieldResolution::Missing { ty } => {
+            tc.push_error(TypeError::UnknownMember {
+                ty,
+                member: name,
+                kind: MemberAccessKind::Field,
+                span: tc.error_span(span),
+            });
+            FieldValueResult::Error
+        }
+        member::FieldResolution::StaticOnValue { ty } => FieldValueResult::StaticOnValue(ty),
+        member::FieldResolution::NonAggregate { ty } => FieldValueResult::NonAggregate(ty),
+    }
+}
+
+fn promoted_field_value(
+    expr: Option<&ExprNode>,
+    receiver: &PlaceValue,
+    field_id: ExprId,
+    span: Span,
+    promoted: member::PromotedFieldAccess,
+    tc: &mut TypeChecker,
+) -> FieldValueResult {
+    tc.record_member_path(MemberPathFact {
+        expr_id: field_id,
+        kind: MemberPathKind::Field,
+        path: promoted.path.clone(),
+        origin_owner: promoted.origin_owner.clone(),
+        origin_member: promoted.origin_field,
+    });
+    if promoted.exposure == Exposure::Implicit {
+        let receiver_path_len = promoted.path.len().saturating_sub(1);
+        tc.check_stored_field_path_access(
+            &receiver.checked.ty,
+            &promoted.path[..receiver_path_len],
+            span,
+        );
+    }
+
+    match promoted.target {
+        member::PromotedFieldTarget::Aggregate(field) => {
+            tc.check_access_policy(
+                &field.policy,
+                MemberAccessKind::Field,
+                promoted.origin_field,
+                &promoted.origin_owner,
+                &field.origin,
+                span,
+            );
+            let mut value = PlaceValue::new(
+                field_checked(expr, field.ty, false, tc),
+                projected_field_access(receiver.access),
+                receiver.facts.clone(),
+            );
+            value.identity = receiver.identity.clone().fields(&promoted.path);
+            FieldValueResult::Value(value, false)
+        }
+        member::PromotedFieldTarget::Extern(field) => extern_field_value(
+            expr,
+            receiver,
+            receiver.identity.clone().fields(&promoted.path),
+            field,
+            tc,
+        ),
+    }
+}
+
+fn extern_field_value(
+    expr: Option<&ExprNode>,
+    receiver: &PlaceValue,
+    identity: PlaceIdentity,
+    field: member::ExternFieldAccess,
+    tc: &mut TypeChecker,
+) -> FieldValueResult {
+    let mut value = PlaceValue::new(
+        field_checked(expr, field.ty, field.contains_any, tc),
+        field.access,
+        PlaceUseFacts::for_extern_field(&receiver.facts, field.field_ref),
+    );
+    value.identity = identity;
+    FieldValueResult::Value(value, field.contains_any)
+}
+
+fn field_checked(
+    expr: Option<&ExprNode>,
+    ty: Type,
+    contains_extern_any: bool,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let mut checked = match expr {
+        Some(expr) => super::checked_from_type(expr, ty, tc),
+        None => super::checked_type(ty, tc),
+    };
+    checked.contains_extern_any = contains_extern_any;
+    checked
 }
 
 pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
@@ -434,79 +589,30 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
 
     if let ExprKind::Field(field) = &expr.node.kind {
         let receiver = check_place(&field.node.target, tc);
-        if let Some(owner) = tc.extern_type_id(&receiver.value.checked.ty) {
-            let owner_ty = nominal_type(&tc.extern_type(owner).nominal);
-            let Some(extern_field) =
-                resolve_extern_field(owner, field.node.field, receiver.value.access, tc)
-            else {
-                tc.push_error(TypeError::UnknownMember {
-                    ty: owner_ty,
-                    member: field.node.field,
-                    kind: MemberAccessKind::Field,
-                    span: tc.error_span(field.span),
-                });
+        match field_value(
+            Some(expr),
+            &receiver.value,
+            expr.node.id,
+            field.node.field,
+            field.span,
+            tc,
+        ) {
+            FieldValueResult::Value(value, accepts_extern_any) => {
+                return CheckedPlace {
+                    value,
+                    accepts_extern_any,
+                };
+            }
+            FieldValueResult::Error => {
                 let checked = super::checked_from_type(expr, Type::Infer, tc);
                 return CheckedPlace::new(checked, PlaceAccess::NotPlace);
-            };
-
-            let field_ref = extern_field.field_ref;
-            let access = extern_field.access;
-            let ty = extern_field.decl.ty.ty.clone();
-            let contains_any = extern_field.decl.ty.contains_any();
-            let mut checked = super::checked_from_type(expr, ty, tc);
-            checked.contains_extern_any = contains_any;
-            let mut place = CheckedPlace::new(checked, access);
-            place.value.facts = PlaceUseFacts::for_extern_field(&receiver.value.facts, field_ref);
-            place.value.identity = receiver.value.identity.field(field.node.field);
-            place.accepts_extern_any = contains_any;
-            return place;
-        }
-
-        if let Some(key) = tc.decls.key_for_type(&receiver.value.checked.ty) {
-            if let Some(ty) = tc
-                .decls
-                .aggregate_field_type(&receiver.value.checked.ty, field.node.field)
-            {
-                tc.check_field_access_policy(
-                    &receiver.value.checked.ty,
-                    field.node.field,
-                    field.span,
-                );
-                let checked = super::checked_from_type(expr, ty, tc);
-                let access = projected_field_access(receiver.value.access);
-                let mut place = CheckedPlace::new(checked, access);
-                place.value.facts = receiver.value.facts;
-                place.value.identity = receiver.value.identity.field(field.node.field);
-                return place;
             }
-
-            tc.push_error(TypeError::UnknownMember {
-                ty: nominal_type(&key),
-                member: field.node.field,
-                kind: MemberAccessKind::Field,
-                span: tc.error_span(field.span),
-            });
-            let checked = super::checked_from_type(expr, Type::Infer, tc);
-            return CheckedPlace::new(checked, PlaceAccess::NotPlace);
+            FieldValueResult::StaticOnValue(_) | FieldValueResult::NonAggregate(_) => {}
         }
     }
 
     let checked = check_expr_checked(expr, tc);
     CheckedPlace::new(checked, PlaceAccess::NotPlace)
-}
-
-pub(super) fn resolve_extern_field(
-    owner: ExternTypeId,
-    name: Ident,
-    receiver_access: PlaceAccess,
-    tc: &TypeChecker,
-) -> Option<ExternFieldPlace<'_>> {
-    let (field, decl) = tc.extern_field(owner, name)?;
-    Some(ExternFieldPlace {
-        field_ref: field,
-        decl,
-        access: extern_field_access(receiver_access, decl.computed),
-    })
 }
 
 pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {

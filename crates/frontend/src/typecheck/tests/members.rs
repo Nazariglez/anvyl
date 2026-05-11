@@ -6,7 +6,8 @@ use super::support::{
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
-        CallTarget, DeprecatedUseKind, GenericArgs, MemberAccessKind, TypeError, VariantShape,
+        CallTarget, DeprecatedUseKind, GenericArgs, MemberAccessKind, MemberPathKind, TypeError,
+        VariantShape,
         decls::{
             CallableId, DeclError, ExtendId, MethodKey, MethodSurface, ModuleScope, NominalKey,
             VariantPayload, VariantSchema,
@@ -59,6 +60,134 @@ mod field_access {
                 p.pos.x; 
             }",
             Type::Int,
+        );
+    }
+
+    #[test]
+    fn promoted_field_access_records_canonical_path() {
+        let result = check(
+            "struct Health { hp: int }
+            struct Enemy { embed health: Health }
+            fn main(enemy: Enemy) { enemy.hp; }",
+        )
+        .expect("typecheck failed");
+        let fact = result
+            .member_paths()
+            .values()
+            .next()
+            .expect("missing member path fact");
+
+        assert_eq!(fact.kind, MemberPathKind::Field);
+        assert_eq!(fact.path, vec![Ident::new("health"), Ident::new("hp")]);
+        assert_eq!(
+            fact.origin_owner,
+            nominal(NominalKind::Struct, "Health", vec![], None)
+        );
+        assert_eq!(fact.origin_member, Ident::new("hp"));
+    }
+
+    #[test]
+    fn transitive_promoted_field_records_full_path() {
+        let result = check(
+            "struct Health { hp: int }
+            struct Actor { embed health: Health }
+            struct Enemy { embed actor: Actor }
+            fn main(enemy: Enemy) { enemy.hp; }",
+        )
+        .expect("typecheck failed");
+        let fact = result
+            .member_paths()
+            .values()
+            .next()
+            .expect("missing member path fact");
+
+        assert_eq!(fact.kind, MemberPathKind::Field);
+        assert_eq!(
+            fact.path,
+            vec![Ident::new("actor"), Ident::new("health"), Ident::new("hp")]
+        );
+        assert_eq!(
+            fact.origin_owner,
+            nominal(NominalKind::Struct, "Health", vec![], None)
+        );
+        assert_eq!(fact.origin_member, Ident::new("hp"));
+    }
+
+    #[test]
+    fn renamed_promoted_field_records_stored_path() {
+        let result = check(
+            "struct Health { hp: int }
+            struct Enemy { embed health: Health { hp as current } }
+            fn main(enemy: Enemy) { enemy.current; }",
+        )
+        .expect("typecheck failed");
+        let fact = result
+            .member_paths()
+            .values()
+            .next()
+            .expect("missing member path fact");
+
+        assert_eq!(fact.kind, MemberPathKind::Field);
+        assert_eq!(fact.path, vec![Ident::new("health"), Ident::new("hp")]);
+        assert_eq!(fact.origin_member, Ident::new("hp"));
+    }
+
+    #[test]
+    fn dependent_promoted_field_records_specialized_stored_path() {
+        let result = check(
+            "struct Health { hp: int }
+            struct Box<T> { embed value: T }
+            fn read<T>(box: Box<T>) -> int { box.hp }
+            fn main() {
+                let box = Box<Health> { value: Health { hp: 1 } };
+                read<Health>(box);
+                read<Health>(box);
+            }",
+        )
+        .expect("typecheck failed");
+        let fact = result
+            .member_paths()
+            .values()
+            .find(|fact| fact.origin_member == Ident::new("hp"))
+            .expect("missing member path fact");
+
+        assert_eq!(fact.kind, MemberPathKind::Field);
+        assert_eq!(fact.path, vec![Ident::new("value"), Ident::new("hp")]);
+        assert_eq!(
+            fact.origin_owner,
+            nominal(NominalKind::Struct, "Health", vec![], None)
+        );
+    }
+
+    #[test]
+    fn promoted_field_checks_embed_path_policy() {
+        let result = check(
+            "struct Health { hp: int }
+            struct Enemy {
+                @deprecated(\"use hp\")
+                embed health: Health,
+            }
+            fn main(enemy: Enemy) { enemy.hp; }",
+        )
+        .expect("typecheck failed");
+
+        assert_deprecated_warning(&result, DeprecatedUseKind::Field, "health", Some("use hp"));
+    }
+
+    #[test]
+    fn promoted_field_ambiguity() {
+        assert_single_error(
+            "struct A { x: int }
+            struct B { x: int }
+            struct Enemy { embed a: A, embed b: B }
+            fn main(enemy: Enemy) { enemy.x; }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::AmbiguousPromotedField { member, candidates, .. }
+                        if *member == Ident::new("x") && candidates.len() == 2
+                )
+            },
         );
     }
 
@@ -606,6 +735,106 @@ mod method_calls {
         assert_ty(
             "struct Point { x: int, fn add(self, v: int) -> int { 0 } } fn main() -> int { let p = Point { x: 1 }; p.add(2) }",
             Type::Int,
+        );
+    }
+
+    #[test]
+    fn promoted_method_call_records_origin_and_receiver_path() {
+        let result = check(
+            "struct Health { fn damage(self, amount: int) {} }
+            struct Enemy { embed health: Health }
+            fn main(enemy: Enemy) { enemy.damage(1); }",
+        )
+        .expect("typecheck failed");
+
+        assert_method_target(&result, "Health", "damage", true, vec![]);
+        let fact = result
+            .member_paths()
+            .values()
+            .next()
+            .expect("missing member path fact");
+        assert_eq!(fact.kind, MemberPathKind::MethodReceiver);
+        assert_eq!(fact.path, vec![Ident::new("health")]);
+        assert_eq!(
+            fact.origin_owner,
+            nominal(NominalKind::Struct, "Health", vec![], None)
+        );
+        assert_eq!(fact.origin_member, Ident::new("damage"));
+    }
+
+    #[test]
+    fn promoted_method_checks_embed_path_policy() {
+        let result = check(
+            "struct Health { fn damage(self) {} }
+            struct Enemy {
+                @deprecated(\"use health\")
+                embed health: Health,
+            }
+            fn main(enemy: Enemy) { enemy.damage(); }",
+        )
+        .expect("typecheck failed");
+
+        assert_deprecated_warning(
+            &result,
+            DeprecatedUseKind::Field,
+            "health",
+            Some("use health"),
+        );
+    }
+
+    #[test]
+    fn transitive_promoted_method_records_full_receiver_path() {
+        let result = check(
+            "struct Health { fn damage(self) {} }
+            struct Actor { embed health: Health }
+            struct Enemy { embed actor: Actor }
+            fn main(enemy: Enemy) { enemy.damage(); }",
+        )
+        .expect("typecheck failed");
+        let fact = result
+            .member_paths()
+            .values()
+            .next()
+            .expect("missing member path fact");
+
+        assert_eq!(fact.kind, MemberPathKind::MethodReceiver);
+        assert_eq!(fact.path, vec![Ident::new("actor"), Ident::new("health")]);
+        assert_eq!(fact.origin_member, Ident::new("damage"));
+    }
+
+    #[test]
+    fn renamed_promoted_method_records_origin_method() {
+        let result = check(
+            "struct Health { fn damage(self) {} }
+            struct Enemy { embed health: Health { fn damage as hit } }
+            fn main(enemy: Enemy) { enemy.hit(); }",
+        )
+        .expect("typecheck failed");
+        let fact = result
+            .member_paths()
+            .values()
+            .next()
+            .expect("missing member path fact");
+
+        assert_eq!(fact.kind, MemberPathKind::MethodReceiver);
+        assert_eq!(fact.path, vec![Ident::new("health")]);
+        assert_eq!(fact.origin_member, Ident::new("damage"));
+    }
+
+    #[test]
+    fn promoted_method_ambiguity() {
+        assert_single_error(
+            "struct A { fn tick(self) {} }
+            struct B { fn tick(self) {} }
+            struct Enemy { embed a: A, embed b: B }
+            fn main(enemy: Enemy) { enemy.tick(); }",
+            |err| {
+                matches!(
+                    err,
+                    TypeError::AmbiguousPromotedMethod { member, candidates, .. }
+                        if *member == Ident::new("tick") && candidates.len() == 2
+                )
+            },
         );
     }
 

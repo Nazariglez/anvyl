@@ -6,8 +6,8 @@ use crate::{
     span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
     typecheck::{
-        self, CallMap, DeprecatedUseKind, ExternUseMap, TypeError, TypeWarning,
-        decls::DeclarationIndex,
+        self, ArgumentProjectionMap, CallMap, DeprecatedUseKind, ExternUseMap, MemberPathMap,
+        TypeError, TypeWarning, decls::DeclarationIndex,
     },
 };
 
@@ -15,6 +15,8 @@ pub(crate) struct TypecheckTestResult {
     types: HashMap<ExprId, (Span, Type)>,
     calls: CallMap,
     extern_uses: ExternUseMap,
+    member_paths: MemberPathMap,
+    argument_projections: ArgumentProjectionMap,
     warnings: Vec<TypeWarning>,
     decls: DeclarationIndex,
     externs: ExternCatalog,
@@ -31,6 +33,14 @@ impl TypecheckTestResult {
 
     pub(crate) fn extern_uses(&self) -> &ExternUseMap {
         &self.extern_uses
+    }
+
+    pub(crate) fn member_paths(&self) -> &MemberPathMap {
+        &self.member_paths
+    }
+
+    pub(crate) fn argument_projections(&self) -> &ArgumentProjectionMap {
+        &self.argument_projections
     }
 
     pub(crate) fn warnings(&self) -> &[TypeWarning] {
@@ -143,6 +153,8 @@ pub(crate) fn check_with_raw_externs(
         types,
         calls: tc.calls,
         extern_uses: tc.extern_uses,
+        member_paths: tc.member_paths,
+        argument_projections: tc.argument_projections,
         warnings: tc.warnings,
         decls: tc.decls,
         externs: tc.externs,

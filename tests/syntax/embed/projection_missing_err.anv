@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: no direct `@as embed` projection from 'Enemy' to 'Entity'; pass stored path entity
+
+struct Entity {
+    x: int,
+}
+
+struct Enemy {
+    entity: Entity,
+}
+
+fn move_entity(var entity: as Entity) {}
+
+fn test() {
+    var enemy = Enemy { entity: Entity { x: 1 } };
+    move_entity(enemy);
+}

@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Health {
+    @as embed hp: int,
+}
+
+fn bump(var hp: as int) {
+    hp += 1;
+}
+
+fn test() {
+    var health = Health { hp: 1 };
+    bump(health);
+}

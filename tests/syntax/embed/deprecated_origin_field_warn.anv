@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: use current_hp
+
+struct Health {
+    @deprecated("use current_hp")
+    hp: int,
+}
+
+struct Enemy {
+    embed health: Health,
+}
+
+fn test(enemy: Enemy) {
+    println(enemy.hp);
+}

@@ -143,6 +143,12 @@ fn spec(name: Ident) -> Option<AnnotationSpec> {
     Some(spec)
 }
 
+#[derive(Default)]
+pub(crate) struct FieldAnnotations {
+    pub(crate) policy: AccessPolicy,
+    pub(crate) as_projection: bool,
+}
+
 pub(crate) fn normalize_annotations(
     source: SourceId,
     annotations: &[AnnotationNode],
@@ -151,49 +157,96 @@ pub(crate) fn normalize_annotations(
 ) -> AccessPolicy {
     let mut policy = AccessPolicy::default();
     let mut seen = HashSet::new();
+    for annotation in annotations {
+        apply_policy_annotation(source, annotation, target, &mut seen, &mut policy, errors);
+    }
+    policy
+}
+
+pub(crate) fn normalize_field_annotations(
+    source: SourceId,
+    annotations: &[AnnotationNode],
+    embedded: bool,
+    errors: &mut Vec<DeclError>,
+) -> FieldAnnotations {
+    let mut policy = AccessPolicy::default();
+    let mut as_projection = false;
+    let mut seen = HashSet::new();
 
     for annotation in annotations {
         let name = annotation.node.name;
-        let span = Some(SourceSpan::from_byte_span(source, annotation.span));
-        let Some(spec) = spec(name) else {
-            errors.push(DeclError::UnknownAnnotation { name, span });
-            continue;
-        };
-
-        if !spec.targets.contains(&target) {
-            errors.push(DeclError::InvalidAnnotationTarget {
-                name,
-                target: target.to_string(),
-                valid_targets: valid_targets(spec.targets),
-                span,
-            });
+        if name.as_str() != "as" {
+            apply_policy_annotation(
+                source,
+                annotation,
+                AnnotationTarget::Field,
+                &mut seen,
+                &mut policy,
+                errors,
+            );
             continue;
         }
 
+        let span = Some(SourceSpan::from_byte_span(source, annotation.span));
         if !seen.insert(name) {
             errors.push(DeclError::DuplicateAnnotation { name, span });
-            continue;
-        }
-
-        let Some(reason) = annotation_reason(
-            &annotation.node.args,
-            name,
-            spec.args,
-            source,
-            annotation.span,
-            errors,
-        ) else {
-            continue;
-        };
-
-        match spec.kind {
-            AnnotationKind::Test => {}
-            AnnotationKind::Deprecated => policy.set_deprecated(reason.reason),
-            AnnotationKind::Internal => policy.set_internal(reason.reason),
+        } else if !embedded {
+            errors.push(DeclError::AsProjectionWithoutEmbed { span });
+        } else if !matches!(annotation.node.args, AnnotationArgs::None) {
+            errors.push(DeclError::AsProjectionWithArgs { span });
+        } else {
+            as_projection = true;
         }
     }
 
-    policy
+    FieldAnnotations {
+        policy,
+        as_projection,
+    }
+}
+
+fn apply_policy_annotation(
+    source: SourceId,
+    annotation: &AnnotationNode,
+    target: AnnotationTarget,
+    seen: &mut HashSet<Ident>,
+    policy: &mut AccessPolicy,
+    errors: &mut Vec<DeclError>,
+) {
+    let name = annotation.node.name;
+    let span = Some(SourceSpan::from_byte_span(source, annotation.span));
+    let Some(spec) = spec(name) else {
+        errors.push(DeclError::UnknownAnnotation { name, span });
+        return;
+    };
+    if !spec.targets.contains(&target) {
+        errors.push(DeclError::InvalidAnnotationTarget {
+            name,
+            target: target.to_string(),
+            valid_targets: valid_targets(spec.targets),
+            span,
+        });
+        return;
+    }
+    if !seen.insert(name) {
+        errors.push(DeclError::DuplicateAnnotation { name, span });
+        return;
+    }
+    let Some(reason) = annotation_reason(
+        &annotation.node.args,
+        name,
+        spec.args,
+        source,
+        annotation.span,
+        errors,
+    ) else {
+        return;
+    };
+    match spec.kind {
+        AnnotationKind::Test => {}
+        AnnotationKind::Deprecated => policy.set_deprecated(reason.reason),
+        AnnotationKind::Internal => policy.set_internal(reason.reason),
+    }
 }
 
 struct AnnotationReason {

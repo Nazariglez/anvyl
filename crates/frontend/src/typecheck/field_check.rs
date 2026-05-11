@@ -4,6 +4,7 @@ use super::{
     MemberAccessKind, TypeChecker, TypeError,
     annotation::AccessPolicy,
     decls::{FieldSchema, NominalKey},
+    member,
 };
 use crate::{
     ast::{Ident, Type},
@@ -106,12 +107,23 @@ fn missing_default_ok(missing: MissingFields, field: &FieldSchema) -> bool {
 
 fn push_unknown(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecker) {
     match owner {
-        FieldOwner::Nominal(ty) => tc.push_error(TypeError::UnknownMember {
-            ty: ty.clone(),
-            member: name,
-            kind: MemberAccessKind::Field,
-            span: tc.error_span(span),
-        }),
+        FieldOwner::Nominal(ty) => {
+            if let Some(paths) = member::promoted_field_paths(ty, name, tc) {
+                tc.push_error(TypeError::PromotedFieldNotStored {
+                    ty: ty.clone(),
+                    field: name,
+                    paths,
+                    span: tc.error_span(span),
+                });
+                return;
+            }
+            tc.push_error(TypeError::UnknownMember {
+                ty: ty.clone(),
+                member: name,
+                kind: MemberAccessKind::Field,
+                span: tc.error_span(span),
+            });
+        }
         FieldOwner::Variant { key, variant } => {
             tc.push_error(TypeError::UnknownVariantField {
                 enum_name: key.name,

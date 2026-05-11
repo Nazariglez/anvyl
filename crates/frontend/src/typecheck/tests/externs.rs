@@ -22,7 +22,7 @@ use crate::{
     },
     resolve::{ModuleId, ModulePath, PackageId},
     test_support::{parse_program, resolved_modules_with_external},
-    typecheck::{self, DeprecatedUseKind, ExternUseTarget, ModuleScope, TypeError},
+    typecheck::{self, DeprecatedUseKind, ExternUseTarget, MemberPathKind, ModuleScope, TypeError},
 };
 
 fn parse(source: &str) -> Program {
@@ -378,6 +378,30 @@ mod calls {
         assert_use(&result, ExternUseTarget::Function(id));
         assert_use_total(&result, 1);
         assert!(result.calls().is_empty());
+        assert_typecheck_closed(&result);
+    }
+
+    #[test]
+    fn cached_generic_specialization_restores_extern_uses() {
+        let result = check(
+            r#"
+            extern fn tick() -> void;
+            fn wrap<T>(x: T) { tick(); }
+            fn main() {
+                wrap(1);
+                wrap("x");
+                wrap(2);
+            }
+            "#,
+        )
+        .expect("typecheck failed");
+        let id = result
+            .externs()
+            .function_by_key(&function_key(ModuleScope::Root, "tick"))
+            .expect("extern function");
+
+        assert_use(&result, ExternUseTarget::Function(id));
+        assert_use_total(&result, 1);
         assert_typecheck_closed(&result);
     }
 
@@ -2178,6 +2202,31 @@ mod compound {
             ",
         )
         .expect("typecheck failed");
+    }
+
+    #[test]
+    fn promoted_field_records_extern_read_and_member_path() {
+        let result = check(
+            r"
+            extern type HostStats { hp: int; }
+            struct Enemy { embed stats: HostStats }
+            fn read(enemy: Enemy) -> int { enemy.hp }
+            ",
+        )
+        .expect("typecheck failed");
+        let owner = catalog_type(&result, ModuleScope::Root, "HostStats");
+        let field = catalog_field(&result, owner, "hp");
+        let fact = result
+            .member_paths()
+            .values()
+            .next()
+            .expect("missing member path fact");
+
+        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
+        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 0);
+        assert_eq!(fact.kind, MemberPathKind::Field);
+        assert_eq!(fact.path, vec![Ident::new("stats"), Ident::new("hp")]);
+        assert_eq!(fact.origin_member, Ident::new("hp"));
     }
 
     #[test]

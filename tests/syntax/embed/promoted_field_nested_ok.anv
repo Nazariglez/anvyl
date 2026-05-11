@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Vec2 { x: int }
+struct Transform { position: Vec2 }
+
+struct Enemy {
+    embed transform: Transform,
+}
+
+fn test(var enemy: Enemy) {
+    enemy.position.x += 1;
+}

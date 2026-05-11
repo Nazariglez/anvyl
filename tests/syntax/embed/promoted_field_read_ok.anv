@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Health { hp: int }
+
+struct Enemy {
+    embed health: Health,
+}
+
+fn test(enemy: Enemy) {
+    let _hp: int = enemy.hp;
+}

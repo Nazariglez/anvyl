@@ -63,9 +63,18 @@ fn parse_annotation_args<'src>() -> BoxedParser<'src, ast::AnnotationArgs> {
         .boxed()
 }
 
+fn annotation_name<'src>() -> BoxedParser<'src, ast::Ident> {
+    choice((
+        identifier(),
+        select! { Token::Keyword(Keyword::As) => ast::Ident::new("as") },
+    ))
+    .labelled("annotation name")
+    .boxed()
+}
+
 fn parse_annotation<'src>() -> BoxedParser<'src, ast::AnnotationNode> {
     select! { Token::At => () }
-        .ignore_then(identifier())
+        .ignore_then(annotation_name())
         .then(parse_annotation_args())
         .map_with(|(name, args), e| {
             let s = e.span();
@@ -920,28 +929,98 @@ pub(super) fn local_function<'src>(
         .boxed()
 }
 
+fn embed_selector_item<'src>() -> BoxedParser<'src, ast::EmbedSelectorItem> {
+    let method = select! { Token::Keyword(Keyword::Fn) => () }
+        .or_not()
+        .map(|token| match token {
+            Some(()) => ast::EmbedSelectorKind::Method,
+            None => ast::EmbedSelectorKind::Field,
+        });
+    let alias = select! { Token::Keyword(Keyword::As) => () }
+        .ignore_then(identifier())
+        .or_not();
+
+    method
+        .then(identifier())
+        .then(alias)
+        .map_with(|((kind, name), alias), e| ast::EmbedSelectorItem {
+            kind,
+            name,
+            alias,
+            span: e.span().byte(),
+        })
+        .labelled("embed selector")
+        .boxed()
+}
+
+fn embed_selector<'src>() -> BoxedParser<'src, ast::EmbedSelector> {
+    select! { Token::Open(Delimiter::Brace) => () }
+        .ignore_then(
+            embed_selector_item()
+                .separated_by(select! { Token::Comma => () })
+                .allow_trailing()
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(select! { Token::Close(Delimiter::Brace) => () })
+        .validate(|items, extra, emitter| {
+            if items.is_empty() {
+                emitter.emit(Rich::custom(extra.span(), "embed selector cannot be empty"));
+            }
+            ast::EmbedSelector { items }
+        })
+        .boxed()
+}
+
 fn struct_field<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
+    allow_embed: bool,
 ) -> BoxedParser<'src, ast::StructField> {
     annotations()
         .then(doc_comment_block())
-        .then(identifier())
+        .then(identifier().then(identifier().or_not()))
         .then_ignore(select! {
             Token::Colon => (),
         })
         .then(type_ident())
+        .then(embed_selector().or_not())
         .then(
             select! { Token::Op(Op::Assign) => () }
                 .ignore_then(expression(stmt))
                 .or_not(),
         )
-        .map(
-            |((((annotations, doc), name), ty), default)| ast::StructField {
-                annotations,
-                name,
-                ty,
-                default,
-                doc,
+        .validate(
+            move |(((((annotations, doc), (first, second)), ty), selector), default),
+                  extra,
+                  emitter| {
+                let is_embed = allow_embed && first.as_str() == "embed" && second.is_some();
+                if second.is_some() && !is_embed {
+                    emitter.emit(Rich::custom(extra.span(), "expected ':' after field name"));
+                }
+                let name = match (is_embed, second) {
+                    (true, Some(name)) => name,
+                    _ => first,
+                };
+                let selector_without_embed = !is_embed && selector.is_some();
+                let embed = if is_embed {
+                    Some(ast::EmbedSpec { selector })
+                } else {
+                    None
+                };
+                if selector_without_embed {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        "embed selectors require an embedded field",
+                    ));
+                }
+                ast::StructField {
+                    annotations,
+                    embed,
+                    span: extra.span().byte(),
+                    name,
+                    ty,
+                    default,
+                    doc,
+                }
             },
         )
         .labelled("struct field")
@@ -1111,7 +1190,7 @@ fn aggregate_declaration<'src>(
                 Token::Open(Delimiter::Brace) => (),
             }
             .ignore_then(
-                struct_field(stmt.clone())
+                struct_field(stmt.clone(), true)
                     .separated_by(select! { Token::Comma => () })
                     .allow_trailing()
                     .collect::<Vec<_>>(),
@@ -1154,6 +1233,8 @@ fn aggregate_declaration<'src>(
                     );
                     ast::StructField {
                         annotations: f.annotations,
+                        embed: f.embed,
+                        span: f.span,
                         name: f.name,
                         ty,
                         default: f.default,
@@ -1269,7 +1350,7 @@ fn enum_variant_struct_payload<'src>(
 ) -> BoxedParser<'src, ast::VariantKind> {
     select! { Token::Open(Delimiter::Brace) => () }
         .ignore_then(
-            struct_field(stmt)
+            struct_field(stmt, false)
                 .separated_by(select! { Token::Comma => () })
                 .allow_trailing()
                 .collect::<Vec<_>>(),
@@ -1349,6 +1430,8 @@ pub(super) fn enum_declaration<'src>(
                                 .iter()
                                 .map(|f| ast::StructField {
                                     annotations: f.annotations.clone(),
+                                    embed: None,
+                                    span: f.span,
                                     name: f.name,
                                     ty: resolve_type_params(
                                         &f.ty,
