@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: try requires Option
+// @frontend: new
+
+fn bad() -> int? {
+    let value: int = try Result.Err(1);
+    value
+}

@@ -15,7 +15,7 @@ use self::{
         AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee,
         check_place,
     },
-    postfix::{check_postfix_chain, collect_postfix_chain},
+    postfix::{PostfixStep, check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
     type_refs::{
         FinalizedTypeRef, GenericParamError, LocalTypeAlias, LocalTypeScopes, TypeRefResolver,
@@ -153,6 +153,25 @@ pub(crate) enum TypeWarning {
         message: String,
         span: SourceSpan,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TryCarrierKind {
+    Result,
+    Option,
+}
+
+impl TryCarrierKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Result => "Result",
+            Self::Option => "Option",
+        }
+    }
+
+    pub(crate) fn any_label() -> &'static str {
+        "Result or Option"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,15 +351,16 @@ pub(crate) enum TypeError {
     ContinueInsideDefer {
         span: Option<SourceSpan>,
     },
-    TryOnNonResult {
+    TryOnInvalidCarrier {
+        expected: TryCarrierKind,
         found: Type,
         span: Option<SourceSpan>,
     },
-    TryOutsideResultFunction {
+    TryOutsideCarrierFunction {
         found: Option<Type>,
         span: Option<SourceSpan>,
     },
-    TryErrorMismatch {
+    TryResultErrorMismatch {
         expected: Type,
         found: Type,
         span: Option<SourceSpan>,
@@ -1487,26 +1507,29 @@ impl TypeChecker {
         self.externs.ty(owner)
     }
 
-    fn core_result_parts(&self, ty: &Type) -> Option<ResultParts> {
-        if self.decls.key_for_type(ty)? != self.decls.core_result_key()? {
-            return None;
-        }
+    fn try_carrier_parts(&self, ty: &Type) -> Option<TryCarrier> {
         let Type::Nominal(nominal) = ty else {
             return None;
         };
-        let [ok, err] = nominal.type_args.as_slice() else {
-            return None;
+        let key = self.decls.key_for_type(ty)?;
+        let (kind, success, error) = if self.decls.core_result_key().as_ref() == Some(&key) {
+            let [success, error] = nominal.type_args.as_slice() else {
+                return None;
+            };
+            (TryCarrierKind::Result, success, Some(error.clone()))
+        } else {
+            (
+                TryCarrierKind::Option,
+                self.decls.core_option_inner(ty)?,
+                None,
+            )
         };
-        Some(ResultParts {
+        Some(TryCarrier {
+            kind,
             nominal: nominal.clone(),
-            ok: ok.clone(),
-            err: err.clone(),
+            success: success.clone(),
+            error,
         })
-    }
-
-    fn result_operand_handle(&mut self, parts: &ResultParts, ok: TypeHandle) -> TypeHandle {
-        let err = self.type_handle(&parts.err);
-        self.solver.nominal_handle(&parts.nominal, vec![ok, err])
     }
 
     fn extern_field(
@@ -4452,10 +4475,42 @@ struct CheckedType {
 }
 
 #[derive(Clone)]
-struct ResultParts {
+struct TryCarrier {
+    kind: TryCarrierKind,
     nominal: NominalType,
-    ok: Type,
-    err: Type,
+    success: Type,
+    error: Option<Type>,
+}
+
+impl TryCarrier {
+    fn operand_handle(&self, success: TypeHandle, tc: &mut TypeChecker) -> TypeHandle {
+        let mut args = vec![success];
+        if let Some(error) = &self.error {
+            args.push(tc.type_handle(error));
+        }
+        tc.solver.nominal_handle(&self.nominal, args)
+    }
+
+    fn validate_residual(&self, operand: &Self, span: Span, tc: &mut TypeChecker) -> bool {
+        let (Some(expected), Some(found)) = (&self.error, &operand.error) else {
+            return true;
+        };
+        if expected == found {
+            return true;
+        }
+        tc.push_error(TypeError::TryResultErrorMismatch {
+            expected: expected.clone(),
+            found: found.clone(),
+            span: tc.error_span(span),
+        });
+        false
+    }
+}
+
+struct TryOperandHint {
+    success: TypeHandle,
+    operand_expected: TypeHandle,
+    success_matches_result_error: bool,
 }
 
 fn checked_type(ty: Type, tc: &TypeChecker) -> CheckedType {
@@ -5272,20 +5327,189 @@ fn type_from_lit(lit: &Lit) -> Type {
     }
 }
 
-fn take_try_error_mismatch(
+fn try_operand_hint(
+    enclosing: &TryCarrier,
+    expected: Option<TypeHandle>,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> TryOperandHint {
+    let expected_success = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let optional_context = matches!(enclosing.kind, TryCarrierKind::Option)
+        && expected_success
+            .as_ref()
+            .is_some_and(|ty| tc.decls.core_option_inner(ty).is_some());
+    let success_matches_result_error = enclosing
+        .error
+        .as_ref()
+        .is_some_and(|error| expected_success.as_ref() == Some(error));
+    let success = if optional_context {
+        tc.fresh_temp_handle(span)
+    } else {
+        expected.unwrap_or_else(|| tc.fresh_temp_handle(span))
+    };
+
+    TryOperandHint {
+        operand_expected: enclosing.operand_handle(success.clone(), tc),
+        success,
+        success_matches_result_error,
+    }
+}
+
+fn try_operand_recovery_ty(
+    expr: &ExprNode,
+    operand_ty: &Type,
+    operand: &TypeHandle,
+    tc: &TypeChecker,
+) -> Option<Type> {
+    if operand_ty != &Type::Infer {
+        return None;
+    }
+    let partial = tc.solver.handle_to_partial_type(operand);
+    if tc.try_carrier_parts(&partial).is_some() {
+        return Some(partial);
+    }
+    try_operand_field_carrier_ty(expr, tc)
+}
+
+fn try_operand_field_carrier_ty(expr: &ExprNode, tc: &TypeChecker) -> Option<Type> {
+    let chain = collect_postfix_chain(expr)?;
+    let PostfixStep::Field { node, id } = chain.steps.first()? else {
+        return None;
+    };
+    let field = tc.solver.expr_handle(*id);
+    let carrier_ty = tc.solver.handle_to_partial_type(&field);
+    let key = tc.decls.key_for_type(&carrier_ty)?;
+    let schema = tc.decls.enum_schema(&key)?;
+    schema.variants.get(&node.node.field)?;
+
+    let Type::Nominal(mut nominal) = carrier_ty else {
+        return None;
+    };
+    if nominal.type_args.len() != schema.generics.type_params.len() {
+        nominal.type_args = vec![Type::Infer; schema.generics.type_params.len()];
+    }
+    if nominal.const_args.len() != schema.generics.const_params.len() {
+        return None;
+    }
+
+    let ty = Type::Nominal(nominal);
+    tc.try_carrier_parts(&ty)?;
+    Some(ty)
+}
+
+fn take_try_operand_error(
     start: usize,
     end: usize,
-    expected_ty: &Type,
+    operand_span: Span,
+    try_span: Span,
+    enclosing: &TryCarrier,
+    hint: &TryOperandHint,
+    found_ty: Option<&Type>,
     tc: &mut TypeChecker,
-) -> Option<Type> {
+) -> Option<TypeError> {
     let end = end.min(tc.errors.len());
-    let index = tc.errors[start..end].iter().position(|error| {
-        matches!(error, TypeError::TypeMismatch { expected, .. } if expected == expected_ty)
-    })? + start;
-    let TypeError::TypeMismatch { found, .. } = tc.errors.remove(index) else {
-        unreachable!();
-    };
-    Some(found)
+    let root_span = tc.error_span(operand_span);
+    if let Some((index, error)) = (start..end).find_map(|index| {
+        let TypeError::TypeMismatch {
+            expected,
+            found,
+            span,
+        } = &tc.errors[index]
+        else {
+            return None;
+        };
+        try_operand_error_from_mismatch(
+            expected, found, *span, root_span, try_span, enclosing, hint, tc,
+        )
+        .map(|error| (index, error))
+    }) {
+        tc.errors.remove(index);
+        return Some(error);
+    }
+
+    let found = try_carrier_mismatch_ty(found_ty?, enclosing, tc)?;
+    remove_root_try_operand_error(start, end, operand_span, enclosing, tc);
+    Some(try_invalid_carrier_error(enclosing, found, try_span, tc))
+}
+
+fn try_operand_error_from_mismatch(
+    expected: &Type,
+    found: &Type,
+    mismatch_span: Option<SourceSpan>,
+    root_span: Option<SourceSpan>,
+    try_span: Span,
+    enclosing: &TryCarrier,
+    hint: &TryOperandHint,
+    tc: &TypeChecker,
+) -> Option<TypeError> {
+    if let Some(error) = &enclosing.error
+        && expected == error
+        && !hint.success_matches_result_error
+    {
+        return Some(TypeError::TryResultErrorMismatch {
+            expected: error.clone(),
+            found: found.clone(),
+            span: tc.error_span(try_span),
+        });
+    }
+
+    if mismatch_span != root_span {
+        return None;
+    }
+    let found = try_carrier_mismatch_ty(found, enclosing, tc)?;
+    Some(try_invalid_carrier_error(enclosing, found, try_span, tc))
+}
+
+fn try_carrier_mismatch_ty(found: &Type, enclosing: &TryCarrier, tc: &TypeChecker) -> Option<Type> {
+    let found_carrier = tc.try_carrier_parts(found)?;
+    (found_carrier.kind != enclosing.kind).then(|| found.clone())
+}
+
+fn remove_root_try_operand_error(
+    start: usize,
+    end: usize,
+    span: Span,
+    enclosing: &TryCarrier,
+    tc: &mut TypeChecker,
+) {
+    let end = end.min(tc.errors.len());
+    let root_span = tc.error_span(span);
+    let index = (start..end).find(|index| match &tc.errors[*index] {
+        TypeError::TypeMismatch {
+            expected,
+            found,
+            span,
+        } if *span == root_span => {
+            matches!(found, Type::Infer)
+                || matches!(expected, Type::Infer)
+                || try_carrier_mismatch_ty(found, enclosing, tc).is_some()
+                || try_carrier_mismatch_ty(expected, enclosing, tc).is_some()
+        }
+        TypeError::CannotInferType { span } | TypeError::UnboundGenericParam { span, .. } => {
+            *span == root_span
+        }
+        _ => false,
+    });
+    if let Some(index) = index {
+        tc.errors.remove(index);
+    }
+}
+
+fn try_invalid_carrier_error(
+    enclosing: &TryCarrier,
+    found: Type,
+    span: Span,
+    tc: &TypeChecker,
+) -> TypeError {
+    TypeError::TryOnInvalidCarrier {
+        expected: enclosing.kind,
+        found,
+        span: tc.error_span(span),
+    }
+}
+
+fn push_try_invalid_carrier(enclosing: &TryCarrier, found: Type, span: Span, tc: &mut TypeChecker) {
+    tc.push_error(try_invalid_carrier_error(enclosing, found, span, tc));
 }
 
 fn check_try(
@@ -5294,71 +5518,92 @@ fn check_try(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let return_ty = tc.return_type().cloned();
-    let return_parts = return_ty.as_ref().and_then(|ty| tc.core_result_parts(ty));
+    let enclosing = return_ty.as_ref().and_then(|ty| tc.try_carrier_parts(ty));
 
     if tc.in_defer() {
         tc.push_error(TypeError::TryInsideDefer {
             span: tc.error_span(try_node.span),
         });
     }
-    if return_parts.is_none() {
-        tc.push_error(TypeError::TryOutsideResultFunction {
+    if enclosing.is_none() {
+        tc.push_error(TypeError::TryOutsideCarrierFunction {
             found: return_ty.clone(),
             span: tc.error_span(try_node.span),
         });
     }
 
-    let expected_ok_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
-    let operand_expected = match &return_parts {
-        Some(parts) => {
-            let ok = expected.unwrap_or_else(|| tc.fresh_temp_handle(try_node.span));
-            Some(tc.result_operand_handle(parts, ok))
-        }
-        None => None,
-    };
+    let hint = enclosing
+        .as_ref()
+        .map(|enclosing| try_operand_hint(enclosing, expected, try_node.span, tc));
     let operand_error_start = tc.errors.len();
-    let operand = check_value_expr_checked_with_hint(&try_node.node.expr, operand_expected, tc);
+    let operand = check_value_expr_checked_with_hint(
+        &try_node.node.expr,
+        hint.as_ref().map(|hint| hint.operand_expected.clone()),
+        tc,
+    );
     tc.solve_constraints();
     let operand_ty = tc.handle_type(&operand.handle);
     let operand_error_end = tc.errors.len();
+    let operand_recovery_ty =
+        try_operand_recovery_ty(&try_node.node.expr, &operand_ty, &operand.handle, tc);
 
-    if operand_ty == Type::Infer && operand_error_start != operand_error_end {
-        if let Some(return_parts) = &return_parts
-            && expected_ok_ty.as_ref() != Some(&return_parts.err)
-            && let Some(found) = take_try_error_mismatch(
-                operand_error_start,
-                operand_error_end,
-                &return_parts.err,
-                tc,
-            )
-        {
-            tc.push_error(TypeError::TryErrorMismatch {
-                expected: return_parts.err.clone(),
-                found,
-                span: tc.error_span(try_node.span),
-            });
+    if operand_ty == Type::Infer {
+        if operand_error_start != operand_error_end {
+            if let (Some(enclosing), Some(hint)) = (&enclosing, &hint)
+                && let Some(error) = take_try_operand_error(
+                    operand_error_start,
+                    operand_error_end,
+                    try_node.node.expr.span,
+                    try_node.span,
+                    enclosing,
+                    hint,
+                    operand_recovery_ty.as_ref(),
+                    tc,
+                )
+            {
+                tc.push_error(error);
+            }
+            return checked_type(Type::Infer, tc);
         }
-        return checked_type(Type::Infer, tc);
+        if let (Some(enclosing), Some(found)) = (&enclosing, operand_recovery_ty.as_ref())
+            && let Some(found) = try_carrier_mismatch_ty(found, enclosing, tc)
+        {
+            push_try_invalid_carrier(enclosing, found, try_node.span, tc);
+            return checked_type(Type::Infer, tc);
+        }
+        if let Some(hint) = &hint {
+            let ty = tc.handle_type(&hint.success);
+            return CheckedType {
+                contains_extern_any: type_closure_facts(&ty).contains_any,
+                handle: hint.success.clone(),
+                ty,
+            };
+        }
     }
-    let Some(operand_parts) = tc.core_result_parts(&operand_ty) else {
-        tc.push_error(TypeError::TryOnNonResult {
-            found: operand_ty,
-            span: tc.error_span(try_node.span),
-        });
+
+    let Some(enclosing) = enclosing else {
         return checked_type(Type::Infer, tc);
     };
-    let Some(return_parts) = return_parts else {
+    let Some(operand_carrier) = tc.try_carrier_parts(&operand_ty) else {
+        push_try_invalid_carrier(&enclosing, operand_ty, try_node.span, tc);
         return checked_type(Type::Infer, tc);
     };
-    if operand_parts.err != return_parts.err {
-        tc.push_error(TypeError::TryErrorMismatch {
-            expected: return_parts.err,
-            found: operand_parts.err,
-            span: tc.error_span(try_node.span),
-        });
+    if operand_carrier.kind != enclosing.kind {
+        remove_root_try_operand_error(
+            operand_error_start,
+            operand_error_end,
+            try_node.node.expr.span,
+            &enclosing,
+            tc,
+        );
+        push_try_invalid_carrier(&enclosing, operand_ty, try_node.span, tc);
         return checked_type(Type::Infer, tc);
     }
-    let mut checked = checked_type(operand_parts.ok, tc);
+    if !enclosing.validate_residual(&operand_carrier, try_node.span, tc) {
+        return checked_type(Type::Infer, tc);
+    }
+
+    let mut checked = checked_type(operand_carrier.success.clone(), tc);
     checked.contains_extern_any = type_closure_facts(&checked.ty).contains_any;
     checked
 }

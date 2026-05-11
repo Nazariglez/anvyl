@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: try requires Option
+// @contains: Unknown variable 'missing'
+// @frontend: new
+
+fn bad() -> int? {
+    let value: int = try Result.Ok(missing);
+    value
+}

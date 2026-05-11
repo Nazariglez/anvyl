@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: try requires Result, found 'Option<int>'
+// @frontend: new
+
+fn read() -> int? {
+    1
+}
+
+fn bad() -> Result<int, string> {
+    let value = try read();
+    Result.Ok(value)
+}

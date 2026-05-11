@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Could not infer type
+// @frontend: new
+
+fn bad() -> int? {
+    let _ = try nil;
+    1
+}

@@ -1,0 +1,53 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Profile { age: int }
+struct User { profile: Profile? }
+
+fn basic(x: int?) -> int? {
+    let value = try x;
+    value + 1
+}
+
+fn tail(x: int?) -> int? {
+    try x
+}
+
+fn nested(x: Option<int?>) -> int? {
+    try x
+}
+
+fn nil_expected() -> int? {
+    let value: int = try nil;
+    value
+}
+
+fn none_expected() -> int? {
+    let value: int = try Option.None;
+    value
+}
+
+fn inferred_none_expected() -> int? {
+    let value: int = try .None;
+    value
+}
+
+fn tail_nil() -> int? {
+    try nil
+}
+
+fn age(user: User?) -> int? {
+    let profile = try user?.profile;
+    profile.age
+}
+
+fn success_type_can_differ(x: int?) -> string? {
+    let _ = try x;
+    "ok"
+}
+
+fn lambda(x: int?) -> int? {
+    let f: fn() -> int? = || { try x };
+    f()
+}

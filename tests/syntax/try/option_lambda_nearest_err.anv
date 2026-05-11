@@ -3,10 +3,7 @@
 // @contains: try requires enclosing function to return Result or Option, found 'int'
 // @frontend: new
 
-fn read() -> Result<int, string> {
-    Result.Ok(1)
-}
-
-fn load() -> int {
-    try read()
+fn bad(x: int?) -> int? {
+    let f: fn() -> int = || { try x };
+    f()
 }

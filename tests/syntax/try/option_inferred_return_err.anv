@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: try requires enclosing function to return Result or Option
+// @frontend: new
+
+fn bad<T>(x: T?) -> _ {
+    try x
+}
+
+fn main() {
+    let x: int? = 1;
+    let _ = bad(x);
+}

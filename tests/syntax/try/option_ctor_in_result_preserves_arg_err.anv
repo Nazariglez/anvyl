@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'int', found 'string'
+// @contains: try requires Result, found 'Option<int>'
+// @frontend: new
+
+fn takes_int(x: int) -> int { x }
+
+fn bad() -> Result<int, string> {
+    let value = try Option.Some(takes_int("x"));
+    Result.Ok(value)
+}

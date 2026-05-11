@@ -23,7 +23,7 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, DeprecatedUseKind,
-        MemberAccessKind, ModuleScope, TypeError, TypeWarning, VariantShape,
+        MemberAccessKind, ModuleScope, TryCarrierKind, TypeError, TypeWarning, VariantShape,
     },
 };
 
@@ -657,16 +657,24 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ReturnInsideDefer { .. } => "return inside defer".to_string(),
         TypeError::BreakInsideDefer { .. } => "break inside defer".to_string(),
         TypeError::ContinueInsideDefer { .. } => "continue inside defer".to_string(),
-        TypeError::TryOnNonResult { found, .. } => {
-            format!("try requires Result, found '{found}'")
+        TypeError::TryOnInvalidCarrier {
+            expected, found, ..
+        } => {
+            format!("try requires {}, found '{found}'", expected.label())
         }
-        TypeError::TryOutsideResultFunction { found: None, .. } => {
-            "try requires an enclosing Result-returning function".to_string()
+        TypeError::TryOutsideCarrierFunction { found: None, .. } => {
+            format!(
+                "try requires enclosing function to return {}",
+                TryCarrierKind::any_label()
+            )
         }
-        TypeError::TryOutsideResultFunction {
+        TypeError::TryOutsideCarrierFunction {
             found: Some(found), ..
-        } => format!("try requires enclosing function to return Result, found '{found}'"),
-        TypeError::TryErrorMismatch {
+        } => format!(
+            "try requires enclosing function to return {}, found '{found}'",
+            TryCarrierKind::any_label()
+        ),
+        TypeError::TryResultErrorMismatch {
             expected, found, ..
         } => format!("try error type mismatch: expected '{expected}', found '{found}'"),
         TypeError::TryInsideDefer { .. } => "try inside defer".to_string(),
@@ -1082,9 +1090,9 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::ReturnInsideDefer { span, .. }
         | TypeError::BreakInsideDefer { span, .. }
         | TypeError::ContinueInsideDefer { span, .. }
-        | TypeError::TryOnNonResult { span, .. }
-        | TypeError::TryOutsideResultFunction { span, .. }
-        | TypeError::TryErrorMismatch { span, .. }
+        | TypeError::TryOnInvalidCarrier { span, .. }
+        | TypeError::TryOutsideCarrierFunction { span, .. }
+        | TypeError::TryResultErrorMismatch { span, .. }
         | TypeError::TryInsideDefer { span, .. }
         | TypeError::ForIterableNotSupported { span, .. }
         | TypeError::ForIterationModifier { span, .. }

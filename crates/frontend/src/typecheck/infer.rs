@@ -749,6 +749,10 @@ impl Solver {
         self.type_for_storage(&self.resolve_ref(&handle.0))
     }
 
+    pub(super) fn handle_to_partial_type(&self, handle: &TypeHandle) -> Type {
+        self.finalize_ty(&self.resolve_ref(&handle.0)).0
+    }
+
     pub(super) fn add_handle_equal(
         &mut self,
         span: Option<SourceSpan>,
