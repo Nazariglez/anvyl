@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: visibility is not allowed on local function declarations
+
+fn main() {
+    pub fn helper() {}
+}

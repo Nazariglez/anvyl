@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: use of deprecated type alias 'ListOf': use array
+
+@deprecated("use array")
+type ListOf<T> = [T];
+
+fn main() {
+    let xs: ListOf<int> = [1];
+}

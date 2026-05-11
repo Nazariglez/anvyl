@@ -3,7 +3,7 @@ use chumsky::prelude::*;
 use super::{
     AnvParser, BoxedParser,
     common::{block_stmt, identifier},
-    decl::{function, local_type_alias_statement},
+    decl::{DeclPolicy, declaration_header, local_function, local_type_alias_statement},
     expr::{cond_expression, expression, for_header_expression},
     pattern::{let_or_var_head, pattern},
     types::type_ident,
@@ -17,7 +17,7 @@ use crate::{
 pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
     recursive(|stmt| {
         let expr = expression(stmt.clone());
-        let func = function(stmt.clone());
+        let func = local_function(stmt.clone());
         let bind = binding(stmt.clone());
         let const_s = const_stmt(stmt.clone());
         let type_alias = local_type_alias_statement();
@@ -68,6 +68,8 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             Token::Keyword(Keyword::Defer) => (),
             Token::Keyword(Keyword::Const) => (),
             Token::Keyword(Keyword::Type) => (),
+            Token::At => (),
+            Token::DocComment(_) => (),
         }
         .rewind();
 
@@ -179,27 +181,29 @@ fn binding<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src,
 }
 
 fn const_stmt<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src, ast::StmtNode> {
-    select! { Token::Keyword(Keyword::Const) => () }
-        .ignore_then(identifier())
+    declaration_header(DeclPolicy::LOCAL_CONST)
         .then(
-            select! { Token::Colon => () }
-                .ignore_then(type_ident())
-                .or_not(),
+            select! { Token::Keyword(Keyword::Const) => () }
+                .ignore_then(identifier())
+                .then(
+                    select! { Token::Colon => () }
+                        .ignore_then(type_ident())
+                        .or_not(),
+                )
+                .then_ignore(select! { Token::Op(Op::Assign) => () })
+                .then(expression(stmt))
+                .then_ignore(select! { Token::Semicolon => () }),
         )
-        .then_ignore(select! { Token::Op(Op::Assign) => () })
-        .then(expression(stmt))
-        .then_ignore(select! { Token::Semicolon => () })
-        .map_with(|((name, ty), value), e| {
-            let s = e.span();
-            let span = s.byte();
+        .map_with(|(header, ((name, ty), value)), e| {
+            let span = e.span().byte();
             let node = Spanned::new(
                 ast::ConstDecl {
-                    annotations: vec![],
-                    doc: None,
+                    annotations: header.annotations,
+                    doc: header.doc,
                     name,
                     ty,
                     value,
-                    visibility: ast::Visibility::Private,
+                    visibility: header.visibility,
                 },
                 span,
             );

@@ -808,7 +808,7 @@ fn apply_module_field(
             return Subject::Type(nominal_type(&key));
         }
         ModuleMemberLookup::Found(binding @ TypeBinding::Alias(_)) => {
-            let ty = tc.resolve_type_binding_for_tc_at(binding, &[], span);
+            let ty = tc.resolve_type_binding_for_tc_at(binding, &[], span, name);
             if !matches!(ty, Type::Infer) {
                 return Subject::Type(ty);
             }

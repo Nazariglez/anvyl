@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: annotations are not allowed on local const declarations
+
+fn main() {
+    @deprecated
+    const X: int = 1;
+}

@@ -52,6 +52,12 @@ pub(super) struct PatternPlace {
     pub(super) accepts_extern_any: bool,
 }
 
+enum StructPatternTarget {
+    Found(NominalKey, Type),
+    Missing,
+    ReportedError,
+}
+
 #[derive(Clone)]
 struct PatternInput {
     expected: TypeHandle,
@@ -776,31 +782,42 @@ impl<'tc> PatternChecker<'tc> {
         self.unsupported_named("range", span)
     }
 
-    fn resolve_struct_pattern_target(
-        &mut self,
-        name: Ident,
-        span: Span,
-    ) -> Option<(NominalKey, Type)> {
-        if let Some(alias) = self.tc.local_type_scopes.visible(name, None).cloned() {
-            let expanded = self.tc.resolve_local_alias_target_for_tc_at(&alias, span);
-            let key = self.tc.decls.key_for_type(&expanded)?;
-            return Some((key, expanded));
+    fn resolve_struct_pattern_target(&mut self, name: Ident, span: Span) -> StructPatternTarget {
+        if self.tc.local_type_scopes.visible(name, None).is_some() {
+            let expanded = self
+                .tc
+                .resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
+            return self.struct_pattern_target_from_expanded(expanded);
         }
-        let binding =
+        let Some(binding) =
             self.tc
                 .decls
-                .resolve_visible_type_binding(&self.tc.current_module, None, name)?;
+                .resolve_visible_type_binding(&self.tc.current_module, None, name)
+        else {
+            return StructPatternTarget::Missing;
+        };
         match binding {
             TypeBinding::Nominal(key) => {
                 let ty = nominal_type(&key);
-                Some((key, ty))
+                StructPatternTarget::Found(key, ty)
             }
-            TypeBinding::Alias(key) => {
-                let expanded = self.tc.resolve_module_alias_target_for_tc_at(&key, span);
-                let key = self.tc.decls.key_for_type(&expanded)?;
-                Some((key, expanded))
+            TypeBinding::Alias(_) => {
+                let expanded = self
+                    .tc
+                    .resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
+                self.struct_pattern_target_from_expanded(expanded)
             }
         }
+    }
+
+    fn struct_pattern_target_from_expanded(&self, expanded: Type) -> StructPatternTarget {
+        if matches!(expanded, Type::Infer) {
+            return StructPatternTarget::ReportedError;
+        }
+        let Some(key) = self.tc.decls.key_for_type(&expanded) else {
+            return StructPatternTarget::Missing;
+        };
+        StructPatternTarget::Found(key, expanded)
     }
 
     fn check_struct(
@@ -810,14 +827,21 @@ impl<'tc> PatternChecker<'tc> {
         span: Span,
         input: PatternInput,
     ) -> PatternCheckResult {
-        let Some((key, head_ty)) = self.resolve_struct_pattern_target(name, span) else {
-            self.tc.push_error(TypeError::UnknownType {
-                qualifier: None,
-                name,
-                span: self.tc.error_span(span),
-            });
-            self.check_field_patterns(fields, input.access);
-            return PatternCheckResult::empty(PatternOutcome::error());
+        let (key, head_ty) = match self.resolve_struct_pattern_target(name, span) {
+            StructPatternTarget::Found(key, ty) => (key, ty),
+            StructPatternTarget::Missing => {
+                self.tc.push_error(TypeError::UnknownType {
+                    qualifier: None,
+                    name,
+                    span: self.tc.error_span(span),
+                });
+                self.check_field_patterns(fields, input.access);
+                return PatternCheckResult::empty(PatternOutcome::error());
+            }
+            StructPatternTarget::ReportedError => {
+                self.check_field_patterns(fields, input.access);
+                return PatternCheckResult::empty(PatternOutcome::error());
+            }
         };
 
         let expected_key = self.tc.decls.key_for_type(&input.expected_ty);

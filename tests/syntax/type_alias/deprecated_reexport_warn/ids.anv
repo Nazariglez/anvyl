@@ -1,0 +1,4 @@
+// @helper
+
+@deprecated("use int")
+pub type Id = int;

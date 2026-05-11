@@ -17,7 +17,10 @@ use self::{
     },
     postfix::{check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
-    type_refs::{GenericParamError, LocalTypeAlias, LocalTypeScopes, TypeRefResolver},
+    type_refs::{
+        FinalizedTypeRef, GenericParamError, LocalTypeAlias, LocalTypeScopes, TypeRefResolver,
+        TypeRefWarning,
+    },
 };
 pub(crate) use self::{
     decls::*,
@@ -122,6 +125,7 @@ pub(crate) enum DeprecatedUseKind {
     ExternFunction,
     Const,
     ExternType,
+    TypeAlias,
     Struct,
     DataRef,
     Enum,
@@ -1927,7 +1931,7 @@ impl TypeChecker {
     fn resolve_type_for_tc_at(&mut self, ty: &Type, span: Span) -> Type {
         let generics = self.generic_contexts.last().cloned().unwrap_or_default();
         let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
-        let result = resolver.finalize(&self.current_module, &generics, ty);
+        let result = resolver.finalize_at(&self.current_module, &generics, ty, Some(span));
         self.finish_type_ref_result(result, span)
     }
 
@@ -1936,32 +1940,68 @@ impl TypeChecker {
         binding: TypeBinding,
         args: &[GenericArg],
         span: Span,
+        use_name: Ident,
     ) -> Type {
         let generics = self.generic_contexts.last().cloned().unwrap_or_default();
         let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
-        let result = resolver.finalize_type_binding(&self.current_module, &generics, binding, args);
+        let result = resolver.finalize_type_binding_at(
+            &self.current_module,
+            &generics,
+            binding,
+            args,
+            Some(span),
+            use_name,
+        );
         self.finish_type_ref_result(result, span)
     }
 
-    fn resolve_module_alias_target_for_tc_at(&mut self, key: &TypeAliasKey, span: Span) -> Type {
-        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
-        let result = resolver.finalize_module_alias_target(key);
-        self.finish_type_ref_result(result, span)
-    }
-
-    fn resolve_local_alias_target_for_tc_at(&mut self, alias: &LocalTypeAlias, span: Span) -> Type {
-        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
-        let result = resolver.finalize_local_alias_target(alias);
-        self.finish_type_ref_result(result, span)
-    }
-
-    fn finish_type_ref_result(&mut self, result: Result<Type, TypeRefError>, span: Span) -> Type {
+    fn finish_type_ref_result(
+        &mut self,
+        result: Result<FinalizedTypeRef, TypeRefError>,
+        span: Span,
+    ) -> Type {
         match result {
-            Ok(ty) => self.finish_resolved_type(ty, span),
+            Ok(finalized) => {
+                self.push_type_ref_warnings(finalized.warnings);
+                self.finish_resolved_type(finalized.ty, span)
+            }
             Err(error) => {
                 self.push_error_once(type_ref_error(error, self.error_span(span)));
                 Type::Infer
             }
+        }
+    }
+
+    fn resolve_module_alias_target_for_tc_at(
+        &mut self,
+        key: &TypeAliasKey,
+        span: Span,
+        use_name: Ident,
+    ) -> Type {
+        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+        let result = resolver.finalize_module_alias_target_at(key, Some(span), use_name);
+        self.finish_type_ref_result(result, span)
+    }
+
+    fn resolve_local_alias_target_for_tc_at(
+        &mut self,
+        alias: &LocalTypeAlias,
+        span: Span,
+        use_name: Ident,
+    ) -> Type {
+        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+        let result = resolver.finalize_local_alias_target_at(alias, Some(span), use_name);
+        self.finish_type_ref_result(result, span)
+    }
+
+    fn push_type_ref_warnings(&mut self, warnings: Vec<TypeRefWarning>) {
+        for warning in warnings {
+            self.push_warning(TypeWarning::DeprecatedAccess {
+                kind: DeprecatedUseKind::TypeAlias,
+                name: warning.name,
+                reason: warning.reason,
+                span: self.source_span(warning.span),
+            });
         }
     }
 
@@ -2138,17 +2178,8 @@ impl TypeChecker {
         if let Some(ty) = self.substituted_type_param(name) {
             return Some(ty);
         }
-        if let Some(alias) = self.local_type_scopes.visible(name, None).cloned() {
-            if !alias.generics.is_empty() {
-                let generics = &alias.generics;
-                let expected = generics.type_params.len() + generics.const_params.len();
-                self.push_error_once(type_ref_error(
-                    TypeRefError::GenericArity { expected, found: 0 },
-                    self.error_span(span),
-                ));
-                return None;
-            }
-            let ty = self.resolve_local_alias_target_for_tc_at(&alias, span);
+        if self.local_type_scopes.visible(name, None).is_some() {
+            let ty = self.resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
             return (!matches!(ty, Type::Infer)).then_some(ty);
         }
         let binding = self
@@ -2160,7 +2191,7 @@ impl TypeChecker {
                 Some(nominal_type(&key))
             }
             TypeBinding::Alias(_) => {
-                let ty = self.resolve_type_binding_for_tc_at(binding, &[], span);
+                let ty = self.resolve_type_binding_for_tc_at(binding, &[], span, name);
                 (!matches!(ty, Type::Infer)).then_some(ty)
             }
         }
@@ -2323,8 +2354,12 @@ impl TypeChecker {
         site: DeclTypeSite,
         ty: Type,
     ) -> Type {
-        match decls.finalize_type_ref(&site.module, &site.generics, &ty) {
-            Ok(ty) => ty,
+        let resolver = TypeRefResolver::module_only(decls);
+        match resolver.finalize_at(&site.module, &site.generics, &ty, Some(site.span)) {
+            Ok(finalized) => {
+                self.push_type_ref_warnings(finalized.warnings);
+                finalized.ty
+            }
             Err(TypeRefError::Unknown { qualifier, name }) => {
                 self.push_error(TypeError::Decl(DeclError::UnknownType {
                     module: site.module,
@@ -2761,19 +2796,33 @@ fn generic_param_type_error(error: GenericParamError, span: Option<SourceSpan>) 
 
 fn validate_type_alias_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
     for alias in decls.type_aliases() {
-        if matches!(alias.aliased, Type::Infer) {
-            continue;
-        }
-        push_unused_alias_params(&alias.generics, &alias.aliased, alias.span, errors);
-        if matches!(alias.visibility, Visibility::Public)
-            && let Some(ty) = private_alias_type(decls, &alias.aliased)
-        {
-            errors.push(TypeError::Decl(DeclError::PublicAliasPrivateType {
-                name: alias.key.name,
-                ty,
-                span: Some(alias.span),
-            }));
-        }
+        validate_type_alias_def(
+            decls,
+            &alias.def,
+            &alias.def.aliased,
+            matches!(alias.visibility, Visibility::Public),
+            errors,
+        );
+    }
+}
+
+fn validate_type_alias_def(
+    decls: &DeclarationIndex,
+    alias: &TypeAliasDef,
+    target: &Type,
+    public: bool,
+    errors: &mut Vec<TypeError>,
+) {
+    if matches!(target, Type::Infer) {
+        return;
+    }
+    push_unused_alias_params(&alias.generics, target, alias.span, errors);
+    if public && let Some(ty) = private_alias_type(decls, target) {
+        errors.push(TypeError::Decl(DeclError::PublicAliasPrivateType {
+            name: alias.name,
+            ty,
+            span: Some(alias.span),
+        }));
     }
 }
 
@@ -3407,13 +3456,25 @@ fn register_local_type_aliases(stmts: &[StmtNode], tc: &mut TypeChecker) {
             &alias.const_params,
             alias_node.span,
         );
+        let mut errors = vec![];
+        let policy = annotation::normalize_annotations(
+            tc.source_id(),
+            &alias.annotations,
+            annotation::AnnotationTarget::TypeAlias,
+            &mut errors,
+        );
+        tc.errors.extend(errors.into_iter().map(TypeError::Decl));
         let local = LocalTypeAlias {
             key: alias_node.span,
-            module: tc.current_module.clone(),
-            name: alias.name,
-            generics: generic_params(&alias.type_params, &alias.const_params),
-            generic_context,
-            aliased: alias.aliased.clone(),
+            def: TypeAliasDef {
+                module: tc.current_module.clone(),
+                name: alias.name,
+                generics: generic_params(&alias.type_params, &alias.const_params),
+                generic_context,
+                aliased: alias.aliased.clone(),
+                policy,
+                span: tc.source_span(alias_node.span),
+            },
             visible_depth: tc.local_type_scopes.depth(),
         };
         if !tc.local_type_scopes.insert(local) {
@@ -4659,26 +4720,13 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
 }
 
 fn check_type_alias(alias_node: &TypeAliasDeclNode, tc: &mut TypeChecker) {
-    let alias = &alias_node.node;
-    let owner = tc.generic_contexts.last().cloned().unwrap_or_default();
-    let generics = tc.extended_generic_context(
-        &owner,
-        &alias.type_params,
-        &alias.const_params,
-        alias_node.span,
-    );
-    tc.push_generic_context(generics);
-    let aliased = tc.resolve_type_for_tc_at(&alias.aliased, alias_node.span);
-    tc.pop_generic_context();
-    if matches!(aliased, Type::Infer) {
+    let Some(local) = tc.local_type_scopes.by_key(alias_node.span).cloned() else {
         return;
-    }
-    push_unused_alias_params(
-        &generic_params(&alias.type_params, &alias.const_params),
-        &aliased,
-        tc.source_span(alias_node.span),
-        &mut tc.errors,
-    );
+    };
+    tc.push_generic_context(local.def.generic_context.clone());
+    let aliased = tc.resolve_type_for_tc_at(&local.def.aliased, alias_node.span);
+    tc.pop_generic_context();
+    validate_type_alias_def(&tc.decls, &local.def, &aliased, false, &mut tc.errors);
 }
 
 fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
@@ -7078,7 +7126,7 @@ fn resolve_struct_target(
         && let Some(alias) = tc.local_type_scopes.visible(lit.node.name, None).cloned()
     {
         let expanded = if lit.node.generic_args.is_empty() {
-            tc.resolve_local_alias_target_for_tc_at(&alias, lit.span)
+            tc.resolve_local_alias_target_for_tc_at(&alias, lit.span, lit.node.name)
         } else {
             let ty = Type::UnresolvedNominal {
                 qualifier: None,
@@ -7106,7 +7154,7 @@ fn resolve_struct_target(
         TypeBinding::Nominal(key) => Some(StructLiteralTarget { key, seeds: None }),
         TypeBinding::Alias(key) => {
             let expanded = if lit.node.generic_args.is_empty() {
-                tc.resolve_module_alias_target_for_tc_at(&key, lit.span)
+                tc.resolve_module_alias_target_for_tc_at(&key, lit.span, lit.node.name)
             } else {
                 let ty = Type::UnresolvedNominal {
                     qualifier: lit.node.qualifier,
@@ -7125,6 +7173,9 @@ fn struct_literal_target_from_expanded(
     expanded: Type,
     tc: &mut TypeChecker,
 ) -> Option<StructLiteralTarget> {
+    if matches!(expanded, Type::Infer) {
+        return None;
+    }
     let Some(key) = tc.decls.key_for_type(&expanded) else {
         tc.push_error(TypeError::InvalidStructLiteral {
             name: lit.node.name,

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    /// local alias
+    type Id = int;
+    let x: Id = 1;
+}

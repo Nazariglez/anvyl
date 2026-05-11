@@ -1585,6 +1585,7 @@ fn render_deprecated_use_kind(kind: DeprecatedUseKind) -> &'static str {
         DeprecatedUseKind::ExternFunction => "extern function",
         DeprecatedUseKind::Const => "const",
         DeprecatedUseKind::ExternType => "extern type",
+        DeprecatedUseKind::TypeAlias => "type alias",
         DeprecatedUseKind::Struct => "struct",
         DeprecatedUseKind::DataRef => "dataref",
         DeprecatedUseKind::Enum => "enum",

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::{
     const_term::ConstTerm,
     decls::{
-        DeclarationIndex, ModuleScope, NominalKey, TypeAliasKey, TypeBinding,
+        DeclarationIndex, ModuleScope, NominalKey, TypeAliasDef, TypeAliasKey, TypeBinding,
         nominal_type_with_args,
     },
     generic::{GenericArgs, GenericParams, substitute},
@@ -140,16 +140,25 @@ pub(crate) enum TypeRefError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypeRefWarning {
+    pub(crate) name: Ident,
+    pub(crate) reason: Option<String>,
+    pub(crate) span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalizedTypeRef {
+    pub(crate) ty: Type,
+    pub(crate) warnings: Vec<TypeRefWarning>,
+}
+
 pub(crate) type LocalTypeAliasKey = Span;
 
 #[derive(Clone)]
 pub(crate) struct LocalTypeAlias {
     pub(crate) key: LocalTypeAliasKey,
-    pub(crate) module: ModuleScope,
-    pub(crate) name: Ident,
-    pub(crate) generics: GenericParams,
-    pub(crate) generic_context: GenericTypeContext,
-    pub(crate) aliased: Type,
+    pub(crate) def: TypeAliasDef,
     pub(crate) visible_depth: usize,
 }
 
@@ -175,7 +184,7 @@ impl LocalTypeScopes {
         let Some(scope) = self.scopes.last_mut() else {
             return false;
         };
-        match scope.entry(alias.name) {
+        match scope.entry(alias.def.name) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(alias);
@@ -191,6 +200,13 @@ impl LocalTypeScopes {
             .rev()
             .find_map(|scope| scope.get(&name))
     }
+
+    pub(crate) fn by_key(&self, key: LocalTypeAliasKey) -> Option<&LocalTypeAlias> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.values())
+            .find(|alias| alias.key == key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -199,9 +215,61 @@ enum AliasExpansionKey {
     Local(LocalTypeAliasKey),
 }
 
+struct AliasRef<'a> {
+    key: AliasExpansionKey,
+    def: &'a TypeAliasDef,
+    local_depth: Option<usize>,
+}
+
 pub(crate) struct TypeRefResolver<'a> {
     decls: &'a DeclarationIndex,
     local_types: Option<&'a LocalTypeScopes>,
+}
+
+struct FinalizeState {
+    local_depth: Option<usize>,
+    stack: Vec<AliasExpansionKey>,
+    site: Option<Span>,
+    warnings: Vec<TypeRefWarning>,
+}
+
+impl FinalizeState {
+    fn new(site: Option<Span>) -> Self {
+        Self {
+            local_depth: None,
+            stack: vec![],
+            site,
+            warnings: vec![],
+        }
+    }
+
+    fn alias_target(alias: &AliasRef<'_>, site: Option<Span>) -> Self {
+        Self {
+            local_depth: alias.local_depth,
+            stack: vec![alias.key.clone()],
+            site,
+            warnings: vec![],
+        }
+    }
+
+    fn warn_deprecated_alias(&mut self, alias: &AliasRef<'_>, use_name: Ident) {
+        if alias.def.policy.has_deprecated()
+            && let Some(span) = self.site
+        {
+            self.warnings.push(TypeRefWarning {
+                name: use_name,
+                reason: alias.def.policy.deprecated_reason().map(str::to_string),
+                span,
+            });
+        }
+    }
+
+    fn finish(self, ty: Type) -> FinalizedTypeRef {
+        FinalizedTypeRef {
+            ty,
+            warnings: self.warnings,
+        }
+    }
 }
 
 impl<'a> TypeRefResolver<'a> {
@@ -228,7 +296,19 @@ impl<'a> TypeRefResolver<'a> {
         generics: &GenericTypeContext,
         ty: &Type,
     ) -> Result<Type, TypeRefError> {
-        self.finalize_inner(module, generics, ty, None, &mut vec![])
+        Ok(self.finalize_at(module, generics, ty, None)?.ty)
+    }
+
+    pub(crate) fn finalize_at(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        ty: &Type,
+        site: Option<Span>,
+    ) -> Result<FinalizedTypeRef, TypeRefError> {
+        let mut state = FinalizeState::new(site);
+        let ty = self.finalize_inner(module, generics, ty, &mut state)?;
+        Ok(state.finish(ty))
     }
 
     fn finalize_inner(
@@ -236,12 +316,11 @@ impl<'a> TypeRefResolver<'a> {
         module: &ModuleScope,
         generics: &GenericTypeContext,
         ty: &Type,
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
     ) -> Result<Type, TypeRefError> {
         match ty {
             Type::UnresolvedName(name) => {
-                self.finalize_unresolved_name(module, generics, *name, local_depth, stack)
+                self.finalize_unresolved_name(module, generics, *name, state)
             }
             Type::UnresolvedNominal {
                 qualifier,
@@ -253,32 +332,31 @@ impl<'a> TypeRefResolver<'a> {
                 *qualifier,
                 *name,
                 generic_args,
-                local_depth,
-                stack,
+                state,
             ),
             Type::Func { params, ret } => Ok(Type::Func {
                 params: params
                     .iter()
                     .map(|param| {
                         Ok(FuncParam::new(
-                            self.finalize_inner(module, generics, &param.ty, local_depth, stack)?,
+                            self.finalize_inner(module, generics, &param.ty, state)?,
                             param.mutable,
                             param.cast_accept,
                         ))
                     })
                     .collect::<Result<_, _>>()?,
-                ret: Box::new(self.finalize_inner(module, generics, ret, local_depth, stack)?),
+                ret: Box::new(self.finalize_inner(module, generics, ret, state)?),
             }),
             Type::Tuple(elems) => elems
                 .iter()
-                .map(|ty| self.finalize_inner(module, generics, ty, local_depth, stack))
+                .map(|ty| self.finalize_inner(module, generics, ty, state))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Type::Tuple),
             Type::Nominal(nominal) => {
                 let type_args = nominal
                     .type_args
                     .iter()
-                    .map(|ty| self.finalize_inner(module, generics, ty, local_depth, stack))
+                    .map(|ty| self.finalize_inner(module, generics, ty, state))
                     .collect::<Result<Vec<_>, _>>()?;
                 let const_args = nominal
                     .const_args
@@ -302,24 +380,18 @@ impl<'a> TypeRefResolver<'a> {
                 ))
             }
             Type::List { elem } => Ok(Type::List {
-                elem: Box::new(self.finalize_inner(module, generics, elem, local_depth, stack)?),
+                elem: Box::new(self.finalize_inner(module, generics, elem, state)?),
             }),
             Type::Slice { elem } => Ok(Type::Slice {
-                elem: Box::new(self.finalize_inner(module, generics, elem, local_depth, stack)?),
+                elem: Box::new(self.finalize_inner(module, generics, elem, state)?),
             }),
             Type::Array { elem, len } => Ok(Type::Array {
-                elem: Box::new(self.finalize_inner(module, generics, elem, local_depth, stack)?),
+                elem: Box::new(self.finalize_inner(module, generics, elem, state)?),
                 len: finalize_array_len(generics, *len)?,
             }),
             Type::Map { key, value } => Ok(Type::Map {
-                key: Box::new(self.finalize_inner(module, generics, key, local_depth, stack)?),
-                value: Box::new(self.finalize_inner(
-                    module,
-                    generics,
-                    value,
-                    local_depth,
-                    stack,
-                )?),
+                key: Box::new(self.finalize_inner(module, generics, key, state)?),
+                value: Box::new(self.finalize_inner(module, generics, value, state)?),
             }),
             Type::Infer
             | Type::InferReturn
@@ -338,8 +410,7 @@ impl<'a> TypeRefResolver<'a> {
         module: &ModuleScope,
         generics: &GenericTypeContext,
         name: Ident,
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
     ) -> Result<Type, TypeRefError> {
         if let Some(id) = generics.type_param(name) {
             return Ok(Type::Var(id));
@@ -350,8 +421,9 @@ impl<'a> TypeRefResolver<'a> {
                 name,
             });
         }
-        if let Some(alias) = self.local_alias(name, local_depth) {
-            return self.expand_local_alias(module, generics, alias, &[], local_depth, stack);
+        if let Some(alias) = self.local_alias(name, state.local_depth) {
+            let alias_ref = Self::local_alias_ref(alias);
+            return self.expand_alias_ref(module, generics, &alias_ref, &[], state, name);
         }
         let binding = self
             .decls
@@ -360,7 +432,7 @@ impl<'a> TypeRefResolver<'a> {
                 qualifier: None,
                 name,
             })?;
-        self.finalize_binding(module, generics, binding, &[], local_depth, stack)
+        self.finalize_binding(module, generics, binding, &[], state, name)
     }
 
     fn finalize_unresolved_nominal(
@@ -370,8 +442,7 @@ impl<'a> TypeRefResolver<'a> {
         qualifier: Option<Ident>,
         name: Ident,
         generic_args: &[GenericArg],
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
     ) -> Result<Type, TypeRefError> {
         if qualifier.is_none() && generic_args.is_empty() {
             if let Some(id) = generics.type_param(name) {
@@ -385,66 +456,92 @@ impl<'a> TypeRefResolver<'a> {
             }
         }
         if qualifier.is_none()
-            && let Some(alias) = self.local_alias(name, local_depth)
+            && let Some(alias) = self.local_alias(name, state.local_depth)
         {
-            return self.expand_local_alias(
-                module,
-                generics,
-                alias,
-                generic_args,
-                local_depth,
-                stack,
-            );
+            let alias_ref = Self::local_alias_ref(alias);
+            return self.expand_alias_ref(module, generics, &alias_ref, generic_args, state, name);
         }
         let binding = self
             .decls
             .resolve_visible_type_binding(module, qualifier, name)
             .ok_or(TypeRefError::Unknown { qualifier, name })?;
-        self.finalize_binding(module, generics, binding, generic_args, local_depth, stack)
+        self.finalize_binding(module, generics, binding, generic_args, state, name)
     }
 
     fn local_alias(&self, name: Ident, depth: Option<usize>) -> Option<&LocalTypeAlias> {
         self.local_types?.visible(name, depth)
     }
 
-    pub(crate) fn finalize_type_binding(
+    fn local_alias_ref(alias: &LocalTypeAlias) -> AliasRef<'_> {
+        AliasRef {
+            key: AliasExpansionKey::Local(alias.key),
+            def: &alias.def,
+            local_depth: Some(alias.visible_depth),
+        }
+    }
+
+    fn module_alias_ref(&self, key: &TypeAliasKey) -> Result<AliasRef<'a>, TypeRefError> {
+        let schema = self.decls.type_alias(key).ok_or(TypeRefError::Unknown {
+            qualifier: None,
+            name: key.name,
+        })?;
+        Ok(AliasRef {
+            key: AliasExpansionKey::Module(key.clone()),
+            def: &schema.def,
+            local_depth: None,
+        })
+    }
+
+    pub(crate) fn finalize_type_binding_at(
         &self,
         module: &ModuleScope,
         generics: &GenericTypeContext,
         binding: TypeBinding,
         args: &[GenericArg],
-    ) -> Result<Type, TypeRefError> {
-        self.finalize_binding(module, generics, binding, args, None, &mut vec![])
+        site: Option<Span>,
+        use_name: Ident,
+    ) -> Result<FinalizedTypeRef, TypeRefError> {
+        let mut state = FinalizeState::new(site);
+        let ty = self.finalize_binding(module, generics, binding, args, &mut state, use_name)?;
+        Ok(state.finish(ty))
     }
 
-    pub(crate) fn finalize_module_alias_target(
-        &self,
-        key: &TypeAliasKey,
-    ) -> Result<Type, TypeRefError> {
-        let schema = self.decls.type_alias(key).ok_or(TypeRefError::Unknown {
-            qualifier: None,
-            name: key.name,
-        })?;
-        self.finalize_inner(
-            &key.module,
-            &GenericTypeContext::default(),
-            &schema.aliased,
-            None,
-            &mut vec![AliasExpansionKey::Module(key.clone())],
-        )
-    }
-
-    pub(crate) fn finalize_local_alias_target(
+    pub(crate) fn finalize_local_alias_target_at(
         &self,
         alias: &LocalTypeAlias,
-    ) -> Result<Type, TypeRefError> {
-        self.finalize_inner(
-            &alias.module,
-            &alias.generic_context,
-            &alias.aliased,
-            Some(alias.visible_depth),
-            &mut vec![AliasExpansionKey::Local(alias.key)],
-        )
+        site: Option<Span>,
+        use_name: Ident,
+    ) -> Result<FinalizedTypeRef, TypeRefError> {
+        let alias_ref = Self::local_alias_ref(alias);
+        self.finalize_alias_ref_target_at(&alias_ref, site, use_name)
+    }
+
+    pub(crate) fn finalize_module_alias_target_at(
+        &self,
+        key: &TypeAliasKey,
+        site: Option<Span>,
+        use_name: Ident,
+    ) -> Result<FinalizedTypeRef, TypeRefError> {
+        let alias_ref = self.module_alias_ref(key)?;
+        self.finalize_alias_ref_target_at(&alias_ref, site, use_name)
+    }
+
+    fn finalize_alias_ref_target_at(
+        &self,
+        alias: &AliasRef<'_>,
+        site: Option<Span>,
+        use_name: Ident,
+    ) -> Result<FinalizedTypeRef, TypeRefError> {
+        let mut state = FinalizeState::alias_target(alias, site);
+        state.warn_deprecated_alias(alias, use_name);
+        state.site = None;
+        let ty = self.finalize_inner(
+            &alias.def.module,
+            &alias.def.generic_context,
+            &alias.def.aliased,
+            &mut state,
+        )?;
+        Ok(state.finish(ty))
     }
 
     fn finalize_binding(
@@ -453,90 +550,57 @@ impl<'a> TypeRefResolver<'a> {
         generics: &GenericTypeContext,
         binding: TypeBinding,
         args: &[GenericArg],
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
+        use_name: Ident,
     ) -> Result<Type, TypeRefError> {
         match binding {
-            TypeBinding::Nominal(key) => {
-                self.finalize_nominal(module, generics, &key, args, local_depth, stack)
-            }
+            TypeBinding::Nominal(key) => self.finalize_nominal(module, generics, &key, args, state),
             TypeBinding::Alias(key) => {
-                self.expand_alias(module, generics, &key, args, local_depth, stack)
+                let alias_ref = self.module_alias_ref(&key)?;
+                self.expand_alias_ref(module, generics, &alias_ref, args, state, use_name)
             }
         }
     }
 
-    fn expand_alias(
+    fn expand_alias_ref(
         &self,
         module: &ModuleScope,
         generics: &GenericTypeContext,
-        key: &TypeAliasKey,
+        alias: &AliasRef<'_>,
         args: &[GenericArg],
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
+        use_name: Ident,
     ) -> Result<Type, TypeRefError> {
-        let stack_key = AliasExpansionKey::Module(key.clone());
-        if stack.contains(&stack_key) {
-            return Err(TypeRefError::AliasCycle { name: key.name });
+        if state.stack.contains(&alias.key) {
+            return Err(TypeRefError::AliasCycle {
+                name: alias.def.name,
+            });
         }
-        let schema = self.decls.type_alias(key).ok_or(TypeRefError::Unknown {
-            qualifier: None,
-            name: key.name,
-        })?;
+        state.warn_deprecated_alias(alias, use_name);
         let args = self.finalize_decl_generic_args_inner(
             module,
             generics,
-            &schema.generics,
+            &alias.def.generics,
             args,
-            local_depth,
-            stack,
+            state,
         )?;
-        let (type_subst, const_subst) = schema.generics.substitutions(&args);
-        let aliased = substitute(&schema.aliased, &type_subst, &const_subst);
-        stack.push(stack_key);
-        let result = self.finalize_inner(
-            &key.module,
-            &GenericTypeContext::default(),
-            &aliased,
-            None,
-            stack,
-        );
-        stack.pop();
-        result
-    }
+        let (type_subst, const_subst) = alias.def.generics.substitutions(&args);
+        let aliased = substitute(&alias.def.aliased, &type_subst, &const_subst);
 
-    fn expand_local_alias(
-        &self,
-        module: &ModuleScope,
-        generics: &GenericTypeContext,
-        alias: &LocalTypeAlias,
-        args: &[GenericArg],
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
-    ) -> Result<Type, TypeRefError> {
-        let stack_key = AliasExpansionKey::Local(alias.key);
-        if stack.contains(&stack_key) {
-            return Err(TypeRefError::AliasCycle { name: alias.name });
-        }
-        let args = self.finalize_decl_generic_args_inner(
-            module,
-            generics,
-            &alias.generics,
-            args,
-            local_depth,
-            stack,
-        )?;
-        let (type_subst, const_subst) = alias.generics.substitutions(&args);
-        let aliased = substitute(&alias.aliased, &type_subst, &const_subst);
-        stack.push(stack_key);
+        let outer_depth = state.local_depth;
+        let outer_site = state.site;
+        state.local_depth = alias.local_depth;
+        state.site = None;
+        state.stack.push(alias.key.clone());
         let result = self.finalize_inner(
-            &alias.module,
-            &alias.generic_context,
+            &alias.def.module,
+            &alias.def.generic_context,
             &aliased,
-            Some(alias.visible_depth),
-            stack,
+            state,
         );
-        stack.pop();
+        state.stack.pop();
+        state.site = outer_site;
+        state.local_depth = outer_depth;
         result
     }
 
@@ -546,13 +610,13 @@ impl<'a> TypeRefResolver<'a> {
         key: &NominalKey,
         args: &[GenericArg],
     ) -> Result<Type, TypeRefError> {
+        let mut state = FinalizeState::new(None);
         self.finalize_nominal(
             module,
             &GenericTypeContext::default(),
             key,
             args,
-            None,
-            &mut vec![],
+            &mut state,
         )
     }
 
@@ -562,18 +626,10 @@ impl<'a> TypeRefResolver<'a> {
         generics: &GenericTypeContext,
         key: &NominalKey,
         args: &[GenericArg],
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
     ) -> Result<Type, TypeRefError> {
         let params = self.decls.nominal_generics(key).unwrap_or_default();
-        let args = self.finalize_decl_generic_args_inner(
-            module,
-            generics,
-            &params,
-            args,
-            local_depth,
-            stack,
-        )?;
+        let args = self.finalize_decl_generic_args_inner(module, generics, &params, args, state)?;
         let const_args = ConstTerm::to_args_no_infer(&args.const_args)
             .expect("type reference finalization does not create const inference terms");
         Ok(nominal_type_with_args(key, &args.type_args, &const_args))
@@ -585,8 +641,7 @@ impl<'a> TypeRefResolver<'a> {
         generics: &GenericTypeContext,
         params: &GenericParams,
         args: &[GenericArg],
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
     ) -> Result<GenericArgs, TypeRefError> {
         let type_len = params.type_params.len();
         let expected = type_len + params.const_params.len();
@@ -604,10 +659,9 @@ impl<'a> TypeRefResolver<'a> {
                 let GenericArg::Type(ty) = arg else {
                     return Err(TypeRefError::GenericArgKindMismatch { expected: "type" });
                 };
-                type_args.push(self.finalize_inner(module, generics, ty, local_depth, stack)?);
+                type_args.push(self.finalize_inner(module, generics, ty, state)?);
             } else {
-                let arg =
-                    self.finalize_generic_const_arg(module, generics, arg, local_depth, stack)?;
+                let arg = self.finalize_generic_const_arg(module, generics, arg, state)?;
                 const_args.push(ConstTerm::from_arg(&arg));
             }
         }
@@ -622,15 +676,14 @@ impl<'a> TypeRefResolver<'a> {
         module: &ModuleScope,
         generics: &GenericTypeContext,
         arg: &GenericArg,
-        local_depth: Option<usize>,
-        stack: &mut Vec<AliasExpansionKey>,
+        state: &mut FinalizeState,
     ) -> Result<ConstArg, TypeRefError> {
         match arg {
             GenericArg::Const(arg) => finalize_const_arg(generics, arg),
             GenericArg::Type(ty) => match bare_type_name(ty) {
                 Some(name) => finalize_const_name_arg(generics, name),
                 None => {
-                    let ty = self.finalize_inner(module, generics, ty, local_depth, stack)?;
+                    let ty = self.finalize_inner(module, generics, ty, state)?;
                     match ty {
                         Type::Var(id) => {
                             let name = generics.type_param_name(id).unwrap_or(Ident::new("_"));

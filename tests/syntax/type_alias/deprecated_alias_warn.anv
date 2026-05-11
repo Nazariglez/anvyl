@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: use of deprecated type alias 'Old': use int
+
+@deprecated("use int")
+type Old = int;
+
+fn main() {
+    let x: Old = 1;
+}

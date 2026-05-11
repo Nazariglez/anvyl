@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: use of deprecated type alias 'Id': use int
+
+import facade { Id };
+
+fn main() {
+    let x: Id = 1;
+}

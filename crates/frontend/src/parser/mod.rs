@@ -126,7 +126,6 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
             dataref_decl,
             enum_decl,
             const_decl,
-            type_alias_decl,
             extern_decl,
         )))
         .map(|((annots, doc), mut stmt_node)| {
@@ -147,10 +146,6 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
                     c.node.doc = doc;
                     c.node.annotations = annots;
                 }
-                ast::Stmt::TypeAlias(alias) => {
-                    alias.node.doc = doc;
-                    alias.node.annotations = annots;
-                }
                 ast::Stmt::ExternFunc(ef) => {
                     ef.node.doc = doc;
                     ef.node.annotations = annots;
@@ -166,7 +161,7 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
 
     let undocumented_decl = choice((import_declaration(), extend_decl));
 
-    choice((documented_decl, undocumented_decl))
+    choice((type_alias_decl, documented_decl, undocumented_decl))
         .repeated()
         .collect::<Vec<_>>()
         .map(|stmts| ast::Program { stmts })

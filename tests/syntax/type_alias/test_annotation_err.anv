@@ -3,5 +3,5 @@
 // @frontend: new
 // @contains: is not valid on type alias
 
-@internal
+@test
 type Id = int;

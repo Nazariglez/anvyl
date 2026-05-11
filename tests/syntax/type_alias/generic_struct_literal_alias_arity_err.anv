@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: wrong number of type parameters
+
+struct Box<T> { value: T }
+type BoxAlias<T> = Box<T>;
+
+fn f() {
+    let b = BoxAlias<int, int> { value: 2 };
+}

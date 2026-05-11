@@ -89,6 +89,81 @@ pub(super) fn doc_comment_block<'src>() -> BoxedParser<'src, Option<String>> {
         .boxed()
 }
 
+pub(super) struct DeclHeader {
+    pub(super) annotations: Vec<ast::AnnotationNode>,
+    pub(super) doc: Option<String>,
+    pub(super) visibility: ast::Visibility,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DeclPolicy {
+    target: &'static str,
+    allow_visibility: bool,
+    allow_metadata: bool,
+}
+
+impl DeclPolicy {
+    pub(super) const MODULE_TYPE_ALIAS: Self = Self {
+        target: "module type aliases",
+        allow_visibility: true,
+        allow_metadata: true,
+    };
+    pub(super) const LOCAL_TYPE_ALIAS: Self = Self {
+        target: "local type aliases",
+        allow_visibility: false,
+        allow_metadata: true,
+    };
+    pub(super) const LOCAL_FUNC: Self = Self {
+        target: "local function declarations",
+        allow_visibility: false,
+        allow_metadata: false,
+    };
+    pub(super) const LOCAL_CONST: Self = Self {
+        target: "local const declarations",
+        allow_visibility: false,
+        allow_metadata: false,
+    };
+}
+
+pub(super) fn declaration_header<'src>(policy: DeclPolicy) -> BoxedParser<'src, DeclHeader> {
+    let pub_visibility = select! { Token::Keyword(Keyword::Pub) => () }.or_not();
+
+    annotations()
+        .then(doc_comment_block())
+        .then(pub_visibility)
+        .validate(move |((annotations, doc), pub_span), extra, emitter| {
+            if !policy.allow_metadata && !annotations.is_empty() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    format!("annotations are not allowed on {}", policy.target),
+                ));
+            }
+            if !policy.allow_metadata && doc.is_some() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    format!("doc comments are not allowed on {}", policy.target),
+                ));
+            }
+            if !policy.allow_visibility && pub_span.is_some() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    format!("visibility is not allowed on {}", policy.target),
+                ));
+            }
+            let visibility = if policy.allow_visibility && pub_span.is_some() {
+                ast::Visibility::Public
+            } else {
+                ast::Visibility::Private
+            };
+            DeclHeader {
+                annotations,
+                doc,
+                visibility,
+            }
+        })
+        .boxed()
+}
+
 #[derive(Default)]
 struct GenericParams {
     type_params: Vec<ast::TypeParam>,
@@ -758,25 +833,23 @@ fn visibility<'src>() -> BoxedParser<'src, ast::Visibility> {
     .boxed()
 }
 
-pub(super) fn function<'src>(
+fn function_body<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::FuncNode> {
     let tail_expr = expression(stmt.clone());
-    visibility()
-        .then_ignore(select! {
-            Token::Keyword(Keyword::Fn) => (),
-        })
-        .then(identifier())
+    select! { Token::Keyword(Keyword::Fn) => () }
+        .ignore_then(identifier())
         .then(generic_params())
         .then(params(stmt.clone()))
         .then(return_type())
         .then(block_stmt(stmt, tail_expr))
-        .map_with(|(((((vis, name), gp), params), ret), body), e| {
+        .map_with(|((((name, gp), params), ret), body), e| {
             let s = e.span();
             let GenericParams {
                 type_params,
                 const_params,
             } = gp;
+
             let type_param_map: HashMap<ast::Ident, ast::TypeVarId> =
                 type_params.iter().map(|tp| (tp.name, tp.id)).collect();
             let const_param_map: HashMap<ast::Ident, ast::ConstParamId> =
@@ -806,7 +879,7 @@ pub(super) fn function<'src>(
                     annotations: vec![],
                     doc: None,
                     name,
-                    visibility: vis,
+                    visibility: ast::Visibility::Private,
                     type_params,
                     const_params,
                     params: resolved_params,
@@ -821,11 +894,37 @@ pub(super) fn function<'src>(
         .boxed()
 }
 
+pub(super) fn function<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, ast::FuncNode> {
+    visibility()
+        .then(function_body(stmt))
+        .map(|(visibility, mut func)| {
+            func.node.visibility = visibility;
+            func
+        })
+        .boxed()
+}
+
+pub(super) fn local_function<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, ast::FuncNode> {
+    declaration_header(DeclPolicy::LOCAL_FUNC)
+        .then(function_body(stmt))
+        .map(|(header, mut func)| {
+            func.node.annotations = header.annotations;
+            func.node.doc = header.doc;
+            func.node.visibility = header.visibility;
+            func
+        })
+        .boxed()
+}
+
 fn struct_field<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StructField> {
-    doc_comment_block()
-        .then(annotations())
+    annotations()
+        .then(doc_comment_block())
         .then(identifier())
         .then_ignore(select! {
             Token::Colon => (),
@@ -837,7 +936,7 @@ fn struct_field<'src>(
                 .or_not(),
         )
         .map(
-            |((((doc, annotations), name), ty), default)| ast::StructField {
+            |((((annotations, doc), name), ty), default)| ast::StructField {
                 annotations,
                 name,
                 ty,
@@ -1183,15 +1282,15 @@ fn enum_variant_struct_payload<'src>(
 fn enum_variant<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::EnumVariant> {
-    doc_comment_block()
-        .then(annotations())
+    annotations()
+        .then(doc_comment_block())
         .then(identifier())
         .then(choice((
             enum_variant_tuple_payload(),
             enum_variant_struct_payload(stmt),
             empty().to(ast::VariantKind::Unit),
         )))
-        .map(|(((doc, annotations), name), kind)| ast::EnumVariant {
+        .map(|(((annotations, doc), name), kind)| ast::EnumVariant {
             annotations,
             name,
             kind,
@@ -1439,17 +1538,14 @@ pub(super) fn extend_declaration<'src>(
         .boxed()
 }
 
-fn type_alias_with_visibility<'src>(
-    visibility: impl AnvParser<'src, ast::Visibility>,
-) -> BoxedParser<'src, ast::StmtNode> {
-    visibility
-        .then_ignore(select! { Token::Keyword(Keyword::Type) => () })
-        .then(identifier())
+fn type_alias_body<'src>() -> BoxedParser<'src, ast::TypeAliasDeclNode> {
+    select! { Token::Keyword(Keyword::Type) => () }
+        .ignore_then(identifier())
         .then(generic_params())
         .then_ignore(select! { Token::Op(Op::Assign) => () })
         .then(type_ident())
         .then_ignore(select! { Token::Semicolon => () })
-        .map_with(|(((visibility, name), gp), aliased), e| {
+        .map_with(|((name, gp), aliased), e| {
             let GenericParams {
                 type_params,
                 const_params,
@@ -1457,32 +1553,43 @@ fn type_alias_with_visibility<'src>(
             let type_param_map = type_params.iter().map(|tp| (tp.name, tp.id)).collect();
             let const_param_map = const_params.iter().map(|cp| (cp.name, cp.id)).collect();
             let aliased = resolve_type_params(&aliased, &type_param_map, &const_param_map);
-            let span = e.span().byte();
-            let node = Spanned::new(
+            Spanned::new(
                 ast::TypeAliasDecl {
                     annotations: vec![],
                     doc: None,
-                    visibility,
+                    visibility: ast::Visibility::Private,
                     name,
                     type_params,
                     const_params,
                     aliased,
                 },
-                span,
-            );
-            Spanned::new(ast::Stmt::TypeAlias(node), span)
+                e.span().byte(),
+            )
         })
         .labelled("type alias declaration")
         .as_context()
         .boxed()
 }
 
+fn type_alias_with_header<'src>(policy: DeclPolicy) -> BoxedParser<'src, ast::StmtNode> {
+    declaration_header(policy)
+        .then(type_alias_body())
+        .map(|(header, mut alias)| {
+            alias.node.annotations = header.annotations;
+            alias.node.doc = header.doc;
+            alias.node.visibility = header.visibility;
+            let span = alias.span;
+            Spanned::new(ast::Stmt::TypeAlias(alias), span)
+        })
+        .boxed()
+}
+
 pub(super) fn type_alias_declaration<'src>() -> BoxedParser<'src, ast::StmtNode> {
-    type_alias_with_visibility(visibility())
+    type_alias_with_header(DeclPolicy::MODULE_TYPE_ALIAS)
 }
 
 pub(super) fn local_type_alias_statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
-    type_alias_with_visibility(empty().to(ast::Visibility::Private))
+    type_alias_with_header(DeclPolicy::LOCAL_TYPE_ALIAS)
 }
 
 pub(super) fn const_decl<'src>(

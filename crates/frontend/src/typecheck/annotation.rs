@@ -114,6 +114,7 @@ const DEPRECATED_TARGETS: &[AnnotationTarget] = &[
     AnnotationTarget::Const,
     AnnotationTarget::ExternFunc,
     AnnotationTarget::ExternType,
+    AnnotationTarget::TypeAlias,
     AnnotationTarget::InlineMethod,
     AnnotationTarget::ExtendMethod,
 ];

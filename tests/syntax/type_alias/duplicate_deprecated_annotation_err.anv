@@ -1,7 +1,8 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: is not valid on type alias
+// @contains: duplicate annotation
 
-@internal
+@deprecated
+@deprecated
 type Id = int;

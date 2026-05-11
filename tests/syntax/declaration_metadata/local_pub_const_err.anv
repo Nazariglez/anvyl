@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: visibility is not allowed on local const declarations
+
+fn main() {
+    pub const X: int = 1;
+}

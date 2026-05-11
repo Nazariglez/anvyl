@@ -1029,12 +1029,20 @@ pub(crate) struct AggregateSchema {
 }
 
 #[derive(Clone)]
-pub(crate) struct TypeAliasSchema {
-    pub(crate) key: TypeAliasKey,
+pub(crate) struct TypeAliasDef {
+    pub(crate) module: ModuleScope,
+    pub(crate) name: Ident,
     pub(crate) generics: GenericParams,
+    pub(crate) generic_context: GenericTypeContext,
     pub(crate) aliased: Type,
-    pub(crate) visibility: Visibility,
+    pub(crate) policy: AccessPolicy,
     pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone)]
+pub(crate) struct TypeAliasSchema {
+    pub(crate) def: TypeAliasDef,
+    pub(crate) visibility: Visibility,
 }
 
 #[derive(Clone)]
@@ -1328,18 +1336,19 @@ impl DeclarationIndex {
                 continue;
             };
             let generics = generic_context(
-                key.module.clone(),
-                &schema.generics.type_params,
-                &schema.generics.const_params,
-                schema.span.byte(),
+                schema.def.module.clone(),
+                &schema.def.generics.type_params,
+                &schema.def.generics.const_params,
+                schema.def.span.byte(),
                 &mut errors,
             );
+            schema.def.generic_context = generics.clone();
             let site = DeclTypeSite {
-                module: key.module,
-                span: schema.span.byte(),
+                module: schema.def.module.clone(),
+                span: schema.def.span.byte(),
                 generics,
             };
-            schema.aliased = f(site, schema.aliased.clone());
+            schema.def.aliased = f(site, schema.def.aliased.clone());
         }
 
         for index in 0..self.extends.len() {
@@ -1768,7 +1777,7 @@ impl DeclarationIndex {
                 }
                 Stmt::TypeAlias(alias_node) => {
                     let alias = &alias_node.node;
-                    annotation::normalize_annotations(
+                    let policy = annotation::normalize_annotations(
                         source,
                         &alias.annotations,
                         annotation::AnnotationTarget::TypeAlias,
@@ -1786,14 +1795,26 @@ impl DeclarationIndex {
                         exported,
                         Some(SourceSpan::from_byte_span(source, alias_node.span)),
                     ) {
+                        let generics = generic_params(&alias.type_params, &alias.const_params);
+                        let generic_context = GenericTypeContext::try_from_params(
+                            &alias.type_params,
+                            &alias.const_params,
+                        )
+                        .unwrap_or_default();
+                        let span = SourceSpan::from_byte_span(source, alias_node.span);
                         self.type_aliases.insert(
-                            key.clone(),
+                            key,
                             TypeAliasSchema {
-                                key,
-                                generics: generic_params(&alias.type_params, &alias.const_params),
-                                aliased: alias.aliased.clone(),
+                                def: TypeAliasDef {
+                                    module: scope.clone(),
+                                    name: alias.name,
+                                    generics,
+                                    generic_context,
+                                    aliased: alias.aliased.clone(),
+                                    policy,
+                                    span,
+                                },
                                 visibility: alias.visibility,
-                                span: SourceSpan::from_byte_span(source, alias_node.span),
                             },
                         );
                     }

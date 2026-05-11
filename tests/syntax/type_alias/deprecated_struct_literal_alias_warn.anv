@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: use of deprecated type alias 'OldBox': use Box
+
+struct Box<T> { value: T }
+
+@deprecated("use Box")
+type OldBox<T> = Box<T>;
+
+fn f() {
+    let b = OldBox { value: 1 };
+}
