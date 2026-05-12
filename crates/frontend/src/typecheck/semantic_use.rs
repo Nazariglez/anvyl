@@ -21,6 +21,7 @@ pub(crate) type ContractWitnessMap = HashMap<WitnessId, ContractWitnessFact>;
 pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
 pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
 pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
+pub(crate) type DynDowncastMap = HashMap<ExprId, DynDowncastFact>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallTarget {
@@ -130,6 +131,16 @@ pub(crate) struct DynCallFact {
     pub(crate) method: Ident,
     pub(crate) arg_count: usize,
     pub(crate) requires_mutable: bool,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynDowncastFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) source_id: ExprId,
+    pub(crate) source: ContractSetKey,
+    pub(crate) target: Type,
+    pub(crate) mutable: bool,
     pub(crate) span: SourceSpan,
 }
 

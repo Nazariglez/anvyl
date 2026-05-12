@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: immutable
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn main() {
+    let actor: dyn Drawable = Enemy {};
+    if let var enemy = actor as? Enemy {}
+}

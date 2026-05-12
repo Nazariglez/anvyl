@@ -352,6 +352,13 @@ pub(super) fn expect_cast(expr: &ast::ExprNode) -> (&ast::ExprNode, &ast::Type) 
     }
 }
 
+pub(super) fn expect_exact_downcast(expr: &ast::ExprNode) -> (&ast::ExprNode, &ast::Type) {
+    match &expr.node.kind {
+        ast::ExprKind::ExactDowncast(node) => (node.node.expr.as_ref(), &node.node.target),
+        other => panic!("expected ExactDowncast, found {other:?}"),
+    }
+}
+
 pub(super) fn expect_intrinsic_call<'a>(
     expr: &'a ast::ExprNode,
     name: &str,

@@ -23,6 +23,7 @@ pub(super) struct DynInference {
     dyn_sources: Vec<PendingDynSource>,
     hole_targets: Vec<PendingHoleTarget>,
     calls: Vec<PendingCall>,
+    downcasts: Vec<PendingDowncast>,
     solutions: HashMap<DynContractHoleId, ContractRef>,
 }
 
@@ -66,6 +67,16 @@ struct PendingCall {
     method: Ident,
     arg_count: usize,
     requires_mutable: bool,
+    span: SourceSpan,
+}
+
+struct PendingDowncast {
+    module: ModuleScope,
+    expr_id: ExprId,
+    source_id: ExprId,
+    hole: DynContractHoleId,
+    target: Type,
+    mutable: bool,
     span: SourceSpan,
 }
 
@@ -203,6 +214,27 @@ impl DynInference {
         });
     }
 
+    pub(super) fn add_downcast(
+        &mut self,
+        module: ModuleScope,
+        expr_id: ExprId,
+        source_id: ExprId,
+        hole: DynContractHoleId,
+        target: Type,
+        mutable: bool,
+        span: SourceSpan,
+    ) {
+        self.downcasts.push(PendingDowncast {
+            module,
+            expr_id,
+            source_id,
+            hole,
+            target,
+            mutable,
+            span,
+        });
+    }
+
     pub(super) fn solve(&mut self, tc: &mut TypeChecker) {
         let mut ids = self.holes.keys().copied().collect::<Vec<_>>();
         ids.sort_by_key(|id| id.0);
@@ -213,6 +245,7 @@ impl DynInference {
         self.finish_dyn_sources(tc);
         self.finish_hole_targets(tc);
         self.finish_calls(tc);
+        self.finish_downcasts(tc);
         self.rewrite_solver_types(tc);
     }
 
@@ -276,7 +309,7 @@ impl DynInference {
 
         if hole.exported {
             tc.push_warning(super::TypeWarning::CompileMessage {
-                message: "exported function uses inferred dynamic contract; write `dyn Updatable` or an explicit `dyn { ... }`".to_string(),
+                message: "exported function uses inferred dynamic contract; declare a named contract and use `dyn Name`".to_string(),
                 span: hole.span,
             });
         }
@@ -365,6 +398,28 @@ impl DynInference {
                 method: pending.method,
                 arg_count: pending.arg_count,
                 requires_mutable: pending.requires_mutable,
+                span: pending.span,
+            });
+        }
+    }
+
+    fn finish_downcasts(&mut self, tc: &mut TypeChecker) {
+        let downcasts = std::mem::take(&mut self.downcasts);
+        for pending in downcasts {
+            let Some(source) = self.solution(pending.hole) else {
+                continue;
+            };
+            let Some(source) =
+                contracts::contract_set_key_for_ref(&tc.decls, &pending.module, &source)
+            else {
+                continue;
+            };
+            tc.record_dyn_downcast(super::DynDowncastFact {
+                expr_id: pending.expr_id,
+                source_id: pending.source_id,
+                source,
+                target: pending.target,
+                mutable: pending.mutable,
                 span: pending.span,
             });
         }

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Actor {
+    fn draw(self) {}
+}
+
+struct System {
+    fn tick<T>(actor: dyn _, value: T) {
+        actor.draw();
+    }
+}
+
+fn main() {
+    System.tick(Actor {}, 1);
+}

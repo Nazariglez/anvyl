@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: use a wider dynamic type at the conversion site
+
+contract Drawable {
+    fn draw(self);
+}
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+    fn update(var self) {}
+}
+
+fn main() {
+    var actor: dyn Drawable = Enemy {};
+    if let wider = actor as? dyn Drawable + Updatable {}
+}

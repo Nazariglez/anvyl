@@ -2885,6 +2885,15 @@ impl DeclarationIndex {
         }
     }
 
+    pub(crate) fn set_func_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
+        let ty = Box::new(ty);
+        for decls in self.modules.values_mut() {
+            Self::set_namespace_func_type(&mut decls.locals, scope, name, &ty);
+            Self::set_namespace_func_type(&mut decls.exports, scope, name, &ty);
+            Self::set_namespace_func_type(&mut decls.imports.namespace, scope, name, &ty);
+        }
+    }
+
     fn set_namespace_const_type(
         namespace: &mut Namespace,
         scope: &ModuleScope,
@@ -2895,6 +2904,22 @@ impl DeclarationIndex {
             if value.module == *scope
                 && value.name == name
                 && let ValueDecl::Const(sig) = &mut value.decl
+            {
+                sig.ty = ty.clone();
+            }
+        }
+    }
+
+    fn set_namespace_func_type(
+        namespace: &mut Namespace,
+        scope: &ModuleScope,
+        name: Ident,
+        ty: &Type,
+    ) {
+        for value in namespace.values.values_mut() {
+            if value.module == *scope
+                && value.name == name
+                && let ValueDecl::Func(sig) = &mut value.decl
             {
                 sig.ty = ty.clone();
             }
@@ -2912,6 +2937,10 @@ impl DeclarationIndex {
         );
         debug_assert!(aggregate.projections.iter().all(projection_entry_valid));
         Some(aggregate)
+    }
+
+    pub(crate) fn aggregate_mut(&mut self, key: &NominalKey) -> Option<&mut AggregateSchema> {
+        self.aggregates.get_mut(key)
     }
 
     pub(crate) fn promoted_surface_for(
@@ -3221,6 +3250,10 @@ impl DeclarationIndex {
 
     pub(crate) fn extends(&self) -> impl Iterator<Item = &ExtendSchema> {
         self.extends.iter()
+    }
+
+    pub(crate) fn extend_mut(&mut self, id: &ExtendId) -> Option<&mut ExtendSchema> {
+        self.extends.iter_mut().find(|extend| extend.id == *id)
     }
 
     pub(crate) fn find_cast_conversion(
@@ -4854,7 +4887,7 @@ fn validate_embed_selector(
     }
 }
 
-fn stmt_visibility(stmt: &StmtNode) -> Visibility {
+pub(crate) fn stmt_visibility(stmt: &StmtNode) -> Visibility {
     match &stmt.node {
         Stmt::ExternFunc(n) => n.node.visibility,
         Stmt::ExternType(n) => n.node.visibility,

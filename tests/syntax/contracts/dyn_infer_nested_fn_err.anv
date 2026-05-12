@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: nested function types because they have no body that can own inference
+
+fn take(callback: fn(dyn _) -> void) {}

@@ -766,6 +766,45 @@ fn cast_chained() {
 }
 
 #[test]
+fn exact_downcast_basic() {
+    let expr = parse_expr("actor as? Enemy");
+    let (inner, target) = expect_exact_downcast(&expr);
+    expect_ident(inner, "actor");
+    expect_nominal(target, "Enemy");
+}
+
+#[test]
+fn exact_downcast_chains_with_casts() {
+    let expr = parse_expr("x as? Enemy as Actor");
+    let (outer_inner, outer_target) = expect_cast(&expr);
+    expect_nominal(outer_target, "Actor");
+    let (_, inner_target) = expect_exact_downcast(outer_inner);
+    expect_nominal(inner_target, "Enemy");
+
+    let expr = parse_expr("x as Enemy as? Actor");
+    let (outer_inner, outer_target) = expect_exact_downcast(&expr);
+    expect_nominal(outer_target, "Actor");
+    let (_, inner_target) = expect_cast(outer_inner);
+    expect_nominal(inner_target, "Enemy");
+}
+
+#[test]
+fn exact_downcast_if_let_var_scrutinee() {
+    let program = parse_program("fn main() { if let var enemy = actor as? Enemy {} }");
+    let ast::Stmt::Func(func) = &program.stmts[0].node else {
+        panic!("expected function");
+    };
+    let Some(expr) = &func.node.body.node.tail else {
+        panic!("expected if-let tail expression");
+    };
+    let ast::ExprKind::IfLet(if_let) = &expr.node.kind else {
+        panic!("expected if-let");
+    };
+    assert_eq!(if_let.node.head, ast::PatternHead::Var);
+    expect_exact_downcast(&if_let.node.value);
+}
+
+#[test]
 fn struct_args() {
     let expr = parse_expr("FixedBuf<int, 3> { data: xs }");
     let ast::ExprKind::StructLiteral(lit) = &expr.node.kind else {

@@ -124,92 +124,25 @@ pub(super) fn generic_arg<'src>(
     .boxed()
 }
 
-fn anonymous_contract_requirement<'src>(
-    ty: impl AnvParser<'src, Type>,
-) -> BoxedParser<'src, ast::AnonymousContractRequirement> {
-    let var_kw = select! { Token::Keyword(Keyword::Var) => () };
-    let receiver = choice((
-        var_kw
-            .ignore_then(identifier())
-            .validate(|name, extra, emitter| {
-                if name.0.as_ref() != "self" {
-                    emitter.emit(Rich::custom(extra.span(), "expected 'self'"));
-                }
-                ast::MethodReceiver::Var
-            }),
-        identifier().validate(|name, extra, emitter| {
-            if name.0.as_ref() != "self" {
-                emitter.emit(Rich::custom(
-                    extra.span(),
-                    "contract method requirements must include a `self` or `var self` receiver",
-                ));
-            }
-            ast::MethodReceiver::Value
-        }),
-    ));
-
-    let param = select! { Token::Keyword(Keyword::Var) => () }
-        .or_not()
-        .map(|opt| opt.is_some())
-        .then(identifier())
-        .then_ignore(select! { Token::Colon => () })
-        .then(ty.clone())
-        .map(|((mutable, name), ty)| ast::AnonymousContractParam { mutable, name, ty });
-
-    let params = select! { Token::Comma => () }
-        .ignore_then(param)
-        .repeated()
-        .collect::<Vec<_>>();
-
-    let ret = select! { Token::Op(Op::ThinArrow) => () }
-        .ignore_then(ty)
-        .or_not()
-        .map(|ret| ret.unwrap_or(Type::Void));
-
-    select! { Token::Keyword(Keyword::Fn) => () }
-        .ignore_then(identifier())
-        .then(
-            select! { Token::Open(Delimiter::Parent) => () }
-                .ignore_then(receiver.then(params))
-                .then_ignore(select! { Token::Close(Delimiter::Parent) => () }),
-        )
-        .then(ret)
-        .then_ignore(select! { Token::Semicolon => () })
-        .map(
-            |((name, (receiver, params)), ret)| ast::AnonymousContractRequirement {
-                receiver,
-                name,
-                params,
-                ret,
-            },
-        )
-        .labelled("anonymous contract requirement")
-        .as_context()
-        .boxed()
-}
-
 pub(super) fn contract_ref<'src>() -> BoxedParser<'src, ast::ContractRef> {
     contract_ref_with(named_contract_ref())
 }
 
-fn dyn_contract_ref<'src>(ty: impl AnvParser<'src, Type>) -> BoxedParser<'src, ast::ContractRef> {
+fn dyn_contract_ref<'src>() -> BoxedParser<'src, ast::ContractRef> {
     let anonymous = select! { Token::Open(Delimiter::Brace) => () }
         .ignore_then(
-            anonymous_contract_requirement(ty)
-                .repeated()
-                .collect::<Vec<_>>(),
+            any()
+                .filter(|token| !matches!(token, Token::Close(Delimiter::Brace)))
+                .repeated(),
         )
         .then_ignore(select! { Token::Close(Delimiter::Brace) => () })
-        .validate(|requirements, extra, emitter| {
-            if requirements.is_empty() {
-                emitter.emit(Rich::custom(
-                    extra.span(),
-                    "anonymous dynamic contracts cannot be empty",
-                ));
-            }
-            ast::ContractRef::Anonymous(ast::AnonymousContract { requirements })
+        .validate(|(), extra, emitter| {
+            emitter.emit(Rich::custom(
+                extra.span(),
+                "anonymous dynamic contract syntax is not supported; declare a named contract or use dyn _ in a callable parameter",
+            ));
+            ast::ContractRef::Infer
         });
-
     contract_ref_with(choice((
         anonymous,
         inferred_contract_ref(),
@@ -308,7 +241,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
         );
 
         let dyn_type = select! { Token::Ident(i) if i.0.as_ref() == "dyn" => () }
-            .ignore_then(dyn_contract_ref(type_parser.clone()))
+            .ignore_then(dyn_contract_ref())
             .map(Type::Dyn);
 
         let paren_type = paren_or_tuple_type(type_parser.clone());

@@ -1550,6 +1550,7 @@ pub enum ExprKind {
     Match(MatchNode),
     StringInterp(Vec<StringPart>),
     Cast(CastNode),
+    ExactDowncast(CastNode),
     Try(TryNode),
     Lambda(LambdaNode),
     InferredEnum(InferredEnumNode),
@@ -1561,7 +1562,7 @@ impl ExprKind {
         match self {
             Self::Binary(node) => Some(node.node.op.precedence()),
             Self::Range(_) => Some(ExprPrecedence::Range),
-            Self::Cast(_) => Some(ExprPrecedence::Cast),
+            Self::Cast(_) | Self::ExactDowncast(_) => Some(ExprPrecedence::Cast),
             Self::Unary(_) | Self::Try(_) => Some(ExprPrecedence::Prefix),
             Self::Ternary(_) => Some(ExprPrecedence::Ternary),
             Self::Assign(_) => Some(ExprPrecedence::Assignment),
@@ -1594,6 +1595,7 @@ impl ExprKind {
             Self::Match(_) => "Match",
             Self::StringInterp(_) => "StringInterp",
             Self::Cast(_) => "Cast",
+            Self::ExactDowncast(_) => "ExactDowncast",
             Self::Try(_) => "Try",
             Self::Lambda(_) => "Lambda",
             Self::InferredEnum(_) => "InferredEnum",
@@ -1813,6 +1815,7 @@ pub type DeferNode = Spanned<Defer>;
 pub type IntrinsicCallNode = Spanned<IntrinsicCall>;
 pub type InferredEnumNode = Spanned<InferredEnum>;
 pub type CastNode = Spanned<Cast>;
+pub type ExactDowncastNode = CastNode;
 pub type TryNode = Spanned<Try>;
 pub type ConstDeclNode = Spanned<ConstDecl>;
 pub type TypeAliasDeclNode = Spanned<TypeAliasDecl>;

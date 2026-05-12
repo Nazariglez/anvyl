@@ -6,7 +6,10 @@ struct Actor {
     fn draw(self) {}
 }
 
-fn main() {
-    let actor: dyn _ = Actor {};
+fn tick<T>(actor: dyn _, value: T) {
     actor.draw();
+}
+
+fn main() {
+    tick(Actor {}, 1);
 }

@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: exact downcast source must be a dynamic place
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn make_actor() -> dyn Drawable {
+    Enemy {}
+}
+
+fn main() {
+    if let enemy = make_actor() as? Enemy {}
+}

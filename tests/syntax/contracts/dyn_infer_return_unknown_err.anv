@@ -7,7 +7,10 @@ struct Actor {
     fn count(self) -> int { 1 }
 }
 
+fn use_actor(actor: dyn _) {
+    let count = actor.count(); // needs return type to infer the contract
+}
+
 fn main() {
-    let actor: dyn _ = Actor {};
-    let count = actor.count();
+    use_actor(Actor {});
 }

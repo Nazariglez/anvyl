@@ -350,6 +350,7 @@ pub(super) struct PlaceValue {
     pub(super) access: PlaceAccess,
     pub(super) facts: PlaceUseFacts,
     pub(super) identity: PlaceIdentity,
+    pub(super) root_name: Option<Ident>,
 }
 
 pub(super) struct CheckedPlace {
@@ -364,6 +365,7 @@ impl PlaceValue {
             access,
             facts,
             identity: PlaceIdentity::unknown(),
+            root_name: None,
         }
     }
 
@@ -403,6 +405,7 @@ pub(super) fn field_value(
                 receiver.facts.clone(),
             );
             value.identity = receiver.identity.clone().field(name);
+            value.root_name = receiver.root_name;
             FieldValueResult::Value(Box::new(value), false)
         }
         member::FieldResolution::Promoted(promoted) => {
@@ -482,6 +485,7 @@ fn promoted_field_value(
                 receiver.facts.clone(),
             );
             value.identity = receiver.identity.clone().fields(&promoted.path);
+            value.root_name = receiver.root_name;
             FieldValueResult::Value(Box::new(value), false)
         }
         member::PromotedFieldTarget::Extern(field) => extern_field_value(
@@ -507,6 +511,7 @@ fn extern_field_value(
         PlaceUseFacts::for_extern_field(&receiver.facts, field.field_ref),
     );
     value.identity = identity;
+    value.root_name = receiver.root_name;
     FieldValueResult::Value(Box::new(value), field.contains_any)
 }
 
@@ -536,6 +541,12 @@ pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> Ch
 }
 
 pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
+    let place = check_place_inner(expr, tc);
+    tc.check_mut_downcast_root_use(place.value.root_name, &place.value.identity, expr.span);
+    place
+}
+
+fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     if let ExprKind::Ident(name) = &expr.node.kind {
         match tc.lookup_local_value_checked(*name, expr.span) {
             Ok(Some(value)) => {
@@ -545,6 +556,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
                 let mut place = CheckedPlace::new(checked, access.access);
                 place.value.facts = access.facts;
                 place.value.identity = access.identity;
+                place.value.root_name = Some(*name);
                 place.accepts_extern_any = access.accepts_extern_any;
                 return place;
             }
@@ -567,7 +579,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
     }
 
     if let ExprKind::Index(index) = &expr.node.kind {
-        let target = check_place(&index.node.target, tc);
+        let target = check_place_inner(&index.node.target, tc);
         let indexed = check_index_access(index, &target.value.checked, tc);
         let mut checked = super::checked_from_type(expr, indexed.write_ty, tc);
         checked.contains_extern_any = indexed.contains_extern_any;
@@ -575,23 +587,25 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
         let mut place = CheckedPlace::new(checked, access);
         place.value.facts = target.value.facts;
         place.value.identity = target.value.identity.index();
+        place.value.root_name = target.value.root_name;
         place.accepts_extern_any = target.accepts_extern_any;
         return place;
     }
 
     if let ExprKind::TupleIndex(index) = &expr.node.kind {
-        let target = check_place(&index.node.target, tc);
+        let target = check_place_inner(&index.node.target, tc);
         let checked = check_tuple_index_access(expr, index, &target.value.checked, tc);
         let access = projected_field_access(target.value.access);
         let mut place = CheckedPlace::new(checked, access);
         place.value.facts = target.value.facts;
         place.value.identity = target.value.identity.tuple(index.node.index as usize);
+        place.value.root_name = target.value.root_name;
         place.accepts_extern_any = target.accepts_extern_any;
         return place;
     }
 
     if let ExprKind::Field(field) = &expr.node.kind {
-        let receiver = check_place(&field.node.target, tc);
+        let receiver = check_place_inner(&field.node.target, tc);
         match field_value(
             Some(expr),
             &receiver.value,

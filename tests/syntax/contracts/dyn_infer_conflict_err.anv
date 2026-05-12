@@ -7,8 +7,11 @@ struct Actor {
     fn f(self, x: int) {}
 }
 
-fn main() {
-    let actor: dyn _ = Actor {};
+fn use_actor(actor: dyn _) {
     actor.f(1);
     actor.f("x");
+}
+
+fn main() {
+    use_actor(Actor {});
 }

@@ -961,10 +961,10 @@ struct ScopeState {
     local_type_scopes: LocalTypeScopes,
 }
 
-#[derive(Clone, Copy)]
-enum DynInferPolicy {
-    Reject,
-    Allow { exported: bool },
+#[derive(Clone)]
+struct ActiveMutDowncastRoot {
+    identity: PlaceIdentity,
+    allowed: Ident,
 }
 
 struct TypeChecker {
@@ -978,6 +978,9 @@ struct TypeChecker {
     dyn_conversions: DynConversionMap,
     dyn_weakenings: DynWeakeningMap,
     dyn_calls: DynCallMap,
+    dyn_downcasts: DynDowncastMap,
+    active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
+    dyn_infer_registered_modules: HashSet<ModuleScope>,
     dyn_infer: DynInference,
     next_witness_id: u32,
     decls: DeclarationIndex,
@@ -1077,6 +1080,9 @@ impl TypeChecker {
             dyn_conversions: HashMap::new(),
             dyn_weakenings: HashMap::new(),
             dyn_calls: HashMap::new(),
+            dyn_downcasts: HashMap::new(),
+            active_mut_downcast_roots: vec![],
+            dyn_infer_registered_modules: HashSet::new(),
             dyn_infer: DynInference::default(),
             next_witness_id: 0,
             decls,
@@ -1612,6 +1618,37 @@ impl TypeChecker {
         self.dyn_calls.insert(fact.call_id, fact);
     }
 
+    fn record_dyn_downcast(&mut self, fact: DynDowncastFact) {
+        self.dyn_downcasts.insert(fact.expr_id, fact);
+    }
+
+    fn should_register_dyn_infer_params(&mut self) -> bool {
+        self.dyn_infer_registered_modules
+            .insert(self.current_module.clone())
+    }
+
+    pub(super) fn check_mut_downcast_root_use(
+        &mut self,
+        root_name: Option<Ident>,
+        identity: &PlaceIdentity,
+        span: Span,
+    ) {
+        let Some(root_name) = root_name else {
+            return;
+        };
+        if self
+            .active_mut_downcast_roots
+            .iter()
+            .any(|root| root.allowed != root_name && root.identity.conflicts_with(identity))
+        {
+            self.push_error(TypeError::CompileError {
+                message: "dynamic root cannot be used while a mutable downcast binding is live"
+                    .to_string(),
+                span: self.error_span(span),
+            });
+        }
+    }
+
     fn promoted_surface_for(&mut self, receiver: &Type) -> Option<PromotedSurface> {
         let key = CanonicalTypeKey(receiver.clone());
         if let Some(surface) = self.promoted_surfaces.get(&key) {
@@ -2106,6 +2143,7 @@ impl TypeChecker {
             dyn_conversions: self.dyn_conversions.clone(),
             dyn_weakenings: self.dyn_weakenings.clone(),
             dyn_calls: self.dyn_calls.clone(),
+            dyn_downcasts: self.dyn_downcasts.clone(),
         }
     }
 
@@ -2129,6 +2167,7 @@ impl TypeChecker {
         self.dyn_conversions.extend(facts.dyn_conversions);
         self.dyn_weakenings.extend(facts.dyn_weakenings);
         self.dyn_calls.extend(facts.dyn_calls);
+        self.dyn_downcasts.extend(facts.dyn_downcasts);
     }
 
     fn resolved_value(value: ResolvedValue) -> (ModuleScope, Ident, ValueDecl) {
@@ -2198,54 +2237,82 @@ impl TypeChecker {
     }
 
     fn resolve_type_for_tc_at(&mut self, ty: &Type, span: Span) -> Type {
-        self.resolve_type_for_tc_at_with_dyn_infer(ty, span, DynInferPolicy::Reject)
-    }
-
-    fn resolve_type_allow_dyn_infer_at(&mut self, ty: &Type, span: Span, exported: bool) -> Type {
-        self.resolve_type_for_tc_at_with_dyn_infer(ty, span, DynInferPolicy::Allow { exported })
-    }
-
-    fn resolve_type_for_tc_at_with_dyn_infer(
-        &mut self,
-        ty: &Type,
-        span: Span,
-        policy: DynInferPolicy,
-    ) -> Type {
         let generics = self.generic_contexts.last().cloned().unwrap_or_default();
         let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
         let result = resolver.finalize_at(&self.current_module, &generics, ty, Some(span));
         let ty = self.finish_type_ref_result(result, span);
-        self.apply_dyn_infer_policy(ty, span, policy)
+        self.reject_source_dyn_contracts(ty, span)
     }
 
-    fn apply_dyn_infer_policy(&mut self, ty: Type, span: Span, policy: DynInferPolicy) -> Type {
+    fn resolve_downcast_target_type_at(&mut self, ty: &Type, span: Span) -> Type {
+        let generics = self.generic_contexts.last().cloned().unwrap_or_default();
+        let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+        match resolver.finalize_at(&self.current_module, &generics, ty, Some(span)) {
+            Ok(finalized) => {
+                self.push_type_ref_warnings(finalized.warnings);
+                let ty = self.reject_source_dyn_contracts(finalized.ty, span);
+                if matches!(ty, Type::Infer) {
+                    Type::Infer
+                } else if type_depends_on_generics(&ty) {
+                    self.push_error(TypeError::CompileError {
+                        message:
+                            "exact downcast target must be a fully concrete runtime-identifiable type"
+                                .to_string(),
+                        span: self.error_span(span),
+                    });
+                    Type::Infer
+                } else {
+                    self.finish_resolved_type(ty, span)
+                }
+            }
+            Err(error) => {
+                self.push_error_once(type_ref_error(error, self.error_span(span)));
+                Type::Infer
+            }
+        }
+    }
+
+    fn resolve_callable_param_type(&mut self, ty: &Type, span: Span, exported: bool) -> Type {
+        if matches!(ty, Type::Dyn(ContractRef::Infer)) {
+            let generics = self.generic_contexts.last().cloned().unwrap_or_default();
+            let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
+            let result = resolver.finalize_at(&self.current_module, &generics, ty, Some(span));
+            let ty = self.finish_type_ref_result(result, span);
+            return self.dyn_infer.assign_holes(
+                &self.current_module,
+                &ty,
+                self.source_span(span),
+                exported,
+            );
+        }
+        self.resolve_type_for_tc_at(ty, span)
+    }
+
+    fn reject_source_dyn_contracts(&mut self, ty: Type, span: Span) -> Type {
+        if type_contains_anonymous_contract(&ty) {
+            self.push_error(TypeError::CompileError {
+                message: "anonymous dynamic contract syntax is not supported; declare a named contract or use dyn _ in a callable parameter".to_string(),
+                span: self.error_span(span),
+            });
+            return Type::Infer;
+        }
+        self.reject_raw_dyn_infer(ty, span)
+    }
+
+    fn reject_raw_dyn_infer(&mut self, ty: Type, span: Span) -> Type {
         if !DynInference::has_raw_hole(&ty) {
             return ty;
         }
-        match policy {
-            DynInferPolicy::Reject => {
-                self.push_error(TypeError::CompileError {
-                    message: "inferred dynamic contracts are not allowed here".to_string(),
-                    span: self.error_span(span),
-                });
-                Type::Infer
-            }
-            DynInferPolicy::Allow { exported } => {
-                if !dyn_infer_positions_valid(&ty) {
-                    self.push_error(TypeError::CompileError {
-                        message: "inferred dynamic contracts cannot be composed or nested inside contract surfaces".to_string(),
-                        span: self.error_span(span),
-                    });
-                    return Type::Infer;
-                }
-                self.dyn_infer.assign_holes(
-                    &self.current_module,
-                    &ty,
-                    self.source_span(span),
-                    exported,
-                )
-            }
-        }
+        let message = if type_contains_raw_dyn_infer_func(&ty) {
+            "inferred dynamic contracts are not allowed in nested function types because they have no body that can own inference"
+        } else {
+            "inferred dynamic contracts are only allowed as direct parameters of callables with bodies"
+        };
+        self.push_error(TypeError::CompileError {
+            message: message.to_string(),
+            span: self.error_span(span),
+        });
+        Type::Infer
     }
 
     fn resolve_type_binding_for_tc_at(
@@ -2265,7 +2332,8 @@ impl TypeChecker {
             Some(span),
             use_name,
         );
-        self.finish_type_ref_result(result, span)
+        let ty = self.finish_type_ref_result(result, span);
+        self.reject_source_dyn_contracts(ty, span)
     }
 
     fn finish_type_ref_result(
@@ -2293,7 +2361,8 @@ impl TypeChecker {
     ) -> Type {
         let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
         let result = resolver.finalize_module_alias_target_at(key, Some(span), use_name);
-        self.finish_type_ref_result(result, span)
+        let ty = self.finish_type_ref_result(result, span);
+        self.reject_source_dyn_contracts(ty, span)
     }
 
     fn resolve_local_alias_target_for_tc_at(
@@ -2304,7 +2373,8 @@ impl TypeChecker {
     ) -> Type {
         let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
         let result = resolver.finalize_local_alias_target_at(alias, Some(span), use_name);
-        self.finish_type_ref_result(result, span)
+        let ty = self.finish_type_ref_result(result, span);
+        self.reject_source_dyn_contracts(ty, span)
     }
 
     fn push_type_ref_warnings(&mut self, warnings: Vec<TypeRefWarning>) {
@@ -2515,31 +2585,40 @@ impl TypeChecker {
     }
 
     fn func_type_from_sig(&mut self, params: &[Param], ret: &Type, span: Span) -> Type {
-        self.func_type_from_sig_with_dyn_infer(params, ret, span, false)
+        self.callable_type_from_sig(params, ret, span, false)
     }
 
-    fn func_type_from_sig_with_dyn_infer(
+    fn callable_type_from_sig(
         &mut self,
         params: &[Param],
         ret: &Type,
         span: Span,
         exported: bool,
     ) -> Type {
-        let resolved_params: Vec<FuncParam> = params
-            .iter()
-            .map(|p| {
-                FuncParam::new(
-                    self.resolve_type_allow_dyn_infer_at(&p.ty, span, exported),
-                    matches!(p.mutability, Mutability::Mutable),
-                    p.cast_accept,
-                )
-            })
-            .collect();
-        let resolved_ret = Box::new(self.resolve_type_allow_dyn_infer_at(ret, span, exported));
+        let resolved_params = self.resolve_callable_params(params, span, exported);
+        let resolved_ret = Box::new(self.resolve_type_for_tc_at(ret, span));
         Type::Func {
             params: resolved_params,
             ret: resolved_ret,
         }
+    }
+
+    fn resolve_callable_params(
+        &mut self,
+        params: &[Param],
+        span: Span,
+        exported: bool,
+    ) -> Vec<FuncParam> {
+        params
+            .iter()
+            .map(|p| {
+                FuncParam::new(
+                    self.resolve_callable_param_type(&p.ty, span, exported),
+                    matches!(p.mutability, Mutability::Mutable),
+                    p.cast_accept,
+                )
+            })
+            .collect()
     }
 
     fn finish(&mut self) -> Result<SourceExprTypes, Vec<TypeError>> {
@@ -3287,7 +3366,7 @@ fn generic_param_type_error(error: GenericParamError, span: Option<SourceSpan>) 
 fn validate_dyn_infer_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
     for (_key, aggregate) in decls.aggregates() {
         for field in aggregate.fields.values() {
-            push_ownerless_dyn_infer(&field.ty, field.span, errors);
+            push_invalid_dyn_infer_decl(&field.ty, field.span, errors);
         }
     }
     for (_key, schema) in decls.enums() {
@@ -3296,37 +3375,36 @@ fn validate_dyn_infer_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError
                 VariantPayload::Unit => {}
                 VariantPayload::Tuple(types) => {
                     for ty in types {
-                        push_ownerless_dyn_infer(ty, None, errors);
+                        push_invalid_dyn_infer_decl(ty, None, errors);
                     }
                 }
                 VariantPayload::Struct(fields) => {
                     for field in fields.values() {
-                        push_ownerless_dyn_infer(&field.ty, field.span, errors);
+                        push_invalid_dyn_infer_decl(&field.ty, field.span, errors);
                     }
                 }
             }
         }
     }
     for alias in decls.type_aliases() {
-        push_ownerless_dyn_infer(&alias.def.aliased, Some(alias.def.span), errors);
+        push_invalid_dyn_infer_decl(&alias.def.aliased, Some(alias.def.span), errors);
     }
     for value in decls.values() {
         match &value.decl {
-            ValueDecl::Const(sig) => push_ownerless_dyn_infer(&sig.ty, None, errors),
+            ValueDecl::Const(sig) => push_invalid_dyn_infer_decl(&sig.ty, None, errors),
             ValueDecl::Func(sig) if sig.kind == CallableKind::ExternFunction => {
-                push_ownerless_dyn_infer(&sig.ty, None, errors);
+                push_invalid_dyn_infer_decl(&sig.ty, None, errors);
             }
             ValueDecl::Func(_) => {}
         }
     }
 }
 
-fn push_ownerless_dyn_infer(ty: &Type, span: Option<SourceSpan>, errors: &mut Vec<TypeError>) {
+fn push_invalid_dyn_infer_decl(ty: &Type, span: Option<SourceSpan>, errors: &mut Vec<TypeError>) {
     if DynInference::has_raw_hole(ty) {
         errors.push(TypeError::CompileError {
-            message:
-                "inferred dynamic contracts are not allowed in stored or ownerless type positions"
-                    .to_string(),
+            message: "inferred dynamic contracts are only allowed as direct parameters of callables with bodies"
+                .to_string(),
             span,
         });
     }
@@ -3977,37 +4055,38 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
     }
 }
 
-fn dyn_infer_positions_valid(ty: &Type) -> bool {
-    struct InvalidDynInferPosition;
+fn type_contains_anonymous_contract(ty: &Type) -> bool {
+    struct AnonymousContractVisitor;
 
-    impl TypeVisitor for InvalidDynInferPosition {
+    impl TypeVisitor for AnonymousContractVisitor {
+        fn visit_contract_ref_leaf(&mut self, contract: &ContractRef) -> bool {
+            matches!(contract, ContractRef::Anonymous(_))
+        }
+    }
+
+    let mut visitor = AnonymousContractVisitor;
+    visitor.visit_type(ty)
+}
+
+fn type_contains_raw_dyn_infer_func(ty: &Type) -> bool {
+    struct RawDynInferFunc;
+
+    impl TypeVisitor for RawDynInferFunc {
         fn visit_type(&mut self, ty: &Type) -> bool {
             match ty {
-                Type::Dyn(ContractRef::Infer) => false,
-                Type::Dyn(contract) => dyn_infer_contract_contains_raw_hole(contract),
+                Type::Func { params, ret } => {
+                    params
+                        .iter()
+                        .any(|param| DynInference::has_raw_hole(&param.ty))
+                        || DynInference::has_raw_hole(ret)
+                }
                 _ => self.visit_type_children(ty),
             }
         }
     }
 
-    let mut visitor = InvalidDynInferPosition;
-    !visitor.visit_type(ty)
-}
-
-fn dyn_infer_contract_contains_raw_hole(contract: &ContractRef) -> bool {
-    match contract {
-        ContractRef::Infer => true,
-        ContractRef::Anonymous(surface) => surface.requirements.iter().any(|req| {
-            req.params
-                .iter()
-                .any(|param| DynInference::has_raw_hole(&param.ty))
-                || DynInference::has_raw_hole(&req.ret)
-        }),
-        ContractRef::Intersection(contracts) => {
-            contracts.iter().any(dyn_infer_contract_contains_raw_hole)
-        }
-        ContractRef::Named { .. } | ContractRef::Hole(_) => false,
-    }
+    let mut visitor = RawDynInferFunc;
+    visitor.visit_type(ty)
 }
 
 fn push_source_scope(tc: &mut TypeChecker) {
@@ -4048,6 +4127,8 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
         tc.define(name, ty, false);
     }
 
+    let register_dyn_infer = tc.should_register_dyn_infer_params();
+
     for stmt in &program.stmts {
         match &stmt.node {
             Stmt::Func(func_node) => {
@@ -4055,12 +4136,30 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                 if is_generic(func) {
                     continue;
                 }
-                let func_ty = tc.func_type_from_sig_with_dyn_infer(
-                    &func.params,
-                    &func.ret,
-                    func_node.span,
-                    matches!(func.visibility, Visibility::Public),
-                );
+                let func_ty = if register_dyn_infer {
+                    let func_ty = tc.callable_type_from_sig(
+                        &func.params,
+                        &func.ret,
+                        func_node.span,
+                        matches!(func.visibility, Visibility::Public),
+                    );
+                    tc.decls
+                        .set_func_type(&tc.current_module, func.name, func_ty.clone());
+                    func_ty
+                } else {
+                    tc.decls
+                        .local_value(&tc.current_module, func.name)
+                        .map_or_else(
+                            || {
+                                debug_assert!(
+                                    false,
+                                    "registered function missing declaration type"
+                                );
+                                Type::Infer
+                            },
+                            |value| value.decl.ty().clone(),
+                        )
+                };
                 tc.define(func.name, func_ty, false);
             }
             Stmt::Aggregate(_) | Stmt::Enum(_) => {}
@@ -4076,6 +4175,155 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
             _ => {}
         }
     }
+
+    if register_dyn_infer {
+        register_callable_dyn_infer_params(program, tc);
+    }
+}
+
+fn register_callable_dyn_infer_params(program: &Program, tc: &mut TypeChecker) {
+    let module = tc.current_module.clone();
+    let mut extend_index = 0;
+
+    for stmt in &program.stmts {
+        let exported = matches!(stmt_visibility(stmt), Visibility::Public);
+        match &stmt.node {
+            Stmt::Func(func_node)
+                if is_generic(&func_node.node)
+                    && callable_sig_has_raw_dyn_infer(
+                        &func_node.node.params,
+                        &func_node.node.ret,
+                    ) =>
+            {
+                let sig = source_func_sig(&func_node.node, func_node.span, tc);
+                tc.decls
+                    .set_func_type(&module, func_node.node.name, sig.surface_ty);
+            }
+            Stmt::Aggregate(agg_node) => {
+                register_aggregate_method_dyn_infer_params(agg_node, &module, exported, tc);
+            }
+            Stmt::Extend(extend_node) => {
+                let id = ExtendId {
+                    module: module.clone(),
+                    index: extend_index,
+                };
+                extend_index += 1;
+                register_extend_method_dyn_infer_params(extend_node, &id, exported, tc);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn register_aggregate_method_dyn_infer_params(
+    agg_node: &AggregateDeclNode,
+    module: &ModuleScope,
+    exported: bool,
+    tc: &mut TypeChecker,
+) {
+    let agg = &agg_node.node;
+    let key = NominalKey {
+        module: module.clone(),
+        kind: agg.kind.into(),
+        name: agg.name,
+    };
+    let owner_generics = tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
+    for method in &agg.methods {
+        if !callable_sig_has_raw_dyn_infer(&method.sig.params, &method.sig.ret) {
+            continue;
+        }
+        let mode = MethodMode::from_receiver(method.sig.receiver);
+        let generics = tc.extended_generic_context(
+            &owner_generics,
+            &method.sig.type_params,
+            &method.sig.const_params,
+            agg_node.span,
+        );
+        let (params, ret) = resolve_callable_sig_types(
+            &method.sig.params,
+            &method.sig.ret,
+            generics,
+            agg_node.span,
+            exported,
+            tc,
+        );
+        let Some(schema) = tc.decls.aggregate_mut(&key) else {
+            continue;
+        };
+        let Some(method_schema) = schema
+            .methods
+            .get_mut(&MethodKey::new(method.sig.name, mode.surface()))
+        else {
+            continue;
+        };
+        method_schema.params = params;
+        method_schema.ret = ret;
+    }
+}
+
+fn register_extend_method_dyn_infer_params(
+    extend_node: &ExtendDeclNode,
+    id: &ExtendId,
+    exported: bool,
+    tc: &mut TypeChecker,
+) {
+    let extend = &extend_node.node;
+    let owner_generics =
+        tc.generic_context(&extend.type_params, &extend.const_params, extend_node.span);
+    for method_node in &extend.methods {
+        let method = &method_node.node;
+        if !callable_sig_has_raw_dyn_infer(&method.sig.params, &method.sig.ret) {
+            continue;
+        }
+        let mode = MethodMode::from_receiver(method.sig.receiver);
+        let generics = tc.extended_generic_context(
+            &owner_generics,
+            &method.sig.type_params,
+            &method.sig.const_params,
+            method_node.span,
+        );
+        let (params, ret) = resolve_callable_sig_types(
+            &method.sig.params,
+            &method.sig.ret,
+            generics,
+            method_node.span,
+            exported,
+            tc,
+        );
+        let Some(extend) = tc.decls.extend_mut(id) else {
+            continue;
+        };
+        let Some(method_schema) = extend
+            .methods
+            .get_mut(&MethodKey::new(method.sig.name, mode.surface()))
+        else {
+            continue;
+        };
+        method_schema.params = params;
+        method_schema.ret = ret;
+    }
+}
+
+fn callable_sig_has_raw_dyn_infer(params: &[Param], ret: &Type) -> bool {
+    params
+        .iter()
+        .any(|param| DynInference::has_raw_hole(&param.ty))
+        || DynInference::has_raw_hole(ret)
+}
+
+fn resolve_callable_sig_types(
+    params: &[Param],
+    ret: &Type,
+    generics: GenericTypeContext,
+    span: Span,
+    exported: bool,
+    tc: &mut TypeChecker,
+) -> (Vec<FuncParam>, Type) {
+    tc.push_generic_context(generics);
+    let params = tc.resolve_callable_params(params, span, exported);
+    let ret = tc.resolve_type_for_tc_at(ret, span);
+    tc.pop_generic_context();
+    (params, ret)
 }
 
 fn check_stmts(stmts: &[StmtNode], tc: &mut TypeChecker) {
@@ -4099,26 +4347,9 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
 
     tc.push_generic_context(generic_context.clone());
     tc.resolve_generic_bounds_for_tc(&mut generics, span);
-    let params = func
-        .params
-        .iter()
-        .map(|param| {
-            FuncParam::new(
-                tc.resolve_type_allow_dyn_infer_at(
-                    &param.ty,
-                    span,
-                    matches!(func.visibility, Visibility::Public),
-                ),
-                matches!(param.mutability, Mutability::Mutable),
-                param.cast_accept,
-            )
-        })
-        .collect::<Vec<_>>();
-    let ret = tc.resolve_type_allow_dyn_infer_at(
-        &func.ret,
-        span,
-        matches!(func.visibility, Visibility::Public),
-    );
+    let exported = matches!(func.visibility, Visibility::Public);
+    let params = tc.resolve_callable_params(&func.params, span, exported);
+    let ret = tc.resolve_type_for_tc_at(&func.ret, span);
     tc.pop_generic_context();
 
     SourceFuncSig {
@@ -4649,17 +4880,18 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
         }
         let mode = MethodMode::from_receiver(method.sig.receiver);
         let params = &method.sig.params;
-        let param_types: Vec<_> = params
-            .iter()
-            .map(|param| {
-                FuncParam::new(
-                    tc.resolve_type_for_tc_at(&param.ty, method_node.span),
-                    matches!(param.mutability, Mutability::Mutable),
-                    param.cast_accept,
-                )
+        let key = MethodKey::new(method.sig.name, mode.surface());
+        let Some((param_types, ret_ty)) = tc
+            .decls
+            .extends()
+            .find(|extend| {
+                extend.origin == tc.current_module && extend.span.byte() == extend_node.span
             })
-            .collect();
-        let ret_ty = tc.resolve_type_for_tc_at(&method.sig.ret, method_node.span);
+            .and_then(|extend| extend.methods.get(&key))
+            .map(|method| (method.params.clone(), method.ret.clone()))
+        else {
+            continue;
+        };
         check_func_body(
             mode.receiver().map(|receiver| (receiver, self_ty.clone())),
             params,
@@ -5113,6 +5345,7 @@ fn specialized_body_facts(
         dyn_conversions: map_delta(&old.dyn_conversions, &current.dyn_conversions),
         dyn_weakenings: map_delta(&old.dyn_weakenings, &current.dyn_weakenings),
         dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
+        dyn_downcasts: map_delta(&old.dyn_downcasts, &current.dyn_downcasts),
     }
 }
 
@@ -5332,6 +5565,7 @@ impl PatternScrutinee {
             access,
             facts,
             identity,
+            ..
         } = place.value;
         Self {
             checked,
@@ -5429,7 +5663,7 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let mode = mode_for_binding(binding);
     match &binding.ty {
         Some(annot) => {
-            let annot_ty = tc.resolve_type_allow_dyn_infer_at(annot, binding_node.span, false);
+            let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
             let value = match mode {
                 PatternBindMode::Owned { .. } => {
@@ -5715,7 +5949,14 @@ fn check_expr_checked_with_hint(
             checked_from_type(expr, Type::Infer, tc)
         }
         ExprKind::Ident(name) => match tc.lookup_local_symbol_checked(*name, expr.span) {
-            LocalSymbolLookup::Found(LocalSymbol::Value(info), _depth) => {
+            LocalSymbolLookup::Found(ref symbol @ LocalSymbol::Value(ref info), depth) => {
+                let value = LocalValue {
+                    info: info.clone(),
+                    depth,
+                    requires_runtime_capture: symbol.requires_runtime_capture(),
+                };
+                let access = tc.local_value_access(*name, &value);
+                tc.check_mut_downcast_root_use(Some(*name), &access.identity, expr.span);
                 if let Some((_, value_name, value)) = tc.lookup_named_value(*name) {
                     tc.warn_named_value_deprecated(&value, value_name, expr.span);
                 }
@@ -5846,6 +6087,7 @@ fn check_expr_checked_with_hint(
         ExprKind::IntrinsicCall(call) => check_intrinsic_call(expr, call, tc),
         ExprKind::Range(range) => check_range_expr(expr, range, expected, tc),
         ExprKind::Cast(cast) => check_cast_expr(expr, cast, tc),
+        ExprKind::ExactDowncast(downcast) => check_exact_downcast_expr(expr, downcast, tc),
         ExprKind::Lambda(lambda) => check_lambda_expr(expr, lambda, expected, tc),
     }
 }
@@ -6905,18 +7147,7 @@ fn check_lambda_expr(
         .enumerate()
         .map(|(index, param)| {
             let ty = match &param.ty {
-                Some(ty) if DynInference::has_raw_hole(ty) => expected_func
-                    .as_ref()
-                    .and_then(|(params, _)| params.get(index))
-                    .and_then(|param| matches!(param.ty, Type::Dyn(_)).then(|| param.ty.clone()))
-                    .unwrap_or_else(|| {
-                        tc.push_error(TypeError::CompileError {
-                            message: "lambda parameter `dyn _` requires an expected dynamic function type".to_string(),
-                            span: tc.error_span(lambda.span),
-                        });
-                        Type::Infer
-                    }),
-                Some(ty) => tc.resolve_type_for_tc_at(ty, lambda.span),
+                Some(ty) => tc.resolve_callable_param_type(ty, lambda.span, false),
                 None => expected_func
                     .as_ref()
                     .and_then(|(params, _)| params.get(index))
@@ -7061,6 +7292,20 @@ fn check_cast_expr(expr: &ExprNode, cast: &CastNode, tc: &mut TypeChecker) -> Ch
     let mut casted = checked_from_type(expr, ty, tc);
     casted.contains_extern_any = checked.contains_extern_any;
     casted
+}
+
+fn check_exact_downcast_expr(
+    expr: &ExprNode,
+    downcast: &ExactDowncastNode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let _target = tc.resolve_downcast_target_type_at(&downcast.node.target, downcast.span);
+    check_value_expr_checked_with_hint(&downcast.node.expr, None, tc);
+    tc.push_error(TypeError::CompileError {
+        message: "exact downcast is only supported in conditional bindings".to_string(),
+        span: tc.error_span(downcast.span),
+    });
+    checked_from_type(expr, Type::Infer, tc)
 }
 
 fn check_range_expr(
@@ -8550,12 +8795,218 @@ fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
     tc.pop_scope();
 }
 
+fn check_if_let_exact_downcast(
+    if_let_node: &IfLetNode,
+    downcast: &ExactDowncastNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let node = &if_let_node.node;
+    let binding = exact_downcast_binding(node, tc);
+    let target = tc.resolve_downcast_target_type_at(&downcast.node.target, downcast.span);
+    let target = runtime_downcast_target(tc, target, downcast.span);
+    let source = check_place(&downcast.node.expr, tc);
+    let source_contract = match &source.checked().ty {
+        Type::Dyn(contract) => Some(contract.clone()),
+        Type::Infer => None,
+        _ => {
+            tc.push_error(TypeError::CompileError {
+                message: "exact downcast source must be a dynamic value".to_string(),
+                span: tc.error_span(downcast.node.expr.span),
+            });
+            None
+        }
+    };
+    let mut source_valid = source_contract.is_some();
+
+    match binding {
+        Some(binding) if binding.mutable => {
+            if let Some(error) = source
+                .value
+                .access
+                .mut_borrow_error(binding.name, tc.error_span(downcast.node.expr.span))
+            {
+                tc.push_error(error);
+                source_valid = false;
+            }
+        }
+        Some(_) if matches!(source.value.access, PlaceAccess::NotPlace) => {
+            tc.push_error(TypeError::CompileError {
+                message: "exact downcast source must be a dynamic place".to_string(),
+                span: tc.error_span(downcast.node.expr.span),
+            });
+            source_valid = false;
+        }
+        _ => {}
+    }
+
+    let binding_ty = target.clone().unwrap_or(Type::Infer);
+    checked_from_type(&node.value, binding_ty.clone(), tc);
+    let Some(binding) = binding else {
+        return check_downcast_branches(node, None, binding_ty, expected, tc);
+    };
+    let Some(target) = target else {
+        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
+    };
+    if !source_valid {
+        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
+    }
+    let source_contract = source_contract.expect("valid downcast source has contract");
+
+    if let Some(source) =
+        contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, &source_contract)
+    {
+        tc.record_dyn_downcast(DynDowncastFact {
+            expr_id: node.value.node.id,
+            source_id: downcast.node.expr.node.id,
+            source,
+            target: target.clone(),
+            mutable: binding.mutable,
+            span: tc.source_span(node.value.span),
+        });
+    } else if let Some(hole) = dyn_infer::hole_id(&source_contract) {
+        tc.dyn_infer.add_downcast(
+            tc.current_module.clone(),
+            node.value.node.id,
+            downcast.node.expr.node.id,
+            hole,
+            target.clone(),
+            binding.mutable,
+            tc.source_span(node.value.span),
+        );
+    }
+
+    tc.push_scope();
+    let handle = tc.type_handle(&target);
+    if binding.mutable {
+        let alias = place::AliasTarget {
+            access: PlaceAccess::Mutable,
+            identity: source.value.identity.clone(),
+            facts: source.value.facts.clone(),
+            accepts_extern_any: source.accepts_extern_any(),
+        };
+        tc.define_alias_binding_from_handle(binding.name, &handle, alias);
+        tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
+            identity: source.value.identity.clone(),
+            allowed: binding.name,
+        });
+    } else {
+        tc.define_pattern_binding_from_handle(binding.name, &handle, false);
+    }
+
+    let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
+    if binding.mutable {
+        tc.active_mut_downcast_roots.pop();
+    }
+    tc.pop_scope();
+    finish_if_let_branches(node, then, expected, tc)
+}
+
+#[derive(Clone, Copy)]
+struct ExactDowncastBinding {
+    name: Ident,
+    mutable: bool,
+}
+
+fn exact_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<ExactDowncastBinding> {
+    match node.pattern.node {
+        Pattern::Ident(name) => Some(ExactDowncastBinding {
+            name,
+            mutable: matches!(node.head, PatternHead::Var),
+        }),
+        _ => {
+            tc.push_error(TypeError::CompileError {
+                message: "exact downcast currently binds a single identifier".to_string(),
+                span: tc.error_span(node.pattern.span),
+            });
+            None
+        }
+    }
+}
+
+fn runtime_downcast_target(tc: &mut TypeChecker, target: Type, span: Span) -> Option<Type> {
+    match &target {
+        Type::Dyn(_) => {
+            tc.push_error(TypeError::CompileError {
+                message: "downcast tests the stored concrete type; use a wider dynamic type at the conversion site instead of downcasting to another contract".to_string(),
+                span: tc.error_span(span),
+            });
+            return None;
+        }
+        Type::Infer => return None,
+        _ => {}
+    }
+    let facts = type_closure_facts(&target);
+    if facts.first_unresolved.is_some()
+        || facts.infer.contains_type
+        || facts.infer.contains_return
+        || facts.contains_unresolved_const
+        || type_depends_on_generics(&target)
+    {
+        tc.push_error(TypeError::CompileError {
+            message: "exact downcast target must be a fully concrete runtime-identifiable type"
+                .to_string(),
+            span: tc.error_span(span),
+        });
+        return None;
+    }
+    if tc.decls.key_for_type(&target).is_some() {
+        Some(target)
+    } else {
+        tc.push_error(TypeError::CompileError {
+            message: "exact downcast target must be a concrete nominal type".to_string(),
+            span: tc.error_span(span),
+        });
+        None
+    }
+}
+
+fn check_downcast_branches(
+    node: &IfLet,
+    binding: Option<ExactDowncastBinding>,
+    binding_ty: Type,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    tc.push_scope();
+    if let Some(binding) = binding {
+        let handle = tc.type_handle(&binding_ty);
+        tc.define_pattern_binding_from_handle(binding.name, &handle, binding.mutable);
+    }
+    let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
+    tc.pop_scope();
+    finish_if_let_branches(node, then, expected, tc)
+}
+
+fn finish_if_let_branches(
+    node: &IfLet,
+    then: CheckedType,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let Some(else_block) = &node.else_block else {
+        return checked_void(tc);
+    };
+    let else_checked = check_block_checked_with_hint(else_block, expected, tc);
+    join_checked(
+        then,
+        node.then_block.span,
+        else_checked,
+        else_block.span,
+        tc,
+    )
+}
+
 fn check_if_let_checked_with_hint(
     if_let_node: &IfLetNode,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &if_let_node.node;
+    if let ExprKind::ExactDowncast(downcast) = &node.value.node.kind {
+        return check_if_let_exact_downcast(if_let_node, downcast, expected, tc);
+    }
+
     let mode = mode_for_head(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
     tc.push_scope();
@@ -8569,17 +9020,7 @@ fn check_if_let_checked_with_hint(
     );
     let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
     tc.pop_scope();
-    let Some(else_block) = &node.else_block else {
-        return checked_void(tc);
-    };
-    let else_checked = check_block_checked_with_hint(else_block, expected, tc);
-    join_checked(
-        then,
-        node.then_block.span,
-        else_checked,
-        else_block.span,
-        tc,
-    )
+    finish_if_let_branches(node, then, expected, tc)
 }
 
 fn check_match_checked_with_hint(

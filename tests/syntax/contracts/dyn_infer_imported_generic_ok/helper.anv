@@ -1,0 +1,13 @@
+// @helper
+
+pub struct Actor {
+    fn draw(self) {}
+}
+
+pub fn take(actor: dyn _) {
+    actor.draw();
+}
+
+pub fn run<T>(value: T) {
+    take(value);
+}

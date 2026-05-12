@@ -54,6 +54,8 @@ pub(super) enum Subject {
         receiver: ReceiverMode,
         receiver_access: PlaceAccess,
         receiver_place: PlaceUseFacts,
+        receiver_identity: place::PlaceIdentity,
+        receiver_root_name: Option<Ident>,
         receiver_id: ExprId,
         name: Ident,
         signature: ResolvedExternSignature,
@@ -63,6 +65,8 @@ pub(super) enum Subject {
         requirement: ContractRequirementSchema,
         receiver_access: PlaceAccess,
         receiver_place: PlaceUseFacts,
+        receiver_identity: place::PlaceIdentity,
+        receiver_root_name: Option<Ident>,
         receiver_id: ExprId,
         name: Ident,
     },
@@ -70,6 +74,8 @@ pub(super) enum Subject {
         hole: crate::ast::DynContractHoleId,
         receiver_access: PlaceAccess,
         receiver_place: PlaceUseFacts,
+        receiver_identity: place::PlaceIdentity,
+        receiver_root_name: Option<Ident>,
         receiver_id: ExprId,
         name: Ident,
     },
@@ -101,8 +107,17 @@ pub(super) struct SourceReceiver {
     access: PlaceAccess,
     facts: PlaceUseFacts,
     identity: place::PlaceIdentity,
+    root_name: Option<Ident>,
     expr_id: ExprId,
     name: Ident,
+}
+
+struct DynReceiver<'a> {
+    access: PlaceAccess,
+    facts: &'a PlaceUseFacts,
+    identity: &'a place::PlaceIdentity,
+    root_name: Option<Ident>,
+    id: ExprId,
 }
 
 pub(super) fn collect_postfix_chain(expr: &ExprNode) -> Option<PostfixChain<'_>> {
@@ -149,6 +164,7 @@ fn local_value_subject(
     let access = tc.local_value_access(name, value);
     let mut value = PlaceValue::new(checked, access.access, access.facts);
     value.identity = access.identity;
+    value.root_name = Some(name);
     Subject::Value(value)
 }
 
@@ -291,6 +307,7 @@ pub(super) fn check_postfix_chain(
     }
 
     if let Subject::Value(value) = &subject {
+        tc.check_mut_downcast_root_use(value.root_name, &value.identity, expr.span);
         place::record_value_read(expr.node.id, value, tc);
     }
 
@@ -545,6 +562,7 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
             target.value.facts,
         );
         value.identity = target.value.identity.index();
+        value.root_name = target.value.root_name;
         return value;
     }
 
@@ -557,6 +575,7 @@ fn source_receiver(
     access: PlaceAccess,
     facts: &PlaceUseFacts,
     identity: place::PlaceIdentity,
+    root_name: Option<Ident>,
     expr_id: ExprId,
     name: Ident,
 ) -> SourceReceiver {
@@ -565,6 +584,7 @@ fn source_receiver(
         access,
         facts: facts.clone(),
         identity,
+        root_name,
         expr_id,
         name,
     }
@@ -608,6 +628,8 @@ fn apply_value_field(
                     contract,
                     receiver_access,
                     receiver_place.clone(),
+                    receiver_identity,
+                    receiver.root_name,
                     receiver_id,
                     name,
                     span,
@@ -631,6 +653,7 @@ fn apply_value_field(
                             receiver_access,
                             receiver_place,
                             receiver_identity,
+                            receiver.root_name,
                             receiver_id,
                             name,
                         )),
@@ -658,6 +681,7 @@ fn apply_value_field(
                             receiver_access,
                             receiver_place,
                             receiver_identity,
+                            receiver.root_name,
                             receiver_id,
                             name,
                         )),
@@ -693,6 +717,7 @@ fn apply_value_field(
                                     promoted_access,
                                     receiver_place,
                                     promoted_identity,
+                                    receiver.root_name,
                                     field_id,
                                     name,
                                 )),
@@ -703,6 +728,8 @@ fn apply_value_field(
                             receiver: method.receiver,
                             receiver_access: promoted_access,
                             receiver_place: receiver_place.clone(),
+                            receiver_identity: promoted_identity,
+                            receiver_root_name: receiver.root_name,
                             receiver_id: field_id,
                             name,
                             signature: method.signature,
@@ -727,6 +754,8 @@ fn apply_value_field(
                     receiver: method.receiver,
                     receiver_access,
                     receiver_place: receiver_place.clone(),
+                    receiver_identity,
+                    receiver_root_name: receiver.root_name,
                     receiver_id,
                     name: method.name,
                     signature: method.signature,
@@ -758,6 +787,8 @@ fn apply_dyn_method(
     contract: &crate::ast::ContractRef,
     receiver_access: PlaceAccess,
     receiver_place: PlaceUseFacts,
+    receiver_identity: place::PlaceIdentity,
+    receiver_root_name: Option<Ident>,
     receiver_id: ExprId,
     name: Ident,
     span: Span,
@@ -768,6 +799,8 @@ fn apply_dyn_method(
             hole,
             receiver_access,
             receiver_place,
+            receiver_identity,
+            receiver_root_name,
             receiver_id,
             name,
         };
@@ -779,6 +812,8 @@ fn apply_dyn_method(
             requirement,
             receiver_access,
             receiver_place,
+            receiver_identity,
+            receiver_root_name,
             receiver_id,
             name,
         },
@@ -1073,6 +1108,8 @@ fn apply_call(
             receiver,
             receiver_access,
             receiver_place,
+            receiver_identity,
+            receiver_root_name,
             receiver_id,
             name,
             signature,
@@ -1082,6 +1119,8 @@ fn apply_call(
                 receiver: *receiver,
                 receiver_access: *receiver_access,
                 receiver_place,
+                receiver_identity,
+                receiver_root_name: *receiver_root_name,
                 receiver_id: *receiver_id,
                 name: *name,
                 signature,
@@ -1096,14 +1135,20 @@ fn apply_call(
             requirement,
             receiver_access,
             receiver_place,
+            receiver_identity,
+            receiver_root_name,
             receiver_id,
             name,
         } => check_dyn_method_call(
             contract,
             requirement,
-            *receiver_access,
-            receiver_place,
-            *receiver_id,
+            DynReceiver {
+                access: *receiver_access,
+                facts: receiver_place,
+                identity: receiver_identity,
+                root_name: *receiver_root_name,
+                id: *receiver_id,
+            },
             *name,
             call,
             call_id,
@@ -1114,13 +1159,19 @@ fn apply_call(
             hole,
             receiver_access,
             receiver_place,
+            receiver_identity,
+            receiver_root_name,
             receiver_id,
             name,
         } => check_dyn_hole_method_call(
             *hole,
-            *receiver_access,
-            receiver_place,
-            *receiver_id,
+            DynReceiver {
+                access: *receiver_access,
+                facts: receiver_place,
+                identity: receiver_identity,
+                root_name: *receiver_root_name,
+                id: *receiver_id,
+            },
             *name,
             call,
             call_id,
@@ -1132,6 +1183,7 @@ fn apply_call(
             signature,
         } => check_extern_static_call(*static_ref, signature, call, call_id, expected, tc),
         Subject::Value(value) => {
+            tc.check_mut_downcast_root_use(value.root_name, &value.identity, call.node.func.span);
             place::record_value_read(call.node.func.node.id, value, tc);
             checked_type(call_value(value.checked.ty.clone(), call, call_id, tc), tc)
         }
@@ -1152,6 +1204,7 @@ fn check_source_receiver(
     span: Span,
     tc: &mut TypeChecker,
 ) -> Option<MutableArg> {
+    tc.check_mut_downcast_root_use(receiver.root_name, &receiver.identity, span);
     if receiver.mutable {
         if let Some(error) =
             mutating_receiver_error(receiver.access, receiver.name, tc.error_span(span))
@@ -1197,32 +1250,32 @@ fn call_value(callee_ty: Type, call: &CallNode, call_id: ExprId, tc: &mut TypeCh
 
 fn check_dyn_hole_method_call(
     hole: crate::ast::DynContractHoleId,
-    receiver_access: PlaceAccess,
-    receiver_place: &PlaceUseFacts,
-    receiver_id: ExprId,
+    receiver: DynReceiver<'_>,
     name: Ident,
     call: &CallNode,
     call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let receiver = if matches!(receiver_access, PlaceAccess::Mutable | PlaceAccess::DynView) {
+    let method_receiver = if matches!(receiver.access, PlaceAccess::Mutable | PlaceAccess::DynView)
+    {
         MethodReceiver::Var
     } else {
         MethodReceiver::Value
     };
-    let requires_mutable = matches!(receiver, MethodReceiver::Var);
+    let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
+    tc.check_mut_downcast_root_use(receiver.root_name, receiver.identity, call.span);
     if requires_mutable {
-        match mutating_receiver_error(receiver_access, name, tc.error_span(call.span)) {
+        match mutating_receiver_error(receiver.access, name, tc.error_span(call.span)) {
             Some(error) => {
                 tc.push_error(error);
             }
             None => {
-                place::record_facts_write(receiver_id, receiver_place, tc);
+                place::record_facts_write(receiver.id, receiver.facts, tc);
             }
         }
     } else {
-        place::record_facts_read(receiver_id, receiver_place, tc);
+        place::record_facts_read(receiver.id, receiver.facts, tc);
     }
 
     let mut failed = false;
@@ -1257,7 +1310,7 @@ fn check_dyn_hole_method_call(
         match tc.dyn_infer.collect_method(
             hole,
             name,
-            receiver,
+            method_receiver,
             params,
             ret.clone(),
             tc.source_span(call.span),
@@ -1265,7 +1318,7 @@ fn check_dyn_hole_method_call(
             Ok(()) => tc.dyn_infer.add_call(
                 tc.current_module.clone(),
                 call_id,
-                receiver_id,
+                receiver.id,
                 hole,
                 name,
                 call.node.args.len(),
@@ -1285,31 +1338,30 @@ fn check_dyn_hole_method_call(
 fn check_dyn_method_call(
     contract: &ContractSetKey,
     requirement: &ContractRequirementSchema,
-    receiver_access: PlaceAccess,
-    receiver_place: &PlaceUseFacts,
-    receiver_id: ExprId,
+    receiver: DynReceiver<'_>,
     name: Ident,
     call: &CallNode,
     call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let receiver = requirement
+    let method_receiver = requirement
         .receiver
         .expect("contract requirements are finalized with receivers");
-    let requires_mutable = matches!(receiver, MethodReceiver::Var);
+    let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
+    tc.check_mut_downcast_root_use(receiver.root_name, receiver.identity, call.span);
     let mut failed = false;
     if requires_mutable {
         if let Some(error) =
-            mutating_receiver_error(receiver_access, name, tc.error_span(call.span))
+            mutating_receiver_error(receiver.access, name, tc.error_span(call.span))
         {
             tc.push_error(error);
             failed = true;
         } else {
-            place::record_facts_write(receiver_id, receiver_place, tc);
+            place::record_facts_write(receiver.id, receiver.facts, tc);
         }
     } else {
-        place::record_facts_read(receiver_id, receiver_place, tc);
+        place::record_facts_read(receiver.id, receiver.facts, tc);
     }
 
     failed |= check_args(&call.node.args, &requirement.params, call.span, call_id, tc);
@@ -1318,7 +1370,7 @@ fn check_dyn_method_call(
     if !failed {
         tc.record_dyn_call(DynCallFact {
             call_id,
-            receiver_id,
+            receiver_id: receiver.id,
             contract: contract.clone(),
             method: name,
             arg_count: call.node.args.len(),
@@ -1335,6 +1387,8 @@ struct ExternMethodCall<'a> {
     receiver: ReceiverMode,
     receiver_access: PlaceAccess,
     receiver_place: &'a PlaceUseFacts,
+    receiver_identity: &'a place::PlaceIdentity,
+    receiver_root_name: Option<Ident>,
     receiver_id: ExprId,
     name: Ident,
     signature: &'a ResolvedExternSignature,
@@ -1641,6 +1695,7 @@ fn check_projecting_var_arg(
         place.value.facts.clone(),
     );
     projected.identity = place.value.identity.fields(&projection.field_path);
+    projected.root_name = place.value.root_name;
     tc.reject_extern_any_escape(&projected.checked, arg.span);
     tc.expect_assignable_expr(
         arg.span,
@@ -1982,6 +2037,7 @@ fn check_qualified_extend_call(
         receiver.access,
         &receiver.facts,
         receiver.identity.clone(),
+        receiver.root_name,
         receiver_expr.node.id,
         name,
     );
@@ -2074,6 +2130,11 @@ fn check_extern_method_call(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
+    tc.check_mut_downcast_root_use(
+        method.receiver_root_name,
+        method.receiver_identity,
+        call.span,
+    );
     match method.receiver {
         ReceiverMode::Mutable => {
             if let Some(error) = method

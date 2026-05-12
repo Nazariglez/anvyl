@@ -1,0 +1,23 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'draw'
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Source {
+    fn draw(self) {}
+}
+
+struct Enemy {
+    fn attack(self) {}
+}
+
+fn main() {
+    let actor: dyn Drawable = Source {};
+    if let enemy = actor as? Enemy {
+        enemy.draw();
+    }
+}

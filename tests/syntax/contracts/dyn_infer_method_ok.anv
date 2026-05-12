@@ -6,11 +6,12 @@ struct Actor {
     fn draw(self) {}
 }
 
-fn make() -> dyn _ {
-    Actor {}
+struct System {
+    fn tick(actor: dyn _) {
+        actor.draw();
+    }
 }
 
 fn main() {
-    let actor = make();
-    actor.draw();
+    System.tick(Actor {});
 }

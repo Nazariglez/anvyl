@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: exact downcast currently binds a single identifier
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn main() {
+    let actor: dyn Drawable = Enemy {};
+    if let _ = actor as? Enemy {}
+}

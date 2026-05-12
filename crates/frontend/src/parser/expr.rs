@@ -92,7 +92,8 @@ pub(super) fn cond_expression<'src>() -> BoxedParser<'src, ast::ExprNode> {
         let atom = cond_atom_expr(cond_expr.clone());
         let postfix = postfix_expr(atom, cond_expr.clone());
         let unary = unary_expr(postfix);
-        let binary = binary_expr(unary);
+        let cast = cast_expr(unary);
+        let binary = binary_expr(cast);
         let ternary = ternary_expr(binary, cond_expr.clone());
         assignment_expr(ternary)
     })
@@ -124,11 +125,22 @@ fn if_expr<'src>(
         )))
         .or_not();
 
-        let if_let = select! { Token::Keyword(Keyword::If) => () }
-            .ignore_then(let_or_var_head())
-            .then(pattern())
+        let let_var_ident_value = select! { Token::Keyword(Keyword::Let) => () }
+            .ignore_then(select! { Token::Keyword(Keyword::Var) => () })
+            .ignore_then(
+                identifier()
+                    .map_with(|ident, e| Spanned::new(ast::Pattern::Ident(ident), e.span().byte())),
+            )
             .then_ignore(select! { Token::Op(Op::Assign) => () })
             .then(cond_expression())
+            .map(|(pat, value)| ((ast::PatternHead::Var, pat), value));
+        let let_value = let_or_var_head()
+            .then(pattern())
+            .then_ignore(select! { Token::Op(Op::Assign) => () })
+            .then(cond_expression());
+
+        let if_let = select! { Token::Keyword(Keyword::If) => () }
+            .ignore_then(choice((let_var_ident_value, let_value)))
             .then(block_stmt(stmt.clone(), expr.clone()))
             .then(else_branch.clone())
             .map_with(|((((head, pat), value), then_block), else_block), e| {
@@ -1163,26 +1175,40 @@ fn postfix_expr<'src>(
 }
 
 fn cast_expr<'src>(unary: impl AnvParser<'src, ast::ExprNode>) -> BoxedParser<'src, ast::ExprNode> {
-    let as_kw = select! { Token::Keyword(Keyword::As) => () };
+    let cast_op = select! { Token::Keyword(Keyword::As) => () }
+        .ignore_then(select! { Token::Question => CastOp::Exact }.or_not())
+        .then(type_ident())
+        .map(|(op, target)| (op.unwrap_or(CastOp::Ordinary), target));
     unary
-        .foldl_with(
-            as_kw.ignore_then(type_ident()).repeated(),
-            |expr, target, e| {
-                let s = e.span();
-                let span = s.byte();
-                let cast_node = Spanned::new(
+        .foldl_with(cast_op.repeated(), |expr, (op, target), e| {
+            let s = e.span();
+            let span = s.byte();
+            let id = new_expr_id();
+            let kind = match op {
+                CastOp::Ordinary => ast::ExprKind::Cast(Spanned::new(
                     ast::Cast {
                         expr: Box::new(expr),
                         target,
                     },
                     span,
-                );
-                let id = new_expr_id();
-                let node = ast::Expr::new(ast::ExprKind::Cast(cast_node), id);
-                Spanned::new(node, span)
-            },
-        )
+                )),
+                CastOp::Exact => ast::ExprKind::ExactDowncast(Spanned::new(
+                    ast::Cast {
+                        expr: Box::new(expr),
+                        target,
+                    },
+                    span,
+                )),
+            };
+            Spanned::new(ast::Expr::new(kind, id), span)
+        })
         .boxed()
+}
+
+#[derive(Clone, Copy)]
+enum CastOp {
+    Ordinary,
+    Exact,
 }
 
 enum PrefixOp {

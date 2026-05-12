@@ -292,27 +292,11 @@ fn static_bound_does_not_create_witness_for_concrete_arg() {
 }
 
 #[test]
-fn anonymous_dynamic_contract_validates_requirement_types() {
-    let errors = errors(
-        "contract A { fn a(self); }
-        type Bad = dyn { fn f(self, values: [dyn A: int]); };",
-    );
-
-    assert!(
-        errors
-            .iter()
-            .any(|error| matches!(error, TypeError::NonKeyableMapKey { .. }))
-    );
-}
-
-#[test]
-fn inferred_dynamic_local_collects_method() {
+fn inferred_dynamic_param_collects_method() {
     checker(
         "struct Actor { fn draw(self) {} }
-        fn main() {
-            let actor: dyn _ = Actor {};
-            actor.draw();
-        }",
+        fn use_actor(actor: dyn _) { actor.draw(); }
+        fn main() { use_actor(Actor {}); }",
     );
 }
 
@@ -320,10 +304,8 @@ fn inferred_dynamic_local_collects_method() {
 fn inferred_dynamic_receiver_mutability_uses_access() {
     checker(
         "struct Actor { fn update(var self, dt: float) {} }
-        fn main() {
-            var actor: dyn _ = Actor {};
-            actor.update(1.0);
-        }",
+        fn use_actor(var actor: dyn _) { actor.update(1.0); }
+        fn main() { var actor = Actor {}; use_actor(actor); }",
     );
 }
 
@@ -333,24 +315,8 @@ fn inferred_dynamic_expected_context_solves_empty_surface() {
         "contract Drawable { fn draw(self); }
         struct Actor { fn draw(self) {} }
         fn take(actor: dyn Drawable) {}
-        fn main() {
-            let actor: dyn _ = Actor {};
-            take(actor);
-        }",
-    );
-}
-
-#[test]
-fn inferred_dynamic_function_param_and_return_solve_from_body() {
-    checker(
-        "struct Actor { fn draw(self) {} }
-        fn use_actor(actor: dyn _) { actor.draw(); }
-        fn make_actor() -> dyn _ { Actor {} }
-        fn main() {
-            use_actor(Actor {});
-            let actor = make_actor();
-            actor.draw();
-        }",
+        fn use_actor(actor: dyn _) { take(actor); }
+        fn main() { use_actor(Actor {}); }",
     );
 }
 
@@ -358,7 +324,8 @@ fn inferred_dynamic_function_param_and_return_solve_from_body() {
 fn inferred_dynamic_empty_hole_is_error() {
     let errors = errors(
         "struct Actor {}
-        fn main() { let actor: dyn _ = Actor {}; }",
+        fn use_actor(actor: dyn _) {}
+        fn main() { use_actor(Actor {}); }",
     );
 
     assert!(errors.iter().any(|error| matches!(
@@ -374,11 +341,11 @@ fn inferred_dynamic_rejects_conflicting_requirements() {
         "struct Actor {
             fn f(self, x: int) {}
         }
-        fn main() {
-            let actor: dyn _ = Actor {};
+        fn use_actor(actor: dyn _) {
             actor.f(1);
             actor.f(\"x\");
-        }",
+        }
+        fn main() { use_actor(Actor {}); }",
     );
 
     assert!(errors.iter().any(|error| matches!(
@@ -392,10 +359,8 @@ fn inferred_dynamic_rejects_conflicting_requirements() {
 fn inferred_dynamic_rejects_unknown_argument_type() {
     let errors = errors(
         "struct Actor { fn f(self, x: int) {} }
-        fn main() {
-            let actor: dyn _ = Actor {};
-            actor.f(nil);
-        }",
+        fn use_actor(actor: dyn _) { actor.f(nil); }
+        fn main() { use_actor(Actor {}); }",
     );
 
     assert!(errors.iter().any(|error| matches!(
@@ -409,10 +374,8 @@ fn inferred_dynamic_rejects_unknown_argument_type() {
 fn inferred_dynamic_rejects_unsolved_return_type() {
     let errors = errors(
         "struct Actor { fn count(self) -> int { 1 } }
-        fn main() {
-            let actor: dyn _ = Actor {};
-            let count = actor.count();
-        }",
+        fn use_actor(actor: dyn _) { let count = actor.count(); }
+        fn main() { use_actor(Actor {}); }",
     );
 
     assert!(errors.iter().any(|error| matches!(
@@ -429,54 +392,8 @@ fn inferred_dynamic_rejects_stored_positions() {
     assert!(errors.iter().any(|error| matches!(
         error,
         TypeError::CompileError { message, .. }
-            if message.contains("stored or ownerless type positions")
+            if message.contains("direct parameters of callables")
     )));
-}
-
-#[test]
-fn anonymous_dynamic_contract_converts_and_calls() {
-    let result = check(
-        "struct Thing { fn draw(self) {} }
-        fn main() {
-            let value: dyn { fn draw(self); } = Thing {};
-            value.draw();
-        }",
-    )
-    .expect("typecheck failed");
-
-    assert_eq!(result.contract_witnesses().len(), 1);
-    assert_eq!(result.dyn_conversions().len(), 1);
-    assert_eq!(result.dyn_calls().len(), 1);
-}
-
-#[test]
-fn anonymous_dynamic_contract_rejects_missing_method() {
-    let errors = errors(
-        "struct Thing {}
-        fn main() {
-            let value: dyn { fn draw(self); } = Thing {};
-        }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::ContractUnsatisfied { detail, .. } if detail.contains("missing method 'draw'")
-    )));
-}
-
-#[test]
-fn anonymous_dynamic_contract_weakens_from_named_surface() {
-    check(
-        "contract A { fn a(self); }
-        contract B { fn b(self); }
-        struct Both { fn a(self) {} fn b(self) {} }
-        fn take(value: dyn { fn a(self); }) {}
-        fn main() {
-            let value: dyn A + B = Both {};
-            take(value);
-        }",
-    )
-    .expect("typecheck failed");
 }
 
 #[test]
@@ -493,6 +410,40 @@ fn dynamic_weakening_records_fact() {
     .expect("typecheck failed");
 
     assert_eq!(result.dyn_weakenings().len(), 1);
+}
+
+#[test]
+fn exact_downcast_records_fact() {
+    let result = check(
+        "contract A { fn a(self); }
+        struct Thing { fn a(self) {} fn concrete(self) {} }
+        fn main() {
+            let value: dyn A = Thing {};
+            if let thing = value as? Thing {
+                thing.concrete();
+            }
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_downcasts().len(), 1);
+}
+
+#[test]
+fn inferred_dynamic_exact_downcast_records_fact_after_solving() {
+    let result = check(
+        "struct Thing { fn a(self) {} fn concrete(self) {} }
+        fn use_value(value: dyn _) {
+            value.a();
+            if let thing = value as? Thing {
+                thing.concrete();
+            }
+        }
+        fn main() { use_value(Thing {}); }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_downcasts().len(), 1);
 }
 
 #[test]

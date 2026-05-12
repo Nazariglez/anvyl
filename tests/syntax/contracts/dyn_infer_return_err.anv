@@ -3,6 +3,10 @@
 // @frontend: new
 // @contains: inferred dynamic contracts are only allowed as direct parameters of callables with bodies
 
-struct Box {
-    actor: dyn _,
+struct Actor {
+    fn draw(self) {}
+}
+
+fn make_actor() -> dyn _ {
+    Actor {}
 }

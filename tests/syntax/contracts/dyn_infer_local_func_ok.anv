@@ -2,11 +2,13 @@
 // @expect: success
 // @frontend: new
 
-struct Sprite {
+struct Actor {
     fn draw(self) {}
 }
 
 fn main() {
-    let sprite: dyn { fn draw(self); } = Sprite {};
-    sprite.draw();
+    fn tick(actor: dyn _) {
+        actor.draw();
+    }
+    tick(Actor {});
 }

@@ -485,50 +485,9 @@ fn dyn_intersection_type() {
 }
 
 #[test]
-fn dyn_anonymous_type() {
-    let ty = parse_type("dyn { fn draw(self); fn update(var self, dt: float); }");
-    let ast::Type::Dyn(ast::ContractRef::Anonymous(surface)) = ty else {
-        panic!("expected anonymous dynamic contract");
-    };
-    assert_eq!(surface.requirements.len(), 2);
-    assert_eq!(surface.requirements[0].name, ast::Ident::new("draw"));
-    assert_eq!(surface.requirements[1].receiver, ast::MethodReceiver::Var);
-    assert_eq!(surface.requirements[1].params.len(), 1);
-}
-
-#[test]
-fn dyn_anonymous_nested_type_positions() {
-    let ty = parse_type("fn(dyn { fn draw(self); }?) -> [dyn { fn tick(var self); }]");
-    let ast::Type::Func { params, ret } = ty else {
-        panic!("expected function type");
-    };
-    assert!(params[0].ty.is_option());
-    let ast::Type::List { elem } = *ret else {
-        panic!("expected list return type");
-    };
-    assert!(matches!(
-        *elem,
-        ast::Type::Dyn(ast::ContractRef::Anonymous(_))
-    ));
-}
-
-#[test]
-fn dyn_mixed_anonymous_intersection() {
-    let ty = parse_type("dyn A + { fn draw(self); } + B");
-    let ast::Type::Dyn(ast::ContractRef::Intersection(contracts)) = ty else {
-        panic!("expected dynamic intersection");
-    };
-    assert_eq!(contracts.len(), 3);
-    assert!(matches!(contracts[1], ast::ContractRef::Anonymous(_)));
-}
-
-#[test]
-fn dyn_anonymous_invalid_forms_reject() {
-    parse_type_err("dyn {}");
-    parse_type_err("dyn { x: int; }");
-    parse_type_err("dyn { fn f(self) {} }");
-    parse_type_err("dyn { fn f<T>(self); }");
-    parse_type_err("dyn { fn f(self, x: int = 1); }");
+fn dyn_anonymous_source_rejects() {
+    parse_type_err("dyn { fn draw(self); }");
+    parse_type_err("dyn A + { fn draw(self); }");
 }
 
 #[test]

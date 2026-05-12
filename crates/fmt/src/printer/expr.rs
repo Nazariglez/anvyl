@@ -167,6 +167,12 @@ impl Printer<'_> {
                 self.format_type(&node.node.target);
             }
 
+            ast::ExprKind::ExactDowncast(node) => {
+                self.format_expr_prec(&node.node.expr.node, ExprPrecedence::Cast, Left);
+                self.write(" as? ");
+                self.format_type(&node.node.target);
+            }
+
             ast::ExprKind::Lambda(node) => self.format_lambda(&node.node),
             ast::ExprKind::InferredEnum(node) => self.format_inferred_enum_expr(&node.node),
             ast::ExprKind::IntrinsicCall(node) => {

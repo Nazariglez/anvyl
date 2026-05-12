@@ -7,8 +7,8 @@ use crate::{
     test_support::{empty_resolved, parse_program, resolved_modules},
     typecheck::{
         self, ArgumentProjectionMap, CallMap, ContractWitnessMap, DeprecatedUseKind, DynCallMap,
-        DynConversionMap, DynWeakeningMap, ExternUseMap, MemberPathMap, TypeError, TypeWarning,
-        decls::DeclarationIndex,
+        DynConversionMap, DynDowncastMap, DynWeakeningMap, ExternUseMap, MemberPathMap, TypeError,
+        TypeWarning, decls::DeclarationIndex,
     },
 };
 
@@ -22,6 +22,7 @@ pub(crate) struct TypecheckTestResult {
     dyn_conversions: DynConversionMap,
     dyn_weakenings: DynWeakeningMap,
     dyn_calls: DynCallMap,
+    dyn_downcasts: DynDowncastMap,
     warnings: Vec<TypeWarning>,
     decls: DeclarationIndex,
     externs: ExternCatalog,
@@ -62,6 +63,10 @@ impl TypecheckTestResult {
 
     pub(crate) fn dyn_calls(&self) -> &DynCallMap {
         &self.dyn_calls
+    }
+
+    pub(crate) fn dyn_downcasts(&self) -> &DynDowncastMap {
+        &self.dyn_downcasts
     }
 
     pub(crate) fn warnings(&self) -> &[TypeWarning] {
@@ -180,6 +185,7 @@ pub(crate) fn check_with_raw_externs(
         dyn_conversions: tc.dyn_conversions,
         dyn_weakenings: tc.dyn_weakenings,
         dyn_calls: tc.dyn_calls,
+        dyn_downcasts: tc.dyn_downcasts,
         warnings: tc.warnings,
         decls: tc.decls,
         externs: tc.externs,

@@ -189,10 +189,18 @@ mod tests {
     }
 
     #[test]
-    fn exact_anonymous_dyn_contracts() {
+    fn exact_dyn_contract_composition() {
         assert_fmt(
-            "fn draw(x:dyn{fn draw(self);fn tick(var self,dt:float);}){}",
-            "fn draw(\n    x: dyn {\n        fn draw(self);\n        fn tick(var self, dt: float);\n    },\n) {}\n",
+            "fn draw(x:dyn Drawable+Updatable){}",
+            "fn draw(x: dyn Drawable + Updatable) {}\n",
+        );
+    }
+
+    #[test]
+    fn exact_downcast_expr() {
+        assert_fmt(
+            "fn f(){if let enemy=actor as? Enemy{enemy.draw();}}",
+            "fn f() {\n    if let enemy = actor as? Enemy {\n        enemy.draw();\n    }\n}\n",
         );
     }
 
