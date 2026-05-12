@@ -3,21 +3,23 @@ use std::collections::HashMap;
 use anvyx_externs::{ParamFlow, ReceiverMode};
 
 use super::{
-    ContractKey, ContractRequirementSchema, DeclarationIndex, Exposure, FuncParam,
-    MemberAccessKind, MethodMode, MethodReceiver, TypeChecker, TypeError,
+    ContractKey, ContractRequirementKey, ContractRequirementSchema, ContractSetKey, DeclError,
+    DeclarationIndex, DeprecatedUseKind, Exposure, FuncParam, MemberAccessKind, MethodMode,
+    MethodReceiver, TypeChecker, TypeError, TypeWarning,
     member::{self, PromotedMethodTarget},
     semantic_use::{ContractWitnessKey, WitnessId, WitnessSlot, WitnessSlotTarget},
+    type_ops::TypeVisitor,
     type_refs::TypeRefResolver,
 };
 use crate::{
-    ast::{ContractRef, Ident, Type},
-    span::Span,
+    ast::{AnonymousContract, ContractRef, Ident, Type},
+    span::{SourceSpan, Span},
 };
 
 #[derive(Clone)]
 pub(super) struct ContractMatch {
     pub(super) concrete_ty: Type,
-    pub(super) contract: ContractKey,
+    pub(super) contract: ContractSetKey,
     pub(super) slots: Vec<ContractSlot>,
 }
 
@@ -38,7 +40,14 @@ pub(super) enum ContractSlotTarget {
 #[derive(Clone)]
 pub(super) enum ContractMatchError {
     UnknownContract,
+    ConflictingRequirement(Ident),
     Unsatisfied(Box<ContractRequirementError>),
+}
+
+#[derive(Clone)]
+pub(super) enum ContractSetError {
+    UnknownContract,
+    ConflictingRequirement(Ident),
 }
 
 #[derive(Clone)]
@@ -71,11 +80,147 @@ pub(super) enum RequirementError {
     },
 }
 
+#[derive(Clone)]
+struct ContractSet {
+    key: ContractSetKey,
+    requirements: Vec<ContractRequirementSchema>,
+}
+
 struct CandidateSig {
     receiver: MethodReceiver,
     params: Vec<FuncParam>,
     ret: Type,
     generic_method: bool,
+}
+
+fn contract_set_for_ref(
+    decls: &DeclarationIndex,
+    module: &super::ModuleScope,
+    contract: &ContractRef,
+) -> Result<ContractSet, ContractSetError> {
+    let requirements = requirements_for_ref(decls, module, contract)?;
+    Ok(ContractSet {
+        key: contract_set_key(&requirements),
+        requirements,
+    })
+}
+
+pub(super) fn requirements_for_ref(
+    decls: &DeclarationIndex,
+    module: &super::ModuleScope,
+    contract: &ContractRef,
+) -> Result<Vec<ContractRequirementSchema>, ContractSetError> {
+    let mut requirements = vec![];
+    collect_contract_ref_requirements(decls, module, contract, &mut requirements)?;
+    requirements.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    Ok(requirements)
+}
+
+fn collect_contract_ref_requirements(
+    decls: &DeclarationIndex,
+    module: &super::ModuleScope,
+    contract: &ContractRef,
+    requirements: &mut Vec<ContractRequirementSchema>,
+) -> Result<(), ContractSetError> {
+    match contract {
+        ContractRef::Named { .. } => {
+            let resolver = TypeRefResolver::module_only(decls);
+            let key = resolver
+                .resolve_contract_ref(module, contract)
+                .map_err(|_| ContractSetError::UnknownContract)?;
+            let schema = decls
+                .contract(&key)
+                .ok_or(ContractSetError::UnknownContract)?;
+            merge_effective_requirements(requirements, &schema.requirements)
+                .map_err(|req| ContractSetError::ConflictingRequirement(req.name))
+        }
+        ContractRef::Anonymous(surface) => {
+            let anonymous = anonymous_requirements(surface);
+            merge_effective_requirements(requirements, &anonymous)
+                .map_err(|req| ContractSetError::ConflictingRequirement(req.name))
+        }
+        ContractRef::Intersection(contracts) => {
+            for contract in contracts {
+                collect_contract_ref_requirements(decls, module, contract, requirements)?;
+            }
+            Ok(())
+        }
+        ContractRef::Infer | ContractRef::Hole(_) => Err(ContractSetError::UnknownContract),
+    }
+}
+
+fn anonymous_requirements(surface: &AnonymousContract) -> Vec<ContractRequirementSchema> {
+    surface
+        .requirements
+        .iter()
+        .map(|req| ContractRequirementSchema {
+            name: req.name,
+            receiver: Some(req.receiver),
+            params: req
+                .params
+                .iter()
+                .map(|param| FuncParam::new(param.ty.clone(), param.mutable, false))
+                .collect(),
+            required_params: req.params.len(),
+            ret: req.ret.clone(),
+            generics_empty: true,
+            span: None,
+        })
+        .collect()
+}
+
+pub(super) fn contract_set_key(requirements: &[ContractRequirementSchema]) -> ContractSetKey {
+    let mut requirements = requirements
+        .iter()
+        .map(ContractRequirementKey::from_schema)
+        .collect::<Vec<_>>();
+    requirements.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    ContractSetKey { requirements }
+}
+
+pub(super) fn merge_effective_requirements(
+    target: &mut Vec<ContractRequirementSchema>,
+    source: &[ContractRequirementSchema],
+) -> Result<(), ContractRequirementSchema> {
+    for req in source {
+        if let Some(prev) = target.iter().find(|prev| prev.name == req.name) {
+            if !same_requirement_signature(prev, req) {
+                return Err(req.clone());
+            }
+        } else {
+            target.push(req.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn contract_set_key_for_ref(
+    decls: &DeclarationIndex,
+    module: &super::ModuleScope,
+    contract: &ContractRef,
+) -> Option<ContractSetKey> {
+    contract_set_for_ref(decls, module, contract)
+        .ok()
+        .map(|set| set.key)
+}
+
+pub(crate) fn contract_ref_subset(
+    decls: &DeclarationIndex,
+    module: &super::ModuleScope,
+    source: &ContractRef,
+    target: &ContractRef,
+) -> bool {
+    let (Ok(source), Ok(target)) = (
+        contract_set_for_ref(decls, module, source),
+        contract_set_for_ref(decls, module, target),
+    ) else {
+        return false;
+    };
+    target
+        .key
+        .requirements
+        .iter()
+        .all(|req| source.key.requirements.contains(req))
 }
 
 pub(super) fn match_contract(
@@ -84,18 +229,16 @@ pub(super) fn match_contract(
     contract: &ContractRef,
     span: Span,
 ) -> Result<ContractMatch, ContractMatchError> {
-    let resolver = TypeRefResolver::with_local_types(&tc.decls, &tc.local_type_scopes);
-    let contract_key = resolver
-        .resolve_contract_ref(&tc.current_module, contract)
-        .map_err(|_| ContractMatchError::UnknownContract)?;
-    let schema = tc
-        .decls
-        .contract(&contract_key)
-        .cloned()
-        .expect("resolved contract key missing schema");
+    let set =
+        contract_set_for_ref(&tc.decls, &tc.current_module, contract).map_err(|err| match err {
+            ContractSetError::UnknownContract => ContractMatchError::UnknownContract,
+            ContractSetError::ConflictingRequirement(name) => {
+                ContractMatchError::ConflictingRequirement(name)
+            }
+        })?;
 
-    let mut slots = Vec::with_capacity(schema.requirements.len());
-    for requirement in &schema.requirements {
+    let mut slots = Vec::with_capacity(set.requirements.len());
+    for requirement in &set.requirements {
         let target = match_requirement(tc, concrete_ty, requirement, span)?;
         slots.push(ContractSlot {
             requirement: requirement.clone(),
@@ -105,35 +248,35 @@ pub(super) fn match_contract(
 
     Ok(ContractMatch {
         concrete_ty: concrete_ty.clone(),
-        contract: contract_key,
+        contract: set.key,
         slots,
     })
 }
 
 pub(super) enum DynamicMethodError {
     UnknownContract,
-    Missing { contract: ContractKey },
+    ConflictingRequirement(Ident),
+    Missing { contract: Ident },
 }
 
 pub(super) fn resolve_dynamic_method(
     tc: &TypeChecker,
     contract: &ContractRef,
     name: Ident,
-) -> Result<(ContractKey, ContractRequirementSchema), DynamicMethodError> {
-    let resolver = TypeRefResolver::with_local_types(&tc.decls, &tc.local_type_scopes);
-    let contract_key = resolver
-        .resolve_contract_ref(&tc.current_module, contract)
-        .map_err(|_| DynamicMethodError::UnknownContract)?;
-    let schema = tc
-        .decls
-        .contract(&contract_key)
-        .expect("resolved contract key missing schema");
-    let Some(requirement) = schema.requirements.iter().find(|req| req.name == name) else {
+) -> Result<(ContractSetKey, ContractRequirementSchema), DynamicMethodError> {
+    let set =
+        contract_set_for_ref(&tc.decls, &tc.current_module, contract).map_err(|err| match err {
+            ContractSetError::UnknownContract => DynamicMethodError::UnknownContract,
+            ContractSetError::ConflictingRequirement(name) => {
+                DynamicMethodError::ConflictingRequirement(name)
+            }
+        })?;
+    let Some(requirement) = set.requirements.iter().find(|req| req.name == name) else {
         return Err(DynamicMethodError::Missing {
-            contract: contract_key,
+            contract: Ident::new(contract.to_string()),
         });
     };
-    Ok((contract_key, requirement.clone()))
+    Ok((set.key, requirement.clone()))
 }
 
 pub(super) fn plan_witness(tc: &mut TypeChecker, matched: &ContractMatch, span: Span) -> WitnessId {
@@ -391,23 +534,27 @@ fn extern_receiver(receiver: ReceiverMode) -> MethodReceiver {
     }
 }
 
-pub(crate) fn finalize_contracts(decls: &mut DeclarationIndex, errors: &mut Vec<TypeError>) {
+pub(crate) fn finalize_contracts(
+    decls: &mut DeclarationIndex,
+    errors: &mut Vec<TypeError>,
+    warnings: &mut Vec<TypeWarning>,
+) {
     for contract in decls.contracts_mut() {
         let mut by_name: HashMap<Ident, ContractRequirementSchema> = HashMap::new();
-        for req in std::mem::take(&mut contract.requirements) {
+        for req in std::mem::take(&mut contract.direct_requirements) {
             if req.receiver.is_none() {
                 errors.push(TypeError::CompileError {
                     message:
                         "contract method requirements must include a `self` or `var self` receiver"
                             .to_string(),
-                    span: Some(req.span),
+                    span: req.span,
                 });
                 continue;
             }
             if !req.generics_empty {
                 errors.push(TypeError::CompileError {
                     message: "contract method requirements cannot be generic".to_string(),
-                    span: Some(req.span),
+                    span: req.span,
                 });
                 continue;
             }
@@ -415,42 +562,192 @@ pub(crate) fn finalize_contracts(decls: &mut DeclarationIndex, errors: &mut Vec<
                 errors.push(TypeError::CompileError {
                     message: "contract method requirements cannot use inferred return types"
                         .to_string(),
-                    span: Some(req.span),
+                    span: req.span,
                 });
                 continue;
             }
             match by_name.get(&req.name) {
-                Some(prev) if same_requirement(prev, &req) => {}
-                Some(_) => errors.push(TypeError::CompileError {
-                    message: format!(
-                        "conflicting contract requirement '{}' in contract '{}'",
-                        req.name, contract.key.name
-                    ),
-                    span: Some(req.span),
-                }),
+                Some(prev) if same_requirement_signature(prev, &req) => {
+                    errors.push(TypeError::Decl(DeclError::DuplicateContractRequirement {
+                        contract: contract.key.clone(),
+                        name: req.name,
+                        span: req.span,
+                    }));
+                }
+                Some(_) => errors.push(conflicting_requirement_error(
+                    &contract.key,
+                    req.name,
+                    req.span,
+                )),
                 None => {
                     by_name.insert(req.name, req);
                 }
             }
         }
-        contract.requirements = by_name.into_values().collect();
+        contract.direct_requirements = by_name.into_values().collect();
         contract
-            .requirements
+            .direct_requirements
             .sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-        if contract.requirements.is_empty() {
-            let noun = match contract.visibility {
-                crate::ast::Visibility::Public => "public contract",
-                crate::ast::Visibility::Private => "contract",
-            };
+    }
+
+    let keys = decls
+        .contracts()
+        .map(|contract| contract.key.clone())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let mut stack = vec![];
+        finalize_effective_contract(decls, &key, &mut stack, errors, warnings);
+    }
+}
+
+fn finalize_effective_contract(
+    decls: &mut DeclarationIndex,
+    key: &ContractKey,
+    stack: &mut Vec<ContractKey>,
+    errors: &mut Vec<TypeError>,
+    warnings: &mut Vec<TypeWarning>,
+) -> Vec<ContractRequirementSchema> {
+    if let Some(schema) = decls.contract(key)
+        && schema.contract_set.is_some()
+    {
+        return schema.requirements.clone();
+    }
+    if stack.contains(key) {
+        let span = decls.contract(key).map(|contract| contract.span);
+        errors.push(TypeError::CompileError {
+            message: format!("contract inclusion cycle involving '{}'", key.name),
+            span,
+        });
+        return vec![];
+    }
+
+    let Some(schema) = decls.contract(key).cloned() else {
+        return vec![];
+    };
+    stack.push(key.clone());
+
+    let mut effective = schema.direct_requirements.clone();
+    for (include, include_span) in schema.includes {
+        let included_keys = resolve_included_contracts(
+            decls,
+            &schema.key,
+            &include,
+            include_span,
+            errors,
+            warnings,
+        );
+        for included_key in included_keys {
+            let included =
+                finalize_effective_contract(decls, &included_key, stack, errors, warnings);
+            if let Err(conflict) = merge_effective_requirements(&mut effective, &included) {
+                errors.push(conflicting_requirement_error(
+                    &schema.key,
+                    conflict.name,
+                    Some(include_span),
+                ));
+            }
+        }
+    }
+
+    stack.pop();
+    effective.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    let set = contract_set_key(&effective);
+    if effective.is_empty() {
+        let noun = match schema.visibility {
+            crate::ast::Visibility::Public => "public contract",
+            crate::ast::Visibility::Private => "contract",
+        };
+        errors.push(TypeError::CompileError {
+            message: format!("{noun} '{}' cannot be empty", schema.key.name),
+            span: Some(schema.span),
+        });
+    }
+    let result = effective.clone();
+    if let Some(contract) = decls.contracts_mut().find(|contract| contract.key == *key) {
+        contract.requirements = effective;
+        contract.contract_set = Some(set);
+    }
+    result
+}
+
+fn resolve_included_contracts(
+    decls: &DeclarationIndex,
+    owner: &ContractKey,
+    include: &ContractRef,
+    span: SourceSpan,
+    errors: &mut Vec<TypeError>,
+    warnings: &mut Vec<TypeWarning>,
+) -> Vec<ContractKey> {
+    match include {
+        ContractRef::Named { .. } => {
+            let resolver = TypeRefResolver::module_only(decls);
+            match resolver.resolve_contract_ref(&owner.module, include) {
+                Ok(key) => {
+                    if let Some(schema) = decls.contract(&key)
+                        && schema.policy.has_deprecated()
+                    {
+                        let warning = TypeWarning::DeprecatedAccess {
+                            kind: DeprecatedUseKind::Contract,
+                            name: key.name,
+                            reason: schema.policy.deprecated_reason().map(str::to_string),
+                            span,
+                        };
+                        if !warnings.contains(&warning) {
+                            warnings.push(warning);
+                        }
+                    }
+                    vec![key]
+                }
+                Err(_) => {
+                    errors.push(TypeError::CompileError {
+                        message: format!("unknown contract '{include}'"),
+                        span: Some(span),
+                    });
+                    vec![]
+                }
+            }
+        }
+        ContractRef::Intersection(contracts) => contracts
+            .iter()
+            .flat_map(|contract| {
+                resolve_included_contracts(decls, owner, contract, span, errors, warnings)
+            })
+            .collect(),
+        ContractRef::Anonymous(_) => {
             errors.push(TypeError::CompileError {
-                message: format!("{noun} '{}' cannot be empty", contract.key.name),
-                span: Some(contract.span),
+                message: "anonymous contracts cannot be included in a contract".to_string(),
+                span: Some(span),
             });
+            vec![]
+        }
+        ContractRef::Infer | ContractRef::Hole(_) => {
+            errors.push(TypeError::CompileError {
+                message: "inferred contracts cannot be included in a contract".to_string(),
+                span: Some(span),
+            });
+            vec![]
         }
     }
 }
 
-fn same_requirement(left: &ContractRequirementSchema, right: &ContractRequirementSchema) -> bool {
+fn conflicting_requirement_error(
+    contract: &ContractKey,
+    name: Ident,
+    span: Option<SourceSpan>,
+) -> TypeError {
+    TypeError::CompileError {
+        message: format!(
+            "conflicting contract requirement '{}' in contract '{}'",
+            name, contract.name
+        ),
+        span,
+    }
+}
+
+fn same_requirement_signature(
+    left: &ContractRequirementSchema,
+    right: &ContractRequirementSchema,
+) -> bool {
     left.receiver == right.receiver
         && left.params == right.params
         && left.required_params == right.required_params
@@ -458,28 +755,14 @@ fn same_requirement(left: &ContractRequirementSchema, right: &ContractRequiremen
 }
 
 fn contains_infer_return(ty: &Type) -> bool {
-    match ty {
-        Type::InferReturn => true,
-        Type::Func { params, ret } => {
-            params.iter().any(|param| contains_infer_return(&param.ty))
-                || contains_infer_return(ret)
+    struct Visitor;
+
+    impl TypeVisitor for Visitor {
+        fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+            matches!(ty, Type::InferReturn)
         }
-        Type::Tuple(elems) => elems.iter().any(contains_infer_return),
-        Type::Nominal(nominal) => nominal.type_args.iter().any(contains_infer_return),
-        Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
-            contains_infer_return(elem)
-        }
-        Type::Map { key, value } => contains_infer_return(key) || contains_infer_return(value),
-        Type::Infer
-        | Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Dyn(_)
-        | Type::Var(_)
-        | Type::UnresolvedName(_)
-        | Type::UnresolvedNominal { .. } => false,
     }
+
+    let mut visitor = Visitor;
+    visitor.visit_type(ty)
 }

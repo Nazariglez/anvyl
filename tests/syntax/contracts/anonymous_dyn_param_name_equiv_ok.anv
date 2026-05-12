@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn use_fn(f: fn(dyn { fn draw(self, x: int); }) -> void) {}
+
+fn draw_fn(actor: dyn { fn draw(self, y: int); }) {}
+
+fn main() {
+    use_fn(draw_fn);
+}

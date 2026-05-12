@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::{
     ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, TypeSubst,
     const_term::{ConstInferVarId, ConstTerm},
+    type_ops::TypeFolder,
 };
 use crate::{
     ast::{
@@ -530,6 +531,72 @@ struct FinalizeCx<'a> {
     seen_consts: &'a mut HashSet<ConstInferVarId>,
 }
 
+fn rewrite_ty_contract_refs(ty: &mut Ty, f: &mut impl FnMut(&ContractRef) -> ContractRef) {
+    match ty {
+        Ty::Func { params, ret } => {
+            for param in params {
+                rewrite_ty_contract_refs(&mut param.ty, f);
+            }
+            rewrite_ty_contract_refs(ret, f);
+        }
+        Ty::Dyn(contract) => *contract = rewrite_contract_ref(contract, f),
+        Ty::UnresolvedNominal { generic_args, .. } => {
+            for arg in generic_args {
+                if let TyGenericArg::Type(ty) = arg {
+                    rewrite_ty_contract_refs(ty, f);
+                }
+            }
+        }
+        Ty::Tuple(elems) => {
+            for elem in elems {
+                rewrite_ty_contract_refs(elem, f);
+            }
+        }
+        Ty::Nominal(nominal) => {
+            for arg in &mut nominal.type_args {
+                rewrite_ty_contract_refs(arg, f);
+            }
+        }
+        Ty::List { elem } | Ty::Array { elem, .. } | Ty::Slice { elem } => {
+            rewrite_ty_contract_refs(elem, f);
+        }
+        Ty::Map { key, value } => {
+            rewrite_ty_contract_refs(key, f);
+            rewrite_ty_contract_refs(value, f);
+        }
+        Ty::Error
+        | Ty::Infer(_)
+        | Ty::Any
+        | Ty::Int
+        | Ty::Float
+        | Ty::Bool
+        | Ty::String
+        | Ty::Void
+        | Ty::Var(_)
+        | Ty::UnresolvedName(_) => {}
+    }
+}
+
+fn rewrite_contract_ref(
+    contract: &ContractRef,
+    f: &mut impl FnMut(&ContractRef) -> ContractRef,
+) -> ContractRef {
+    ContractRefRewriter { f }.fold_contract_ref(contract)
+}
+
+struct ContractRefRewriter<'a, F> {
+    f: &'a mut F,
+}
+
+impl<F> TypeFolder for ContractRefRewriter<'_, F>
+where
+    F: FnMut(&ContractRef) -> ContractRef,
+{
+    fn fold_contract_ref_leaf(&mut self, contract: ContractRef) -> ContractRef {
+        (self.f)(&contract)
+    }
+}
+
 pub(super) type SourceExprTypes = HashMap<ExprId, (Option<SourceSpan>, Type)>;
 
 #[derive(Debug, Default, Clone)]
@@ -685,23 +752,23 @@ impl Solver {
         TypeHandle(TypeRef::temp(self.alloc_temp(ty)))
     }
 
-    pub(super) fn array_handle(&mut self, elem: TypeHandle, len: ArrayLen) -> TypeHandle {
+    pub(super) fn array_handle(&mut self, elem: &TypeHandle, len: &ArrayLen) -> TypeHandle {
         let elem = self.resolve_ref(&elem.0);
-        let len = ConstTerm::from_array_len(len);
+        let len = ConstTerm::from_array_len(*len);
         self.temp_handle(Ty::Array {
             elem: Box::new(elem),
             len,
         })
     }
 
-    pub(super) fn list_handle(&mut self, elem: TypeHandle) -> TypeHandle {
+    pub(super) fn list_handle(&mut self, elem: &TypeHandle) -> TypeHandle {
         let elem = self.resolve_ref(&elem.0);
         self.temp_handle(Ty::List {
             elem: Box::new(elem),
         })
     }
 
-    pub(super) fn map_handle(&mut self, key: TypeHandle, value: TypeHandle) -> TypeHandle {
+    pub(super) fn map_handle(&mut self, key: &TypeHandle, value: &TypeHandle) -> TypeHandle {
         let key = self.resolve_ref(&key.0);
         let value = self.resolve_ref(&value.0);
         self.temp_handle(Ty::Map {
@@ -741,7 +808,7 @@ impl Solver {
         &mut self,
         id: ExprId,
         span: Option<SourceSpan>,
-        handle: TypeHandle,
+        handle: &TypeHandle,
     ) -> TypeHandle {
         let ty = self.resolve_ref(&handle.0);
         self.set_expr_type(id, span, ty);
@@ -779,8 +846,8 @@ impl Solver {
         probe
             .constrain_tys_assignable(
                 span,
-                Ty::from_recovery_type(from),
-                Ty::from_recovery_type(to),
+                &Ty::from_recovery_type(from),
+                &Ty::from_recovery_type(to),
             )
             .is_ok()
     }
@@ -849,6 +916,24 @@ impl Solver {
             .collect()
     }
 
+    pub(super) fn rewrite_contract_refs(
+        &mut self,
+        f: &mut impl FnMut(&ContractRef) -> ContractRef,
+    ) {
+        for ty in &mut self.local_types {
+            rewrite_ty_contract_refs(ty, f);
+        }
+        for ty in &mut self.temp_types {
+            rewrite_ty_contract_refs(ty, f);
+        }
+        for ty in self.type_bindings.values_mut() {
+            rewrite_ty_contract_refs(ty, f);
+        }
+        for (_, ty) in self.expr_types.values_mut() {
+            rewrite_ty_contract_refs(ty, f);
+        }
+    }
+
     fn instantiate_type_template(&self, ty: &Type, vars: &GenericSolverVars) -> Ty {
         match ty {
             Type::Infer | Type::InferReturn => Ty::Error,
@@ -869,7 +954,7 @@ impl Solver {
                     .collect(),
                 ret: Box::new(self.instantiate_type_template(ret, vars)),
             },
-            Type::Dyn(contract) => Ty::Dyn(contract.clone()),
+            Type::Dyn(contract) => Ty::Dyn(self.instantiate_contract_ref_template(contract, vars)),
             Type::Var(id) => vars.types.get(id).cloned().unwrap_or(Ty::Var(*id)),
             Type::UnresolvedName(name) => Ty::UnresolvedName(*name),
             Type::UnresolvedNominal {
@@ -943,6 +1028,52 @@ impl Solver {
                 .collect(),
             origin.cloned(),
         )
+    }
+
+    fn instantiate_contract_ref_template(
+        &self,
+        contract: &ContractRef,
+        vars: &GenericSolverVars,
+    ) -> ContractRef {
+        match contract {
+            ContractRef::Anonymous(surface) => {
+                ContractRef::Anonymous(crate::ast::AnonymousContract {
+                    requirements: surface
+                        .requirements
+                        .iter()
+                        .map(|req| crate::ast::AnonymousContractRequirement {
+                            receiver: req.receiver,
+                            name: req.name,
+                            params: req
+                                .params
+                                .iter()
+                                .map(|param| crate::ast::AnonymousContractParam {
+                                    mutable: param.mutable,
+                                    name: param.name,
+                                    ty: self
+                                        .instantiate_type_template(&param.ty, vars)
+                                        .try_to_type_no_infer()
+                                        .unwrap_or(Type::Infer),
+                                })
+                                .collect(),
+                            ret: self
+                                .instantiate_type_template(&req.ret, vars)
+                                .try_to_type_no_infer()
+                                .unwrap_or(Type::Infer),
+                        })
+                        .collect(),
+                })
+            }
+            ContractRef::Intersection(contracts) => ContractRef::Intersection(
+                contracts
+                    .iter()
+                    .map(|contract| self.instantiate_contract_ref_template(contract, vars))
+                    .collect(),
+            ),
+            ContractRef::Named { .. } | ContractRef::Infer | ContractRef::Hole(_) => {
+                contract.clone()
+            }
+        }
     }
 
     fn instantiate_generic_arg_template(
@@ -1046,9 +1177,9 @@ impl Solver {
         left: TypeRef,
         right: TypeRef,
     ) -> Result<Ty, SolveError> {
-        let left = self.resolve_ref(&left);
-        let right = self.resolve_ref(&right);
-        self.unify_tys_equal(span, left, right)
+        let left = self.resolve_owned_ref(left);
+        let right = self.resolve_owned_ref(right);
+        self.unify_tys_equal(span, &left, &right)
     }
 
     fn constrain_assignable(
@@ -1057,9 +1188,9 @@ impl Solver {
         from: TypeRef,
         to: TypeRef,
     ) -> Result<Ty, SolveError> {
-        let from = self.resolve_ref(&from);
-        let to = self.resolve_ref(&to);
-        self.constrain_tys_assignable(span, from, to)
+        let from = self.resolve_owned_ref(from);
+        let to = self.resolve_owned_ref(to);
+        self.constrain_tys_assignable(span, &from, &to)
     }
 
     fn fresh_type(&mut self, span: Option<SourceSpan>) -> Ty {
@@ -1128,8 +1259,8 @@ impl Solver {
     fn relate_tys(
         &mut self,
         span: Option<SourceSpan>,
-        expected: Ty,
-        found: Ty,
+        expected: &Ty,
+        found: &Ty,
         relation: TyRelation,
     ) -> Result<Ty, SolveError> {
         match relation {
@@ -1145,7 +1276,9 @@ impl Solver {
         found: Ty,
         relation: TyRelation,
     ) -> Result<Box<Ty>, SolveError> {
-        Ok(Box::new(self.relate_tys(span, expected, found, relation)?))
+        Ok(Box::new(
+            self.relate_tys(span, &expected, &found, relation)?,
+        ))
     }
 
     fn relate_boxed_assignable(
@@ -1193,7 +1326,7 @@ impl Solver {
     ) -> Result<Vec<Ty>, SolveError> {
         let mut related = Vec::with_capacity(expected.len());
         for (expected, found) in expected.into_iter().zip(found) {
-            related.push(self.relate_tys(span, expected, found, relation)?);
+            related.push(self.relate_tys(span, &expected, &found, relation)?);
         }
         Ok(related)
     }
@@ -1223,7 +1356,7 @@ impl Solver {
                 }
                 let mutable = expected.mutable;
                 let cast_accept = expected.cast_accept || found.cast_accept;
-                let ty = self.unify_tys_equal(span, expected.ty, found.ty)?;
+                let ty = self.unify_tys_equal(span, &expected.ty, &found.ty)?;
                 Ok(TyFuncParam {
                     ty,
                     mutable,
@@ -1233,18 +1366,18 @@ impl Solver {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Ty::Func {
             params,
-            ret: Box::new(self.unify_tys_equal(span, expected_func.ret, found_func.ret)?),
+            ret: Box::new(self.unify_tys_equal(span, &expected_func.ret, &found_func.ret)?),
         })
     }
 
     fn unify_tys_equal(
         &mut self,
         span: Option<SourceSpan>,
-        left: Ty,
-        right: Ty,
+        left: &Ty,
+        right: &Ty,
     ) -> Result<Ty, SolveError> {
-        let left = self.resolve_ty(&left);
-        let right = self.resolve_ty(&right);
+        let left = self.resolve_ty(left);
+        let right = self.resolve_ty(right);
         if left == right {
             return Ok(left);
         }
@@ -1354,13 +1487,13 @@ impl Solver {
     fn constrain_tys_assignable(
         &mut self,
         span: Option<SourceSpan>,
-        from: Ty,
-        to: Ty,
+        from: &Ty,
+        to: &Ty,
     ) -> Result<Ty, SolveError> {
-        let from = self.resolve_ty(&from);
-        let to = self.resolve_ty(&to);
+        let from = self.resolve_ty(from);
+        let to = self.resolve_ty(to);
         if from == to {
-            return self.unify_tys_equal(span, from, to);
+            return self.unify_tys_equal(span, &from, &to);
         }
         if matches!(from, Ty::Error) || matches!(to, Ty::Error) {
             return Ok(Ty::Error);
@@ -1372,12 +1505,12 @@ impl Solver {
             return Ok(to);
         }
         if matches!(from, Ty::Infer(_)) || matches!(to, Ty::Infer(_)) {
-            return self.unify_tys_equal(span, from, to);
+            return self.unify_tys_equal(span, &from, &to);
         }
         if let Some(inner) = to.option_inner().cloned()
             && !from.is_option()
         {
-            self.constrain_tys_assignable(span, from, inner)?;
+            self.constrain_tys_assignable(span, &from, &inner)?;
             return Ok(to);
         }
 
@@ -1462,7 +1595,7 @@ impl Solver {
         }
         let target_accepts_nil = matches!(to, Ty::Infer(_)) || to.is_option();
         if target_accepts_nil {
-            return Some(self.unify_tys_equal(span, from.clone(), to.clone()));
+            return Some(self.unify_tys_equal(span, from, to));
         }
         Some(Err(SolveError::type_mismatch(
             to.clone(),
@@ -1537,9 +1670,9 @@ impl Solver {
         left.into_iter()
             .zip(right)
             .map(|(left, right)| match (left, right) {
-                (TyGenericArg::Type(left), TyGenericArg::Type(right)) => {
-                    Ok(TyGenericArg::Type(self.unify_tys_equal(span, left, right)?))
-                }
+                (TyGenericArg::Type(left), TyGenericArg::Type(right)) => Ok(TyGenericArg::Type(
+                    self.unify_tys_equal(span, &left, &right)?,
+                )),
                 (TyGenericArg::Const(left), TyGenericArg::Const(right)) => Ok(TyGenericArg::Const(
                     self.unify_const_equal(span, left, right)?,
                 )),
@@ -1702,6 +1835,20 @@ impl Solver {
             TypeRef::Expr(id) => {
                 let ty = self
                     .expr_type(*id)
+                    .expect("expression type must be set before use");
+                self.resolve_ty(ty)
+            }
+        }
+    }
+
+    fn resolve_owned_ref(&self, r: TypeRef) -> Ty {
+        match r {
+            TypeRef::Concrete(ty) => self.resolve_ty(&ty),
+            TypeRef::Local(id) => self.resolve_ty(self.local_type(id)),
+            TypeRef::Temp(id) => self.resolve_ty(self.temp_type(id)),
+            TypeRef::Expr(id) => {
+                let ty = self
+                    .expr_type(id)
                     .expect("expression type must be set before use");
                 self.resolve_ty(ty)
             }
@@ -2206,6 +2353,7 @@ mod tests {
         crate::ast::TypeParam {
             name: ident(name),
             id: type_var(id),
+            bounds: vec![],
         }
     }
 
@@ -3265,7 +3413,7 @@ mod tests {
     fn finalize_dedup() {
         let mut solver = Solver::default();
         let first = solver.fresh_expr_type(ExprId(1), span(1, 2));
-        solver.set_expr_type_from_handle(ExprId(2), span(3, 4), first);
+        solver.set_expr_type_from_handle(ExprId(2), span(3, 4), &first);
         let (_, errors) = solver.finalize_expr_types();
         assert_eq!(
             errors,

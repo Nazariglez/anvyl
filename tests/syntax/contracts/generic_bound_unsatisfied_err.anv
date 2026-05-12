@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: does not satisfy contract bound 'Updatable'
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+struct Rock {}
+
+fn tick<T: Updatable>(actor: T, dt: float) {}
+
+fn main() {
+    tick(Rock {}, 1.0);
+}

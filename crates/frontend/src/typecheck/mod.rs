@@ -6,6 +6,7 @@ use std::{
 
 use self::{
     const_term::ConstTerm,
+    dyn_infer::DynInference,
     generic_bind::bind_exact_generic_args,
     infer::{
         GenericSolverSeeds, GenericSolverVars, LocalTypeId, Solver, SolverFinalizeError,
@@ -20,7 +21,7 @@ use self::{
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
     type_refs::{
         FinalizedTypeRef, GenericParamError, LocalTypeAlias, LocalTypeScopes, TypeRefResolver,
-        TypeRefWarning,
+        TypeRefWarning, TypeRefWarningKind,
     },
 };
 pub(crate) use self::{
@@ -54,6 +55,7 @@ mod contracts;
 mod control_flow;
 mod convert;
 mod decls;
+mod dyn_infer;
 mod enum_variant;
 mod extern_boundary;
 mod extern_ops;
@@ -132,6 +134,7 @@ pub(crate) enum DeprecatedUseKind {
     Const,
     ExternType,
     TypeAlias,
+    Contract,
     Struct,
     DataRef,
     Enum,
@@ -958,6 +961,12 @@ struct ScopeState {
     local_type_scopes: LocalTypeScopes,
 }
 
+#[derive(Clone, Copy)]
+enum DynInferPolicy {
+    Reject,
+    Allow { exported: bool },
+}
+
 struct TypeChecker {
     solver: Solver,
     calls: CallMap,
@@ -967,7 +976,9 @@ struct TypeChecker {
     contract_witnesses: ContractWitnessMap,
     witness_keys: HashMap<ContractWitnessKey, WitnessId>,
     dyn_conversions: DynConversionMap,
+    dyn_weakenings: DynWeakeningMap,
     dyn_calls: DynCallMap,
+    dyn_infer: DynInference,
     next_witness_id: u32,
     decls: DeclarationIndex,
     externs: ExternCatalog,
@@ -979,6 +990,7 @@ struct TypeChecker {
     returns: Vec<ReturnFrame>,
     loop_depth: usize,
     defer_depth: usize,
+    discard_depth: usize,
     errors: Vec<TypeError>,
     warnings: Vec<TypeWarning>,
     config: TypecheckConfig,
@@ -1063,7 +1075,9 @@ impl TypeChecker {
             contract_witnesses: HashMap::new(),
             witness_keys: HashMap::new(),
             dyn_conversions: HashMap::new(),
+            dyn_weakenings: HashMap::new(),
             dyn_calls: HashMap::new(),
+            dyn_infer: DynInference::default(),
             next_witness_id: 0,
             decls,
             externs,
@@ -1075,6 +1089,7 @@ impl TypeChecker {
             returns: vec![],
             loop_depth: 0,
             defer_depth: 0,
+            discard_depth: 0,
             errors: vec![],
             warnings: vec![],
             config,
@@ -1450,7 +1465,7 @@ impl TypeChecker {
         self.solver.fresh_nil_handle(self.error_span(span))
     }
 
-    fn set_type_from_handle(&mut self, id: ExprId, span: Span, handle: TypeHandle) -> TypeHandle {
+    fn set_type_from_handle(&mut self, id: ExprId, span: Span, handle: &TypeHandle) -> TypeHandle {
         self.solver
             .set_expr_type_from_handle(id, self.error_span(span), handle)
     }
@@ -1459,15 +1474,15 @@ impl TypeChecker {
         self.solver.fresh_temp_handle(self.error_span(span))
     }
 
-    fn array_handle(&mut self, elem: TypeHandle, len: ArrayLen) -> TypeHandle {
+    fn array_handle(&mut self, elem: &TypeHandle, len: &ArrayLen) -> TypeHandle {
         self.solver.array_handle(elem, len)
     }
 
-    fn list_handle(&mut self, elem: TypeHandle) -> TypeHandle {
+    fn list_handle(&mut self, elem: &TypeHandle) -> TypeHandle {
         self.solver.list_handle(elem)
     }
 
-    fn map_handle(&mut self, key: TypeHandle, value: TypeHandle) -> TypeHandle {
+    fn map_handle(&mut self, key: &TypeHandle, value: &TypeHandle) -> TypeHandle {
         self.solver.map_handle(key, value)
     }
 
@@ -1505,6 +1520,12 @@ impl TypeChecker {
             self.push_solver_error(error);
         }
         has_errors
+    }
+
+    fn solve_dyn_inference(&mut self) {
+        let mut dyn_infer = std::mem::take(&mut self.dyn_infer);
+        dyn_infer.solve(self);
+        self.dyn_infer = dyn_infer;
     }
 
     fn push_solver_error(&mut self, error: SolverRelationError) {
@@ -1581,6 +1602,10 @@ impl TypeChecker {
 
     fn record_dyn_conversion(&mut self, fact: DynConversionFact) {
         self.dyn_conversions.insert(fact.expr_id, fact);
+    }
+
+    fn record_dyn_weakening(&mut self, fact: DynWeakeningFact) {
+        self.dyn_weakenings.insert(fact.expr_id, fact);
     }
 
     fn record_dyn_call(&mut self, fact: DynCallFact) {
@@ -1719,7 +1744,9 @@ impl TypeChecker {
     }
 
     fn push_warning(&mut self, warning: TypeWarning) {
-        self.warnings.push(warning);
+        if !self.warnings.contains(&warning) {
+            self.warnings.push(warning);
+        }
     }
 
     fn check_matched_field_access_policy(
@@ -1998,6 +2025,24 @@ impl TypeChecker {
         }
     }
 
+    fn resolve_generic_bounds_for_tc(&mut self, generics: &mut GenericParams, span: Span) {
+        for param in &mut generics.type_params {
+            param.bounds = std::mem::take(&mut param.bounds)
+                .into_iter()
+                .filter_map(
+                    |bound| match self.resolve_type_for_tc_at(&Type::Dyn(bound), span) {
+                        Type::Dyn(bound)
+                            if !matches!(bound, ContractRef::Infer | ContractRef::Hole(_)) =>
+                        {
+                            Some(bound)
+                        }
+                        _ => None,
+                    },
+                )
+                .collect();
+        }
+    }
+
     fn push_generic_context(&mut self, generics: GenericTypeContext) {
         self.generic_contexts.push(generics);
     }
@@ -2059,6 +2104,7 @@ impl TypeChecker {
             argument_projections: self.argument_projections.clone(),
             contract_witnesses: self.contract_witnesses.clone(),
             dyn_conversions: self.dyn_conversions.clone(),
+            dyn_weakenings: self.dyn_weakenings.clone(),
             dyn_calls: self.dyn_calls.clone(),
         }
     }
@@ -2081,6 +2127,7 @@ impl TypeChecker {
             self.contract_witnesses.insert(fact.id, fact);
         }
         self.dyn_conversions.extend(facts.dyn_conversions);
+        self.dyn_weakenings.extend(facts.dyn_weakenings);
         self.dyn_calls.extend(facts.dyn_calls);
     }
 
@@ -2151,10 +2198,54 @@ impl TypeChecker {
     }
 
     fn resolve_type_for_tc_at(&mut self, ty: &Type, span: Span) -> Type {
+        self.resolve_type_for_tc_at_with_dyn_infer(ty, span, DynInferPolicy::Reject)
+    }
+
+    fn resolve_type_allow_dyn_infer_at(&mut self, ty: &Type, span: Span, exported: bool) -> Type {
+        self.resolve_type_for_tc_at_with_dyn_infer(ty, span, DynInferPolicy::Allow { exported })
+    }
+
+    fn resolve_type_for_tc_at_with_dyn_infer(
+        &mut self,
+        ty: &Type,
+        span: Span,
+        policy: DynInferPolicy,
+    ) -> Type {
         let generics = self.generic_contexts.last().cloned().unwrap_or_default();
         let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
         let result = resolver.finalize_at(&self.current_module, &generics, ty, Some(span));
-        self.finish_type_ref_result(result, span)
+        let ty = self.finish_type_ref_result(result, span);
+        self.apply_dyn_infer_policy(ty, span, policy)
+    }
+
+    fn apply_dyn_infer_policy(&mut self, ty: Type, span: Span, policy: DynInferPolicy) -> Type {
+        if !DynInference::has_raw_hole(&ty) {
+            return ty;
+        }
+        match policy {
+            DynInferPolicy::Reject => {
+                self.push_error(TypeError::CompileError {
+                    message: "inferred dynamic contracts are not allowed here".to_string(),
+                    span: self.error_span(span),
+                });
+                Type::Infer
+            }
+            DynInferPolicy::Allow { exported } => {
+                if !dyn_infer_positions_valid(&ty) {
+                    self.push_error(TypeError::CompileError {
+                        message: "inferred dynamic contracts cannot be composed or nested inside contract surfaces".to_string(),
+                        span: self.error_span(span),
+                    });
+                    return Type::Infer;
+                }
+                self.dyn_infer.assign_holes(
+                    &self.current_module,
+                    &ty,
+                    self.source_span(span),
+                    exported,
+                )
+            }
+        }
     }
 
     fn resolve_type_binding_for_tc_at(
@@ -2218,8 +2309,12 @@ impl TypeChecker {
 
     fn push_type_ref_warnings(&mut self, warnings: Vec<TypeRefWarning>) {
         for warning in warnings {
+            let kind = match warning.kind {
+                TypeRefWarningKind::TypeAlias => DeprecatedUseKind::TypeAlias,
+                TypeRefWarningKind::Contract => DeprecatedUseKind::Contract,
+            };
             self.push_warning(TypeWarning::DeprecatedAccess {
-                kind: DeprecatedUseKind::TypeAlias,
+                kind,
                 name: warning.name,
                 reason: warning.reason,
                 span: self.source_span(warning.span),
@@ -2420,17 +2515,27 @@ impl TypeChecker {
     }
 
     fn func_type_from_sig(&mut self, params: &[Param], ret: &Type, span: Span) -> Type {
+        self.func_type_from_sig_with_dyn_infer(params, ret, span, false)
+    }
+
+    fn func_type_from_sig_with_dyn_infer(
+        &mut self,
+        params: &[Param],
+        ret: &Type,
+        span: Span,
+        exported: bool,
+    ) -> Type {
         let resolved_params: Vec<FuncParam> = params
             .iter()
             .map(|p| {
                 FuncParam::new(
-                    self.resolve_type_for_tc_at(&p.ty, span),
+                    self.resolve_type_allow_dyn_infer_at(&p.ty, span, exported),
                     matches!(p.mutability, Mutability::Mutable),
                     p.cast_accept,
                 )
             })
             .collect();
-        let resolved_ret = Box::new(self.resolve_type_for_tc_at(ret, span));
+        let resolved_ret = Box::new(self.resolve_type_allow_dyn_infer_at(ret, span, exported));
         Type::Func {
             params: resolved_params,
             ret: resolved_ret,
@@ -2439,6 +2544,7 @@ impl TypeChecker {
 
     fn finish(&mut self) -> Result<SourceExprTypes, Vec<TypeError>> {
         self.solve_constraints();
+        self.solve_dyn_inference();
         if !self.errors.is_empty() {
             return Err(std::mem::take(&mut self.errors));
         }
@@ -2520,7 +2626,7 @@ impl TypeChecker {
                 }
                 self.validate_nominal_uses(ret, span);
             }
-            Type::Dyn(_) => {}
+            Type::Dyn(contract) => self.validate_contract_ref_uses(contract, span),
             Type::Tuple(elems) => {
                 for elem in elems {
                     self.validate_nominal_uses(elem, span);
@@ -2548,6 +2654,45 @@ impl TypeChecker {
         }
     }
 
+    fn validate_contract_ref_uses(&mut self, contract: &ContractRef, span: Span) {
+        if let Some(name) = contract_surface_conflict(&self.decls, &self.current_module, contract) {
+            self.push_error(TypeError::CompileError {
+                message: format!("conflicting contract requirement '{name}'"),
+                span: self.error_span(span),
+            });
+        }
+        match contract {
+            ContractRef::Anonymous(surface) => {
+                for req in &surface.requirements {
+                    for param in &req.params {
+                        self.validate_nominal_uses(&param.ty, span);
+                    }
+                    self.validate_nominal_uses(&req.ret, span);
+                }
+            }
+            ContractRef::Intersection(contracts) => {
+                for contract in contracts {
+                    self.validate_contract_ref_uses(contract, span);
+                }
+            }
+            ContractRef::Named { .. } | ContractRef::Infer | ContractRef::Hole(_) => {}
+        }
+    }
+
+    fn validate_contract_surface(
+        &mut self,
+        decls: &DeclarationIndex,
+        contract: &ContractRef,
+        span: Span,
+    ) {
+        if let Some(name) = contract_surface_conflict(decls, &self.current_module, contract) {
+            self.push_error(TypeError::CompileError {
+                message: format!("conflicting contract requirement '{name}'"),
+                span: self.error_span(span),
+            });
+        }
+    }
+
     fn finalize_declarations(&mut self) {
         let saved_module = self.current_module.clone();
         let mut decls = std::mem::take(&mut self.decls);
@@ -2557,7 +2702,6 @@ impl TypeChecker {
             let span = site.span;
             let ty = self.finalize_decl_type(&lookup, site, ty);
             let ty = self.normalize_type_consts(&ty, span);
-            self.validate_nominal_uses_in(&lookup, &ty, span);
             self.reject_user_any_type(&ty, span);
             ty
         });
@@ -2566,8 +2710,9 @@ impl TypeChecker {
             self.push_error(generic_param_decl_type_error(error, source));
         }
         validate_type_alias_decls(&decls, &mut self.errors);
-        contracts::finalize_contracts(&mut decls, &mut self.errors);
+        contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.warnings);
         validate_public_contract_types(&decls, &mut self.errors);
+        validate_dyn_infer_decls(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
         for error in decls.build_projection_entries() {
             self.push_error(TypeError::Decl(error));
@@ -2575,8 +2720,27 @@ impl TypeChecker {
         for error in decls.build_promoted_surfaces(&self.externs) {
             self.push_error(TypeError::Decl(error));
         }
+        self.validate_final_decl_type_uses(&mut decls);
         self.current_module = saved_module;
         self.decls = decls;
+    }
+
+    fn validate_final_decl_type_uses(&mut self, decls: &mut DeclarationIndex) {
+        let validation = decls.clone();
+        self.decls = validation.clone();
+        let _ = decls.map_canonical_type_uses(|site, ty| {
+            self.current_module = site.module;
+            self.push_generic_owner_frame(GenericOwnerFrame {
+                params: GenericParams {
+                    type_params: site.type_params,
+                    const_params: vec![],
+                },
+                ..GenericOwnerFrame::default()
+            });
+            self.validate_nominal_uses_in(&validation, &ty, site.span);
+            self.pop_generic_owner_frame();
+            ty
+        });
     }
 
     fn finalize_decl_type(
@@ -2628,7 +2792,7 @@ impl TypeChecker {
                 }
                 self.validate_nominal_uses_in(decls, ret, span);
             }
-            Type::Dyn(_) => {}
+            Type::Dyn(contract) => self.validate_contract_ref_uses_in(decls, contract, span),
             Type::Tuple(elems) => {
                 for elem in elems {
                     self.validate_nominal_uses_in(decls, elem, span);
@@ -2656,6 +2820,78 @@ impl TypeChecker {
         }
     }
 
+    fn validate_contract_ref_uses_in(
+        &mut self,
+        decls: &DeclarationIndex,
+        contract: &ContractRef,
+        span: Span,
+    ) {
+        self.validate_contract_surface(decls, contract, span);
+        match contract {
+            ContractRef::Anonymous(surface) => {
+                for req in &surface.requirements {
+                    for param in &req.params {
+                        self.validate_nominal_uses_in(decls, &param.ty, span);
+                    }
+                    self.validate_nominal_uses_in(decls, &req.ret, span);
+                }
+            }
+            ContractRef::Intersection(contracts) => {
+                for contract in contracts {
+                    self.validate_contract_ref_uses_in(decls, contract, span);
+                }
+            }
+            ContractRef::Named { .. } | ContractRef::Infer | ContractRef::Hole(_) => {}
+        }
+    }
+
+    pub(crate) fn check_generic_bounds(
+        &mut self,
+        generics: &GenericParams,
+        args: &GenericArgs,
+        span: Span,
+    ) -> bool {
+        let before = self.errors.len();
+        for (param, arg) in generics.type_params.iter().zip(&args.type_args) {
+            for bound in &param.bounds {
+                if self.type_satisfies_bound(arg, bound, span) {
+                    continue;
+                }
+                self.push_error(TypeError::CompileError {
+                    message: format!("type '{arg}' does not satisfy contract bound '{bound}'"),
+                    span: self.error_span(span),
+                });
+            }
+        }
+        self.errors.len() == before
+    }
+
+    fn type_satisfies_bound(&mut self, ty: &Type, bound: &ContractRef, span: Span) -> bool {
+        match ty {
+            Type::Dyn(source) => {
+                contracts::contract_ref_subset(&self.decls, &self.current_module, source, bound)
+            }
+            Type::Var(id) => self.type_param_satisfies_bound(*id, bound),
+            Type::Infer => true,
+            _ => contracts::match_contract(self, ty, bound, span).is_ok(),
+        }
+    }
+
+    fn type_param_satisfies_bound(&self, id: TypeVarId, bound: &ContractRef) -> bool {
+        let Some(bounds) = self.type_param_bounds(id) else {
+            return false;
+        };
+        let source = contract_ref_from_bounds(bounds);
+        contracts::contract_ref_subset(&self.decls, &self.current_module, &source, bound)
+    }
+
+    fn type_param_bounds(&self, id: TypeVarId) -> Option<&[ContractRef]> {
+        self.generic_owner_frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.params.type_param_bounds(id))
+    }
+
     fn validate_nominal_args(
         &mut self,
         decls: &DeclarationIndex,
@@ -2669,6 +2905,9 @@ impl TypeChecker {
             self.require_usize_const_inner(term.clone(), span, false);
         }
         if self.errors.len() != error_count {
+            return;
+        }
+        if !self.check_generic_bounds(generics, args, span) {
             return;
         }
         let (type_subst, const_subst) = generics.substitutions(args);
@@ -2707,6 +2946,24 @@ impl TypeChecker {
             }
             NominalKind::Extern => {}
         }
+    }
+}
+
+fn contract_ref_from_bounds(bounds: &[ContractRef]) -> ContractRef {
+    match bounds {
+        [bound] => bound.clone(),
+        _ => ContractRef::Intersection(bounds.to_vec()),
+    }
+}
+
+fn contract_surface_conflict(
+    decls: &DeclarationIndex,
+    module: &ModuleScope,
+    contract: &ContractRef,
+) -> Option<Ident> {
+    match contracts::requirements_for_ref(decls, module, contract) {
+        Err(contracts::ContractSetError::ConflictingRequirement(name)) => Some(name),
+        Ok(_) | Err(contracts::ContractSetError::UnknownContract) => None,
     }
 }
 
@@ -3027,6 +3284,54 @@ fn generic_param_type_error(error: GenericParamError, span: Option<SourceSpan>) 
     }
 }
 
+fn validate_dyn_infer_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
+    for (_key, aggregate) in decls.aggregates() {
+        for field in aggregate.fields.values() {
+            push_ownerless_dyn_infer(&field.ty, field.span, errors);
+        }
+    }
+    for (_key, schema) in decls.enums() {
+        for variant in schema.variants.values() {
+            match &variant.payload {
+                VariantPayload::Unit => {}
+                VariantPayload::Tuple(types) => {
+                    for ty in types {
+                        push_ownerless_dyn_infer(ty, None, errors);
+                    }
+                }
+                VariantPayload::Struct(fields) => {
+                    for field in fields.values() {
+                        push_ownerless_dyn_infer(&field.ty, field.span, errors);
+                    }
+                }
+            }
+        }
+    }
+    for alias in decls.type_aliases() {
+        push_ownerless_dyn_infer(&alias.def.aliased, Some(alias.def.span), errors);
+    }
+    for value in decls.values() {
+        match &value.decl {
+            ValueDecl::Const(sig) => push_ownerless_dyn_infer(&sig.ty, None, errors),
+            ValueDecl::Func(sig) if sig.kind == CallableKind::ExternFunction => {
+                push_ownerless_dyn_infer(&sig.ty, None, errors);
+            }
+            ValueDecl::Func(_) => {}
+        }
+    }
+}
+
+fn push_ownerless_dyn_infer(ty: &Type, span: Option<SourceSpan>, errors: &mut Vec<TypeError>) {
+    if DynInference::has_raw_hole(ty) {
+        errors.push(TypeError::CompileError {
+            message:
+                "inferred dynamic contracts are not allowed in stored or ownerless type positions"
+                    .to_string(),
+            span,
+        });
+    }
+}
+
 fn validate_type_alias_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
     for alias in decls.type_aliases() {
         validate_type_alias_def(
@@ -3044,6 +3349,15 @@ fn validate_public_contract_types(decls: &DeclarationIndex, errors: &mut Vec<Typ
         if !matches!(contract.visibility, Visibility::Public) {
             continue;
         }
+        for (include, span) in &contract.includes {
+            if private_included_contract(decls, &contract.key.module, include).is_some() {
+                errors.push(TypeError::Decl(DeclError::PublicContractPrivateType {
+                    name: contract.key.name,
+                    ty: Type::Dyn(include.clone()),
+                    span: Some(*span),
+                }));
+            }
+        }
         for req in &contract.requirements {
             let exposed = req
                 .params
@@ -3054,7 +3368,7 @@ fn validate_public_contract_types(decls: &DeclarationIndex, errors: &mut Vec<Typ
                 errors.push(TypeError::Decl(DeclError::PublicContractPrivateType {
                     name: contract.key.name,
                     ty,
-                    span: Some(req.span),
+                    span: req.span,
                 }));
             }
         }
@@ -3147,22 +3461,55 @@ fn private_exposed_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
     }
 }
 
+fn private_included_contract(
+    decls: &DeclarationIndex,
+    module: &ModuleScope,
+    contract: &ContractRef,
+) -> Option<ContractKey> {
+    match contract {
+        ContractRef::Named { .. } => {
+            let resolver = TypeRefResolver::module_only(decls);
+            let key = resolver.resolve_contract_ref(module, contract).ok()?;
+            let exported = matches!(
+                decls.exported_type_binding(&key.module, key.name),
+                Some(TypeBinding::Contract(exported)) if exported == key
+            );
+            (!exported).then_some(key)
+        }
+        ContractRef::Intersection(contracts) => contracts
+            .iter()
+            .find_map(|contract| private_included_contract(decls, module, contract)),
+        ContractRef::Anonymous(_) | ContractRef::Infer | ContractRef::Hole(_) => None,
+    }
+}
+
 fn private_contract_type(decls: &DeclarationIndex, contract: &ContractRef) -> Option<Type> {
-    let ContractRef::Named { name, origin, .. } = contract else {
-        return None;
-    };
-    let module = origin
-        .as_ref()
-        .map_or(ModuleScope::Root, ModuleScope::from_nominal_origin);
-    let key = ContractKey {
-        module,
-        name: *name,
-    };
-    let exported = matches!(
-        decls.exported_type_binding(&key.module, key.name),
-        Some(TypeBinding::Contract(exported)) if exported == key
-    );
-    (!exported).then(|| Type::Dyn(contract.clone()))
+    match contract {
+        ContractRef::Named { name, origin, .. } => {
+            let module = origin
+                .as_ref()
+                .map_or(ModuleScope::Root, ModuleScope::from_nominal_origin);
+            let key = ContractKey {
+                module,
+                name: *name,
+            };
+            let exported = matches!(
+                decls.exported_type_binding(&key.module, key.name),
+                Some(TypeBinding::Contract(exported)) if exported == key
+            );
+            (!exported).then(|| Type::Dyn(contract.clone()))
+        }
+        ContractRef::Anonymous(surface) => surface.requirements.iter().find_map(|req| {
+            req.params
+                .iter()
+                .find_map(|param| private_exposed_type(decls, &param.ty))
+                .or_else(|| private_exposed_type(decls, &req.ret))
+        }),
+        ContractRef::Intersection(contracts) => contracts
+            .iter()
+            .find_map(|contract| private_contract_type(decls, contract)),
+        ContractRef::Infer | ContractRef::Hole(_) => None,
+    }
 }
 
 fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
@@ -3424,6 +3771,18 @@ fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> TypeError {
             },
             span,
         },
+        TypeRefError::DuplicateContractRequirement { name } => TypeError::CompileError {
+            message: format!("duplicate contract requirement '{name}'"),
+            span,
+        },
+        TypeRefError::ConflictingContractRequirement { name } => TypeError::CompileError {
+            message: format!("conflicting contract requirement '{name}'"),
+            span,
+        },
+        TypeRefError::UnsupportedContractComposition => TypeError::CompileError {
+            message: "inferred dynamic contracts are not supported yet".to_string(),
+            span,
+        },
     }
 }
 
@@ -3618,6 +3977,39 @@ fn collect_callable_templates(module: ModuleScope, program: &Program, tc: &mut T
     }
 }
 
+fn dyn_infer_positions_valid(ty: &Type) -> bool {
+    struct InvalidDynInferPosition;
+
+    impl TypeVisitor for InvalidDynInferPosition {
+        fn visit_type(&mut self, ty: &Type) -> bool {
+            match ty {
+                Type::Dyn(ContractRef::Infer) => false,
+                Type::Dyn(contract) => dyn_infer_contract_contains_raw_hole(contract),
+                _ => self.visit_type_children(ty),
+            }
+        }
+    }
+
+    let mut visitor = InvalidDynInferPosition;
+    !visitor.visit_type(ty)
+}
+
+fn dyn_infer_contract_contains_raw_hole(contract: &ContractRef) -> bool {
+    match contract {
+        ContractRef::Infer => true,
+        ContractRef::Anonymous(surface) => surface.requirements.iter().any(|req| {
+            req.params
+                .iter()
+                .any(|param| DynInference::has_raw_hole(&param.ty))
+                || DynInference::has_raw_hole(&req.ret)
+        }),
+        ContractRef::Intersection(contracts) => {
+            contracts.iter().any(dyn_infer_contract_contains_raw_hole)
+        }
+        ContractRef::Named { .. } | ContractRef::Hole(_) => false,
+    }
+}
+
 fn push_source_scope(tc: &mut TypeChecker) {
     tc.push_scope();
     register_builtins(tc);
@@ -3663,7 +4055,12 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                 if is_generic(func) {
                     continue;
                 }
-                let func_ty = tc.func_type_from_sig(&func.params, &func.ret, func_node.span);
+                let func_ty = tc.func_type_from_sig_with_dyn_infer(
+                    &func.params,
+                    &func.ret,
+                    func_node.span,
+                    matches!(func.visibility, Visibility::Public),
+                );
                 tc.define(func.name, func_ty, false);
             }
             Stmt::Aggregate(_) | Stmt::Enum(_) => {}
@@ -3689,7 +4086,7 @@ fn check_stmts(stmts: &[StmtNode], tc: &mut TypeChecker) {
 
 fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncSig {
     let owner = tc.visible_generic_owner();
-    let generics = generic_params(&func.type_params, &func.const_params);
+    let mut generics = generic_params(&func.type_params, &func.const_params);
     let generic_context =
         tc.extended_generic_context(&owner.generics, &func.type_params, &func.const_params, span);
     check_param_order(&func.params, span, tc);
@@ -3701,18 +4098,27 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     );
 
     tc.push_generic_context(generic_context.clone());
+    tc.resolve_generic_bounds_for_tc(&mut generics, span);
     let params = func
         .params
         .iter()
         .map(|param| {
             FuncParam::new(
-                tc.resolve_type_for_tc_at(&param.ty, span),
+                tc.resolve_type_allow_dyn_infer_at(
+                    &param.ty,
+                    span,
+                    matches!(func.visibility, Visibility::Public),
+                ),
                 matches!(param.mutability, Mutability::Mutable),
                 param.cast_accept,
             )
         })
         .collect::<Vec<_>>();
-    let ret = tc.resolve_type_for_tc_at(&func.ret, span);
+    let ret = tc.resolve_type_allow_dyn_infer_at(
+        &func.ret,
+        span,
+        matches!(func.visibility, Visibility::Public),
+    );
     tc.pop_generic_context();
 
     SourceFuncSig {
@@ -4124,7 +4530,9 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
             check_return(ret_node, tc);
         }
         Stmt::Expr(expr_node) => {
+            tc.discard_depth += 1;
             check_expr_checked(expr_node, tc);
+            tc.discard_depth -= 1;
         }
         Stmt::While(while_node) => {
             check_while(while_node, tc);
@@ -4703,6 +5111,7 @@ fn specialized_body_facts(
         argument_projections: map_delta(&old.argument_projections, &current.argument_projections),
         contract_witnesses: map_delta(&old.contract_witnesses, &current.contract_witnesses),
         dyn_conversions: map_delta(&old.dyn_conversions, &current.dyn_conversions),
+        dyn_weakenings: map_delta(&old.dyn_weakenings, &current.dyn_weakenings),
         dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
     }
 }
@@ -5020,7 +5429,7 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let mode = mode_for_binding(binding);
     match &binding.ty {
         Some(annot) => {
-            let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
+            let annot_ty = tc.resolve_type_allow_dyn_infer_at(annot, binding_node.span, false);
             let annot_handle = tc.type_handle(&annot_ty);
             let value = match mode {
                 PatternBindMode::Owned { .. } => {
@@ -5177,7 +5586,7 @@ fn checked_from_type(expr: &ExprNode, ty: Type, tc: &mut TypeChecker) -> Checked
 }
 
 fn checked_from_handle(expr: &ExprNode, handle: TypeHandle, tc: &mut TypeChecker) -> CheckedType {
-    let handle = tc.set_type_from_handle(expr.node.id, expr.span, handle);
+    let handle = tc.set_type_from_handle(expr.node.id, expr.span, &handle);
     let ty = tc.handle_type(&handle);
     CheckedType {
         ty,
@@ -5191,7 +5600,7 @@ fn checked_from_checked(
     checked: CheckedType,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let handle = tc.set_type_from_handle(expr.node.id, expr.span, checked.handle);
+    let handle = tc.set_type_from_handle(expr.node.id, expr.span, &checked.handle);
     let ty = tc.handle_type(&handle);
     CheckedType {
         ty,
@@ -6496,6 +6905,17 @@ fn check_lambda_expr(
         .enumerate()
         .map(|(index, param)| {
             let ty = match &param.ty {
+                Some(ty) if DynInference::has_raw_hole(ty) => expected_func
+                    .as_ref()
+                    .and_then(|(params, _)| params.get(index))
+                    .and_then(|param| matches!(param.ty, Type::Dyn(_)).then(|| param.ty.clone()))
+                    .unwrap_or_else(|| {
+                        tc.push_error(TypeError::CompileError {
+                            message: "lambda parameter `dyn _` requires an expected dynamic function type".to_string(),
+                            span: tc.error_span(lambda.span),
+                        });
+                        Type::Infer
+                    }),
                 Some(ty) => tc.resolve_type_for_tc_at(ty, lambda.span),
                 None => expected_func
                     .as_ref()
@@ -6594,8 +7014,8 @@ fn collection_literal_handle(
     tc: &mut TypeChecker,
 ) -> TypeHandle {
     match kind {
-        CollectionLiteralKind::Array => tc.array_handle(elem, len),
-        CollectionLiteralKind::List => tc.list_handle(elem),
+        CollectionLiteralKind::Array => tc.array_handle(&elem, &len),
+        CollectionLiteralKind::List => tc.list_handle(&elem),
     }
 }
 
@@ -6801,7 +7221,7 @@ fn check_map_lit_hint(
         contains_extern_any |= key_checked.contains_extern_any || value_checked.contains_extern_any;
     }
 
-    let map = tc.map_handle(key, value);
+    let map = tc.map_handle(&key, &value);
     let mut checked = solve_and_checked_from_handle(expr, map, tc);
     if !has_hint && let Type::Map { key, .. } = &checked.ty {
         tc.validate_map_key_type(key, lit.span);
@@ -7194,6 +7614,9 @@ impl NominalLiteralSolver {
                 return None;
             }
         };
+        if !tc.check_generic_bounds(generics, &args, span) {
+            return None;
+        }
         Some(nominal_literal_type(key, generics, Some(&args)))
     }
 }

@@ -6,7 +6,7 @@ use super::{
     AnvParser, BoxedParser,
     common::{block_stmt, field_name_ident, identifier, param, params, return_type},
     expr::expression,
-    types::{extend_type_ident, type_ident},
+    types::{contract_ref, extend_type_ident, type_ident},
 };
 use crate::{
     ast,
@@ -189,19 +189,42 @@ enum GenericParamItem {
     Const(ast::ConstParam),
 }
 
+#[derive(Clone)]
+enum GenericParamSuffix {
+    Const,
+    Bounds(Vec<ast::ContractRef>),
+}
+
 fn required_generic_params<'src>() -> BoxedParser<'src, GenericParams> {
     let colon = select! { Token::Colon => () };
     let int_kw = select! { Token::Keyword(Keyword::Int) => () };
 
+    let bounds = contract_ref().map(|contract| match contract {
+        ast::ContractRef::Intersection(contracts) => contracts,
+        contract => vec![contract],
+    });
+    let suffix = colon
+        .ignore_then(choice((
+            int_kw.to(GenericParamSuffix::Const),
+            bounds.map(GenericParamSuffix::Bounds),
+        )))
+        .or_not();
+
     let generic_param = identifier()
-        .then(colon.ignore_then(int_kw).or_not())
-        .map_with(|(name, is_const), e| {
-            if is_const.is_some() {
+        .then(suffix)
+        .map_with(|(name, suffix), e| match suffix {
+            Some(GenericParamSuffix::Const) => {
                 let id = e.state().new_const_param_id();
                 GenericParamItem::Const(ast::ConstParam { name, id })
-            } else {
+            }
+            bounds => {
                 let id = e.state().new_type_var_id();
-                GenericParamItem::Type(ast::TypeParam { name, id })
+                let bounds = match bounds {
+                    Some(GenericParamSuffix::Bounds(bounds)) => bounds,
+                    Some(GenericParamSuffix::Const) => unreachable!("const suffix handled above"),
+                    None => vec![],
+                };
+                GenericParamItem::Type(ast::TypeParam { name, id, bounds })
             }
         });
 
@@ -1680,9 +1703,14 @@ pub(super) fn local_type_alias_statement<'src>() -> BoxedParser<'src, ast::StmtN
     type_alias_with_header(DeclPolicy::LOCAL_TYPE_ALIAS)
 }
 
-fn contract_requirement<'src>(
+enum ContractMember {
+    Include(Spanned<ast::ContractRef>),
+    Requirement(ast::ContractRequirementNode),
+}
+
+fn contract_member<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
-) -> BoxedParser<'src, Option<ast::ContractRequirementNode>> {
+) -> BoxedParser<'src, Option<ContractMember>> {
     let semicolon = select! { Token::Semicolon => () };
     let comma = select! { Token::Comma => () };
     let field_like = identifier()
@@ -1698,7 +1726,7 @@ fn contract_requirement<'src>(
         });
 
     let method = method_sig(stmt, MethodSigPolicy::Aggregate)
-        .then_ignore(semicolon)
+        .then_ignore(select! { Token::Semicolon => () })
         .validate(|sig, extra, emitter| {
             if sig.receiver.is_none() {
                 emitter.emit(Rich::custom(
@@ -1726,13 +1754,22 @@ fn contract_requirement<'src>(
                     ));
                 }
             }
-            Some(Spanned::new(
+            Some(ContractMember::Requirement(Spanned::new(
                 ast::ContractRequirement { sig },
                 extra.span().byte(),
-            ))
+            )))
         });
 
-    choice((method, field_like)).boxed()
+    let include = contract_ref()
+        .then_ignore(select! { Token::Semicolon => () })
+        .map_with(|contract, extra| {
+            Some(ContractMember::Include(Spanned::new(
+                contract,
+                extra.span().byte(),
+            )))
+        });
+
+    choice((method, field_like, include)).boxed()
 }
 
 pub(super) fn contract_declaration<'src>(
@@ -1745,27 +1782,30 @@ pub(super) fn contract_declaration<'src>(
         .then(identifier())
         .then(
             select! { Token::Open(Delimiter::Brace) => () }
-                .ignore_then(contract_requirement(stmt).repeated().collect::<Vec<_>>())
+                .ignore_then(contract_member(stmt).repeated().collect::<Vec<_>>())
                 .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
         )
         .validate(|((header, name), body), extra, emitter| {
-            if !header.annotations.is_empty() {
-                emitter.emit(Rich::custom(
-                    extra.span(),
-                    "annotations are not allowed on contracts",
-                ));
+            let mut includes = vec![];
+            let mut requirements = vec![];
+            for member in body.into_iter().flatten() {
+                match member {
+                    ContractMember::Include(include) => includes.push(include),
+                    ContractMember::Requirement(req) => requirements.push(req),
+                }
             }
-            let requirements = body.into_iter().flatten().collect::<Vec<_>>();
-            if requirements.is_empty() {
+            if includes.is_empty() && requirements.is_empty() {
                 emitter.emit(Rich::custom(extra.span(), "contracts cannot be empty"));
             }
             let span = extra.span().byte();
             Spanned::new(
                 ast::Stmt::Contract(Spanned::new(
                     ast::ContractDecl {
+                        annotations: header.annotations,
                         doc: header.doc,
                         visibility: header.visibility,
                         name,
+                        includes,
                         requirements,
                     },
                     span,

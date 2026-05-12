@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: does not satisfy contract bound 'A'
+
+import api { Box };
+
+contract B {
+    fn b(self);
+}
+
+struct Wrapper<U: B> {
+    box: Box<U>,
+}
+
+fn main() {}

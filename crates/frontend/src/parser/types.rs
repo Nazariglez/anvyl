@@ -65,9 +65,9 @@ fn type_contains_slice(ty: &Type) -> bool {
         | Type::Bool
         | Type::String
         | Type::Void
-        | Type::Dyn(_)
         | Type::Var(_)
         | Type::UnresolvedName(_) => false,
+        Type::Dyn(contract) => contract_ref_contains_slice(contract),
     }
 }
 
@@ -75,6 +75,24 @@ fn generic_arg_contains_slice(arg: &ast::GenericArg) -> bool {
     match arg {
         ast::GenericArg::Type(ty) => type_contains_slice(ty),
         ast::GenericArg::Const(_) => false,
+    }
+}
+
+fn contract_ref_contains_slice(contract: &ast::ContractRef) -> bool {
+    match contract {
+        ast::ContractRef::Anonymous(surface) => surface.requirements.iter().any(|requirement| {
+            requirement
+                .params
+                .iter()
+                .any(|param| type_contains_slice(&param.ty))
+                || type_contains_slice(&requirement.ret)
+        }),
+        ast::ContractRef::Intersection(contracts) => {
+            contracts.iter().any(contract_ref_contains_slice)
+        }
+        ast::ContractRef::Named { .. } | ast::ContractRef::Infer | ast::ContractRef::Hole(_) => {
+            false
+        }
     }
 }
 
@@ -104,6 +122,141 @@ pub(super) fn generic_arg<'src>(
         ty.map(ast::GenericArg::Type),
     ))
     .boxed()
+}
+
+fn anonymous_contract_requirement<'src>(
+    ty: impl AnvParser<'src, Type>,
+) -> BoxedParser<'src, ast::AnonymousContractRequirement> {
+    let var_kw = select! { Token::Keyword(Keyword::Var) => () };
+    let receiver = choice((
+        var_kw
+            .ignore_then(identifier())
+            .validate(|name, extra, emitter| {
+                if name.0.as_ref() != "self" {
+                    emitter.emit(Rich::custom(extra.span(), "expected 'self'"));
+                }
+                ast::MethodReceiver::Var
+            }),
+        identifier().validate(|name, extra, emitter| {
+            if name.0.as_ref() != "self" {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "contract method requirements must include a `self` or `var self` receiver",
+                ));
+            }
+            ast::MethodReceiver::Value
+        }),
+    ));
+
+    let param = select! { Token::Keyword(Keyword::Var) => () }
+        .or_not()
+        .map(|opt| opt.is_some())
+        .then(identifier())
+        .then_ignore(select! { Token::Colon => () })
+        .then(ty.clone())
+        .map(|((mutable, name), ty)| ast::AnonymousContractParam { mutable, name, ty });
+
+    let params = select! { Token::Comma => () }
+        .ignore_then(param)
+        .repeated()
+        .collect::<Vec<_>>();
+
+    let ret = select! { Token::Op(Op::ThinArrow) => () }
+        .ignore_then(ty)
+        .or_not()
+        .map(|ret| ret.unwrap_or(Type::Void));
+
+    select! { Token::Keyword(Keyword::Fn) => () }
+        .ignore_then(identifier())
+        .then(
+            select! { Token::Open(Delimiter::Parent) => () }
+                .ignore_then(receiver.then(params))
+                .then_ignore(select! { Token::Close(Delimiter::Parent) => () }),
+        )
+        .then(ret)
+        .then_ignore(select! { Token::Semicolon => () })
+        .map(
+            |((name, (receiver, params)), ret)| ast::AnonymousContractRequirement {
+                receiver,
+                name,
+                params,
+                ret,
+            },
+        )
+        .labelled("anonymous contract requirement")
+        .as_context()
+        .boxed()
+}
+
+pub(super) fn contract_ref<'src>() -> BoxedParser<'src, ast::ContractRef> {
+    contract_ref_with(named_contract_ref())
+}
+
+fn dyn_contract_ref<'src>(ty: impl AnvParser<'src, Type>) -> BoxedParser<'src, ast::ContractRef> {
+    let anonymous = select! { Token::Open(Delimiter::Brace) => () }
+        .ignore_then(
+            anonymous_contract_requirement(ty)
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(select! { Token::Close(Delimiter::Brace) => () })
+        .validate(|requirements, extra, emitter| {
+            if requirements.is_empty() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "anonymous dynamic contracts cannot be empty",
+                ));
+            }
+            ast::ContractRef::Anonymous(ast::AnonymousContract { requirements })
+        });
+
+    contract_ref_with(choice((
+        anonymous,
+        inferred_contract_ref(),
+        named_contract_ref(),
+    )))
+}
+
+fn contract_ref_with<'src>(
+    operand: impl AnvParser<'src, ast::ContractRef>,
+) -> BoxedParser<'src, ast::ContractRef> {
+    operand
+        .separated_by(select! { Token::Op(Op::Add) => () })
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map(|mut contracts| {
+            if contracts.len() == 1 {
+                contracts.pop().expect("one contract ref")
+            } else {
+                ast::ContractRef::Intersection(contracts)
+            }
+        })
+        .labelled("contract reference")
+        .as_context()
+        .boxed()
+}
+
+fn inferred_contract_ref<'src>() -> BoxedParser<'src, ast::ContractRef> {
+    select! { Token::Ident(name) if name.0.as_ref() == "_" => ast::ContractRef::Infer }.boxed()
+}
+
+fn named_contract_ref<'src>() -> BoxedParser<'src, ast::ContractRef> {
+    identifier()
+        .then(
+            select! { Token::Dot => () }
+                .ignore_then(identifier())
+                .or_not(),
+        )
+        .map(|(qualifier_ident, name_ident)| match name_ident {
+            Some(name) => (Some(qualifier_ident), name),
+            None => (None, qualifier_ident),
+        })
+        .map(|(qualifier, name)| ast::ContractRef::Named {
+            qualifier,
+            name,
+            origin: None,
+        })
+        .boxed()
 }
 
 fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
@@ -155,17 +308,8 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
         );
 
         let dyn_type = select! { Token::Ident(i) if i.0.as_ref() == "dyn" => () }
-            .ignore_then(name_ref)
-            .validate(|(qualifier, name), extra, emitter| {
-                if name.0.as_ref() == "_" {
-                    emitter.emit(Rich::custom(extra.span(), "`dyn _` is not supported yet"));
-                }
-                Type::Dyn(ast::ContractRef::Named {
-                    qualifier,
-                    name,
-                    origin: None,
-                })
-            });
+            .ignore_then(dyn_contract_ref(type_parser.clone()))
+            .map(Type::Dyn);
 
         let paren_type = paren_or_tuple_type(type_parser.clone());
 

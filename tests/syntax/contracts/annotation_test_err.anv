@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: not valid on contract
+
+@test
+contract C {
+    fn f(self);
+}

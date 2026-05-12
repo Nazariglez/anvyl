@@ -380,6 +380,7 @@ impl Printer<'_> {
     }
 
     pub(super) fn format_contract(&mut self, contract: &ast::ContractDecl) {
+        self.format_annotations(&contract.annotations);
         self.format_doc_comment(contract.doc.as_ref());
         self.write_indent();
         self.format_visibility(contract.visibility);
@@ -388,6 +389,12 @@ impl Printer<'_> {
         self.write(" {");
         self.writeln();
         self.indent();
+        for include in &contract.includes {
+            self.write_indent();
+            self.format_contract_ref(&include.node);
+            self.write(";");
+            self.writeln();
+        }
         for req in &contract.requirements {
             self.write_indent();
             self.write("fn ");

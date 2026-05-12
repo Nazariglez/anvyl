@@ -1,0 +1,7 @@
+// @helper
+
+pub contract A {
+    fn a(self);
+}
+
+pub fn take<T: A>(value: T) {}

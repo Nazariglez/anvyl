@@ -216,6 +216,9 @@ pub struct NominalType {
     pub origin: Option<ModuleOrigin>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DynContractHoleId(pub u32);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContractRef {
     Named {
@@ -223,8 +226,45 @@ pub enum ContractRef {
         name: Ident,
         origin: Option<ModuleOrigin>,
     },
+    Anonymous(AnonymousContract),
     Intersection(Vec<ContractRef>),
     Infer,
+    Hole(DynContractHoleId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnonymousContract {
+    pub requirements: Vec<AnonymousContractRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnonymousContractRequirement {
+    pub receiver: MethodReceiver,
+    pub name: Ident,
+    pub params: Vec<AnonymousContractParam>,
+    pub ret: Type,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnonymousContractParam {
+    pub mutable: bool,
+    pub name: Ident,
+    pub ty: Type,
+}
+
+impl PartialEq for AnonymousContractParam {
+    fn eq(&self, other: &Self) -> bool {
+        self.mutable == other.mutable && self.ty == other.ty
+    }
+}
+
+impl Eq for AnonymousContractParam {}
+
+impl std::hash::Hash for AnonymousContractParam {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.mutable, state);
+        std::hash::Hash::hash(&self.ty, state);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +586,29 @@ impl Display for ContractRef {
                 }
                 write!(f, "{name}")
             }
+            Self::Anonymous(surface) => {
+                write!(f, "{{ ")?;
+                for requirement in &surface.requirements {
+                    write!(f, "fn {}(", requirement.name)?;
+                    match requirement.receiver {
+                        MethodReceiver::Value => write!(f, "self")?,
+                        MethodReceiver::Var => write!(f, "var self")?,
+                    }
+                    for param in &requirement.params {
+                        write!(f, ", ")?;
+                        if param.mutable {
+                            write!(f, "var ")?;
+                        }
+                        write!(f, "{}: {}", param.name, param.ty)?;
+                    }
+                    if requirement.ret == Type::Void {
+                        write!(f, "); ")?;
+                    } else {
+                        write!(f, ") -> {}; ", requirement.ret)?;
+                    }
+                }
+                write!(f, "}}")
+            }
             Self::Intersection(contracts) => {
                 for (i, contract) in contracts.iter().enumerate() {
                     if i > 0 {
@@ -555,7 +618,7 @@ impl Display for ContractRef {
                 }
                 Ok(())
             }
-            Self::Infer => write!(f, "_"),
+            Self::Infer | Self::Hole(_) => write!(f, "_"),
         }
     }
 }
@@ -752,6 +815,7 @@ pub struct ExprId(pub u64);
 pub struct TypeParam {
     pub name: Ident,
     pub id: TypeVarId,
+    pub bounds: Vec<ContractRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1055,9 +1119,11 @@ pub struct TypeAliasDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContractDecl {
+    pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
     pub visibility: Visibility,
     pub name: Ident,
+    pub includes: Vec<Spanned<ContractRef>>,
     pub requirements: Vec<ContractRequirementNode>,
 }
 

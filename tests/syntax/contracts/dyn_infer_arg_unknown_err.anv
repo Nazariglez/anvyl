@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot infer parameter type for dynamic method 'f'
+
+struct Actor {
+    fn f(self, x: int) {}
+}
+
+fn main() {
+    let actor: dyn _ = Actor {};
+    actor.f(nil);
+}

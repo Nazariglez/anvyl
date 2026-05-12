@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: does not satisfy contract bound 'Named'
+
+contract Named {
+    fn name(self) -> string;
+}
+
+struct Rock {}
+
+struct Box<T: Named> {
+    value: T,
+}
+
+fn main() {
+    let box: Box<Rock> = Box { value: Rock {} };
+}

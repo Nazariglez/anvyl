@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use super::{
-    ArgumentProjectionMap, CallMap, ContractWitnessMap, DynCallMap, DynConversionMap, ExternUseMap,
-    MemberPathMap, const_term::ConstTerm, decls::CallableId, type_ops::TypeFolder,
+    ArgumentProjectionMap, CallMap, ContractWitnessMap, DynCallMap, DynConversionMap,
+    DynWeakeningMap, ExternUseMap, MemberPathMap, const_term::ConstTerm, decls::CallableId,
+    type_ops::TypeFolder,
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ExprId, GenericArg, Type, TypeParam,
-        TypeVarId,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef, ExprId, GenericArg, Type,
+        TypeParam, TypeVarId,
     },
     span::Span,
 };
@@ -29,6 +30,13 @@ pub(crate) struct GenericParams {
 impl GenericParams {
     pub(crate) fn is_empty(&self) -> bool {
         self.type_params.is_empty() && self.const_params.is_empty()
+    }
+
+    pub(crate) fn type_param_bounds(&self, id: TypeVarId) -> Option<&[ContractRef]> {
+        self.type_params
+            .iter()
+            .find(|param| param.id == id)
+            .map(|param| param.bounds.as_slice())
     }
 
     pub(crate) fn substitutions(&self, args: &GenericArgs) -> (TypeSubst, ConstSubst) {
@@ -77,6 +85,7 @@ pub(crate) struct SpecializedBodyFacts {
     pub(crate) argument_projections: ArgumentProjectionMap,
     pub(crate) contract_witnesses: ContractWitnessMap,
     pub(crate) dyn_conversions: DynConversionMap,
+    pub(crate) dyn_weakenings: DynWeakeningMap,
     pub(crate) dyn_calls: DynCallMap,
 }
 

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate contract requirement
+
+fn render(actor: dyn {
+    fn draw(self);
+    fn draw(self);
+}) {}
+
+fn main() {}

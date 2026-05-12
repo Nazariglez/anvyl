@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Actor {
+    fn draw(self) {}
+}
+
+fn make() -> dyn _ {
+    Actor {}
+}
+
+fn main() {
+    let actor = make();
+    actor.draw();
+}

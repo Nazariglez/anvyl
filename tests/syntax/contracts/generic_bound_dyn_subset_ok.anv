@@ -1,0 +1,23 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+struct Both {
+    fn a(self) {}
+    fn b(self) {}
+}
+
+fn take<T: A>(value: T) {}
+
+fn main() {
+    let value: dyn A + B = Both {};
+    take(value);
+}

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Sprite {
+    fn draw(self) {}
+}
+
+fn main() {
+    let sprite: dyn { fn draw(self); } = Sprite {};
+    sprite.draw();
+}

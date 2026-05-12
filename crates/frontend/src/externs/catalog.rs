@@ -1059,7 +1059,8 @@ impl<'a> CatalogBuilder<'a> {
                     });
                 Type::UnresolvedName(fallback)
             }
-            TypeRefError::Unknown { qualifier, name } => {
+            TypeRefError::Unknown { qualifier, name }
+            | TypeRefError::UnknownContract { qualifier, name } => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: context.clone(),
                     module: qualifier.map(|qualifier| {
@@ -1073,7 +1074,10 @@ impl<'a> CatalogBuilder<'a> {
                 });
                 Type::UnresolvedName(name)
             }
-            TypeRefError::AliasCycle { name } | TypeRefError::ContractAsType { name } => {
+            TypeRefError::AliasCycle { name }
+            | TypeRefError::ContractAsType { name }
+            | TypeRefError::DuplicateContractRequirement { name }
+            | TypeRefError::ConflictingContractRequirement { name } => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: context.clone(),
                     module: None,
@@ -1082,19 +1086,14 @@ impl<'a> CatalogBuilder<'a> {
                 });
                 Type::UnresolvedName(name)
             }
-            TypeRefError::UnknownContract { qualifier, name } => {
+            TypeRefError::UnsupportedContractComposition => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: context.clone(),
-                    module: qualifier.map(|qualifier| {
-                        ModuleScope::Named(
-                            ModulePath::new(vec![qualifier.to_string()])
-                                .expect("single segment module path is valid"),
-                        )
-                    }),
-                    name,
+                    module: None,
+                    name: fallback,
                     site,
                 });
-                Type::UnresolvedName(name)
+                Type::UnresolvedName(fallback)
             }
         }
     }

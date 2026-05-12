@@ -11,8 +11,8 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef, FuncParam, GenericArg, Ident,
-        Type, TypeParam, TypeVarId,
+        AnonymousContractRequirement, ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef,
+        FuncParam, GenericArg, Ident, Type, TypeParam, TypeVarId,
     },
     span::Span,
 };
@@ -145,10 +145,24 @@ pub(crate) enum TypeRefError {
         qualifier: Option<Ident>,
         name: Ident,
     },
+    DuplicateContractRequirement {
+        name: Ident,
+    },
+    ConflictingContractRequirement {
+        name: Ident,
+    },
+    UnsupportedContractComposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeRefWarningKind {
+    TypeAlias,
+    Contract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypeRefWarning {
+    pub(crate) kind: TypeRefWarningKind,
     pub(crate) name: Ident,
     pub(crate) reason: Option<String>,
     pub(crate) span: Span,
@@ -264,8 +278,22 @@ impl FinalizeState {
             && let Some(span) = self.site
         {
             self.warnings.push(TypeRefWarning {
+                kind: TypeRefWarningKind::TypeAlias,
                 name: use_name,
                 reason: alias.def.policy.deprecated_reason().map(str::to_string),
+                span,
+            });
+        }
+    }
+
+    fn warn_deprecated_contract(&mut self, schema: &super::decls::ContractSchema, use_name: Ident) {
+        if schema.policy.has_deprecated()
+            && let Some(span) = self.site
+        {
+            self.warnings.push(TypeRefWarning {
+                kind: TypeRefWarningKind::Contract,
+                name: use_name,
+                reason: schema.policy.deprecated_reason().map(str::to_string),
                 span,
             });
         }
@@ -354,10 +382,9 @@ impl<'a> TypeRefResolver<'a> {
                     .collect::<Result<_, _>>()?,
                 ret: Box::new(self.finalize_inner(module, generics, ret, state)?),
             }),
-            Type::Dyn(contract) => {
-                let key = self.resolve_contract_ref(module, contract)?;
-                Ok(Type::Dyn(canonical_contract_ref(&key)))
-            }
+            Type::Dyn(contract) => self
+                .finalize_contract_ref(module, generics, contract, state)
+                .map(Type::Dyn),
             Type::Tuple(elems) => elems
                 .iter()
                 .map(|ty| self.finalize_inner(module, generics, ty, state))
@@ -616,6 +643,105 @@ impl<'a> TypeRefResolver<'a> {
         result
     }
 
+    fn finalize_contract_ref(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        contract: &ContractRef,
+        state: &mut FinalizeState,
+    ) -> Result<ContractRef, TypeRefError> {
+        let mut refs = vec![];
+        self.collect_canonical_contract_refs(module, generics, contract, state, &mut refs)?;
+        refs.sort_by_key(ToString::to_string);
+        let mut unique = vec![];
+        for contract in refs {
+            if !unique.contains(&contract) {
+                unique.push(contract);
+            }
+        }
+        let mut refs = unique;
+        Ok(if refs.len() == 1 {
+            refs.pop().expect("one contract ref")
+        } else {
+            ContractRef::Intersection(refs)
+        })
+    }
+
+    fn collect_canonical_contract_refs(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        contract: &ContractRef,
+        state: &mut FinalizeState,
+        refs: &mut Vec<ContractRef>,
+    ) -> Result<(), TypeRefError> {
+        match contract {
+            ContractRef::Named {
+                name, origin: None, ..
+            } => {
+                let key = self.resolve_contract_ref(module, contract)?;
+                if let Some(schema) = self.decls.contract(&key) {
+                    state.warn_deprecated_contract(schema, *name);
+                }
+                refs.push(canonical_contract_ref(&key));
+                Ok(())
+            }
+            ContractRef::Named { .. } => {
+                let key = self.resolve_contract_ref(module, contract)?;
+                refs.push(canonical_contract_ref(&key));
+                Ok(())
+            }
+            ContractRef::Anonymous(surface) => {
+                let requirements = surface
+                    .requirements
+                    .iter()
+                    .map(|req| self.finalize_anonymous_requirement(module, generics, req, state))
+                    .collect::<Result<Vec<_>, _>>()?;
+                refs.push(ContractRef::Anonymous(crate::ast::AnonymousContract {
+                    requirements: canonical_anonymous_requirements(requirements)?,
+                }));
+                Ok(())
+            }
+            ContractRef::Intersection(contracts) => {
+                for contract in contracts {
+                    self.collect_canonical_contract_refs(module, generics, contract, state, refs)?;
+                }
+                Ok(())
+            }
+            ContractRef::Infer | ContractRef::Hole(_) => {
+                refs.push(contract.clone());
+                Ok(())
+            }
+        }
+    }
+
+    fn finalize_anonymous_requirement(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        req: &AnonymousContractRequirement,
+        state: &mut FinalizeState,
+    ) -> Result<AnonymousContractRequirement, TypeRefError> {
+        let params = req
+            .params
+            .iter()
+            .map(|param| {
+                Ok(crate::ast::AnonymousContractParam {
+                    mutable: param.mutable,
+                    name: param.name,
+                    ty: self.finalize_inner(module, generics, &param.ty, state)?,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let ret = self.finalize_inner(module, generics, &req.ret, state)?;
+        Ok(AnonymousContractRequirement {
+            receiver: req.receiver,
+            name: req.name,
+            params,
+            ret,
+        })
+    }
+
     pub(crate) fn resolve_contract_ref(
         &self,
         module: &ModuleScope,
@@ -627,10 +753,7 @@ impl<'a> TypeRefResolver<'a> {
             origin,
         } = contract
         else {
-            return Err(TypeRefError::UnknownContract {
-                qualifier: None,
-                name: Ident::new(contract.to_string()),
-            });
+            return Err(TypeRefError::UnsupportedContractComposition);
         };
 
         if let Some(origin) = origin {
@@ -760,6 +883,46 @@ fn canonical_contract_ref(key: &ContractKey) -> ContractRef {
     }
 }
 
+fn canonical_anonymous_requirements(
+    requirements: Vec<AnonymousContractRequirement>,
+) -> Result<Vec<AnonymousContractRequirement>, TypeRefError> {
+    let mut by_name = HashMap::<Ident, AnonymousContractRequirement>::new();
+    for requirement in requirements {
+        match by_name.get(&requirement.name) {
+            Some(prev) if same_anonymous_requirement(prev, &requirement) => {
+                return Err(TypeRefError::DuplicateContractRequirement {
+                    name: requirement.name,
+                });
+            }
+            Some(_) => {
+                return Err(TypeRefError::ConflictingContractRequirement {
+                    name: requirement.name,
+                });
+            }
+            None => {
+                by_name.insert(requirement.name, requirement);
+            }
+        }
+    }
+    let mut requirements = by_name.into_values().collect::<Vec<_>>();
+    requirements.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    Ok(requirements)
+}
+
+fn same_anonymous_requirement(
+    left: &AnonymousContractRequirement,
+    right: &AnonymousContractRequirement,
+) -> bool {
+    left.receiver == right.receiver
+        && left.ret == right.ret
+        && left.params.len() == right.params.len()
+        && left
+            .params
+            .iter()
+            .zip(&right.params)
+            .all(|(left, right)| left.mutable == right.mutable && left.ty == right.ty)
+}
+
 fn finalize_const_arg(
     generics: &GenericTypeContext,
     arg: &ConstArg,
@@ -814,6 +977,7 @@ mod tests {
         TypeParam {
             name: ident(name),
             id: TypeVarId(id),
+            bounds: vec![],
         }
     }
 

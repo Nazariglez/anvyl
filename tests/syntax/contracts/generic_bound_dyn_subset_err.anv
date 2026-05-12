@@ -1,0 +1,23 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: does not satisfy contract bound 'B'
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+struct OnlyA {
+    fn a(self) {}
+}
+
+fn take<T: A + B>(value: T) {}
+
+fn main() {
+    let value: dyn A = OnlyA {};
+    take(value);
+}

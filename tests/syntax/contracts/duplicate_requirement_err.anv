@@ -1,7 +1,7 @@
 // @mode: check
-// @expect: success
+// @expect: error
 // @frontend: new
-// @skip: FIXME: duplicatin declarations should not be allowed
+// @contains: duplicate contract requirement 'draw' in contract 'Drawable'
 
 contract Drawable {
     fn draw(self);

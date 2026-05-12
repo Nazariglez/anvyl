@@ -1,0 +1,5 @@
+// @helper
+
+struct Hidden {}
+
+pub type Bad = dyn { fn leak(self) -> Hidden; };

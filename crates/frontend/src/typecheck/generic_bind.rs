@@ -206,6 +206,7 @@ mod tests {
         TypeParam {
             name: ident(name),
             id: tv(id),
+            bounds: vec![],
         }
     }
 

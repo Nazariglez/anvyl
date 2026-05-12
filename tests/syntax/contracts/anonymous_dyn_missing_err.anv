@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: missing method 'draw'
+
+struct Sprite {}
+
+fn main() {
+    let sprite: dyn { fn draw(self); } = Sprite {};
+}

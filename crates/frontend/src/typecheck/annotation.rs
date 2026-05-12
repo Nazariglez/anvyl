@@ -60,6 +60,7 @@ pub(crate) enum AnnotationTarget {
     ExternFunc,
     ExternType,
     TypeAlias,
+    Contract,
     InlineMethod,
     ExtendMethod,
 }
@@ -77,6 +78,7 @@ impl fmt::Display for AnnotationTarget {
             Self::ExternFunc => "extern function",
             Self::ExternType => "extern type",
             Self::TypeAlias => "type alias",
+            Self::Contract => "contract",
             Self::InlineMethod => "inline method",
             Self::ExtendMethod => "extend method",
         };
@@ -115,6 +117,7 @@ const DEPRECATED_TARGETS: &[AnnotationTarget] = &[
     AnnotationTarget::ExternFunc,
     AnnotationTarget::ExternType,
     AnnotationTarget::TypeAlias,
+    AnnotationTarget::Contract,
     AnnotationTarget::InlineMethod,
     AnnotationTarget::ExtendMethod,
 ];

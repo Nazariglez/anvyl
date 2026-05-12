@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: public type alias 'Bad' exposes private type
+
+import lib { Bad };

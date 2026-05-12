@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Name {
+    value: string,
+}
+
+struct Person {
+    fn name(self) -> Name { Name { value: "Ada" } }
+}
+
+fn main() {
+    type LocalName = Name;
+    let person: dyn { fn name(self) -> LocalName; } = Person {};
+    let name = person.name();
+}

@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Thing {
+    fn f(self) {}
+}
+
+fn take(a: dyn { fn f(self); }) {
+    a.f();
+}
+
+fn main() {
+    take(Thing {});
+}

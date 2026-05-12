@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: implicit dynamic strengthening is not allowed
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+struct OnlyA {
+    fn a(self) {}
+}
+
+fn main() {
+    let a: dyn A = OnlyA {};
+    let both: dyn A + B = a;
+}

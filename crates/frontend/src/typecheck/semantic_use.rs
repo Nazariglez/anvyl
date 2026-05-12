@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::{
-    ContractKey, GenericArgs, MethodMode, MethodReceiver, Type,
+    ContractSetKey, GenericArgs, MethodMode, MethodReceiver, Type,
     decls::{CallableId, ExtendId},
 };
 use crate::{
@@ -19,6 +19,7 @@ pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
 pub(crate) type ArgumentProjectionMap = HashMap<(ExprId, usize), ArgumentProjectionFact>;
 pub(crate) type ContractWitnessMap = HashMap<WitnessId, ContractWitnessFact>;
 pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
+pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
 pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +71,7 @@ pub(crate) struct ContractWitnessFact {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ContractWitnessKey {
     pub(crate) concrete_ty: Type,
-    pub(crate) contract: ContractKey,
+    pub(crate) contract: ContractSetKey,
     pub(crate) slots: Vec<WitnessSlot>,
 }
 
@@ -114,10 +115,18 @@ pub(crate) struct DynConversionFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynWeakeningFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) source: ContractSetKey,
+    pub(crate) target: ContractSetKey,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DynCallFact {
     pub(crate) call_id: ExprId,
     pub(crate) receiver_id: ExprId,
-    pub(crate) contract: ContractKey,
+    pub(crate) contract: ContractSetKey,
     pub(crate) method: Ident,
     pub(crate) arg_count: usize,
     pub(crate) requires_mutable: bool,

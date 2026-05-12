@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot infer empty dynamic contract
+
+struct Actor {}
+
+fn main() {
+    let actor: dyn _ = Actor {};
+}

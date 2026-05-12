@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot infer return type for dynamic method 'count'
+
+struct Actor {
+    fn count(self) -> int { 1 }
+}
+
+fn main() {
+    let actor: dyn _ = Actor {};
+    let count = actor.count();
+}

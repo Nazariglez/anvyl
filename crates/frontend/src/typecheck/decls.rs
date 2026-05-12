@@ -11,8 +11,8 @@ use super::{
 };
 use crate::{
     ast::{
-        self, AggregateKind, ArrayLen, ConstArg, ConstParam, FuncParam, GenericArg, Ident,
-        ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
+        self, AggregateKind, ArrayLen, ConstArg, ConstParam, ContractRef, FuncParam, GenericArg,
+        Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
         NominalKind, Param, Program, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     externs::{
@@ -122,6 +122,32 @@ pub(crate) struct TypeAliasKey {
 pub(crate) struct ContractKey {
     pub(crate) module: ModuleScope,
     pub(crate) name: Ident,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ContractSetKey {
+    pub(crate) requirements: Vec<ContractRequirementKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ContractRequirementKey {
+    pub(crate) name: Ident,
+    pub(crate) receiver: Option<MethodReceiver>,
+    pub(crate) params: Vec<FuncParam>,
+    pub(crate) required_params: usize,
+    pub(crate) ret: Type,
+}
+
+impl ContractRequirementKey {
+    pub(crate) fn from_schema(req: &ContractRequirementSchema) -> Self {
+        Self {
+            name: req.name,
+            receiver: req.receiver,
+            params: req.params.clone(),
+            required_params: req.required_params,
+            ret: req.ret.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -388,6 +414,11 @@ pub(crate) enum DeclError {
         owner: NominalKey,
         name: Ident,
         surface: MethodSurface,
+        span: Option<SourceSpan>,
+    },
+    DuplicateContractRequirement {
+        contract: ContractKey,
+        name: Ident,
         span: Option<SourceSpan>,
     },
     DuplicateExtendMethod {
@@ -1172,7 +1203,11 @@ pub(crate) struct TypeAliasSchema {
 pub(crate) struct ContractSchema {
     pub(crate) key: ContractKey,
     pub(crate) visibility: Visibility,
+    pub(crate) includes: Vec<(ContractRef, SourceSpan)>,
+    pub(crate) direct_requirements: Vec<ContractRequirementSchema>,
     pub(crate) requirements: Vec<ContractRequirementSchema>,
+    pub(crate) contract_set: Option<ContractSetKey>,
+    pub(crate) policy: AccessPolicy,
     pub(crate) span: SourceSpan,
 }
 
@@ -1184,7 +1219,7 @@ pub(crate) struct ContractRequirementSchema {
     pub(crate) required_params: usize,
     pub(crate) ret: Type,
     pub(crate) generics_empty: bool,
-    pub(crate) span: SourceSpan,
+    pub(crate) span: Option<SourceSpan>,
 }
 
 #[derive(Clone)]
@@ -1283,6 +1318,44 @@ pub(crate) struct DeclTypeSite {
     pub(crate) module: ModuleScope,
     pub(crate) span: Span,
     pub(crate) generics: GenericTypeContext,
+    pub(crate) type_params: Vec<TypeParam>,
+}
+
+fn combined_type_params(owner: &[TypeParam], local: &[TypeParam]) -> Vec<TypeParam> {
+    owner.iter().chain(local).cloned().collect()
+}
+
+fn map_generic_bounds<F>(
+    module: &ModuleScope,
+    span: Span,
+    generics: &GenericTypeContext,
+    params: &mut GenericParams,
+    f: &mut F,
+) where
+    F: FnMut(DeclTypeSite, Type) -> Type,
+{
+    let type_params = params.type_params.clone();
+    for param in &mut params.type_params {
+        param.bounds = std::mem::take(&mut param.bounds)
+            .into_iter()
+            .filter_map(|bound| {
+                let site = DeclTypeSite {
+                    module: module.clone(),
+                    span,
+                    generics: generics.clone(),
+                    type_params: type_params.clone(),
+                };
+                match f(site, Type::Dyn(bound)) {
+                    Type::Dyn(bound)
+                        if !matches!(bound, ContractRef::Infer | ContractRef::Hole(_)) =>
+                    {
+                        Some(bound)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+    }
 }
 
 pub(crate) struct GenericContextError {
@@ -1407,11 +1480,20 @@ impl DeclarationIndex {
                 span,
                 &mut errors,
             );
+            map_generic_bounds(
+                &key.module,
+                span,
+                &owner_generics,
+                &mut schema.generics,
+                &mut f,
+            );
+            let owner_type_params = schema.generics.type_params.clone();
             for field in schema.fields.values_mut() {
                 let site = DeclTypeSite {
                     module: key.module.clone(),
                     span,
                     generics: owner_generics.clone(),
+                    type_params: owner_type_params.clone(),
                 };
                 field.ty = f(site, field.ty.clone());
             }
@@ -1424,11 +1506,15 @@ impl DeclarationIndex {
                     span,
                     &mut errors,
                 );
+                map_generic_bounds(&key.module, span, &generics, &mut method.generics, &mut f);
+                let type_params =
+                    combined_type_params(&owner_type_params, &method.generics.type_params);
                 for param in &mut method.params {
                     let site = DeclTypeSite {
                         module: key.module.clone(),
                         span,
                         generics: generics.clone(),
+                        type_params: type_params.clone(),
                     };
                     param.ty = f(site, param.ty.clone());
                 }
@@ -1436,6 +1522,7 @@ impl DeclarationIndex {
                     module: key.module.clone(),
                     span,
                     generics,
+                    type_params,
                 };
                 method.ret = f(site, method.ret.clone());
             }
@@ -1456,6 +1543,8 @@ impl DeclarationIndex {
                 span,
                 &mut errors,
             );
+            map_generic_bounds(&key.module, span, &generics, &mut schema.generics, &mut f);
+            let type_params = schema.generics.type_params.clone();
             for variant in schema.variants.values_mut() {
                 match &mut variant.payload {
                     VariantPayload::Unit => {}
@@ -1465,6 +1554,7 @@ impl DeclarationIndex {
                                 module: key.module.clone(),
                                 span,
                                 generics: generics.clone(),
+                                type_params: type_params.clone(),
                             };
                             *ty = f(site, ty.clone());
                         }
@@ -1475,6 +1565,7 @@ impl DeclarationIndex {
                                 module: key.module.clone(),
                                 span,
                                 generics: generics.clone(),
+                                type_params: type_params.clone(),
                             };
                             field.ty = f(site, field.ty.clone());
                         }
@@ -1488,19 +1579,24 @@ impl DeclarationIndex {
             let Some(schema) = self.contracts.get_mut(&key) else {
                 continue;
             };
-            for req in &mut schema.requirements {
+            for req in &mut schema.direct_requirements {
+                let Some(span) = req.span else {
+                    continue;
+                };
                 for param in &mut req.params {
                     let site = DeclTypeSite {
                         module: key.module.clone(),
-                        span: req.span.byte(),
+                        span: span.byte(),
                         generics: GenericTypeContext::default(),
+                        type_params: vec![],
                     };
                     param.ty = f(site, param.ty.clone());
                 }
                 let site = DeclTypeSite {
                     module: key.module.clone(),
-                    span: req.span.byte(),
+                    span: span.byte(),
                     generics: GenericTypeContext::default(),
+                    type_params: vec![],
                 };
                 req.ret = f(site, req.ret.clone());
             }
@@ -1519,10 +1615,18 @@ impl DeclarationIndex {
                 &mut errors,
             );
             schema.def.generic_context = generics.clone();
+            map_generic_bounds(
+                &schema.def.module,
+                schema.def.span.byte(),
+                &generics,
+                &mut schema.def.generics,
+                &mut f,
+            );
             let site = DeclTypeSite {
                 module: schema.def.module.clone(),
                 span: schema.def.span.byte(),
                 generics,
+                type_params: schema.def.generics.type_params.clone(),
             };
             schema.def.aliased = f(site, schema.def.aliased.clone());
         }
@@ -1538,10 +1642,13 @@ impl DeclarationIndex {
                 span,
                 &mut errors,
             );
+            map_generic_bounds(&origin, span, &generics, &mut extend.generics, &mut f);
+            let extend_type_params = extend.generics.type_params.clone();
             let target_site = DeclTypeSite {
                 module: origin.clone(),
                 span,
                 generics: generics.clone(),
+                type_params: extend_type_params.clone(),
             };
             extend.target = f(target_site, extend.target.clone());
             for method in extend.methods.values_mut() {
@@ -1553,11 +1660,21 @@ impl DeclarationIndex {
                     span,
                     &mut errors,
                 );
+                map_generic_bounds(
+                    &origin,
+                    span,
+                    &method_generics,
+                    &mut method.generics,
+                    &mut f,
+                );
+                let type_params =
+                    combined_type_params(&extend_type_params, &method.generics.type_params);
                 for param in &mut method.params {
                     let site = DeclTypeSite {
                         module: origin.clone(),
                         span,
                         generics: method_generics.clone(),
+                        type_params: type_params.clone(),
                     };
                     param.ty = f(site, param.ty.clone());
                 }
@@ -1565,6 +1682,7 @@ impl DeclarationIndex {
                     module: origin.clone(),
                     span,
                     generics: method_generics,
+                    type_params,
                 };
                 method.ret = f(site, method.ret.clone());
             }
@@ -1573,6 +1691,7 @@ impl DeclarationIndex {
                     module: origin.clone(),
                     span: cast.span.byte(),
                     generics: generics.clone(),
+                    type_params: extend_type_params.clone(),
                 };
                 cast.source = f(site.clone(), cast.source.clone());
                 if let Some(ret) = &mut cast.ret {
@@ -1594,25 +1713,41 @@ impl DeclarationIndex {
                 else {
                     continue;
                 };
-                let generics = match &value.decl {
-                    ValueDecl::Func(sig) => generic_context(
-                        value.module.clone(),
-                        &sig.generics.type_params,
-                        &sig.generics.const_params,
-                        span,
-                        &mut errors,
-                    ),
-                    ValueDecl::Const(_) => GenericTypeContext::default(),
-                };
-                let site = DeclTypeSite {
-                    module: value.module.clone(),
-                    span,
-                    generics,
-                };
                 match &mut value.decl {
-                    ValueDecl::Func(sig) if sig.kind == CallableKind::ExternFunction => {}
-                    ValueDecl::Func(sig) => sig.ty = f(site, sig.ty.clone()),
-                    ValueDecl::Const(sig) => sig.ty = f(site, sig.ty.clone()),
+                    ValueDecl::Func(sig) => {
+                        let generics = generic_context(
+                            value.module.clone(),
+                            &sig.generics.type_params,
+                            &sig.generics.const_params,
+                            span,
+                            &mut errors,
+                        );
+                        map_generic_bounds(
+                            &value.module,
+                            span,
+                            &generics,
+                            &mut sig.generics,
+                            &mut f,
+                        );
+                        if sig.kind != CallableKind::ExternFunction {
+                            let site = DeclTypeSite {
+                                module: value.module.clone(),
+                                span,
+                                generics,
+                                type_params: sig.generics.type_params.clone(),
+                            };
+                            sig.ty = f(site, sig.ty.clone());
+                        }
+                    }
+                    ValueDecl::Const(sig) => {
+                        let site = DeclTypeSite {
+                            module: value.module.clone(),
+                            span,
+                            generics: GenericTypeContext::default(),
+                            type_params: vec![],
+                        };
+                        sig.ty = f(site, sig.ty.clone());
+                    }
                 }
             }
         }
@@ -2098,6 +2233,12 @@ impl DeclarationIndex {
                 }
                 Stmt::Contract(contract_node) => {
                     let contract = &contract_node.node;
+                    let policy = annotation::normalize_annotations(
+                        source,
+                        &contract.annotations,
+                        annotation::AnnotationTarget::Contract,
+                        &mut self.errors,
+                    );
                     let key = ContractKey {
                         module: scope.clone(),
                         name: contract.name,
@@ -2122,7 +2263,7 @@ impl DeclarationIndex {
                                 ret: req.node.sig.ret.clone(),
                                 generics_empty: req.node.sig.type_params.is_empty()
                                     && req.node.sig.const_params.is_empty(),
-                                span: SourceSpan::from_byte_span(source, req.span),
+                                span: Some(SourceSpan::from_byte_span(source, req.span)),
                             })
                             .collect();
                         self.contracts.insert(
@@ -2130,7 +2271,20 @@ impl DeclarationIndex {
                             ContractSchema {
                                 key,
                                 visibility: contract.visibility,
-                                requirements,
+                                includes: contract
+                                    .includes
+                                    .iter()
+                                    .map(|include| {
+                                        (
+                                            include.node.clone(),
+                                            SourceSpan::from_byte_span(source, include.span),
+                                        )
+                                    })
+                                    .collect(),
+                                direct_requirements: requirements,
+                                requirements: vec![],
+                                contract_set: None,
+                                policy,
                                 span,
                             },
                         );
@@ -2538,6 +2692,12 @@ impl DeclarationIndex {
 
     pub(crate) fn local_value(&self, module: &ModuleScope, name: Ident) -> Option<ResolvedValue> {
         self.modules.get(module)?.locals.value(name).cloned()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &ResolvedValue> {
+        self.modules
+            .values()
+            .flat_map(|module| module.locals.values.values())
     }
 
     pub(crate) fn local_type_binding(
@@ -5360,6 +5520,7 @@ mod tests {
             type_params: vec![TypeParam {
                 name: ident("T"),
                 id: TypeVarId(0),
+                bounds: vec![],
             }],
             const_params: vec![],
         };

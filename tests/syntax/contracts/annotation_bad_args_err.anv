@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: invalid arguments for `@deprecated`
+
+@deprecated(reason = "use D")
+contract C {
+    fn f(self);
+}

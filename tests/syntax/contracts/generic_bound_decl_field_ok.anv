@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Named {
+    fn name(self) -> string;
+}
+
+struct Person {
+    fn name(self) -> string { "person" }
+}
+
+struct Box<T: Named> {
+    value: T,
+}
+
+struct Uses {
+    box: Box<Person>,
+}
+
+fn main() {}

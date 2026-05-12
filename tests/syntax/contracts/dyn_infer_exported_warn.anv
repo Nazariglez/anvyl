@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: exported function uses inferred dynamic contract
+
+struct Actor {
+    fn draw(self) {}
+}
+
+pub fn take(actor: dyn _) {
+    actor.draw();
+}
+
+fn main() {
+    take(Actor {});
+}

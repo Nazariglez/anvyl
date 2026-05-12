@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+struct Enemy {
+    hp: int,
+}
+
+extend Enemy {
+    fn update(var self, dt: float) {
+        self.hp -= 1;
+    }
+}
+
+fn tick<T: Updatable>(var actor: T, dt: float) {
+    actor.update(dt);
+}
+
+fn main() {
+    var enemy = Enemy { hp: 10 };
+    tick(enemy, 1.0);
+}

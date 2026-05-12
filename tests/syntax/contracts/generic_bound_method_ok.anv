@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Named {
+    fn name(self) -> string;
+}
+
+struct Person {
+    fn name(self) -> string { "Ada" }
+}
+
+struct Box<T> {
+    value: T,
+
+    fn label<U: Named>(self, value: U) -> string {
+        value.name()
+    }
+}
+
+fn main() {
+    let box = Box { value: 1 };
+    let label = box.label(Person {});
+}

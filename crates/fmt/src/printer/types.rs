@@ -115,7 +115,7 @@ impl Printer<'_> {
         }
     }
 
-    fn format_contract_ref(&mut self, contract: &ast::ContractRef) {
+    pub(super) fn format_contract_ref(&mut self, contract: &ast::ContractRef) {
         match contract {
             ast::ContractRef::Named {
                 qualifier, name, ..
@@ -126,6 +126,19 @@ impl Printer<'_> {
                 }
                 self.write_fmt(name);
             }
+            ast::ContractRef::Anonymous(surface) => {
+                self.write("{");
+                self.writeln();
+                self.indent();
+                for requirement in &surface.requirements {
+                    self.write_indent();
+                    self.format_anonymous_contract_requirement(requirement);
+                    self.writeln();
+                }
+                self.dedent();
+                self.write_indent();
+                self.write("}");
+            }
             ast::ContractRef::Intersection(contracts) => {
                 for (i, contract) in contracts.iter().enumerate() {
                     if i > 0 {
@@ -134,8 +147,33 @@ impl Printer<'_> {
                     self.format_contract_ref(contract);
                 }
             }
-            ast::ContractRef::Infer => self.write("_"),
+            ast::ContractRef::Infer | ast::ContractRef::Hole(_) => self.write("_"),
         }
+    }
+
+    fn format_anonymous_contract_requirement(
+        &mut self,
+        requirement: &ast::AnonymousContractRequirement,
+    ) {
+        self.write("fn ");
+        self.write_fmt(requirement.name);
+        self.write("(");
+        match requirement.receiver {
+            ast::MethodReceiver::Value => self.write("self"),
+            ast::MethodReceiver::Var => self.write("var self"),
+        }
+        for param in &requirement.params {
+            self.write(", ");
+            if param.mutable {
+                self.write("var ");
+            }
+            self.write_fmt(param.name);
+            self.write(": ");
+            self.format_type(&param.ty);
+        }
+        self.write(")");
+        self.format_return_type(&requirement.ret);
+        self.write(";");
     }
 
     fn format_nominal_type(&mut self, nominal: &ast::NominalType) {
@@ -197,6 +235,15 @@ impl Printer<'_> {
                 self.write(", ");
             }
             self.write_fmt(tp.name);
+            if !tp.bounds.is_empty() {
+                self.write(": ");
+                for (j, bound) in tp.bounds.iter().enumerate() {
+                    if j > 0 {
+                        self.write(" + ");
+                    }
+                    self.format_contract_ref(bound);
+                }
+            }
         }
         for (i, cp) in const_params.iter().enumerate() {
             if i > 0 || !type_params.is_empty() {

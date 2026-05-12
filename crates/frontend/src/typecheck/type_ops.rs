@@ -1,4 +1,7 @@
-use crate::ast::{ArrayLen, ConstArg, FuncParam, GenericArg, Ident, Type, TypeVarId};
+use crate::ast::{
+    AnonymousContract, AnonymousContractParam, AnonymousContractRequirement, ArrayLen, ConstArg,
+    ContractRef, FuncParam, GenericArg, Ident, Type, TypeVarId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UnresolvedTypeRef {
@@ -119,7 +122,7 @@ pub(crate) trait TypeFolder {
                     .collect(),
                 ret: Box::new(self.fold_type(ret)),
             },
-            Type::Dyn(contract) => Type::Dyn(contract.clone()),
+            Type::Dyn(contract) => Type::Dyn(self.fold_contract_ref(contract)),
             Type::Var(id) => self.fold_var(*id),
             Type::UnresolvedName(name) => self.fold_unresolved_name(*name),
             Type::UnresolvedNominal {
@@ -179,6 +182,45 @@ pub(crate) trait TypeFolder {
         len
     }
 
+    fn fold_contract_ref(&mut self, contract: &ContractRef) -> ContractRef {
+        let contract = match contract {
+            ContractRef::Anonymous(surface) => ContractRef::Anonymous(AnonymousContract {
+                requirements: surface
+                    .requirements
+                    .iter()
+                    .map(|req| AnonymousContractRequirement {
+                        receiver: req.receiver,
+                        name: req.name,
+                        params: req
+                            .params
+                            .iter()
+                            .map(|param| AnonymousContractParam {
+                                mutable: param.mutable,
+                                name: param.name,
+                                ty: self.fold_type(&param.ty),
+                            })
+                            .collect(),
+                        ret: self.fold_type(&req.ret),
+                    })
+                    .collect(),
+            }),
+            ContractRef::Intersection(contracts) => ContractRef::Intersection(
+                contracts
+                    .iter()
+                    .map(|c| self.fold_contract_ref(c))
+                    .collect(),
+            ),
+            ContractRef::Named { .. } | ContractRef::Infer | ContractRef::Hole(_) => {
+                contract.clone()
+            }
+        };
+        self.fold_contract_ref_leaf(contract)
+    }
+
+    fn fold_contract_ref_leaf(&mut self, contract: ContractRef) -> ContractRef {
+        contract
+    }
+
     fn fold_var(&mut self, id: TypeVarId) -> Type {
         Type::Var(id)
     }
@@ -227,7 +269,7 @@ pub(crate) trait TypeVisitor {
             Type::Func { params, ret } => {
                 params.iter().any(|param| self.visit_func_param(param)) || self.visit_type(ret)
             }
-            Type::Dyn(_) => false,
+            Type::Dyn(contract) => self.visit_contract_ref(contract),
             Type::Tuple(elems) => elems.iter().any(|ty| self.visit_type(ty)),
             Type::Nominal(nominal) => {
                 nominal.type_args.iter().any(|ty| self.visit_type(ty))
@@ -253,6 +295,24 @@ pub(crate) trait TypeVisitor {
             | Type::Var(_)
             | Type::UnresolvedName(_) => false,
         }
+    }
+
+    fn visit_contract_ref(&mut self, contract: &ContractRef) -> bool {
+        self.visit_contract_ref_leaf(contract)
+            || match contract {
+                ContractRef::Anonymous(surface) => surface.requirements.iter().any(|req| {
+                    req.params.iter().any(|param| self.visit_type(&param.ty))
+                        || self.visit_type(&req.ret)
+                }),
+                ContractRef::Intersection(contracts) => {
+                    contracts.iter().any(|c| self.visit_contract_ref(c))
+                }
+                ContractRef::Named { .. } | ContractRef::Infer | ContractRef::Hole(_) => false,
+            }
+    }
+
+    fn visit_contract_ref_leaf(&mut self, _contract: &ContractRef) -> bool {
+        false
     }
 
     fn visit_func_param(&mut self, param: &FuncParam) -> bool {

@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Actor {
+    fn update(var self, dt: float) {}
+}
+
+fn tick(var actor: dyn _) {
+    actor.update(1.0);
+}
+
+fn main() {
+    var actor = Actor {};
+    tick(actor);
+}

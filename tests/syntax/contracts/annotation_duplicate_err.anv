@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate annotation
+
+@deprecated
+@deprecated("use D")
+contract C {
+    fn f(self);
+}

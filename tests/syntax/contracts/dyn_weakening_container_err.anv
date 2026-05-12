@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Mismatched types
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+fn use_list(values: [dyn A]) {}
+
+fn main() {
+    let values: [dyn A + B] = [];
+    use_list(values);
+}

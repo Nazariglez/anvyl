@@ -7,7 +7,7 @@ use super::{
     check_expr_checked, checked_type,
     contracts::{self, DynamicMethodError},
     decls::{
-        CallableKind, CallableParent, CallableRef, ContractKey, ContractRequirementSchema,
+        CallableKind, CallableParent, CallableRef, ContractRequirementSchema, ContractSetKey,
         DeclError, ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface,
         ModuleMemberLookup, ModuleScope, ProjectionLookup, ResolvedValue, TypeBinding, ValueDecl,
         VariantPayload, nominal_type, owner_template,
@@ -59,8 +59,15 @@ pub(super) enum Subject {
         signature: ResolvedExternSignature,
     },
     DynMethod {
-        contract: ContractKey,
+        contract: ContractSetKey,
         requirement: ContractRequirementSchema,
+        receiver_access: PlaceAccess,
+        receiver_place: PlaceUseFacts,
+        receiver_id: ExprId,
+        name: Ident,
+    },
+    DynHoleMethod {
+        hole: crate::ast::DynContractHoleId,
         receiver_access: PlaceAccess,
         receiver_place: PlaceUseFacts,
         receiver_id: ExprId,
@@ -332,6 +339,10 @@ fn subject_type(subject: &Subject) -> Type {
             signature.to_func_type()
         }
         Subject::DynMethod { requirement, .. } => func_type(&requirement.params, &requirement.ret),
+        Subject::DynHoleMethod { .. } => Type::Func {
+            params: vec![],
+            ret: Box::new(Type::Void),
+        },
         Subject::Module(_) => Type::Void,
         Subject::Type(ty) => ty.clone(),
         Subject::QualifiedExtend { .. } | Subject::Error => Type::Infer,
@@ -427,7 +438,8 @@ fn apply_field(
         | Subject::QualifiedExtend { .. }
         | Subject::ExternMethod { .. }
         | Subject::ExternStatic { .. }
-        | Subject::DynMethod { .. } => {
+        | Subject::DynMethod { .. }
+        | Subject::DynHoleMethod { .. } => {
             field_access_on_non_aggregate(subject, field.node.field, kind, field.span, tc)
         }
         Subject::Error => Subject::Error,
@@ -459,13 +471,24 @@ fn named_value_subject(
 ) -> Subject {
     tc.warn_named_value_deprecated(value, name, span);
     let resolved = ResolvedValue {
-        module,
+        module: module.clone(),
         name,
         decl: value.clone(),
     };
+    let local_dyn_infer_ty = (module == tc.current_module
+        && super::dyn_infer::DynInference::has_raw_hole(value.ty()))
+    .then(|| tc.lookup(name))
+    .flatten()
+    .map(|info| tc.solver.local_type_to_type(info.type_id));
     match tc.decls.callable_for_value(&resolved) {
-        Some(callee) => callable_subject(callee, None),
-        None => value_subject(value.ty().clone(), tc),
+        Some(mut callee) => {
+            if let Some(Type::Func { params, ret }) = local_dyn_infer_ty {
+                callee.def.sig.params = params;
+                callee.def.sig.ret = *ret;
+            }
+            callable_subject(callee, None)
+        }
+        None => value_subject(local_dyn_infer_ty.unwrap_or_else(|| value.ty().clone()), tc),
     }
 }
 
@@ -740,6 +763,16 @@ fn apply_dyn_method(
     span: Span,
     tc: &mut TypeChecker,
 ) -> Subject {
+    if let Some(hole) = super::dyn_infer::hole_id(contract) {
+        return Subject::DynHoleMethod {
+            hole,
+            receiver_access,
+            receiver_place,
+            receiver_id,
+            name,
+        };
+    }
+
     match contracts::resolve_dynamic_method(tc, contract, name) {
         Ok((contract, requirement)) => Subject::DynMethod {
             contract,
@@ -751,8 +784,15 @@ fn apply_dyn_method(
         },
         Err(DynamicMethodError::Missing { contract }) => {
             tc.push_error(TypeError::DynamicMethodMissing {
-                contract: contract.name,
+                contract,
                 method: name,
+                span: tc.error_span(span),
+            });
+            Subject::Error
+        }
+        Err(DynamicMethodError::ConflictingRequirement(requirement)) => {
+            tc.push_error(TypeError::CompileError {
+                message: format!("conflicting contract requirement '{requirement}'"),
                 span: tc.error_span(span),
             });
             Subject::Error
@@ -1070,6 +1110,23 @@ fn apply_call(
             expected,
             tc,
         ),
+        Subject::DynHoleMethod {
+            hole,
+            receiver_access,
+            receiver_place,
+            receiver_id,
+            name,
+        } => check_dyn_hole_method_call(
+            *hole,
+            *receiver_access,
+            receiver_place,
+            *receiver_id,
+            *name,
+            call,
+            call_id,
+            expected,
+            tc,
+        ),
         Subject::ExternStatic {
             static_ref,
             signature,
@@ -1138,8 +1195,95 @@ fn call_value(callee_ty: Type, call: &CallNode, call_id: ExprId, tc: &mut TypeCh
     }
 }
 
+fn check_dyn_hole_method_call(
+    hole: crate::ast::DynContractHoleId,
+    receiver_access: PlaceAccess,
+    receiver_place: &PlaceUseFacts,
+    receiver_id: ExprId,
+    name: Ident,
+    call: &CallNode,
+    call_id: ExprId,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let receiver = if matches!(receiver_access, PlaceAccess::Mutable | PlaceAccess::DynView) {
+        MethodReceiver::Var
+    } else {
+        MethodReceiver::Value
+    };
+    let requires_mutable = matches!(receiver, MethodReceiver::Var);
+    if requires_mutable {
+        match mutating_receiver_error(receiver_access, name, tc.error_span(call.span)) {
+            Some(error) => {
+                tc.push_error(error);
+            }
+            None => {
+                place::record_facts_write(receiver_id, receiver_place, tc);
+            }
+        }
+    } else {
+        place::record_facts_read(receiver_id, receiver_place, tc);
+    }
+
+    let mut failed = false;
+    let mut params = Vec::with_capacity(call.node.args.len());
+    for arg in &call.node.args {
+        let checked = check_expr_checked(arg, tc);
+        let ty = checked.ty;
+        if matches!(ty, Type::Infer) {
+            tc.push_error(TypeError::CompileError {
+                message: format!("cannot infer parameter type for dynamic method '{name}'"),
+                span: tc.error_span(arg.span),
+            });
+            failed = true;
+        }
+        params.push(FuncParam::new(ty, false, false));
+    }
+
+    let ret = match expected {
+        Some(expected) => tc.handle_type(&expected),
+        None if tc.discard_depth > 0 => Type::Void,
+        None => {
+            tc.push_error(TypeError::CompileError {
+                message: format!("cannot infer return type for dynamic method '{name}'"),
+                span: tc.error_span(call.span),
+            });
+            failed = true;
+            Type::Infer
+        }
+    };
+
+    if !failed {
+        match tc.dyn_infer.collect_method(
+            hole,
+            name,
+            receiver,
+            params,
+            ret.clone(),
+            tc.source_span(call.span),
+        ) {
+            Ok(()) => tc.dyn_infer.add_call(
+                tc.current_module.clone(),
+                call_id,
+                receiver_id,
+                hole,
+                name,
+                call.node.args.len(),
+                requires_mutable,
+                tc.source_span(call.span),
+            ),
+            Err(message) => tc.push_error(TypeError::CompileError {
+                message,
+                span: tc.error_span(call.span),
+            }),
+        }
+    }
+
+    checked_type(ret, tc)
+}
+
 fn check_dyn_method_call(
-    contract: &ContractKey,
+    contract: &ContractSetKey,
     requirement: &ContractRequirementSchema,
     receiver_access: PlaceAccess,
     receiver_place: &PlaceUseFacts,
@@ -1278,6 +1422,9 @@ fn solve_generic_call_with(
             return None;
         }
     };
+    if !tc.check_generic_bounds(generics, &args, call_span) {
+        return None;
+    }
 
     let (type_subst, const_subst) = generics.substitutions(&args);
     let concrete_params =

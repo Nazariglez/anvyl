@@ -189,6 +189,14 @@ mod tests {
     }
 
     #[test]
+    fn exact_anonymous_dyn_contracts() {
+        assert_fmt(
+            "fn draw(x:dyn{fn draw(self);fn tick(var self,dt:float);}){}",
+            "fn draw(\n    x: dyn {\n        fn draw(self);\n        fn tick(var self, dt: float);\n    },\n) {}\n",
+        );
+    }
+
+    #[test]
     fn exact_type_aliases() {
         assert_fmt("type Id=int;", "type Id = int;\n");
         assert_fmt("type Pair<T> = (T,T);", "type Pair<T> = (T, T);\n");

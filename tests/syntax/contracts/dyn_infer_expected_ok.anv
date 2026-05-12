@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Actor {
+    fn draw(self) {}
+}
+
+fn take(actor: dyn Drawable) {}
+
+fn main() {
+    let actor: dyn _ = Actor {};
+    take(actor);
+}

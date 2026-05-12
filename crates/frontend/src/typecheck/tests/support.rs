@@ -6,8 +6,9 @@ use crate::{
     span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
     typecheck::{
-        self, ArgumentProjectionMap, CallMap, DeprecatedUseKind, ExternUseMap, MemberPathMap,
-        TypeError, TypeWarning, decls::DeclarationIndex,
+        self, ArgumentProjectionMap, CallMap, ContractWitnessMap, DeprecatedUseKind, DynCallMap,
+        DynConversionMap, DynWeakeningMap, ExternUseMap, MemberPathMap, TypeError, TypeWarning,
+        decls::DeclarationIndex,
     },
 };
 
@@ -17,6 +18,10 @@ pub(crate) struct TypecheckTestResult {
     extern_uses: ExternUseMap,
     member_paths: MemberPathMap,
     argument_projections: ArgumentProjectionMap,
+    contract_witnesses: ContractWitnessMap,
+    dyn_conversions: DynConversionMap,
+    dyn_weakenings: DynWeakeningMap,
+    dyn_calls: DynCallMap,
     warnings: Vec<TypeWarning>,
     decls: DeclarationIndex,
     externs: ExternCatalog,
@@ -41,6 +46,22 @@ impl TypecheckTestResult {
 
     pub(crate) fn argument_projections(&self) -> &ArgumentProjectionMap {
         &self.argument_projections
+    }
+
+    pub(crate) fn contract_witnesses(&self) -> &ContractWitnessMap {
+        &self.contract_witnesses
+    }
+
+    pub(crate) fn dyn_conversions(&self) -> &DynConversionMap {
+        &self.dyn_conversions
+    }
+
+    pub(crate) fn dyn_weakenings(&self) -> &DynWeakeningMap {
+        &self.dyn_weakenings
+    }
+
+    pub(crate) fn dyn_calls(&self) -> &DynCallMap {
+        &self.dyn_calls
     }
 
     pub(crate) fn warnings(&self) -> &[TypeWarning] {
@@ -155,6 +176,10 @@ pub(crate) fn check_with_raw_externs(
         extern_uses: tc.extern_uses,
         member_paths: tc.member_paths,
         argument_projections: tc.argument_projections,
+        contract_witnesses: tc.contract_witnesses,
+        dyn_conversions: tc.dyn_conversions,
+        dyn_weakenings: tc.dyn_weakenings,
+        dyn_calls: tc.dyn_calls,
         warnings: tc.warnings,
         decls: tc.decls,
         externs: tc.externs,

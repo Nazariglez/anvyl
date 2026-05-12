@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+struct Both {
+    fn a(self) {}
+    fn b(self) {}
+}
+
+fn main() {
+    let both: dyn A + B = Both {};
+    let maybe_a: dyn A? = both;
+}

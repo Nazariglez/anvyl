@@ -1252,6 +1252,7 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::DuplicateModuleBinding { span, .. }
         | DeclError::DuplicateGenericParam { span, .. }
         | DeclError::DuplicateAggregateMethod { span, .. }
+        | DeclError::DuplicateContractRequirement { span, .. }
         | DeclError::DuplicateExtendMethod { span, .. }
         | DeclError::DuplicateCastFrom { span, .. }
         | DeclError::PointlessCastFrom { span, .. }
@@ -1689,6 +1690,7 @@ fn render_deprecated_use_kind(kind: DeprecatedUseKind) -> &'static str {
         DeprecatedUseKind::Const => "const",
         DeprecatedUseKind::ExternType => "extern type",
         DeprecatedUseKind::TypeAlias => "type alias",
+        DeprecatedUseKind::Contract => "contract",
         DeprecatedUseKind::Struct => "struct",
         DeprecatedUseKind::DataRef => "dataref",
         DeprecatedUseKind::Enum => "enum",
@@ -1780,6 +1782,10 @@ fn render_decl_error(error: &DeclError) -> String {
             "duplicate {} method '{name}' on type '{}'",
             surface.label(),
             owner.name
+        ),
+        DeclError::DuplicateContractRequirement { contract, name, .. } => format!(
+            "duplicate contract requirement '{name}' in contract '{}'",
+            contract.name
         ),
         DeclError::DuplicateExtendMethod { name, surface, .. } => {
             format!("duplicate extend {} method '{name}'", surface.label())
@@ -2335,6 +2341,14 @@ mod tests {
             (
                 DeprecatedUseKind::ExternType,
                 "use of deprecated extern type 'old'",
+            ),
+            (
+                DeprecatedUseKind::TypeAlias,
+                "use of deprecated type alias 'old'",
+            ),
+            (
+                DeprecatedUseKind::Contract,
+                "use of deprecated contract 'old'",
             ),
             (DeprecatedUseKind::Struct, "use of deprecated struct 'old'"),
             (DeprecatedUseKind::Enum, "use of deprecated enum 'old'"),

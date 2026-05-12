@@ -1,0 +1,9 @@
+// @helper
+
+pub contract A {
+    fn a(self);
+}
+
+pub struct Box<T: A> {
+    value: T,
+}

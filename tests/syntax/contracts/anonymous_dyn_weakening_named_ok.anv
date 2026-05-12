@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+contract Tickable {
+    fn tick(var self, dt: float);
+}
+
+struct Sprite {
+    fn draw(self) {}
+    fn tick(var self, dt: float) {}
+}
+
+fn take_draw(value: dyn { fn draw(self); }) {
+    value.draw();
+}
+
+fn main() {
+    let sprite: dyn Drawable + Tickable = Sprite {};
+    take_draw(sprite);
+}

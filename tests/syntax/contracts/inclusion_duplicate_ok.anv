@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract A {
+    fn draw(self);
+}
+
+contract B {
+    fn draw(self);
+}
+
+contract C {
+    A;
+    B;
+}
+
+struct Sprite {
+    fn draw(self) {}
+}
+
+fn render(sprite: Sprite) {
+    let actor: dyn C = sprite;
+    actor.draw();
+}

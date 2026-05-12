@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: incompatible parameter
+
+struct Sprite {
+    fn draw(self, dt: int) {}
+}
+
+fn main() {
+    let sprite: dyn { fn draw(self, dt: float); } = Sprite {};
+}

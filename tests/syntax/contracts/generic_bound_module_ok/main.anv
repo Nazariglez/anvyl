@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import api { take };
+import thing { Thing };
+
+fn main() {
+    take(Thing {});
+}

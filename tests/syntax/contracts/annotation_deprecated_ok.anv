@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+@deprecated
+contract Old {
+    fn f(self);
+}
+
+fn main() {}

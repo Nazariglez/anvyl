@@ -1,0 +1,38 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+contract Drawable {
+    fn draw(self);
+}
+
+contract Actor {
+    Updatable;
+    Drawable;
+}
+
+struct Enemy {
+    hp: int,
+}
+
+extend Enemy {
+    fn update(var self, dt: float) {
+        self.hp -= 1;
+    }
+
+    fn draw(self) {}
+}
+
+fn tick(var actor: dyn Actor, dt: float) {
+    actor.update(dt);
+    actor.draw();
+}
+
+fn main() {
+    var enemy = Enemy { hp: 10 };
+    tick(enemy, 1.0);
+}
