@@ -801,7 +801,7 @@ impl<'tc> PatternChecker<'tc> {
                 let ty = nominal_type(&key);
                 StructPatternTarget::Found(key, ty)
             }
-            TypeBinding::Alias(_) => {
+            TypeBinding::Alias(_) | TypeBinding::Contract(_) => {
                 let expanded = self
                     .tc
                     .resolve_type_for_tc_at(&Type::UnresolvedName(name), span);

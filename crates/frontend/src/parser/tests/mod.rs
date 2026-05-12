@@ -1,5 +1,6 @@
 mod helpers;
 
+mod contracts;
 mod doc_comments;
 mod expr;
 mod fixtures;

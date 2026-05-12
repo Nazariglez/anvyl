@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: accessing internal method 'reset' of type 'Item'
+
+import internal_witness_helper { Item, Resettable };
+
+fn main() {
+    var item = Item {};
+    let resettable: dyn Resettable = item;
+}

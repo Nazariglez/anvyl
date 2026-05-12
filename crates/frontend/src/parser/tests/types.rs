@@ -433,3 +433,51 @@ fn rejects_labelled_tuple_type() {
 fn rejects_single_labelled_tuple_type() {
     parse_type_err("(a: int)");
 }
+
+#[test]
+fn dyn_named_type() {
+    let ty = parse_type("dyn Updatable");
+    assert_eq!(
+        ty,
+        ast::Type::Dyn(ast::ContractRef::Named {
+            qualifier: None,
+            name: ast::Ident::new("Updatable"),
+            origin: None,
+        })
+    );
+}
+
+#[test]
+fn dyn_qualified_type() {
+    let ty = parse_type("dyn contracts.Updatable");
+    assert_eq!(
+        ty,
+        ast::Type::Dyn(ast::ContractRef::Named {
+            qualifier: Some(ast::Ident::new("contracts")),
+            name: ast::Ident::new("Updatable"),
+            origin: None,
+        })
+    );
+}
+
+#[test]
+fn dyn_nested_type_positions() {
+    let ty = parse_type("fn(var dyn Updatable) -> [dyn Drawable?]");
+    let ast::Type::Func { params, ret } = ty else {
+        panic!("expected function type");
+    };
+    assert_eq!(params.len(), 1);
+    assert!(params[0].mutable);
+    assert!(matches!(params[0].ty, ast::Type::Dyn(_)));
+    let ast::Type::List { elem } = *ret else {
+        panic!("expected list return type");
+    };
+    assert!(elem.is_option());
+}
+
+#[test]
+fn dyn_deferred_forms_reject() {
+    parse_type_err("dyn A + B");
+    parse_type_err("dyn _");
+    parse_type_err("dyn { fn f(self); }");
+}

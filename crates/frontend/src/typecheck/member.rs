@@ -58,6 +58,7 @@ pub(super) enum FieldResolution {
     },
 }
 
+#[derive(Clone)]
 pub(super) struct MethodAccess {
     pub(super) callee: CallableRef,
     pub(super) mode: MethodMode,
@@ -65,6 +66,7 @@ pub(super) struct MethodAccess {
     pub(super) origin: ModuleScope,
 }
 
+#[derive(Clone)]
 pub(super) struct ExtendMethodAccess {
     pub(super) callee: CallableRef,
     pub(super) mode: MethodMode,
@@ -72,6 +74,7 @@ pub(super) struct ExtendMethodAccess {
     pub(super) method: ExtendMethodSchema,
 }
 
+#[derive(Clone)]
 pub(super) struct ExternMethodAccess {
     pub(super) method_ref: ExternMethodRef,
     pub(super) receiver: anvyx_externs::ReceiverMode,
@@ -79,6 +82,7 @@ pub(super) struct ExternMethodAccess {
     pub(super) signature: ResolvedExternSignature,
 }
 
+#[derive(Clone)]
 pub(super) struct PromotedMethodAccess {
     pub(super) path: Vec<Ident>,
     pub(super) origin_owner: Type,
@@ -87,6 +91,7 @@ pub(super) struct PromotedMethodAccess {
     pub(super) target: PromotedMethodTarget,
 }
 
+#[derive(Clone)]
 pub(super) enum PromotedMethodTarget {
     Aggregate(Box<MethodAccess>),
     Extern(ExternMethodAccess),

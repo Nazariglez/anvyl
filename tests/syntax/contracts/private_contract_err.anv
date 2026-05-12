@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unknown contract 'helper.Hidden'
+
+import contract_use_helper as helper;
+
+fn take(action: dyn helper.Hidden) {}

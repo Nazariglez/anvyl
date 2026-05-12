@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+/// Values that can update themselves.
+pub contract Updatable {
+    fn update(var self, dt: float);
+    fn alive(self) -> bool;
+}
+
+fn main() {}

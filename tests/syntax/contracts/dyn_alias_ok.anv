@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Action {
+    fn act(self);
+}
+
+type AnyAction = dyn Action;
+
+fn take(a: AnyAction) -> AnyAction {
+    a
+}

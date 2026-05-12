@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unexpected token '{'
+
+fn take(a: dyn { fn f(self); }) {}

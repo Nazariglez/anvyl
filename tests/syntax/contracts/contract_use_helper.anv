@@ -1,0 +1,17 @@
+// @helper
+
+contract Hidden {
+    fn hidden(self);
+}
+
+pub contract PublicAction {
+    fn act(self);
+}
+
+pub struct PublicActor {
+    fn act(self) {}
+}
+
+pub fn take_public_action(action: dyn PublicAction) {
+    action.act();
+}

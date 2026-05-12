@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Named {
+    fn name(self) -> string;
+}
+
+struct Enemy {
+    fn name(self) -> string {
+        "enemy"
+    }
+}
+
+fn main() {
+    let actor: dyn Named = Enemy {};
+    let name: string = actor.name();
+}

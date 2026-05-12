@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Mismatched types
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+struct Enemy {
+    fn update(var self, dt: float) {}
+}
+
+fn main() {
+    var actor: dyn Updatable = Enemy {};
+    actor.update("bad");
+}

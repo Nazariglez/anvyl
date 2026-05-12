@@ -1,0 +1,7 @@
+// @helper
+
+contract Hidden {
+    fn hide(self);
+}
+
+pub type Leaked = dyn Hidden;

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import contract_use_helper as helper;
+
+fn take(action: dyn helper.PublicAction) {}

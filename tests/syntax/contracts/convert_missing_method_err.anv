@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Enemy does not satisfy Updatable: missing method 'update'
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+struct Enemy {
+    hp: int,
+}
+
+fn main() {
+    let actor: dyn Updatable = Enemy { hp: 10 };
+}

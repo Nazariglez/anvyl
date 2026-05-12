@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: immutable binding 'enemy' cannot be passed to var parameter
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+struct Enemy {
+    fn update(var self, dt: float) {}
+}
+
+fn tick(var actor: dyn Updatable, dt: float) {}
+
+fn main() {
+    let enemy = Enemy {};
+    tick(enemy, 1.0);
+}

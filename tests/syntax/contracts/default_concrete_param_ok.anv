@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self, layer: int);
+}
+
+struct Sprite {
+    fn draw(self, layer: int = 0) {}
+}
+
+fn main() {
+    let drawable: dyn Drawable = Sprite {};
+}

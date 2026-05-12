@@ -216,6 +216,17 @@ pub struct NominalType {
     pub origin: Option<ModuleOrigin>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContractRef {
+    Named {
+        qualifier: Option<Ident>,
+        name: Ident,
+        origin: Option<ModuleOrigin>,
+    },
+    Intersection(Vec<ContractRef>),
+    Infer,
+}
+
 #[derive(Debug, Clone)]
 pub enum Type {
     Infer,
@@ -230,6 +241,7 @@ pub enum Type {
         params: Vec<FuncParam>,
         ret: Box<Type>,
     },
+    Dyn(ContractRef),
     Var(TypeVarId),
     UnresolvedName(Ident),
     UnresolvedNominal {
@@ -276,6 +288,7 @@ impl PartialEq for Type {
                     ret: r2,
                 },
             ) => p1 == p2 && r1 == r2,
+            (Self::Dyn(a), Self::Dyn(b)) => a == b,
             (Self::Var(a), Self::Var(b)) => a == b,
             (Self::UnresolvedName(a), Self::UnresolvedName(b)) => a == b,
             (
@@ -315,6 +328,7 @@ impl std::hash::Hash for Type {
                 params.hash(state);
                 ret.hash(state);
             }
+            Type::Dyn(contract) => contract.hash(state),
             Type::Var(id) => id.hash(state),
             Type::UnresolvedName(ident) => ident.hash(state),
             Type::UnresolvedNominal {
@@ -521,6 +535,31 @@ fn fmt_generic_args(
     write!(f, ">")
 }
 
+impl Display for ContractRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Named {
+                qualifier, name, ..
+            } => {
+                if let Some(qualifier) = qualifier {
+                    write!(f, "{qualifier}.")?;
+                }
+                write!(f, "{name}")
+            }
+            Self::Intersection(contracts) => {
+                for (i, contract) in contracts.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " + ")?;
+                    }
+                    write!(f, "{contract}")?;
+                }
+                Ok(())
+            }
+            Self::Infer => write!(f, "_"),
+        }
+    }
+}
+
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -548,6 +587,7 @@ impl Display for Type {
                 }
                 Ok(())
             }
+            Self::Dyn(contract) => write!(f, "dyn {contract}"),
             Self::Var(id) => write!(f, "{id}"),
             Self::UnresolvedName(ident) => write!(f, "{ident}"),
             Self::UnresolvedNominal {
@@ -1011,6 +1051,19 @@ pub struct TypeAliasDecl {
     pub type_params: Vec<TypeParam>,
     pub const_params: Vec<ConstParam>,
     pub aliased: Type,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractDecl {
+    pub doc: Option<String>,
+    pub visibility: Visibility,
+    pub name: Ident,
+    pub requirements: Vec<ContractRequirementNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractRequirement {
+    pub sig: MethodSig,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1514,6 +1567,7 @@ pub enum Stmt {
     Extend(ExtendDeclNode),
     Const(ConstDeclNode),
     TypeAlias(TypeAliasDeclNode),
+    Contract(ContractDeclNode),
     Expr(ExprNode),
     Binding(BindingNode),
     LetElse(LetElseNode),
@@ -1614,7 +1668,7 @@ pub enum ExternReceiverMode {
     Mutable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MethodReceiver {
     Value,
     Var,
@@ -1696,6 +1750,8 @@ pub type CastNode = Spanned<Cast>;
 pub type TryNode = Spanned<Try>;
 pub type ConstDeclNode = Spanned<ConstDecl>;
 pub type TypeAliasDeclNode = Spanned<TypeAliasDecl>;
+pub type ContractDeclNode = Spanned<ContractDecl>;
+pub type ContractRequirementNode = Spanned<ContractRequirement>;
 
 #[cfg(test)]
 mod tests {

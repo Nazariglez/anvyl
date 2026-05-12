@@ -65,6 +65,7 @@ fn type_contains_slice(ty: &Type) -> bool {
         | Type::Bool
         | Type::String
         | Type::Void
+        | Type::Dyn(_)
         | Type::Var(_)
         | Type::UnresolvedName(_) => false,
     }
@@ -134,23 +135,36 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
             )
             .then_ignore(select! { Token::Op(Op::GreaterThan) => () });
 
-        let type_name_ref = identifier()
+        let name_ref = identifier()
             .then(
                 select! { Token::Dot => () }
                     .ignore_then(identifier())
                     .or_not(),
             )
-            .then(generic_args.or_not())
-            .map(|((qualifier_ident, name_ident), generic_args)| {
-                let (qualifier, name) = match name_ident {
-                    Some(name) => (Some(qualifier_ident), name),
-                    None => (None, qualifier_ident),
-                };
-                Type::UnresolvedNominal {
+            .map(|(qualifier_ident, name_ident)| match name_ident {
+                Some(name) => (Some(qualifier_ident), name),
+                None => (None, qualifier_ident),
+            });
+
+        let type_name_ref = name_ref.clone().then(generic_args.or_not()).map(
+            |((qualifier, name), generic_args)| Type::UnresolvedNominal {
+                qualifier,
+                name,
+                generic_args: generic_args.unwrap_or_default(),
+            },
+        );
+
+        let dyn_type = select! { Token::Ident(i) if i.0.as_ref() == "dyn" => () }
+            .ignore_then(name_ref)
+            .validate(|(qualifier, name), extra, emitter| {
+                if name.0.as_ref() == "_" {
+                    emitter.emit(Rich::custom(extra.span(), "`dyn _` is not supported yet"));
+                }
+                Type::Dyn(ast::ContractRef::Named {
                     qualifier,
                     name,
-                    generic_args: generic_args.unwrap_or_default(),
-                }
+                    origin: None,
+                })
             });
 
         let paren_type = paren_or_tuple_type(type_parser.clone());
@@ -253,6 +267,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
         let primary_type = choice((
             builtin_typ,
             slice_type,
+            dyn_type,
             type_name_ref,
             paren_type,
             bracketed_type,

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Sprite {
+    fn draw(self) {}
+}
+
+fn draw_one(sprite: dyn Drawable) {}
+
+fn main() {
+    draw_one(Sprite {});
+}

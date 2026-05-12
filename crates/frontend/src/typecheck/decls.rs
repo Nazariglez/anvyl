@@ -46,7 +46,7 @@ impl ModuleScope {
         Self::Package(module.clone())
     }
 
-    fn nominal_origin(&self) -> Option<ModuleOrigin> {
+    pub(crate) fn nominal_origin(&self) -> Option<ModuleOrigin> {
         match self {
             ModuleScope::Root => None,
             ModuleScope::Named(path) => Some(ModuleOrigin::Module(path.to_ast_path())),
@@ -73,7 +73,7 @@ impl ModuleScope {
         }
     }
 
-    fn from_nominal_origin(origin: &ModuleOrigin) -> Self {
+    pub(crate) fn from_nominal_origin(origin: &ModuleOrigin) -> Self {
         match origin {
             ModuleOrigin::Module(path) => Self::Named(
                 ModulePath::new(path.iter().cloned().collect())
@@ -119,9 +119,16 @@ pub(crate) struct TypeAliasKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ContractKey {
+    pub(crate) module: ModuleScope,
+    pub(crate) name: Ident,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TypeBinding {
     Nominal(NominalKey),
     Alias(TypeAliasKey),
+    Contract(ContractKey),
 }
 
 impl TypeBinding {
@@ -129,20 +136,21 @@ impl TypeBinding {
         match self {
             Self::Nominal(key) => &key.module,
             Self::Alias(key) => &key.module,
+            Self::Contract(key) => &key.module,
         }
     }
 
     pub(crate) fn as_nominal(&self) -> Option<&NominalKey> {
         match self {
             Self::Nominal(key) => Some(key),
-            Self::Alias(_) => None,
+            Self::Alias(_) | Self::Contract(_) => None,
         }
     }
 
     pub(crate) fn into_nominal(self) -> Option<NominalKey> {
         match self {
             Self::Nominal(key) => Some(key),
-            Self::Alias(_) => None,
+            Self::Alias(_) | Self::Contract(_) => None,
         }
     }
 }
@@ -426,6 +434,11 @@ pub(crate) enum DeclError {
         ty: Type,
         span: Option<SourceSpan>,
     },
+    PublicContractPrivateType {
+        name: Ident,
+        ty: Type,
+        span: Option<SourceSpan>,
+    },
     ExtendMethodConflict {
         ty: Type,
         name: Ident,
@@ -579,6 +592,7 @@ pub(crate) struct DeclarationIndex {
     enums: HashMap<NominalKey, EnumSchema>,
     extends: Vec<ExtendSchema>,
     type_aliases: HashMap<TypeAliasKey, TypeAliasSchema>,
+    contracts: HashMap<ContractKey, ContractSchema>,
     extern_type_policies: HashMap<NominalKey, AccessPolicy>,
     value_spans: HashMap<(ModuleScope, Ident), Span>,
     type_spans: HashMap<NominalKey, Span>,
@@ -1155,6 +1169,25 @@ pub(crate) struct TypeAliasSchema {
 }
 
 #[derive(Clone)]
+pub(crate) struct ContractSchema {
+    pub(crate) key: ContractKey,
+    pub(crate) visibility: Visibility,
+    pub(crate) requirements: Vec<ContractRequirementSchema>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone)]
+pub(crate) struct ContractRequirementSchema {
+    pub(crate) name: Ident,
+    pub(crate) receiver: Option<MethodReceiver>,
+    pub(crate) params: Vec<FuncParam>,
+    pub(crate) required_params: usize,
+    pub(crate) ret: Type,
+    pub(crate) generics_empty: bool,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone)]
 pub(crate) struct FieldSchema {
     pub(crate) ty: Type,
     pub(crate) has_default: bool,
@@ -1447,6 +1480,29 @@ impl DeclarationIndex {
                         }
                     }
                 }
+            }
+        }
+
+        let contract_keys = self.contracts.keys().cloned().collect::<Vec<_>>();
+        for key in contract_keys {
+            let Some(schema) = self.contracts.get_mut(&key) else {
+                continue;
+            };
+            for req in &mut schema.requirements {
+                for param in &mut req.params {
+                    let site = DeclTypeSite {
+                        module: key.module.clone(),
+                        span: req.span.byte(),
+                        generics: GenericTypeContext::default(),
+                    };
+                    param.ty = f(site, param.ty.clone());
+                }
+                let site = DeclTypeSite {
+                    module: key.module.clone(),
+                    span: req.span.byte(),
+                    generics: GenericTypeContext::default(),
+                };
+                req.ret = f(site, req.ret.clone());
             }
         }
 
@@ -2036,6 +2092,46 @@ impl DeclarationIndex {
                                     span,
                                 },
                                 visibility: alias.visibility,
+                            },
+                        );
+                    }
+                }
+                Stmt::Contract(contract_node) => {
+                    let contract = &contract_node.node;
+                    let key = ContractKey {
+                        module: scope.clone(),
+                        name: contract.name,
+                    };
+                    if self.insert_local_type(
+                        &mut decls,
+                        &scope,
+                        contract.name,
+                        TypeBinding::Contract(key.clone()),
+                        exported,
+                        Some(SourceSpan::from_byte_span(source, contract_node.span)),
+                    ) {
+                        let span = SourceSpan::from_byte_span(source, contract_node.span);
+                        let requirements = contract
+                            .requirements
+                            .iter()
+                            .map(|req| ContractRequirementSchema {
+                                name: req.node.sig.name,
+                                receiver: req.node.sig.receiver,
+                                params: resolve_func_params(&req.node.sig.params),
+                                required_params: required_param_count(&req.node.sig.params),
+                                ret: req.node.sig.ret.clone(),
+                                generics_empty: req.node.sig.type_params.is_empty()
+                                    && req.node.sig.const_params.is_empty(),
+                                span: SourceSpan::from_byte_span(source, req.span),
+                            })
+                            .collect();
+                        self.contracts.insert(
+                            key.clone(),
+                            ContractSchema {
+                                key,
+                                visibility: contract.visibility,
+                                requirements,
+                                span,
                             },
                         );
                     }
@@ -2770,6 +2866,18 @@ impl DeclarationIndex {
         self.type_aliases.values()
     }
 
+    pub(crate) fn contract(&self, key: &ContractKey) -> Option<&ContractSchema> {
+        self.contracts.get(key)
+    }
+
+    pub(crate) fn contracts(&self) -> impl Iterator<Item = &ContractSchema> {
+        self.contracts.values()
+    }
+
+    pub(crate) fn contracts_mut(&mut self) -> impl Iterator<Item = &mut ContractSchema> {
+        self.contracts.values_mut()
+    }
+
     pub(crate) fn nominal_generics(&self, key: &NominalKey) -> Option<GenericParams> {
         match key.kind {
             NominalKind::Struct | NominalKind::DataRef => {
@@ -2878,6 +2986,7 @@ impl DeclarationIndex {
             | Type::Float
             | Type::Void
             | Type::Func { .. }
+            | Type::Dyn(_)
             | Type::List { .. }
             | Type::Array { .. }
             | Type::Map { .. }
@@ -4449,7 +4558,7 @@ fn insert_merged_aliases(
 }
 
 fn shortest_implicit_aliases(aliases: Vec<PromotedAlias>) -> Vec<PromotedAlias> {
-    let Some(path_len) = aliases.iter().map(|alias| alias.path_len()).min() else {
+    let Some(path_len) = aliases.iter().map(PromotedAlias::path_len).min() else {
         return vec![];
     };
     aliases
@@ -4502,6 +4611,7 @@ fn concrete_surface_type(ty: &Type) -> bool {
             params.iter().all(|param| concrete_surface_type(&param.ty))
                 && concrete_surface_type(ret)
         }
+        Type::Dyn(_) => true,
         Type::Tuple(elems) => elems.iter().all(concrete_surface_type),
         Type::Nominal(nominal) => {
             nominal.type_args.iter().all(concrete_surface_type)
@@ -4594,6 +4704,7 @@ fn stmt_visibility(stmt: &StmtNode) -> Visibility {
         Stmt::Enum(n) => n.node.visibility,
         Stmt::Const(n) => n.node.visibility,
         Stmt::TypeAlias(n) => n.node.visibility,
+        Stmt::Contract(n) => n.node.visibility,
         _ => Visibility::Private,
     }
 }

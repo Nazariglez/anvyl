@@ -90,7 +90,7 @@ pub(super) fn check_checked_value(
     }
 
     let expected = tc.type_handle(&boundary.ty);
-    tc.expect_assignable(expr.span, checked.handle.clone(), expected);
+    tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
     let failed = tc.solve_constraints();
     any_ok && !failed
 }

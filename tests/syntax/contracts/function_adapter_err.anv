@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Mismatched types
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Sprite {
+    fn draw(self) {}
+}
+
+fn make_sprite() -> Sprite {
+    Sprite {}
+}
+
+fn main() {
+    let f: fn() -> dyn Drawable = make_sprite;
+}

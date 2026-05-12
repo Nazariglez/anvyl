@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: type 'dyn Action' is not keyable and cannot be used as map key
+
+contract Action {
+    fn act(self);
+}
+
+fn take(map: [dyn Action: int]) {}

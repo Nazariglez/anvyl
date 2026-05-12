@@ -1,0 +1,7 @@
+// @helper
+
+struct Hidden {}
+
+pub contract Leaky {
+    fn hidden(self) -> Hidden;
+}

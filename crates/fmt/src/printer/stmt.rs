@@ -119,6 +119,7 @@ impl Printer<'_> {
             ast::Stmt::Import(imp) => self.format_import(&imp.node),
             ast::Stmt::Const(c) => self.format_const(&c.node),
             ast::Stmt::TypeAlias(alias) => self.format_type_alias(&alias.node),
+            ast::Stmt::Contract(contract) => self.format_contract(&contract.node),
             ast::Stmt::Aggregate(s) => self.format_aggregate(&s.node),
             ast::Stmt::Enum(e) => self.format_enum(&e.node),
             ast::Stmt::Extend(ext) => self.format_extend(&ext.node),

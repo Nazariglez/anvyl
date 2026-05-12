@@ -545,6 +545,18 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::AnyOutsideExternBoundary { .. } => {
             "any is only allowed in extern boundary signatures".to_string()
         }
+        TypeError::ContractUnsatisfied {
+            ty,
+            contract,
+            detail,
+            ..
+        } => format!("{ty} does not satisfy {contract}: {detail}"),
+        TypeError::DynamicMethodMissing {
+            contract, method, ..
+        } => format!("dynamic contract '{contract}' has no method '{method}'"),
+        TypeError::BorrowedDynReassign { name, .. } => {
+            format!("cannot reassign borrowed dynamic parameter '{name}'")
+        }
         TypeError::RecursiveInference { .. } => {
             "recursive type inference is not allowed".to_string()
         }
@@ -1222,6 +1234,9 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::GenericArgKindMismatch { span, .. }
         | TypeError::ExternAnyEscape { span, .. }
         | TypeError::AnyOutsideExternBoundary { span, .. }
+        | TypeError::ContractUnsatisfied { span, .. }
+        | TypeError::DynamicMethodMissing { span, .. }
+        | TypeError::BorrowedDynReassign { span, .. }
         | TypeError::DuplicateGenericParam { span, .. } => *span,
         TypeError::GenericArity(_) => None,
     }
@@ -1247,6 +1262,7 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::UnusedAliasTypeParam { span, .. }
         | DeclError::UnusedAliasConstParam { span, .. }
         | DeclError::PublicAliasPrivateType { span, .. }
+        | DeclError::PublicContractPrivateType { span, .. }
         | DeclError::ExtendMethodConflict { span, .. }
         | DeclError::ReexportConflict { span, .. }
         | DeclError::UnknownType { span, .. }
@@ -1338,6 +1354,7 @@ fn render_surface_type(ty: &Type) -> String {
         Type::Slice { elem } => format!("slice[{}]", render_surface_type(elem)),
         Type::Tuple(elems) => render_wrapped_types("(", ")", elems, render_surface_type),
         Type::Func { .. }
+        | Type::Dyn(_)
         | Type::Infer
         | Type::InferReturn
         | Type::Any
@@ -1795,6 +1812,9 @@ fn render_decl_error(error: &DeclError) -> String {
         }
         DeclError::PublicAliasPrivateType { name, ty, .. } => {
             format!("public type alias '{name}' exposes private type '{ty}'")
+        }
+        DeclError::PublicContractPrivateType { name, ty, .. } => {
+            format!("public contract '{name}' exposes private type '{ty}'")
         }
         DeclError::ExtendMethodConflict {
             ty, name, surface, ..
@@ -2553,7 +2573,7 @@ mod tests {
 
     fn package_nominal(package: &str, name: &str) -> Type {
         Type::nominal_with_origin(
-            crate::ast::NominalKind::Struct,
+            ast::NominalKind::Struct,
             ident(name),
             vec![],
             vec![],

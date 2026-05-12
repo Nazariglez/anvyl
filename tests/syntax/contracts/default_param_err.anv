@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: contract method parameters cannot have defaults
+
+contract C {
+    fn f(self, x: int = 0);
+}

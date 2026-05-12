@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: contract method requirements cannot be generic
+
+contract Mapper {
+    fn map<T>(self, x: T) -> T;
+}

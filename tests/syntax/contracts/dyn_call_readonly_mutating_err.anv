@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutating method requires mutable receiver 'update'
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+struct Enemy {
+    fn update(var self, dt: float) {}
+}
+
+fn main() {
+    let actor: dyn Updatable = Enemy {};
+    actor.update(1.0);
+}

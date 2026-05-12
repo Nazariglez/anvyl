@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot reassign borrowed dynamic parameter 'actor'
+
+contract Updatable {
+    fn update(var self, dt: float);
+}
+
+struct Enemy {
+    fn update(var self, dt: float) {}
+}
+
+fn tick(var actor: dyn Updatable) {
+    actor = Enemy {};
+}

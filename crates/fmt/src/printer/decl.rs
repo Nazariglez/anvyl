@@ -379,6 +379,29 @@ impl Printer<'_> {
         self.writeln();
     }
 
+    pub(super) fn format_contract(&mut self, contract: &ast::ContractDecl) {
+        self.format_doc_comment(contract.doc.as_ref());
+        self.write_indent();
+        self.format_visibility(contract.visibility);
+        self.write("contract ");
+        self.write_fmt(contract.name);
+        self.write(" {");
+        self.writeln();
+        self.indent();
+        for req in &contract.requirements {
+            self.write_indent();
+            self.write("fn ");
+            self.format_method_sig(&req.node.sig);
+            self.format_return_type(&req.node.sig.ret);
+            self.write(";");
+            self.writeln();
+        }
+        self.dedent();
+        self.write_indent();
+        self.write("}");
+        self.writeln();
+    }
+
     fn format_struct_field(&mut self, field: &ast::StructField) {
         self.format_annotations(&field.annotations);
         self.format_doc_comment(field.doc.as_ref());

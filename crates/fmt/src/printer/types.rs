@@ -74,6 +74,10 @@ impl Printer<'_> {
                 self.write(") -> ");
                 self.format_type(ret);
             }
+            ast::Type::Dyn(contract) => {
+                self.write("dyn ");
+                self.format_contract_ref(contract);
+            }
             ast::Type::Tuple(elems) => {
                 self.write("(");
                 for (i, elem) in elems.iter().enumerate() {
@@ -108,6 +112,29 @@ impl Printer<'_> {
                 self.format_type(elem);
                 self.write("]");
             }
+        }
+    }
+
+    fn format_contract_ref(&mut self, contract: &ast::ContractRef) {
+        match contract {
+            ast::ContractRef::Named {
+                qualifier, name, ..
+            } => {
+                if let Some(qualifier) = qualifier {
+                    self.write_fmt(qualifier);
+                    self.write(".");
+                }
+                self.write_fmt(name);
+            }
+            ast::ContractRef::Intersection(contracts) => {
+                for (i, contract) in contracts.iter().enumerate() {
+                    if i > 0 {
+                        self.write(" + ");
+                    }
+                    self.format_contract_ref(contract);
+                }
+            }
+            ast::ContractRef::Infer => self.write("_"),
         }
     }
 

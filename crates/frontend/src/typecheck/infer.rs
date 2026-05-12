@@ -6,8 +6,8 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParamId, ExprId, FuncParam, GenericArg, Ident, ModuleOrigin,
-        NominalKind, NominalType, Type, TypeVarId,
+        ArrayLen, ConstArg, ConstParamId, ContractRef, ExprId, FuncParam, GenericArg, Ident,
+        ModuleOrigin, NominalKind, NominalType, Type, TypeVarId,
     },
     span::{SourceSpan, Span},
 };
@@ -100,6 +100,7 @@ enum Ty {
         params: Vec<TyFuncParam>,
         ret: Box<Ty>,
     },
+    Dyn(ContractRef),
     Var(TypeVarId),
     UnresolvedName(Ident),
     UnresolvedNominal {
@@ -225,6 +226,7 @@ impl Ty {
                     .collect(),
                 ret: Box::new(Self::from_recovery_type(ret)),
             },
+            Type::Dyn(contract) => Self::Dyn(contract.clone()),
             Type::Var(id) => Self::Var(*id),
             Type::UnresolvedName(name) => Self::UnresolvedName(*name),
             Type::UnresolvedNominal {
@@ -287,6 +289,7 @@ impl Ty {
                     .collect::<Option<Vec<_>>>()?,
                 ret: Box::new(ret.try_to_type_no_infer()?),
             }),
+            Self::Dyn(contract) => Some(Type::Dyn(contract.clone())),
             Self::Var(id) => Some(Type::Var(*id)),
             Self::UnresolvedName(name) => Some(Type::UnresolvedName(*name)),
             Self::UnresolvedNominal {
@@ -866,6 +869,7 @@ impl Solver {
                     .collect(),
                 ret: Box::new(self.instantiate_type_template(ret, vars)),
             },
+            Type::Dyn(contract) => Ty::Dyn(contract.clone()),
             Type::Var(id) => vars.types.get(id).cloned().unwrap_or(Ty::Var(*id)),
             Type::UnresolvedName(name) => Ty::UnresolvedName(*name),
             Type::UnresolvedNominal {
@@ -1781,6 +1785,7 @@ impl Solver {
                 elem: Box::new(self.resolve_ty(elem)),
             },
             Ty::Error
+            | Ty::Dyn(_)
             | Ty::Any
             | Ty::Int
             | Ty::Float
@@ -1831,6 +1836,7 @@ impl Solver {
                 self.type_occurs_in_ty(var, &key) || self.type_occurs_in_ty(var, &value)
             }
             Ty::Error
+            | Ty::Dyn(_)
             | Ty::Any
             | Ty::Int
             | Ty::Float
@@ -1885,6 +1891,7 @@ impl Solver {
                     .collect(),
                 ret: Box::new(self.finalize_ty_inner(&ret, cx)),
             },
+            Ty::Dyn(contract) => Type::Dyn(contract),
             Ty::Var(id) => Type::Var(id),
             Ty::UnresolvedName(name) => Type::UnresolvedName(name),
             Ty::UnresolvedNominal {

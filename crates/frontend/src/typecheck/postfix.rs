@@ -1,14 +1,16 @@
 use anvyx_externs::ReceiverMode;
 
 use super::{
-    ArgumentProjectionFact, CallForm, CallTarget, CheckedType, ConstSubst, Exposure,
+    ArgumentProjectionFact, CallForm, CallTarget, CheckedType, ConstSubst, DynCallFact, Exposure,
     ExternUseTarget, GenericArgs, GenericParams, MemberAccessKind, MemberPathFact, MemberPathKind,
     PlaceAccess, TypeChecker, TypeError, TypeSubst, VariantShape, check_arg_count, check_arg_range,
     check_expr_checked, checked_type,
+    contracts::{self, DynamicMethodError},
     decls::{
-        CallableKind, CallableParent, CallableRef, DeclError, ExtendMethodSchema, ExtendSchema,
-        MethodKey, MethodMode, MethodSurface, ModuleMemberLookup, ModuleScope, ProjectionLookup,
-        ResolvedValue, TypeBinding, ValueDecl, VariantPayload, nominal_type, owner_template,
+        CallableKind, CallableParent, CallableRef, ContractKey, ContractRequirementSchema,
+        DeclError, ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface,
+        ModuleMemberLookup, ModuleScope, ProjectionLookup, ResolvedValue, TypeBinding, ValueDecl,
+        VariantPayload, nominal_type, owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
@@ -19,7 +21,8 @@ use super::{
 };
 use crate::{
     ast::{
-        CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg, Ident, Type,
+        CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg, Ident,
+        MethodReceiver, Type,
     },
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
@@ -54,6 +57,14 @@ pub(super) enum Subject {
         receiver_id: ExprId,
         name: Ident,
         signature: ResolvedExternSignature,
+    },
+    DynMethod {
+        contract: ContractKey,
+        requirement: ContractRequirementSchema,
+        receiver_access: PlaceAccess,
+        receiver_place: PlaceUseFacts,
+        receiver_id: ExprId,
+        name: Ident,
     },
     ExternStatic {
         static_ref: ExternStaticRef,
@@ -320,6 +331,7 @@ fn subject_type(subject: &Subject) -> Type {
         Subject::ExternMethod { signature, .. } | Subject::ExternStatic { signature, .. } => {
             signature.to_func_type()
         }
+        Subject::DynMethod { requirement, .. } => func_type(&requirement.params, &requirement.ret),
         Subject::Module(_) => Type::Void,
         Subject::Type(ty) => ty.clone(),
         Subject::QualifiedExtend { .. } | Subject::Error => Type::Infer,
@@ -414,7 +426,8 @@ fn apply_field(
         | Subject::EnumVariant { .. }
         | Subject::QualifiedExtend { .. }
         | Subject::ExternMethod { .. }
-        | Subject::ExternStatic { .. } => {
+        | Subject::ExternStatic { .. }
+        | Subject::DynMethod { .. } => {
             field_access_on_non_aggregate(subject, field.node.field, kind, field.span, tc)
         }
         Subject::Error => Subject::Error,
@@ -551,7 +564,7 @@ fn apply_value_field(
     match kind {
         MemberAccessKind::Field => {
             match place::field_value(None, receiver, field_id, name, span, tc) {
-                place::FieldValueResult::Value(value, _) => Subject::Value(value),
+                place::FieldValueResult::Value(value, _) => Subject::Value(*value),
                 place::FieldValueResult::StaticOnValue(ty) => {
                     tc.push_error(TypeError::StaticMethodOnValue {
                         ty,
@@ -566,140 +579,191 @@ fn apply_value_field(
                 place::FieldValueResult::Error => Subject::Error,
             }
         }
-        MemberAccessKind::Method => match member::resolve_method(receiver_ty, name, tc) {
-            member::MethodResolution::Direct(method) => {
-                tc.check_access_policy(
-                    &method.policy,
-                    MemberAccessKind::Method,
-                    name,
-                    receiver_ty,
-                    &method.origin,
-                    span,
-                );
-                callable_subject(
-                    method.callee,
-                    Some(source_receiver(
-                        method.mode,
-                        receiver_access,
-                        receiver_place,
-                        receiver_identity,
-                        receiver_id,
-                        name,
-                    )),
-                )
-            }
-            member::MethodResolution::Extend(method) => {
-                check_extend_method_access(
-                    &mut super::AccessPolicyOutput {
-                        source: tc.source_id(),
-                        current_module: &tc.current_module,
-                        config: &tc.config,
-                        warnings: &mut tc.warnings,
-                        errors: &mut tc.errors,
-                    },
-                    &method.extend,
-                    &method.method,
-                    receiver_ty,
+        MemberAccessKind::Method => {
+            if let Type::Dyn(contract) = receiver_ty {
+                return apply_dyn_method(
+                    contract,
+                    receiver_access,
+                    receiver_place.clone(),
+                    receiver_id,
                     name,
                     span,
+                    tc,
                 );
-                callable_subject(
-                    method.callee,
-                    Some(source_receiver(
-                        method.mode,
-                        receiver_access,
-                        receiver_place,
-                        receiver_identity,
-                        receiver_id,
-                        name,
-                    )),
-                )
             }
-            member::MethodResolution::Promoted(promoted) => {
-                tc.record_member_path(MemberPathFact {
-                    expr_id: field_id,
-                    kind: MemberPathKind::MethodReceiver,
-                    path: promoted.path.clone(),
-                    origin_owner: promoted.origin_owner.clone(),
-                    origin_member: promoted.origin_method,
-                });
-                if promoted.exposure == Exposure::Implicit {
-                    tc.check_stored_field_path_access(receiver_ty, &promoted.path, span);
+            match member::resolve_method(receiver_ty, name, tc) {
+                member::MethodResolution::Direct(method) => {
+                    tc.check_access_policy(
+                        &method.policy,
+                        MemberAccessKind::Method,
+                        name,
+                        receiver_ty,
+                        &method.origin,
+                        span,
+                    );
+                    callable_subject(
+                        method.callee,
+                        Some(source_receiver(
+                            method.mode,
+                            receiver_access,
+                            receiver_place,
+                            receiver_identity,
+                            receiver_id,
+                            name,
+                        )),
+                    )
                 }
-                let promoted_access = place::projected_field_access(receiver_access);
-                let promoted_identity = receiver_identity.fields(&promoted.path);
-                match promoted.target {
-                    member::PromotedMethodTarget::Aggregate(method) => {
-                        tc.check_access_policy(
-                            &method.policy,
-                            MemberAccessKind::Method,
-                            promoted.origin_method,
-                            &promoted.origin_owner,
-                            &method.origin,
-                            span,
-                        );
-                        callable_subject(
-                            method.callee,
-                            Some(source_receiver(
-                                method.mode,
-                                promoted_access,
-                                receiver_place,
-                                promoted_identity,
-                                field_id,
-                                name,
-                            )),
-                        )
+                member::MethodResolution::Extend(method) => {
+                    check_extend_method_access(
+                        &mut super::AccessPolicyOutput {
+                            source: tc.source_id(),
+                            current_module: &tc.current_module,
+                            config: &tc.config,
+                            warnings: &mut tc.warnings,
+                            errors: &mut tc.errors,
+                        },
+                        &method.extend,
+                        &method.method,
+                        receiver_ty,
+                        name,
+                        span,
+                    );
+                    callable_subject(
+                        method.callee,
+                        Some(source_receiver(
+                            method.mode,
+                            receiver_access,
+                            receiver_place,
+                            receiver_identity,
+                            receiver_id,
+                            name,
+                        )),
+                    )
+                }
+                member::MethodResolution::Promoted(promoted) => {
+                    tc.record_member_path(MemberPathFact {
+                        expr_id: field_id,
+                        kind: MemberPathKind::MethodReceiver,
+                        path: promoted.path.clone(),
+                        origin_owner: promoted.origin_owner.clone(),
+                        origin_member: promoted.origin_method,
+                    });
+                    if promoted.exposure == Exposure::Implicit {
+                        tc.check_stored_field_path_access(receiver_ty, &promoted.path, span);
                     }
-                    member::PromotedMethodTarget::Extern(method) => Subject::ExternMethod {
-                        method_ref: method.method_ref,
-                        receiver: method.receiver,
-                        receiver_access: promoted_access,
-                        receiver_place: receiver_place.clone(),
-                        receiver_id: field_id,
-                        name,
-                        signature: method.signature,
-                    },
+                    let promoted_access = place::projected_field_access(receiver_access);
+                    let promoted_identity = receiver_identity.fields(&promoted.path);
+                    match promoted.target {
+                        member::PromotedMethodTarget::Aggregate(method) => {
+                            tc.check_access_policy(
+                                &method.policy,
+                                MemberAccessKind::Method,
+                                promoted.origin_method,
+                                &promoted.origin_owner,
+                                &method.origin,
+                                span,
+                            );
+                            callable_subject(
+                                method.callee,
+                                Some(source_receiver(
+                                    method.mode,
+                                    promoted_access,
+                                    receiver_place,
+                                    promoted_identity,
+                                    field_id,
+                                    name,
+                                )),
+                            )
+                        }
+                        member::PromotedMethodTarget::Extern(method) => Subject::ExternMethod {
+                            method_ref: method.method_ref,
+                            receiver: method.receiver,
+                            receiver_access: promoted_access,
+                            receiver_place: receiver_place.clone(),
+                            receiver_id: field_id,
+                            name,
+                            signature: method.signature,
+                        },
+                    }
+                }
+                member::MethodResolution::AmbiguousPromoted {
+                    ty,
+                    name,
+                    candidates,
+                } => {
+                    tc.push_error(TypeError::AmbiguousPromotedMethod {
+                        ty,
+                        member: name,
+                        candidates,
+                        span: tc.error_span(span),
+                    });
+                    Subject::Error
+                }
+                member::MethodResolution::Extern(method) => Subject::ExternMethod {
+                    method_ref: method.method_ref,
+                    receiver: method.receiver,
+                    receiver_access,
+                    receiver_place: receiver_place.clone(),
+                    receiver_id,
+                    name: method.name,
+                    signature: method.signature,
+                },
+                member::MethodResolution::StaticOnValue { ty } => {
+                    tc.push_error(TypeError::StaticMethodOnValue {
+                        ty,
+                        method: name,
+                        span: tc.error_span(span),
+                    });
+                    Subject::Error
+                }
+                member::MethodResolution::ExtendError(error) => {
+                    push_extend_method_error(tc, error, span);
+                    Subject::Error
+                }
+                member::MethodResolution::Missing { ty } => {
+                    unknown_member(ty, name, kind, span, tc)
+                }
+                member::MethodResolution::NonAggregate { ty } => {
+                    non_aggregate_member(ty, name, kind, span, tc)
                 }
             }
-            member::MethodResolution::AmbiguousPromoted {
-                ty,
-                name,
-                candidates,
-            } => {
-                tc.push_error(TypeError::AmbiguousPromotedMethod {
-                    ty,
-                    member: name,
-                    candidates,
-                    span: tc.error_span(span),
-                });
-                Subject::Error
-            }
-            member::MethodResolution::Extern(method) => Subject::ExternMethod {
-                method_ref: method.method_ref,
-                receiver: method.receiver,
-                receiver_access,
-                receiver_place: receiver_place.clone(),
-                receiver_id,
-                name: method.name,
-                signature: method.signature,
-            },
-            member::MethodResolution::StaticOnValue { ty } => {
-                tc.push_error(TypeError::StaticMethodOnValue {
-                    ty,
-                    method: name,
-                    span: tc.error_span(span),
-                });
-                Subject::Error
-            }
-            member::MethodResolution::ExtendError(error) => {
-                push_extend_method_error(tc, error, span);
-                Subject::Error
-            }
-            member::MethodResolution::Missing { ty } => unknown_member(ty, name, kind, span, tc),
-            member::MethodResolution::NonAggregate { ty } => {
-                non_aggregate_member(ty, name, kind, span, tc)
-            }
+        }
+    }
+}
+
+fn apply_dyn_method(
+    contract: &crate::ast::ContractRef,
+    receiver_access: PlaceAccess,
+    receiver_place: PlaceUseFacts,
+    receiver_id: ExprId,
+    name: Ident,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> Subject {
+    match contracts::resolve_dynamic_method(tc, contract, name) {
+        Ok((contract, requirement)) => Subject::DynMethod {
+            contract,
+            requirement,
+            receiver_access,
+            receiver_place,
+            receiver_id,
+            name,
         },
+        Err(DynamicMethodError::Missing { contract }) => {
+            tc.push_error(TypeError::DynamicMethodMissing {
+                contract: contract.name,
+                method: name,
+                span: tc.error_span(span),
+            });
+            Subject::Error
+        }
+        Err(DynamicMethodError::UnknownContract) => {
+            tc.push_error(TypeError::CompileError {
+                message: format!("unknown dynamic contract in method call '{name}'"),
+                span: tc.error_span(span),
+            });
+            Subject::Error
+        }
     }
 }
 
@@ -761,7 +825,7 @@ fn apply_module_field(
             tc.warn_extern_type_deprecated(&key, span);
             return Subject::Type(nominal_type(&key));
         }
-        ModuleMemberLookup::Found(binding @ TypeBinding::Alias(_)) => {
+        ModuleMemberLookup::Found(binding @ (TypeBinding::Alias(_) | TypeBinding::Contract(_))) => {
             let ty = tc.resolve_type_binding_for_tc_at(binding, &[], span, name);
             if !matches!(ty, Type::Infer) {
                 return Subject::Type(ty);
@@ -987,6 +1051,25 @@ fn apply_call(
             expected,
             tc,
         ),
+        Subject::DynMethod {
+            contract,
+            requirement,
+            receiver_access,
+            receiver_place,
+            receiver_id,
+            name,
+        } => check_dyn_method_call(
+            contract,
+            requirement,
+            *receiver_access,
+            receiver_place,
+            *receiver_id,
+            *name,
+            call,
+            call_id,
+            expected,
+            tc,
+        ),
         Subject::ExternStatic {
             static_ref,
             signature,
@@ -1035,7 +1118,7 @@ fn mutating_receiver_error(
     span: Option<crate::span::SourceSpan>,
 ) -> Option<TypeError> {
     match access {
-        PlaceAccess::Mutable => None,
+        PlaceAccess::Mutable | PlaceAccess::DynView => None,
         PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
         PlaceAccess::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
         PlaceAccess::Immutable
@@ -1053,6 +1136,53 @@ fn call_value(callee_ty: Type, call: &CallNode, call_id: ExprId, tc: &mut TypeCh
         }
         _ => not_callable(callee_ty, call, tc),
     }
+}
+
+fn check_dyn_method_call(
+    contract: &ContractKey,
+    requirement: &ContractRequirementSchema,
+    receiver_access: PlaceAccess,
+    receiver_place: &PlaceUseFacts,
+    receiver_id: ExprId,
+    name: Ident,
+    call: &CallNode,
+    call_id: ExprId,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let receiver = requirement
+        .receiver
+        .expect("contract requirements are finalized with receivers");
+    let requires_mutable = matches!(receiver, MethodReceiver::Var);
+    let mut failed = false;
+    if requires_mutable {
+        if let Some(error) =
+            mutating_receiver_error(receiver_access, name, tc.error_span(call.span))
+        {
+            tc.push_error(error);
+            failed = true;
+        } else {
+            place::record_facts_write(receiver_id, receiver_place, tc);
+        }
+    } else {
+        place::record_facts_read(receiver_id, receiver_place, tc);
+    }
+
+    failed |= check_args(&call.node.args, &requirement.params, call.span, call_id, tc);
+    let ret = tc.type_handle(&requirement.ret);
+    constrain_expected_return(call.span, ret.clone(), expected, tc);
+    if !failed {
+        tc.record_dyn_call(DynCallFact {
+            call_id,
+            receiver_id,
+            contract: contract.clone(),
+            method: name,
+            arg_count: call.node.args.len(),
+            requires_mutable,
+            span: tc.source_span(call.span),
+        });
+    }
+    checked_type(requirement.ret.clone(), tc)
 }
 
 #[derive(Clone, Copy)]
@@ -1237,7 +1367,7 @@ fn var_arg_error(
     span: Option<crate::span::SourceSpan>,
 ) -> Option<TypeError> {
     match access {
-        PlaceAccess::Mutable => None,
+        PlaceAccess::Mutable | PlaceAccess::DynView => None,
         PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
         PlaceAccess::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
         PlaceAccess::Immutable | PlaceAccess::Const => {
@@ -1293,7 +1423,7 @@ fn check_projecting_var_arg(
         tc.push_error(error);
         let checked = place.into_checked();
         tc.reject_extern_any_escape(&checked, arg.span);
-        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+        tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
             mutable_identity: None,
@@ -1301,6 +1431,18 @@ fn check_projecting_var_arg(
     }
 
     let target = tc.handle_type(&param.ty);
+    if matches!(target, Type::Dyn(_)) {
+        place::record_write(arg.node.id, &place, tc);
+        let identity = place.value.identity.clone();
+        let checked = place.into_checked();
+        tc.reject_extern_any_escape(&checked, arg.span);
+        tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
+        return SourceArgCheck {
+            failed: tc.solve_constraints(),
+            mutable_identity: Some(identity),
+        };
+    }
+
     let projection = match tc.decls.projection_from(&place.value.checked.ty, &target) {
         ProjectionLookup::Match(projection) => projection,
         ProjectionLookup::Missing => {
@@ -1353,7 +1495,12 @@ fn check_projecting_var_arg(
     );
     projected.identity = place.value.identity.fields(&projection.field_path);
     tc.reject_extern_any_escape(&projected.checked, arg.span);
-    tc.expect_assignable(arg.span, projected.checked.handle.clone(), param.ty.clone());
+    tc.expect_assignable_expr(
+        arg.span,
+        arg.node.id,
+        projected.checked.handle.clone(),
+        param.ty.clone(),
+    );
     place::record_value_write(arg.node.id, &projected, tc);
     tc.record_argument_projection(ArgumentProjectionFact {
         call_id,
@@ -1383,7 +1530,7 @@ fn finish_var_arg(
     };
     let checked = place.into_checked();
     tc.reject_extern_any_escape(&checked, arg.span);
-    tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+    tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
     SourceArgCheck {
         failed: tc.solve_constraints(),
         mutable_identity,
@@ -1398,7 +1545,7 @@ fn check_cast_accept_arg(
     let checked = super::check_value_expr_checked_with_hint(arg, None, tc);
     tc.reject_extern_any_escape(&checked, arg.span);
     if can_assign_without_errors(arg.span, checked.handle.clone(), param.ty.clone(), tc) {
-        tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+        tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
             mutable_identity: None,
@@ -1411,7 +1558,7 @@ fn check_cast_accept_arg(
             mutable_identity: None,
         };
     }
-    tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+    tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
     SourceArgCheck {
         failed: tc.solve_constraints(),
         mutable_identity: None,
@@ -1421,9 +1568,11 @@ fn check_cast_accept_arg(
 fn check_value_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
     let checked = super::check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc);
     tc.reject_extern_any_escape(&checked, arg.span);
-    tc.expect_assignable(arg.span, checked.handle, param.ty.clone());
+    let dyn_format = matches!(tc.handle_type(&param.ty), Type::Any)
+        && tc.reject_dyn_implicit_format(&checked.ty, arg.span);
+    tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
     SourceArgCheck {
-        failed: tc.solve_constraints(),
+        failed: tc.solve_constraints() || dyn_format,
         mutable_identity: None,
     }
 }
@@ -1985,9 +2134,9 @@ pub(super) fn check_args(
     call_span: Span,
     call_id: ExprId,
     tc: &mut TypeChecker,
-) {
+) -> bool {
     if !check_arg_count(args, params.len(), call_span, tc) {
-        return;
+        return true;
     }
 
     let params = params
@@ -1998,5 +2147,5 @@ pub(super) fn check_args(
             cast_accept: param.cast_accept,
         })
         .collect::<Vec<_>>();
-    check_source_args(args, &params, call_id, None, tc);
+    check_source_args(args, &params, call_id, None, tc)
 }

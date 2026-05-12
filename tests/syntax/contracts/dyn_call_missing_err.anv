@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: dynamic contract 'Drawable' has no method 'update'
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Sprite {
+    fn draw(self) {}
+    fn update(var self) {}
+}
+
+fn main() {
+    var actor: dyn Drawable = Sprite {};
+    actor.update();
+}

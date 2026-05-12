@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: type 'dyn Action' is not equatable
+
+contract Action {
+    fn act(self);
+}
+
+struct Actor {
+    fn act(self) {}
+}
+
+fn main() {
+    let left: dyn Action = Actor {};
+    let right: dyn Action = Actor {};
+    let same = left == right;
+}

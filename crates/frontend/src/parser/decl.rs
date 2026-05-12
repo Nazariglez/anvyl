@@ -117,6 +117,11 @@ impl DeclPolicy {
         allow_visibility: true,
         allow_metadata: true,
     };
+    pub(super) const MODULE_CONTRACT: Self = Self {
+        target: "contracts",
+        allow_visibility: true,
+        allow_metadata: true,
+    };
     pub(super) const LOCAL_TYPE_ALIAS: Self = Self {
         target: "local type aliases",
         allow_visibility: false,
@@ -1675,6 +1680,104 @@ pub(super) fn local_type_alias_statement<'src>() -> BoxedParser<'src, ast::StmtN
     type_alias_with_header(DeclPolicy::LOCAL_TYPE_ALIAS)
 }
 
+fn contract_requirement<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, Option<ast::ContractRequirementNode>> {
+    let semicolon = select! { Token::Semicolon => () };
+    let comma = select! { Token::Comma => () };
+    let field_like = identifier()
+        .then_ignore(select! { Token::Colon => () })
+        .then(type_ident())
+        .then_ignore(choice((semicolon, comma)))
+        .validate(|_, extra, emitter| {
+            emitter.emit(Rich::custom(
+                extra.span(),
+                "contracts can only require methods; write accessor methods such as `fn position(self) -> Vec2;`",
+            ));
+            None
+        });
+
+    let method = method_sig(stmt, MethodSigPolicy::Aggregate)
+        .then_ignore(semicolon)
+        .validate(|sig, extra, emitter| {
+            if sig.receiver.is_none() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "contract method requirements must include a `self` or `var self` receiver",
+                ));
+            }
+            if !sig.type_params.is_empty() || !sig.const_params.is_empty() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "contract method requirements cannot be generic",
+                ));
+            }
+            for param in &sig.params {
+                if param.default.is_some() {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        "contract method parameters cannot have defaults",
+                    ));
+                }
+                if param.cast_accept {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        "contract method parameters cannot use the `as` modifier",
+                    ));
+                }
+            }
+            Some(Spanned::new(
+                ast::ContractRequirement { sig },
+                extra.span().byte(),
+            ))
+        });
+
+    choice((method, field_like)).boxed()
+}
+
+pub(super) fn contract_declaration<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, ast::StmtNode> {
+    let contract_kw = select! { Token::Ident(id) if id.0.as_ref() == "contract" => () };
+
+    declaration_header(DeclPolicy::MODULE_CONTRACT)
+        .then_ignore(contract_kw)
+        .then(identifier())
+        .then(
+            select! { Token::Open(Delimiter::Brace) => () }
+                .ignore_then(contract_requirement(stmt).repeated().collect::<Vec<_>>())
+                .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
+        )
+        .validate(|((header, name), body), extra, emitter| {
+            if !header.annotations.is_empty() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "annotations are not allowed on contracts",
+                ));
+            }
+            let requirements = body.into_iter().flatten().collect::<Vec<_>>();
+            if requirements.is_empty() {
+                emitter.emit(Rich::custom(extra.span(), "contracts cannot be empty"));
+            }
+            let span = extra.span().byte();
+            Spanned::new(
+                ast::Stmt::Contract(Spanned::new(
+                    ast::ContractDecl {
+                        doc: header.doc,
+                        visibility: header.visibility,
+                        name,
+                        requirements,
+                    },
+                    span,
+                )),
+                span,
+            )
+        })
+        .labelled("contract declaration")
+        .as_context()
+        .boxed()
+}
+
 pub(super) fn const_decl<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
@@ -1793,7 +1896,7 @@ fn resolve_type_params_with_self(
     self_type: Option<&ast::Type>,
 ) -> ast::Type {
     use ast::Type::{
-        Array, Func, List, Map, Nominal, Slice, Tuple, UnresolvedName, UnresolvedNominal, Var,
+        Array, Dyn, Func, List, Map, Nominal, Slice, Tuple, UnresolvedName, UnresolvedNominal, Var,
     };
     match ty {
         UnresolvedName(ident) => {
@@ -1878,6 +1981,8 @@ fn resolve_type_params_with_self(
                     .boxed(),
             }
         }
+
+        Dyn(contract) => Dyn(contract.clone()),
 
         Tuple(elements) => {
             let resolved_elements = elements

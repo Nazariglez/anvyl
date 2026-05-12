@@ -1,0 +1,5 @@
+// @helper
+
+import contract_use_helper { PublicAction };
+
+pub import contract_use_helper { PublicAction as ReexportedAction };

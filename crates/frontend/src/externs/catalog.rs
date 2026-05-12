@@ -1073,10 +1073,24 @@ impl<'a> CatalogBuilder<'a> {
                 });
                 Type::UnresolvedName(name)
             }
-            TypeRefError::AliasCycle { name } => {
+            TypeRefError::AliasCycle { name } | TypeRefError::ContractAsType { name } => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: context.clone(),
                     module: None,
+                    name,
+                    site,
+                });
+                Type::UnresolvedName(name)
+            }
+            TypeRefError::UnknownContract { qualifier, name } => {
+                self.errors.push(ExternCatalogError::UnknownType {
+                    context: context.clone(),
+                    module: qualifier.map(|qualifier| {
+                        ModuleScope::Named(
+                            ModulePath::new(vec![qualifier.to_string()])
+                                .expect("single segment module path is valid"),
+                        )
+                    }),
                     name,
                     site,
                 });
@@ -1361,6 +1375,7 @@ fn validate_void_positions(
             }
         }
         Type::Void
+        | Type::Dyn(_)
         | Type::Infer
         | Type::InferReturn
         | Type::Any

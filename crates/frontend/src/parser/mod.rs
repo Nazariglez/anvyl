@@ -19,9 +19,9 @@ use chumsky::{
     prelude::*,
 };
 use decl::{
-    annotations, const_decl, dataref_declaration, doc_comment_block, enum_declaration,
-    extend_declaration, extern_declaration, function, import_declaration, struct_declaration,
-    type_alias_declaration,
+    annotations, const_decl, contract_declaration, dataref_declaration, doc_comment_block,
+    enum_declaration, extend_declaration, extern_declaration, function, import_declaration,
+    struct_declaration, type_alias_declaration,
 };
 use stmt::statement;
 
@@ -115,8 +115,9 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
         Spanned::new(ast::Stmt::Extend(extend_node), span)
     });
     let extern_decl = extern_declaration(stmt.clone());
-    let const_decl = const_decl(stmt);
+    let const_decl = const_decl(stmt.clone());
     let type_alias_decl = type_alias_declaration();
+    let contract_decl = contract_declaration(stmt);
 
     let documented_decl = annotations()
         .then(doc_comment_block())
@@ -161,10 +162,15 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
 
     let undocumented_decl = choice((import_declaration(), extend_decl));
 
-    choice((type_alias_decl, documented_decl, undocumented_decl))
-        .repeated()
-        .collect::<Vec<_>>()
-        .map(|stmts| ast::Program { stmts })
-        .then_ignore(end())
-        .boxed()
+    choice((
+        type_alias_decl,
+        contract_decl,
+        documented_decl,
+        undocumented_decl,
+    ))
+    .repeated()
+    .collect::<Vec<_>>()
+    .map(|stmts| ast::Program { stmts })
+    .then_ignore(end())
+    .boxed()
 }

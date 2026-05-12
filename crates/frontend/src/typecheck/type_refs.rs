@@ -3,16 +3,16 @@ use std::collections::{HashMap, HashSet};
 use super::{
     const_term::ConstTerm,
     decls::{
-        DeclarationIndex, ModuleScope, NominalKey, TypeAliasDef, TypeAliasKey, TypeBinding,
-        nominal_type_with_args,
+        ContractKey, DeclarationIndex, ModuleScope, NominalKey, TypeAliasDef, TypeAliasKey,
+        TypeBinding, nominal_type_with_args,
     },
     generic::{GenericArgs, GenericParams, substitute},
     type_ops::bare_type_name,
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, FuncParam, GenericArg, Ident, Type,
-        TypeParam, TypeVarId,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef, FuncParam, GenericArg, Ident,
+        Type, TypeParam, TypeVarId,
     },
     span::Span,
 };
@@ -136,6 +136,13 @@ pub(crate) enum TypeRefError {
         expected: &'static str,
     },
     AliasCycle {
+        name: Ident,
+    },
+    ContractAsType {
+        name: Ident,
+    },
+    UnknownContract {
+        qualifier: Option<Ident>,
         name: Ident,
     },
 }
@@ -347,6 +354,10 @@ impl<'a> TypeRefResolver<'a> {
                     .collect::<Result<_, _>>()?,
                 ret: Box::new(self.finalize_inner(module, generics, ret, state)?),
             }),
+            Type::Dyn(contract) => {
+                let key = self.resolve_contract_ref(module, contract)?;
+                Ok(Type::Dyn(canonical_contract_ref(&key)))
+            }
             Type::Tuple(elems) => elems
                 .iter()
                 .map(|ty| self.finalize_inner(module, generics, ty, state))
@@ -559,6 +570,7 @@ impl<'a> TypeRefResolver<'a> {
                 let alias_ref = self.module_alias_ref(&key)?;
                 self.expand_alias_ref(module, generics, &alias_ref, args, state, use_name)
             }
+            TypeBinding::Contract(_) => Err(TypeRefError::ContractAsType { name: use_name }),
         }
     }
 
@@ -602,6 +614,46 @@ impl<'a> TypeRefResolver<'a> {
         state.site = outer_site;
         state.local_depth = outer_depth;
         result
+    }
+
+    pub(crate) fn resolve_contract_ref(
+        &self,
+        module: &ModuleScope,
+        contract: &ContractRef,
+    ) -> Result<ContractKey, TypeRefError> {
+        let ContractRef::Named {
+            qualifier,
+            name,
+            origin,
+        } = contract
+        else {
+            return Err(TypeRefError::UnknownContract {
+                qualifier: None,
+                name: Ident::new(contract.to_string()),
+            });
+        };
+
+        if let Some(origin) = origin {
+            let module = ModuleScope::from_nominal_origin(origin);
+            return match self.decls.local_type_binding(&module, *name) {
+                Some(TypeBinding::Contract(key)) => Ok(key),
+                _ => Err(TypeRefError::UnknownContract {
+                    qualifier: None,
+                    name: *name,
+                }),
+            };
+        }
+
+        match self
+            .decls
+            .resolve_visible_type_binding(module, *qualifier, *name)
+        {
+            Some(TypeBinding::Contract(key)) => Ok(key),
+            _ => Err(TypeRefError::UnknownContract {
+                qualifier: *qualifier,
+                name: *name,
+            }),
+        }
     }
 
     pub(crate) fn finalize_nominal_args(
@@ -697,6 +749,14 @@ impl<'a> TypeRefResolver<'a> {
                 }
             },
         }
+    }
+}
+
+fn canonical_contract_ref(key: &ContractKey) -> ContractRef {
+    ContractRef::Named {
+        qualifier: None,
+        name: key.name,
+        origin: key.module.nominal_origin(),
     }
 }
 

@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Action {
+    fn act(self);
+}
+
+struct Holder {
+    value: dyn Action,
+    maybe: dyn Action?,
+    list: [dyn Action],
+    array: [dyn Action; 2],
+    pair: (dyn Action, int),
+    callbacks: [string: fn(dyn Action) -> dyn Action],
+}
+
+fn take(a: dyn Action) -> dyn Action {
+    a
+}
+
+fn take_slice(actions: slice[dyn Action]) {}

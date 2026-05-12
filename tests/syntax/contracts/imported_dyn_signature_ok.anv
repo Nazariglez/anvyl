@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import contract_use_helper { PublicActor, take_public_action };
+
+fn main() {
+    let actor = PublicActor {};
+    take_public_action(actor);
+}

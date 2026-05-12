@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Sprite {
+    fn draw(self) {}
+}
+
+struct Slot {
+    item: dyn Drawable,
+}
+
+fn main() {
+    let slot = Slot { item: Sprite {} };
+}

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: annotations are not allowed on contracts
+// @skip: FIXME: contracts must support anotations, and deprecated is useful to shape APIs
+
+@deprecated
+contract C {
+    fn f(self);
+}

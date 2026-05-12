@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: type 'Holder' is not equatable
+
+contract Action {
+    fn act(self);
+}
+
+struct Actor {
+    fn act(self) {}
+}
+
+struct Holder {
+    action: dyn Action,
+}
+
+fn main() {
+    let left = Holder { action: Actor {} };
+    let right = Holder { action: Actor {} };
+    let same = left == right;
+}

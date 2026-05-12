@@ -50,7 +50,9 @@ use crate::{
 mod annotation;
 mod const_eval;
 mod const_term;
+mod contracts;
 mod control_flow;
+mod convert;
 mod decls;
 mod enum_variant;
 mod extern_boundary;
@@ -703,6 +705,21 @@ pub(crate) enum TypeError {
     AnyOutsideExternBoundary {
         span: Option<SourceSpan>,
     },
+    ContractUnsatisfied {
+        ty: Type,
+        contract: String,
+        detail: String,
+        span: Option<SourceSpan>,
+    },
+    DynamicMethodMissing {
+        contract: Ident,
+        method: Ident,
+        span: Option<SourceSpan>,
+    },
+    BorrowedDynReassign {
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
     DuplicateGenericParam {
         name: Ident,
         span: Option<SourceSpan>,
@@ -722,12 +739,21 @@ impl From<SolverFinalizeError> for TypeError {
 enum LocalBindingKind {
     Immutable,
     Mutable,
+    DynView,
     Const,
     Alias,
     ReadonlySelf,
 }
 
 impl LocalBindingKind {
+    fn from_param(mutable: bool, ty: &Type) -> Self {
+        if mutable && matches!(ty, Type::Dyn(_)) {
+            Self::DynView
+        } else {
+            Self::from_mutable(mutable)
+        }
+    }
+
     fn from_mutable(mutable: bool) -> Self {
         if mutable {
             Self::Mutable
@@ -744,6 +770,7 @@ impl LocalBindingKind {
         match self {
             Self::Immutable => PlaceAccess::Immutable,
             Self::Mutable | Self::Alias => PlaceAccess::Mutable,
+            Self::DynView => PlaceAccess::DynView,
             Self::Const => PlaceAccess::Const,
             Self::ReadonlySelf => PlaceAccess::ReadonlySelf,
         }
@@ -937,6 +964,11 @@ struct TypeChecker {
     extern_uses: ExternUseMap,
     member_paths: MemberPathMap,
     argument_projections: ArgumentProjectionMap,
+    contract_witnesses: ContractWitnessMap,
+    witness_keys: HashMap<ContractWitnessKey, WitnessId>,
+    dyn_conversions: DynConversionMap,
+    dyn_calls: DynCallMap,
+    next_witness_id: u32,
     decls: DeclarationIndex,
     externs: ExternCatalog,
     promoted_surfaces: HashMap<CanonicalTypeKey, PromotedSurface>,
@@ -1028,6 +1060,11 @@ impl TypeChecker {
             extern_uses: HashMap::new(),
             member_paths: HashMap::new(),
             argument_projections: HashMap::new(),
+            contract_witnesses: HashMap::new(),
+            witness_keys: HashMap::new(),
+            dyn_conversions: HashMap::new(),
+            dyn_calls: HashMap::new(),
+            next_witness_id: 0,
             decls,
             externs,
             promoted_surfaces: HashMap::new(),
@@ -1443,8 +1480,17 @@ impl TypeChecker {
     }
 
     fn expect_assignable(&mut self, span: Span, from: TypeHandle, to: TypeHandle) {
-        self.solver
-            .add_handle_assignable(self.error_span(span), from, to);
+        convert::expect_assignable(self, span, None, from, to);
+    }
+
+    fn expect_assignable_expr(
+        &mut self,
+        span: Span,
+        expr_id: ExprId,
+        from: TypeHandle,
+        to: TypeHandle,
+    ) {
+        convert::expect_assignable(self, span, Some(expr_id), from, to);
     }
 
     fn expect_equal(&mut self, span: Span, left: TypeHandle, right: TypeHandle) {
@@ -1517,6 +1563,30 @@ impl TypeChecker {
             .insert((fact.call_id, fact.arg_index), fact);
     }
 
+    fn record_contract_witness(&mut self, key: ContractWitnessKey, span: Span) -> WitnessId {
+        if let Some(id) = self.witness_keys.get(&key) {
+            return *id;
+        }
+        let id = WitnessId(self.next_witness_id);
+        self.next_witness_id += 1;
+        let fact = ContractWitnessFact {
+            id,
+            key: key.clone(),
+            span: self.source_span(span),
+        };
+        self.witness_keys.insert(key, id);
+        self.contract_witnesses.insert(id, fact);
+        id
+    }
+
+    fn record_dyn_conversion(&mut self, fact: DynConversionFact) {
+        self.dyn_conversions.insert(fact.expr_id, fact);
+    }
+
+    fn record_dyn_call(&mut self, fact: DynCallFact) {
+        self.dyn_calls.insert(fact.call_id, fact);
+    }
+
     fn promoted_surface_for(&mut self, receiver: &Type) -> Option<PromotedSurface> {
         let key = CanonicalTypeKey(receiver.clone());
         if let Some(surface) = self.promoted_surfaces.get(&key) {
@@ -1547,6 +1617,17 @@ impl TypeChecker {
             return false;
         }
         self.push_error(TypeError::AnyOutsideExternBoundary {
+            span: self.error_span(span),
+        });
+        true
+    }
+
+    fn reject_dyn_implicit_format(&mut self, ty: &Type, span: Span) -> bool {
+        if !type_contains_dyn_value(ty, &self.decls, &mut HashSet::new()) {
+            return false;
+        }
+        self.push_error(TypeError::CompileError {
+            message: "dynamic values cannot be implicitly formatted".to_string(),
             span: self.error_span(span),
         });
         true
@@ -1976,6 +2057,9 @@ impl TypeChecker {
             extern_uses: self.extern_uses.clone(),
             member_paths: self.member_paths.clone(),
             argument_projections: self.argument_projections.clone(),
+            contract_witnesses: self.contract_witnesses.clone(),
+            dyn_conversions: self.dyn_conversions.clone(),
+            dyn_calls: self.dyn_calls.clone(),
         }
     }
 
@@ -1991,6 +2075,13 @@ impl TypeChecker {
         for fact in facts.argument_projections.into_values() {
             self.record_argument_projection(fact);
         }
+        for fact in facts.contract_witnesses.into_values() {
+            self.next_witness_id = self.next_witness_id.max(fact.id.0 + 1);
+            self.witness_keys.insert(fact.key.clone(), fact.id);
+            self.contract_witnesses.insert(fact.id, fact);
+        }
+        self.dyn_conversions.extend(facts.dyn_conversions);
+        self.dyn_calls.extend(facts.dyn_calls);
     }
 
     fn resolved_value(value: ResolvedValue) -> (ModuleScope, Ident, ValueDecl) {
@@ -2321,7 +2412,7 @@ impl TypeChecker {
                 self.warn_extern_type_deprecated(&key, span);
                 Some(nominal_type(&key))
             }
-            TypeBinding::Alias(_) => {
+            TypeBinding::Alias(_) | TypeBinding::Contract(_) => {
                 let ty = self.resolve_type_binding_for_tc_at(binding, &[], span, name);
                 (!matches!(ty, Type::Infer)).then_some(ty)
             }
@@ -2429,6 +2520,7 @@ impl TypeChecker {
                 }
                 self.validate_nominal_uses(ret, span);
             }
+            Type::Dyn(_) => {}
             Type::Tuple(elems) => {
                 for elem in elems {
                     self.validate_nominal_uses(elem, span);
@@ -2474,6 +2566,8 @@ impl TypeChecker {
             self.push_error(generic_param_decl_type_error(error, source));
         }
         validate_type_alias_decls(&decls, &mut self.errors);
+        contracts::finalize_contracts(&mut decls, &mut self.errors);
+        validate_public_contract_types(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
         for error in decls.build_projection_entries() {
             self.push_error(TypeError::Decl(error));
@@ -2534,6 +2628,7 @@ impl TypeChecker {
                 }
                 self.validate_nominal_uses_in(decls, ret, span);
             }
+            Type::Dyn(_) => {}
             Type::Tuple(elems) => {
                 for elem in elems {
                     self.validate_nominal_uses_in(decls, elem, span);
@@ -2901,6 +2996,7 @@ fn finite_size_edges(ty: &Type, decls: &DeclarationIndex, edges: &mut Vec<Nomina
         | Type::String
         | Type::Void
         | Type::Func { .. }
+        | Type::Dyn(_)
         | Type::Var(_)
         | Type::UnresolvedName(_)
         | Type::UnresolvedNominal { .. }
@@ -2943,6 +3039,28 @@ fn validate_type_alias_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeErro
     }
 }
 
+fn validate_public_contract_types(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
+    for contract in decls.contracts() {
+        if !matches!(contract.visibility, Visibility::Public) {
+            continue;
+        }
+        for req in &contract.requirements {
+            let exposed = req
+                .params
+                .iter()
+                .find_map(|param| private_exposed_type(decls, &param.ty))
+                .or_else(|| private_exposed_type(decls, &req.ret));
+            if let Some(ty) = exposed {
+                errors.push(TypeError::Decl(DeclError::PublicContractPrivateType {
+                    name: contract.key.name,
+                    ty,
+                    span: Some(req.span),
+                }));
+            }
+        }
+    }
+}
+
 fn validate_type_alias_def(
     decls: &DeclarationIndex,
     alias: &TypeAliasDef,
@@ -2954,7 +3072,7 @@ fn validate_type_alias_def(
         return;
     }
     push_unused_alias_params(&alias.generics, target, alias.span, errors);
-    if public && let Some(ty) = private_alias_type(decls, target) {
+    if public && let Some(ty) = private_exposed_type(decls, target) {
         errors.push(TypeError::Decl(DeclError::PublicAliasPrivateType {
             name: alias.name,
             ty,
@@ -2988,7 +3106,7 @@ fn push_unused_alias_params(
     }
 }
 
-fn private_alias_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
+fn private_exposed_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
     match ty {
         Type::Nominal(nominal) => {
             let key = decls.key_for_type(ty)?;
@@ -3001,18 +3119,19 @@ fn private_alias_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
             nominal
                 .type_args
                 .iter()
-                .find_map(|ty| private_alias_type(decls, ty))
+                .find_map(|ty| private_exposed_type(decls, ty))
         }
         Type::Func { params, ret } => params
             .iter()
-            .find_map(|param| private_alias_type(decls, &param.ty))
-            .or_else(|| private_alias_type(decls, ret)),
-        Type::Tuple(elems) => elems.iter().find_map(|ty| private_alias_type(decls, ty)),
+            .find_map(|param| private_exposed_type(decls, &param.ty))
+            .or_else(|| private_exposed_type(decls, ret)),
+        Type::Dyn(contract) => private_contract_type(decls, contract),
+        Type::Tuple(elems) => elems.iter().find_map(|ty| private_exposed_type(decls, ty)),
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
-            private_alias_type(decls, elem)
+            private_exposed_type(decls, elem)
         }
         Type::Map { key, value } => {
-            private_alias_type(decls, key).or_else(|| private_alias_type(decls, value))
+            private_exposed_type(decls, key).or_else(|| private_exposed_type(decls, value))
         }
         Type::Infer
         | Type::InferReturn
@@ -3026,6 +3145,24 @@ fn private_alias_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
         | Type::UnresolvedName(_)
         | Type::UnresolvedNominal { .. } => None,
     }
+}
+
+fn private_contract_type(decls: &DeclarationIndex, contract: &ContractRef) -> Option<Type> {
+    let ContractRef::Named { name, origin, .. } = contract else {
+        return None;
+    };
+    let module = origin
+        .as_ref()
+        .map_or(ModuleScope::Root, ModuleScope::from_nominal_origin);
+    let key = ContractKey {
+        module,
+        name: *name,
+    };
+    let exported = matches!(
+        decls.exported_type_binding(&key.module, key.name),
+        Some(TypeBinding::Contract(exported)) if exported == key
+    );
+    (!exported).then(|| Type::Dyn(contract.clone()))
 }
 
 fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
@@ -3272,6 +3409,19 @@ fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> TypeError {
         }
         TypeRefError::AliasCycle { name } => TypeError::CompileError {
             message: format!("type alias '{name}' depends on itself"),
+            span,
+        },
+        TypeRefError::ContractAsType { name } => TypeError::CompileError {
+            message: format!(
+                "contract '{name}' is not a concrete type; use 'dyn {name}' or a generic bound"
+            ),
+            span,
+        },
+        TypeRefError::UnknownContract { qualifier, name } => TypeError::CompileError {
+            message: match qualifier {
+                Some(qualifier) => format!("unknown contract '{qualifier}.{name}'"),
+                None => format!("unknown contract '{name}'"),
+            },
             span,
         },
     }
@@ -3997,7 +4147,7 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
         Stmt::Aggregate(agg_node) => {
             check_aggregate_decl(agg_node, tc);
         }
-        Stmt::Enum(_) => {}
+        Stmt::Enum(_) | Stmt::Contract(_) => {}
         Stmt::Const(const_node) => {
             if tc.scopes.len() > 1 {
                 match local_const {
@@ -4245,6 +4395,13 @@ impl CallableBody<'_> {
         }
     }
 
+    fn value_expr_id(&self) -> Option<ExprId> {
+        match self {
+            Self::Block(block) => block.node.tail.as_ref().map(|expr| expr.node.id),
+            Self::Expr(expr) => Some(expr.node.id),
+        }
+    }
+
     fn check_with_hint(&self, expected: Option<TypeHandle>, tc: &mut TypeChecker) -> CheckedType {
         match self {
             Self::Block(block) => check_block_checked_with_hint(block, expected, tc),
@@ -4277,7 +4434,15 @@ fn finish_callable_body_return(
             if !checked.ty.is_void() {
                 tc.reject_extern_any_escape(checked, body.span());
                 let ret_handle = tc.type_handle(ret);
-                tc.expect_assignable(body.span(), checked.handle.clone(), ret_handle);
+                match body.value_expr_id() {
+                    Some(expr_id) => tc.expect_assignable_expr(
+                        body.span(),
+                        expr_id,
+                        checked.handle.clone(),
+                        ret_handle,
+                    ),
+                    None => tc.expect_assignable(body.span(), checked.handle.clone(), ret_handle),
+                }
             } else if !ret.is_void() && !body.diverges() {
                 tc.push_error(TypeError::MissingReturn {
                     expected: ret.clone(),
@@ -4328,11 +4493,9 @@ fn check_func_body(
         tc.define_value(Ident::new("self"), self_ty, kind, None);
     }
     for (param, param_ty) in params.iter().zip(param_types.iter()) {
-        tc.define(
-            param.name,
-            param_ty.ty.clone(),
-            matches!(param.mutability, Mutability::Mutable),
-        );
+        let mutable = matches!(param.mutability, Mutability::Mutable);
+        let kind = LocalBindingKind::from_param(mutable, &param_ty.ty);
+        tc.define_value(param.name, param_ty.ty.clone(), kind, None);
     }
     let expected_ret = (!infer_return).then_some(&ret_ty);
     check_callable_body_with_return(CallableBody::Block(body), expected_ret, span, tc);
@@ -4538,6 +4701,9 @@ fn specialized_body_facts(
         extern_uses: map_delta(&old.extern_uses, &current.extern_uses),
         member_paths: map_delta(&old.member_paths, &current.member_paths),
         argument_projections: map_delta(&old.argument_projections, &current.argument_projections),
+        contract_witnesses: map_delta(&old.contract_witnesses, &current.contract_witnesses),
+        dyn_conversions: map_delta(&old.dyn_conversions, &current.dyn_conversions),
+        dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
     }
 }
 
@@ -4869,8 +5035,9 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
                 }
             };
             tc.reject_extern_any_escape(&value.checked, binding.value.span);
-            tc.expect_assignable(
+            tc.expect_assignable_expr(
                 binding.value.span,
+                binding.value.node.id,
                 value.checked.handle.clone(),
                 annot_handle,
             );
@@ -4958,7 +5125,7 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
             let expected = tc.type_handle(&expected_ty);
             let actual = check_value_expr_checked_with_hint(expr, Some(expected.clone()), tc);
             tc.reject_extern_any_escape(&actual, expr.span);
-            tc.expect_assignable(expr.span, actual.handle, expected);
+            tc.expect_assignable_expr(expr.span, expr.node.id, actual.handle, expected);
         } else {
             let actual = check_value_expr_checked_with_hint(expr, None, tc);
             tc.reject_extern_any_escape(&actual, expr.span);
@@ -5044,7 +5211,7 @@ fn solve_and_checked_from_handle(
 
 fn check_expected(expr: &ExprNode, expected: TypeHandle, tc: &mut TypeChecker) -> CheckedType {
     let checked = check_value_expr_checked_with_hint(expr, Some(expected.clone()), tc);
-    tc.expect_assignable(expr.span, checked.handle.clone(), expected);
+    tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
     checked
 }
 
@@ -5056,7 +5223,7 @@ pub(in crate::typecheck) fn validate_const_expr_type(
     let error_count = tc.errors.len();
     let checked = check_value_expr_checked_with_hint(expr, expected.clone(), tc);
     if let Some(expected) = expected {
-        tc.expect_assignable(expr.span, checked.handle, expected);
+        tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle, expected);
         tc.solve_constraints();
     }
     if tc.errors.len() == error_count {
@@ -5116,7 +5283,7 @@ fn check_expr_checked_with_hint(
         ExprKind::Lit(Lit::Nil) => match expected {
             Some(expected) => {
                 let nil = tc.fresh_nil_handle(expr.span);
-                tc.expect_assignable(expr.span, nil, expected.clone());
+                tc.expect_assignable_expr(expr.span, expr.node.id, nil, expected.clone());
                 checked_from_handle(expr, expected, tc)
             }
             None => {
@@ -5795,7 +5962,12 @@ fn check_coalesce(
     }
 
     let result = tc.type_handle(&inner);
-    tc.expect_assignable(right_expr.span, right.handle, result.clone());
+    tc.expect_assignable_expr(
+        right_expr.span,
+        right_expr.node.id,
+        right.handle,
+        result.clone(),
+    );
     tc.solve_constraints();
     CheckedType {
         ty: tc.handle_type(&result),
@@ -5841,8 +6013,89 @@ enum BinaryTypeFailure {
     },
 }
 
-fn equatable_type(ty: &Type) -> bool {
+fn equatable_type(ty: &Type, tc: &TypeChecker) -> bool {
     !matches!(ty, Type::Slice { .. })
+        && !type_contains_dyn_value(ty, &tc.decls, &mut HashSet::new())
+}
+
+fn type_contains_dyn_value(
+    ty: &Type,
+    decls: &DeclarationIndex,
+    seen: &mut HashSet<NominalKey>,
+) -> bool {
+    match ty {
+        Type::Dyn(_) => true,
+        Type::Tuple(elems) => elems
+            .iter()
+            .any(|elem| type_contains_dyn_value(elem, decls, seen)),
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+            type_contains_dyn_value(elem, decls, seen)
+        }
+        Type::Map { key, value } => {
+            type_contains_dyn_value(key, decls, seen) || type_contains_dyn_value(value, decls, seen)
+        }
+        Type::Nominal(_) => nominal_contains_dyn_value(ty, decls, seen),
+        Type::Func { .. }
+        | Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Var(_)
+        | Type::UnresolvedName(_)
+        | Type::UnresolvedNominal { .. } => false,
+    }
+}
+
+fn nominal_contains_dyn_value(
+    ty: &Type,
+    decls: &DeclarationIndex,
+    seen: &mut HashSet<NominalKey>,
+) -> bool {
+    let Some(key) = decls.key_for_type(ty) else {
+        return false;
+    };
+    if !seen.insert(key.clone()) {
+        return false;
+    }
+    let contains = match key.kind {
+        NominalKind::Struct | NominalKind::DataRef => decls.aggregate(&key).is_some_and(|agg| {
+            agg.fields.values().any(|field| {
+                let field_ty = substitute_aggregate_member(ty, &agg.generics, &field.ty);
+                type_contains_dyn_value(&field_ty, decls, seen)
+            })
+        }),
+        NominalKind::Enum => decls.enum_schema(&key).is_some_and(|schema| {
+            let Some(nominal) = ty.as_nominal() else {
+                return false;
+            };
+            let args = GenericArgs {
+                type_args: nominal.type_args.clone(),
+                const_args: ConstTerm::from_args(&nominal.const_args),
+            };
+            let (type_subst, const_subst) = schema.generics.substitutions(&args);
+            schema
+                .variants
+                .values()
+                .any(|variant| match &variant.payload {
+                    VariantPayload::Unit => false,
+                    VariantPayload::Tuple(types) => types.iter().any(|ty| {
+                        let ty = substitute(ty, &type_subst, &const_subst);
+                        type_contains_dyn_value(&ty, decls, seen)
+                    }),
+                    VariantPayload::Struct(fields) => fields.values().any(|field| {
+                        let ty = substitute(&field.ty, &type_subst, &const_subst);
+                        type_contains_dyn_value(&ty, decls, seen)
+                    }),
+                })
+        }),
+        NominalKind::Extern => false,
+    };
+    seen.remove(&key);
+    contains
 }
 
 fn builtin_binary_type(
@@ -5887,7 +6140,7 @@ fn builtin_binary_type(
                     operand_type: right_ty.clone(),
                     fallback: Type::Infer,
                 })
-            } else if same && equatable_type(left_ty) {
+            } else if same && equatable_type(left_ty, tc) {
                 Ok(Type::Bool)
             } else if same {
                 Err(BinaryTypeFailure::NotEquatable {
@@ -6272,7 +6525,8 @@ fn check_lambda_expr(
     tc.enter_lambda();
     tc.push_scope();
     for (param, param_ty) in lambda.node.params.iter().zip(&params) {
-        tc.define(param.name, param_ty.ty.clone(), param.mutable);
+        let kind = LocalBindingKind::from_param(param.mutable, &param_ty.ty);
+        tc.define_value(param.name, param_ty.ty.clone(), kind, None);
     }
     let return_mode = match &expected_ret {
         Some(ret) => ReturnMode::Explicit(ret.clone()),
@@ -6443,6 +6697,7 @@ fn check_string_interp(expr: &ExprNode, parts: &[StringPart], tc: &mut TypeCheck
             continue;
         };
         let checked = check_value_expr_checked_with_hint(inner, None, tc);
+        tc.reject_dyn_implicit_format(&checked.ty, inner.span);
         if let Some(spec) = spec {
             validate_format_spec(&checked.ty, &spec.node, spec.span, tc);
         }
@@ -7428,7 +7683,7 @@ fn check_expr_fields(
         let hint = inf.instantiate(&field.ty, tc);
         let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
         check.contains_extern_any |= checked.contains_extern_any;
-        tc.expect_assignable(value.span, checked.handle, hint);
+        tc.expect_assignable_expr(value.span, value.node.id, checked.handle, hint);
         check.failed |= tc.solve_constraints();
     }
     check
@@ -7538,6 +7793,17 @@ fn resolve_struct_target(
             };
             struct_literal_target_from_expanded(lit, expanded, tc)
         }
+        TypeBinding::Contract(_) => {
+            tc.resolve_type_for_tc_at(
+                &Type::UnresolvedNominal {
+                    qualifier: lit.node.qualifier,
+                    name: lit.node.name,
+                    generic_args: lit.node.generic_args.clone(),
+                },
+                lit.span,
+            );
+            None
+        }
     }
 }
 
@@ -7602,8 +7868,9 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
                 tc.reject_extern_any_escape(&value, assign.node.value.span);
             }
             if !target.checked().ty.is_void() && !value.ty.is_void() {
-                tc.expect_assignable(
+                tc.expect_assignable_expr(
                     assign.node.value.span,
+                    assign.node.value.node.id,
                     value.handle,
                     target.checked().handle.clone(),
                 );
@@ -7630,8 +7897,9 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
                 tc,
             );
             if !target.checked().ty.is_void() && !result.ty.is_void() {
-                tc.expect_assignable(
+                tc.expect_assignable_expr(
                     assign.node.value.span,
+                    assign.node.value.node.id,
                     result.handle,
                     target.checked().handle.clone(),
                 );

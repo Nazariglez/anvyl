@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import contract_use_helper as helper;
+import contract_use_helper { PublicAction, PublicActor };
+
+fn main() {
+    let actor = PublicActor {};
+    let unqualified: dyn PublicAction = actor;
+    let qualified: dyn helper.PublicAction = unqualified;
+}

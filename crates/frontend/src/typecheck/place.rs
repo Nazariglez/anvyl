@@ -12,6 +12,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlaceAccess {
     Mutable,
+    DynView,
     Settable,
     Immutable,
     Const,
@@ -239,7 +240,7 @@ impl PlaceAccess {
     }
 
     pub(super) fn can_mut_borrow(self) -> bool {
-        matches!(self, Self::Mutable)
+        matches!(self, Self::Mutable | Self::DynView)
     }
 
     pub(super) fn assign_error(
@@ -249,6 +250,7 @@ impl PlaceAccess {
     ) -> Option<TypeError> {
         match self {
             Self::Mutable | Self::Settable => None,
+            Self::DynView => Some(TypeError::BorrowedDynReassign { name, span }),
             Self::Const => Some(TypeError::ConstAssignment { name, span }),
             Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
             Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
@@ -262,7 +264,7 @@ impl PlaceAccess {
         span: Option<crate::span::SourceSpan>,
     ) -> Option<TypeError> {
         match self {
-            Self::Mutable => None,
+            Self::Mutable | Self::DynView => None,
             Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
             Self::Const => Some(TypeError::ConstAssignment { name, span }),
             Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
@@ -289,6 +291,7 @@ fn merged_access(accesses: impl IntoIterator<Item = PlaceAccess>) -> PlaceAccess
     }
     for restricted in [
         PlaceAccess::Captured,
+        PlaceAccess::DynView,
         PlaceAccess::ReadonlySelf,
         PlaceAccess::Const,
         PlaceAccess::NotPlace,
@@ -370,7 +373,7 @@ impl PlaceValue {
 }
 
 pub(super) enum FieldValueResult {
-    Value(PlaceValue, bool),
+    Value(Box<PlaceValue>, bool),
     StaticOnValue(Type),
     NonAggregate(Type),
     Error,
@@ -400,7 +403,7 @@ pub(super) fn field_value(
                 receiver.facts.clone(),
             );
             value.identity = receiver.identity.clone().field(name);
-            FieldValueResult::Value(value, false)
+            FieldValueResult::Value(Box::new(value), false)
         }
         member::FieldResolution::Promoted(promoted) => {
             promoted_field_value(expr, receiver, field_id, span, promoted, tc)
@@ -479,7 +482,7 @@ fn promoted_field_value(
                 receiver.facts.clone(),
             );
             value.identity = receiver.identity.clone().fields(&promoted.path);
-            FieldValueResult::Value(value, false)
+            FieldValueResult::Value(Box::new(value), false)
         }
         member::PromotedFieldTarget::Extern(field) => extern_field_value(
             expr,
@@ -504,7 +507,7 @@ fn extern_field_value(
         PlaceUseFacts::for_extern_field(&receiver.facts, field.field_ref),
     );
     value.identity = identity;
-    FieldValueResult::Value(value, field.contains_any)
+    FieldValueResult::Value(Box::new(value), field.contains_any)
 }
 
 fn field_checked(
@@ -599,7 +602,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
         ) {
             FieldValueResult::Value(value, accepts_extern_any) => {
                 return CheckedPlace {
-                    value,
+                    value: *value,
                     accepts_extern_any,
                 };
             }
@@ -685,6 +688,7 @@ impl CheckedPlace {
 pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAccess {
     match receiver_access {
         PlaceAccess::Mutable => PlaceAccess::Mutable,
+        PlaceAccess::DynView => PlaceAccess::DynView,
         PlaceAccess::Const => PlaceAccess::Const,
         PlaceAccess::Captured => PlaceAccess::Captured,
         PlaceAccess::ReadonlySelf => PlaceAccess::ReadonlySelf,

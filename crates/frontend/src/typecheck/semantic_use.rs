@@ -1,18 +1,25 @@
 use std::collections::HashMap;
 
-use super::{GenericArgs, Type, decls::CallableId};
+use super::{
+    ContractKey, GenericArgs, MethodMode, MethodReceiver, Type,
+    decls::{CallableId, ExtendId},
+};
 use crate::{
     ast::{ExprId, Ident},
     externs::catalog::{
         ExternFieldRef, ExternFunctionId, ExternMethodRef, ExternOperatorRef, ExternStaticRef,
         ExternTypeId,
     },
+    span::SourceSpan,
 };
 
 pub(crate) type CallMap = HashMap<ExprId, CallTarget>;
 pub(crate) type ExternUseMap = HashMap<ExprId, Vec<ExternUseTarget>>;
 pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
 pub(crate) type ArgumentProjectionMap = HashMap<(ExprId, usize), ArgumentProjectionFact>;
+pub(crate) type ContractWitnessMap = HashMap<WitnessId, ContractWitnessFact>;
+pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
+pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallTarget {
@@ -48,6 +55,73 @@ pub(crate) struct ArgumentProjectionFact {
     pub(crate) arg_index: usize,
     pub(crate) path: Vec<Ident>,
     pub(crate) target_ty: Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct WitnessId(pub(crate) u32);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContractWitnessFact {
+    pub(crate) id: WitnessId,
+    pub(crate) key: ContractWitnessKey,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ContractWitnessKey {
+    pub(crate) concrete_ty: Type,
+    pub(crate) contract: ContractKey,
+    pub(crate) slots: Vec<WitnessSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WitnessSlot {
+    pub(crate) name: Ident,
+    pub(crate) required_receiver: MethodReceiver,
+    pub(crate) target: WitnessSlotTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum WitnessSlotTarget {
+    Direct {
+        callable: CallableId,
+        owner_args: GenericArgs,
+        receiver_mode: MethodMode,
+    },
+    Extend {
+        extend: ExtendId,
+        callable: CallableId,
+        owner_args: GenericArgs,
+        receiver_mode: MethodMode,
+    },
+    Extern {
+        method: ExternMethodRef,
+        receiver: anvyx_externs::ReceiverMode,
+    },
+    Promoted {
+        path: Vec<Ident>,
+        origin_owner: Type,
+        origin_method: Ident,
+        target: Box<WitnessSlotTarget>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynConversionFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) witness: WitnessId,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynCallFact {
+    pub(crate) call_id: ExprId,
+    pub(crate) receiver_id: ExprId,
+    pub(crate) contract: ContractKey,
+    pub(crate) method: Ident,
+    pub(crate) arg_count: usize,
+    pub(crate) requires_mutable: bool,
+    pub(crate) span: SourceSpan,
 }
 
 impl CallTarget {

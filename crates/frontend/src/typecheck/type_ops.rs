@@ -119,6 +119,7 @@ pub(crate) trait TypeFolder {
                     .collect(),
                 ret: Box::new(self.fold_type(ret)),
             },
+            Type::Dyn(contract) => Type::Dyn(contract.clone()),
             Type::Var(id) => self.fold_var(*id),
             Type::UnresolvedName(name) => self.fold_unresolved_name(*name),
             Type::UnresolvedNominal {
@@ -226,6 +227,7 @@ pub(crate) trait TypeVisitor {
             Type::Func { params, ret } => {
                 params.iter().any(|param| self.visit_func_param(param)) || self.visit_type(ret)
             }
+            Type::Dyn(_) => false,
             Type::Tuple(elems) => elems.iter().any(|ty| self.visit_type(ty)),
             Type::Nominal(nominal) => {
                 nominal.type_args.iter().any(|ty| self.visit_type(ty))
