@@ -13,7 +13,8 @@ use crate::{
     ast::{
         self, AggregateKind, ArrayLen, ConstArg, ConstParam, ContractRef, FuncParam, GenericArg,
         Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
-        NominalKind, Param, Program, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
+        NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type, TypeParam, VariantKind,
+        Visibility,
     },
     externs::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
@@ -135,7 +136,7 @@ pub(crate) struct ContractRequirementKey {
     pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
-    pub(crate) ret: Type,
+    pub(crate) ret: ReturnSpec,
 }
 
 impl ContractRequirementKey {
@@ -1126,7 +1127,7 @@ pub(crate) struct CallableSig {
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
-    pub(crate) ret: Type,
+    pub(crate) ret: ReturnSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -1217,7 +1218,7 @@ pub(crate) struct ContractRequirementSchema {
     pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
-    pub(crate) ret: Type,
+    pub(crate) ret: ReturnSpec,
     pub(crate) generics_empty: bool,
     pub(crate) span: Option<SourceSpan>,
 }
@@ -1245,7 +1246,7 @@ pub(crate) struct MethodSchema {
     pub(crate) mode: MethodMode,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
-    pub(crate) ret: Type,
+    pub(crate) ret: ReturnSpec,
     pub(crate) policy: AccessPolicy,
 }
 
@@ -1284,7 +1285,7 @@ pub(crate) struct ExtendSchema {
 #[derive(Clone)]
 pub(crate) struct CastConversionSchema {
     pub(crate) source: Type,
-    pub(crate) ret: Option<Type>,
+    pub(crate) ret: Option<ReturnSpec>,
     pub(crate) span: SourceSpan,
 }
 
@@ -1294,7 +1295,7 @@ pub(crate) struct ExtendMethodSchema {
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) required_params: usize,
-    pub(crate) ret: Type,
+    pub(crate) ret: ReturnSpec,
     pub(crate) policy: AccessPolicy,
 }
 
@@ -1524,7 +1525,7 @@ impl DeclarationIndex {
                     generics,
                     type_params,
                 };
-                method.ret = f(site, method.ret.clone());
+                method.ret.ty = f(site, method.ret.ty.clone());
             }
         }
 
@@ -1598,7 +1599,7 @@ impl DeclarationIndex {
                     generics: GenericTypeContext::default(),
                     type_params: vec![],
                 };
-                req.ret = f(site, req.ret.clone());
+                req.ret.ty = f(site, req.ret.ty.clone());
             }
         }
 
@@ -1684,7 +1685,7 @@ impl DeclarationIndex {
                     generics: method_generics,
                     type_params,
                 };
-                method.ret = f(site, method.ret.clone());
+                method.ret.ty = f(site, method.ret.ty.clone());
             }
             for cast in &mut extend.cast_froms {
                 let site = DeclTypeSite {
@@ -1695,7 +1696,7 @@ impl DeclarationIndex {
                 };
                 cast.source = f(site.clone(), cast.source.clone());
                 if let Some(ret) = &mut cast.ret {
-                    *ret = f(site, ret.clone());
+                    ret.ty = f(site, ret.ty.clone());
                 }
             }
         }
@@ -1925,7 +1926,7 @@ impl DeclarationIndex {
             Some(MethodReceiver::Value) if !sig.params.is_empty() => {
                 Some("to_string method must take no parameters")
             }
-            Some(MethodReceiver::Value) if sig.ret != Type::String => {
+            Some(MethodReceiver::Value) if sig.ret.ty != Type::String => {
                 Some("to_string method must return 'string'")
             }
             Some(MethodReceiver::Value) => None,
@@ -2452,7 +2453,7 @@ impl DeclarationIndex {
                     generics: GenericParams::default(),
                     ty: Type::Func {
                         params: vec![],
-                        ret: Box::new(Type::Void),
+                        ret: Box::new(ReturnSpec::void()),
                     },
                     required_params: 0,
                     policy,
@@ -3391,7 +3392,7 @@ impl DeclarationIndex {
                     generics: sig.generics.clone(),
                     params: params.clone(),
                     required_params: sig.required_params,
-                    ret: (**ret).clone(),
+                    ret: ret.as_ref().clone(),
                 },
             },
             receiver_ty: None,
@@ -3446,7 +3447,9 @@ impl DeclarationIndex {
         );
         let ret = subst.as_ref().map_or_else(
             || method.ret.clone(),
-            |(type_subst, const_subst)| substitute(&method.ret, type_subst, const_subst),
+            |(type_subst, const_subst)| {
+                substitute_return_spec(&method.ret, type_subst, const_subst)
+            },
         );
 
         CallableRef {
@@ -3513,7 +3516,9 @@ impl DeclarationIndex {
                 )
             })
             .collect::<Vec<_>>();
-        let template_ret = generic_template_type(&method.ret, &extend.generics);
+        let template_ret = method
+            .ret
+            .with_ty(generic_template_type(&method.ret.ty, &extend.generics));
 
         CallableRef {
             def: CallableDef {
@@ -3523,7 +3528,7 @@ impl DeclarationIndex {
                     generics: method.generics.clone(),
                     params: substitute_func_params(&template_params, &type_subst, &const_subst),
                     required_params: method.required_params,
-                    ret: substitute(&template_ret, &type_subst, &const_subst),
+                    ret: substitute_return_spec(&template_ret, &type_subst, &const_subst),
                 },
             },
             receiver_ty,
@@ -3554,7 +3559,7 @@ impl DeclarationIndex {
                     generics: GenericParams::default(),
                     required_params: params.len(),
                     params,
-                    ret,
+                    ret: ReturnSpec::value(ret),
                 },
             },
             receiver_ty: None,
@@ -3974,7 +3979,7 @@ pub(crate) fn generic_params(
     }
 }
 
-pub(crate) fn func_type_from_params(params: &[Param], ret: &Type) -> Type {
+pub(crate) fn func_type_from_params(params: &[Param], ret: &ReturnSpec) -> Type {
     let resolved_params = params
         .iter()
         .map(|p| {
@@ -4002,6 +4007,14 @@ pub(crate) fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
             )
         })
         .collect()
+}
+
+pub(crate) fn substitute_return_spec(
+    ret: &ReturnSpec,
+    type_subst: &TypeSubst,
+    const_subst: &ConstSubst,
+) -> ReturnSpec {
+    ret.with_ty(substitute(&ret.ty, type_subst, const_subst))
 }
 
 pub(crate) fn required_param_count(params: &[Param]) -> usize {
@@ -4802,7 +4815,7 @@ fn concrete_surface_type(ty: &Type) -> bool {
         | Type::UnresolvedNominal { .. } => false,
         Type::Func { params, ret } => {
             params.iter().all(|param| concrete_surface_type(&param.ty))
-                && concrete_surface_type(ret)
+                && concrete_surface_type(&ret.ty)
         }
         Type::Dyn(_) => true,
         Type::Tuple(elems) => elems.iter().all(concrete_surface_type),
@@ -5046,7 +5059,7 @@ mod tests {
         let Type::Func { ret, .. } = ty else {
             panic!("expected function type: {ty:?}");
         };
-        ret
+        &ret.ty
     }
 
     fn assert_nominal(ty: &Type, kind: NominalKind, module: Option<&str>, name: &str) {
@@ -6128,7 +6141,7 @@ mod tests {
             instance_ref.def.sig.params,
             vec![FuncParam::immut(Type::Int)]
         );
-        assert_eq!(instance_ref.def.sig.ret, Type::Int);
+        assert_eq!(instance_ref.def.sig.ret.ty, Type::Int);
     }
 
     #[test]
@@ -6160,7 +6173,7 @@ mod tests {
         assert_eq!(callable.owner_args, owner_args);
         assert_eq!(callable.receiver_ty, Some(Type::Int));
         assert_eq!(callable.def.sig.params, vec![FuncParam::immut(Type::Int)]);
-        assert_eq!(callable.def.sig.ret, Type::Int);
+        assert_eq!(callable.def.sig.ret.ty, Type::Int);
     }
 
     #[test]
@@ -6185,7 +6198,7 @@ mod tests {
             vec![FuncParam::immut(Type::Var(TypeVarId(0)))]
         );
         assert_eq!(
-            tuple.def.sig.ret,
+            tuple.def.sig.ret.ty,
             Type::nominal(
                 NominalKind::Enum,
                 ident("E"),

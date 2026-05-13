@@ -217,11 +217,18 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn format_return_type(&mut self, ret: &ast::Type) {
-        if !matches!(ret, ast::Type::Void) {
+    fn format_return_type(&mut self, ret: &ast::ReturnSpec) {
+        if !ret.is_implicit_void() {
             self.write(" -> ");
-            self.format_type(ret);
+            self.format_return_spec_tail(ret);
         }
+    }
+
+    fn format_return_spec_tail(&mut self, ret: &ast::ReturnSpec) {
+        if ret.is_place() {
+            self.write("var ");
+        }
+        self.format_type(&ret.ty);
     }
 
     fn format_visibility(&mut self, vis: ast::Visibility) {

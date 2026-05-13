@@ -4,7 +4,7 @@ use chumsky::{error::Rich, prelude::*};
 
 use super::{
     AnvParser, BoxedParser,
-    common::{block_stmt, field_name_ident, identifier, param, params, return_type},
+    common::{block_stmt, field_name_ident, identifier, param, params, return_spec},
     expr::expression,
     types::{contract_ref, extend_type_ident, type_ident},
 };
@@ -426,7 +426,7 @@ fn extern_func_declaration<'src>(
     select! { Token::Keyword(Keyword::Fn) => () }
         .ignore_then(identifier())
         .then(params(stmt))
-        .then(return_type())
+        .then(return_spec())
         .then_ignore(semicolon)
         .map_with(|((name, params), ret), e| {
             let s = e.span();
@@ -438,7 +438,7 @@ fn extern_func_declaration<'src>(
                     visibility: ast::Visibility::Private,
                     name,
                     params,
-                    ret: ret.unwrap_or(ast::Type::Void),
+                    ret: ret.unwrap_or_else(ast::ReturnSpec::void),
                 },
                 span,
             );
@@ -570,12 +570,7 @@ fn resolve_extern_members(
                 name,
                 receiver,
                 params: resolve_extern_params(params, type_param_map, const_param_map, self_type),
-                ret: resolve_type_params_with_self(
-                    &ret,
-                    type_param_map,
-                    const_param_map,
-                    Some(self_type),
-                ),
+                ret: resolve_return_spec(&ret, type_param_map, const_param_map, Some(self_type)),
             },
             ast::ExternTypeMember::StaticMethod {
                 doc,
@@ -586,12 +581,7 @@ fn resolve_extern_members(
                 doc,
                 name,
                 params: resolve_extern_params(params, type_param_map, const_param_map, self_type),
-                ret: resolve_type_params_with_self(
-                    &ret,
-                    type_param_map,
-                    const_param_map,
-                    Some(self_type),
-                ),
+                ret: resolve_return_spec(&ret, type_param_map, const_param_map, Some(self_type)),
             },
             ast::ExternTypeMember::Operator {
                 op,
@@ -777,10 +767,10 @@ fn extern_type_method_member<'src>(
             select! { Token::Keyword(Keyword::Fn) => () }
                 .ignore_then(field_name_ident())
                 .then(extern_method_params(stmt))
-                .then(return_type()),
+                .then(return_spec()),
         )
         .map(|(doc, ((name, (receiver, params)), ret))| {
-            let ret = ret.unwrap_or(ast::Type::Void);
+            let ret = ret.unwrap_or_else(ast::ReturnSpec::void);
             match receiver {
                 Some(receiver) => ast::ExternTypeMember::Method {
                     doc,
@@ -878,7 +868,7 @@ fn function_body<'src>(
         .ignore_then(identifier())
         .then(generic_params())
         .then(params(stmt.clone()))
-        .then(return_type())
+        .then(return_spec())
         .then(block_stmt(stmt, tail_expr))
         .map_with(|((((name, gp), params), ret), body), e| {
             let s = e.span();
@@ -906,10 +896,9 @@ fn function_body<'src>(
                 })
                 .collect();
 
-            let resolved_ret = match ret {
-                Some(ty) => resolve_type_params(&ty, &type_param_map, &const_param_map),
-                None => ast::Type::Void,
-            };
+            let resolved_ret = ret.map_or_else(ast::ReturnSpec::void, |ret| {
+                resolve_return_spec(&ret, &type_param_map, &const_param_map, None)
+            });
 
             Spanned::new(
                 ast::Func {
@@ -1095,7 +1084,7 @@ fn method_sig<'src>(
         .ignore_then(name)
         .then(generic_params())
         .then(method_params(stmt))
-        .then(return_type())
+        .then(return_spec())
         .map(|(((name, gp), (receiver, params)), ret)| {
             let GenericParams {
                 type_params,
@@ -1107,7 +1096,7 @@ fn method_sig<'src>(
                 const_params,
                 receiver,
                 params,
-                ret: ret.unwrap_or(ast::Type::Void),
+                ret: ret.unwrap_or_else(ast::ReturnSpec::void),
             }
         })
         .boxed()
@@ -1301,7 +1290,7 @@ fn aggregate_declaration<'src>(
                         })
                         .collect();
 
-                    let resolved_ret = resolve_type_params_with_self(
+                    let resolved_ret = resolve_return_spec(
                         &m.sig.ret,
                         &combined_type_param_map,
                         &combined_const_param_map,
@@ -1535,7 +1524,7 @@ fn cast_from_decl<'src>(
     cast_kw
         .ignore_then(from_kw)
         .ignore_then(params(stmt.clone()))
-        .then(return_type())
+        .then(return_spec())
         .then(block_stmt(stmt, tail_expr))
         .validate(|((param_list, ret), body), extra, emitter| {
             let s = extra.span();
@@ -1929,6 +1918,20 @@ fn resolve_split_generic_args(
     (resolved_types, resolved_consts)
 }
 
+fn resolve_return_spec(
+    ret: &ast::ReturnSpec,
+    type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
+    const_param_map: &HashMap<ast::Ident, ast::ConstParamId>,
+    self_type: Option<&ast::Type>,
+) -> ast::ReturnSpec {
+    ret.with_ty(resolve_type_params_with_self(
+        &ret.ty,
+        type_param_map,
+        const_param_map,
+        self_type,
+    ))
+}
+
 fn resolve_type_params_with_self(
     ty: &ast::Type,
     type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
@@ -2017,8 +2020,12 @@ fn resolve_type_params_with_self(
                 .collect::<Vec<_>>();
             Func {
                 params: resolved_params,
-                ret: resolve_type_params_with_self(ret, type_param_map, const_param_map, self_type)
-                    .boxed(),
+                ret: Box::new(resolve_return_spec(
+                    ret,
+                    type_param_map,
+                    const_param_map,
+                    self_type,
+                )),
             }
         }
 

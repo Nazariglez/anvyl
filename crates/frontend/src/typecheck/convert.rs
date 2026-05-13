@@ -82,7 +82,7 @@ fn contains_dyn(ty: &Type) -> bool {
     match ty {
         Type::Dyn(_) => true,
         Type::Func { params, ret } => {
-            params.iter().any(|param| contains_dyn(&param.ty)) || contains_dyn(ret)
+            params.iter().any(|param| contains_dyn(&param.ty)) || contains_dyn(&ret.ty)
         }
         Type::Tuple(elems) => elems.iter().any(contains_dyn),
         Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => contains_dyn(elem),

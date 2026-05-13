@@ -1,6 +1,6 @@
 use crate::ast::{
     AnonymousContract, AnonymousContractParam, AnonymousContractRequirement, ArrayLen, ConstArg,
-    ContractRef, FuncParam, GenericArg, Ident, Type, TypeVarId,
+    ContractRef, FuncParam, GenericArg, Ident, ReturnSpec, Type, TypeVarId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,7 +120,7 @@ pub(crate) trait TypeFolder {
                     .iter()
                     .map(|param| self.fold_func_param(param))
                     .collect(),
-                ret: Box::new(self.fold_type(ret)),
+                ret: Box::new(self.fold_return_spec(ret)),
             },
             Type::Dyn(contract) => Type::Dyn(self.fold_contract_ref(contract)),
             Type::Var(id) => self.fold_var(*id),
@@ -167,6 +167,10 @@ pub(crate) trait TypeFolder {
         FuncParam::new(self.fold_type(&param.ty), param.mutable, param.cast_accept)
     }
 
+    fn fold_return_spec(&mut self, ret: &ReturnSpec) -> ReturnSpec {
+        ret.with_ty(self.fold_type(&ret.ty))
+    }
+
     fn fold_generic_arg(&mut self, arg: &GenericArg) -> GenericArg {
         match arg {
             GenericArg::Type(ty) => GenericArg::Type(self.fold_type(ty)),
@@ -200,7 +204,7 @@ pub(crate) trait TypeFolder {
                                 ty: self.fold_type(&param.ty),
                             })
                             .collect(),
-                        ret: self.fold_type(&req.ret),
+                        ret: self.fold_return_spec(&req.ret),
                     })
                     .collect(),
             }),
@@ -267,7 +271,8 @@ pub(crate) trait TypeVisitor {
     fn visit_type_children(&mut self, ty: &Type) -> bool {
         match ty {
             Type::Func { params, ret } => {
-                params.iter().any(|param| self.visit_func_param(param)) || self.visit_type(ret)
+                params.iter().any(|param| self.visit_func_param(param))
+                    || self.visit_return_spec(ret)
             }
             Type::Dyn(contract) => self.visit_contract_ref(contract),
             Type::Tuple(elems) => elems.iter().any(|ty| self.visit_type(ty)),
@@ -302,7 +307,7 @@ pub(crate) trait TypeVisitor {
             || match contract {
                 ContractRef::Anonymous(surface) => surface.requirements.iter().any(|req| {
                     req.params.iter().any(|param| self.visit_type(&param.ty))
-                        || self.visit_type(&req.ret)
+                        || self.visit_return_spec(&req.ret)
                 }),
                 ContractRef::Intersection(contracts) => {
                     contracts.iter().any(|c| self.visit_contract_ref(c))
@@ -317,6 +322,10 @@ pub(crate) trait TypeVisitor {
 
     fn visit_func_param(&mut self, param: &FuncParam) -> bool {
         self.visit_type(&param.ty)
+    }
+
+    fn visit_return_spec(&mut self, ret: &ReturnSpec) -> bool {
+        self.visit_type(&ret.ty)
     }
 
     fn visit_generic_arg(&mut self, arg: &GenericArg) -> bool {

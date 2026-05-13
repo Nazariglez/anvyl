@@ -8,7 +8,7 @@ use super::{
 use crate::{
     ast::{
         ArrayLen, ConstArg, ConstParamId, ContractRef, ExprId, FuncParam, GenericArg, Ident,
-        ModuleOrigin, NominalKind, NominalType, Type, TypeVarId,
+        ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type, TypeVarId,
     },
     span::{SourceSpan, Span},
 };
@@ -43,7 +43,43 @@ impl TyFuncParam {
 
 struct TyFuncParts {
     params: Vec<TyFuncParam>,
-    ret: Ty,
+    ret: TyReturnSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TyReturnSpec {
+    access: ReturnAccess,
+    ty: Ty,
+}
+
+impl TyReturnSpec {
+    fn value(ty: Ty) -> Self {
+        Self {
+            access: ReturnAccess::Value,
+            ty,
+        }
+    }
+
+    fn with_ty(&self, ty: Ty) -> Self {
+        Self {
+            access: self.access,
+            ty,
+        }
+    }
+
+    fn from_recovery_return_spec(ret: &ReturnSpec) -> Self {
+        Self {
+            access: ret.access,
+            ty: Ty::from_recovery_type(&ret.ty),
+        }
+    }
+
+    fn try_to_return_spec_no_infer(&self) -> Option<ReturnSpec> {
+        Some(ReturnSpec {
+            access: self.access,
+            ty: self.ty.try_to_type_no_infer()?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,7 +135,7 @@ enum Ty {
     Void,
     Func {
         params: Vec<TyFuncParam>,
-        ret: Box<Ty>,
+        ret: Box<TyReturnSpec>,
     },
     Dyn(ContractRef),
     Var(TypeVarId),
@@ -225,7 +261,7 @@ impl Ty {
                     .iter()
                     .map(TyFuncParam::from_recovery_func_param)
                     .collect(),
-                ret: Box::new(Self::from_recovery_type(ret)),
+                ret: Box::new(TyReturnSpec::from_recovery_return_spec(ret)),
             },
             Type::Dyn(contract) => Self::Dyn(contract.clone()),
             Type::Var(id) => Self::Var(*id),
@@ -288,7 +324,7 @@ impl Ty {
                     .iter()
                     .map(TyFuncParam::try_to_func_param_no_infer)
                     .collect::<Option<Vec<_>>>()?,
-                ret: Box::new(ret.try_to_type_no_infer()?),
+                ret: Box::new(ret.try_to_return_spec_no_infer()?),
             }),
             Self::Dyn(contract) => Some(Type::Dyn(contract.clone())),
             Self::Var(id) => Some(Type::Var(*id)),
@@ -332,6 +368,13 @@ impl Ty {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(super) struct LocalTypeId(u32);
+
+#[cfg(test)]
+impl LocalTypeId {
+    pub(super) fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 struct TempTypeId(u32);
@@ -508,11 +551,11 @@ impl SolveError {
         Self::type_mismatch(
             Ty::Func {
                 params: vec![expected],
-                ret: Box::new(Ty::Void),
+                ret: Box::new(TyReturnSpec::value(Ty::Void)),
             },
             Ty::Func {
                 params: vec![found],
-                ret: Box::new(Ty::Void),
+                ret: Box::new(TyReturnSpec::value(Ty::Void)),
             },
             span,
         )
@@ -537,7 +580,7 @@ fn rewrite_ty_contract_refs(ty: &mut Ty, f: &mut impl FnMut(&ContractRef) -> Con
             for param in params {
                 rewrite_ty_contract_refs(&mut param.ty, f);
             }
-            rewrite_ty_contract_refs(ret, f);
+            rewrite_ty_contract_refs(&mut ret.ty, f);
         }
         Ty::Dyn(contract) => *contract = rewrite_contract_ref(contract, f),
         Ty::UnresolvedNominal { generic_args, .. } => {
@@ -952,7 +995,10 @@ impl Solver {
                         cast_accept: param.cast_accept,
                     })
                     .collect(),
-                ret: Box::new(self.instantiate_type_template(ret, vars)),
+                ret: Box::new(TyReturnSpec {
+                    access: ret.access,
+                    ty: self.instantiate_type_template(&ret.ty, vars),
+                }),
             },
             Type::Dyn(contract) => Ty::Dyn(self.instantiate_contract_ref_template(contract, vars)),
             Type::Var(id) => vars.types.get(id).cloned().unwrap_or(Ty::Var(*id)),
@@ -1056,10 +1102,11 @@ impl Solver {
                                         .unwrap_or(Type::Infer),
                                 })
                                 .collect(),
-                            ret: self
-                                .instantiate_type_template(&req.ret, vars)
-                                .try_to_type_no_infer()
-                                .unwrap_or(Type::Infer),
+                            ret: req.ret.with_ty(
+                                self.instantiate_type_template(&req.ret.ty, vars)
+                                    .try_to_type_no_infer()
+                                    .unwrap_or(Type::Infer),
+                            ),
                         })
                         .collect(),
                 })
@@ -1366,8 +1413,34 @@ impl Solver {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Ty::Func {
             params,
-            ret: Box::new(self.unify_tys_equal(span, &expected_func.ret, &found_func.ret)?),
+            ret: Box::new(self.unify_return_specs_equal(
+                span,
+                expected_func.ret,
+                found_func.ret,
+            )?),
         })
+    }
+
+    fn unify_return_specs_equal(
+        &mut self,
+        span: Option<SourceSpan>,
+        expected: TyReturnSpec,
+        found: TyReturnSpec,
+    ) -> Result<TyReturnSpec, SolveError> {
+        if expected.access != found.access {
+            return Err(SolveError::type_mismatch(
+                Ty::Func {
+                    params: vec![],
+                    ret: Box::new(expected),
+                },
+                Ty::Func {
+                    params: vec![],
+                    ret: Box::new(found),
+                },
+                span,
+            ));
+        }
+        Ok(expected.with_ty(self.unify_tys_equal(span, &expected.ty, &found.ty)?))
     }
 
     fn unify_tys_equal(
@@ -1898,7 +1971,7 @@ impl Solver {
                         cast_accept: param.cast_accept,
                     })
                     .collect(),
-                ret: Box::new(self.resolve_ty(ret)),
+                ret: Box::new(ret.with_ty(self.resolve_ty(&ret.ty))),
             },
             Ty::UnresolvedNominal {
                 qualifier,
@@ -1964,7 +2037,7 @@ impl Solver {
                 params
                     .iter()
                     .any(|param| self.type_occurs_in_ty(var, &param.ty))
-                    || self.type_occurs_in_ty(var, &ret)
+                    || self.type_occurs_in_ty(var, &ret.ty)
             }
             Ty::UnresolvedNominal { generic_args, .. } => {
                 generic_args.iter().any(|arg| match arg {
@@ -2036,7 +2109,10 @@ impl Solver {
                         cast_accept: param.cast_accept,
                     })
                     .collect(),
-                ret: Box::new(self.finalize_ty_inner(&ret, cx)),
+                ret: Box::new(ReturnSpec {
+                    access: ret.access,
+                    ty: self.finalize_ty_inner(&ret.ty, cx),
+                }),
             },
             Ty::Dyn(contract) => Type::Dyn(contract),
             Ty::Var(id) => Type::Var(id),
@@ -2479,7 +2555,7 @@ mod tests {
                 FuncParam::new(Type::Int, true, false),
                 FuncParam::immut(Type::Bool),
             ],
-            ret: Box::new(Type::String),
+            ret: Box::new(ReturnSpec::value(Type::String)),
         });
     }
 
@@ -3020,11 +3096,11 @@ mod tests {
                 mutable: false,
                 cast_accept: false,
             }],
-            ret: Box::new(Ty::Bool),
+            ret: Box::new(TyReturnSpec::value(Ty::Bool)),
         };
         let wrong_count = Ty::Func {
             params: vec![],
-            ret: Box::new(Ty::Bool),
+            ret: Box::new(TyReturnSpec::value(Ty::Bool)),
         };
         let wrong_mutability = Ty::Func {
             params: vec![TyFuncParam {
@@ -3032,7 +3108,7 @@ mod tests {
                 mutable: true,
                 cast_accept: false,
             }],
-            ret: Box::new(Ty::Bool),
+            ret: Box::new(TyReturnSpec::value(Ty::Bool)),
         };
         assert!(matches!(
             solver.unify_equal(span(1, 2), ty_ref(left.clone()), ty_ref(wrong_count)),
@@ -3317,7 +3393,7 @@ mod tests {
                 mutable: false,
                 cast_accept: false,
             }],
-            ret: Box::new(Ty::Int),
+            ret: Box::new(TyReturnSpec::value(Ty::Int)),
         };
         let to = Ty::Func {
             params: vec![TyFuncParam {
@@ -3325,7 +3401,7 @@ mod tests {
                 mutable: false,
                 cast_accept: false,
             }],
-            ret: Box::new(ty_option(Ty::Int)),
+            ret: Box::new(TyReturnSpec::value(ty_option(Ty::Int))),
         };
         assert!(matches!(
             solver.constrain_assignable(span(1, 2), ty_ref(from), ty_ref(to)),

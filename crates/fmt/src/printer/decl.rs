@@ -589,7 +589,7 @@ impl Printer<'_> {
         self.write(")");
         if let Some(ret) = &cf.ret {
             self.write(" -> ");
-            self.format_type(ret);
+            self.format_return_spec_tail(ret);
         }
         self.write(" ");
         self.format_block(&cf.body);

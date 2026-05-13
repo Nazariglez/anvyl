@@ -600,7 +600,7 @@ mod method_schemas {
             .expect("no method");
         assert_eq!(method.mode.surface(), MethodSurface::Instance);
         assert_eq!(method.params.len(), 0);
-        assert_eq!(method.ret, Type::Int);
+        assert_eq!(method.ret.ty, Type::Int);
     }
 
     #[test]
@@ -639,7 +639,7 @@ mod method_schemas {
         assert_eq!(method.mode.surface(), MethodSurface::Instance);
         assert_eq!(method.params.len(), 1);
         assert_eq!(method.params[0].ty, Type::Int);
-        assert_eq!(method.ret, Type::Int);
+        assert_eq!(method.ret.ty, Type::Int);
     }
 
     #[test]
@@ -660,7 +660,7 @@ mod method_schemas {
         assert_eq!(method.generics.type_params.len(), 1);
         assert!(method.generics.const_params.is_empty());
         assert_eq!(method.params[0].ty, Type::Var(t));
-        assert_eq!(method.ret, Type::Var(t));
+        assert_eq!(method.ret.ty, Type::Var(t));
     }
 
     #[test]
@@ -687,7 +687,7 @@ mod method_schemas {
         assert_eq!(method.generics.type_params.len(), 1);
         assert_eq!(method.generics.const_params.len(), 1);
         assert_eq!(method.params[0].ty, array_ty.clone());
-        assert_eq!(method.ret, array_ty);
+        assert_eq!(method.ret.ty, array_ty);
     }
 }
 
@@ -1203,7 +1203,7 @@ mod extend_schemas {
             .expect("no method");
         assert_eq!(method.params.len(), 1);
         assert_eq!(method.params[0].ty, Type::Int);
-        assert_eq!(method.ret, Type::Int);
+        assert_eq!(method.ret.ty, Type::Int);
     }
 
     #[test]
@@ -1232,7 +1232,7 @@ mod extend_schemas {
         assert!(ext.generics.const_params.is_empty());
         assert!(method.generics.is_empty());
         assert!(method.params.is_empty());
-        assert_eq!(method.ret, Type::Var(type_param));
+        assert_eq!(method.ret.ty, Type::Var(type_param));
     }
 
     #[test]

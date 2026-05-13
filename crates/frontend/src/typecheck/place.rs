@@ -1,6 +1,6 @@
 use super::{
-    CheckedType, Exposure, ExternUseTarget, MemberAccessKind, MemberPathFact, MemberPathKind,
-    TypeChecker, TypeError, ValueDecl, check_expr_checked, check_index_access,
+    CheckedType, Exposure, ExternUseTarget, LocalTypeId, MemberAccessKind, MemberPathFact,
+    MemberPathKind, TypeChecker, TypeError, ValueDecl, check_expr_checked, check_index_access,
     check_tuple_index_access, member,
 };
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     span::Span,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum PlaceAccess {
     Mutable,
     DynView,
@@ -18,13 +18,17 @@ pub(super) enum PlaceAccess {
     Const,
     Captured,
     ReadonlySelf,
+    #[default]
     NotPlace,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) enum PlaceIdentity {
+    #[default]
     Unknown,
     Single(PlacePath),
+    UnknownDerived(PlaceRoot),
+    IndexedDerived(PlaceRoot),
     Alternatives {
         group: AliasAltGroupId,
         alternatives: Vec<PlaceIdentity>,
@@ -34,23 +38,12 @@ pub(super) enum PlaceIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AliasAltGroupId(u32);
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct AliasTarget {
     pub(super) access: PlaceAccess,
     pub(super) identity: PlaceIdentity,
     pub(super) facts: PlaceUseFacts,
     pub(super) accepts_extern_any: bool,
-}
-
-impl Default for AliasTarget {
-    fn default() -> Self {
-        Self {
-            access: PlaceAccess::NotPlace,
-            identity: PlaceIdentity::unknown(),
-            facts: PlaceUseFacts::default(),
-            accepts_extern_any: false,
-        }
-    }
 }
 
 impl AliasTarget {
@@ -84,8 +77,14 @@ impl AliasAltGroupId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlacePath {
-    root: Ident,
+    root: PlaceRoot,
     segments: Vec<PlacePathSegment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum PlaceRoot {
+    Local(LocalTypeId),
+    Temporary(ExprId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +92,6 @@ pub(super) enum PlacePathSegment {
     Field(Ident),
     Tuple(usize),
     Variant(Ident),
-    Index,
 }
 
 impl PlaceIdentity {
@@ -101,8 +99,8 @@ impl PlaceIdentity {
         Self::Unknown
     }
 
-    pub(super) fn root(name: Ident) -> Self {
-        Self::Single(PlacePath::root(name))
+    pub(super) fn root(root: PlaceRoot) -> Self {
+        Self::Single(PlacePath::root(root))
     }
 
     pub(super) fn field(self, field: Ident) -> Self {
@@ -125,7 +123,35 @@ impl PlaceIdentity {
     }
 
     pub(super) fn index(self) -> Self {
-        self.project(&PlacePath::index)
+        match self {
+            Self::Single(path) => Self::IndexedDerived(path.root),
+            Self::UnknownDerived(root) => Self::IndexedDerived(root),
+            Self::Alternatives {
+                group,
+                alternatives,
+            } => Self::alternatives(
+                group,
+                alternatives.into_iter().map(PlaceIdentity::index).collect(),
+            ),
+            identity => identity,
+        }
+    }
+
+    pub(super) fn returned_place(self) -> Self {
+        match self {
+            Self::Single(path) => Self::UnknownDerived(path.root),
+            Self::Alternatives {
+                group,
+                alternatives,
+            } => Self::alternatives(
+                group,
+                alternatives
+                    .into_iter()
+                    .map(PlaceIdentity::returned_place)
+                    .collect(),
+            ),
+            identity => identity,
+        }
     }
 
     pub(super) fn alternatives(group: AliasAltGroupId, alternatives: Vec<Self>) -> Self {
@@ -139,16 +165,34 @@ impl PlaceIdentity {
         }
     }
 
+    pub(super) fn derives_from(&self, source: &Self) -> bool {
+        match (self, source) {
+            (Self::Unknown, _) | (_, Self::Unknown) => false,
+            (Self::Alternatives { alternatives, .. }, source) => {
+                alternatives.iter().all(|alt| alt.derives_from(source))
+            }
+            (identity, Self::Alternatives { alternatives, .. }) => alternatives
+                .iter()
+                .any(|source| identity.derives_from(source)),
+            (Self::Single(path), Self::Single(source)) => path.starts_with(source),
+            _ => self.place_root() == source.place_root(),
+        }
+    }
+
+    pub(super) fn is_indexed_derived(&self) -> bool {
+        match self {
+            Self::IndexedDerived(_) => true,
+            Self::Alternatives { alternatives, .. } => {
+                alternatives.iter().any(Self::is_indexed_derived)
+            }
+            Self::Unknown | Self::Single(_) | Self::UnknownDerived(_) => false,
+        }
+    }
+
     pub(super) fn conflicts_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Unknown, _) | (_, Self::Unknown) => true,
             (Self::Single(left), Self::Single(right)) => left.conflicts_with(right),
-            (Self::Single(_), Self::Alternatives { alternatives, .. }) => {
-                alternatives.iter().any(|alt| self.conflicts_with(alt))
-            }
-            (Self::Alternatives { alternatives, .. }, Self::Single(_)) => {
-                alternatives.iter().any(|alt| alt.conflicts_with(other))
-            }
             (
                 Self::Alternatives {
                     group: left_group,
@@ -159,12 +203,26 @@ impl PlaceIdentity {
                     alternatives: right,
                 },
             ) => alternatives_conflict(*left_group, left, *right_group, right),
+            (Self::Alternatives { alternatives, .. }, _) => {
+                alternatives.iter().any(|alt| alt.conflicts_with(other))
+            }
+            (_, Self::Alternatives { alternatives, .. }) => {
+                alternatives.iter().any(|alt| self.conflicts_with(alt))
+            }
+            _ => self.place_root() == other.place_root(),
+        }
+    }
+
+    fn place_root(&self) -> Option<PlaceRoot> {
+        match self {
+            Self::Single(path) => Some(path.root),
+            Self::UnknownDerived(root) | Self::IndexedDerived(root) => Some(*root),
+            Self::Unknown | Self::Alternatives { .. } => None,
         }
     }
 
     fn project(self, project_path: &impl Fn(PlacePath) -> PlacePath) -> Self {
         match self {
-            Self::Unknown => Self::Unknown,
             Self::Single(path) => Self::Single(project_path(path)),
             Self::Alternatives {
                 group,
@@ -176,6 +234,7 @@ impl PlaceIdentity {
                     .map(|identity| identity.project(project_path))
                     .collect(),
             ),
+            identity => identity,
         }
     }
 }
@@ -200,7 +259,7 @@ fn alternatives_conflict(
 }
 
 impl PlacePath {
-    pub(super) fn root(root: Ident) -> Self {
+    pub(super) fn root(root: PlaceRoot) -> Self {
         Self {
             root,
             segments: vec![],
@@ -222,15 +281,12 @@ impl PlacePath {
         self
     }
 
-    pub(super) fn index(mut self) -> Self {
-        self.segments.push(PlacePathSegment::Index);
-        self
+    pub(super) fn starts_with(&self, other: &Self) -> bool {
+        self.root == other.root && self.segments.starts_with(&other.segments)
     }
 
     pub(super) fn conflicts_with(&self, other: &Self) -> bool {
-        self.root == other.root
-            && (self.segments.starts_with(&other.segments)
-                || other.segments.starts_with(&self.segments))
+        self.starts_with(other) || other.starts_with(self)
     }
 }
 
@@ -552,7 +608,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
             Ok(Some(value)) => {
                 let checked =
                     super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
-                let access = tc.local_value_access(*name, &value);
+                let access = tc.local_value_access(&value);
                 let mut place = CheckedPlace::new(checked, access.access);
                 place.value.facts = access.facts;
                 place.value.identity = access.identity;
@@ -628,8 +684,16 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
         }
     }
 
-    let checked = check_expr_checked(expr, tc);
-    CheckedPlace::new(checked, PlaceAccess::NotPlace)
+    if let Some(chain) = super::postfix::collect_postfix_chain(expr) {
+        let value = super::postfix::check_postfix_chain_place(&chain, expr, None, false, tc);
+        let accepts_extern_any = value.checked.contains_extern_any;
+        return CheckedPlace {
+            value,
+            accepts_extern_any,
+        };
+    }
+
+    CheckedPlace::new(check_expr_checked(expr, tc), PlaceAccess::NotPlace)
 }
 
 pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
@@ -727,27 +791,37 @@ mod tests {
         Ident::new(name)
     }
 
+    fn root(id: u32) -> PlaceRoot {
+        PlaceRoot::Local(LocalTypeId::new(id))
+    }
+
+    fn path(id: u32) -> PlacePath {
+        PlacePath::root(root(id))
+    }
+
+    fn identity(id: u32) -> PlaceIdentity {
+        PlaceIdentity::root(root(id))
+    }
+
     #[test]
     fn place_path_conflicts_on_same_or_prefix_path() {
-        let root = PlacePath::root(ident("x"));
-        let field = PlacePath::root(ident("x")).field(ident("a"));
-        let nested = PlacePath::root(ident("x"))
-            .field(ident("a"))
-            .field(ident("b"));
+        let root = path(1);
+        let field = path(1).field(ident("a"));
+        let nested = path(1).field(ident("a")).field(ident("b"));
 
         assert!(root.conflicts_with(&field));
         assert!(field.conflicts_with(&root));
         assert!(field.conflicts_with(&nested));
-        assert!(root.conflicts_with(&PlacePath::root(ident("x")).tuple(0)));
+        assert!(root.conflicts_with(&path(1).tuple(0)));
     }
 
     #[test]
     fn place_path_does_not_conflict_on_distinct_fields_or_roots() {
-        let a = PlacePath::root(ident("x")).field(ident("a"));
-        let b = PlacePath::root(ident("x")).field(ident("b"));
-        let other = PlacePath::root(ident("y")).field(ident("a"));
-        let first = PlacePath::root(ident("x")).tuple(0);
-        let second = PlacePath::root(ident("x")).tuple(1);
+        let a = path(1).field(ident("a"));
+        let b = path(1).field(ident("b"));
+        let other = path(2).field(ident("a"));
+        let first = path(1).tuple(0);
+        let second = path(1).tuple(1);
 
         assert!(!a.conflicts_with(&b));
         assert!(!a.conflicts_with(&other));
@@ -758,8 +832,8 @@ mod tests {
         AliasAltGroupId(id)
     }
 
-    fn tuple(root: &str, index: usize) -> PlaceIdentity {
-        PlaceIdentity::root(ident(root)).tuple(index)
+    fn tuple(root: u32, index: usize) -> PlaceIdentity {
+        identity(root).tuple(index)
     }
 
     fn alternatives(group_id: u32, identities: Vec<PlaceIdentity>) -> PlaceIdentity {
@@ -768,9 +842,9 @@ mod tests {
 
     #[test]
     fn place_identity_conflicts_on_same_or_prefix_path() {
-        let root = PlaceIdentity::root(ident("x"));
-        let field = PlaceIdentity::root(ident("x")).field(ident("a"));
-        let other = PlaceIdentity::root(ident("x")).field(ident("b"));
+        let root = identity(1);
+        let field = identity(1).field(ident("a"));
+        let other = identity(1).field(ident("b"));
 
         assert!(root.conflicts_with(&field));
         assert!(field.conflicts_with(&root));
@@ -779,38 +853,32 @@ mod tests {
 
     #[test]
     fn same_group_swapped_paths_do_not_conflict_when_zipped() {
-        let left = alternatives(1, vec![tuple("x", 0), tuple("x", 1)]);
-        let right = alternatives(1, vec![tuple("x", 1), tuple("x", 0)]);
+        let left = alternatives(1, vec![tuple(1, 0), tuple(1, 1)]);
+        let right = alternatives(1, vec![tuple(1, 1), tuple(1, 0)]);
 
         assert!(!left.conflicts_with(&right));
     }
 
     #[test]
     fn same_group_same_path_conflicts_when_zipped() {
-        let left = alternatives(1, vec![tuple("x", 0), PlaceIdentity::root(ident("y"))]);
-        let right = alternatives(1, vec![tuple("x", 0), PlaceIdentity::root(ident("z"))]);
+        let left = alternatives(1, vec![tuple(1, 0), identity(2)]);
+        let right = alternatives(1, vec![tuple(1, 0), identity(3)]);
 
         assert!(left.conflicts_with(&right));
     }
 
     #[test]
     fn different_groups_use_cross_product() {
-        let left = alternatives(1, vec![tuple("x", 0), PlaceIdentity::root(ident("y"))]);
-        let right = alternatives(2, vec![PlaceIdentity::root(ident("z")), tuple("x", 0)]);
+        let left = alternatives(1, vec![tuple(1, 0), identity(2)]);
+        let right = alternatives(2, vec![identity(3), tuple(1, 0)]);
 
         assert!(left.conflicts_with(&right));
     }
 
     #[test]
     fn single_conflicts_with_any_alternative() {
-        let single = tuple("x", 0);
-        let choices = alternatives(
-            1,
-            vec![
-                PlaceIdentity::root(ident("y")),
-                PlaceIdentity::root(ident("x")),
-            ],
-        );
+        let single = tuple(1, 0);
+        let choices = alternatives(1, vec![identity(2), identity(1)]);
 
         assert!(single.conflicts_with(&choices));
         assert!(choices.conflicts_with(&single));
@@ -819,7 +887,7 @@ mod tests {
     #[test]
     fn unknown_conflicts_with_mutable_identity() {
         let unknown = PlaceIdentity::unknown();
-        let field = PlaceIdentity::root(ident("x")).field(ident("a"));
+        let field = identity(1).field(ident("a"));
 
         assert!(unknown.conflicts_with(&field));
         assert!(field.conflicts_with(&unknown));
@@ -828,32 +896,18 @@ mod tests {
 
     #[test]
     fn recursive_alternatives_preserve_inner_group_alignment() {
-        let inner_left = alternatives(1, vec![tuple("x", 0), tuple("x", 1)]);
-        let inner_right = alternatives(1, vec![tuple("x", 1), tuple("x", 0)]);
-        let left = alternatives(2, vec![inner_left, PlaceIdentity::root(ident("y"))]);
-        let right = alternatives(2, vec![inner_right, PlaceIdentity::root(ident("z"))]);
+        let inner_left = alternatives(1, vec![tuple(1, 0), tuple(1, 1)]);
+        let inner_right = alternatives(1, vec![tuple(1, 1), tuple(1, 0)]);
+        let left = alternatives(2, vec![inner_left, identity(2)]);
+        let right = alternatives(2, vec![inner_right, identity(3)]);
 
         assert!(!left.conflicts_with(&right));
     }
 
     #[test]
     fn projection_preserves_alternative_groups() {
-        let left = alternatives(
-            1,
-            vec![
-                PlaceIdentity::root(ident("x")),
-                PlaceIdentity::root(ident("y")),
-            ],
-        )
-        .field(ident("a"));
-        let right = alternatives(
-            1,
-            vec![
-                PlaceIdentity::root(ident("x")),
-                PlaceIdentity::root(ident("z")),
-            ],
-        )
-        .field(ident("a"));
+        let left = alternatives(1, vec![identity(1), identity(2)]).field(ident("a"));
+        let right = alternatives(1, vec![identity(1), identity(3)]).field(ident("a"));
 
         assert!(left.conflicts_with(&right));
     }

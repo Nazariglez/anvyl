@@ -28,6 +28,17 @@ fn expect_if_let_downcast_head(source: &str, head: ast::PatternHead) {
 }
 
 #[test]
+fn lambda_var_return() {
+    let expr = parse_expr("|var x: int| -> var int { x }");
+    let ast::ExprKind::Lambda(lambda) = &expr.node.kind else {
+        panic!("expected lambda");
+    };
+    let ret = lambda.node.ret_type.as_ref().expect("return type");
+    assert_eq!(ret.access, ast::ReturnAccess::Place);
+    assert_eq!(ret.ty, ast::Type::Int);
+}
+
+#[test]
 fn mul_add_prec() {
     let expr = parse_expr("1 + 2 * 3");
     let (left, right) = expect_binary(&expr, ast::BinaryOp::Add);

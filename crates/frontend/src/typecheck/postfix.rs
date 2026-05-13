@@ -22,7 +22,7 @@ use super::{
 use crate::{
     ast::{
         CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg, Ident,
-        MethodReceiver, Type,
+        MethodReceiver, ReturnSpec, Type,
     },
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
@@ -161,7 +161,7 @@ fn local_value_subject(
     tc: &mut TypeChecker,
 ) -> Subject {
     let checked = super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
-    let access = tc.local_value_access(name, value);
+    let access = tc.local_value_access(value);
     let mut value = PlaceValue::new(checked, access.access, access.facts);
     value.identity = access.identity;
     value.root_name = Some(name);
@@ -238,6 +238,16 @@ pub(super) fn check_postfix_chain(
     expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
+    check_postfix_chain_place(chain, expr, expected, true, tc).checked
+}
+
+pub(super) fn check_postfix_chain_place(
+    chain: &PostfixChain,
+    expr: &ExprNode,
+    expected: Option<&TypeHandle>,
+    record_final_read: bool,
+    tc: &mut TypeChecker,
+) -> PlaceValue {
     let Some(mut subject) = resolve_base(chain.base, tc) else {
         if let ExprKind::Ident(name) = &chain.base.node.kind {
             tc.push_error(TypeError::UndefinedVariable {
@@ -246,7 +256,7 @@ pub(super) fn check_postfix_chain(
             });
         }
         tc.set_type(chain.base.node.id, Type::Infer, chain.base.span);
-        return checked_type(finish_chain(chain, expr, tc), tc);
+        return PlaceValue::not_place(checked_type(finish_chain(chain, expr, tc), tc));
     };
 
     tc.set_type(chain.base.node.id, subject_type(&subject), chain.base.span);
@@ -283,23 +293,23 @@ pub(super) fn check_postfix_chain(
                 let call_expected = is_last_step
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
-                let checked = apply_call(&subject, node, *id, call_expected, tc);
+                let value = apply_call(&subject, node, *id, call_expected, tc);
                 tc.set_type(
                     *id,
-                    wrap_optional(checked.ty.clone(), optional_chain, tc),
+                    wrap_optional(value.checked.ty.clone(), optional_chain, tc),
                     node.span,
                 );
                 if matches!(subject, Subject::Error) {
                     Subject::Error
                 } else {
-                    value_subject_checked(checked)
+                    Subject::Value(value)
                 }
             }
         };
     }
 
     if let Subject::Callable { callee, .. } = &subject
-        && matches!(callee.def.sig.ret, Type::InferReturn)
+        && callee.def.sig.ret.is_infer()
     {
         tc.push_error(TypeError::InferReturnValue {
             span: tc.error_span(expr.span),
@@ -308,7 +318,9 @@ pub(super) fn check_postfix_chain(
 
     if let Subject::Value(value) = &subject {
         tc.check_mut_downcast_root_use(value.root_name, &value.identity, expr.span);
-        place::record_value_read(expr.node.id, value, tc);
+        if record_final_read {
+            place::record_value_read(expr.node.id, value, tc);
+        }
     }
 
     if let Subject::Type(ty) = &subject {
@@ -316,15 +328,24 @@ pub(super) fn check_postfix_chain(
             ty: ty.clone(),
             span: tc.error_span(expr.span),
         });
-        return super::checked_from_type(expr, Type::Infer, tc);
+        return PlaceValue::not_place(super::checked_from_type(expr, Type::Infer, tc));
     }
 
     let ty = chain_type(&subject, optional_chain, tc);
-    let handle = tc.set_type(expr.node.id, ty.clone(), expr.span);
-    CheckedType {
+    let checked = CheckedType {
+        handle: tc.set_type(expr.node.id, ty.clone(), expr.span),
         ty,
-        handle,
         contains_extern_any: subject_contains_extern_any(&subject),
+    };
+    if optional_chain {
+        return PlaceValue::not_place(checked);
+    }
+    match subject {
+        Subject::Value(mut value) => {
+            value.checked = checked;
+            value
+        }
+        _ => PlaceValue::not_place(checked),
     }
 }
 
@@ -358,7 +379,7 @@ fn subject_type(subject: &Subject) -> Type {
         Subject::DynMethod { requirement, .. } => func_type(&requirement.params, &requirement.ret),
         Subject::DynHoleMethod { .. } => Type::Func {
             params: vec![],
-            ret: Box::new(Type::Void),
+            ret: Box::new(ReturnSpec::void()),
         },
         Subject::Module(_) => Type::Void,
         Subject::Type(ty) => ty.clone(),
@@ -501,7 +522,7 @@ fn named_value_subject(
         Some(mut callee) => {
             if let Some(Type::Func { params, ret }) = local_dyn_infer_ty {
                 callee.def.sig.params = params;
-                callee.def.sig.ret = *ret;
+                callee.def.sig.ret = ret.as_ref().clone();
             }
             callable_subject(callee, None)
         }
@@ -537,7 +558,7 @@ fn callable_subject(callee: CallableRef, receiver: Option<SourceReceiver>) -> Su
 
 fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     let ExprKind::Index(index) = &expr.node.kind else {
-        return place::check_place(expr, tc).value;
+        return materialized_receiver_value(expr.node.id, place::check_place(expr, tc).value);
     };
 
     let target = place::check_place(&index.node.target, tc);
@@ -567,7 +588,17 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     }
 
     place::record_value_read(index.node.target.node.id, &target.value, tc);
-    PlaceValue::not_place(checked)
+    materialized_receiver_value(expr.node.id, PlaceValue::not_place(checked))
+}
+
+fn materialized_receiver_value(expr_id: ExprId, mut value: PlaceValue) -> PlaceValue {
+    if value.access != PlaceAccess::NotPlace || matches!(value.checked.ty, Type::Infer | Type::Void)
+    {
+        return value;
+    }
+    value.access = PlaceAccess::Mutable;
+    value.identity = place::PlaceIdentity::root(place::PlaceRoot::Temporary(expr_id));
+    value
 }
 
 fn source_receiver(
@@ -1087,7 +1118,7 @@ fn apply_call(
     call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
-) -> CheckedType {
+) -> PlaceValue {
     match subject {
         Subject::Callable {
             callee, receiver, ..
@@ -1096,13 +1127,15 @@ fn apply_call(
                 .as_ref()
                 .and_then(|receiver| check_source_receiver(receiver, call.span, tc));
             check_callable_call(callee, call, call_id, receiver_arg, expected, tc)
+                .into_place_value()
         }
         Subject::QualifiedExtend { module, name, span } => {
             check_qualified_extend_call(module, *name, *span, call, call_id, expected, tc)
+                .into_place_value()
         }
-        Subject::EnumVariant { resolved, .. } => {
-            check_enum_variant_call(resolved, call, call_id, expected, tc)
-        }
+        Subject::EnumVariant { resolved, .. } => PlaceValue::not_place(check_enum_variant_call(
+            resolved, call, call_id, expected, tc,
+        )),
         Subject::ExternMethod {
             method_ref,
             receiver,
@@ -1113,7 +1146,7 @@ fn apply_call(
             receiver_id,
             name,
             signature,
-        } => check_extern_method_call(
+        } => PlaceValue::not_place(check_extern_method_call(
             ExternMethodCall {
                 method_ref: *method_ref,
                 receiver: *receiver,
@@ -1129,7 +1162,7 @@ fn apply_call(
             call_id,
             expected,
             tc,
-        ),
+        )),
         Subject::DynMethod {
             contract,
             requirement,
@@ -1139,7 +1172,7 @@ fn apply_call(
             receiver_root_name,
             receiver_id,
             name,
-        } => check_dyn_method_call(
+        } => PlaceValue::not_place(check_dyn_method_call(
             contract,
             requirement,
             DynReceiver {
@@ -1154,7 +1187,7 @@ fn apply_call(
             call_id,
             expected,
             tc,
-        ),
+        )),
         Subject::DynHoleMethod {
             hole,
             receiver_access,
@@ -1163,7 +1196,7 @@ fn apply_call(
             receiver_root_name,
             receiver_id,
             name,
-        } => check_dyn_hole_method_call(
+        } => PlaceValue::not_place(check_dyn_hole_method_call(
             *hole,
             DynReceiver {
                 access: *receiver_access,
@@ -1177,24 +1210,32 @@ fn apply_call(
             call_id,
             expected,
             tc,
-        ),
+        )),
         Subject::ExternStatic {
             static_ref,
             signature,
-        } => check_extern_static_call(*static_ref, signature, call, call_id, expected, tc),
+        } => PlaceValue::not_place(check_extern_static_call(
+            *static_ref,
+            signature,
+            call,
+            call_id,
+            expected,
+            tc,
+        )),
         Subject::Value(value) => {
             tc.check_mut_downcast_root_use(value.root_name, &value.identity, call.node.func.span);
             place::record_value_read(call.node.func.node.id, value, tc);
-            checked_type(call_value(value.checked.ty.clone(), call, call_id, tc), tc)
+            call_value(value.checked.ty.clone(), call, call_id, expected, tc).into_place_value()
         }
-        Subject::Module(_) | Subject::Type(_) => {
-            checked_type(not_callable(subject_type(subject), call, tc), tc)
-        }
+        Subject::Module(_) | Subject::Type(_) => PlaceValue::not_place(checked_type(
+            not_callable(subject_type(subject), call, tc),
+            tc,
+        )),
         Subject::Error => {
             for arg in &call.node.args {
                 check_expr_checked(arg, tc);
             }
-            checked_type(Type::Infer, tc)
+            PlaceValue::not_place(checked_type(Type::Infer, tc))
         }
     }
 }
@@ -1216,6 +1257,12 @@ fn check_source_receiver(
         return Some(MutableArg {
             identity: receiver.identity.clone(),
             span,
+            source: ReturnPlaceSource {
+                access: receiver.access,
+                facts: receiver.facts.clone(),
+                identity: receiver.identity.clone(),
+                root_name: receiver.root_name,
+            },
         });
     }
     place::record_facts_read(receiver.expr_id, &receiver.facts, tc);
@@ -1238,13 +1285,40 @@ fn mutating_receiver_error(
     }
 }
 
-fn call_value(callee_ty: Type, call: &CallNode, call_id: ExprId, tc: &mut TypeChecker) -> Type {
+fn call_value(
+    callee_ty: Type,
+    call: &CallNode,
+    call_id: ExprId,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedCall {
     match &callee_ty {
         Type::Func { params, ret } => {
-            check_args(&call.node.args, params, call.span, call_id, tc);
-            (**ret).clone()
+            let params = params
+                .iter()
+                .map(|param| CallParam {
+                    ty: tc.type_handle(&param.ty),
+                    mutable: param.mutable,
+                    cast_accept: param.cast_accept,
+                })
+                .collect::<Vec<_>>();
+            let args_check = if check_arg_count(&call.node.args, params.len(), call.span, tc) {
+                check_source_args(&call.node.args, &params, call_id, None, tc)
+            } else {
+                SourceArgsCheck {
+                    failed: true,
+                    place_source: None,
+                }
+            };
+            let ret_handle = tc.type_handle(&ret.ty);
+            constrain_expected_return(call.span, ret_handle.clone(), expected, tc);
+            CheckedCall {
+                checked: checked_type(ret.ty.clone(), tc),
+                returns_place: ret.is_place() && !args_check.failed,
+                source: args_check.place_source,
+            }
         }
-        _ => not_callable(callee_ty, call, tc),
+        _ => CheckedCall::value(checked_type(not_callable(callee_ty, call, tc), tc)),
     }
 }
 
@@ -1365,7 +1439,7 @@ fn check_dyn_method_call(
     }
 
     failed |= check_args(&call.node.args, &requirement.params, call.span, call_id, tc);
-    let ret = tc.type_handle(&requirement.ret);
+    let ret = tc.type_handle(&requirement.ret.ty);
     constrain_expected_return(call.span, ret.clone(), expected, tc);
     if !failed {
         tc.record_dyn_call(DynCallFact {
@@ -1378,7 +1452,7 @@ fn check_dyn_method_call(
             span: tc.source_span(call.span),
         });
     }
-    checked_type(requirement.ret.clone(), tc)
+    checked_type(requirement.ret.ty.clone(), tc)
 }
 
 #[derive(Clone, Copy)]
@@ -1399,7 +1473,8 @@ struct GenericCallInstantiation {
     type_subst: TypeSubst,
     const_subst: ConstSubst,
     concrete_params: Vec<FuncParam>,
-    ret: Type,
+    ret: ReturnSpec,
+    place_source: Option<ReturnPlaceSource>,
 }
 
 struct CallParam {
@@ -1421,7 +1496,7 @@ fn solve_generic_call_with(
     seeds: &GenericSolverSeeds,
     template_params: &[FuncParam],
     required_params: usize,
-    template_ret: &Type,
+    template_ret: &ReturnSpec,
     source: GenericCallSource<'_>,
     tc: &mut TypeChecker,
     add_constraints: impl FnOnce(&GenericSolverVars, &mut TypeChecker),
@@ -1437,13 +1512,18 @@ fn solve_generic_call_with(
         return None;
     }
 
-    let inferred_ret = matches!(template_ret, Type::InferReturn);
+    let inferred_ret = template_ret.is_infer();
     let error_count = tc.errors.len();
     for param in template_params {
         tc.substitute_checked(&param.ty, &seeds.type_args, &seeds.const_args, call_span);
     }
     if !inferred_ret {
-        tc.substitute_checked(template_ret, &seeds.type_args, &seeds.const_args, call_span);
+        tc.substitute_checked(
+            &template_ret.ty,
+            &seeds.type_args,
+            &seeds.const_args,
+            call_span,
+        );
     }
     if tc.errors.len() != error_count {
         for arg in args {
@@ -1459,9 +1539,10 @@ fn solve_generic_call_with(
     let mut failed = tc.solve_constraints();
 
     let params = instantiate_call_params(template_params, &vars, tc);
-    failed |= check_source_args(args, &params, call_id, receiver_arg, tc);
+    let args_check = check_source_args(args, &params, call_id, receiver_arg, tc);
+    failed |= args_check.failed;
     if !inferred_ret {
-        let ret_handle = tc.solver.instantiate_generic_type(template_ret, &vars);
+        let ret_handle = tc.solver.instantiate_generic_type(&template_ret.ty, &vars);
         failed |= constrain_expected_return(call_span, ret_handle, expected, tc);
     }
 
@@ -1483,11 +1564,11 @@ fn solve_generic_call_with(
     let (type_subst, const_subst) = generics.substitutions(&args);
     let concrete_params =
         substitute_params_checked(template_params, &type_subst, &const_subst, call_span, tc);
-    let ret = if inferred_ret {
+    let ret = template_ret.with_ty(if inferred_ret {
         Type::InferReturn
     } else {
-        tc.substitute_checked(template_ret, &type_subst, &const_subst, call_span)
-    };
+        tc.substitute_checked(&template_ret.ty, &type_subst, &const_subst, call_span)
+    });
 
     Some(GenericCallInstantiation {
         args,
@@ -1495,6 +1576,7 @@ fn solve_generic_call_with(
         const_subst,
         concrete_params,
         ret,
+        place_source: args_check.place_source,
     })
 }
 
@@ -1519,31 +1601,87 @@ fn check_source_args(
     call_id: ExprId,
     receiver_arg: Option<MutableArg>,
     tc: &mut TypeChecker,
-) -> bool {
+) -> SourceArgsCheck {
     let mut failed = false;
     let mut mutable_args = receiver_arg.into_iter().collect::<Vec<_>>();
     for (index, (arg, param)) in args.iter().zip(params).enumerate() {
         let checked = check_source_arg(arg, param, call_id, index, tc);
         failed |= checked.failed;
-        if let Some(identity) = checked.mutable_identity {
-            mutable_args.push(MutableArg {
-                identity,
-                span: arg.span,
-            });
+        if let Some(mutable_arg) = checked.mutable_arg {
+            mutable_args.push(mutable_arg);
         }
     }
     let alias_failed = validate_mutable_aliases(&mutable_args, tc);
-    failed || alias_failed
+    SourceArgsCheck {
+        failed: failed || alias_failed,
+        place_source: mutable_args.first().map(|arg| arg.source.clone()),
+    }
+}
+
+struct SourceArgsCheck {
+    failed: bool,
+    place_source: Option<ReturnPlaceSource>,
 }
 
 struct SourceArgCheck {
     failed: bool,
-    mutable_identity: Option<place::PlaceIdentity>,
+    mutable_arg: Option<MutableArg>,
+}
+
+#[derive(Clone)]
+struct ReturnPlaceSource {
+    access: PlaceAccess,
+    facts: PlaceUseFacts,
+    identity: place::PlaceIdentity,
+    root_name: Option<Ident>,
+}
+
+struct CheckedCall {
+    checked: CheckedType,
+    returns_place: bool,
+    source: Option<ReturnPlaceSource>,
+}
+
+impl CheckedCall {
+    fn value(checked: CheckedType) -> Self {
+        Self {
+            checked,
+            returns_place: false,
+            source: None,
+        }
+    }
+
+    fn into_place_value(self) -> PlaceValue {
+        let Some(source) = self.source.filter(|_| self.returns_place) else {
+            return PlaceValue::not_place(self.checked);
+        };
+        PlaceValue {
+            checked: self.checked,
+            access: source.access,
+            facts: source.facts,
+            identity: source.identity.returned_place(),
+            root_name: source.root_name,
+        }
+    }
 }
 
 struct MutableArg {
     identity: place::PlaceIdentity,
     span: Span,
+    source: ReturnPlaceSource,
+}
+
+fn mutable_arg(span: Span, value: &PlaceValue) -> MutableArg {
+    MutableArg {
+        identity: value.identity.clone(),
+        span,
+        source: ReturnPlaceSource {
+            access: value.access,
+            facts: value.facts.clone(),
+            identity: value.identity.clone(),
+            root_name: value.root_name,
+        },
+    }
 }
 
 fn validate_mutable_aliases(args: &[MutableArg], tc: &mut TypeChecker) -> bool {
@@ -1627,20 +1765,20 @@ fn check_projecting_var_arg(
         tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
-            mutable_identity: None,
+            mutable_arg: None,
         };
     }
 
     let target = tc.handle_type(&param.ty);
     if matches!(target, Type::Dyn(_)) {
         place::record_write(arg.node.id, &place, tc);
-        let identity = place.value.identity.clone();
+        let mutable_arg = mutable_arg(arg.span, &place.value);
         let checked = place.into_checked();
         tc.reject_extern_any_escape(&checked, arg.span);
         tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
-            mutable_identity: Some(identity),
+            mutable_arg: Some(mutable_arg),
         };
     }
 
@@ -1659,7 +1797,7 @@ fn check_projecting_var_arg(
                 });
                 return SourceArgCheck {
                     failed: true,
-                    mutable_identity: None,
+                    mutable_arg: None,
                 };
             }
             tc.push_error(TypeError::MissingProjection {
@@ -1672,7 +1810,7 @@ fn check_projecting_var_arg(
             });
             return SourceArgCheck {
                 failed: true,
-                mutable_identity: None,
+                mutable_arg: None,
             };
         }
         ProjectionLookup::Conflict(conflict) => {
@@ -1684,7 +1822,7 @@ fn check_projecting_var_arg(
             });
             return SourceArgCheck {
                 failed: true,
-                mutable_identity: None,
+                mutable_arg: None,
             };
         }
     };
@@ -1712,7 +1850,7 @@ fn check_projecting_var_arg(
     });
     SourceArgCheck {
         failed: tc.solve_constraints(),
-        mutable_identity: Some(projected.identity),
+        mutable_arg: Some(mutable_arg(arg.span, &projected)),
     }
 }
 
@@ -1723,19 +1861,19 @@ fn finish_var_arg(
     mutability_error: Option<TypeError>,
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
-    let mutable_identity = if let Some(error) = mutability_error {
+    let mutable_arg = if let Some(error) = mutability_error {
         tc.push_error(error);
         None
     } else {
         place::record_write(arg.node.id, &place, tc);
-        Some(place.value.identity.clone())
+        Some(mutable_arg(arg.span, &place.value))
     };
     let checked = place.into_checked();
     tc.reject_extern_any_escape(&checked, arg.span);
     tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
     SourceArgCheck {
         failed: tc.solve_constraints(),
-        mutable_identity,
+        mutable_arg,
     }
 }
 
@@ -1750,20 +1888,20 @@ fn check_cast_accept_arg(
         tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
         return SourceArgCheck {
             failed: tc.solve_constraints(),
-            mutable_identity: None,
+            mutable_arg: None,
         };
     }
     let target = tc.handle_type(&param.ty);
     if tc.has_cast_from_conversion(&checked.ty, &target) {
         return SourceArgCheck {
             failed: tc.solve_constraints(),
-            mutable_identity: None,
+            mutable_arg: None,
         };
     }
     tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
     SourceArgCheck {
         failed: tc.solve_constraints(),
-        mutable_identity: None,
+        mutable_arg: None,
     }
 }
 
@@ -1775,7 +1913,7 @@ fn check_value_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> S
     tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
     SourceArgCheck {
         failed: tc.solve_constraints() || dyn_format,
-        mutable_identity: None,
+        mutable_arg: None,
     }
 }
 
@@ -1870,6 +2008,7 @@ fn check_enum_variant_call(
         expected,
         tc,
     )
+    .checked
 }
 
 fn check_callable_call(
@@ -1879,9 +2018,11 @@ fn check_callable_call(
     receiver_arg: Option<MutableArg>,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
-) -> CheckedType {
+) -> CheckedCall {
     if matches!(callee.def.id.kind, CallableKind::ExternFunction) {
-        return check_extern_function_call(callee, call, call_id, expected, tc);
+        return CheckedCall::value(check_extern_function_call(
+            callee, call, call_id, expected, tc,
+        ));
     }
     let checked = check_callable_call_with_args(
         callee,
@@ -1894,10 +2035,11 @@ fn check_callable_call(
         expected,
         tc,
     );
-    if matches!(callee.def.sig.ret, Type::InferReturn) {
+    if callee.def.sig.ret.is_infer() {
+        let ret = callee.def.sig.ret.with_ty(checked.checked.ty.clone());
         tc.set_type(
             call.node.func.node.id,
-            func_type(&callee.def.sig.params, &checked.ty),
+            func_type(&callee.def.sig.params, &ret),
             call.node.func.span,
         );
     }
@@ -1914,11 +2056,11 @@ fn check_callable_call_with_args(
     receiver_arg: Option<MutableArg>,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
-) -> CheckedType {
+) -> CheckedCall {
     let Some(mut seeds) =
         bind_prefix_generic_seeds(tc, syntactic_generics(callee), generic_args, call_span)
     else {
-        return checked_type(Type::Infer, tc);
+        return CheckedCall::value(checked_type(Type::Infer, tc));
     };
     seed_owner_args(
         &mut seeds,
@@ -1944,7 +2086,7 @@ fn check_callable_call_with_args(
         tc,
         |vars, tc| constrain_callable_owner(callee, vars, call_span, tc),
     ) else {
-        return checked_type(Type::Infer, tc);
+        return CheckedCall::value(checked_type(Type::Infer, tc));
     };
 
     let (owner_args, callable_args) = split_generic_args(
@@ -1964,6 +2106,7 @@ fn check_callable_call_with_args(
         const_subst,
         concrete_params,
         mut ret,
+        place_source,
         ..
     } = inst;
     let body_ret = ret.clone();
@@ -1978,7 +2121,7 @@ fn check_callable_call_with_args(
         const_bindings,
         tc,
     ) {
-        ret = inferred_ret;
+        ret.ty = inferred_ret;
     }
     let id = callee.def.id.clone();
     let target = match form {
@@ -1986,7 +2129,12 @@ fn check_callable_call_with_args(
         CallForm::QualifiedExtend { receiver } => CallTarget::qualified_extend(id, args, receiver),
     };
     tc.record_call(call_id, target);
-    checked_type(ret, tc)
+    let returns_place = ret.is_place();
+    CheckedCall {
+        checked: checked_type(ret.ty, tc),
+        returns_place,
+        source: place_source,
+    }
 }
 
 fn check_qualified_extend_call(
@@ -1997,14 +2145,14 @@ fn check_qualified_extend_call(
     call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
-) -> CheckedType {
+) -> CheckedCall {
     let Some((receiver_expr, args)) = call.node.args.split_first() else {
         tc.push_error(TypeError::WrongArgCount {
             expected: 1,
             found: 0,
             span: tc.error_span(call.span),
         });
-        return checked_type(Type::Infer, tc);
+        return CheckedCall::value(checked_type(Type::Infer, tc));
     };
 
     let receiver = check_receiver_value(receiver_expr, tc);
@@ -2020,7 +2168,7 @@ fn check_qualified_extend_call(
             kind: MemberAccessKind::Method,
             span: tc.error_span(span),
         });
-        return check_unhinted_args(args, tc);
+        return CheckedCall::value(check_unhinted_args(args, tc));
     };
 
     let (extend, method, receiver_ty, owner_args) =
@@ -2028,7 +2176,7 @@ fn check_qualified_extend_call(
             Ok(parts) => parts,
             Err(error) => {
                 push_extend_method_error(tc, error, span);
-                return check_unhinted_args(args, tc);
+                return CheckedCall::value(check_unhinted_args(args, tc));
             }
         };
 
@@ -2297,7 +2445,7 @@ fn not_callable(ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
     Type::Infer
 }
 
-fn func_type(params: &[FuncParam], ret: &Type) -> Type {
+fn func_type(params: &[FuncParam], ret: &ReturnSpec) -> Type {
     Type::Func {
         params: params.to_vec(),
         ret: Box::new(ret.clone()),
@@ -2355,5 +2503,5 @@ pub(super) fn check_args(
             cast_accept: param.cast_accept,
         })
         .collect::<Vec<_>>();
-    check_source_args(args, &params, call_id, None, tc)
+    check_source_args(args, &params, call_id, None, tc).failed
 }

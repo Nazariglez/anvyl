@@ -5,7 +5,7 @@ use anvyx_externs::{
 use chumsky::error::{Rich, RichReason};
 
 use crate::{
-    ast::{self, ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, Type},
+    ast::{self, ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, ReturnSpec, Type},
     conditional::ConditionalError,
     diagnostic::Diagnostic,
     externs::{
@@ -582,6 +582,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::InferReturnRecursive { .. } => {
             "recursive inferred return type requires an explicit return type".to_string()
         }
+        TypeError::UnsupportedPlaceReturn { message, .. } => (*message).to_string(),
         TypeError::UnknownType {
             qualifier, name, ..
         } => format!(
@@ -1136,6 +1137,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::InferReturnValue { span, .. }
         | TypeError::InferReturnMismatch { span, .. }
         | TypeError::InferReturnRecursive { span, .. }
+        | TypeError::UnsupportedPlaceReturn { span, .. }
         | TypeError::UnknownType { span, .. }
         | TypeError::TypeUsedAsValue { span, .. }
         | TypeError::CannotInferConst { span, .. }
@@ -1449,13 +1451,13 @@ fn render_detailed_type(ty: &Type) -> String {
     }
 }
 
-fn render_detailed_func(params: &[FuncParam], ret: &Type) -> String {
+fn render_detailed_func(params: &[FuncParam], ret: &ReturnSpec) -> String {
     let params = params
         .iter()
         .map(|param| {
             let ty = render_detailed_type(&param.ty);
             if param.mutable {
-                format!("mut {ty}")
+                format!("var {ty}")
             } else {
                 ty
             }
@@ -1463,9 +1465,12 @@ fn render_detailed_func(params: &[FuncParam], ret: &Type) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let mut rendered = format!("fn({params})");
-    if !ret.is_void() {
+    if !ret.is_implicit_void() {
         rendered.push_str(" -> ");
-        rendered.push_str(&render_detailed_type(ret));
+        if ret.is_place() {
+            rendered.push_str("var ");
+        }
+        rendered.push_str(&render_detailed_type(&ret.ty));
     }
     rendered
 }

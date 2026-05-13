@@ -48,6 +48,16 @@ fn let_else_var() {
 }
 
 #[test]
+fn func_var_return() {
+    let prog = parse_program("fn id(var x: int) -> var int { x }");
+    let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    assert_eq!(func_node.node.ret.access, ast::ReturnAccess::Place);
+    assert_eq!(func_node.node.ret.ty, Type::Int);
+}
+
+#[test]
 fn if_var() {
     let expr = parse_expr("if var x? = opt {}");
     let ast::ExprKind::IfLet(if_let_node) = &expr.node.kind else {
@@ -691,7 +701,7 @@ mod externs {
         let node = parse_extern_func("extern fn tick() -> void;");
         assert_eq!(node.node.name.0.as_ref(), "tick");
         assert_eq!(node.node.params.len(), 0);
-        assert_eq!(node.node.ret, Type::Void);
+        assert_eq!(node.node.ret.ty, Type::Void);
     }
 
     #[test]
@@ -704,13 +714,13 @@ mod externs {
         assert_eq!(ef.params[0].ty, Type::Int);
         assert_eq!(ef.params[1].name.0.as_ref(), "b");
         assert_eq!(ef.params[1].ty, Type::Int);
-        assert_eq!(ef.ret, Type::Int);
+        assert_eq!(ef.ret.ty, Type::Int);
     }
 
     #[test]
     fn fn_void_default() {
         let node = parse_extern_func("extern fn fire();");
-        assert_eq!(node.node.ret, Type::Void);
+        assert_eq!(node.node.ret.ty, Type::Void);
     }
 
     #[test]
@@ -855,7 +865,7 @@ mod externs {
             qualifier: None,
             name,
             generic_args,
-        } = ret
+        } = &ret.ty
         else {
             panic!("expected Point nominal, found {ret:?}");
         };
@@ -888,7 +898,7 @@ mod externs {
         assert_eq!(name.0.as_ref(), "get_x");
         assert_eq!(*receiver, ExternReceiverMode::Value);
         assert!(params.is_empty());
-        assert_eq!(*ret, Type::Float);
+        assert_eq!(ret.ty, Type::Float);
 
         let ast::ExternTypeMember::Method { name, receiver, .. } = &node.node.members[1] else {
             panic!("expected Method");
@@ -904,7 +914,7 @@ mod externs {
             panic!("expected Method");
         };
         assert_eq!(*receiver, ExternReceiverMode::Shared);
-        assert_eq!(*ret, Type::Float);
+        assert_eq!(ret.ty, Type::Float);
     }
 
     #[test]
@@ -941,7 +951,7 @@ mod externs {
             panic!("expected StaticMethod");
         };
         assert_eq!(
-            *ret,
+            ret.ty,
             Type::nominal(
                 NominalKind::Extern,
                 ast::Ident(internment::Intern::new("Point".to_string())),

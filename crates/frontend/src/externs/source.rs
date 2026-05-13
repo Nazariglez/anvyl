@@ -9,7 +9,8 @@ use super::raw::*;
 use crate::{
     ast::{
         self, BinaryOp, ExternFuncNode, ExternReceiverMode, ExternTypeMember, ExternTypeNode,
-        ExternTypeRep, GenericArg, Mutability, Param, Program, Stmt, Type, UnaryOp, Visibility,
+        ExternTypeRep, GenericArg, Mutability, Param, Program, ReturnSpec, Stmt, Type, UnaryOp,
+        Visibility,
     },
     resolve::{ModuleId, ResolveResult},
     source::SourceId,
@@ -271,12 +272,12 @@ fn normalize_member(
 fn signature(
     source: SourceId,
     params: &[Param],
-    ret: &Type,
+    ret: &ReturnSpec,
     span: Span,
 ) -> SourceResult<ExternSignature> {
     Ok(ExternSignature {
         params: param_list(source, params, span)?,
-        ret: type_expr(source, ret, span)?,
+        ret: type_expr(source, &ret.ty, span)?,
     })
 }
 
@@ -361,6 +362,14 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
             Box::new(type_expr(source, value, span)?),
         )),
         Type::Func { params, ret } => {
+            if ret.is_place() {
+                return Err(Box::new(ExternInputError::UnsupportedSource {
+                    span: SourceSpan::from_byte_span(source, span),
+                    kind: UnsupportedSourceKind::Type(
+                        "callback function returning a mutable place".to_string(),
+                    ),
+                }));
+            }
             if params.iter().any(|param| param.mutable) {
                 return Err(unsupported_callback_param(
                     source,
@@ -374,7 +383,7 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
                     .iter()
                     .map(|param| type_expr(source, &param.ty, span))
                     .collect::<SourceResult<Vec<_>>>()?,
-                ret: Box::new(type_expr(source, ret, span)?),
+                ret: Box::new(type_expr(source, &ret.ty, span)?),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::NonEscaping,
                     thread: CallbackThread::SameThread,

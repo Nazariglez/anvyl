@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let id = |var x: int| -> var int { x };
+    var n = 1;
+    id(n) = 2;
+}

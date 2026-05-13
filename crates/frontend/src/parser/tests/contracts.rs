@@ -24,7 +24,7 @@ fn contract_decl() {
     assert_eq!(sig.params.len(), 1);
     assert_eq!(sig.params[0].name.as_str(), "dt");
     assert_eq!(sig.params[0].ty, ast::Type::Float);
-    assert_eq!(sig.ret, ast::Type::Void);
+    assert_eq!(sig.ret.ty, ast::Type::Void);
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn contract_annotation_with_doc_and_pub() {
 fn contract_requirement_return_type() {
     let contract = first_contract("contract Named { fn name(self) -> string; }");
     let sig = &contract.requirements[0].node.sig;
-    assert_eq!(sig.ret, ast::Type::String);
+    assert_eq!(sig.ret.ty, ast::Type::String);
 }
 
 #[test]

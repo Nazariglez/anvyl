@@ -97,10 +97,24 @@ fn fn_type() {
                     ast::FuncParam::immut(ast::Type::String),
                 ]
             );
-            assert_eq!(*ret, ast::Type::Bool);
+            assert_eq!(ret.ty, ast::Type::Bool);
         }
         other => panic!("expected function type, found {other:?}"),
     }
+}
+
+#[test]
+fn fn_type_var_return() {
+    let ty = parse_type("fn(var int) -> var int");
+    let ast::Type::Func { params, ret } = ty else {
+        panic!("expected function type, found {ty:?}");
+    };
+    assert_eq!(
+        params,
+        vec![ast::FuncParam::new(ast::Type::Int, true, false)]
+    );
+    assert_eq!(ret.access, ast::ReturnAccess::Place);
+    assert_eq!(ret.ty, ast::Type::Int);
 }
 
 #[test]
@@ -114,7 +128,7 @@ fn fn_type_opt() {
     match inner {
         ast::Type::Func { params, ret } => {
             assert_eq!(*params, vec![ast::FuncParam::immut(ast::Type::Float)]);
-            assert_eq!(**ret, ast::Type::Int);
+            assert_eq!(ret.ty, ast::Type::Int);
         }
         other => panic!("expected function type inside optional, found {other:?}"),
     }
@@ -289,7 +303,7 @@ fn fn_type_var_param() {
                 params,
                 vec![ast::FuncParam::new(ast::Type::Int, true, false)]
             );
-            assert_eq!(*ret, ast::Type::Void);
+            assert_eq!(ret.ty, ast::Type::Void);
         }
         other => panic!("expected function type with var param, found {other:?}"),
     }
@@ -307,7 +321,7 @@ fn fn_type_mixed_var() {
                     ast::FuncParam::immut(ast::Type::String),
                 ]
             );
-            assert_eq!(*ret, ast::Type::Bool);
+            assert_eq!(ret.ty, ast::Type::Bool);
         }
         other => panic!("expected function type with mixed params, found {other:?}"),
     }
@@ -469,7 +483,7 @@ fn dyn_nested_type_positions() {
     assert_eq!(params.len(), 1);
     assert!(params[0].mutable);
     assert!(matches!(params[0].ty, ast::Type::Dyn(_)));
-    let ast::Type::List { elem } = *ret else {
+    let ast::Type::List { elem } = ret.ty else {
         panic!("expected list return type");
     };
     assert!(elem.is_option());

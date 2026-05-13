@@ -3,7 +3,7 @@ use chumsky::{error::Rich, prelude::*};
 use super::{
     AnvParser, BoxedParser,
     common::{
-        TupleShapeResult, block_stmt, field_name_ident, identifier, literal,
+        TupleShapeResult, block_stmt, field_name_ident, identifier, literal, return_spec,
         validate_tuple_shape_raw,
     },
     new_expr_id,
@@ -26,11 +26,11 @@ pub(super) fn expression<'src>(
     recursive(|expr| {
         let atom = atom_expr(stmt, expr.clone());
         let postfix = postfix_expr(atom, expr.clone());
-        let unary = unary_expr(postfix);
+        let unary = unary_expr(postfix.clone());
         let cast = cast_expr(unary);
         let binary = binary_expr(cast);
         let ternary = ternary_expr(binary, expr.clone());
-        assignment_expr(ternary)
+        assignment_expr(ternary, postfix)
     })
     .boxed()
 }
@@ -41,11 +41,11 @@ pub(super) fn for_header_expression<'src>(
     let full_expr = expression(stmt.clone());
     let atom = for_header_atom_expr(stmt, full_expr.clone());
     let postfix = postfix_expr(atom, full_expr.clone());
-    let unary = unary_expr(postfix);
+    let unary = unary_expr(postfix.clone());
     let cast = cast_expr(unary);
     let binary = binary_expr(cast);
     let ternary = ternary_expr(binary, full_expr);
-    assignment_expr(ternary)
+    assignment_expr(ternary, postfix)
 }
 
 fn for_header_atom_expr<'src>(
@@ -91,11 +91,11 @@ pub(super) fn cond_expression<'src>() -> BoxedParser<'src, ast::ExprNode> {
     recursive(|cond_expr| {
         let atom = cond_atom_expr(cond_expr.clone());
         let postfix = postfix_expr(atom, cond_expr.clone());
-        let unary = unary_expr(postfix);
+        let unary = unary_expr(postfix.clone());
         let cast = cast_expr(unary);
         let binary = binary_expr(cast);
         let ternary = ternary_expr(binary, cond_expr.clone());
-        assignment_expr(ternary)
+        assignment_expr(ternary, postfix)
     })
     .boxed()
 }
@@ -575,7 +575,6 @@ fn lambda_expr<'src>(
     let or_op = select! { Token::Op(Op::Or) => () };
     let comma = select! { Token::Comma => () };
     let colon = select! { Token::Colon => () };
-    let thin_arrow = select! { Token::Op(Op::ThinArrow) => () };
 
     let var_kw = select! {
         Token::Keyword(Keyword::Var) => (),
@@ -621,7 +620,7 @@ fn lambda_expr<'src>(
 
     let params = choice((zero_params, with_params));
 
-    let ret_type = thin_arrow.ignore_then(type_ident()).or_not();
+    let ret_type = return_spec();
 
     let block_body = block_stmt(stmt, expr.clone()).map(|block_node| {
         let span = block_node.span;
@@ -1380,135 +1379,11 @@ fn ternary_expr<'src>(
         .boxed()
 }
 
-enum LvalueSuffix {
-    Field(ast::Ident),
-    TupleIndices(Vec<u32>),
-    Index(Box<ast::ExprNode>),
-}
-
-fn lvalue_expr<'src>() -> BoxedParser<'src, ast::ExprNode> {
-    let base = identifier().map_with(|ident, e| {
-        let s = e.span();
-        let span = s.byte();
-        let expr_id = new_expr_id();
-        let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
-        Spanned::new(expr, span)
-    });
-
-    let index_atom = choice((
-        literal().map_with(|lit, e| {
-            let s = e.span();
-            let span = s.byte();
-            let expr_id = new_expr_id();
-            let expr = ast::Expr::new(ast::ExprKind::Lit(lit), expr_id);
-            Spanned::new(expr, span)
-        }),
-        identifier().map_with(|ident, e| {
-            let s = e.span();
-            let span = s.byte();
-            let expr_id = new_expr_id();
-            let expr = ast::Expr::new(ast::ExprKind::Ident(ident), expr_id);
-            Spanned::new(expr, span)
-        }),
-    ));
-
-    let field_suffix = select! { Token::Dot => () }
-        .ignore_then(identifier())
-        .map(LvalueSuffix::Field);
-
-    let single_tuple_index = select! {
-        Token::Dot => (),
-    }
-    .ignore_then(select! {
-        Token::Literal(LitToken::Number(n)) => LvalueSuffix::TupleIndices(vec![n as u32]),
-    });
-
-    let chained_tuple_index = select! {
-        Token::Dot => (),
-    }
-    .ignore_then(select! {
-        Token::Literal(LitToken::Float(s)) => s,
-    })
-    .try_map(|s, span| {
-        let parts = s.as_ref().split('.').collect::<Vec<_>>();
-        let indices = parts
-            .iter()
-            .map(|p| p.parse::<u32>())
-            .collect::<Result<Vec<_>, _>>();
-        indices
-            .map(LvalueSuffix::TupleIndices)
-            .map_err(|_| Rich::custom(span, "invalid tuple index"))
-    });
-
-    let index_suffix = select! { Token::Open(Delimiter::Bracket) => () }
-        .ignore_then(index_atom)
-        .then_ignore(select! { Token::Close(Delimiter::Bracket) => () })
-        .map(|e| LvalueSuffix::Index(Box::new(e)));
-
-    let suffix = choice((
-        chained_tuple_index,
-        single_tuple_index,
-        field_suffix,
-        index_suffix,
-    ));
-
-    base.foldl_with(suffix.repeated(), |target, suf, e| {
-        let s = e.span();
-        let span = s.byte();
-        match suf {
-            LvalueSuffix::Field(field) => {
-                let field_node = Spanned::new(
-                    ast::FieldAccess {
-                        target: Box::new(target),
-                        field,
-                        safe: false,
-                    },
-                    span,
-                );
-                let expr_id = new_expr_id();
-                let expr = ast::Expr::new(ast::ExprKind::Field(field_node), expr_id);
-                Spanned::new(expr, span)
-            }
-            LvalueSuffix::TupleIndices(indices) => {
-                let mut current = target;
-                for index in indices {
-                    let index_node = Spanned::new(
-                        ast::TupleIndex {
-                            target: Box::new(current),
-                            index,
-                        },
-                        span,
-                    );
-                    let expr_id = new_expr_id();
-                    let expr = ast::Expr::new(ast::ExprKind::TupleIndex(index_node), expr_id);
-                    current = Spanned::new(expr, span);
-                }
-                current
-            }
-            LvalueSuffix::Index(index_expr) => {
-                let index_node = Spanned::new(
-                    ast::Index {
-                        target: Box::new(target),
-                        index: index_expr,
-                        safe: false,
-                    },
-                    span,
-                );
-                let expr_id = new_expr_id();
-                let expr = ast::Expr::new(ast::ExprKind::Index(index_node), expr_id);
-                Spanned::new(expr, span)
-            }
-        }
-    })
-    .labelled("left value expr")
-    .as_context()
-    .boxed()
-}
-
 fn assignment_expr<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
+    target: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::ExprNode> {
-    lvalue_expr()
+    target
         .then(assign_op().then(expr.clone()))
         .map_with(|(target, (op, value)), e| {
             let s = e.span();

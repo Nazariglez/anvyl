@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: var arguments must not alias the same variable
+
+struct Pair {
+    left: int,
+    right: int,
+}
+
+struct Holder {
+    pair: Pair,
+
+    fn pair(var self) -> var Pair {
+        self.pair
+    }
+}
+
+fn take_two(var a: int, var b: int) { }
+
+fn main() {
+    var holder = Holder { pair: Pair { left: 1, right: 2 } };
+    take_two(holder.pair().left, holder.pair().right);
+}

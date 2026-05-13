@@ -324,7 +324,7 @@ impl Printer<'_> {
             self.write("||");
             if let Some(ret) = &lambda.ret_type {
                 self.write(" -> ");
-                self.format_type(ret);
+                self.format_return_spec_tail(ret);
             }
             self.write(" ");
             self.format_expr(&lambda.body.node);
@@ -336,7 +336,7 @@ impl Printer<'_> {
             p.write("|");
             if let Some(ret) = &lambda.ret_type {
                 p.write(" -> ");
-                p.format_type(ret);
+                p.format_return_spec_tail(ret);
             }
             p.write(" ");
             p.format_expr(&lambda.body.node);
@@ -365,7 +365,7 @@ impl Printer<'_> {
         }
         if let Some(ret) = &lambda.ret_type {
             self.write(" -> ");
-            self.format_type(ret);
+            self.format_return_spec_tail(ret);
         }
         self.write(" ");
         self.format_expr(&lambda.body.node);

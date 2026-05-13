@@ -10,7 +10,7 @@ use super::{
 use crate::{
     ast::{
         AnonymousContract, AnonymousContractParam, AnonymousContractRequirement, ContractRef,
-        DynContractHoleId, ExprId, Ident, Type,
+        DynContractHoleId, ExprId, Ident, ReturnSpec, Type,
     },
     span::{SourceSpan, Span},
 };
@@ -172,7 +172,7 @@ impl DynInference {
             receiver: Some(receiver),
             required_params: params.len(),
             params,
-            ret,
+            ret: ReturnSpec::value(ret),
             generics_empty: true,
             span: Some(span),
         };

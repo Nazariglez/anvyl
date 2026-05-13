@@ -152,7 +152,8 @@ fn covers_type<'a>(general: &Type, specific: &'a Type, cover: &mut Cover<'a>) ->
                     .iter()
                     .zip(specific_params)
                     .all(|(a, b)| covers_type(&a.ty, &b.ty, cover))
-                && covers_type(ret, specific_ret, cover)
+                && ret.access == specific_ret.access
+                && covers_type(&ret.ty, &specific_ret.ty, cover)
         }
         (Type::Tuple(a), Type::Tuple(b)) => covers_types(a, b, cover),
         (Type::Nominal(a), Type::Nominal(b)) => {
@@ -423,14 +424,14 @@ mod tests {
         let ts = HashMap::from([(tv(0), Type::Int), (tv(1), Type::Bool)]);
         let ty = Type::Func {
             params: vec![FuncParam::new(Type::Var(tv(0)), false, false)],
-            ret: Box::new(Type::Var(tv(1))),
+            ret: Box::new(crate::ast::ReturnSpec::value(Type::Var(tv(1)))),
         };
         let result = substitute(&ty, &ts, &HashMap::new());
         assert_eq!(
             result,
             Type::Func {
                 params: vec![FuncParam::new(Type::Int, false, false)],
-                ret: Box::new(Type::Bool),
+                ret: Box::new(crate::ast::ReturnSpec::value(Type::Bool)),
             }
         );
     }

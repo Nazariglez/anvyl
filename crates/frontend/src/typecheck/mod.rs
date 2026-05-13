@@ -14,8 +14,8 @@ use self::{
     },
     pattern::{PatternBindMode, PatternContext, PatternRoot, PatternRootInput},
     place::{
-        AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee,
-        check_place,
+        AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts,
+        check_alias_scrutinee, check_place,
     },
     postfix::{PostfixStep, check_postfix_chain, collect_postfix_chain},
     type_ops::{TypeFolder, TypeVisitor, type_depends_on_generics},
@@ -244,6 +244,10 @@ pub(crate) enum TypeError {
         span: Option<SourceSpan>,
     },
     InferReturnRecursive {
+        span: Option<SourceSpan>,
+    },
+    UnsupportedPlaceReturn {
+        message: &'static str,
         span: Option<SourceSpan>,
     },
     UnknownType {
@@ -887,7 +891,7 @@ struct SourceFuncSig {
     generic_context: GenericTypeContext,
     params: Vec<FuncParam>,
     required_params: usize,
-    ret: Type,
+    ret: ReturnSpec,
     surface_ty: Type,
 }
 
@@ -905,7 +909,7 @@ impl LocalCallableInfo {
     fn value_error(&self, name: Ident, span: Option<SourceSpan>) -> Option<TypeError> {
         if self.has_generics() {
             Some(TypeError::UndefinedVariable { name, span })
-        } else if matches!(self.callee.def.sig.ret, Type::InferReturn) {
+        } else if self.callee.def.sig.ret.is_infer() {
             Some(TypeError::InferReturnValue { span })
         } else {
             None
@@ -953,7 +957,7 @@ struct CallableTemplate {
     generics: GenericTypeContext,
     env: CallableTemplateEnv,
     params: Vec<Param>,
-    ret: Type,
+    ret: ReturnSpec,
     ret_span: Span,
     body: BlockNode,
 }
@@ -965,8 +969,15 @@ struct ControlFlowFrame {
 }
 
 enum ReturnMode {
-    Explicit(Type),
-    Infer { candidates: Vec<(Span, TypeHandle)> },
+    Explicit {
+        ret: ReturnSpec,
+        source: Option<PlaceIdentity>,
+    },
+    Infer {
+        access: ReturnAccess,
+        source: Option<PlaceIdentity>,
+        candidates: Vec<(Span, TypeHandle)>,
+    },
 }
 
 struct ReturnFrame {
@@ -1258,8 +1269,8 @@ impl TypeChecker {
         ty: Type,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
-    ) {
-        self.define_value_with_alias(name, ty, kind, const_value, None);
+    ) -> LocalTypeId {
+        self.define_value_with_alias(name, ty, kind, const_value, None)
     }
 
     fn define_value_with_alias(
@@ -1269,7 +1280,7 @@ impl TypeChecker {
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
-    ) {
+    ) -> LocalTypeId {
         let type_id = self.solver.alloc_local_type(&ty);
         self.define_local_symbol(
             name,
@@ -1281,6 +1292,7 @@ impl TypeChecker {
                 alias,
             }),
         );
+        type_id
     }
 
     fn define_local_symbol(&mut self, name: Ident, symbol: LocalSymbol) {
@@ -1433,7 +1445,7 @@ impl TypeChecker {
         value.requires_runtime_capture && self.crosses_lambda_capture_boundary(value.depth)
     }
 
-    fn local_value_access(&self, name: Ident, value: &LocalValue) -> LocalPlaceAccess {
+    fn local_value_access(&self, value: &LocalValue) -> LocalPlaceAccess {
         let captured = self.captures_runtime_value(value);
         let alias = value.info.alias.as_ref();
         let access = if captured {
@@ -1447,7 +1459,11 @@ impl TypeChecker {
                 alias.identity.clone(),
                 alias.accepts_extern_any,
             ),
-            None => (PlaceUseFacts::default(), PlaceIdentity::root(name), false),
+            None => (
+                PlaceUseFacts::default(),
+                PlaceIdentity::root(PlaceRoot::Local(value.info.type_id)),
+                false,
+            ),
         };
         LocalPlaceAccess {
             access,
@@ -1781,9 +1797,13 @@ impl TypeChecker {
         self.returns.pop()
     }
 
+    fn return_mode(&self) -> Option<&ReturnMode> {
+        self.returns.last().map(|frame| &frame.mode)
+    }
+
     fn return_type(&self) -> Option<&Type> {
-        match &self.returns.last()?.mode {
-            ReturnMode::Explicit(ty) => Some(ty),
+        match self.return_mode()? {
+            ReturnMode::Explicit { ret, .. } => Some(&ret.ty),
             ReturnMode::Infer { .. } => None,
         }
     }
@@ -1792,7 +1812,7 @@ impl TypeChecker {
         let Some(frame) = self.returns.last_mut() else {
             return;
         };
-        let ReturnMode::Infer { candidates } = &mut frame.mode else {
+        let ReturnMode::Infer { candidates, .. } = &mut frame.mode else {
             return;
         };
         candidates.push((span, handle));
@@ -2425,7 +2445,12 @@ impl TypeChecker {
         };
         let ty = self.normalize_type_consts(&substituted, span);
         self.reject_user_any_type(&ty, span);
+        self.validate_type_return_specs(&ty, span);
         ty
+    }
+
+    fn validate_type_return_specs(&mut self, ty: &Type, span: Span) {
+        ReturnSpecValidator { tc: self, span }.visit_type(ty);
     }
 
     fn normalize_type_consts(&mut self, ty: &Type, span: Span) -> Type {
@@ -2606,22 +2631,22 @@ impl TypeChecker {
         }
     }
 
-    fn func_type_from_sig(&mut self, params: &[Param], ret: &Type, span: Span) -> Type {
+    fn func_type_from_sig(&mut self, params: &[Param], ret: &ReturnSpec, span: Span) -> Type {
         self.callable_type_from_sig(params, ret, span, false)
     }
 
     fn callable_type_from_sig(
         &mut self,
         params: &[Param],
-        ret: &Type,
+        ret: &ReturnSpec,
         span: Span,
         exported: bool,
     ) -> Type {
         let resolved_params = self.resolve_callable_params(params, span, exported);
-        let resolved_ret = Box::new(self.resolve_type_for_tc_at(ret, span));
+        let resolved_ret = ret.with_ty(self.resolve_type_for_tc_at(&ret.ty, span));
         Type::Func {
             params: resolved_params,
-            ret: resolved_ret,
+            ret: Box::new(resolved_ret),
         }
     }
 
@@ -2725,7 +2750,7 @@ impl TypeChecker {
                 for param in params {
                     self.validate_nominal_uses(&param.ty, span);
                 }
-                self.validate_nominal_uses(ret, span);
+                self.validate_nominal_uses(&ret.ty, span);
             }
             Type::Dyn(contract) => self.validate_contract_ref_uses(contract, span),
             Type::Tuple(elems) => {
@@ -2768,7 +2793,7 @@ impl TypeChecker {
                     for param in &req.params {
                         self.validate_nominal_uses(&param.ty, span);
                     }
-                    self.validate_nominal_uses(&req.ret, span);
+                    self.validate_nominal_uses(&req.ret.ty, span);
                 }
             }
             ContractRef::Intersection(contracts) => {
@@ -2891,7 +2916,7 @@ impl TypeChecker {
                 for param in params {
                     self.validate_nominal_uses_in(decls, &param.ty, span);
                 }
-                self.validate_nominal_uses_in(decls, ret, span);
+                self.validate_nominal_uses_in(decls, &ret.ty, span);
             }
             Type::Dyn(contract) => self.validate_contract_ref_uses_in(decls, contract, span),
             Type::Tuple(elems) => {
@@ -2934,7 +2959,7 @@ impl TypeChecker {
                     for param in &req.params {
                         self.validate_nominal_uses_in(decls, &param.ty, span);
                     }
-                    self.validate_nominal_uses_in(decls, &req.ret, span);
+                    self.validate_nominal_uses_in(decls, &req.ret.ty, span);
                 }
             }
             ContractRef::Intersection(contracts) => {
@@ -3463,7 +3488,7 @@ fn validate_public_contract_types(decls: &DeclarationIndex, errors: &mut Vec<Typ
                 .params
                 .iter()
                 .find_map(|param| private_exposed_type(decls, &param.ty))
-                .or_else(|| private_exposed_type(decls, &req.ret));
+                .or_else(|| private_exposed_type(decls, &req.ret.ty));
             if let Some(ty) = exposed {
                 errors.push(TypeError::Decl(DeclError::PublicContractPrivateType {
                     name: contract.key.name,
@@ -3538,7 +3563,7 @@ fn private_exposed_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
         Type::Func { params, ret } => params
             .iter()
             .find_map(|param| private_exposed_type(decls, &param.ty))
-            .or_else(|| private_exposed_type(decls, ret)),
+            .or_else(|| private_exposed_type(decls, &ret.ty)),
         Type::Dyn(contract) => private_contract_type(decls, contract),
         Type::Tuple(elems) => elems.iter().find_map(|ty| private_exposed_type(decls, ty)),
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
@@ -3603,7 +3628,7 @@ fn private_contract_type(decls: &DeclarationIndex, contract: &ContractRef) -> Op
             req.params
                 .iter()
                 .find_map(|param| private_exposed_type(decls, &param.ty))
-                .or_else(|| private_exposed_type(decls, &req.ret))
+                .or_else(|| private_exposed_type(decls, &req.ret.ty))
         }),
         ContractRef::Intersection(contracts) => contracts
             .iter()
@@ -3691,11 +3716,11 @@ fn validate_cast_froms(
             }));
         }
         if let Some(ret) = &cast.ret
-            && !same_extend_target(ret, &extend.generics, &extend.target, &extend.generics)
+            && !same_extend_target(&ret.ty, &extend.generics, &extend.target, &extend.generics)
         {
             errors.push(TypeError::Decl(DeclError::CastFromReturnMismatch {
                 expected: extend.target.clone(),
-                found: ret.clone(),
+                found: ret.ty.clone(),
                 span: Some(cast.span),
             }));
         }
@@ -3886,6 +3911,40 @@ fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> TypeError {
     }
 }
 
+struct ReturnSpecValidator<'a> {
+    tc: &'a mut TypeChecker,
+    span: Span,
+}
+
+impl TypeVisitor for ReturnSpecValidator<'_> {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        if let Type::Func { params, ret } = ty {
+            validate_return_spec(
+                ret,
+                false,
+                has_mutable_func_param(params),
+                self.span,
+                self.tc,
+            );
+        }
+        false
+    }
+
+    fn visit_contract_ref_leaf(&mut self, contract: &ContractRef) -> bool {
+        if let ContractRef::Anonymous(surface) = contract {
+            for req in &surface.requirements {
+                validate_unsupported_return_spec(
+                    &req.ret,
+                    "contract requirements cannot return mutable places",
+                    self.span,
+                    self.tc,
+                );
+            }
+        }
+        false
+    }
+}
+
 fn has_generics(type_params: &[TypeParam], const_params: &[ConstParam]) -> bool {
     !type_params.is_empty() || !const_params.is_empty()
 }
@@ -3903,22 +3962,30 @@ fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) {
         match &stmt.node {
             Stmt::Func(func_node) => {
                 let func = &func_node.node;
-                check_infer_return_allowed(&func.ret, is_generic(func), func_node.span, tc);
+                validate_return_spec(
+                    &func.ret,
+                    is_generic(func),
+                    has_mutable_param(&func.params),
+                    func_node.span,
+                    tc,
+                );
             }
             Stmt::ExternFunc(func_node) => {
-                if matches!(func_node.node.ret, Type::InferReturn) {
-                    tc.push_error(TypeError::InferReturnExtern {
-                        span: tc.error_span(func_node.span),
-                    });
-                }
+                validate_unsupported_return_spec(
+                    &func_node.node.ret,
+                    "extern functions cannot return mutable places",
+                    func_node.span,
+                    tc,
+                );
             }
             Stmt::Aggregate(agg_node) => {
                 let agg = &agg_node.node;
                 let owner_is_generic = has_generics(&agg.type_params, &agg.const_params);
                 for method in &agg.methods {
-                    check_infer_return_allowed(
+                    validate_return_spec(
                         &method.sig.ret,
                         owner_is_generic || method_sig_is_generic(&method.sig),
+                        method_has_mutable_input(&method.sig),
                         agg_node.span,
                         tc,
                     );
@@ -3928,10 +3995,31 @@ fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) {
                 let extend = &extend_node.node;
                 let owner_is_generic = has_generics(&extend.type_params, &extend.const_params);
                 for method in &extend.methods {
-                    check_infer_return_allowed(
+                    validate_return_spec(
                         &method.node.sig.ret,
                         owner_is_generic || method_sig_is_generic(&method.node.sig),
+                        method_has_mutable_input(&method.node.sig),
                         method.span,
+                        tc,
+                    );
+                }
+                for cast in &extend.cast_froms {
+                    if let Some(ret) = &cast.node.ret {
+                        validate_unsupported_return_spec(
+                            ret,
+                            "cast from declarations cannot return mutable places",
+                            cast.span,
+                            tc,
+                        );
+                    }
+                }
+            }
+            Stmt::Contract(contract_node) => {
+                for req in &contract_node.node.requirements {
+                    validate_unsupported_return_spec(
+                        &req.node.sig.ret,
+                        "contract requirements cannot return mutable places",
+                        req.span,
                         tc,
                     );
                 }
@@ -3941,9 +4029,72 @@ fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) {
     }
 }
 
-fn check_infer_return_allowed(ret: &Type, generic: bool, span: Span, tc: &mut TypeChecker) {
-    if matches!(ret, Type::InferReturn) && !generic {
+fn has_mutable_param(params: &[Param]) -> bool {
+    params
+        .iter()
+        .any(|param| matches!(param.mutability, Mutability::Mutable))
+}
+
+fn has_mutable_func_param(params: &[FuncParam]) -> bool {
+    params.iter().any(|param| param.mutable)
+}
+
+fn method_has_mutable_input(sig: &MethodSig) -> bool {
+    matches!(sig.receiver, Some(MethodReceiver::Var)) || has_mutable_param(&sig.params)
+}
+
+fn validate_return_spec(
+    ret: &ReturnSpec,
+    generic: bool,
+    first_input_mutable: bool,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    if ret.is_infer() && !generic {
         tc.push_error(TypeError::InferReturnNonGeneric {
+            span: tc.error_span(span),
+        });
+    }
+    validate_place_return_spec(ret, first_input_mutable, span, tc);
+}
+
+fn validate_unsupported_return_spec(
+    ret: &ReturnSpec,
+    place_message: &'static str,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    if ret.is_infer() {
+        tc.push_error(TypeError::InferReturnExtern {
+            span: tc.error_span(span),
+        });
+    }
+    if ret.is_place() {
+        tc.push_error(TypeError::UnsupportedPlaceReturn {
+            message: place_message,
+            span: tc.error_span(span),
+        });
+    }
+}
+
+fn validate_place_return_spec(
+    ret: &ReturnSpec,
+    first_input_mutable: bool,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    if !ret.is_place() {
+        return;
+    }
+    if ret.is_void() {
+        tc.push_error(TypeError::UnsupportedPlaceReturn {
+            message: "mutable place returns cannot return void",
+            span: tc.error_span(span),
+        });
+    }
+    if !first_input_mutable {
+        tc.push_error(TypeError::UnsupportedPlaceReturn {
+            message: "mutable place returns require a first mutable input",
             span: tc.error_span(span),
         });
     }
@@ -4100,7 +4251,7 @@ fn type_contains_raw_dyn_infer_func(ty: &Type) -> bool {
                     params
                         .iter()
                         .any(|param| DynInference::has_raw_hole(&param.ty))
-                        || DynInference::has_raw_hole(ret)
+                        || DynInference::has_raw_hole(&ret.ty)
                 }
                 _ => self.visit_type_children(ty),
             }
@@ -4132,7 +4283,7 @@ fn register_builtins(tc: &mut TypeChecker) {
             Ident::new(name),
             Type::Func {
                 params,
-                ret: Box::new(ret),
+                ret: Box::new(ReturnSpec::value(ret)),
             },
             false,
         );
@@ -4326,24 +4477,24 @@ fn register_extend_method_dyn_infer_params(
     }
 }
 
-fn callable_sig_has_raw_dyn_infer(params: &[Param], ret: &Type) -> bool {
+fn callable_sig_has_raw_dyn_infer(params: &[Param], ret: &ReturnSpec) -> bool {
     params
         .iter()
         .any(|param| DynInference::has_raw_hole(&param.ty))
-        || DynInference::has_raw_hole(ret)
+        || DynInference::has_raw_hole(&ret.ty)
 }
 
 fn resolve_callable_sig_types(
     params: &[Param],
-    ret: &Type,
+    ret: &ReturnSpec,
     generics: GenericTypeContext,
     span: Span,
     exported: bool,
     tc: &mut TypeChecker,
-) -> (Vec<FuncParam>, Type) {
+) -> (Vec<FuncParam>, ReturnSpec) {
     tc.push_generic_context(generics);
     let params = tc.resolve_callable_params(params, span, exported);
-    let ret = tc.resolve_type_for_tc_at(ret, span);
+    let ret = ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty, span));
     tc.pop_generic_context();
     (params, ret)
 }
@@ -4360,9 +4511,10 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     let generic_context =
         tc.extended_generic_context(&owner.generics, &func.type_params, &func.const_params, span);
     check_param_order(&func.params, span, tc);
-    check_infer_return_allowed(
+    validate_return_spec(
         &func.ret,
         !generics.is_empty() || !owner.params.is_empty(),
+        has_mutable_param(&func.params),
         span,
         tc,
     );
@@ -4371,7 +4523,9 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     tc.resolve_generic_bounds_for_tc(&mut generics, span);
     let exported = matches!(func.visibility, Visibility::Public);
     let params = tc.resolve_callable_params(&func.params, span, exported);
-    let ret = tc.resolve_type_for_tc_at(&func.ret, span);
+    let ret = func
+        .ret
+        .with_ty(tc.resolve_type_for_tc_at(&func.ret.ty, span));
     tc.pop_generic_context();
 
     SourceFuncSig {
@@ -4559,7 +4713,7 @@ fn add_callable_decl_placeholders(
                     generics: GenericParams::default(),
                     params: vec![],
                     required_params: 0,
-                    ret: Type::Infer,
+                    ret: ReturnSpec::value(Type::Infer),
                 },
             },
             receiver_ty: None,
@@ -4580,7 +4734,7 @@ fn store_local_callable_template(
     tc: &mut TypeChecker,
 ) {
     let has_template = is_generic(&decl.func.node)
-        || matches!(decl.func.node.ret, Type::InferReturn)
+        || decl.func.node.ret.is_infer()
         || !decl.sig.owner_generics.is_empty();
     if !has_template {
         return;
@@ -4866,7 +5020,7 @@ fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
                 None,
                 &func.params,
                 &params,
-                *ret,
+                ret.as_ref().clone(),
                 &func.body,
                 func_node.span,
                 &[],
@@ -4932,7 +5086,7 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
             None,
             std::slice::from_ref(&cast.node.param),
             std::slice::from_ref(&param),
-            self_ty.clone(),
+            ReturnSpec::value(self_ty.clone()),
             &cast.node.body,
             cast.span,
             &[],
@@ -5074,20 +5228,102 @@ impl CallableBody<'_> {
 
 fn check_callable_body_with_return(
     body: CallableBody<'_>,
-    expected_ret: Option<&Type>,
+    expected_ret: Option<&ReturnSpec>,
+    source: Option<&PlaceIdentity>,
     callable_span: Span,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let expected = expected_ret.map(|ret| tc.type_handle(ret));
+    if expected_ret.is_some_and(ReturnSpec::is_place) {
+        return check_callable_body_place_return(body, expected_ret, source, callable_span, tc);
+    }
+
+    let expected = expected_ret.map(|ret| tc.type_handle(&ret.ty));
     let checked = body.check_with_hint(expected, tc);
-    finish_callable_body_return(body, &checked, expected_ret, callable_span, tc);
+    finish_callable_body_value_return(body, &checked, expected_ret, callable_span, tc);
     checked
 }
 
-fn finish_callable_body_return(
+fn check_callable_body_place_return(
+    body: CallableBody<'_>,
+    expected_ret: Option<&ReturnSpec>,
+    source: Option<&PlaceIdentity>,
+    callable_span: Span,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match body {
+        CallableBody::Block(block) => {
+            tc.push_scope();
+            let declarations = register_block_declarations(&block.node.stmts, tc);
+            for (stmt, local_const) in block.node.stmts.iter().zip(declarations) {
+                check_stmt(stmt, local_const, tc);
+            }
+            let checked = match &block.node.tail {
+                Some(expr) => check_tail_place_return(expr, expected_ret, source, tc),
+                None => checked_void(tc),
+            };
+            finish_missing_place_return(
+                &checked,
+                control_flow::block_diverges(block),
+                expected_ret,
+                callable_span,
+                tc,
+            );
+            tc.pop_scope();
+            checked
+        }
+        CallableBody::Expr(expr) => check_tail_place_return(expr, expected_ret, source, tc),
+    }
+}
+
+fn check_tail_place_return(
+    expr: &ExprNode,
+    expected_ret: Option<&ReturnSpec>,
+    source: Option<&PlaceIdentity>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if let ExprKind::Block(block) = &expr.node.kind {
+        return check_callable_body_place_return(
+            CallableBody::Block(block),
+            expected_ret,
+            source,
+            expr.span,
+            tc,
+        );
+    }
+
+    let ret = expected_ret
+        .cloned()
+        .unwrap_or_else(|| ReturnSpec::place(Type::InferReturn));
+    let checked = check_return_expr(expr, ret, source.cloned(), tc);
+    if expected_ret.is_none() {
+        tc.push_inferred_return(expr.span, checked.handle.clone());
+    }
+    checked
+}
+
+fn finish_missing_place_return(
+    checked: &CheckedType,
+    diverges: bool,
+    expected_ret: Option<&ReturnSpec>,
+    callable_span: Span,
+    tc: &mut TypeChecker,
+) {
+    if checked.ty.is_void() && !diverges {
+        match expected_ret {
+            Some(ret) if !ret.ty.is_void() => tc.push_error(TypeError::MissingReturn {
+                expected: ret.ty.clone(),
+                span: tc.error_span(callable_span),
+            }),
+            None => tc.push_inferred_return(callable_span, tc.type_handle(&Type::Void)),
+            _ => {}
+        }
+    }
+}
+
+fn finish_callable_body_value_return(
     body: CallableBody<'_>,
     checked: &CheckedType,
-    expected_ret: Option<&Type>,
+    expected_ret: Option<&ReturnSpec>,
     callable_span: Span,
     tc: &mut TypeChecker,
 ) {
@@ -5095,7 +5331,7 @@ fn finish_callable_body_return(
         Some(ret) => {
             if !checked.ty.is_void() {
                 tc.reject_extern_any_escape(checked, body.span());
-                let ret_handle = tc.type_handle(ret);
+                let ret_handle = tc.type_handle(&ret.ty);
                 match body.value_expr_id() {
                     Some(expr_id) => tc.expect_assignable_expr(
                         body.span(),
@@ -5105,9 +5341,9 @@ fn finish_callable_body_return(
                     ),
                     None => tc.expect_assignable(body.span(), checked.handle.clone(), ret_handle),
                 }
-            } else if !ret.is_void() && !body.diverges() {
+            } else if !ret.ty.is_void() && !body.diverges() {
                 tc.push_error(TypeError::MissingReturn {
-                    expected: ret.clone(),
+                    expected: ret.ty.clone(),
                     span: tc.error_span(callable_span),
                 });
             }
@@ -5127,7 +5363,7 @@ fn check_func_body(
     self_binding: Option<(MethodReceiver, Type)>,
     params: &[Param],
     param_types: &[FuncParam],
-    ret_ty: Type,
+    ret: ReturnSpec,
     body: &BlockNode,
     span: Span,
     const_bindings: &[(Ident, ConstValue)],
@@ -5140,27 +5376,47 @@ fn check_func_body(
     for (name, value) in const_bindings {
         tc.define_const(*name, const_eval::const_type(value), value.clone());
     }
-    let infer_return = matches!(ret_ty, Type::InferReturn);
-    let return_mode = if infer_return {
-        ReturnMode::Infer { candidates: vec![] }
-    } else {
-        ReturnMode::Explicit(ret_ty.clone())
-    };
-    tc.push_return_frame(return_mode);
+    let infer_return = ret.is_infer();
+    let mut source = None;
     if let Some((receiver, self_ty)) = self_binding {
         let kind = match receiver {
             MethodReceiver::Var => LocalBindingKind::Mutable,
             MethodReceiver::Value => LocalBindingKind::ReadonlySelf,
         };
-        tc.define_value(Ident::new("self"), self_ty, kind, None);
+        let type_id = tc.define_value(Ident::new("self"), self_ty, kind, None);
+        if matches!(receiver, MethodReceiver::Var) {
+            source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
+        }
     }
     for (param, param_ty) in params.iter().zip(param_types.iter()) {
         let mutable = matches!(param.mutability, Mutability::Mutable);
         let kind = LocalBindingKind::from_param(mutable, &param_ty.ty);
-        tc.define_value(param.name, param_ty.ty.clone(), kind, None);
+        let type_id = tc.define_value(param.name, param_ty.ty.clone(), kind, None);
+        if source.is_none() && mutable {
+            source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
+        }
     }
-    let expected_ret = (!infer_return).then_some(&ret_ty);
-    check_callable_body_with_return(CallableBody::Block(body), expected_ret, span, tc);
+    let return_mode = if infer_return {
+        ReturnMode::Infer {
+            access: ret.access,
+            source: source.clone(),
+            candidates: vec![],
+        }
+    } else {
+        ReturnMode::Explicit {
+            ret: ret.clone(),
+            source: source.clone(),
+        }
+    };
+    tc.push_return_frame(return_mode);
+    let expected_ret = (!infer_return).then_some(&ret);
+    check_callable_body_with_return(
+        CallableBody::Block(body),
+        expected_ret,
+        source.as_ref(),
+        span,
+        tc,
+    );
     let frame = tc.pop_return_frame();
     let inferred_ret = frame.and_then(|frame| infer_return_type(frame, tc));
     tc.pop_scope();
@@ -5170,7 +5426,7 @@ fn check_func_body(
 }
 
 fn infer_return_type(frame: ReturnFrame, tc: &mut TypeChecker) -> Option<Type> {
-    let ReturnMode::Infer { candidates } = frame.mode else {
+    let ReturnMode::Infer { candidates, .. } = frame.mode else {
         return None;
     };
     let mut candidates = candidates.into_iter();
@@ -5229,7 +5485,7 @@ fn with_callable_body_env<R>(
 fn check_specialized_callable_body(
     callee: &CallableRef,
     param_types: &[FuncParam],
-    ret_ty: Type,
+    ret: ReturnSpec,
     args: &GenericArgs,
     type_subst: TypeSubst,
     const_subst: ConstSubst,
@@ -5246,7 +5502,7 @@ fn check_specialized_callable_body(
     }
 
     let template = tc.callable_template(&callee.def.id).cloned()?;
-    let inferred = matches!(template.ret, Type::InferReturn);
+    let inferred = template.ret.is_infer();
     let key = specialization_key(callee.def.id.clone(), args);
     match tc.specialization(&key).cloned() {
         Some(SpecializationState::InProgress) if inferred => {
@@ -5276,7 +5532,7 @@ fn check_specialized_callable_body(
                 receiver,
                 &template.params,
                 param_types,
-                ret_ty.clone(),
+                ret.clone(),
                 &template.body,
                 template.span,
                 &const_bindings,
@@ -5785,26 +6041,299 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
         return;
     }
 
-    if let Some(expr) = &ret.value {
-        if let Some(expected_ty) = tc.return_type().cloned() {
-            let expected = tc.type_handle(&expected_ty);
-            let actual = check_value_expr_checked_with_hint(expr, Some(expected.clone()), tc);
-            tc.reject_extern_any_escape(&actual, expr.span);
-            tc.expect_assignable_expr(expr.span, expr.node.id, actual.handle, expected);
-        } else {
-            let actual = check_value_expr_checked_with_hint(expr, None, tc);
-            tc.reject_extern_any_escape(&actual, expr.span);
+    match (&ret.value, tc.return_mode()) {
+        (Some(expr), Some(ReturnMode::Explicit { ret, source })) => {
+            check_return_expr(expr, ret.clone(), source.clone(), tc);
+        }
+        (Some(expr), Some(ReturnMode::Infer { access, source, .. })) => {
+            let ret = ReturnSpec {
+                access: *access,
+                ty: Type::InferReturn,
+            };
+            let actual = check_return_expr(expr, ret, source.clone(), tc);
             tc.push_inferred_return(expr.span, actual.handle);
         }
-    } else if let Some(expected_ty) = tc.return_type().cloned() {
-        if !expected_ty.is_void() {
+        (Some(expr), None) => {
+            let actual = check_value_expr_checked_with_hint(expr, None, tc);
+            tc.reject_extern_any_escape(&actual, expr.span);
+        }
+        (None, Some(ReturnMode::Explicit { ret, .. })) if !ret.ty.is_void() => {
             tc.push_error(TypeError::MissingReturn {
-                expected: expected_ty,
+                expected: ret.ty.clone(),
                 span: tc.error_span(ret_node.span),
             });
         }
+        (None, Some(ReturnMode::Infer { .. })) => {
+            tc.push_inferred_return(ret_node.span, tc.type_handle(&Type::Void));
+        }
+        (None, _) => {}
+    }
+}
+
+fn check_return_expr(
+    expr: &ExprNode,
+    ret: ReturnSpec,
+    source: Option<PlaceIdentity>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if ret.is_place() {
+        if let Some(checked) = check_branch_place_return_expr(expr, &ret, source.as_ref(), tc) {
+            return checked_from_checked(expr, checked, tc);
+        }
+        let place = check_place(expr, tc);
+        validate_place_return_expr(&place.value, source.as_ref(), expr.span, tc);
+        let checked = place.into_checked();
+        tc.reject_extern_any_escape(&checked, expr.span);
+        if !matches!(ret.ty, Type::InferReturn) {
+            let expected = tc.type_handle(&ret.ty);
+            tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
+        }
+        return checked;
+    }
+
+    let expected = (!matches!(ret.ty, Type::InferReturn)).then(|| tc.type_handle(&ret.ty));
+    let actual = check_value_expr_checked_with_hint(expr, expected.clone(), tc);
+    tc.reject_extern_any_escape(&actual, expr.span);
+    if let Some(expected) = expected {
+        tc.expect_assignable_expr(expr.span, expr.node.id, actual.handle.clone(), expected);
+    }
+    actual
+}
+
+fn check_branch_place_return_expr(
+    expr: &ExprNode,
+    ret: &ReturnSpec,
+    source: Option<&PlaceIdentity>,
+    tc: &mut TypeChecker,
+) -> Option<CheckedType> {
+    let expected = place_return_expected_handle(ret, tc);
+    match &expr.node.kind {
+        ExprKind::Block(block) => Some(check_callable_body_place_return(
+            CallableBody::Block(block),
+            Some(ret),
+            source,
+            block.span,
+            tc,
+        )),
+        ExprKind::If(if_node) => {
+            let cond = check_expr_checked(&if_node.node.cond, tc);
+            check_bool_condition(ConditionKind::If, cond, if_node.node.cond.span, tc);
+            let then_checked = check_callable_body_place_return(
+                CallableBody::Block(&if_node.node.then_block),
+                Some(ret),
+                source,
+                if_node.node.then_block.span,
+                tc,
+            );
+            let Some(else_block) = &if_node.node.else_block else {
+                tc.push_error(TypeError::MissingReturn {
+                    expected: ret.ty.clone(),
+                    span: tc.error_span(expr.span),
+                });
+                return Some(if then_checked.ty.is_void() {
+                    diverged_place_return(ret, tc)
+                } else {
+                    then_checked
+                });
+            };
+            let else_checked = check_callable_body_place_return(
+                CallableBody::Block(else_block),
+                Some(ret),
+                source,
+                else_block.span,
+                tc,
+            );
+            Some(join_place_return_branches(
+                ret,
+                expected,
+                place_return_branch(
+                    then_checked,
+                    if_node.node.then_block.span,
+                    control_flow::block_diverges(&if_node.node.then_block),
+                ),
+                place_return_branch(
+                    else_checked,
+                    else_block.span,
+                    control_flow::block_diverges(else_block),
+                ),
+                tc,
+            ))
+        }
+        ExprKind::Ternary(ternary) => {
+            let cond = check_expr_checked(&ternary.node.cond, tc);
+            check_bool_condition(ConditionKind::Ternary, cond, ternary.node.cond.span, tc);
+            let then_checked =
+                check_return_expr(&ternary.node.then_expr, ret.clone(), source.cloned(), tc);
+            let else_checked =
+                check_return_expr(&ternary.node.else_expr, ret.clone(), source.cloned(), tc);
+            Some(join_place_return_branches(
+                ret,
+                expected,
+                place_return_branch(
+                    then_checked,
+                    ternary.node.then_expr.span,
+                    control_flow::expr_diverges(&ternary.node.then_expr),
+                ),
+                place_return_branch(
+                    else_checked,
+                    ternary.node.else_expr.span,
+                    control_flow::expr_diverges(&ternary.node.else_expr),
+                ),
+                tc,
+            ))
+        }
+        ExprKind::Match(match_node) => {
+            let node = &match_node.node;
+            let mode = mode_for_head(node.head);
+            let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
+            if node.arms.is_empty() {
+                tc.push_error(TypeError::EmptyMatch {
+                    span: tc.error_span(match_node.span),
+                });
+                return Some(checked_void(tc));
+            }
+
+            let mut joined = None;
+            let mut outcomes = Vec::with_capacity(node.arms.len());
+            for arm in &node.arms {
+                tc.push_scope();
+                let outcome = pattern::check_place_at(
+                    &arm.node.pattern,
+                    scrutinee.pattern_place(
+                        scrutinee.checked.handle.clone(),
+                        scrutinee.checked.ty.clone(),
+                    ),
+                    mode,
+                    node.scrutinee.node.id,
+                    PatternContext::Match,
+                    tc,
+                );
+                let checked = check_return_expr(&arm.node.body, ret.clone(), source.cloned(), tc);
+                tc.pop_scope();
+                outcomes.push(outcome);
+                let branch = place_return_branch(
+                    checked,
+                    arm.node.body.span,
+                    control_flow::expr_diverges(&arm.node.body),
+                );
+                joined = Some(match joined {
+                    Some(previous) => {
+                        join_place_return_branch(ret, expected.clone(), previous, branch, tc)
+                    }
+                    None => branch,
+                });
+            }
+            match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
+            Some(match joined {
+                Some(branch) => finish_place_return_branch(ret, expected, branch, tc),
+                None => checked_void(tc),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn place_return_expected_handle(ret: &ReturnSpec, tc: &TypeChecker) -> Option<TypeHandle> {
+    (!matches!(ret.ty, Type::InferReturn)).then(|| tc.type_handle(&ret.ty))
+}
+
+fn place_return_branch(checked: CheckedType, span: Span, diverges: bool) -> CheckedBranch {
+    CheckedBranch {
+        diverges: diverges && checked.ty.is_void(),
+        checked,
+        span,
+    }
+}
+
+fn join_place_return_branch(
+    ret: &ReturnSpec,
+    expected: Option<TypeHandle>,
+    left: CheckedBranch,
+    right: CheckedBranch,
+    tc: &mut TypeChecker,
+) -> CheckedBranch {
+    let diverges = left.diverges && right.diverges;
+    let span = right.span;
+    let checked = join_branches_with_hint(expected, left, right, tc);
+    let checked = if diverges {
+        diverged_place_return(ret, tc)
     } else {
-        tc.push_inferred_return(ret_node.span, tc.type_handle(&Type::Void));
+        checked
+    };
+    CheckedBranch {
+        checked,
+        span,
+        diverges,
+    }
+}
+
+fn join_place_return_branches(
+    ret: &ReturnSpec,
+    expected: Option<TypeHandle>,
+    left: CheckedBranch,
+    right: CheckedBranch,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let branch = join_place_return_branch(ret, expected, left, right, tc);
+    if branch.diverges {
+        diverged_place_return(ret, tc)
+    } else {
+        branch.checked
+    }
+}
+
+fn finish_place_return_branch(
+    ret: &ReturnSpec,
+    expected: Option<TypeHandle>,
+    branch: CheckedBranch,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if branch.diverges {
+        diverged_place_return(ret, tc)
+    } else {
+        checked_branch_against_expected(branch, expected, tc)
+    }
+}
+
+fn diverged_place_return(ret: &ReturnSpec, tc: &TypeChecker) -> CheckedType {
+    let ty = if matches!(ret.ty, Type::InferReturn) {
+        Type::Infer
+    } else {
+        ret.ty.clone()
+    };
+    checked_type(ty, tc)
+}
+
+fn validate_place_return_expr(
+    value: &place::PlaceValue,
+    source: Option<&PlaceIdentity>,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    if !value.access.can_mut_borrow() {
+        tc.push_error(TypeError::UnsupportedPlaceReturn {
+            message: "mutable place return requires a mutable place",
+            span: tc.error_span(span),
+        });
+    }
+    if value.identity.is_indexed_derived() {
+        tc.push_error(TypeError::UnsupportedPlaceReturn {
+            message: "mutable place return cannot return an indexed place",
+            span: tc.error_span(span),
+        });
+    }
+    let Some(source) = source else {
+        tc.push_error(TypeError::UnsupportedPlaceReturn {
+            message: "mutable place return must derive from the first mutable input",
+            span: tc.error_span(span),
+        });
+        return;
+    };
+    if !value.identity.derives_from(source) {
+        tc.push_error(TypeError::UnsupportedPlaceReturn {
+            message: "mutable place return must derive from the first mutable input",
+            span: tc.error_span(span),
+        });
     }
 }
 
@@ -5977,7 +6506,7 @@ fn check_expr_checked_with_hint(
                     depth,
                     requires_runtime_capture: symbol.requires_runtime_capture(),
                 };
-                let access = tc.local_value_access(*name, &value);
+                let access = tc.local_value_access(&value);
                 tc.check_mut_downcast_root_use(Some(*name), &access.identity, expr.span);
                 if let Some((_, value_name, value)) = tc.lookup_named_value(*name) {
                     tc.warn_named_value_deprecated(&value, value_name, expr.span);
@@ -6022,7 +6551,7 @@ fn check_expr_checked_with_hint(
                         name: value_name,
                         decl: value,
                     })
-                    && matches!(callee.def.sig.ret, Type::InferReturn)
+                    && callee.def.sig.ret.is_infer()
                 {
                     tc.push_error(TypeError::InferReturnValue {
                         span: tc.error_span(expr.span),
@@ -7191,25 +7720,40 @@ fn check_lambda_expr(
         .node
         .ret_type
         .as_ref()
-        .map(|ty| tc.resolve_type_for_tc_at(ty, lambda.span));
+        .map(|ret| ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty, lambda.span)));
+    if let Some(ret) = &explicit_ret {
+        validate_return_spec(ret, false, has_mutable_func_param(&params), lambda.span, tc);
+    }
     let expected_ret = explicit_ret.or_else(|| expected_func.as_ref().map(|(_, ret)| ret.clone()));
 
     let flow = tc.enter_function_control_flow();
     tc.enter_lambda();
     tc.push_scope();
+    let mut source = None;
     for (param, param_ty) in lambda.node.params.iter().zip(&params) {
         let kind = LocalBindingKind::from_param(param.mutable, &param_ty.ty);
-        tc.define_value(param.name, param_ty.ty.clone(), kind, None);
+        let type_id = tc.define_value(param.name, param_ty.ty.clone(), kind, None);
+        if source.is_none() && param.mutable {
+            source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
+        }
     }
     let return_mode = match &expected_ret {
-        Some(ret) => ReturnMode::Explicit(ret.clone()),
-        None => ReturnMode::Infer { candidates: vec![] },
+        Some(ret) => ReturnMode::Explicit {
+            ret: ret.clone(),
+            source: source.clone(),
+        },
+        None => ReturnMode::Infer {
+            access: ReturnAccess::Value,
+            source: None,
+            candidates: vec![],
+        },
     };
     tc.push_return_frame(return_mode);
 
     check_callable_body_with_return(
         CallableBody::Expr(&lambda.node.body),
         expected_ret.as_ref(),
+        source.as_ref(),
         lambda.span,
         tc,
     );
@@ -7220,7 +7764,9 @@ fn check_lambda_expr(
     tc.exit_lambda();
     tc.exit_function_control_flow(flow);
 
-    let ret = expected_ret.or(inferred_ret).unwrap_or(Type::Infer);
+    let ret = expected_ret
+        .or_else(|| inferred_ret.map(ReturnSpec::value))
+        .unwrap_or_else(|| ReturnSpec::value(Type::Infer));
     checked_from_type(
         expr,
         Type::Func {

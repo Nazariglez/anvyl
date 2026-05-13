@@ -118,14 +118,26 @@ pub(super) fn param<'src>(
         .boxed()
 }
 
-pub(super) fn return_type<'src>() -> BoxedParser<'src, Option<ast::Type>> {
+pub(super) fn return_spec_tail<'src>() -> BoxedParser<'src, ast::ReturnSpec> {
     let inferred =
         select! { Token::Ident(ident) if ident.0.as_ref() == "_" => ast::Type::InferReturn };
+    let access = select! { Token::Keyword(Keyword::Var) => ast::ReturnAccess::Place }
+        .or_not()
+        .map(|access| access.unwrap_or(ast::ReturnAccess::Value));
 
+    access
+        .then(choice((inferred, type_ident())))
+        .map(|(access, ty)| ast::ReturnSpec { access, ty })
+        .labelled("return type")
+        .as_context()
+        .boxed()
+}
+
+pub(super) fn return_spec<'src>() -> BoxedParser<'src, Option<ast::ReturnSpec>> {
     select! {
         Token::Op(Op::ThinArrow) => (),
     }
-    .ignore_then(choice((inferred, type_ident())))
+    .ignore_then(return_spec_tail())
     .or_not()
     .labelled("return type")
     .as_context()

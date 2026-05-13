@@ -12,7 +12,7 @@ use super::{
     type_refs::TypeRefResolver,
 };
 use crate::{
-    ast::{AnonymousContract, ContractRef, Ident, Type},
+    ast::{AnonymousContract, ContractRef, Ident, ReturnSpec, Type},
     span::{SourceSpan, Span},
 };
 
@@ -89,7 +89,7 @@ struct ContractSet {
 struct CandidateSig {
     receiver: MethodReceiver,
     params: Vec<FuncParam>,
-    ret: Type,
+    ret: ReturnSpec,
     generic_method: bool,
 }
 
@@ -381,7 +381,7 @@ impl CandidateSig {
                     )
                 })
                 .collect(),
-            ret: method.signature.ret.ty.clone(),
+            ret: ReturnSpec::value(method.signature.ret.ty.clone()),
             generic_method: false,
         }
     }
@@ -419,8 +419,8 @@ fn signature_error(
     }
     if requirement.ret != candidate.ret {
         return Some(RequirementError::Return {
-            expected: requirement.ret.clone(),
-            found: candidate.ret.clone(),
+            expected: requirement.ret.ty.clone(),
+            found: candidate.ret.ty.clone(),
         });
     }
     None
@@ -558,7 +558,7 @@ pub(crate) fn finalize_contracts(
                 });
                 continue;
             }
-            if contains_infer_return(&req.ret) {
+            if contains_infer_return(&req.ret.ty) {
                 errors.push(TypeError::CompileError {
                     message: "contract method requirements cannot use inferred return types"
                         .to_string(),

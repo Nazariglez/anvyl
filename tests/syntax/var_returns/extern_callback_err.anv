@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: callback function returning a mutable place
+
+extern fn takes(callback: fn() -> var int);

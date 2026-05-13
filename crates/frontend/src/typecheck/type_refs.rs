@@ -380,7 +380,7 @@ impl<'a> TypeRefResolver<'a> {
                         ))
                     })
                     .collect::<Result<_, _>>()?,
-                ret: Box::new(self.finalize_inner(module, generics, ret, state)?),
+                ret: Box::new(ret.with_ty(self.finalize_inner(module, generics, &ret.ty, state)?)),
             }),
             Type::Dyn(contract) => self
                 .finalize_contract_ref(module, generics, contract, state)
@@ -733,7 +733,9 @@ impl<'a> TypeRefResolver<'a> {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let ret = self.finalize_inner(module, generics, &req.ret, state)?;
+        let ret = req
+            .ret
+            .with_ty(self.finalize_inner(module, generics, &req.ret.ty, state)?);
         Ok(AnonymousContractRequirement {
             receiver: req.receiver,
             name: req.name,

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn spaced(var x: int) -> var int { x }
+
+fn main() {
+    let lambda = |var x: int| -> var int { x };
+    let f: fn(var int) -> var int = lambda;
+}

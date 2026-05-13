@@ -242,7 +242,7 @@ pub struct AnonymousContractRequirement {
     pub receiver: MethodReceiver,
     pub name: Ident,
     pub params: Vec<AnonymousContractParam>,
-    pub ret: Type,
+    pub ret: ReturnSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +267,61 @@ impl std::hash::Hash for AnonymousContractParam {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReturnAccess {
+    Value,
+    Place,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReturnSpec {
+    pub access: ReturnAccess,
+    pub ty: Type,
+}
+
+impl ReturnSpec {
+    pub fn value(ty: Type) -> Self {
+        Self {
+            access: ReturnAccess::Value,
+            ty,
+        }
+    }
+
+    pub fn place(ty: Type) -> Self {
+        Self {
+            access: ReturnAccess::Place,
+            ty,
+        }
+    }
+
+    pub fn void() -> Self {
+        Self::value(Type::Void)
+    }
+
+    pub fn with_ty(&self, ty: Type) -> Self {
+        Self {
+            access: self.access,
+            ty,
+        }
+    }
+
+    pub fn is_implicit_void(&self) -> bool {
+        self.access == ReturnAccess::Value && self.is_void()
+    }
+
+    pub fn is_place(&self) -> bool {
+        self.access == ReturnAccess::Place
+    }
+
+    pub fn is_void(&self) -> bool {
+        self.ty == Type::Void
+    }
+
+    pub fn is_infer(&self) -> bool {
+        self.ty == Type::InferReturn
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Type {
     Infer,
@@ -279,7 +334,7 @@ pub enum Type {
     Void,
     Func {
         params: Vec<FuncParam>,
-        ret: Box<Type>,
+        ret: Box<ReturnSpec>,
     },
     Dyn(ContractRef),
     Var(TypeVarId),
@@ -601,7 +656,7 @@ impl Display for ContractRef {
                         }
                         write!(f, "{}: {}", param.name, param.ty)?;
                     }
-                    if requirement.ret == Type::Void {
+                    if requirement.ret.is_implicit_void() {
                         write!(f, "); ")?;
                     } else {
                         write!(f, ") -> {}; ", requirement.ret)?;
@@ -623,6 +678,15 @@ impl Display for ContractRef {
     }
 }
 
+impl Display for ReturnSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_place() {
+            write!(f, "var ")?;
+        }
+        write!(f, "{}", self.ty)
+    }
+}
+
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -640,12 +704,12 @@ impl Display for Type {
                         write!(f, ", ")?;
                     }
                     if p.mutable {
-                        write!(f, "mut ")?;
+                        write!(f, "var ")?;
                     }
                     write!(f, "{p}")?;
                 }
                 write!(f, ")")?;
-                if !matches!(**ret, Self::Void) {
+                if !ret.is_implicit_void() {
                     write!(f, " -> {ret}")?;
                 }
                 Ok(())
@@ -833,7 +897,7 @@ pub struct Func {
     pub type_params: Vec<TypeParam>,
     pub const_params: Vec<ConstParam>,
     pub params: Vec<Param>,
-    pub ret: Type,
+    pub ret: ReturnSpec,
     pub body: BlockNode,
 }
 
@@ -859,7 +923,7 @@ pub struct ExternFunc {
     pub visibility: Visibility,
     pub name: Ident,
     pub params: Vec<Param>,
-    pub ret: Type,
+    pub ret: ReturnSpec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -891,13 +955,13 @@ pub enum ExternTypeMember {
         name: Ident,
         receiver: ExternReceiverMode,
         params: Vec<Param>,
-        ret: Type,
+        ret: ReturnSpec,
     },
     StaticMethod {
         doc: Option<String>,
         name: Ident,
         params: Vec<Param>,
-        ret: Type,
+        ret: ReturnSpec,
     },
     Operator {
         op: BinaryOp,
@@ -992,7 +1056,7 @@ pub struct MethodSig {
     pub const_params: Vec<ConstParam>,
     pub receiver: Option<MethodReceiver>,
     pub params: Vec<Param>,
-    pub ret: Type,
+    pub ret: ReturnSpec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1166,7 +1230,7 @@ pub struct ExtendDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CastFrom {
     pub param: Param,
-    pub ret: Option<Type>,
+    pub ret: Option<ReturnSpec>,
     pub body: BlockNode,
 }
 
@@ -1279,7 +1343,7 @@ pub struct LambdaParam {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lambda {
     pub params: Vec<LambdaParam>,
-    pub ret_type: Option<Type>,
+    pub ret_type: Option<ReturnSpec>,
     pub body: Box<ExprNode>,
 }
 

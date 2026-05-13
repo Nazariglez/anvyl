@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn add(x: int, var y: int) -> var int {
+    y
+}
+
+fn main() {
+    var n = 1;
+    add(0, n) = 2;
+}

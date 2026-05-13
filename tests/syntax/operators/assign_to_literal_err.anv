@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
-// @contains: Unexpected token
+// @frontend: new
+// @contains: Cannot assign to immutable value
 
 fn main() {
     let i: int = 10;

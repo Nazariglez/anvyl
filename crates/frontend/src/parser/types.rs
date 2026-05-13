@@ -48,7 +48,8 @@ fn type_contains_slice(ty: &Type) -> bool {
     match ty {
         Type::Slice { .. } => true,
         Type::Func { params, ret } => {
-            params.iter().any(|param| type_contains_slice(&param.ty)) || type_contains_slice(ret)
+            params.iter().any(|param| type_contains_slice(&param.ty))
+                || type_contains_slice(&ret.ty)
         }
         Type::Tuple(elems) => elems.iter().any(type_contains_slice),
         Type::Nominal(nominal) => nominal.type_args.iter().any(type_contains_slice),
@@ -85,7 +86,7 @@ fn contract_ref_contains_slice(contract: &ast::ContractRef) -> bool {
                 .params
                 .iter()
                 .any(|param| type_contains_slice(&param.ty))
-                || type_contains_slice(&requirement.ret)
+                || type_contains_slice(&requirement.ret.ty)
         }),
         ast::ContractRef::Intersection(contracts) => {
             contracts.iter().any(contract_ref_contains_slice)
@@ -321,6 +322,17 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
             .then(param_type_parser)
             .map(|(mutable, ty)| ast::FuncParam::new(ty, mutable, false));
 
+        let return_value_type = choice((
+            select! { Token::Ident(ident) if ident.0.as_ref() == "_" => Type::InferReturn },
+            type_parser.clone(),
+        ));
+        let return_access = select! { Token::Keyword(Keyword::Var) => ast::ReturnAccess::Place }
+            .or_not()
+            .map(|access| access.unwrap_or(ast::ReturnAccess::Value));
+        let fn_return_spec = return_access
+            .then(return_value_type)
+            .map(|(access, ty)| ast::ReturnSpec { access, ty });
+
         let fn_type = select! { Token::Keyword(Keyword::Fn) => () }
             .ignore_then(
                 open_paren
@@ -335,10 +347,10 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
                     .then_ignore(close_paren),
             )
             .then_ignore(arrow)
-            .then(type_parser.clone())
+            .then(fn_return_spec)
             .map(|(params, ret)| Type::Func {
                 params,
-                ret: ret.boxed(),
+                ret: Box::new(ret),
             });
 
         let primary_type = choice((

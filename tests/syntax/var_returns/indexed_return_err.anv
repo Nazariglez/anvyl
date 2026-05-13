@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutable place return cannot return an indexed place
+
+fn first(var xs: slice[int]) -> var int {
+    xs[0]
+}

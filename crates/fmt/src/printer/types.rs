@@ -72,7 +72,7 @@ impl Printer<'_> {
                     self.format_type(&p.ty);
                 }
                 self.write(") -> ");
-                self.format_type(ret);
+                self.format_return_spec_tail(ret);
             }
             ast::Type::Dyn(contract) => {
                 self.write("dyn ");

@@ -6,7 +6,7 @@ use anvyx_externs::{
 };
 
 use crate::{
-    ast::{FuncParam, GenericArg, Ident, NominalKind, Type},
+    ast::{FuncParam, GenericArg, Ident, NominalKind, ReturnSpec, Type},
     externs::{
         extern_module_path, extern_module_scope,
         raw::{
@@ -93,7 +93,7 @@ impl ResolvedExternSignature {
                 .iter()
                 .map(ResolvedExternParam::to_func_param)
                 .collect(),
-            ret: Box::new(self.ret.ty.clone()),
+            ret: Box::new(ReturnSpec::value(self.ret.ty.clone())),
         }
     }
 }
@@ -927,7 +927,7 @@ impl<'a> CatalogBuilder<'a> {
                     .collect();
                 Type::Func {
                     params,
-                    ret: Box::new(self.resolve_ty(ctx, &callback.ret).ty),
+                    ret: Box::new(ReturnSpec::value(self.resolve_ty(ctx, &callback.ret).ty)),
                 }
             }
             ExternTypeExpr::Named { module, name, args } => {
@@ -1354,7 +1354,7 @@ fn validate_void_positions(
                     errors,
                 );
             }
-            validate_void_positions(context, ret, TypePosition::Return, site, errors);
+            validate_void_positions(context, &ret.ty, TypePosition::Return, site, errors);
         }
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
             validate_void_positions(context, elem, TypePosition::Nested, site, errors);
@@ -2224,7 +2224,7 @@ mod tests {
             };
             assert_eq!(params.len(), 1);
             assert_eq!(params[0].ty, Type::Any);
-            assert_eq!(ret.as_ref(), &decls.core_option_of(Type::Int).unwrap());
+            assert_eq!(ret.ty, decls.core_option_of(Type::Int).unwrap());
         }
     }
 
