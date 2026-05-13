@@ -5,7 +5,7 @@ use super::{
     common::{block_stmt, identifier},
     decl::{DeclPolicy, declaration_header, local_function, local_type_alias_statement},
     expr::{cond_expression, expression, for_header_expression},
-    pattern::{let_or_var_head, pattern},
+    pattern::{binding_pattern, pattern},
     types::type_ident,
 };
 use crate::{
@@ -29,8 +29,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let continue_s = continue_stmt();
         let defer_s = defer_stmt(stmt.clone(), expr.clone());
 
-        let let_else = let_or_var_head()
-            .then(pattern())
+        let let_else = binding_pattern()
             .then_ignore(select! { Token::Op(Op::Assign) => () })
             .then(expression(stmt.clone()))
             .then_ignore(select! { Token::Keyword(Keyword::Else) => () })
@@ -241,8 +240,7 @@ fn while_let_stmt<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
     select! { Token::Keyword(Keyword::While) => () }
-        .ignore_then(let_or_var_head())
-        .then(pattern())
+        .ignore_then(binding_pattern())
         .then_ignore(select! { Token::Op(Op::Assign) => () })
         .then(cond_expression())
         .then(block_stmt(stmt, expr))
@@ -294,7 +292,8 @@ fn for_stmt<'src>(
     select! {
         Token::Keyword(Keyword::For) => (),
     }
-    .ignore_then(pattern())
+    .ignore_then(select! { Token::Keyword(Keyword::Var) => () }.or_not())
+    .then(pattern())
     .then_ignore(select! {
         Token::Keyword(Keyword::In) => (),
     })
@@ -302,21 +301,24 @@ fn for_stmt<'src>(
     .then(for_header_expression(stmt.clone()))
     .then(contextual_step(stmt.clone()))
     .then(block_stmt(stmt, expr))
-    .map_with(|((((pat, reversed), iterable), step), body), e| {
-        let s = e.span();
-        let span = s.byte();
-        let for_node = Spanned::new(
-            ast::For {
-                pattern: pat,
-                iterable,
-                step,
-                reversed,
-                body,
-            },
-            span,
-        );
-        Spanned::new(ast::Stmt::For(Box::new(for_node)), span)
-    })
+    .map_with(
+        |(((((mutable, pat), reversed), iterable), step), body), e| {
+            let s = e.span();
+            let span = s.byte();
+            let for_node = Spanned::new(
+                ast::For {
+                    mutable: mutable.is_some(),
+                    pattern: pat,
+                    iterable,
+                    step,
+                    reversed,
+                    body,
+                },
+                span,
+            );
+            Spanned::new(ast::Stmt::For(Box::new(for_node)), span)
+        },
+    )
     .labelled("for statement")
     .as_context()
     .boxed()

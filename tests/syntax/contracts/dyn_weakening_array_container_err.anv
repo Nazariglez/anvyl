@@ -11,9 +11,14 @@ contract B {
     fn b(self);
 }
 
-fn use_list(values: [dyn A]) {}
+struct AB {
+    fn a(self) {}
+    fn b(self) {}
+}
+
+fn use_array(values: [dyn A; 1]) {}
 
 fn main() {
-    let values: [dyn A + B] = [];
-    use_list(values);
+    let values: [dyn A + B; 1] = [AB {}];
+    use_array(values);
 }

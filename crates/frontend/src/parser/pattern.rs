@@ -10,12 +10,16 @@ use crate::{
     span::{SourceSpan, Spanned},
 };
 
-pub(super) fn let_or_var_head<'src>() -> BoxedParser<'src, ast::PatternHead> {
+fn let_or_var_head<'src>() -> BoxedParser<'src, ast::PatternHead> {
     select! {
         Token::Keyword(Keyword::Let) => ast::PatternHead::Let,
         Token::Keyword(Keyword::Var) => ast::PatternHead::Var,
     }
     .boxed()
+}
+
+pub(super) fn binding_pattern<'src>() -> BoxedParser<'src, (ast::PatternHead, ast::PatternNode)> {
+    let_or_var_head().then(pattern()).boxed()
 }
 
 pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutating method
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Enemy {
+    fn update(var self) {}
+}
+
+fn main() {
+    let items: [dyn Updatable] = [Enemy {}];
+    items[0].update();
+}

@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: collection conversion is not implicit
+// @contains: fixed-array conversion is not implicit
 
 contract Drawable {
     fn draw(self);
@@ -12,6 +12,6 @@ struct Sprite {
 }
 
 fn main() {
-    let sprites: [Sprite] = [Sprite {}];
-    let items: [dyn Drawable] = sprites;
+    let sprites: [Sprite; 1] = [Sprite {}];
+    let items: [dyn Drawable; 1] = sprites;
 }

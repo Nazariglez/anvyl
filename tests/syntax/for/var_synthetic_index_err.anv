@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: for var cannot bind a synthetic index
+
+fn main() {
+    var xs = [1, 2, 3];
+    // FIXME: can mix i (value) and x (bind), we probably want to support this eventually materalizing the rvalue of index?
+    for var (i, x) in xs {
+        x = i;
+    }
+}

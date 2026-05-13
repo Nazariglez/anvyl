@@ -14,7 +14,7 @@ struct Enemy {
 
 fn main() {
     var actor: dyn Drawable = Enemy { hp: 1 };
-    if let var enemy = actor as? Enemy {
+    if var enemy = actor as? Enemy {
         enemy.hp = 2;
     }
 }

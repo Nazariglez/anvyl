@@ -1242,6 +1242,7 @@ pub struct WhileLet {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct For {
+    pub mutable: bool,
     pub pattern: PatternNode,
     pub iterable: ExprNode,
     pub step: Option<ExprNode>,

@@ -805,6 +805,24 @@ mod tests {
     }
 
     #[test]
+    fn for_var() {
+        for (source, expected) in [
+            ("fn f() { for var x in xs { } }", "for var x in xs {}"),
+            (
+                "fn f() { for var (a, b) in get() { } }",
+                "for var (a, b) in get() {}",
+            ),
+            (
+                "fn f() { for var x in rev xs step 2 { } }",
+                "for var x in rev xs step 2 {}",
+            ),
+        ] {
+            let formatted = format_source(source).expect("format failed");
+            assert!(formatted.contains(expected));
+        }
+    }
+
+    #[test]
     fn break_continue() {
         let source = "fn f() { while true { break; } }";
         let formatted = format_source(source).expect("format failed");

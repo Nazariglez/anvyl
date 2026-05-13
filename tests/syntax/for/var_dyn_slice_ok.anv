@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Enemy {
+    fn update(var self) {}
+}
+
+fn update_all(var actors: slice[dyn Updatable]) {
+    for var actor in actors {
+        actor.update();
+    }
+}
+
+fn main() {
+    var actors: [dyn Updatable; 1] = [Enemy {}];
+    update_all(actors);
+}

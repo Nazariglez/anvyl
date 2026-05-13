@@ -70,6 +70,17 @@ fn match_let_head_rejected() {
     parse_program_err("fn main() { let _ = match let opt { _ => 0 }; }");
 }
 
+fn first_for(src: &str) -> ast::ForNode {
+    let prog = parse_program(src);
+    let ast::Stmt::Func(func) = &prog.stmts[0].node else {
+        panic!("expected Func");
+    };
+    let ast::Stmt::For(for_node) = &func.node.body.node.stmts[0].node else {
+        panic!("expected For stmt");
+    };
+    (**for_node).clone()
+}
+
 #[test]
 fn while_after_let() {
     let prog = parse_program("fn main() { while true {} }");
@@ -213,6 +224,7 @@ fn for_range() {
     };
     assert_eq!(ident.0.as_ref(), "n");
 
+    assert!(!for_inner.mutable);
     assert!(!for_inner.reversed);
     assert!(for_inner.step.is_none());
 
@@ -223,6 +235,28 @@ fn for_range() {
         panic!("expected bounded range");
     };
     assert!(!inclusive);
+}
+
+#[test]
+fn for_var_item() {
+    let for_node = first_for("fn main() { for var x in xs {} }");
+    assert!(for_node.node.mutable);
+    let ast::Pattern::Ident(ident) = &for_node.node.pattern.node else {
+        panic!("expected Ident pattern");
+    };
+    assert_eq!(ident.0.as_ref(), "x");
+}
+
+#[test]
+fn for_var_tuple_pattern() {
+    let for_node = first_for("fn main() { for var (a, b) in xs {} }");
+    assert!(for_node.node.mutable);
+    assert!(matches!(for_node.node.pattern.node, ast::Pattern::Tuple(_)));
+}
+
+#[test]
+fn for_let_rejected() {
+    parse_program_err("fn main() { for let x in xs {} }");
 }
 
 #[test]

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var pairs = [(1, 2)];
+    for var (a, b) in pairs {
+        a = 3;
+        b = 4;
+    }
+}

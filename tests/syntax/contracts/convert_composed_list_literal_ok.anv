@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+    fn update(var self) {}
+}
+
+struct Button {
+    fn draw(self) {}
+    fn update(var self) {}
+}
+
+fn main() {
+    let items: [dyn Drawable + Updatable] = [Enemy {}, Button {}];
+}

@@ -20,7 +20,7 @@ struct Slot {
 
 fn main() {
     var slot = Slot { actor: Enemy { hp: 1 }, count: 0 };
-    if let var enemy = slot.actor as? Enemy {
+    if var enemy = slot.actor as? Enemy {
         slot.actor.draw();
     }
 }

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutable iteration requires a mutable iterable place
+
+fn main() {
+    let xs = [1, 2, 3];
+    for var x in xs {
+        x = 4;
+    }
+}

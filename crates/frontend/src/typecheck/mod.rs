@@ -170,6 +170,22 @@ pub(crate) enum TryCarrierKind {
     Option,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForVarUnsupportedReason {
+    Range,
+    String,
+    Map,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynContainerConversionKind {
+    Collection,
+    FixedArray,
+    Slice,
+    DynamicWeakening,
+    MapValue,
+}
+
 impl TryCarrierKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -379,6 +395,16 @@ pub(crate) enum TypeError {
     },
     ForIterableNotSupported {
         found: Type,
+        span: Option<SourceSpan>,
+    },
+    ForVarRequiresMutableIterable {
+        span: Option<SourceSpan>,
+    },
+    ForVarUnsupportedIterable {
+        reason: ForVarUnsupportedReason,
+        span: Option<SourceSpan>,
+    },
+    ForVarSyntheticIndex {
         span: Option<SourceSpan>,
     },
     ForIterationModifier {
@@ -721,6 +747,10 @@ pub(crate) enum TypeError {
     },
     BorrowedDynReassign {
         name: Ident,
+        span: Option<SourceSpan>,
+    },
+    DynContainerConversion {
+        kind: DynContainerConversionKind,
         span: Option<SourceSpan>,
     },
     DuplicateGenericParam {
@@ -8607,15 +8637,95 @@ fn assign_op_to_binary_op(op: AssignOp) -> Option<BinaryOp> {
 fn check_while(while_node: &WhileNode, tc: &mut TypeChecker) {
     let cond = check_expr_checked(&while_node.node.cond, tc);
     check_bool_condition(ConditionKind::While, cond, while_node.node.cond.span, tc);
+    check_loop_body(&while_node.node.body, tc);
+}
+
+fn check_loop_body(body: &BlockNode, tc: &mut TypeChecker) {
     tc.enter_loop();
-    check_block_checked(&while_node.node.body, tc);
+    check_block_checked(body, tc);
     tc.exit_loop();
 }
 
 fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     let node = &for_node.node;
+    if node.mutable {
+        check_for_var(node, tc);
+        return;
+    }
+
     let iterable_ty = check_expr_checked(&node.iterable, tc).ty;
-    let range_kind = tc.decls.core_range_kind(&iterable_ty);
+    check_for_modifiers(node, &iterable_ty, tc);
+
+    let item_ty = iterable_item_type(&iterable_ty, &tc.decls).unwrap_or_else(|| {
+        tc.push_error(TypeError::ForIterableNotSupported {
+            found: iterable_ty.clone(),
+            span: tc.error_span(node.iterable.span),
+        });
+        Type::Infer
+    });
+    let pattern_ty = for_pattern_item_type(&node.pattern, &iterable_ty, item_ty);
+
+    tc.push_scope();
+    pattern::check(
+        &node.pattern,
+        &pattern_ty,
+        PatternBindMode::Owned { mutable: false },
+        PatternContext::For,
+        tc,
+    );
+    check_loop_body(&node.body, tc);
+    tc.pop_scope();
+}
+
+fn check_for_var(node: &For, tc: &mut TypeChecker) {
+    let iterable = check_place(&node.iterable, tc);
+    let iterable_ty = iterable.value.checked.ty.clone();
+    check_for_modifiers(node, &iterable_ty, tc);
+
+    let Some(elem_ty) = mutable_iterable_item_type(&iterable_ty, node.iterable.span, tc) else {
+        return;
+    };
+    if for_var_binds_synthetic_index(&node.pattern, &elem_ty) {
+        tc.push_error(TypeError::ForVarSyntheticIndex {
+            span: tc.error_span(node.pattern.span),
+        });
+        return;
+    }
+
+    let access = place::projected_field_access(iterable.value.access);
+    let access = if access.can_assign() {
+        access
+    } else {
+        tc.push_error(TypeError::ForVarRequiresMutableIterable {
+            span: tc.error_span(node.iterable.span),
+        });
+        PlaceAccess::Mutable
+    };
+    let accepts_extern_any = iterable.accepts_extern_any();
+    let place = pattern::PatternPlace {
+        expected_handle: tc.type_handle(&elem_ty),
+        expected_ty: elem_ty,
+        access,
+        facts: iterable.value.facts,
+        identity: iterable.value.identity.index(),
+        accepts_extern_any,
+    };
+
+    tc.push_scope();
+    pattern::check_place_at(
+        &node.pattern,
+        place,
+        PatternBindMode::Alias,
+        node.iterable.node.id,
+        PatternContext::For,
+        tc,
+    );
+    check_loop_body(&node.body, tc);
+    tc.pop_scope();
+}
+
+fn check_for_modifiers(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
+    let range_kind = tc.decls.core_range_kind(iterable_ty);
 
     if node.reversed {
         if matches!(iterable_ty, Type::Map { .. }) {
@@ -8644,7 +8754,7 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
             let step_checked = check_expr_checked(step, tc);
             let step_is_int = matches!(step_checked.ty, Type::Int | Type::Infer);
             let range_is_int = matches!(
-                tc.decls.core_range_inner(&iterable_ty),
+                tc.decls.core_range_inner(iterable_ty),
                 Some(Type::Int | Type::Infer)
             );
             if range_kind.is_some() && (!range_is_int || !step_is_int) {
@@ -8654,28 +8764,47 @@ fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
             tc.expect_assignable(step.span, step_checked.handle, int);
         }
     }
+}
 
-    let item_ty = iterable_item_type(&iterable_ty, &tc.decls).unwrap_or_else(|| {
-        tc.push_error(TypeError::ForIterableNotSupported {
-            found: iterable_ty.clone(),
-            span: tc.error_span(node.iterable.span),
-        });
-        Type::Infer
+fn for_var_binds_synthetic_index(pattern: &PatternNode, item: &Type) -> bool {
+    tuple_pattern_len(pattern) == Some(2)
+        && !matches!(item, Type::Infer)
+        && !matches!(item, Type::Tuple(types) if types.len() == 2)
+}
+
+fn mutable_iterable_item_type(ty: &Type, span: Span, tc: &mut TypeChecker) -> Option<Type> {
+    match ty {
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+            Some((**elem).clone())
+        }
+        Type::Infer => Some(Type::Infer),
+        Type::String => {
+            push_for_var_unsupported(tc, ForVarUnsupportedReason::String, span);
+            None
+        }
+        Type::Map { .. } => {
+            push_for_var_unsupported(tc, ForVarUnsupportedReason::Map, span);
+            None
+        }
+        _ if tc.decls.core_range_inner(ty).is_some() => {
+            push_for_var_unsupported(tc, ForVarUnsupportedReason::Range, span);
+            None
+        }
+        _ => {
+            tc.push_error(TypeError::ForIterableNotSupported {
+                found: ty.clone(),
+                span: tc.error_span(span),
+            });
+            None
+        }
+    }
+}
+
+fn push_for_var_unsupported(tc: &mut TypeChecker, reason: ForVarUnsupportedReason, span: Span) {
+    tc.push_error(TypeError::ForVarUnsupportedIterable {
+        reason,
+        span: tc.error_span(span),
     });
-    let pattern_ty = for_pattern_item_type(&node.pattern, &iterable_ty, item_ty);
-
-    tc.push_scope();
-    pattern::check(
-        &node.pattern,
-        &pattern_ty,
-        PatternBindMode::Owned { mutable: false },
-        PatternContext::For,
-        tc,
-    );
-    tc.enter_loop();
-    check_block_checked(&node.body, tc);
-    tc.exit_loop();
-    tc.pop_scope();
 }
 
 fn push_for_modifier_error(tc: &mut TypeChecker, message: &'static str, span: Span) {
@@ -8789,9 +8918,7 @@ fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
         PatternContext::WhileLet,
         tc,
     );
-    tc.enter_loop();
-    check_block_checked(&node.body, tc);
-    tc.exit_loop();
+    check_loop_body(&node.body, tc);
     tc.pop_scope();
 }
 

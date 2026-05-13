@@ -16,5 +16,5 @@ fn make_actor() -> dyn Drawable {
 }
 
 fn main() {
-    if let var enemy = make_actor() as? Enemy {}
+    if var enemy = make_actor() as? Enemy {}
 }

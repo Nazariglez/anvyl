@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Enemy {
+    fn update(var self) {}
+}
+
+fn main() {
+    var items: [dyn Updatable] = [Enemy {}];
+    items[0].update();
+}

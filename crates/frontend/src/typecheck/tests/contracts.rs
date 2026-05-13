@@ -447,6 +447,53 @@ fn inferred_dynamic_exact_downcast_records_fact_after_solving() {
 }
 
 #[test]
+fn dynamic_collection_literal_records_element_conversions() {
+    let result = check(
+        "contract Drawable { fn draw(self); }
+        struct Sprite { fn draw(self) {} }
+        struct Label { fn draw(self) {} }
+        fn main() {
+            let items: [dyn Drawable] = [Sprite {}, Label {}];
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_conversions().len(), 2);
+}
+
+#[test]
+fn indexed_dynamic_call_records_fact() {
+    let result = check(
+        "contract Drawable { fn draw(self); }
+        struct Sprite { fn draw(self) {} }
+        fn main() {
+            let items: [dyn Drawable] = [Sprite {}];
+            items[0].draw();
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_calls().len(), 1);
+}
+
+#[test]
+fn for_var_dynamic_call_records_fact() {
+    let result = check(
+        "contract Updatable { fn update(var self); }
+        struct Enemy { fn update(var self) {} }
+        fn main() {
+            var items: [dyn Updatable] = [Enemy {}];
+            for var item in items {
+                item.update();
+            }
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_calls().len(), 1);
+}
+
+#[test]
 fn dynamic_strengthening_is_rejected() {
     let errors = errors(
         "contract A { fn a(self); }

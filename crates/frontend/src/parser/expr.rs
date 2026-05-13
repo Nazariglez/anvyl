@@ -11,7 +11,7 @@ use super::{
         add_sub_op, and_op, assign_op, bit_and_op, bit_or_op, cmp_op, coalesce_op, eq_op,
         infix_left, mul_div_op, or_op, shift_op, xor_op,
     },
-    pattern::{let_or_var_head, pattern},
+    pattern::{binding_pattern, pattern},
     types::{generic_arg, type_ident, type_subject_type_ident},
 };
 use crate::{
@@ -125,22 +125,12 @@ fn if_expr<'src>(
         )))
         .or_not();
 
-        let let_var_ident_value = select! { Token::Keyword(Keyword::Let) => () }
-            .ignore_then(select! { Token::Keyword(Keyword::Var) => () })
-            .ignore_then(
-                identifier()
-                    .map_with(|ident, e| Spanned::new(ast::Pattern::Ident(ident), e.span().byte())),
-            )
-            .then_ignore(select! { Token::Op(Op::Assign) => () })
-            .then(cond_expression())
-            .map(|(pat, value)| ((ast::PatternHead::Var, pat), value));
-        let let_value = let_or_var_head()
-            .then(pattern())
+        let let_value = binding_pattern()
             .then_ignore(select! { Token::Op(Op::Assign) => () })
             .then(cond_expression());
 
         let if_let = select! { Token::Keyword(Keyword::If) => () }
-            .ignore_then(choice((let_var_ident_value, let_value)))
+            .ignore_then(let_value)
             .then(block_stmt(stmt.clone(), expr.clone()))
             .then(else_branch.clone())
             .map_with(|((((head, pat), value), then_block), else_block), e| {

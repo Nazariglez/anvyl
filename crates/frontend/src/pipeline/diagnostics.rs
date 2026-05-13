@@ -23,7 +23,8 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, DeprecatedUseKind,
-        MemberAccessKind, ModuleScope, TryCarrierKind, TypeError, TypeWarning, VariantShape,
+        DynContainerConversionKind, ForVarUnsupportedReason, MemberAccessKind, ModuleScope,
+        TryCarrierKind, TypeError, TypeWarning, VariantShape,
     },
 };
 
@@ -557,6 +558,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::BorrowedDynReassign { name, .. } => {
             format!("cannot reassign borrowed dynamic parameter '{name}'")
         }
+        TypeError::DynContainerConversion { kind, .. } => render_dyn_container_conversion(*kind),
         TypeError::RecursiveInference { .. } => {
             "recursive type inference is not allowed".to_string()
         }
@@ -692,6 +694,13 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::TryInsideDefer { .. } => "try inside defer".to_string(),
         TypeError::ForIterableNotSupported { found, .. } => {
             format!("type '{found}' cannot be iterated")
+        }
+        TypeError::ForVarRequiresMutableIterable { .. } => {
+            "mutable iteration requires a mutable iterable place".to_string()
+        }
+        TypeError::ForVarUnsupportedIterable { reason, .. } => render_for_var_unsupported(*reason),
+        TypeError::ForVarSyntheticIndex { .. } => {
+            "for var cannot bind a synthetic index; use an index loop or ordinary for when mutation is not needed".to_string()
         }
         TypeError::ForIterationModifier { message, .. } => (*message).to_string(),
         TypeError::InfiniteSize { name, .. } => {
@@ -1145,6 +1154,9 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::CannotMutateCapturedVariable { span, .. }
         | TypeError::RequiresMutablePlace { span, .. }
         | TypeError::VarPatternRequiresMutablePlace { span, .. }
+        | TypeError::ForVarRequiresMutableIterable { span, .. }
+        | TypeError::ForVarUnsupportedIterable { span, .. }
+        | TypeError::ForVarSyntheticIndex { span, .. }
         | TypeError::InvalidOperand { span, .. }
         | TypeError::MissingReturn { span, .. }
         | TypeError::IfWithoutElseValue { span, .. }
@@ -1237,6 +1249,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::ContractUnsatisfied { span, .. }
         | TypeError::DynamicMethodMissing { span, .. }
         | TypeError::BorrowedDynReassign { span, .. }
+        | TypeError::DynContainerConversion { span, .. }
         | TypeError::DuplicateGenericParam { span, .. } => *span,
         TypeError::GenericArity(_) => None,
     }
@@ -1321,6 +1334,40 @@ fn render_type_mismatch(expected: &Type, found: &Type) -> String {
         "Mismatched types: {}",
         expected_found_label(&expected, &found)
     )
+}
+
+fn render_for_var_unsupported(reason: ForVarUnsupportedReason) -> String {
+    match reason {
+        ForVarUnsupportedReason::Range => {
+            "ranges produce values and cannot be iterated by mutable alias"
+        }
+        ForVarUnsupportedReason::String => "mutable string element iteration is not supported",
+        ForVarUnsupportedReason::Map => {
+            "mutable map iteration is not supported yet because key/value alias semantics are not defined"
+        }
+    }
+    .to_string()
+}
+
+fn render_dyn_container_conversion(kind: DynContainerConversionKind) -> String {
+    match kind {
+        DynContainerConversionKind::Collection => {
+            "collection conversion is not implicit; construct a dynamic collection with an expected element type"
+        }
+        DynContainerConversionKind::FixedArray => {
+            "fixed-array conversion is not implicit; construct a dynamic fixed array with an expected element type"
+        }
+        DynContainerConversionKind::Slice => {
+            "slices are invariant and cannot be reinterpreted as dynamic slices"
+        }
+        DynContainerConversionKind::DynamicWeakening => {
+            "dynamic weakening applies to values, not containers"
+        }
+        DynContainerConversionKind::MapValue => {
+            "maps are invariant and no hidden dynamic value conversion is created"
+        }
+    }
+    .to_string()
 }
 
 fn render_type_mismatch_parts(expected: &Type, found: &Type) -> (String, String) {

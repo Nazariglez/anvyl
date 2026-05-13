@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutating method
+
+struct Counter {
+    n: int,
+
+    fn inc(var self) {
+        self.n += 1;
+    }
+}
+
+fn main() {
+    var counters = [Counter { n: 0 }];
+    for counter in counters {
+        counter.inc();
+    }
+}

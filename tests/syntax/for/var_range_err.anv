@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ranges produce values and cannot be iterated by mutable alias
+
+fn main() {
+    for var x in 0..10 {
+        x = 4;
+    }
+}

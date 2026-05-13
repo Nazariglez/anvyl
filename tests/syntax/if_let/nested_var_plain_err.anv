@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
+// @contains: `var` is only allowed before the whole pattern
 // @frontend: new
-// @contains: immutable
 
 contract Drawable {
     fn draw(self);
@@ -13,5 +13,7 @@ struct Enemy {
 
 fn main() {
     let actor: dyn Drawable = Enemy {};
-    if var enemy = actor as? Enemy {}
+    if let var enemy = actor as? Enemy {
+        enemy.draw();
+    }
 }

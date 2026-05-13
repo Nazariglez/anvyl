@@ -1,5 +1,6 @@
 use super::{
-    DynConversionFact, DynWeakeningFact, TypeChecker, TypeError, TypeHandle,
+    DynContainerConversionKind, DynConversionFact, DynWeakeningFact, TypeChecker, TypeError,
+    TypeHandle,
     contracts::{self, ContractMatchError, RequirementError},
 };
 use crate::{
@@ -19,8 +20,86 @@ pub(super) fn expect_assignable(
     if try_expected_dyn(tc, span, expr_id, &from_ty, &to_ty) {
         return;
     }
+    if let Some(kind) = dyn_container_conversion_kind(&from_ty, &to_ty) {
+        tc.push_error(TypeError::DynContainerConversion {
+            kind,
+            span: tc.error_span(span),
+        });
+        return;
+    }
     tc.solver
         .add_handle_assignable(tc.error_span(span), from, to);
+}
+
+fn dyn_container_conversion_kind(from: &Type, to: &Type) -> Option<DynContainerConversionKind> {
+    if from == to {
+        return None;
+    }
+    match (from, to) {
+        (Type::List { elem: from }, Type::List { elem: to }) => dyn_collection_kind(from, to),
+        (Type::Array { elem: from, .. }, Type::Array { elem: to, .. }) => {
+            dyn_collection_kind(from, to).map(|kind| match kind {
+                DynContainerConversionKind::Collection => DynContainerConversionKind::FixedArray,
+                other => other,
+            })
+        }
+        (
+            Type::Slice { elem: from } | Type::Array { elem: from, .. } | Type::List { elem: from },
+            Type::Slice { elem: to },
+        ) if dyn_elem_mismatch(from, to) => Some(DynContainerConversionKind::Slice),
+        (
+            Type::Map {
+                key: from_key,
+                value: from_value,
+            },
+            Type::Map {
+                key: to_key,
+                value: to_value,
+            },
+        ) if from_key == to_key && dyn_elem_mismatch(from_value, to_value) => {
+            Some(DynContainerConversionKind::MapValue)
+        }
+        _ => None,
+    }
+}
+
+fn dyn_collection_kind(from: &Type, to: &Type) -> Option<DynContainerConversionKind> {
+    if from == to {
+        return None;
+    }
+    match (from, to) {
+        (Type::Dyn(_), Type::Dyn(_)) => Some(DynContainerConversionKind::DynamicWeakening),
+        (_, Type::Dyn(_)) | (Type::Dyn(_), _) => Some(DynContainerConversionKind::Collection),
+        _ => None,
+    }
+}
+
+fn dyn_elem_mismatch(from: &Type, to: &Type) -> bool {
+    from != to && (contains_dyn(from) || contains_dyn(to))
+}
+
+fn contains_dyn(ty: &Type) -> bool {
+    match ty {
+        Type::Dyn(_) => true,
+        Type::Func { params, ret } => {
+            params.iter().any(|param| contains_dyn(&param.ty)) || contains_dyn(ret)
+        }
+        Type::Tuple(elems) => elems.iter().any(contains_dyn),
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => contains_dyn(elem),
+        Type::Map { key, value } => contains_dyn(key) || contains_dyn(value),
+        Type::Nominal(nominal) => nominal.type_args.iter().any(contains_dyn),
+        Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Var(_)
+        | Type::UnresolvedName(_)
+        | Type::UnresolvedNominal { .. } => false,
+    }
 }
 
 fn try_expected_dyn(

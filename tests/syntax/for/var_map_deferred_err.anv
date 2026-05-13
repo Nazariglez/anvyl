@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutable map iteration is not supported yet
+
+fn main() {
+    var xs = ["a": 1];
+    for var entry in xs {
+        entry = ("b", 2);
+    }
+}

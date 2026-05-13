@@ -68,6 +68,9 @@ impl Printer<'_> {
     fn format_for(&mut self, f: &ast::For) {
         self.write_indent();
         self.write("for ");
+        if f.mutable {
+            self.write("var ");
+        }
         self.format_pattern(&f.pattern.node);
         self.write(" in ");
         if f.reversed {

@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: maps are invariant
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+struct AB {
+    fn a(self) {}
+    fn b(self) {}
+}
+
+fn use_map(values: [string: dyn A]) {}
+
+fn main() {
+    let values: [string: dyn A + B] = ["x": AB {}];
+    use_map(values);
+}

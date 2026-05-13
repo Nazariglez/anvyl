@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+    fn damage(var self) {}
+}
+
+fn main() {
+    var actors: [dyn Drawable] = [Enemy {}];
+    for var actor in actors {
+        if var enemy = actor as? Enemy {
+            enemy.damage();
+        }
+    }
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Mismatched types
+
+struct Sprite {}
+struct Label {}
+
+fn main() {
+    let items = [Sprite {}, Label {}];
+}

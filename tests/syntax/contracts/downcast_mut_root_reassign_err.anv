@@ -13,7 +13,7 @@ struct Enemy {
 
 fn main() {
     var actor: dyn Drawable = Enemy {};
-    if let var enemy = actor as? Enemy {
+    if var enemy = actor as? Enemy {
         actor = Enemy {};
     }
 }

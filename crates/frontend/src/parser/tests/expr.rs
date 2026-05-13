@@ -12,6 +12,21 @@ fn expect_ternary(expr: &ast::ExprNode) -> (&ast::ExprNode, &ast::ExprNode, &ast
     }
 }
 
+fn expect_if_let_downcast_head(source: &str, head: ast::PatternHead) {
+    let program = parse_program(source);
+    let ast::Stmt::Func(func) = &program.stmts[0].node else {
+        panic!("expected function");
+    };
+    let Some(expr) = &func.node.body.node.tail else {
+        panic!("expected if-let tail expression");
+    };
+    let ast::ExprKind::IfLet(if_let) = &expr.node.kind else {
+        panic!("expected if-let");
+    };
+    assert_eq!(if_let.node.head, head);
+    expect_exact_downcast(&if_let.node.value);
+}
+
 #[test]
 fn mul_add_prec() {
     let expr = parse_expr("1 + 2 * 3");
@@ -789,19 +804,24 @@ fn exact_downcast_chains_with_casts() {
 }
 
 #[test]
-fn exact_downcast_if_let_var_scrutinee() {
-    let program = parse_program("fn main() { if let var enemy = actor as? Enemy {} }");
-    let ast::Stmt::Func(func) = &program.stmts[0].node else {
-        panic!("expected function");
-    };
-    let Some(expr) = &func.node.body.node.tail else {
-        panic!("expected if-let tail expression");
-    };
-    let ast::ExprKind::IfLet(if_let) = &expr.node.kind else {
-        panic!("expected if-let");
-    };
-    assert_eq!(if_let.node.head, ast::PatternHead::Var);
-    expect_exact_downcast(&if_let.node.value);
+fn exact_downcast_if_var_scrutinee() {
+    expect_if_let_downcast_head(
+        "fn main() { if var enemy = actor as? Enemy {} }",
+        ast::PatternHead::Var,
+    );
+}
+
+#[test]
+fn exact_downcast_if_let_scrutinee() {
+    expect_if_let_downcast_head(
+        "fn main() { if let enemy = actor as? Enemy {} }",
+        ast::PatternHead::Let,
+    );
+}
+
+#[test]
+fn exact_downcast_if_let_var_rejected() {
+    parse_program_err("fn main() { if let var enemy = actor as? Enemy {} }");
 }
 
 #[test]

@@ -1,7 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: immutable
 
 contract Drawable {
     fn draw(self);
@@ -12,6 +11,8 @@ struct Enemy {
 }
 
 fn main() {
-    let actor: dyn Drawable = Enemy {};
-    if var enemy = actor as? Enemy {}
+    let actors: [dyn Drawable] = [Enemy {}];
+    for actor in actors {
+        actor.draw();
+    }
 }
