@@ -784,29 +784,14 @@ mod tests {
     }
 
     #[test]
-    fn for_simple() {
-        let source = "fn f() { for x in 0..10 { } }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("for x in 0..10 {}"));
-    }
-
-    #[test]
-    fn for_rev() {
-        let source = "fn f() { for x in rev 0..10 { } }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("for x in rev 0..10 {}"));
-    }
-
-    #[test]
-    fn for_tuple_pattern() {
-        let source = "fn f() { for (a, b) in get() { } }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("for (a, b) in get() {}"));
-    }
-
-    #[test]
-    fn for_var() {
+    fn for_stmt() {
         for (source, expected) in [
+            ("fn f() { for x in 0..10 { } }", "for x in 0..10 {}"),
+            ("fn f() { for x in rev 0..10 { } }", "for x in rev 0..10 {}"),
+            (
+                "fn f() { for (a, b) in get() { } }",
+                "for (a, b) in get() {}",
+            ),
             ("fn f() { for var x in xs { } }", "for var x in xs {}"),
             (
                 "fn f() { for var (a, b) in get() { } }",
@@ -816,6 +801,7 @@ mod tests {
                 "fn f() { for var x in rev xs step 2 { } }",
                 "for var x in rev xs step 2 {}",
             ),
+            ("fn f() { for i, var x in xs { } }", "for i, var x in xs {}"),
         ] {
             let formatted = format_source(source).expect("format failed");
             assert!(formatted.contains(expected));

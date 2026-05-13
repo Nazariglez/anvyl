@@ -1065,6 +1065,26 @@ mod fields {
     }
 
     #[test]
+    fn for_iterable_records_read() {
+        let result = check(
+            r"
+            extern type Bag { values: [int]; }
+            fn read(b: Bag) {
+                for value in b.values {
+                    let _: int = value;
+                }
+            }
+            ",
+        )
+        .expect("typecheck failed");
+        let owner = catalog_type(&result, ModuleScope::Root, "Bag");
+        let field = catalog_field(&result, owner, "values");
+
+        assert_use(&result, ExternUseTarget::FieldRead(field));
+        assert_typecheck_closed(&result);
+    }
+
+    #[test]
     fn provider_records_read() {
         let result = check_with_provider(
             r"

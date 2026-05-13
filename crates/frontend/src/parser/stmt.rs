@@ -285,6 +285,26 @@ fn contextual_step<'src>(
     .boxed()
 }
 
+fn for_binding_segment<'src>() -> BoxedParser<'src, ast::ForBinding> {
+    select! { Token::Keyword(Keyword::Var) => () }
+        .or_not()
+        .then(pattern())
+        .map(|(mutable, pattern)| ast::ForBinding {
+            mutable: mutable.is_some(),
+            pattern,
+        })
+        .boxed()
+}
+
+fn for_binding_segments<'src>() -> BoxedParser<'src, Vec<ast::ForBinding>> {
+    for_binding_segment()
+        .separated_by(select! { Token::Comma => () })
+        .at_least(1)
+        .at_most(2)
+        .collect::<Vec<_>>()
+        .boxed()
+}
+
 fn for_stmt<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
@@ -292,8 +312,7 @@ fn for_stmt<'src>(
     select! {
         Token::Keyword(Keyword::For) => (),
     }
-    .ignore_then(select! { Token::Keyword(Keyword::Var) => () }.or_not())
-    .then(pattern())
+    .ignore_then(for_binding_segments())
     .then_ignore(select! {
         Token::Keyword(Keyword::In) => (),
     })
@@ -301,24 +320,21 @@ fn for_stmt<'src>(
     .then(for_header_expression(stmt.clone()))
     .then(contextual_step(stmt.clone()))
     .then(block_stmt(stmt, expr))
-    .map_with(
-        |(((((mutable, pat), reversed), iterable), step), body), e| {
-            let s = e.span();
-            let span = s.byte();
-            let for_node = Spanned::new(
-                ast::For {
-                    mutable: mutable.is_some(),
-                    pattern: pat,
-                    iterable,
-                    step,
-                    reversed,
-                    body,
-                },
-                span,
-            );
-            Spanned::new(ast::Stmt::For(Box::new(for_node)), span)
-        },
-    )
+    .map_with(|((((bindings, reversed), iterable), step), body), e| {
+        let s = e.span();
+        let span = s.byte();
+        let for_node = Spanned::new(
+            ast::For {
+                bindings,
+                iterable,
+                step,
+                reversed,
+                body,
+            },
+            span,
+        );
+        Spanned::new(ast::Stmt::For(Box::new(for_node)), span)
+    })
     .labelled("for statement")
     .as_context()
     .boxed()

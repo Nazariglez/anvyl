@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var xs = ["a": 1];
+    for k, var v in xs {
+        let _: string = k;
+        v += 1;
+    }
+}

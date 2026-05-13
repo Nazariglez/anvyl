@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: mutable map iteration is not supported yet
+// @contains: mutable map entry iteration is not supported
 
 fn main() {
     var xs = ["a": 1];

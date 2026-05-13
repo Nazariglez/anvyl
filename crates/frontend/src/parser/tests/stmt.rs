@@ -81,6 +81,20 @@ fn first_for(src: &str) -> ast::ForNode {
     (**for_node).clone()
 }
 
+fn ident_bindings(for_node: &ast::ForNode) -> Vec<(bool, &str)> {
+    for_node
+        .node
+        .bindings
+        .iter()
+        .map(|binding| {
+            let ast::Pattern::Ident(ident) = &binding.pattern.node else {
+                panic!("expected Ident pattern");
+            };
+            (binding.mutable, ident.as_str())
+        })
+        .collect()
+}
+
 #[test]
 fn while_after_let() {
     let prog = parse_program("fn main() { while true {} }");
@@ -218,13 +232,7 @@ fn for_range() {
         panic!("expected For stmt");
     };
     let for_inner = &for_node.node;
-
-    let ast::Pattern::Ident(ident) = &for_inner.pattern.node else {
-        panic!("expected Ident pattern");
-    };
-    assert_eq!(ident.0.as_ref(), "n");
-
-    assert!(!for_inner.mutable);
+    assert_eq!(ident_bindings(for_node), [(false, "n")]);
     assert!(!for_inner.reversed);
     assert!(for_inner.step.is_none());
 
@@ -240,18 +248,23 @@ fn for_range() {
 #[test]
 fn for_var_item() {
     let for_node = first_for("fn main() { for var x in xs {} }");
-    assert!(for_node.node.mutable);
-    let ast::Pattern::Ident(ident) = &for_node.node.pattern.node else {
-        panic!("expected Ident pattern");
-    };
-    assert_eq!(ident.0.as_ref(), "x");
+    assert_eq!(ident_bindings(&for_node), [(true, "x")]);
 }
 
 #[test]
 fn for_var_tuple_pattern() {
     let for_node = first_for("fn main() { for var (a, b) in xs {} }");
-    assert!(for_node.node.mutable);
-    assert!(matches!(for_node.node.pattern.node, ast::Pattern::Tuple(_)));
+    let [binding] = for_node.node.bindings.as_slice() else {
+        panic!("expected one for binding");
+    };
+    assert!(binding.mutable);
+    assert!(matches!(binding.pattern.node, ast::Pattern::Tuple(_)));
+}
+
+#[test]
+fn for_indexed_var_segment() {
+    let for_node = first_for("fn main() { for i, var x in xs {} }");
+    assert_eq!(ident_bindings(&for_node), [(false, "i"), (true, "x")]);
 }
 
 #[test]

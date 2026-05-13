@@ -12,7 +12,7 @@ use self::{
         GenericSolverSeeds, GenericSolverVars, LocalTypeId, Solver, SolverFinalizeError,
         SolverRelationError, SourceExprTypes, TypeHandle,
     },
-    pattern::{PatternBindMode, PatternContext},
+    pattern::{PatternBindMode, PatternContext, PatternRoot, PatternRootInput},
     place::{
         AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee,
         check_place,
@@ -168,13 +168,6 @@ pub(crate) enum TypeWarning {
 pub(crate) enum TryCarrierKind {
     Result,
     Option,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForVarUnsupportedReason {
-    Range,
-    String,
-    Map,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,11 +393,10 @@ pub(crate) enum TypeError {
     ForVarRequiresMutableIterable {
         span: Option<SourceSpan>,
     },
-    ForVarUnsupportedIterable {
-        reason: ForVarUnsupportedReason,
+    ForMutableMapKey {
         span: Option<SourceSpan>,
     },
-    ForVarSyntheticIndex {
+    ForMutableMapEntry {
         span: Option<SourceSpan>,
     },
     ForIterationModifier {
@@ -8648,80 +8640,148 @@ fn check_loop_body(body: &BlockNode, tc: &mut TypeChecker) {
 
 fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     let node = &for_node.node;
-    if node.mutable {
-        check_for_var(node, tc);
-        return;
-    }
-
-    let iterable_ty = check_expr_checked(&node.iterable, tc).ty;
+    let source = check_place(&node.iterable, tc);
+    place::record_value_read(node.iterable.node.id, &source.value, tc);
+    let iterable_ty = source.value.checked.ty.clone();
     check_for_modifiers(node, &iterable_ty, tc);
 
-    let item_ty = iterable_item_type(&iterable_ty, &tc.decls).unwrap_or_else(|| {
-        tc.push_error(TypeError::ForIterableNotSupported {
-            found: iterable_ty.clone(),
-            span: tc.error_span(node.iterable.span),
-        });
-        Type::Infer
-    });
-    let pattern_ty = for_pattern_item_type(&node.pattern, &iterable_ty, item_ty);
+    let slots = for_slots(&node.bindings, &iterable_ty, node.iterable.span, tc);
+    let roots = node
+        .bindings
+        .iter()
+        .zip(slots)
+        .map(|(binding, slot)| for_slot_root(binding, slot, &source, &node.iterable, tc))
+        .collect();
 
     tc.push_scope();
-    pattern::check(
-        &node.pattern,
-        &pattern_ty,
-        PatternBindMode::Owned { mutable: false },
-        PatternContext::For,
-        tc,
-    );
+    pattern::check_roots(roots, PatternContext::For, tc);
     check_loop_body(&node.body, tc);
     tc.pop_scope();
 }
 
-fn check_for_var(node: &For, tc: &mut TypeChecker) {
-    let iterable = check_place(&node.iterable, tc);
-    let iterable_ty = iterable.value.checked.ty.clone();
-    check_for_modifiers(node, &iterable_ty, tc);
+enum ForSlot {
+    Owned(Type),
+    Item(Type),
+}
 
-    let Some(elem_ty) = mutable_iterable_item_type(&iterable_ty, node.iterable.span, tc) else {
-        return;
-    };
-    if for_var_binds_synthetic_index(&node.pattern, &elem_ty) {
-        tc.push_error(TypeError::ForVarSyntheticIndex {
-            span: tc.error_span(node.pattern.span),
-        });
-        return;
+fn for_slots(
+    bindings: &[ForBinding],
+    iterable_ty: &Type,
+    iterable_span: Span,
+    tc: &mut TypeChecker,
+) -> Vec<ForSlot> {
+    let range_inner = tc.decls.core_range_inner(iterable_ty).cloned();
+    match (bindings, iterable_ty, range_inner) {
+        ([_], Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem }, _) => {
+            vec![ForSlot::Item((**elem).clone())]
+        }
+        ([binding], Type::Map { key, value }, _) => {
+            if binding.mutable {
+                tc.push_error(TypeError::ForMutableMapEntry {
+                    span: tc.error_span(binding.pattern.span),
+                });
+            }
+            vec![ForSlot::Owned(Type::Tuple(vec![
+                (**key).clone(),
+                (**value).clone(),
+            ]))]
+        }
+        ([_], Type::Infer, _) => infer_for_slots(1),
+        ([_], _, Some(inner)) => vec![ForSlot::Owned(inner)],
+        ([_], _, None) => unsupported_for_slots(1, iterable_ty, iterable_span, tc),
+
+        ([_, _], Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem }, _) => {
+            vec![ForSlot::Owned(Type::Int), ForSlot::Item((**elem).clone())]
+        }
+        ([first, _], Type::Map { key, value }, _) => {
+            if first.mutable {
+                tc.push_error(TypeError::ForMutableMapKey {
+                    span: tc.error_span(first.pattern.span),
+                });
+            }
+            vec![
+                ForSlot::Owned((**key).clone()),
+                ForSlot::Item((**value).clone()),
+            ]
+        }
+        ([_, _], Type::Infer, _) => infer_for_slots(2),
+        ([_, _], _, Some(inner)) => vec![ForSlot::Owned(Type::Int), ForSlot::Owned(inner)],
+        ([_, _], _, None) => unsupported_for_slots(2, iterable_ty, iterable_span, tc),
+
+        (bindings, _, _) => infer_for_slots(bindings.len()),
     }
+}
 
-    let access = place::projected_field_access(iterable.value.access);
+fn infer_for_slots(count: usize) -> Vec<ForSlot> {
+    (0..count).map(|_| ForSlot::Owned(Type::Infer)).collect()
+}
+
+fn unsupported_for_slots(
+    count: usize,
+    iterable_ty: &Type,
+    iterable_span: Span,
+    tc: &mut TypeChecker,
+) -> Vec<ForSlot> {
+    tc.push_error(TypeError::ForIterableNotSupported {
+        found: iterable_ty.clone(),
+        span: tc.error_span(iterable_span),
+    });
+    infer_for_slots(count)
+}
+
+fn for_slot_root<'a>(
+    binding: &'a ForBinding,
+    slot: ForSlot,
+    source: &place::CheckedPlace,
+    iterable: &ExprNode,
+    tc: &mut TypeChecker,
+) -> PatternRoot<'a> {
+    match slot {
+        ForSlot::Owned(ty) => owned_for_root(binding, ty),
+        ForSlot::Item(ty) if binding.mutable => alias_for_root(binding, ty, source, iterable, tc),
+        ForSlot::Item(ty) => owned_for_root(binding, ty),
+    }
+}
+
+fn owned_for_root(binding: &ForBinding, ty: Type) -> PatternRoot<'_> {
+    PatternRoot {
+        pattern: &binding.pattern,
+        input: PatternRootInput::Owned(ty),
+        mode: PatternBindMode::Owned {
+            mutable: binding.mutable,
+        },
+    }
+}
+
+fn alias_for_root<'a>(
+    binding: &'a ForBinding,
+    ty: Type,
+    source: &place::CheckedPlace,
+    iterable: &ExprNode,
+    tc: &mut TypeChecker,
+) -> PatternRoot<'a> {
+    let access = place::projected_field_access(source.value.access);
     let access = if access.can_assign() {
         access
     } else {
         tc.push_error(TypeError::ForVarRequiresMutableIterable {
-            span: tc.error_span(node.iterable.span),
+            span: tc.error_span(iterable.span),
         });
         PlaceAccess::Mutable
     };
-    let accepts_extern_any = iterable.accepts_extern_any();
     let place = pattern::PatternPlace {
-        expected_handle: tc.type_handle(&elem_ty),
-        expected_ty: elem_ty,
+        expected_handle: tc.type_handle(&ty),
+        expected_ty: ty,
         access,
-        facts: iterable.value.facts,
-        identity: iterable.value.identity.index(),
-        accepts_extern_any,
+        facts: source.value.facts.clone(),
+        identity: source.value.identity.clone().index(),
+        accepts_extern_any: source.accepts_extern_any(),
     };
-
-    tc.push_scope();
-    pattern::check_place_at(
-        &node.pattern,
-        place,
-        PatternBindMode::Alias,
-        node.iterable.node.id,
-        PatternContext::For,
-        tc,
-    );
-    check_loop_body(&node.body, tc);
-    tc.pop_scope();
+    PatternRoot {
+        pattern: &binding.pattern,
+        input: PatternRootInput::Place(Box::new(place), iterable.node.id),
+        mode: PatternBindMode::Alias,
+    }
 }
 
 fn check_for_modifiers(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
@@ -8766,47 +8826,6 @@ fn check_for_modifiers(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
     }
 }
 
-fn for_var_binds_synthetic_index(pattern: &PatternNode, item: &Type) -> bool {
-    tuple_pattern_len(pattern) == Some(2)
-        && !matches!(item, Type::Infer)
-        && !matches!(item, Type::Tuple(types) if types.len() == 2)
-}
-
-fn mutable_iterable_item_type(ty: &Type, span: Span, tc: &mut TypeChecker) -> Option<Type> {
-    match ty {
-        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
-            Some((**elem).clone())
-        }
-        Type::Infer => Some(Type::Infer),
-        Type::String => {
-            push_for_var_unsupported(tc, ForVarUnsupportedReason::String, span);
-            None
-        }
-        Type::Map { .. } => {
-            push_for_var_unsupported(tc, ForVarUnsupportedReason::Map, span);
-            None
-        }
-        _ if tc.decls.core_range_inner(ty).is_some() => {
-            push_for_var_unsupported(tc, ForVarUnsupportedReason::Range, span);
-            None
-        }
-        _ => {
-            tc.push_error(TypeError::ForIterableNotSupported {
-                found: ty.clone(),
-                span: tc.error_span(span),
-            });
-            None
-        }
-    }
-}
-
-fn push_for_var_unsupported(tc: &mut TypeChecker, reason: ForVarUnsupportedReason, span: Span) {
-    tc.push_error(TypeError::ForVarUnsupportedIterable {
-        reason,
-        span: tc.error_span(span),
-    });
-}
-
 fn push_for_modifier_error(tc: &mut TypeChecker, message: &'static str, span: Span) {
     tc.push_error(TypeError::ForIterationModifier {
         message,
@@ -8836,51 +8855,6 @@ fn check_continue(span: Span, tc: &mut TypeChecker) {
             span: tc.error_span(span),
         });
     }
-}
-
-fn iterable_item_type(ty: &Type, decls: &DeclarationIndex) -> Option<Type> {
-    match ty {
-        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
-            Some((**elem).clone())
-        }
-        Type::Map { key, value } => Some(Type::Tuple(vec![(**key).clone(), (**value).clone()])),
-        Type::Infer => Some(Type::Infer),
-        _ => decls.core_range_inner(ty).cloned(),
-    }
-}
-
-fn for_pattern_item_type(pattern: &PatternNode, iterable: &Type, item: Type) -> Type {
-    if tuple_pattern_len(pattern) != Some(2) {
-        return item;
-    }
-    if matches!(iterable, Type::Map { .. }) {
-        return if is_enumerated_map_pattern(pattern) {
-            Type::Tuple(vec![Type::Int, item])
-        } else {
-            item
-        };
-    }
-    if matches!(&item, Type::Tuple(types) if tuple_pattern_len(pattern) == Some(types.len())) {
-        return item;
-    }
-    Type::Tuple(vec![Type::Int, item])
-}
-
-fn tuple_pattern_len(pattern: &PatternNode) -> Option<usize> {
-    match &pattern.node {
-        Pattern::Tuple(fields) => Some(fields.len()),
-        _ => None,
-    }
-}
-
-fn is_enumerated_map_pattern(pattern: &PatternNode) -> bool {
-    let Pattern::Tuple(fields) = &pattern.node else {
-        return false;
-    };
-    matches!(
-        fields.get(1).map(|field| &field.node),
-        Some(Pattern::Tuple(_))
-    )
 }
 
 fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {

@@ -52,6 +52,17 @@ pub(super) struct PatternPlace {
     pub(super) accepts_extern_any: bool,
 }
 
+pub(super) enum PatternRootInput {
+    Owned(Type),
+    Place(Box<PatternPlace>, ExprId),
+}
+
+pub(super) struct PatternRoot<'a> {
+    pub(super) pattern: &'a PatternNode,
+    pub(super) input: PatternRootInput,
+    pub(super) mode: PatternBindMode,
+}
+
 enum StructPatternTarget {
     Found(NominalKey, Type),
     Missing,
@@ -418,25 +429,6 @@ impl<'tc> PatternChecker<'tc> {
             context,
             mode,
         }
-    }
-
-    fn check_root(&mut self, pattern: &PatternNode, expected: &Type) -> PatternOutcome {
-        let input = PatternInput::owned(expected.clone(), self.tc);
-        let mut result = self.check(pattern, input.clone());
-        self.apply_context_policy(pattern, &input.expected_ty, &mut result.outcome);
-        self.install_root_bindings(&result.bindings, pattern.span);
-        result.outcome
-    }
-
-    fn check_from_handle_root(
-        &mut self,
-        pattern: &PatternNode,
-        input: PatternInput,
-    ) -> PatternOutcome {
-        let mut result = self.check(pattern, input.clone());
-        self.apply_context_policy(pattern, &input.expected_ty, &mut result.outcome);
-        self.install_root_bindings(&result.bindings, pattern.span);
-        result.outcome
     }
 
     fn apply_context_policy(
@@ -1243,16 +1235,6 @@ impl<'tc> PatternChecker<'tc> {
     }
 }
 
-pub(super) fn check(
-    pattern: &PatternNode,
-    expected: &Type,
-    mode: PatternBindMode,
-    context: PatternContext,
-    tc: &mut TypeChecker,
-) -> PatternOutcome {
-    PatternChecker::new(tc, None, context, mode).check_root(pattern, expected)
-}
-
 pub(super) fn check_place_at(
     pattern: &PatternNode,
     place: PatternPlace,
@@ -1261,6 +1243,56 @@ pub(super) fn check_place_at(
     context: PatternContext,
     tc: &mut TypeChecker,
 ) -> PatternOutcome {
-    let input = PatternInput::from_place(place);
-    PatternChecker::new(tc, Some(site), context, mode).check_from_handle_root(pattern, input)
+    check_roots(
+        vec![PatternRoot {
+            pattern,
+            input: PatternRootInput::Place(Box::new(place), site),
+            mode,
+        }],
+        context,
+        tc,
+    )
+}
+
+pub(super) fn check_roots(
+    roots: Vec<PatternRoot<'_>>,
+    context: PatternContext,
+    tc: &mut TypeChecker,
+) -> PatternOutcome {
+    let Some(first) = roots.first() else {
+        return PatternOutcome::irrefutable(PatternCover::CatchAll);
+    };
+    let span = first.pattern.span;
+    let mut had_error = false;
+    let mut refutability = Refutability::Irrefutable;
+    let mut covers = vec![];
+    let mut bindings = BindingAlternatives::single_empty();
+
+    for root in roots {
+        let (input, site) = match root.input {
+            PatternRootInput::Owned(ty) => (PatternInput::owned(ty, tc), None),
+            PatternRootInput::Place(place, site) => (PatternInput::from_place(*place), Some(site)),
+        };
+        let mut checker = PatternChecker::new(tc, site, context, root.mode);
+        let mut result = checker.check(root.pattern, input.clone());
+        checker.apply_context_policy(root.pattern, &input.expected_ty, &mut result.outcome);
+        had_error |= result.outcome.had_error;
+        refutability = combine_refutability(refutability, result.outcome.refutability);
+        covers.push(result.outcome.cover);
+        bindings = bindings.product(result.bindings, checker.tc);
+    }
+
+    PatternChecker::new(tc, None, context, PatternBindMode::Owned { mutable: false })
+        .install_root_bindings(&bindings, span);
+
+    let cover = if covers.len() == 1 {
+        covers.pop().expect("non-empty root covers")
+    } else {
+        PatternCover::Tuple(covers)
+    };
+    PatternOutcome {
+        cover,
+        had_error,
+        refutability,
+    }
 }

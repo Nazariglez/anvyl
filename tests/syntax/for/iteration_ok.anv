@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: success
+// @frontend: new
 
 fn main() {
     let arr: [int; 3] = [1, 2, 3];
@@ -7,7 +8,7 @@ fn main() {
         let _: int = el;
     }
 
-    for (i, el) in arr {
+    for i, el in arr {
         let _: int = i;
         let _: int = el;
     }
@@ -18,17 +19,8 @@ fn main() {
         let _: int = v;
     }
 
-    for (i, (k, v)) in m {
-        let _: int = i;
+    for k, v in m {
         let _: string = k;
-        let _: int = v;
-    }
-
-    for (k, _) in m {
-        let _: string = k;
-    }
-
-    for (_, v) in m {
         let _: int = v;
     }
 }

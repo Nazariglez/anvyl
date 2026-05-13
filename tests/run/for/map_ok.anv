@@ -3,8 +3,6 @@
 // @match-begin
 // hp: 100
 // mp: 50
-// 0: hp = 100
-// 1: mp = 50
 // @match-end
 
 import std.maps;
@@ -15,9 +13,5 @@ fn main() {
     m["mp"] = 50;
     for (k, v) in m {
         println(f"{k}: {v}");
-    }
-
-    for (i, (k, v)) in m {
-        println(f"{i}: {k} = {v}");
     }
 }

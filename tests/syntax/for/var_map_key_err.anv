@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: map keys cannot be mutable
+
+fn main() {
+    var xs = ["a": 1];
+    for var k, v in xs {
+        println(k);
+        println(v);
+    }
+}

@@ -1,10 +1,11 @@
 // @mode: check
 // @expect: error
+// @frontend: new
 // @contains: step is not supported for map iteration
 
 fn main() {
     let m = ["a": 1, "b": 2];
-    for (k, v) in m step 2 {
+    for k, v in m step 2 {
         println(k);
     }
 }

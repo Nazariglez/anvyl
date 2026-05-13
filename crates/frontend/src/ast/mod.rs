@@ -1241,9 +1241,14 @@ pub struct WhileLet {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct For {
+pub struct ForBinding {
     pub mutable: bool,
     pub pattern: PatternNode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct For {
+    pub bindings: Vec<ForBinding>,
     pub iterable: ExprNode,
     pub step: Option<ExprNode>,
     pub reversed: bool,

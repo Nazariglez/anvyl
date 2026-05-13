@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var xs = [1, 2, 3];
+
+    for i, var x in xs {
+        x = i;
+    }
+
+    for var i, x in xs {
+        i += 1;
+        let _: int = x;
+    }
+}

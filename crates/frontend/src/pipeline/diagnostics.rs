@@ -23,8 +23,8 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, DeprecatedUseKind,
-        DynContainerConversionKind, ForVarUnsupportedReason, MemberAccessKind, ModuleScope,
-        TryCarrierKind, TypeError, TypeWarning, VariantShape,
+        DynContainerConversionKind, MemberAccessKind, ModuleScope, TryCarrierKind, TypeError,
+        TypeWarning, VariantShape,
     },
 };
 
@@ -698,9 +698,11 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ForVarRequiresMutableIterable { .. } => {
             "mutable iteration requires a mutable iterable place".to_string()
         }
-        TypeError::ForVarUnsupportedIterable { reason, .. } => render_for_var_unsupported(*reason),
-        TypeError::ForVarSyntheticIndex { .. } => {
-            "for var cannot bind a synthetic index; use an index loop or ordinary for when mutation is not needed".to_string()
+        TypeError::ForMutableMapKey { .. } => {
+            "map keys cannot be mutable; use `for k, var v in map` to mutate values".to_string()
+        }
+        TypeError::ForMutableMapEntry { .. } => {
+            "mutable map entry iteration is not supported; use `for k, var v in map` to mutate values".to_string()
         }
         TypeError::ForIterationModifier { message, .. } => (*message).to_string(),
         TypeError::InfiniteSize { name, .. } => {
@@ -1155,8 +1157,8 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::RequiresMutablePlace { span, .. }
         | TypeError::VarPatternRequiresMutablePlace { span, .. }
         | TypeError::ForVarRequiresMutableIterable { span, .. }
-        | TypeError::ForVarUnsupportedIterable { span, .. }
-        | TypeError::ForVarSyntheticIndex { span, .. }
+        | TypeError::ForMutableMapKey { span, .. }
+        | TypeError::ForMutableMapEntry { span, .. }
         | TypeError::InvalidOperand { span, .. }
         | TypeError::MissingReturn { span, .. }
         | TypeError::IfWithoutElseValue { span, .. }
@@ -1334,19 +1336,6 @@ fn render_type_mismatch(expected: &Type, found: &Type) -> String {
         "Mismatched types: {}",
         expected_found_label(&expected, &found)
     )
-}
-
-fn render_for_var_unsupported(reason: ForVarUnsupportedReason) -> String {
-    match reason {
-        ForVarUnsupportedReason::Range => {
-            "ranges produce values and cannot be iterated by mutable alias"
-        }
-        ForVarUnsupportedReason::String => "mutable string element iteration is not supported",
-        ForVarUnsupportedReason::Map => {
-            "mutable map iteration is not supported yet because key/value alias semantics are not defined"
-        }
-    }
-    .to_string()
 }
 
 fn render_dyn_container_conversion(kind: DynContainerConversionKind) -> String {
