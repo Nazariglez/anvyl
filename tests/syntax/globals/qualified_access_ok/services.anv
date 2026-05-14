@@ -1,0 +1,3 @@
+// @helper
+
+pub lazy var count = 0;

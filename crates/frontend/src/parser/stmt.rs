@@ -66,6 +66,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             Token::Keyword(Keyword::Continue) => (),
             Token::Keyword(Keyword::Defer) => (),
             Token::Keyword(Keyword::Const) => (),
+            Token::Keyword(Keyword::Lazy) => (),
             Token::Keyword(Keyword::Type) => (),
             Token::At => (),
             Token::DocComment(_) => (),

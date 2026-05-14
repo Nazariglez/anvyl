@@ -205,6 +205,27 @@ mod tests {
     }
 
     #[test]
+    fn exact_lazy_globals() {
+        assert_fmt(
+            "lazy let Config=load_config();",
+            "lazy let Config = load_config();\n",
+        );
+        assert_fmt(
+            "lazy var Audio:AudioManager=AudioManager.new();",
+            "lazy var Audio: AudioManager = AudioManager.new();\n",
+        );
+        assert_fmt(
+            "pub lazy let Assets=load_assets();",
+            "pub lazy let Assets = load_assets();\n",
+        );
+        assert_fmt(
+            "@deprecated(\"use Assets2\")\n/// runtime\npub lazy let Assets=load_assets();",
+            "@deprecated(\"use Assets2\")\n/// runtime\npub lazy let Assets = load_assets();\n",
+        );
+        formatted_program("pub lazy var Services = Services.new();");
+    }
+
+    #[test]
     fn exact_type_aliases() {
         assert_fmt("type Id=int;", "type Id = int;\n");
         assert_fmt("type Pair<T> = (T,T);", "type Pair<T> = (T, T);\n");

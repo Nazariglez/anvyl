@@ -1171,6 +1171,17 @@ pub struct ConstDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct GlobalDecl {
+    pub annotations: Vec<AnnotationNode>,
+    pub doc: Option<String>,
+    pub visibility: Visibility,
+    pub mutability: Mutability,
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: ExprNode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypeAliasDecl {
     pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
@@ -1704,6 +1715,7 @@ pub enum Stmt {
     Enum(EnumDeclNode),
     Extend(ExtendDeclNode),
     Const(ConstDeclNode),
+    Global(GlobalDeclNode),
     TypeAlias(TypeAliasDeclNode),
     Contract(ContractDeclNode),
     Expr(ExprNode),
@@ -1888,6 +1900,7 @@ pub type CastNode = Spanned<Cast>;
 pub type ExactDowncastNode = CastNode;
 pub type TryNode = Spanned<Try>;
 pub type ConstDeclNode = Spanned<ConstDecl>;
+pub type GlobalDeclNode = Spanned<GlobalDecl>;
 pub type TypeAliasDeclNode = Spanned<TypeAliasDecl>;
 pub type ContractDeclNode = Spanned<ContractDecl>;
 pub type ContractRequirementNode = Spanned<ContractRequirement>;

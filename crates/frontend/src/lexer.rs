@@ -131,6 +131,7 @@ pub enum Keyword {
     Let,
     Var,
     Const,
+    Lazy,
     If,
     Else,
     While,
@@ -169,6 +170,7 @@ impl Display for Keyword {
             Keyword::Let => write!(f, "let"),
             Keyword::Var => write!(f, "var"),
             Keyword::Const => write!(f, "const"),
+            Keyword::Lazy => write!(f, "lazy"),
             Keyword::If => write!(f, "if"),
             Keyword::Else => write!(f, "else"),
             Keyword::While => write!(f, "while"),
@@ -878,6 +880,7 @@ fn map_ident_to_token(s: &str) -> Token {
         "let" => Token::Keyword(Keyword::Let),
         "var" => Token::Keyword(Keyword::Var),
         "const" => Token::Keyword(Keyword::Const),
+        "lazy" => Token::Keyword(Keyword::Lazy),
         "if" => Token::Keyword(Keyword::If),
         "else" => Token::Keyword(Keyword::Else),
         "while" => Token::Keyword(Keyword::While),
@@ -1105,12 +1108,18 @@ mod tests {
     }
 
     #[test]
+    fn lazy_is_keyword() {
+        assert_eq!(tokenize_tokens("lazy"), vec![Token::Keyword(Keyword::Lazy)]);
+    }
+
+    #[test]
     fn is_source_ident_rejects_non_identifiers() {
         for ident in [
             "",
             "fn",
             "type",
             "import",
+            "lazy",
             "bad-name",
             "math utils",
             " math",

@@ -44,6 +44,7 @@ module.exports = grammar({
       $.import_statement,
       $.extern_declaration,
       $.const_declaration,
+      $.global_declaration,
     ),
 
     // comments
@@ -242,6 +243,20 @@ module.exports = grammar({
       repeat($.doc_comment),
       optional($.visibility_modifier),
       'const',
+      field('name', $.identifier),
+      optional(seq(':', $._type)),
+      '=',
+      $._expression,
+      ';',
+    ),
+
+    // runtime global declaration
+    global_declaration: $ => seq(
+      repeat($.annotation),
+      repeat($.doc_comment),
+      optional($.visibility_modifier),
+      'lazy',
+      choice('let', 'var'),
       field('name', $.identifier),
       optional(seq(':', $._type)),
       '=',
@@ -459,7 +474,7 @@ module.exports = grammar({
       $.tuple_type,
       seq('(', $._type, ')'),
     ),
-    builtin_type: $ => choice('int', 'float', 'double', 'bool', 'string', 'void', 'any'),
+    builtin_type: $ => choice('int', 'float', 'bool', 'string', 'void', 'any'),
     slice_type: $ => seq('slice', '[', $._type, ']'),
     type_identifier: $ => $.identifier,
     generic_type: $ => prec(1, seq($.identifier, '<', commaSep1($._type), '>')),

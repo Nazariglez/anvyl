@@ -62,6 +62,7 @@ mod extern_ops;
 mod field_check;
 mod generic;
 mod generic_bind;
+mod globals;
 mod infer;
 mod match_coverage;
 mod member;
@@ -132,6 +133,7 @@ pub(crate) enum DeprecatedUseKind {
     Function,
     ExternFunction,
     Const,
+    Global,
     ExternType,
     TypeAlias,
     Contract,
@@ -681,6 +683,10 @@ pub(crate) enum TypeError {
         name: Ident,
         span: Option<SourceSpan>,
     },
+    RuntimeGlobalInConstPosition {
+        global: GlobalKey,
+        span: Option<SourceSpan>,
+    },
     ConstCycle {
         name: Ident,
         span: Option<SourceSpan>,
@@ -964,8 +970,9 @@ struct CallableTemplate {
 
 #[derive(Clone, Copy)]
 struct ControlFlowFrame {
-    loop_depth: usize,
-    defer_depth: usize,
+    loops: usize,
+    defers: usize,
+    global_initializers: usize,
 }
 
 enum ReturnMode {
@@ -1012,6 +1019,8 @@ struct TypeChecker {
     dyn_weakenings: DynWeakeningMap,
     dyn_calls: DynCallMap,
     dyn_downcasts: DynDowncastMap,
+    global_accesses: GlobalAccessMap,
+    global_types: HashMap<GlobalKey, LocalTypeId>,
     active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
     dyn_infer_registered_modules: HashSet<ModuleScope>,
     dyn_infer: DynInference,
@@ -1026,6 +1035,7 @@ struct TypeChecker {
     returns: Vec<ReturnFrame>,
     loop_depth: usize,
     defer_depth: usize,
+    global_initializer_depth: usize,
     discard_depth: usize,
     errors: Vec<TypeError>,
     warnings: Vec<TypeWarning>,
@@ -1114,6 +1124,8 @@ impl TypeChecker {
             dyn_weakenings: HashMap::new(),
             dyn_calls: HashMap::new(),
             dyn_downcasts: HashMap::new(),
+            global_accesses: HashMap::new(),
+            global_types: HashMap::new(),
             active_mut_downcast_roots: vec![],
             dyn_infer_registered_modules: HashSet::new(),
             dyn_infer: DynInference::default(),
@@ -1128,6 +1140,7 @@ impl TypeChecker {
             returns: vec![],
             loop_depth: 0,
             defer_depth: 0,
+            global_initializer_depth: 0,
             discard_depth: 0,
             errors: vec![],
             warnings: vec![],
@@ -1660,6 +1673,75 @@ impl TypeChecker {
         self.dyn_downcasts.insert(fact.expr_id, fact);
     }
 
+    pub(crate) fn record_global_access(&mut self, fact: GlobalAccessFact) {
+        self.global_accesses.insert(fact.expr_id, fact);
+    }
+
+    fn seed_global_types(&mut self) {
+        let globals = self
+            .decls
+            .values()
+            .filter_map(|value| match &value.decl {
+                ValueDecl::Global(sig) => {
+                    Some((sig.key.clone(), sig.ty.clone(), sig.initializer_span))
+                }
+                ValueDecl::Func(_) | ValueDecl::Const(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (key, ty, span) in globals {
+            let id = if matches!(ty, Type::Infer) {
+                self.solver.alloc_fresh_local_type(Some(span))
+            } else {
+                self.solver.alloc_local_type(&ty)
+            };
+            self.global_types.insert(key, id);
+        }
+    }
+
+    fn global_handle(&self, key: &GlobalKey) -> TypeHandle {
+        let id = *self
+            .global_types
+            .get(key)
+            .expect("global type was not seeded");
+        self.local_handle(id)
+    }
+
+    fn global_checked(&self, sig: &GlobalSig) -> CheckedType {
+        let handle = self.global_handle(&sig.key);
+        CheckedType {
+            ty: self.handle_type(&handle),
+            handle,
+            contains_extern_any: false,
+        }
+    }
+
+    fn sync_global_types(&mut self) {
+        let globals = self
+            .global_types
+            .iter()
+            .map(|(key, id)| (key.clone(), *id))
+            .collect::<Vec<_>>();
+
+        for (key, id) in globals {
+            let ty = self.solver.local_type_to_type(id);
+            if let Some(sig) = self.decls.global(&key) {
+                if type_closure_facts(&ty).contains_any {
+                    self.push_error_once(TypeError::AnyOutsideExternBoundary {
+                        span: Some(sig.span),
+                    });
+                }
+                let mut errors = vec![];
+                push_type_closure_error(&mut errors, &ty, Some(sig.initializer_span));
+                for error in errors {
+                    self.push_error_once(error);
+                }
+            }
+            self.decls.set_global_type(&key, ty.clone());
+            self.solver.set_local_type_from_type(id, &ty);
+        }
+    }
+
     fn should_register_dyn_infer_params(&mut self) -> bool {
         self.dyn_infer_registered_modules
             .insert(self.current_module.clone())
@@ -1862,27 +1944,8 @@ impl TypeChecker {
     }
 
     fn warn_named_value_deprecated(&mut self, value: &ValueDecl, name: Ident, span: Span) {
-        match value {
-            ValueDecl::Func(sig) => match sig.kind {
-                CallableKind::Function => {
-                    self.warn_deprecated(&sig.policy, DeprecatedUseKind::Function, name, span);
-                }
-                CallableKind::ExternFunction => {
-                    self.warn_deprecated(
-                        &sig.policy,
-                        DeprecatedUseKind::ExternFunction,
-                        name,
-                        span,
-                    );
-                }
-                CallableKind::StaticMethod
-                | CallableKind::InstanceMethod
-                | CallableKind::ExtendMethod(_)
-                | CallableKind::EnumVariant => {}
-            },
-            ValueDecl::Const(sig) => {
-                self.warn_deprecated(&sig.policy, DeprecatedUseKind::Const, name, span);
-            }
+        if let Some(kind) = value.deprecated_kind() {
+            self.warn_deprecated(value.policy(), kind, name, span);
         }
     }
 
@@ -2042,19 +2105,37 @@ impl TypeChecker {
         self.defer_depth > 0
     }
 
+    fn enter_global_initializer(&mut self) {
+        self.global_initializer_depth += 1;
+    }
+
+    fn exit_global_initializer(&mut self) {
+        self.global_initializer_depth = self
+            .global_initializer_depth
+            .checked_sub(1)
+            .expect("global initializer depth underflow");
+    }
+
+    fn in_global_initializer(&self) -> bool {
+        self.global_initializer_depth > 0
+    }
+
     fn enter_function_control_flow(&mut self) -> ControlFlowFrame {
         let frame = ControlFlowFrame {
-            loop_depth: self.loop_depth,
-            defer_depth: self.defer_depth,
+            loops: self.loop_depth,
+            defers: self.defer_depth,
+            global_initializers: self.global_initializer_depth,
         };
         self.loop_depth = 0;
         self.defer_depth = 0;
+        self.global_initializer_depth = 0;
         frame
     }
 
     fn exit_function_control_flow(&mut self, frame: ControlFlowFrame) {
-        self.loop_depth = frame.loop_depth;
-        self.defer_depth = frame.defer_depth;
+        self.loop_depth = frame.loops;
+        self.defer_depth = frame.defers;
+        self.global_initializer_depth = frame.global_initializers;
     }
 
     fn push_type_subst(&mut self, subst: TypeSubst) {
@@ -2186,6 +2267,7 @@ impl TypeChecker {
             dyn_weakenings: self.dyn_weakenings.clone(),
             dyn_calls: self.dyn_calls.clone(),
             dyn_downcasts: self.dyn_downcasts.clone(),
+            global_accesses: self.global_accesses.clone(),
         }
     }
 
@@ -2210,6 +2292,7 @@ impl TypeChecker {
         self.dyn_weakenings.extend(facts.dyn_weakenings);
         self.dyn_calls.extend(facts.dyn_calls);
         self.dyn_downcasts.extend(facts.dyn_downcasts);
+        self.global_accesses.extend(facts.global_accesses);
     }
 
     fn resolved_value(value: ResolvedValue) -> (ModuleScope, Ident, ValueDecl) {
@@ -2491,6 +2574,13 @@ impl TypeChecker {
                 }
                 match self.lookup_visible_const_name(name, span) {
                     const_eval::ConstNameLookup::Value(value) => Some(ConstTerm::Value(value)),
+                    const_eval::ConstNameLookup::RuntimeGlobal(global) => {
+                        self.push_error_once(TypeError::RuntimeGlobalInConstPosition {
+                            global,
+                            span: self.error_span(span),
+                        });
+                        None
+                    }
                     const_eval::ConstNameLookup::Error(error) => {
                         self.push_error(error);
                         None
@@ -2586,11 +2676,6 @@ impl TypeChecker {
         self.decls
             .imported_value(&self.current_module, name)
             .map(Self::resolved_value)
-    }
-
-    fn lookup_imported_value(&self, name: Ident) -> Option<Type> {
-        self.imported_value(name)
-            .map(|(_, _, value)| value.ty().clone())
     }
 
     fn lookup_named_value(&self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
@@ -3233,6 +3318,7 @@ fn typechecker_for_modules(
 
     tc.with_current_module(&root_scope, |tc| tc.eval_module_consts(&root_scope));
     tc.finalize_declarations();
+    tc.seed_global_types();
     check_finite_size_cycles(&mut tc);
     tc.with_current_module(&root_scope, |tc| {
         check_decl_param_order(program, tc);
@@ -3244,6 +3330,12 @@ fn typechecker_for_modules(
             check_infer_return_decls(program.as_ref(), tc);
         });
     }
+    globals::check_global_initializers(&root_scope, program, &mut tc);
+    for (module, program) in &module_bodies {
+        globals::check_global_initializers(module, program.as_ref(), &mut tc);
+    }
+    tc.sync_global_types();
+    validate_public_value_surfaces(&tc.decls, &mut tc.errors);
     if !tc.errors.is_empty() {
         return Err(tc.errors);
     }
@@ -3439,6 +3531,9 @@ fn validate_dyn_infer_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError
     for value in decls.values() {
         match &value.decl {
             ValueDecl::Const(sig) => push_invalid_dyn_infer_decl(&sig.ty, None, errors),
+            ValueDecl::Global(sig) => {
+                push_invalid_dyn_infer_decl(&sig.ty, Some(sig.initializer_span), errors);
+            }
             ValueDecl::Func(sig) if sig.kind == CallableKind::ExternFunction => {
                 push_invalid_dyn_infer_decl(&sig.ty, None, errors);
             }
@@ -3466,6 +3561,22 @@ fn validate_type_alias_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeErro
             matches!(alias.visibility, Visibility::Public),
             errors,
         );
+    }
+}
+
+fn validate_public_value_surfaces(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
+    for value in decls.values() {
+        if !matches!(value.visibility, Visibility::Public) {
+            continue;
+        }
+        if let Some(ty) = private_exposed_type(decls, value.decl.ty()) {
+            errors.push(TypeError::Decl(DeclError::PublicValuePrivateType {
+                kind: value.decl.public_kind(),
+                name: value.name,
+                ty,
+                span: value.decl.diagnostic_span(),
+            }));
+        }
     }
 }
 
@@ -4976,6 +5087,7 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
                 }
             }
         }
+        Stmt::Global(_) => {}
         Stmt::TypeAlias(alias_node) => {
             check_type_alias(alias_node, tc);
         }
@@ -4990,8 +5102,22 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
 }
 
 fn check_defer(defer_node: &DeferNode, tc: &mut TypeChecker) {
+    if tc.in_global_initializer() {
+        tc.push_error(TypeError::CompileError {
+            message: "defer is not allowed in runtime global initializers".to_string(),
+            span: tc.error_span(defer_node.span),
+        });
+        check_defer_body(&defer_node.node.body, tc);
+        return;
+    }
+
     tc.enter_defer();
-    match &defer_node.node.body {
+    check_defer_body(&defer_node.node.body, tc);
+    tc.exit_defer();
+}
+
+fn check_defer_body(body: &DeferBody, tc: &mut TypeChecker) {
+    match body {
         DeferBody::Expr(expr) => {
             check_expr_checked(expr, tc);
         }
@@ -4999,7 +5125,6 @@ fn check_defer(defer_node: &DeferNode, tc: &mut TypeChecker) {
             check_block_checked(block, tc);
         }
     }
-    tc.exit_defer();
 }
 
 fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
@@ -5624,6 +5749,7 @@ fn specialized_body_facts(
         dyn_weakenings: map_delta(&old.dyn_weakenings, &current.dyn_weakenings),
         dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
         dyn_downcasts: map_delta(&old.dyn_downcasts, &current.dyn_downcasts),
+        global_accesses: map_delta(&old.global_accesses, &current.global_accesses),
     }
 }
 
@@ -6030,14 +6156,20 @@ fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
 
 fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
     let ret = &ret_node.node;
+    if tc.in_global_initializer() {
+        tc.push_error(TypeError::CompileError {
+            message: "return is not allowed in runtime global initializers".to_string(),
+            span: tc.error_span(ret_node.span),
+        });
+        check_discarded_return_value(ret, tc);
+        return;
+    }
+
     if tc.in_defer() {
         tc.push_error(TypeError::ReturnInsideDefer {
             span: tc.error_span(ret_node.span),
         });
-        if let Some(expr) = &ret.value {
-            let actual = check_value_expr_checked_with_hint(expr, None, tc);
-            tc.reject_extern_any_escape(&actual, expr.span);
-        }
+        check_discarded_return_value(ret, tc);
         return;
     }
 
@@ -6067,6 +6199,13 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
             tc.push_inferred_return(ret_node.span, tc.type_handle(&Type::Void));
         }
         (None, _) => {}
+    }
+}
+
+fn check_discarded_return_value(ret: &Return, tc: &mut TypeChecker) {
+    if let Some(expr) = &ret.value {
+        let actual = check_value_expr_checked_with_hint(expr, None, tc);
+        tc.reject_extern_any_escape(&actual, expr.span);
     }
 }
 
@@ -6508,7 +6647,9 @@ fn check_expr_checked_with_hint(
                 };
                 let access = tc.local_value_access(&value);
                 tc.check_mut_downcast_root_use(Some(*name), &access.identity, expr.span);
-                if let Some((_, value_name, value)) = tc.lookup_named_value(*name) {
+                if let Some((_, value_name, value)) = tc.lookup_named_value(*name)
+                    && !matches!(value, ValueDecl::Global(_))
+                {
                     tc.warn_named_value_deprecated(&value, value_name, expr.span);
                 }
                 let fallback = tc.solver.local_type_to_type(info.type_id);
@@ -6540,51 +6681,57 @@ fn check_expr_checked_with_hint(
                 tc.push_error(error);
                 checked_from_type(expr, Type::Infer, tc)
             }
-            LocalSymbolLookup::Missing => {
-                let named_value = tc.lookup_named_value(*name);
-                if let Some((_, value_name, value)) = &named_value {
-                    tc.warn_named_value_deprecated(value, *value_name, expr.span);
-                }
-                if let Some((module, value_name, value)) = named_value
-                    && let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
-                        module,
+            LocalSymbolLookup::Missing => match tc.lookup_named_value(*name) {
+                Some((module, value_name, value)) => {
+                    tc.warn_named_value_deprecated(&value, value_name, expr.span);
+                    if let ValueDecl::Global(sig) = &value {
+                        let checked = checked_from_handle(expr, tc.global_handle(&sig.key), tc);
+                        let value = place::global_value(sig, checked);
+                        place::record_value_read(expr.node.id, &value, tc);
+                        return value.checked;
+                    }
+                    if let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
+                        module: module.clone(),
                         name: value_name,
-                        decl: value,
-                    })
-                    && callee.def.sig.ret.is_infer()
-                {
-                    tc.push_error(TypeError::InferReturnValue {
-                        span: tc.error_span(expr.span),
-                    });
-                    checked_from_type(expr, Type::Infer, tc)
-                } else {
-                    let ty = match tc.eval_visible_const(*name, expr.span) {
-                        Some(Ok(value)) => const_eval::const_type(&value),
-                        Some(Err(err)) => {
-                            tc.push_error(err);
-                            Type::Infer
-                        }
-                        None => match tc.lookup_imported_value(*name) {
-                            Some(ty) => ty,
-                            None => {
-                                if let Some(ty) = tc.visible_type_subject(*name, expr.span) {
-                                    tc.push_error(TypeError::TypeUsedAsValue {
-                                        ty,
-                                        span: tc.error_span(expr.span),
-                                    });
-                                } else {
-                                    tc.push_error(TypeError::UndefinedVariable {
-                                        name: *name,
-                                        span: tc.error_span(expr.span),
-                                    });
-                                }
-                                Type::Infer
+                        visibility: Visibility::Private,
+                        decl: value.clone(),
+                    }) && callee.def.sig.ret.is_infer()
+                    {
+                        tc.push_error(TypeError::InferReturnValue {
+                            span: tc.error_span(expr.span),
+                        });
+                        return checked_from_type(expr, Type::Infer, tc);
+                    }
+                    match value {
+                        ValueDecl::Const(_) => match tc.eval_visible_const(*name, expr.span) {
+                            Some(Ok(value)) => {
+                                checked_from_type(expr, const_eval::const_type(&value), tc)
                             }
+                            Some(Err(err)) => {
+                                tc.push_error(err);
+                                checked_from_type(expr, Type::Infer, tc)
+                            }
+                            None => checked_from_type(expr, Type::Infer, tc),
                         },
-                    };
-                    checked_from_type(expr, ty, tc)
+                        ValueDecl::Func(sig) => checked_from_type(expr, sig.ty, tc),
+                        ValueDecl::Global(_) => unreachable!("global handled above"),
+                    }
                 }
-            }
+                None => {
+                    if let Some(ty) = tc.visible_type_subject(*name, expr.span) {
+                        tc.push_error(TypeError::TypeUsedAsValue {
+                            ty,
+                            span: tc.error_span(expr.span),
+                        });
+                    } else {
+                        tc.push_error(TypeError::UndefinedVariable {
+                            name: *name,
+                            span: tc.error_span(expr.span),
+                        });
+                    }
+                    checked_from_type(expr, Type::Infer, tc)
+                }
+            },
         },
         ExprKind::Binary(bin_node) => {
             checked_from_checked(expr, check_binary(expr.node.id, bin_node, expected, tc), tc)
@@ -7016,6 +7163,15 @@ fn check_try(
 ) -> CheckedType {
     let return_ty = tc.return_type().cloned();
     let enclosing = return_ty.as_ref().and_then(|ty| tc.try_carrier_parts(ty));
+
+    if tc.in_global_initializer() {
+        tc.push_error(TypeError::CompileError {
+            message: "try is not allowed in runtime global initializers".to_string(),
+            span: tc.error_span(try_node.span),
+        });
+        check_value_expr_checked_with_hint(&try_node.node.expr, None, tc);
+        return checked_type(Type::Infer, tc);
+    }
 
     if tc.in_defer() {
         tc.push_error(TypeError::TryInsideDefer {

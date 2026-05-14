@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: value 'config' is already declared
+
+lazy let config = 1;
+lazy let config = 2;

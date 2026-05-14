@@ -1,0 +1,21 @@
+// @helper
+
+struct Manager {
+    count: int,
+}
+
+extend Manager {
+    fn do_thing(var self) {
+        self.count += 1;
+    }
+}
+
+fn init_manager() -> Manager {
+    Manager { count: 0 }
+}
+
+lazy var manager: Manager = init_manager();
+
+pub fn do_thing() {
+    manager.do_thing();
+}

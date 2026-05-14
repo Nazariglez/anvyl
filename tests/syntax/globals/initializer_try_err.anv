@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: try is not allowed in runtime global initializers
+
+fn maybe() -> int { 1 }
+
+lazy let bad = try maybe();
+
+fn main() {}

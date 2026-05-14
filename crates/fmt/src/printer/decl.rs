@@ -363,6 +363,27 @@ impl Printer<'_> {
         self.writeln();
     }
 
+    pub(super) fn format_global(&mut self, global: &ast::GlobalDecl) {
+        self.format_annotations(&global.annotations);
+        self.format_doc_comment(global.doc.as_ref());
+        self.write_indent();
+        self.format_visibility(global.visibility);
+        self.write("lazy ");
+        match global.mutability {
+            ast::Mutability::Immutable => self.write("let "),
+            ast::Mutability::Mutable => self.write("var "),
+        }
+        self.write_fmt(global.name);
+        if let Some(ty) = &global.ty {
+            self.write(": ");
+            self.format_type(ty);
+        }
+        self.write(" = ");
+        self.format_expr(&global.value.node);
+        self.write(";");
+        self.writeln();
+    }
+
     pub(super) fn format_type_alias(&mut self, alias: &ast::TypeAliasDecl) {
         self.format_annotations(&alias.annotations);
         self.format_doc_comment(alias.doc.as_ref());

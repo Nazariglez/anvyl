@@ -82,6 +82,9 @@
 (const_declaration
   name: (identifier) @constant)
 
+(global_declaration
+  name: (identifier) @constant)
+
 ; -- Annotations
 (annotation
   "@" @attribute
@@ -97,9 +100,9 @@
 (visibility_modifier) @keyword.modifier
 "as" @keyword.operator
 
-["let" "var" "const"] @keyword
+["let" "var" "const" "lazy"] @keyword
 ["struct" "enum" "type" "extend" "extern" "dataref"] @keyword
-["break" "continue" "defer"] @keyword
+["break" "continue" "defer" "try"] @keyword
 
 ; -- Operators
 ["+" "-" "*" "/" "%"] @operator

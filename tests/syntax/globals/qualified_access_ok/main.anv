@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import services;
+
+fn main() {
+    services.count = 1;
+    let value = services.count;
+}

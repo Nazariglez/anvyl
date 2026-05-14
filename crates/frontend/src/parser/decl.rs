@@ -137,6 +137,11 @@ impl DeclPolicy {
         allow_visibility: false,
         allow_metadata: false,
     };
+    pub(super) const MODULE_GLOBAL: Self = Self {
+        target: "runtime global declarations",
+        allow_visibility: true,
+        allow_metadata: true,
+    };
 }
 
 pub(super) fn declaration_header<'src>(policy: DeclPolicy) -> BoxedParser<'src, DeclHeader> {
@@ -1803,6 +1808,47 @@ pub(super) fn contract_declaration<'src>(
             )
         })
         .labelled("contract declaration")
+        .as_context()
+        .boxed()
+}
+
+pub(super) fn global_declaration<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+) -> BoxedParser<'src, ast::StmtNode> {
+    let mutability = select! {
+        Token::Keyword(Keyword::Let) => ast::Mutability::Immutable,
+        Token::Keyword(Keyword::Var) => ast::Mutability::Mutable,
+    };
+
+    declaration_header(DeclPolicy::MODULE_GLOBAL)
+        .then_ignore(select! { Token::Keyword(Keyword::Lazy) => () })
+        .then(mutability)
+        .then(identifier())
+        .then(
+            select! { Token::Colon => () }
+                .ignore_then(type_ident())
+                .or_not(),
+        )
+        .then_ignore(select! { Token::Op(Op::Assign) => () })
+        .then(expression(stmt))
+        .then_ignore(select! { Token::Semicolon => () })
+        .map_with(|((((header, mutability), name), ty), value), e| {
+            let span = e.span().byte();
+            let node = Spanned::new(
+                ast::GlobalDecl {
+                    annotations: header.annotations,
+                    doc: header.doc,
+                    visibility: header.visibility,
+                    mutability,
+                    name,
+                    ty,
+                    value,
+                },
+                span,
+            );
+            Spanned::new(ast::Stmt::Global(node), span)
+        })
+        .labelled("runtime global declaration")
         .as_context()
         .boxed()
 }

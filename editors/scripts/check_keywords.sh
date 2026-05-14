@@ -4,7 +4,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-LEXER=$(sed -n '/^fn map_ident_to_token/,/^}/p' "$REPO_ROOT/crates/lang/src/lexer.rs" \
+LEXER=$(sed -n '/^fn map_ident_to_token/,/^}/p' "$REPO_ROOT/crates/frontend/src/lexer.rs" \
   | grep -oE '"[a-z]+" =>' \
   | grep -oE '"[a-z]+"' \
   | tr -d '"' \
@@ -17,7 +17,7 @@ TM=$(grep -oE '\\\\b\(?[a-z|]+\)?\\\\b' \
   | grep -vxE 'self' \
   | sort -u)
 
-SCM_GRAMMAR_HANDLED='int|float|double|bool|string|void|any|pub'
+SCM_GRAMMAR_HANDLED='int|float|bool|string|void|any|pub'
 
 # ignore self, from, op, and slice here because they are only keywords in specific contexts.
 SCM=$(grep -oE '"[a-z]+"' "$REPO_ROOT/editors/nvim/queries/highlights.scm" \

@@ -1,0 +1,7 @@
+// @helper
+
+struct Hidden {
+    value: int,
+}
+
+pub lazy let bad: Hidden = Hidden { value: 1 };

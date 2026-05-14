@@ -22,7 +22,7 @@ use super::{
 use crate::{
     ast::{
         CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg, Ident,
-        MethodReceiver, ReturnSpec, Type,
+        MethodReceiver, ReturnSpec, Type, Visibility,
     },
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
@@ -56,6 +56,7 @@ pub(super) enum Subject {
         receiver_place: PlaceUseFacts,
         receiver_identity: place::PlaceIdentity,
         receiver_root_name: Option<Ident>,
+        receiver_global: Option<place::GlobalPlace>,
         receiver_id: ExprId,
         name: Ident,
         signature: ResolvedExternSignature,
@@ -67,6 +68,7 @@ pub(super) enum Subject {
         receiver_place: PlaceUseFacts,
         receiver_identity: place::PlaceIdentity,
         receiver_root_name: Option<Ident>,
+        receiver_global: Option<place::GlobalPlace>,
         receiver_id: ExprId,
         name: Ident,
     },
@@ -76,6 +78,7 @@ pub(super) enum Subject {
         receiver_place: PlaceUseFacts,
         receiver_identity: place::PlaceIdentity,
         receiver_root_name: Option<Ident>,
+        receiver_global: Option<place::GlobalPlace>,
         receiver_id: ExprId,
         name: Ident,
     },
@@ -108,6 +111,7 @@ pub(super) struct SourceReceiver {
     facts: PlaceUseFacts,
     identity: place::PlaceIdentity,
     root_name: Option<Ident>,
+    global: Option<place::GlobalPlace>,
     expr_id: ExprId,
     name: Ident,
 }
@@ -117,6 +121,7 @@ struct DynReceiver<'a> {
     facts: &'a PlaceUseFacts,
     identity: &'a place::PlaceIdentity,
     root_name: Option<Ident>,
+    global: Option<place::GlobalPlace>,
     id: ExprId,
 }
 
@@ -268,7 +273,7 @@ pub(super) fn check_postfix_chain_place(
         subject = match step {
             PostfixStep::Field { node, id } => {
                 if node.node.safe {
-                    subject = safe_subject(&subject, node.span, tc);
+                    subject = safe_subject(&subject, node.node.target.node.id, node.span, tc);
                     optional_chain = true;
                 }
                 let field_expected = (is_last_step && !next_is_call)
@@ -287,7 +292,7 @@ pub(super) fn check_postfix_chain_place(
             }
             PostfixStep::Call { node, id } => {
                 if node.node.safe {
-                    subject = safe_subject(&subject, node.span, tc);
+                    subject = safe_subject(&subject, node.node.func.node.id, node.span, tc);
                     optional_chain = true;
                 }
                 let call_expected = is_last_step
@@ -414,13 +419,14 @@ fn expected_for_chain(
         .map(|inner| tc.type_handle(inner))
 }
 
-fn safe_subject(subject: &Subject, span: Span, tc: &mut TypeChecker) -> Subject {
+fn safe_subject(subject: &Subject, expr_id: ExprId, span: Span, tc: &mut TypeChecker) -> Subject {
     let Subject::Value(value) = subject else {
         tc.push_error(TypeError::OptionalChainingOnNonOptional {
             span: tc.error_span(span),
         });
         return Subject::Error;
     };
+    place::record_value_read(expr_id, value, tc);
     if matches!(value.checked.ty, Type::Infer) {
         return Subject::Value(value.clone());
     }
@@ -436,6 +442,10 @@ fn value_subject(ty: Type, tc: &TypeChecker) -> Subject {
 
 fn value_subject_checked(checked: CheckedType) -> Subject {
     Subject::Value(PlaceValue::not_place(checked))
+}
+
+fn global_subject(sig: &super::GlobalSig, tc: &TypeChecker) -> Subject {
+    Subject::Value(place::global_value(sig, tc.global_checked(sig)))
 }
 
 fn subject_contains_extern_any(subject: &Subject) -> bool {
@@ -511,6 +521,7 @@ fn named_value_subject(
     let resolved = ResolvedValue {
         module: module.clone(),
         name,
+        visibility: Visibility::Private,
         decl: value.clone(),
     };
     let local_dyn_infer_ty = (module == tc.current_module
@@ -518,6 +529,9 @@ fn named_value_subject(
     .then(|| tc.lookup(name))
     .flatten()
     .map(|info| tc.solver.local_type_to_type(info.type_id));
+    if let ValueDecl::Global(sig) = value {
+        return global_subject(sig, tc);
+    }
     match tc.decls.callable_for_value(&resolved) {
         Some(mut callee) => {
             if let Some(Type::Func { params, ret }) = local_dyn_infer_ty {
@@ -584,6 +598,11 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
         );
         value.identity = target.value.identity.index();
         value.root_name = target.value.root_name;
+        value.global = target
+            .value
+            .global
+            .as_ref()
+            .map(place::GlobalPlace::projected);
         return value;
     }
 
@@ -607,6 +626,7 @@ fn source_receiver(
     facts: &PlaceUseFacts,
     identity: place::PlaceIdentity,
     root_name: Option<Ident>,
+    global: Option<place::GlobalPlace>,
     expr_id: ExprId,
     name: Ident,
 ) -> SourceReceiver {
@@ -616,6 +636,7 @@ fn source_receiver(
         facts: facts.clone(),
         identity,
         root_name,
+        global,
         expr_id,
         name,
     }
@@ -661,6 +682,7 @@ fn apply_value_field(
                     receiver_place.clone(),
                     receiver_identity,
                     receiver.root_name,
+                    receiver.global.clone(),
                     receiver_id,
                     name,
                     span,
@@ -685,6 +707,7 @@ fn apply_value_field(
                             receiver_place,
                             receiver_identity,
                             receiver.root_name,
+                            receiver.global.clone(),
                             receiver_id,
                             name,
                         )),
@@ -713,6 +736,7 @@ fn apply_value_field(
                             receiver_place,
                             receiver_identity,
                             receiver.root_name,
+                            receiver.global.clone(),
                             receiver_id,
                             name,
                         )),
@@ -749,6 +773,7 @@ fn apply_value_field(
                                     receiver_place,
                                     promoted_identity,
                                     receiver.root_name,
+                                    receiver.global.as_ref().map(place::GlobalPlace::projected),
                                     field_id,
                                     name,
                                 )),
@@ -761,6 +786,10 @@ fn apply_value_field(
                             receiver_place: receiver_place.clone(),
                             receiver_identity: promoted_identity,
                             receiver_root_name: receiver.root_name,
+                            receiver_global: receiver
+                                .global
+                                .as_ref()
+                                .map(place::GlobalPlace::projected),
                             receiver_id: field_id,
                             name,
                             signature: method.signature,
@@ -787,6 +816,7 @@ fn apply_value_field(
                     receiver_place: receiver_place.clone(),
                     receiver_identity,
                     receiver_root_name: receiver.root_name,
+                    receiver_global: receiver.global.clone(),
                     receiver_id,
                     name: method.name,
                     signature: method.signature,
@@ -820,6 +850,7 @@ fn apply_dyn_method(
     receiver_place: PlaceUseFacts,
     receiver_identity: place::PlaceIdentity,
     receiver_root_name: Option<Ident>,
+    receiver_global: Option<place::GlobalPlace>,
     receiver_id: ExprId,
     name: Ident,
     span: Span,
@@ -832,6 +863,7 @@ fn apply_dyn_method(
             receiver_place,
             receiver_identity,
             receiver_root_name,
+            receiver_global,
             receiver_id,
             name,
         };
@@ -845,6 +877,7 @@ fn apply_dyn_method(
             receiver_place,
             receiver_identity,
             receiver_root_name,
+            receiver_global,
             receiver_id,
             name,
         },
@@ -1143,6 +1176,7 @@ fn apply_call(
             receiver_place,
             receiver_identity,
             receiver_root_name,
+            receiver_global,
             receiver_id,
             name,
             signature,
@@ -1154,6 +1188,7 @@ fn apply_call(
                 receiver_place,
                 receiver_identity,
                 receiver_root_name: *receiver_root_name,
+                receiver_global: receiver_global.clone(),
                 receiver_id: *receiver_id,
                 name: *name,
                 signature,
@@ -1170,6 +1205,7 @@ fn apply_call(
             receiver_place,
             receiver_identity,
             receiver_root_name,
+            receiver_global,
             receiver_id,
             name,
         } => PlaceValue::not_place(check_dyn_method_call(
@@ -1180,6 +1216,7 @@ fn apply_call(
                 facts: receiver_place,
                 identity: receiver_identity,
                 root_name: *receiver_root_name,
+                global: receiver_global.clone(),
                 id: *receiver_id,
             },
             *name,
@@ -1194,6 +1231,7 @@ fn apply_call(
             receiver_place,
             receiver_identity,
             receiver_root_name,
+            receiver_global,
             receiver_id,
             name,
         } => PlaceValue::not_place(check_dyn_hole_method_call(
@@ -1203,6 +1241,7 @@ fn apply_call(
                 facts: receiver_place,
                 identity: receiver_identity,
                 root_name: *receiver_root_name,
+                global: receiver_global.clone(),
                 id: *receiver_id,
             },
             *name,
@@ -1253,7 +1292,15 @@ fn check_source_receiver(
             tc.push_error(error);
             return None;
         }
-        place::record_facts_write(receiver.expr_id, &receiver.facts, tc);
+        let receiver_value = receiver_place_value(
+            receiver.access,
+            &receiver.facts,
+            &receiver.identity,
+            receiver.root_name,
+            receiver.global.clone(),
+            tc,
+        );
+        place::record_mut_receiver(receiver.expr_id, &receiver_value, tc);
         return Some(MutableArg {
             identity: receiver.identity.clone(),
             span,
@@ -1262,11 +1309,38 @@ fn check_source_receiver(
                 facts: receiver.facts.clone(),
                 identity: receiver.identity.clone(),
                 root_name: receiver.root_name,
+                global: receiver.global.clone(),
             },
         });
     }
-    place::record_facts_read(receiver.expr_id, &receiver.facts, tc);
+    let receiver_value = receiver_place_value(
+        receiver.access,
+        &receiver.facts,
+        &receiver.identity,
+        receiver.root_name,
+        receiver.global.clone(),
+        tc,
+    );
+    place::record_value_read(receiver.expr_id, &receiver_value, tc);
     None
+}
+
+fn receiver_place_value(
+    access: PlaceAccess,
+    facts: &PlaceUseFacts,
+    identity: &place::PlaceIdentity,
+    root_name: Option<Ident>,
+    global: Option<place::GlobalPlace>,
+    tc: &TypeChecker,
+) -> PlaceValue {
+    PlaceValue {
+        checked: checked_type(Type::Infer, tc),
+        access,
+        facts: facts.clone(),
+        identity: identity.clone(),
+        root_name,
+        global,
+    }
 }
 
 fn mutating_receiver_error(
@@ -1339,17 +1413,25 @@ fn check_dyn_hole_method_call(
     };
     let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
     tc.check_mut_downcast_root_use(receiver.root_name, receiver.identity, call.span);
+    let receiver_value = receiver_place_value(
+        receiver.access,
+        receiver.facts,
+        receiver.identity,
+        receiver.root_name,
+        receiver.global.clone(),
+        tc,
+    );
     if requires_mutable {
         match mutating_receiver_error(receiver.access, name, tc.error_span(call.span)) {
             Some(error) => {
                 tc.push_error(error);
             }
             None => {
-                place::record_facts_write(receiver.id, receiver.facts, tc);
+                place::record_mut_receiver(receiver.id, &receiver_value, tc);
             }
         }
     } else {
-        place::record_facts_read(receiver.id, receiver.facts, tc);
+        place::record_value_read(receiver.id, &receiver_value, tc);
     }
 
     let mut failed = false;
@@ -1425,6 +1507,14 @@ fn check_dyn_method_call(
     let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
     tc.check_mut_downcast_root_use(receiver.root_name, receiver.identity, call.span);
     let mut failed = false;
+    let receiver_value = receiver_place_value(
+        receiver.access,
+        receiver.facts,
+        receiver.identity,
+        receiver.root_name,
+        receiver.global.clone(),
+        tc,
+    );
     if requires_mutable {
         if let Some(error) =
             mutating_receiver_error(receiver.access, name, tc.error_span(call.span))
@@ -1432,10 +1522,10 @@ fn check_dyn_method_call(
             tc.push_error(error);
             failed = true;
         } else {
-            place::record_facts_write(receiver.id, receiver.facts, tc);
+            place::record_mut_receiver(receiver.id, &receiver_value, tc);
         }
     } else {
-        place::record_facts_read(receiver.id, receiver.facts, tc);
+        place::record_value_read(receiver.id, &receiver_value, tc);
     }
 
     failed |= check_args(&call.node.args, &requirement.params, call.span, call_id, tc);
@@ -1455,7 +1545,7 @@ fn check_dyn_method_call(
     checked_type(requirement.ret.ty.clone(), tc)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ExternMethodCall<'a> {
     method_ref: ExternMethodRef,
     receiver: ReceiverMode,
@@ -1463,6 +1553,7 @@ struct ExternMethodCall<'a> {
     receiver_place: &'a PlaceUseFacts,
     receiver_identity: &'a place::PlaceIdentity,
     receiver_root_name: Option<Ident>,
+    receiver_global: Option<place::GlobalPlace>,
     receiver_id: ExprId,
     name: Ident,
     signature: &'a ResolvedExternSignature,
@@ -1634,6 +1725,7 @@ struct ReturnPlaceSource {
     facts: PlaceUseFacts,
     identity: place::PlaceIdentity,
     root_name: Option<Ident>,
+    global: Option<place::GlobalPlace>,
 }
 
 struct CheckedCall {
@@ -1661,6 +1753,7 @@ impl CheckedCall {
             facts: source.facts,
             identity: source.identity.returned_place(),
             root_name: source.root_name,
+            global: source.global.as_ref().map(place::GlobalPlace::projected),
         }
     }
 }
@@ -1680,6 +1773,7 @@ fn mutable_arg(span: Span, value: &PlaceValue) -> MutableArg {
             facts: value.facts.clone(),
             identity: value.identity.clone(),
             root_name: value.root_name,
+            global: value.global.clone(),
         },
     }
 }
@@ -1771,7 +1865,7 @@ fn check_projecting_var_arg(
 
     let target = tc.handle_type(&param.ty);
     if matches!(target, Type::Dyn(_)) {
-        place::record_write(arg.node.id, &place, tc);
+        place::record_var_argument(arg.node.id, &place.value, tc);
         let mutable_arg = mutable_arg(arg.span, &place.value);
         let checked = place.into_checked();
         tc.reject_extern_any_escape(&checked, arg.span);
@@ -1834,6 +1928,11 @@ fn check_projecting_var_arg(
     );
     projected.identity = place.value.identity.fields(&projection.field_path);
     projected.root_name = place.value.root_name;
+    projected.global = place
+        .value
+        .global
+        .as_ref()
+        .map(place::GlobalPlace::projected);
     tc.reject_extern_any_escape(&projected.checked, arg.span);
     tc.expect_assignable_expr(
         arg.span,
@@ -1841,7 +1940,7 @@ fn check_projecting_var_arg(
         projected.checked.handle.clone(),
         param.ty.clone(),
     );
-    place::record_value_write(arg.node.id, &projected, tc);
+    place::record_var_argument(arg.node.id, &projected, tc);
     tc.record_argument_projection(ArgumentProjectionFact {
         call_id,
         arg_index,
@@ -1865,7 +1964,7 @@ fn finish_var_arg(
         tc.push_error(error);
         None
     } else {
-        place::record_write(arg.node.id, &place, tc);
+        place::record_var_argument(arg.node.id, &place.value, tc);
         Some(mutable_arg(arg.span, &place.value))
     };
     let checked = place.into_checked();
@@ -2186,6 +2285,7 @@ fn check_qualified_extend_call(
         &receiver.facts,
         receiver.identity.clone(),
         receiver.root_name,
+        receiver.global.clone(),
         receiver_expr.node.id,
         name,
     );
@@ -2283,6 +2383,14 @@ fn check_extern_method_call(
         method.receiver_identity,
         call.span,
     );
+    let receiver_value = receiver_place_value(
+        method.receiver_access,
+        method.receiver_place,
+        method.receiver_identity,
+        method.receiver_root_name,
+        method.receiver_global,
+        tc,
+    );
     match method.receiver {
         ReceiverMode::Mutable => {
             if let Some(error) = method
@@ -2291,11 +2399,11 @@ fn check_extern_method_call(
             {
                 tc.push_error(error);
             } else {
-                place::record_facts_write(method.receiver_id, method.receiver_place, tc);
+                place::record_mut_receiver(method.receiver_id, &receiver_value, tc);
             }
         }
         ReceiverMode::Value | ReceiverMode::Shared => {
-            place::record_facts_read(method.receiver_id, method.receiver_place, tc);
+            place::record_value_read(method.receiver_id, &receiver_value, tc);
         }
     }
     check_extern_call(

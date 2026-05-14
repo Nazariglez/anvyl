@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutating method requires mutable receiver 'reset'
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn reset(var self) {
+        self.value = 0;
+    }
+}
+
+lazy let count = Counter { value: 1 };
+
+fn main() {
+    count.reset();
+}

@@ -20,8 +20,8 @@ use chumsky::{
 };
 use decl::{
     annotations, const_decl, contract_declaration, dataref_declaration, doc_comment_block,
-    enum_declaration, extend_declaration, extern_declaration, function, import_declaration,
-    struct_declaration, type_alias_declaration,
+    enum_declaration, extend_declaration, extern_declaration, function, global_declaration,
+    import_declaration, struct_declaration, type_alias_declaration,
 };
 use stmt::statement;
 
@@ -116,6 +116,7 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
     });
     let extern_decl = extern_declaration(stmt.clone());
     let const_decl = const_decl(stmt.clone());
+    let global_decl = global_declaration(stmt.clone());
     let type_alias_decl = type_alias_declaration();
     let contract_decl = contract_declaration(stmt);
 
@@ -165,6 +166,7 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
     choice((
         type_alias_decl,
         contract_decl,
+        global_decl,
         documented_decl,
         undocumented_decl,
     ))

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: runtime global 'size' cannot be used where a compile-time constant is required
+
+import sizes;
+
+fn main() {
+    let xs = [0; sizes.size];
+}

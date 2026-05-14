@@ -5,7 +5,7 @@ use super::{
     infer::TypeHandle,
 };
 use crate::{
-    ast::{ExprNode, Ident, Type},
+    ast::{ExprKind, ExprNode, Ident, Type},
     externs::catalog::{ResolvedExternParam, ResolvedExternSignature, ResolvedExternTy},
     span::Span,
 };
@@ -37,9 +37,17 @@ pub(super) fn check_call(
 
 pub(super) fn check_arg(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     match param.flow {
-        ParamFlow::Value | ParamFlow::Borrow => check_arg_expr(arg, param, tc),
+        ParamFlow::Value => check_arg_expr(arg, param, tc),
+        ParamFlow::Borrow => check_arg_borrow(arg, param, tc),
         ParamFlow::MutBorrow => check_arg_place(arg, param, tc),
     }
+}
+
+fn check_arg_borrow(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
+    let checked = check_place(arg, tc);
+    super::place::record_immutable_borrow(arg.node.id, &checked.value, tc);
+    let checked = checked.into_checked();
+    check_checked_value(arg, &checked, &param.ty, tc)
 }
 
 pub(super) fn check_arg_expr(
@@ -70,7 +78,7 @@ pub(super) fn check_arg_place(
         }
     }
     if is_mutable {
-        super::place::record_write(arg.node.id, &checked, tc);
+        super::place::record_mut_borrow(arg.node.id, &checked.value, tc);
     }
     let checked = checked.into_checked();
     let value_ok = check_checked_value(arg, &checked, &param.ty, tc);
@@ -107,7 +115,7 @@ pub(super) fn type_fits_boundary(
 
 fn place_error_name(arg: &ExprNode, param: &ResolvedExternParam) -> Ident {
     match &arg.node.kind {
-        crate::ast::ExprKind::Ident(name) => *name,
+        ExprKind::Ident(name) => *name,
         _ => param.name.unwrap_or_else(|| Ident::new("_")),
     }
 }

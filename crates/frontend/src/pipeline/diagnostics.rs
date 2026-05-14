@@ -955,6 +955,10 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("Could not infer type parameter '{name}'")
         }
         TypeError::UnknownConst { name, .. } => format!("unknown constant '{name}'"),
+        TypeError::RuntimeGlobalInConstPosition { global, .. } => format!(
+            "runtime global '{}' cannot be used where a compile-time constant is required",
+            global.name
+        ),
         TypeError::ConstCycle { name, .. } => format!("constant '{name}' depends on itself"),
         TypeError::NonConstExpression { .. } => "not a constant expression".to_string(),
         TypeError::GenericFieldDefault { .. } => {
@@ -1237,6 +1241,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::EnumVariantShapeMismatch { span, .. }
         | TypeError::UnboundGenericParam { span, .. }
         | TypeError::UnknownConst { span, .. }
+        | TypeError::RuntimeGlobalInConstPosition { span, .. }
         | TypeError::ConstCycle { span, .. }
         | TypeError::NonConstExpression { span, .. }
         | TypeError::GenericFieldDefault { span, .. }
@@ -1281,6 +1286,7 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::UnusedAliasConstParam { span, .. }
         | DeclError::PublicAliasPrivateType { span, .. }
         | DeclError::PublicContractPrivateType { span, .. }
+        | DeclError::PublicValuePrivateType { span, .. }
         | DeclError::ExtendMethodConflict { span, .. }
         | DeclError::ReexportConflict { span, .. }
         | DeclError::UnknownType { span, .. }
@@ -1729,6 +1735,7 @@ fn render_deprecated_use_kind(kind: DeprecatedUseKind) -> &'static str {
         DeprecatedUseKind::Function => "function",
         DeprecatedUseKind::ExternFunction => "extern function",
         DeprecatedUseKind::Const => "const",
+        DeprecatedUseKind::Global => "runtime global",
         DeprecatedUseKind::ExternType => "extern type",
         DeprecatedUseKind::TypeAlias => "type alias",
         DeprecatedUseKind::Contract => "contract",
@@ -1862,6 +1869,10 @@ fn render_decl_error(error: &DeclError) -> String {
         }
         DeclError::PublicContractPrivateType { name, ty, .. } => {
             format!("public contract '{name}' exposes private type '{ty}'")
+        }
+        DeclError::PublicValuePrivateType { kind, name, ty, .. } => {
+            let kind = kind.label();
+            format!("public {kind} '{name}' exposes private type '{ty}'")
         }
         DeclError::ExtendMethodConflict {
             ty, name, surface, ..

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import services;
+import services { count };
+
+fn main() {
+    let count = "local";
+    let local: string = count;
+    services.count = 1;
+    let global: int = services.count;
+}

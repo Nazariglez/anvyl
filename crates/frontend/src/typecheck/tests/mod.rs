@@ -2,6 +2,7 @@ mod basics;
 mod calls;
 mod contracts;
 mod externs;
+mod globals;
 mod imports;
 mod members;
 mod patterns;

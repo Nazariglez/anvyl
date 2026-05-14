@@ -927,6 +927,11 @@ impl Solver {
         self.alloc_local(Ty::from_recovery_type(ty))
     }
 
+    pub(super) fn alloc_fresh_local_type(&mut self, span: Option<SourceSpan>) -> LocalTypeId {
+        let ty = self.fresh_type(span);
+        self.alloc_local(ty)
+    }
+
     pub(super) fn alloc_local_type_from_handle(&mut self, handle: &TypeHandle) -> LocalTypeId {
         let ty = self.resolve_ref(&handle.0);
         self.alloc_local(ty)

@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+pub struct Config {
+    size: int,
+}
+
+pub lazy let tile_size: int = 16;
+pub lazy var settings: Config = Config { size: tile_size };
+
+fn main() {
+    let size = tile_size;
+    settings = Config { size };
+}

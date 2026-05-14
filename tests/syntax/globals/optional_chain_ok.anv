@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Config {
+    title: int,
+}
+
+lazy let maybe_config: Config? = Config { title: 1 };
+
+fn main() {
+    let title: int? = maybe_config?.title;
+}

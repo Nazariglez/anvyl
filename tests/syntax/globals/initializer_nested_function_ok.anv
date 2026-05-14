@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+lazy let value = {
+    fn make() -> int {
+        defer println(0);
+        return 1;
+    }
+    make()
+};
+
+fn main() {
+    let value: int = value;
+}

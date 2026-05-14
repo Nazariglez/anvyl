@@ -40,6 +40,7 @@ enum ConstState {
 
 pub(super) enum ConstNameLookup {
     Value(ConstValue),
+    RuntimeGlobal(super::GlobalKey),
     NotConstLocal,
     Error(TypeError),
     Missing,
@@ -146,6 +147,12 @@ impl TypeChecker {
                 }
                 match self.lookup_visible_const_name(*name, expr.span) {
                     ConstNameLookup::Value(value) => Ok(value),
+                    ConstNameLookup::RuntimeGlobal(global) => {
+                        Err(TypeError::RuntimeGlobalInConstPosition {
+                            global,
+                            span: self.error_span(expr.span),
+                        })
+                    }
                     ConstNameLookup::NotConstLocal => Err(TypeError::NonConstExpression {
                         span: self.error_span(expr.span),
                     }),
@@ -249,6 +256,10 @@ impl TypeChecker {
                 }
                 self.eval_top_const(&module, name, err_span)
             }
+            Some((_, _, ValueDecl::Global(sig))) => Err(TypeError::RuntimeGlobalInConstPosition {
+                global: sig.key,
+                span: err_span,
+            }),
             Some((_, _, ValueDecl::Func(_))) => {
                 Err(TypeError::NonConstExpression { span: err_span })
             }
@@ -291,6 +302,10 @@ impl TypeChecker {
             };
         }
 
+        if let Some((_, _, ValueDecl::Global(sig))) = self.current_module_value(name) {
+            return ConstNameLookup::RuntimeGlobal(sig.key);
+        }
+
         match self.imported_value(name) {
             Some((module, imported_name, ValueDecl::Const(_))) => {
                 match self.eval_top_const(&module, imported_name, self.error_span(span)) {
@@ -298,6 +313,7 @@ impl TypeChecker {
                     Err(error) => ConstNameLookup::Error(error),
                 }
             }
+            Some((_, _, ValueDecl::Global(sig))) => ConstNameLookup::RuntimeGlobal(sig.key),
             Some((_, _, ValueDecl::Func(_))) | None => ConstNameLookup::Missing,
         }
     }
@@ -309,6 +325,12 @@ impl TypeChecker {
     ) -> Option<Result<ConstValue, TypeError>> {
         match self.lookup_visible_const_name(name, span) {
             ConstNameLookup::Value(value) => Some(Ok(value)),
+            ConstNameLookup::RuntimeGlobal(global) => {
+                Some(Err(TypeError::RuntimeGlobalInConstPosition {
+                    global,
+                    span: self.error_span(span),
+                }))
+            }
             ConstNameLookup::Error(error) => Some(Err(error)),
             ConstNameLookup::NotConstLocal | ConstNameLookup::Missing => None,
         }

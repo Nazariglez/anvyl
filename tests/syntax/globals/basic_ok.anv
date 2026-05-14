@@ -1,0 +1,28 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn reset(var self) {
+        self.value = 0;
+    }
+}
+
+lazy let config = 1;
+lazy var count = Counter { value: config };
+
+fn set(var counter: Counter) {
+    counter.value = 2;
+}
+
+fn main() {
+    let value = count.value;
+    count = Counter { value };
+    count.value = 3;
+    set(count);
+    count.reset();
+}

@@ -1,10 +1,11 @@
 use super::{
-    CheckedType, Exposure, ExternUseTarget, LocalTypeId, MemberAccessKind, MemberPathFact,
-    MemberPathKind, TypeChecker, TypeError, ValueDecl, check_expr_checked, check_index_access,
+    CheckedType, Exposure, ExternUseTarget, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect,
+    GlobalKey, GlobalSig, LocalTypeId, MemberAccessKind, MemberPathFact, MemberPathKind,
+    TypeChecker, TypeError, ValueDecl, check_expr_checked, check_index_access,
     check_tuple_index_access, member,
 };
 use crate::{
-    ast::{ExprId, ExprKind, ExprNode, Ident, Type},
+    ast::{ExprId, ExprKind, ExprNode, Ident, Mutability, Type},
     externs::catalog::ExternFieldRef,
     span::Span,
 };
@@ -81,9 +82,10 @@ pub(super) struct PlacePath {
     segments: Vec<PlacePathSegment>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum PlaceRoot {
     Local(LocalTypeId),
+    Global(GlobalKey),
     Temporary(ExprId),
 }
 
@@ -215,8 +217,8 @@ impl PlaceIdentity {
 
     fn place_root(&self) -> Option<PlaceRoot> {
         match self {
-            Self::Single(path) => Some(path.root),
-            Self::UnknownDerived(root) | Self::IndexedDerived(root) => Some(*root),
+            Self::Single(path) => Some(path.root.clone()),
+            Self::UnknownDerived(root) | Self::IndexedDerived(root) => Some(root.clone()),
             Self::Unknown | Self::Alternatives { .. } => None,
         }
     }
@@ -407,6 +409,37 @@ pub(super) struct PlaceValue {
     pub(super) facts: PlaceUseFacts,
     pub(super) identity: PlaceIdentity,
     pub(super) root_name: Option<Ident>,
+    pub(super) global: Option<GlobalPlace>,
+}
+
+#[derive(Clone)]
+pub(super) struct GlobalPlace {
+    pub(super) key: GlobalKey,
+    pub(super) root: bool,
+}
+
+impl GlobalPlace {
+    pub(super) fn projected(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            root: false,
+        }
+    }
+}
+
+pub(super) fn global_value(sig: &GlobalSig, checked: CheckedType) -> PlaceValue {
+    let access = match sig.mutability {
+        Mutability::Mutable => PlaceAccess::Mutable,
+        Mutability::Immutable => PlaceAccess::Immutable,
+    };
+    let mut value = PlaceValue::new(checked, access, PlaceUseFacts::default());
+    value.identity = PlaceIdentity::root(PlaceRoot::Global(sig.key.clone()));
+    value.root_name = Some(sig.key.name);
+    value.global = Some(GlobalPlace {
+        key: sig.key.clone(),
+        root: true,
+    });
+    value
 }
 
 pub(super) struct CheckedPlace {
@@ -422,6 +455,7 @@ impl PlaceValue {
             facts,
             identity: PlaceIdentity::unknown(),
             root_name: None,
+            global: None,
         }
     }
 
@@ -462,6 +496,7 @@ pub(super) fn field_value(
             );
             value.identity = receiver.identity.clone().field(name);
             value.root_name = receiver.root_name;
+            value.global = receiver.global.as_ref().map(GlobalPlace::projected);
             FieldValueResult::Value(Box::new(value), false)
         }
         member::FieldResolution::Promoted(promoted) => {
@@ -542,6 +577,7 @@ fn promoted_field_value(
             );
             value.identity = receiver.identity.clone().fields(&promoted.path);
             value.root_name = receiver.root_name;
+            value.global = receiver.global.as_ref().map(GlobalPlace::projected);
             FieldValueResult::Value(Box::new(value), false)
         }
         member::PromotedFieldTarget::Extern(field) => extern_field_value(
@@ -568,6 +604,7 @@ fn extern_field_value(
     );
     value.identity = identity;
     value.root_name = receiver.root_name;
+    value.global = receiver.global.as_ref().map(GlobalPlace::projected);
     FieldValueResult::Value(Box::new(value), field.contains_any)
 }
 
@@ -592,7 +629,7 @@ pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> Ch
             span: tc.error_span(expr.span),
         });
     }
-    record_value_read(expr.node.id, &place.value, tc);
+    record_mut_borrow(expr.node.id, &place.value, tc);
     place
 }
 
@@ -627,11 +664,33 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     }
 
     if let ExprKind::Ident(name) = &expr.node.kind
-        && let Some((_, value_name, ValueDecl::Const(sig))) = tc.lookup_named_value(*name)
+        && let Some((_, value_name, decl)) = tc.lookup_named_value(*name)
     {
-        tc.warn_named_const_deprecated(value_name, expr.span);
-        let checked = super::checked_from_type(expr, sig.ty.clone(), tc);
-        return CheckedPlace::new(checked, PlaceAccess::Const);
+        match decl {
+            ValueDecl::Const(sig) => {
+                tc.warn_named_const_deprecated(value_name, expr.span);
+                let checked = super::checked_from_type(expr, sig.ty.clone(), tc);
+                return CheckedPlace::new(checked, PlaceAccess::Const);
+            }
+            ValueDecl::Global(sig) => {
+                tc.warn_named_value_deprecated(
+                    &ValueDecl::Global(sig.clone()),
+                    value_name,
+                    expr.span,
+                );
+                let checked = super::checked_from_handle(expr, tc.global_handle(&sig.key), tc);
+                let value = global_value(&sig, checked);
+                return CheckedPlace {
+                    accepts_extern_any: value.checked.contains_extern_any,
+                    value,
+                };
+            }
+            ValueDecl::Func(_) => {}
+        }
+    }
+
+    if let Some(place) = check_module_qualified_place(expr, tc) {
+        return place;
     }
 
     if let ExprKind::Index(index) = &expr.node.kind {
@@ -644,6 +703,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
         place.value.facts = target.value.facts;
         place.value.identity = target.value.identity.index();
         place.value.root_name = target.value.root_name;
+        place.value.global = target.value.global.as_ref().map(GlobalPlace::projected);
         place.accepts_extern_any = target.accepts_extern_any;
         return place;
     }
@@ -656,6 +716,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
         place.value.facts = target.value.facts;
         place.value.identity = target.value.identity.tuple(index.node.index as usize);
         place.value.root_name = target.value.root_name;
+        place.value.global = target.value.global.as_ref().map(GlobalPlace::projected);
         place.accepts_extern_any = target.accepts_extern_any;
         return place;
     }
@@ -696,22 +757,98 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     CheckedPlace::new(check_expr_checked(expr, tc), PlaceAccess::NotPlace)
 }
 
+fn check_module_qualified_place(expr: &ExprNode, tc: &mut TypeChecker) -> Option<CheckedPlace> {
+    let chain = super::postfix::collect_postfix_chain(expr)?;
+    let ExprKind::Ident(name) = &chain.base.node.kind else {
+        return None;
+    };
+    if tc.lookup_local_symbol(*name).is_some() {
+        return None;
+    }
+    tc.lookup_module_alias(*name)?;
+    let value = super::postfix::check_postfix_chain_place(&chain, expr, None, false, tc);
+    let accepts_extern_any = value.checked.contains_extern_any;
+    Some(CheckedPlace {
+        value,
+        accepts_extern_any,
+    })
+}
+
 pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
+    let mode = if place
+        .value
+        .global
+        .as_ref()
+        .is_some_and(|global| global.root)
+    {
+        GlobalAccessMode::RootAssign
+    } else {
+        GlobalAccessMode::ProjectedAssign
+    };
+    record_global_access(expr_id, &place.value, mode, tc);
     record_value_write(expr_id, &place.value, tc);
 }
 
 pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
+    record_global_access(expr_id, &place.value, GlobalAccessMode::CompoundAssign, tc);
     record_prefix_reads(expr_id, &place.value.facts, tc);
     record_target_reads(expr_id, &place.value.facts, tc);
     record_target_writes(expr_id, &place.value.facts, tc);
 }
 
 pub(super) fn record_value_read(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    record_global_access(expr_id, value, GlobalAccessMode::Read, tc);
     record_facts_read(expr_id, &value.facts, tc);
+}
+
+pub(super) fn record_var_argument(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    record_global_access(expr_id, value, GlobalAccessMode::VarArgument, tc);
+    record_facts_write(expr_id, &value.facts, tc);
+}
+
+pub(super) fn record_mut_receiver(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    record_global_access(expr_id, value, GlobalAccessMode::MutReceiver, tc);
+    record_facts_write(expr_id, &value.facts, tc);
+}
+
+pub(super) fn record_immutable_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    record_global_access(expr_id, value, GlobalAccessMode::ImmutableBorrow, tc);
+    record_facts_read(expr_id, &value.facts, tc);
+}
+
+pub(super) fn record_mut_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    record_global_access(expr_id, value, GlobalAccessMode::MutableBorrow, tc);
+    record_facts_write(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_value_write(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     record_facts_write(expr_id, &value.facts, tc);
+}
+
+fn record_global_access(
+    expr_id: ExprId,
+    value: &PlaceValue,
+    mode: GlobalAccessMode,
+    tc: &mut TypeChecker,
+) {
+    let Some(global) = &value.global else {
+        return;
+    };
+    let init_effect = classify_global_access(global, mode);
+    tc.record_global_access(GlobalAccessFact {
+        expr_id,
+        key: global.key.clone(),
+        mode,
+        init_effect,
+    });
+}
+
+fn classify_global_access(global: &GlobalPlace, mode: GlobalAccessMode) -> GlobalInitEffect {
+    if global.root && mode == GlobalAccessMode::RootAssign {
+        GlobalInitEffect::StoreWithoutInit
+    } else {
+        GlobalInitEffect::InitializeFirst
+    }
 }
 
 pub(super) fn record_facts_read(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {

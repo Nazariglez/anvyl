@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, Type,
-    decls::{CallableId, ExtendId},
+    decls::{CallableId, ExtendId, GlobalKey},
 };
 use crate::{
     ast::{ExprId, Ident},
@@ -22,6 +22,7 @@ pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
 pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
 pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
 pub(crate) type DynDowncastMap = HashMap<ExprId, DynDowncastFact>;
+pub(crate) type GlobalAccessMap = HashMap<ExprId, GlobalAccessFact>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallTarget {
@@ -34,6 +35,32 @@ pub(crate) struct CallTarget {
 pub(crate) enum CallForm {
     Normal,
     QualifiedExtend { receiver: ExprId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GlobalAccessMode {
+    Read,
+    RootAssign,
+    ProjectedAssign,
+    CompoundAssign,
+    ImmutableBorrow,
+    MutableBorrow,
+    VarArgument,
+    MutReceiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GlobalInitEffect {
+    InitializeFirst,
+    StoreWithoutInit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobalAccessFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) key: GlobalKey,
+    pub(crate) mode: GlobalAccessMode,
+    pub(crate) init_effect: GlobalInitEffect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

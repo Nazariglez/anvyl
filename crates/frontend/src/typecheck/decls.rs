@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use super::{
-    ConstSubst, GenericArgs, GenericParams, Specificity, TypeSubst, annotation,
+    ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, Specificity, TypeSubst, annotation,
     compare_specificity,
     const_term::ConstTerm,
     infer::{GenericSolverSeeds, Solver},
@@ -121,6 +121,12 @@ pub(crate) struct TypeAliasKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ContractKey {
+    pub(crate) module: ModuleScope,
+    pub(crate) name: Ident,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GlobalKey {
     pub(crate) module: ModuleScope,
     pub(crate) name: Ident,
 }
@@ -471,6 +477,12 @@ pub(crate) enum DeclError {
         ty: Type,
         span: Option<SourceSpan>,
     },
+    PublicValuePrivateType {
+        kind: PublicValueKind,
+        name: Ident,
+        ty: Type,
+        span: Option<SourceSpan>,
+    },
     ExtendMethodConflict {
         ty: Type,
         name: Ident,
@@ -641,6 +653,7 @@ struct SourceExternPolicies {
 pub(crate) struct ResolvedValue {
     pub(crate) module: ModuleScope,
     pub(crate) name: Ident,
+    pub(crate) visibility: Visibility,
     pub(crate) decl: ValueDecl,
 }
 
@@ -730,10 +743,30 @@ pub(crate) struct ModuleDecls {
     imports: ImportScope,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicValueKind {
+    Function,
+    ExternFunction,
+    Const,
+    RuntimeGlobal,
+}
+
+impl PublicValueKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::ExternFunction => "extern function",
+            Self::Const => "const",
+            Self::RuntimeGlobal => "runtime global",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ValueDecl {
     Func(FuncSig),
     Const(ConstSig),
+    Global(GlobalSig),
 }
 
 impl Namespace {
@@ -1100,8 +1133,50 @@ impl ImportScope {
 impl ValueDecl {
     pub(crate) fn ty(&self) -> &Type {
         match self {
-            ValueDecl::Func(sig) => &sig.ty,
-            ValueDecl::Const(sig) => &sig.ty,
+            Self::Func(sig) => &sig.ty,
+            Self::Const(sig) => &sig.ty,
+            Self::Global(sig) => &sig.ty,
+        }
+    }
+
+    pub(crate) fn policy(&self) -> &AccessPolicy {
+        match self {
+            Self::Func(sig) => &sig.policy,
+            Self::Const(sig) => &sig.policy,
+            Self::Global(sig) => &sig.policy,
+        }
+    }
+
+    pub(crate) fn deprecated_kind(&self) -> Option<DeprecatedUseKind> {
+        match self {
+            Self::Func(sig) => match sig.kind {
+                CallableKind::Function => Some(DeprecatedUseKind::Function),
+                CallableKind::ExternFunction => Some(DeprecatedUseKind::ExternFunction),
+                CallableKind::StaticMethod
+                | CallableKind::InstanceMethod
+                | CallableKind::ExtendMethod(_)
+                | CallableKind::EnumVariant => None,
+            },
+            Self::Const(_) => Some(DeprecatedUseKind::Const),
+            Self::Global(_) => Some(DeprecatedUseKind::Global),
+        }
+    }
+
+    pub(crate) fn public_kind(&self) -> PublicValueKind {
+        match self {
+            Self::Func(sig) if sig.kind == CallableKind::ExternFunction => {
+                PublicValueKind::ExternFunction
+            }
+            Self::Func(_) => PublicValueKind::Function,
+            Self::Const(_) => PublicValueKind::Const,
+            Self::Global(_) => PublicValueKind::RuntimeGlobal,
+        }
+    }
+
+    pub(crate) fn diagnostic_span(&self) -> Option<SourceSpan> {
+        match self {
+            Self::Global(sig) => Some(sig.span),
+            Self::Func(_) | Self::Const(_) => None,
         }
     }
 }
@@ -1119,6 +1194,16 @@ pub(crate) struct FuncSig {
 pub(crate) struct ConstSig {
     pub(crate) ty: Type,
     pub(crate) policy: AccessPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GlobalSig {
+    pub(crate) key: GlobalKey,
+    pub(crate) ty: Type,
+    pub(crate) mutability: Mutability,
+    pub(crate) policy: AccessPolicy,
+    pub(crate) span: SourceSpan,
+    pub(crate) initializer_span: SourceSpan,
 }
 
 #[derive(Debug, Clone)]
@@ -1749,6 +1834,15 @@ impl DeclarationIndex {
                         };
                         sig.ty = f(site, sig.ty.clone());
                     }
+                    ValueDecl::Global(sig) => {
+                        let site = DeclTypeSite {
+                            module: value.module.clone(),
+                            span,
+                            generics: GenericTypeContext::default(),
+                            type_params: vec![],
+                        };
+                        sig.ty = f(site, sig.ty.clone());
+                    }
                 }
             }
         }
@@ -1965,6 +2059,7 @@ impl DeclarationIndex {
                     let value = ResolvedValue {
                         module: scope.clone(),
                         name: func.name,
+                        visibility: func.visibility,
                         decl: ValueDecl::Func(FuncSig {
                             kind: CallableKind::Function,
                             generics: generic_params(&func.type_params, &func.const_params),
@@ -2174,6 +2269,7 @@ impl DeclarationIndex {
                     let value = ResolvedValue {
                         module: scope.clone(),
                         name: c.name,
+                        visibility: c.visibility,
                         decl: ValueDecl::Const(ConstSig {
                             ty: c.ty.clone().unwrap_or(Type::Infer),
                             policy,
@@ -2186,6 +2282,42 @@ impl DeclarationIndex {
                         value,
                         exported,
                         Some(SourceSpan::from_byte_span(source, const_node.span)),
+                    );
+                }
+                Stmt::Global(global_node) => {
+                    let global = &global_node.node;
+                    let policy = annotation::normalize_annotations(
+                        source,
+                        &global.annotations,
+                        annotation::AnnotationTarget::Global,
+                        &mut self.errors,
+                    );
+                    let key = GlobalKey {
+                        module: scope.clone(),
+                        name: global.name,
+                    };
+                    let span = SourceSpan::from_byte_span(source, global_node.span);
+                    let initializer_span = SourceSpan::from_byte_span(source, global.value.span);
+                    let value = ResolvedValue {
+                        module: scope.clone(),
+                        name: global.name,
+                        visibility: global.visibility,
+                        decl: ValueDecl::Global(GlobalSig {
+                            key,
+                            ty: global.ty.clone().unwrap_or(Type::Infer),
+                            mutability: global.mutability,
+                            policy,
+                            span,
+                            initializer_span,
+                        }),
+                    };
+                    self.insert_local_value(
+                        &mut decls,
+                        &scope,
+                        global.name,
+                        value,
+                        exported,
+                        Some(span),
                     );
                 }
                 Stmt::TypeAlias(alias_node) => {
@@ -2448,6 +2580,11 @@ impl DeclarationIndex {
             let value = ResolvedValue {
                 module: scope.clone(),
                 name,
+                visibility: if func.exported {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                },
                 decl: ValueDecl::Func(FuncSig {
                     kind: CallableKind::ExternFunction,
                     generics: GenericParams::default(),
@@ -2878,52 +3015,56 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn set_const_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
-        let ty = Box::new(ty);
-        for decls in self.modules.values_mut() {
-            Self::set_namespace_const_type(&mut decls.locals, scope, name, &ty);
-            Self::set_namespace_const_type(&mut decls.exports, scope, name, &ty);
-            Self::set_namespace_const_type(&mut decls.imports.namespace, scope, name, &ty);
-        }
-    }
-
-    pub(crate) fn set_func_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
-        let ty = Box::new(ty);
-        for decls in self.modules.values_mut() {
-            Self::set_namespace_func_type(&mut decls.locals, scope, name, &ty);
-            Self::set_namespace_func_type(&mut decls.exports, scope, name, &ty);
-            Self::set_namespace_func_type(&mut decls.imports.namespace, scope, name, &ty);
-        }
-    }
-
-    fn set_namespace_const_type(
-        namespace: &mut Namespace,
-        scope: &ModuleScope,
-        name: Ident,
-        ty: &Type,
-    ) {
-        for value in namespace.values.values_mut() {
+        self.update_values(|value| {
             if value.module == *scope
                 && value.name == name
                 && let ValueDecl::Const(sig) = &mut value.decl
             {
                 sig.ty = ty.clone();
             }
-        }
+        });
     }
 
-    fn set_namespace_func_type(
-        namespace: &mut Namespace,
-        scope: &ModuleScope,
-        name: Ident,
-        ty: &Type,
-    ) {
-        for value in namespace.values.values_mut() {
+    pub(crate) fn set_func_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
+        self.update_values(|value| {
             if value.module == *scope
                 && value.name == name
                 && let ValueDecl::Func(sig) = &mut value.decl
             {
                 sig.ty = ty.clone();
             }
+        });
+    }
+
+    pub(crate) fn set_global_type(&mut self, key: &GlobalKey, ty: Type) {
+        self.update_values(|value| {
+            if let ValueDecl::Global(sig) = &mut value.decl
+                && sig.key == *key
+            {
+                sig.ty = ty.clone();
+            }
+        });
+    }
+
+    fn update_values(&mut self, mut f: impl FnMut(&mut ResolvedValue)) {
+        for decls in self.modules.values_mut() {
+            for namespace in [
+                &mut decls.locals,
+                &mut decls.exports,
+                &mut decls.imports.namespace,
+            ] {
+                for value in namespace.values.values_mut() {
+                    f(value);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn global(&self, key: &GlobalKey) -> Option<GlobalSig> {
+        let value = self.local_value(&key.module, key.name)?;
+        match value.decl {
+            ValueDecl::Global(sig) => Some(sig),
+            ValueDecl::Func(_) | ValueDecl::Const(_) => None,
         }
     }
 
@@ -4909,6 +5050,7 @@ pub(crate) fn stmt_visibility(stmt: &StmtNode) -> Visibility {
         Stmt::Aggregate(n) => n.node.visibility,
         Stmt::Enum(n) => n.node.visibility,
         Stmt::Const(n) => n.node.visibility,
+        Stmt::Global(n) => n.node.visibility,
         Stmt::TypeAlias(n) => n.node.visibility,
         Stmt::Contract(n) => n.node.visibility,
         _ => Visibility::Private,

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use super::{
     ArgumentProjectionMap, CallMap, ContractWitnessMap, DynCallMap, DynConversionMap,
-    DynDowncastMap, DynWeakeningMap, ExternUseMap, MemberPathMap, const_term::ConstTerm,
-    decls::CallableId, type_ops::TypeFolder,
+    DynDowncastMap, DynWeakeningMap, ExternUseMap, GlobalAccessMap, MemberPathMap,
+    const_term::ConstTerm, decls::CallableId, type_ops::TypeFolder,
 };
 use crate::{
     ast::{
@@ -88,6 +88,7 @@ pub(crate) struct SpecializedBodyFacts {
     pub(crate) dyn_weakenings: DynWeakeningMap,
     pub(crate) dyn_calls: DynCallMap,
     pub(crate) dyn_downcasts: DynDowncastMap,
+    pub(crate) global_accesses: GlobalAccessMap,
 }
 
 #[derive(Clone)]

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: return is not allowed in runtime global initializers
+
+lazy let bad = {
+    return 1;
+};
+
+fn main() {}
