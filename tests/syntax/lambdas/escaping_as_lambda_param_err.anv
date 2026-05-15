@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: `escaping` cannot be combined with `as`
+// @frontend: new
+
+fn main() {
+    let f = |cb: as escaping fn()| { cb(); };
+}

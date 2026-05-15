@@ -17,7 +17,6 @@ pub(super) enum PlaceAccess {
     Settable,
     Immutable,
     Const,
-    Captured,
     ReadonlySelf,
     #[default]
     NotPlace,
@@ -310,7 +309,6 @@ impl PlaceAccess {
             Self::Mutable | Self::Settable => None,
             Self::DynView => Some(TypeError::BorrowedDynReassign { name, span }),
             Self::Const => Some(TypeError::ConstAssignment { name, span }),
-            Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
             Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
             Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
         }
@@ -325,7 +323,6 @@ impl PlaceAccess {
             Self::Mutable | Self::DynView => None,
             Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
             Self::Const => Some(TypeError::ConstAssignment { name, span }),
-            Self::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
             Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
             Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
         }
@@ -348,7 +345,6 @@ fn merged_access(accesses: impl IntoIterator<Item = PlaceAccess>) -> PlaceAccess
         return PlaceAccess::Settable;
     }
     for restricted in [
-        PlaceAccess::Captured,
         PlaceAccess::DynView,
         PlaceAccess::ReadonlySelf,
         PlaceAccess::Const,
@@ -645,6 +641,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
             Ok(Some(value)) => {
                 let checked =
                     super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
+                tc.record_local_read(expr.node.id, &value);
                 let access = tc.local_value_access(&value);
                 let mut place = CheckedPlace::new(checked, access.access);
                 place.value.facts = access.facts;
@@ -695,6 +692,8 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
 
     if let ExprKind::Index(index) = &expr.node.kind {
         let target = check_place_inner(&index.node.target, tc);
+        tc.closure
+            .copy_place_identity(index.node.target.node.id, expr.node.id);
         let indexed = check_index_access(index, &target.value.checked, tc);
         let mut checked = super::checked_from_type(expr, indexed.write_ty, tc);
         checked.contains_extern_any = indexed.contains_extern_any;
@@ -710,6 +709,8 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
 
     if let ExprKind::TupleIndex(index) = &expr.node.kind {
         let target = check_place_inner(&index.node.target, tc);
+        tc.closure
+            .copy_place_identity(index.node.target.node.id, expr.node.id);
         let checked = check_tuple_index_access(expr, index, &target.value.checked, tc);
         let access = projected_field_access(target.value.access);
         let mut place = CheckedPlace::new(checked, access);
@@ -723,6 +724,8 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
 
     if let ExprKind::Field(field) = &expr.node.kind {
         let receiver = check_place_inner(&field.node.target, tc);
+        tc.closure
+            .copy_place_identity(field.node.target.node.id, expr.node.id);
         match field_value(
             Some(expr),
             &receiver.value,
@@ -790,6 +793,7 @@ pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeC
 }
 
 pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
+    tc.closure.mutably_use_place(expr_id);
     record_global_access(expr_id, &place.value, GlobalAccessMode::CompoundAssign, tc);
     record_prefix_reads(expr_id, &place.value.facts, tc);
     record_target_reads(expr_id, &place.value.facts, tc);
@@ -797,31 +801,37 @@ pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &
 }
 
 pub(super) fn record_value_read(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    tc.closure.read_place(expr_id);
     record_global_access(expr_id, value, GlobalAccessMode::Read, tc);
     record_facts_read(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_var_argument(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    tc.closure.mutably_use_place(expr_id);
     record_global_access(expr_id, value, GlobalAccessMode::VarArgument, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_mut_receiver(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    tc.closure.mutably_use_place(expr_id);
     record_global_access(expr_id, value, GlobalAccessMode::MutReceiver, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_immutable_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    tc.closure.read_place(expr_id);
     record_global_access(expr_id, value, GlobalAccessMode::ImmutableBorrow, tc);
     record_facts_read(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_mut_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    tc.closure.mutably_use_place(expr_id);
     record_global_access(expr_id, value, GlobalAccessMode::MutableBorrow, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_value_write(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    tc.closure.mutably_use_place(expr_id);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
@@ -905,7 +915,6 @@ pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAcces
         PlaceAccess::Mutable => PlaceAccess::Mutable,
         PlaceAccess::DynView => PlaceAccess::DynView,
         PlaceAccess::Const => PlaceAccess::Const,
-        PlaceAccess::Captured => PlaceAccess::Captured,
         PlaceAccess::ReadonlySelf => PlaceAccess::ReadonlySelf,
         PlaceAccess::NotPlace => PlaceAccess::NotPlace,
         PlaceAccess::Settable | PlaceAccess::Immutable => PlaceAccess::Immutable,

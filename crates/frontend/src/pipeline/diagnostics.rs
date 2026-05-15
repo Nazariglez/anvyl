@@ -5,7 +5,9 @@ use anvyx_externs::{
 use chumsky::error::{Rich, RichReason};
 
 use crate::{
-    ast::{self, ConstArg, ConstValue, FuncParam, Ident, ModuleOrigin, ReturnSpec, Type},
+    ast::{
+        self, ConstArg, ConstValue, EscapeMode, FuncParam, Ident, ModuleOrigin, ReturnSpec, Type,
+    },
     conditional::ConditionalError,
     diagnostic::Diagnostic,
     externs::{
@@ -22,9 +24,9 @@ use crate::{
     source::SourceId,
     span::SourceSpan,
     typecheck::{
-        ArityError, BindingNamespace, BindingOrigin, ConstDiagnostic, DeclError, DeprecatedUseKind,
-        DynContainerConversionKind, MemberAccessKind, ModuleScope, TryCarrierKind, TypeError,
-        TypeWarning, VariantShape,
+        ArityError, BindingNamespace, BindingOrigin, CaptureStorageOrigin, ConstDiagnostic,
+        DeclError, DeprecatedUseKind, DynContainerConversionKind, MemberAccessKind, ModuleScope,
+        TryCarrierKind, TypeError, TypeWarning, VariantShape,
     },
 };
 
@@ -640,8 +642,11 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::InvalidFormatSpec { reason, .. } => {
             format!("invalid format specifier: {reason}")
         }
-        TypeError::CannotMutateCapturedVariable { name, .. } => {
-            format!("cannot mutate captured variable '{name}'")
+        TypeError::NonEscapingCallbackEscapes { name, .. } => {
+            format!("callback parameter '{name}' is non-escaping by default, but it escapes here")
+        }
+        TypeError::BorrowedCaptureEscapes { name, origin, .. } => {
+            borrowed_capture_escape_message(*name, *origin)
         }
         TypeError::RequiresMutablePlace { name, .. } => {
             format!("cannot mutably borrow non-storage place '{name}'")
@@ -992,6 +997,12 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("duplicate generic parameter '{name}'")
         }
     });
+    let diagnostic = match error {
+        TypeError::NonEscapingCallbackEscapes {
+            help: Some(help), ..
+        } => diagnostic.with_help(help.clone()),
+        _ => diagnostic,
+    };
     with_primary_if_known(diagnostic, span)
 }
 
@@ -999,6 +1010,34 @@ fn with_primary_if_known(diagnostic: Diagnostic, span: Option<SourceSpan>) -> Di
     match span {
         Some(span) => diagnostic.with_primary(span),
         None => diagnostic,
+    }
+}
+
+fn borrowed_capture_escape_message(name: Ident, origin: CaptureStorageOrigin) -> String {
+    match origin {
+        CaptureStorageOrigin::BorrowedParam => {
+            format!("cannot capture borrowed parameter '{name}' in an escaping lambda")
+        }
+        CaptureStorageOrigin::VarSelf => {
+            "cannot capture mutable receiver 'self' in an escaping lambda".to_string()
+        }
+        CaptureStorageOrigin::DynView => {
+            format!("cannot capture borrowed dynamic view '{name}' in an escaping lambda")
+        }
+        CaptureStorageOrigin::PatternAlias => {
+            format!("cannot capture mutable pattern alias '{name}' in an escaping lambda")
+        }
+        CaptureStorageOrigin::MutableDowncastAlias => {
+            format!("cannot capture mutable downcast alias '{name}' in an escaping lambda")
+        }
+        CaptureStorageOrigin::ForVarAlias => {
+            format!("cannot capture mutable loop alias '{name}' in an escaping lambda")
+        }
+        CaptureStorageOrigin::Owned
+        | CaptureStorageOrigin::Const
+        | CaptureStorageOrigin::ReadonlySelf => {
+            format!("cannot capture '{name}' in an escaping lambda")
+        }
     }
 }
 
@@ -1159,7 +1198,8 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::MutatingMethodImmutableReceiver { span, .. }
         | TypeError::MutableAlias { span, .. }
         | TypeError::InvalidFormatSpec { span, .. }
-        | TypeError::CannotMutateCapturedVariable { span, .. }
+        | TypeError::NonEscapingCallbackEscapes { span, .. }
+        | TypeError::BorrowedCaptureEscapes { span, .. }
         | TypeError::RequiresMutablePlace { span, .. }
         | TypeError::VarPatternRequiresMutablePlace { span, .. }
         | TypeError::ForVarRequiresMutableIterable { span, .. }
@@ -1457,16 +1497,27 @@ fn render_detailed_type(ty: &Type) -> String {
     }
 }
 
+fn render_param_prefix(mutable: bool, escape: EscapeMode, cast_accept: bool) -> String {
+    let mut rendered = String::new();
+    if mutable {
+        rendered.push_str("var ");
+    }
+    if escape.is_escaping() {
+        rendered.push_str("escaping ");
+    }
+    if cast_accept {
+        rendered.push_str("as ");
+    }
+    rendered
+}
+
 fn render_detailed_func(params: &[FuncParam], ret: &ReturnSpec) -> String {
     let params = params
         .iter()
         .map(|param| {
-            let ty = render_detailed_type(&param.ty);
-            if param.mutable {
-                format!("var {ty}")
-            } else {
-                ty
-            }
+            let mut rendered = render_param_prefix(param.mutable, param.escape, param.cast_accept);
+            rendered.push_str(&render_detailed_type(&param.ty));
+            rendered
         })
         .collect::<Vec<_>>()
         .join(", ");

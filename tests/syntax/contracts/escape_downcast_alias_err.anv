@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture mutable downcast alias 'enemy' in an escaping lambda
+// @frontend: new
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Enemy {
+    hp: int,
+
+    fn update(var self) {}
+}
+
+fn bad(var actor: dyn Updatable) -> fn() {
+    if var enemy = actor as? Enemy {
+        return || { enemy.hp = 1; };
+    }
+    || {}
+}

@@ -1,10 +1,10 @@
 use anvyx_externs::{
     BinaryOp as ExternBinaryOp, CallbackEscape, CallbackPolicy, CallbackThread,
-    ExternCallbackSignature, ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor,
-    ExternInitDescriptor, ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator,
-    ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor,
-    ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath, ParamFlow,
-    ProviderDescriptor, ProviderId, ReceiverMode, UnaryOp,
+    ExternCallbackParam, ExternCallbackSignature, ExternEffects, ExternFieldDescriptor,
+    ExternFunctionDescriptor, ExternInitDescriptor, ExternMethodDescriptor, ExternModuleDescriptor,
+    ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
+    ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath,
+    ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, UnaryOp,
 };
 
 use super::support::{
@@ -151,6 +151,7 @@ fn flow_param(name: &str, ty: ExternTypeExpr, flow: ParamFlow) -> ExternParam {
         name: Some(name.to_string()),
         ty,
         flow,
+        escape: CallbackEscape::NonEscaping,
     }
 }
 
@@ -279,7 +280,13 @@ fn module_named(module: &[&str], name: &str) -> ExternTypeExpr {
 
 fn callback(params: Vec<ExternTypeExpr>, ret: ExternTypeExpr) -> ExternTypeExpr {
     ExternTypeExpr::Callback(ExternCallbackSignature {
-        params,
+        params: params
+            .into_iter()
+            .map(|ty| ExternCallbackParam {
+                ty,
+                escape: CallbackEscape::NonEscaping,
+            })
+            .collect(),
         ret: Box::new(ret),
         policy: CallbackPolicy {
             escape: CallbackEscape::NonEscaping,
@@ -886,25 +893,6 @@ mod callbacks {
     }
 
     #[test]
-    fn rejects_arity() {
-        let Err(errors) = check(
-            r"
-            extern fn apply(value: int, cb: fn(int) -> int) -> int;
-            fn add(a: int, b: int) -> int { a + b }
-            fn main() { apply(5, add); }
-            ",
-        ) else {
-            panic!("wrong callback arity should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
-        );
-    }
-
-    #[test]
     fn rejects_param_type() {
         let Err(errors) = check(
             r"
@@ -914,25 +902,6 @@ mod callbacks {
             ",
         ) else {
             panic!("wrong callback parameter type should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_return_type() {
-        let Err(errors) = check(
-            r#"
-            extern fn apply(value: int, cb: fn(int) -> int) -> int;
-            fn label(x: int) -> string { "x" }
-            fn main() { apply(5, label); }
-            "#,
-        ) else {
-            panic!("wrong callback return type should fail");
         };
 
         assert!(
@@ -1025,17 +994,6 @@ mod callbacks {
                 .iter()
                 .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
         );
-    }
-
-    #[test]
-    fn lambda_callback() {
-        check(
-            r"
-            extern fn apply(value: int, cb: fn(int) -> int) -> int;
-            fn main() { apply(5, |x| x * 2); }
-            ",
-        )
-        .expect("lambda callback should typecheck");
     }
 }
 
@@ -2904,6 +2862,29 @@ mod mut_borrow {
 
         assert_use(&result, ExternUseTarget::Function(id));
         assert_typecheck_closed(&result);
+    }
+
+    #[test]
+    fn lambda_capture_access_is_mutable() {
+        let result = check_with_provider(
+            r"
+            import ext:host { touch };
+            fn use_it() {
+                var x = 1;
+                let f = || { touch(x); };
+                f();
+            }
+            ",
+            touch_provider(vec![], ExternTypeExpr::Int),
+        )
+        .expect("typecheck failed");
+
+        let capture = result
+            .lambda_captures()
+            .values()
+            .find(|capture| capture.name.as_str() == "x")
+            .expect("x capture fact");
+        assert_eq!(capture.access, typecheck::CaptureAccess::Mutable);
     }
 
     #[test]

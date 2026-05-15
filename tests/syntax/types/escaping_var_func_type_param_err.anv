@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @contains: `escaping` cannot be combined with `var`
+// @frontend: new
+
+type Bad = fn(var escaping fn());

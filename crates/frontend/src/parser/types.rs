@@ -2,7 +2,7 @@ use chumsky::{error::Rich, prelude::*};
 
 use super::{
     AnvParser, BoxedParser,
-    common::{TupleShapeResult, identifier, validate_tuple_shape_raw},
+    common::{TupleShapeResult, escaping_kw, escaping_type, identifier, validate_tuple_shape_raw},
 };
 use crate::{
     ast::{self, Type},
@@ -314,13 +314,24 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
 
         let bracketed_type = choice((array_type, choice((map_type, list_type))));
 
+        let invalid_escaping_type =
+            escaping_kw()
+                .ignore_then(type_parser.clone())
+                .validate(|ty, extra, emitter| {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        "`escaping` cannot be used on local variable, field, or return types",
+                    ));
+                    ty
+                });
+
         let var_kw = select! { Token::Keyword(Keyword::Var) => () }
             .or_not()
             .map(|opt| opt.is_some());
 
         let fn_param = var_kw
-            .then(param_type_parser)
-            .map(|(mutable, ty)| ast::FuncParam::new(ty, mutable, false));
+            .then(escaping_type(param_type_parser))
+            .map(|(mutable, (escape, ty))| ast::FuncParam::new(ty, mutable, false, escape));
 
         let return_value_type = choice((
             select! { Token::Ident(ident) if ident.0.as_ref() == "_" => Type::InferReturn },
@@ -346,17 +357,17 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
                     )
                     .then_ignore(close_paren),
             )
-            .then_ignore(arrow)
-            .then(fn_return_spec)
+            .then(arrow.ignore_then(fn_return_spec).or_not())
             .map(|(params, ret)| Type::Func {
                 params,
-                ret: Box::new(ret),
+                ret: Box::new(ret.unwrap_or_else(ast::ReturnSpec::void)),
             });
 
         let primary_type = choice((
             builtin_typ,
             slice_type,
             dyn_type,
+            invalid_escaping_type,
             type_name_ref,
             paren_type,
             bracketed_type,

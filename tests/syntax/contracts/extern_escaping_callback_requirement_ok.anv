@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Clickable {
+    fn on(self, f: escaping fn());
+}
+
+extern type Button {
+    fn on(self, f: escaping fn());
+}
+
+fn main(button: Button) {
+    let clickable: dyn Clickable = button;
+}

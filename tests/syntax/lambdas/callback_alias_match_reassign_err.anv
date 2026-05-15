@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'f' is non-escaping by default, but it escapes here
+// @frontend: new
+
+fn bad(f: fn(), opt: int?) -> fn() {
+    var g = f;
+    match opt {
+        Option.Some(_) => { g = || {}; },
+        Option.None => {},
+    };
+    g
+}

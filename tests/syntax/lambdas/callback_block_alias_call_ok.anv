@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn run(f: fn()) {
+    f();
+}
+
+fn main(f: fn()) {
+    let g = { f };
+    run(g);
+}

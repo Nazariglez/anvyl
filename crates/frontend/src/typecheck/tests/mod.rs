@@ -4,6 +4,7 @@ mod contracts;
 mod externs;
 mod globals;
 mod imports;
+mod lambdas;
 mod members;
 mod patterns;
 mod support;

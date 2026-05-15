@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type escaping = int;
+
+fn take(f: fn(escaping)) {
+}

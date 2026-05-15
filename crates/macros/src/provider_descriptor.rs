@@ -172,6 +172,7 @@ fn function_tokens(function: &Function) -> TokenStream {
                 name: Some(#name.to_string()),
                 ty: #ty,
                 flow: anvyx_externs::ParamFlow::Value,
+                escape: anvyx_externs::CallbackEscape::NonEscaping,
             }
         }
     });

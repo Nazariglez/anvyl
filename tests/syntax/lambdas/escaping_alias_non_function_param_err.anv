@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: `escaping` is only valid on function-typed parameters
+// @frontend: new
+
+type Count = int;
+
+fn bad(f: escaping Count) {
+}

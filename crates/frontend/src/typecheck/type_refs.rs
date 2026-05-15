@@ -377,6 +377,7 @@ impl<'a> TypeRefResolver<'a> {
                             self.finalize_inner(module, generics, &param.ty, state)?,
                             param.mutable,
                             param.cast_accept,
+                            param.escape,
                         ))
                     })
                     .collect::<Result<_, _>>()?,
@@ -728,6 +729,7 @@ impl<'a> TypeRefResolver<'a> {
             .map(|param| {
                 Ok(crate::ast::AnonymousContractParam {
                     mutable: param.mutable,
+                    escape: param.escape,
                     name: param.name,
                     ty: self.finalize_inner(module, generics, &param.ty, state)?,
                 })

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type escaping = int;
+
+fn id(x: escaping) -> escaping {
+    x
+}

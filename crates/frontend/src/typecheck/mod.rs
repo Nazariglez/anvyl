@@ -5,6 +5,9 @@ use std::{
 };
 
 use self::{
+    closure::{
+        BorrowedCapture, ClosureClassifier, ClosureScopeState, EscapeEvent, NonEscapingCallback,
+    },
     const_term::ConstTerm,
     dyn_infer::DynInference,
     generic_bind::bind_exact_generic_args,
@@ -49,6 +52,7 @@ use crate::{
 };
 
 mod annotation;
+mod closure;
 mod const_eval;
 mod const_term;
 mod contracts;
@@ -325,8 +329,14 @@ pub(crate) enum TypeError {
         reason: &'static str,
         span: Option<SourceSpan>,
     },
-    CannotMutateCapturedVariable {
+    NonEscapingCallbackEscapes {
         name: Ident,
+        help: Option<String>,
+        span: Option<SourceSpan>,
+    },
+    BorrowedCaptureEscapes {
+        name: Ident,
+        origin: CaptureStorageOrigin,
         span: Option<SourceSpan>,
     },
     RequiresMutablePlace {
@@ -771,58 +781,132 @@ impl From<SolverFinalizeError> for TypeError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalBindingKind {
-    Immutable,
+enum BindingMutability {
+    Readonly,
     Mutable,
-    DynView,
-    Const,
-    Alias,
-    ReadonlySelf,
 }
 
-impl LocalBindingKind {
-    fn from_param(mutable: bool, ty: &Type) -> Self {
-        if mutable && matches!(ty, Type::Dyn(_)) {
-            Self::DynView
-        } else {
-            Self::from_mutable(mutable)
-        }
-    }
-
-    fn from_mutable(mutable: bool) -> Self {
+impl BindingMutability {
+    fn from_bool(mutable: bool) -> Self {
         if mutable {
             Self::Mutable
         } else {
-            Self::Immutable
+            Self::Readonly
         }
-    }
-
-    fn requires_runtime_capture(self) -> bool {
-        !matches!(self, Self::Const)
     }
 
     fn place_access(self) -> PlaceAccess {
         match self {
-            Self::Immutable => PlaceAccess::Immutable,
-            Self::Mutable | Self::Alias => PlaceAccess::Mutable,
-            Self::DynView => PlaceAccess::DynView,
-            Self::Const => PlaceAccess::Const,
-            Self::ReadonlySelf => PlaceAccess::ReadonlySelf,
+            Self::Readonly => PlaceAccess::Immutable,
+            Self::Mutable => PlaceAccess::Mutable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalBindingKind {
+    mutability: BindingMutability,
+    storage: CaptureStorageOrigin,
+}
+
+impl LocalBindingKind {
+    fn immutable() -> Self {
+        Self::from_mutable(false)
+    }
+
+    fn constant() -> Self {
+        Self {
+            mutability: BindingMutability::Readonly,
+            storage: CaptureStorageOrigin::Const,
+        }
+    }
+
+    fn borrowed_self() -> Self {
+        Self {
+            mutability: BindingMutability::Mutable,
+            storage: CaptureStorageOrigin::VarSelf,
+        }
+    }
+
+    fn pattern_alias(context: PatternContext) -> Self {
+        let storage = match context {
+            PatternContext::For => CaptureStorageOrigin::ForVarAlias,
+            _ => CaptureStorageOrigin::PatternAlias,
+        };
+        Self {
+            mutability: BindingMutability::Mutable,
+            storage,
+        }
+    }
+
+    fn downcast_alias() -> Self {
+        Self {
+            mutability: BindingMutability::Mutable,
+            storage: CaptureStorageOrigin::MutableDowncastAlias,
+        }
+    }
+
+    fn readonly_self() -> Self {
+        Self {
+            mutability: BindingMutability::Readonly,
+            storage: CaptureStorageOrigin::ReadonlySelf,
+        }
+    }
+
+    fn from_param(mutable: bool, ty: &Type) -> Self {
+        let mutability = BindingMutability::from_bool(mutable);
+        let storage = if mutable && matches!(ty, Type::Dyn(_)) {
+            CaptureStorageOrigin::DynView
+        } else if mutable {
+            CaptureStorageOrigin::BorrowedParam
+        } else {
+            CaptureStorageOrigin::Owned
+        };
+        Self {
+            mutability,
+            storage,
+        }
+    }
+
+    fn from_mutable(mutable: bool) -> Self {
+        Self {
+            mutability: BindingMutability::from_bool(mutable),
+            storage: CaptureStorageOrigin::Owned,
+        }
+    }
+
+    fn requires_runtime_capture(self) -> bool {
+        !matches!(self.storage, CaptureStorageOrigin::Const)
+    }
+
+    fn place_access(self) -> PlaceAccess {
+        match self.storage {
+            CaptureStorageOrigin::Owned
+            | CaptureStorageOrigin::BorrowedParam
+            | CaptureStorageOrigin::VarSelf => self.mutability.place_access(),
+            CaptureStorageOrigin::DynView => PlaceAccess::DynView,
+            CaptureStorageOrigin::Const => PlaceAccess::Const,
+            CaptureStorageOrigin::PatternAlias
+            | CaptureStorageOrigin::MutableDowncastAlias
+            | CaptureStorageOrigin::ForVarAlias => PlaceAccess::Mutable,
+            CaptureStorageOrigin::ReadonlySelf => PlaceAccess::ReadonlySelf,
         }
     }
 }
 
 #[derive(Clone)]
 struct VarInfo {
+    binding_id: BindingId,
     type_id: LocalTypeId,
     kind: LocalBindingKind,
     const_value: Option<ConstValue>,
     local_const: Option<LocalConstId>,
-    alias: Option<place::AliasTarget>,
+    alias: Option<Box<place::AliasTarget>>,
 }
 
 #[derive(Clone)]
 struct LocalCallableInfo {
+    binding_id: BindingId,
     type_id: LocalTypeId,
     callee: CallableRef,
 }
@@ -835,7 +919,7 @@ enum LocalSymbol {
 
 enum LocalSymbolLookup {
     Found(LocalSymbol, usize),
-    Blocked(TypeError),
+    Blocked(Box<TypeError>),
     Missing,
 }
 
@@ -844,6 +928,7 @@ struct LocalConstId(u32);
 
 #[derive(Clone, Copy)]
 struct LocalConstInfo {
+    binding_id: BindingId,
     type_id: LocalTypeId,
     id: LocalConstId,
 }
@@ -851,8 +936,9 @@ struct LocalConstInfo {
 impl LocalConstInfo {
     fn symbol(self) -> LocalSymbol {
         LocalSymbol::Value(VarInfo {
+            binding_id: self.binding_id,
             type_id: self.type_id,
-            kind: LocalBindingKind::Const,
+            kind: LocalBindingKind::constant(),
             const_value: None,
             local_const: Some(self.id),
             alias: None,
@@ -862,8 +948,7 @@ impl LocalConstInfo {
 
 struct LocalValue {
     info: VarInfo,
-    depth: usize,
-    requires_runtime_capture: bool,
+    source_depth: usize,
 }
 
 struct LocalPlaceAccess {
@@ -924,8 +1009,9 @@ impl LocalCallableInfo {
 
     fn value_view(&self) -> VarInfo {
         VarInfo {
+            binding_id: self.binding_id,
             type_id: self.type_id,
-            kind: LocalBindingKind::Immutable,
+            kind: LocalBindingKind::immutable(),
             const_value: None,
             local_const: None,
             alias: None,
@@ -991,20 +1077,24 @@ struct ReturnFrame {
     mode: ReturnMode,
 }
 
-struct LambdaFrame {
-    start_scope: usize,
-}
-
 #[derive(Clone)]
 struct ScopeState {
     scopes: Vec<HashMap<Ident, LocalSymbol>>,
     local_type_scopes: LocalTypeScopes,
+    closure: ClosureScopeState,
 }
 
 #[derive(Clone)]
 struct ActiveMutDowncastRoot {
     identity: PlaceIdentity,
     allowed: Ident,
+}
+
+#[derive(Clone, Copy)]
+enum ExplicitCast {
+    Identity,
+    Builtin,
+    CastFrom { escape: EscapeMode },
 }
 
 struct TypeChecker {
@@ -1020,6 +1110,7 @@ struct TypeChecker {
     dyn_calls: DynCallMap,
     dyn_downcasts: DynDowncastMap,
     global_accesses: GlobalAccessMap,
+    closure: ClosureClassifier,
     global_types: HashMap<GlobalKey, LocalTypeId>,
     active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
     dyn_infer_registered_modules: HashSet<ModuleScope>,
@@ -1030,7 +1121,6 @@ struct TypeChecker {
     promoted_surfaces: HashMap<CanonicalTypeKey, PromotedSurface>,
     scopes: Vec<HashMap<Ident, LocalSymbol>>,
     local_type_scopes: LocalTypeScopes,
-    lambda_frames: Vec<LambdaFrame>,
     named_function_frames: Vec<NamedFunctionFrame>,
     returns: Vec<ReturnFrame>,
     loop_depth: usize,
@@ -1053,6 +1143,7 @@ struct TypeChecker {
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
     local_consts: Vec<const_eval::LocalConstEntry>,
     next_alias_alt_group: u32,
+    next_binding_id: u32,
 }
 
 struct ConstNormalizer<'tc> {
@@ -1125,6 +1216,7 @@ impl TypeChecker {
             dyn_calls: HashMap::new(),
             dyn_downcasts: HashMap::new(),
             global_accesses: HashMap::new(),
+            closure: ClosureClassifier::default(),
             global_types: HashMap::new(),
             active_mut_downcast_roots: vec![],
             dyn_infer_registered_modules: HashSet::new(),
@@ -1135,7 +1227,6 @@ impl TypeChecker {
             promoted_surfaces: HashMap::new(),
             scopes: vec![],
             local_type_scopes: LocalTypeScopes::default(),
-            lambda_frames: vec![],
             named_function_frames: vec![],
             returns: vec![],
             loop_depth: 0,
@@ -1158,6 +1249,7 @@ impl TypeChecker {
             consts: HashMap::new(),
             local_consts: vec![],
             next_alias_alt_group: 0,
+            next_binding_id: 0,
         }
     }
 
@@ -1200,13 +1292,37 @@ impl TypeChecker {
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.closure.exit_scope(self.scopes.len());
         self.local_type_scopes.pop_scope();
     }
 
+    fn closure_scope_state_from(
+        &self,
+        scopes: &[HashMap<Ident, LocalSymbol>],
+    ) -> ClosureScopeState {
+        self.closure
+            .scope_state_for_bindings(scopes.iter().enumerate().flat_map(|(depth, scope)| {
+                scope.iter().map(move |(name, symbol)| match symbol {
+                    LocalSymbol::Value(info) => {
+                        (info.binding_id, *name, info.type_id, info.kind, depth)
+                    }
+                    LocalSymbol::Callable(info) => (
+                        info.binding_id,
+                        *name,
+                        info.type_id,
+                        LocalBindingKind::immutable(),
+                        depth,
+                    ),
+                })
+            }))
+    }
+
     fn scope_state_from(&self, scopes: Vec<HashMap<Ident, LocalSymbol>>) -> ScopeState {
+        let closure = self.closure_scope_state_from(&scopes);
         ScopeState {
             scopes,
             local_type_scopes: self.local_type_scopes.clone(),
+            closure,
         }
     }
 
@@ -1214,12 +1330,22 @@ impl TypeChecker {
         ScopeState {
             scopes: std::mem::take(&mut self.scopes),
             local_type_scopes: std::mem::take(&mut self.local_type_scopes),
+            closure: self
+                .closure
+                .replace_scope_state(ClosureScopeState::default()),
         }
     }
 
     fn restore_scope_state(&mut self, state: ScopeState) {
         self.scopes = state.scopes;
         self.local_type_scopes = state.local_type_scopes;
+        self.closure.restore_scope_state(state.closure);
+    }
+
+    fn replace_scopes(&mut self, scopes: Vec<HashMap<Ident, LocalSymbol>>) {
+        let closure = self.closure_scope_state_from(&scopes);
+        self.scopes = scopes;
+        self.closure.restore_scope_state(closure);
     }
 
     fn replace_scope_state(&mut self, state: ScopeState) -> ScopeState {
@@ -1229,6 +1355,7 @@ impl TypeChecker {
                 &mut self.local_type_scopes,
                 state.local_type_scopes,
             ),
+            closure: self.closure.replace_scope_state(state.closure),
         }
     }
 
@@ -1236,6 +1363,26 @@ impl TypeChecker {
         let id = self.next_alias_alt_group;
         self.next_alias_alt_group += 1;
         AliasAltGroupId::new(id)
+    }
+
+    fn fresh_binding_id(&mut self) -> BindingId {
+        let id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+        id
+    }
+
+    fn define_closure_binding(
+        &mut self,
+        binding_id: BindingId,
+        name: Ident,
+        type_id: LocalTypeId,
+        kind: LocalBindingKind,
+    ) {
+        let Some(scope_depth) = self.scopes.len().checked_sub(1) else {
+            return;
+        };
+        self.closure
+            .define_binding(binding_id, name, type_id, kind, scope_depth);
     }
 
     fn define(&mut self, name: Ident, ty: Type, mutable: bool) {
@@ -1262,18 +1409,34 @@ impl TypeChecker {
         name: Ident,
         handle: &TypeHandle,
         target: place::AliasTarget,
+        context: PatternContext,
     ) {
         self.define_shadowing_value_from_handle(
             name,
             handle,
-            LocalBindingKind::Alias,
+            LocalBindingKind::pattern_alias(context),
+            None,
+            Some(target),
+        );
+    }
+
+    fn define_downcast_alias_from_handle(
+        &mut self,
+        name: Ident,
+        handle: &TypeHandle,
+        target: place::AliasTarget,
+    ) {
+        self.define_shadowing_value_from_handle(
+            name,
+            handle,
+            LocalBindingKind::downcast_alias(),
             None,
             Some(target),
         );
     }
 
     fn define_const(&mut self, name: Ident, ty: Type, value: ConstValue) {
-        self.define_value(name, ty, LocalBindingKind::Const, Some(value));
+        self.define_value(name, ty, LocalBindingKind::constant(), Some(value));
     }
 
     fn define_value(
@@ -1294,33 +1457,39 @@ impl TypeChecker {
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
     ) -> LocalTypeId {
+        let binding_id = self.fresh_binding_id();
         let type_id = self.solver.alloc_local_type(&ty);
-        self.define_local_symbol(
+        let inserted = self.define_local_symbol(
             name,
             LocalSymbol::Value(VarInfo {
+                binding_id,
                 type_id,
                 kind,
                 const_value,
                 local_const: None,
-                alias,
+                alias: alias.map(Box::new),
             }),
         );
+        if inserted {
+            self.define_closure_binding(binding_id, name, type_id, kind);
+        }
         type_id
     }
 
-    fn define_local_symbol(&mut self, name: Ident, symbol: LocalSymbol) {
+    fn define_local_symbol(&mut self, name: Ident, symbol: LocalSymbol) -> bool {
         let Some(scope) = self.scopes.last() else {
-            return;
+            return false;
         };
         if scope.contains_key(&name) {
             self.errors
                 .push(TypeError::DuplicateName { name, span: None });
-            return;
+            return false;
         }
         self.scopes
             .last_mut()
             .expect("scope exists")
             .insert(name, symbol);
+        true
     }
 
     fn define_shadowing_value_from_handle(
@@ -1343,27 +1512,137 @@ impl TypeChecker {
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
     ) {
+        let binding_id = self.fresh_binding_id();
         let Some(scope) = self.scopes.last_mut() else {
             return;
         };
         scope.insert(
             name,
             LocalSymbol::Value(VarInfo {
+                binding_id,
                 type_id,
                 kind,
                 const_value,
                 local_const: None,
-                alias,
+                alias: alias.map(Box::new),
             }),
+        );
+        self.define_closure_binding(binding_id, name, type_id, kind);
+    }
+
+    fn local_binding_id(&self, name: Ident) -> Option<BindingId> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| match scope.get(&name) {
+                Some(LocalSymbol::Value(info)) => Some(info.binding_id),
+                Some(LocalSymbol::Callable(info)) => Some(info.binding_id),
+                _ => None,
+            })
+    }
+
+    fn mark_non_escaping_callback_binding(&mut self, name: Ident, origin: NonEscapingCallback) {
+        let Some(binding_id) = self.local_binding_id(name) else {
+            return;
+        };
+        self.closure.add_binding_callback(binding_id, origin);
+    }
+
+    fn record_escaping_use(&mut self, expr: &ExprNode) {
+        self.closure.record_escaping_use(expr.node.id, expr.span);
+    }
+
+    fn push_escape_events(&mut self, events: Vec<EscapeEvent>) {
+        for event in events {
+            match event {
+                EscapeEvent::Callback { origin, span } => {
+                    self.push_non_escaping_callback_escape(&origin, span);
+                }
+                EscapeEvent::Borrowed { capture, span } => {
+                    self.push_borrowed_escaping_capture(&capture, span);
+                }
+            }
+        }
+    }
+
+    fn check_argument_escape(&mut self, arg: &ExprNode, escape: EscapeMode) {
+        if escape.is_escaping() {
+            self.record_escaping_use(arg);
+        }
+    }
+
+    fn record_aggregate_elem_flow(&mut self, aggregate: ExprId, elem: &ExprNode) {
+        self.record_escaping_use(elem);
+        self.closure.copy_expr_flow(elem.node.id, aggregate);
+    }
+
+    fn mark_non_escaping_callback_param(
+        &mut self,
+        name: Ident,
+        type_id: LocalTypeId,
+        param: &FuncParam,
+        source_ty: Option<&Type>,
+    ) {
+        if param.escape.is_escaping() || !matches!(param.ty, Type::Func { .. }) {
+            return;
+        }
+        let ty = source_ty.unwrap_or(&param.ty);
+        let help = Some(format!("mark the parameter as `{name}: escaping {ty}`"));
+        self.mark_non_escaping_callback_binding(
+            name,
+            NonEscapingCallback {
+                id: type_id,
+                name,
+                help,
+            },
         );
     }
 
+    fn push_non_escaping_callback_escape(&mut self, origin: &NonEscapingCallback, span: Span) {
+        if !self.closure.record_non_escaping_callback_escape(origin.id) {
+            return;
+        }
+        let help = origin.help.clone().or_else(|| {
+            let ty = self.solver.local_type_to_type(origin.id);
+            matches!(ty, Type::Func { .. })
+                .then(|| format!("mark the parameter as `{}: escaping {ty}`", origin.name))
+        });
+        self.push_error(TypeError::NonEscapingCallbackEscapes {
+            name: origin.name,
+            help,
+            span: self.error_span(span),
+        });
+    }
+
+    fn record_local_read(&mut self, expr: ExprId, value: &LocalValue) {
+        self.closure
+            .record_local_read(expr, value.info.binding_id, value.source_depth);
+    }
+
+    fn push_borrowed_escaping_capture(&mut self, capture: &BorrowedCapture, span: Span) {
+        if !self.closure.record_borrowed_escaping_capture(capture.id) {
+            return;
+        }
+        self.push_error(TypeError::BorrowedCaptureEscapes {
+            name: capture.name,
+            origin: capture.origin,
+            span: self.error_span(span),
+        });
+    }
+
     fn define_local_callable(&mut self, name: Ident, callee: CallableRef, surface_ty: Type) {
+        let binding_id = self.fresh_binding_id();
         let type_id = self.solver.alloc_local_type(&surface_ty);
-        let info = LocalCallableInfo { type_id, callee };
+        let info = LocalCallableInfo {
+            binding_id,
+            type_id,
+            callee,
+        };
         self.local_callables
             .insert(info.callee.def.id.clone(), info.clone());
-        self.define_local_symbol(name, LocalSymbol::Callable(Box::new(info)));
+        if self.define_local_symbol(name, LocalSymbol::Callable(Box::new(info))) {
+            self.define_closure_binding(binding_id, name, type_id, LocalBindingKind::immutable());
+        }
     }
 
     fn lookup(&self, name: Ident) -> Option<VarInfo> {
@@ -1396,10 +1675,10 @@ impl TypeChecker {
             return LocalSymbolLookup::Missing;
         };
         if self.blocks_named_capture(&symbol, depth) {
-            return LocalSymbolLookup::Blocked(TypeError::NamedFunctionCapture {
+            return LocalSymbolLookup::Blocked(Box::new(TypeError::NamedFunctionCapture {
                 name,
                 span: self.error_span(span),
-            });
+            }));
         }
         LocalSymbolLookup::Found(symbol, depth)
     }
@@ -1415,18 +1694,25 @@ impl TypeChecker {
                     self.push_error(error);
                     Err(())
                 } else {
-                    Ok(Some(LocalValue {
-                        info: symbol.value_view(),
+                    Ok(Some(self.local_value_from_info(
+                        name,
+                        symbol.value_view(),
                         depth,
-                        requires_runtime_capture: symbol.requires_runtime_capture(),
-                    }))
+                    )))
                 }
             }
             LocalSymbolLookup::Blocked(error) => {
-                self.push_error(error);
+                self.push_error(*error);
                 Err(())
             }
             LocalSymbolLookup::Missing => Ok(None),
+        }
+    }
+
+    fn local_value_from_info(&self, _name: Ident, info: VarInfo, depth: usize) -> LocalValue {
+        LocalValue {
+            info,
+            source_depth: depth,
         }
     }
 
@@ -1448,24 +1734,9 @@ impl TypeChecker {
         self.named_function_frames.pop();
     }
 
-    fn crosses_lambda_capture_boundary(&self, depth: usize) -> bool {
-        self.lambda_frames
-            .last()
-            .is_some_and(|frame| depth > 0 && depth < frame.start_scope)
-    }
-
-    fn captures_runtime_value(&self, value: &LocalValue) -> bool {
-        value.requires_runtime_capture && self.crosses_lambda_capture_boundary(value.depth)
-    }
-
     fn local_value_access(&self, value: &LocalValue) -> LocalPlaceAccess {
-        let captured = self.captures_runtime_value(value);
-        let alias = value.info.alias.as_ref();
-        let access = if captured {
-            PlaceAccess::Captured
-        } else {
-            alias.map_or_else(|| value.info.kind.place_access(), |alias| alias.access)
-        };
+        let alias = value.info.alias.as_deref();
+        let access = alias.map_or_else(|| value.info.kind.place_access(), |alias| alias.access);
         let (facts, identity, accepts_extern_any) = match alias {
             Some(alias) => (
                 alias.facts.clone(),
@@ -1486,14 +1757,9 @@ impl TypeChecker {
         }
     }
 
-    fn enter_lambda(&mut self) {
-        self.lambda_frames.push(LambdaFrame {
-            start_scope: self.scopes.len(),
-        });
-    }
-
-    fn exit_lambda(&mut self) {
-        self.lambda_frames.pop();
+    fn enter_lambda(&mut self, expr_id: ExprId) {
+        self.closure.mark_lambda_non_escaping(expr_id);
+        self.closure.enter_lambda(expr_id, self.scopes.len());
     }
 
     fn type_handle(&self, ty: &Type) -> TypeHandle {
@@ -2255,6 +2521,11 @@ impl TypeChecker {
         self.specializations.insert(key, state);
     }
 
+    fn closure_fact_snapshot(&self) -> TypecheckFacts {
+        self.closure
+            .fact_snapshot(|id| self.solver.local_type_to_type(id))
+    }
+
     fn specialization_facts(&self) -> SpecializedBodyFacts {
         SpecializedBodyFacts {
             types: self.expr_types(),
@@ -2268,6 +2539,7 @@ impl TypeChecker {
             dyn_calls: self.dyn_calls.clone(),
             dyn_downcasts: self.dyn_downcasts.clone(),
             global_accesses: self.global_accesses.clone(),
+            closure: self.closure_fact_snapshot(),
         }
     }
 
@@ -2293,6 +2565,7 @@ impl TypeChecker {
         self.dyn_calls.extend(facts.dyn_calls);
         self.dyn_downcasts.extend(facts.dyn_downcasts);
         self.global_accesses.extend(facts.global_accesses);
+        self.closure.extend_facts(facts.closure);
     }
 
     fn resolved_value(value: ResolvedValue) -> (ModuleScope, Ident, ValueDecl) {
@@ -2326,18 +2599,25 @@ impl TypeChecker {
             .find_static_extend_method(target, name, |ext| self.extend_visible(ext))
     }
 
-    fn has_explicit_cast_conversion(&self, source: &Type, target: &Type) -> bool {
-        source == target
-            || builtin_numeric_cast(source, target)
-            || self.has_cast_from_conversion(source, target)
+    fn explicit_cast_conversion(&self, source: &Type, target: &Type) -> Option<ExplicitCast> {
+        if source == target {
+            return Some(ExplicitCast::Identity);
+        }
+        if builtin_numeric_cast(source, target) {
+            return Some(ExplicitCast::Builtin);
+        }
+        self.cast_from_conversion_escape(source, target)
+            .map(|escape| ExplicitCast::CastFrom { escape })
     }
 
-    fn has_cast_from_conversion(&self, source: &Type, target: &Type) -> bool {
-        matches!(
-            self.decls
-                .find_cast_conversion(source, target, |ext| self.extend_visible(ext)),
-            Some(CastConversionMatch::Match)
-        )
+    fn cast_from_conversion_escape(&self, source: &Type, target: &Type) -> Option<EscapeMode> {
+        match self
+            .decls
+            .find_cast_conversion(source, target, |ext| self.extend_visible(ext))
+        {
+            Some(CastConversionMatch::Match { escape }) => Some(escape),
+            Some(CastConversionMatch::Ambiguous) | None => None,
+        }
     }
 
     fn exported_value_in_module(
@@ -2518,6 +2798,7 @@ impl TypeChecker {
     }
 
     fn finish_resolved_type(&mut self, finalized: Type, span: Span) -> Type {
+        self.validate_escaping_parameter_types(&finalized, span);
         self.validate_nominal_uses(&finalized, span);
         let substituted = match self.type_substs.last().cloned() {
             Some(ts) => {
@@ -2534,6 +2815,97 @@ impl TypeChecker {
 
     fn validate_type_return_specs(&mut self, ty: &Type, span: Span) {
         ReturnSpecValidator { tc: self, span }.visit_type(ty);
+    }
+
+    fn validate_func_param_escape(
+        &mut self,
+        escape: EscapeMode,
+        mutable: bool,
+        cast_accept: bool,
+        ty: &Type,
+        span: Span,
+    ) {
+        let span = self.error_span(span);
+        validate_param_escape(&mut self.errors, escape, mutable, cast_accept, ty, span);
+    }
+
+    fn validate_escaping_parameter_types(&mut self, ty: &Type, span: Span) {
+        match ty {
+            Type::Func { params, ret } => {
+                for param in params {
+                    self.validate_func_param_escape(
+                        param.escape,
+                        param.mutable,
+                        param.cast_accept,
+                        &param.ty,
+                        span,
+                    );
+                    self.validate_escaping_parameter_types(&param.ty, span);
+                }
+                self.validate_escaping_parameter_types(&ret.ty, span);
+            }
+            Type::Tuple(elems) => {
+                for elem in elems {
+                    self.validate_escaping_parameter_types(elem, span);
+                }
+            }
+            Type::Nominal(nominal) => {
+                for arg in &nominal.type_args {
+                    self.validate_escaping_parameter_types(arg, span);
+                }
+            }
+            Type::UnresolvedNominal { generic_args, .. } => {
+                for arg in generic_args {
+                    if let GenericArg::Type(ty) = arg {
+                        self.validate_escaping_parameter_types(ty, span);
+                    }
+                }
+            }
+            Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+                self.validate_escaping_parameter_types(elem, span);
+            }
+            Type::Map { key, value } => {
+                self.validate_escaping_parameter_types(key, span);
+                self.validate_escaping_parameter_types(value, span);
+            }
+            Type::Dyn(contract) => self.validate_escaping_contract_params(contract, span),
+            Type::Infer
+            | Type::InferReturn
+            | Type::Any
+            | Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Var(_)
+            | Type::UnresolvedName(_) => {}
+        }
+    }
+
+    fn validate_escaping_contract_params(&mut self, contract: &ContractRef, span: Span) {
+        match contract {
+            ContractRef::Anonymous(surface) => {
+                for req in &surface.requirements {
+                    for param in &req.params {
+                        self.validate_func_param_escape(
+                            param.escape,
+                            param.mutable,
+                            false,
+                            &param.ty,
+                            span,
+                        );
+                        self.validate_escaping_parameter_types(&param.ty, span);
+                    }
+                    self.validate_escaping_parameter_types(&req.ret.ty, span);
+                }
+            }
+            ContractRef::Intersection(contracts) => {
+                for contract in contracts {
+                    self.validate_escaping_contract_params(contract, span);
+                }
+            }
+            ContractRef::Named { .. } | ContractRef::Infer | ContractRef::Hole(_) => {}
+        }
     }
 
     fn normalize_type_consts(&mut self, ty: &Type, span: Span) -> Type {
@@ -2744,18 +3116,30 @@ impl TypeChecker {
         params
             .iter()
             .map(|p| {
-                FuncParam::new(
-                    self.resolve_callable_param_type(&p.ty, span, exported),
+                let ty = self.resolve_callable_param_type(&p.ty, span, exported);
+                self.validate_func_param_escape(
+                    p.escape,
                     matches!(p.mutability, Mutability::Mutable),
                     p.cast_accept,
+                    &ty,
+                    span,
+                );
+                FuncParam::new(
+                    ty,
+                    matches!(p.mutability, Mutability::Mutable),
+                    p.cast_accept,
+                    p.escape,
                 )
             })
             .collect()
     }
 
-    fn finish(&mut self) -> Result<SourceExprTypes, Vec<TypeError>> {
+    fn finish(&mut self) -> Result<(SourceExprTypes, TypecheckFacts), Vec<TypeError>> {
         self.solve_constraints();
         self.solve_dyn_inference();
+        let facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
+        let escape_events = self.closure.take_escape_events();
+        self.push_escape_events(escape_events);
         if !self.errors.is_empty() {
             return Err(std::mem::take(&mut self.errors));
         }
@@ -2768,17 +3152,15 @@ impl TypeChecker {
             }
         }
         if self.errors.is_empty() {
-            Ok(types)
+            Ok((types, facts))
         } else {
             Err(std::mem::take(&mut self.errors))
         }
     }
 
     fn into_result(mut self) -> Result<TypecheckResult, Vec<TypeError>> {
-        self.finish()?;
-        Ok(TypecheckResult {
-            warnings: self.warnings,
-        })
+        let (_, facts) = self.finish()?;
+        Ok(TypecheckResult::new(self.warnings, facts))
     }
 
     fn result_closure_errors(&self, types: &SourceExprTypes) -> Vec<TypeError> {
@@ -2999,6 +3381,13 @@ impl TypeChecker {
             }
             Type::Func { params, ret } => {
                 for param in params {
+                    self.validate_func_param_escape(
+                        param.escape,
+                        param.mutable,
+                        param.cast_accept,
+                        &param.ty,
+                        span,
+                    );
                     self.validate_nominal_uses_in(decls, &param.ty, span);
                 }
                 self.validate_nominal_uses_in(decls, &ret.ty, span);
@@ -3042,6 +3431,13 @@ impl TypeChecker {
             ContractRef::Anonymous(surface) => {
                 for req in &surface.requirements {
                     for param in &req.params {
+                        self.validate_func_param_escape(
+                            param.escape,
+                            param.mutable,
+                            false,
+                            &param.ty,
+                            span,
+                        );
                         self.validate_nominal_uses_in(decls, &param.ty, span);
                     }
                     self.validate_nominal_uses_in(decls, &req.ret.ty, span);
@@ -3809,20 +4205,52 @@ fn validate_duplicate_extend_methods(decls: &DeclarationIndex, errors: &mut Vec<
     }
 }
 
+fn validate_param_escape(
+    errors: &mut Vec<TypeError>,
+    escape: EscapeMode,
+    mutable: bool,
+    cast_accept: bool,
+    ty: &Type,
+    span: Option<SourceSpan>,
+) {
+    if !escape.is_escaping() {
+        return;
+    }
+    if mutable {
+        errors.push(TypeError::CompileError {
+            message: "`escaping` cannot be combined with `var`".to_string(),
+            span,
+        });
+    }
+    if cast_accept {
+        errors.push(TypeError::CompileError {
+            message: "`escaping` cannot be combined with `as`".to_string(),
+            span,
+        });
+    }
+    if !matches!(ty, Type::Func { .. }) {
+        errors.push(TypeError::CompileError {
+            message: "`escaping` is only valid on function-typed parameters".to_string(),
+            span,
+        });
+    }
+}
+
 fn validate_cast_froms(
     decls: &DeclarationIndex,
     extend: &ExtendSchema,
     errors: &mut Vec<TypeError>,
 ) {
     for cast in &extend.cast_froms {
+        validate_cast_from_param(cast, errors);
         if same_extend_target(
-            &cast.source,
+            &cast.param.ty,
             &extend.generics,
             &extend.target,
             &extend.generics,
         ) {
             errors.push(TypeError::Decl(DeclError::PointlessCastFrom {
-                ty: cast.source.clone(),
+                ty: cast.param.ty.clone(),
                 span: Some(cast.span),
             }));
         }
@@ -3838,11 +4266,22 @@ fn validate_cast_froms(
         if has_duplicate_cast_from(decls, extend, cast) {
             errors.push(TypeError::Decl(DeclError::DuplicateCastFrom {
                 target: extend.target.clone(),
-                source: cast.source.clone(),
+                source: cast.param.ty.clone(),
                 span: Some(cast.span),
             }));
         }
     }
+}
+
+fn validate_cast_from_param(cast: &CastConversionSchema, errors: &mut Vec<TypeError>) {
+    validate_param_escape(
+        errors,
+        cast.param.escape,
+        cast.param.mutable,
+        cast.param.cast_accept,
+        &cast.param.ty,
+        Some(cast.span),
+    );
 }
 
 fn has_duplicate_cast_from(
@@ -3857,9 +4296,9 @@ fn has_duplicate_cast_from(
                     return false;
                 }
                 if same_extend_target(
-                    &other.source,
+                    &other.param.ty,
                     &other_extend.generics,
-                    &cast.source,
+                    &cast.param.ty,
                     &extend.generics,
                 ) {
                     return true;
@@ -3879,9 +4318,9 @@ fn has_duplicate_cast_from(
         }
         if other_extend.cast_froms.iter().any(|other| {
             same_extend_target(
-                &other.source,
+                &other.param.ty,
                 &other_extend.generics,
-                &cast.source,
+                &cast.param.ty,
                 &extend.generics,
             )
         }) {
@@ -4454,7 +4893,7 @@ fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                     Some(t) => tc.resolve_type_for_tc_at(t, const_node.span),
                     None => Type::Infer,
                 };
-                tc.define_value(c.name, ty, LocalBindingKind::Const, None);
+                tc.define_value(c.name, ty, LocalBindingKind::constant(), None);
             }
             _ => {}
         }
@@ -4830,10 +5269,15 @@ fn add_callable_decl_placeholders(
             receiver_ty: None,
             owner_args: GenericArgs::default(),
         };
+        let binding_id = tc.fresh_binding_id();
         let type_id = tc.solver.alloc_local_type(&Type::Infer);
         add_env_symbol(
             func.name,
-            LocalSymbol::Callable(Box::new(LocalCallableInfo { type_id, callee })),
+            LocalSymbol::Callable(Box::new(LocalCallableInfo {
+                binding_id,
+                type_id,
+                callee,
+            })),
             env,
         );
     }
@@ -4872,10 +5316,12 @@ fn add_capture_blocker(
     tc: &mut TypeChecker,
 ) {
     debug_assert!(kind.requires_runtime_capture());
+    let binding_id = tc.fresh_binding_id();
     let type_id = tc.solver.alloc_local_type(&Type::Infer);
     add_env_symbol(
         name,
         LocalSymbol::Value(VarInfo {
+            binding_id,
             type_id,
             kind,
             const_value: None,
@@ -5078,7 +5524,14 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
             if tc.scopes.len() > 1 {
                 match local_const {
                     Some(info) => {
-                        tc.define_local_symbol(const_node.node.name, info.symbol());
+                        if tc.define_local_symbol(const_node.node.name, info.symbol()) {
+                            tc.define_closure_binding(
+                                info.binding_id,
+                                const_node.node.name,
+                                info.type_id,
+                                LocalBindingKind::constant(),
+                            );
+                        }
                         if let Err(err) = tc.eval_local_const(info.id, const_node.span) {
                             tc.push_error(err);
                         }
@@ -5204,13 +5657,17 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
             tc,
         );
     }
-    for cast in &extend.cast_froms {
-        let param_ty = tc.resolve_type_for_tc_at(&cast.node.param.ty, cast.span);
-        let param = FuncParam::new(param_ty, false, false);
+    let cast_schemas = tc
+        .decls
+        .extends()
+        .find(|extend| extend.origin == tc.current_module && extend.span.byte() == extend_node.span)
+        .map(|extend| extend.cast_froms.clone())
+        .unwrap_or_default();
+    for (cast, schema) in extend.cast_froms.iter().zip(cast_schemas) {
         check_func_body(
             None,
             std::slice::from_ref(&cast.node.param),
-            std::slice::from_ref(&param),
+            std::slice::from_ref(&schema.param),
             ReturnSpec::value(self_ty.clone()),
             &cast.node.body,
             cast.span,
@@ -5337,9 +5794,13 @@ impl CallableBody<'_> {
     }
 
     fn value_expr_id(&self) -> Option<ExprId> {
+        self.value_expr().map(|expr| expr.node.id)
+    }
+
+    fn value_expr(&self) -> Option<&ExprNode> {
         match self {
-            Self::Block(block) => block.node.tail.as_ref().map(|expr| expr.node.id),
-            Self::Expr(expr) => Some(expr.node.id),
+            Self::Block(block) => block.node.tail.as_deref(),
+            Self::Expr(expr) => Some(expr),
         }
     }
 
@@ -5455,6 +5916,9 @@ fn finish_callable_body_value_return(
     match expected_ret {
         Some(ret) => {
             if !checked.ty.is_void() {
+                if let Some(expr) = body.value_expr() {
+                    tc.record_escaping_use(expr);
+                }
                 tc.reject_extern_any_escape(checked, body.span());
                 let ret_handle = tc.type_handle(&ret.ty);
                 match body.value_expr_id() {
@@ -5475,6 +5939,9 @@ fn finish_callable_body_value_return(
         }
         None => {
             if !checked.ty.is_void() {
+                if let Some(expr) = body.value_expr() {
+                    tc.record_escaping_use(expr);
+                }
                 tc.reject_extern_any_escape(checked, body.span());
                 tc.push_inferred_return(body.span(), checked.handle.clone());
             } else if !body.diverges() {
@@ -5505,8 +5972,8 @@ fn check_func_body(
     let mut source = None;
     if let Some((receiver, self_ty)) = self_binding {
         let kind = match receiver {
-            MethodReceiver::Var => LocalBindingKind::Mutable,
-            MethodReceiver::Value => LocalBindingKind::ReadonlySelf,
+            MethodReceiver::Var => LocalBindingKind::borrowed_self(),
+            MethodReceiver::Value => LocalBindingKind::readonly_self(),
         };
         let type_id = tc.define_value(Ident::new("self"), self_ty, kind, None);
         if matches!(receiver, MethodReceiver::Var) {
@@ -5517,6 +5984,7 @@ fn check_func_body(
         let mutable = matches!(param.mutability, Mutability::Mutable);
         let kind = LocalBindingKind::from_param(mutable, &param_ty.ty);
         let type_id = tc.define_value(param.name, param_ty.ty.clone(), kind, None);
+        tc.mark_non_escaping_callback_param(param.name, type_id, param_ty, Some(&param.ty));
         if source.is_none() && mutable {
             source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
         }
@@ -5686,6 +6154,7 @@ fn check_with_specialization(
     tc: &mut TypeChecker,
     check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
 ) -> Option<Type> {
+    tc.solve_constraints();
     let old_facts = tc.specialization_facts();
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
     tc.push_type_subst(type_subst);
@@ -5750,6 +6219,7 @@ fn specialized_body_facts(
         dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
         dyn_downcasts: map_delta(&old.dyn_downcasts, &current.dyn_downcasts),
         global_accesses: map_delta(&old.global_accesses, &current.global_accesses),
+        closure: current.closure.delta_since(&old.closure),
     }
 }
 
@@ -5776,7 +6246,7 @@ fn specialization_key(id: CallableId, args: &GenericArgs) -> SpecializationKey {
 
 fn with_global_scope<R>(tc: &mut TypeChecker, f: impl FnOnce(&mut TypeChecker) -> R) -> R {
     let state = tc.take_scope_state();
-    tc.scopes = state.scopes.first().cloned().into_iter().collect();
+    tc.replace_scopes(state.scopes.first().cloned().into_iter().collect());
     let ret = f(tc);
     tc.restore_scope_state(state);
     ret
@@ -5792,7 +6262,7 @@ fn with_source_module_scope<R>(
         ModuleScope::Root => with_global_scope(tc, f),
         ModuleScope::Named(_) | ModuleScope::Package(_) => {
             let state = tc.take_scope_state();
-            tc.scopes = vec![];
+            tc.replace_scopes(vec![]);
             push_source_scope(tc);
             if let Some(program) = tc.module_programs.get(module).map(Rc::clone) {
                 register_declarations(program.as_ref(), tc);
@@ -6065,7 +6535,7 @@ fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
 fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let binding = &binding_node.node;
     let mode = mode_for_binding(binding);
-    match &binding.ty {
+    let value_ty = match &binding.ty {
         Some(annot) => {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
@@ -6089,6 +6559,7 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
                 annot_handle,
             );
             tc.solve_constraints();
+            let value_ty = value.checked.ty.clone();
             let binding_ty = refined_binding_type(&annot_ty, &value.checked.ty, tc);
             let binding_handle = tc.type_handle(&binding_ty);
             pattern::check_place_at(
@@ -6099,11 +6570,13 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
                 PatternContext::Binding,
                 tc,
             );
+            value_ty
         }
         None => {
             let value = check_pattern_scrutinee(&binding.value, mode, tc);
             tc.reject_extern_any_escape(&value.checked, binding.value.span);
             tc.reject_user_any_type(&value.checked.ty, binding_node.span);
+            let value_ty = value.checked.ty.clone();
             pattern::check_place_at(
                 &binding.pattern,
                 value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
@@ -6112,8 +6585,28 @@ fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
                 PatternContext::Binding,
                 tc,
             );
+            value_ty
         }
+    };
+
+    let function_value = matches!(value_ty, Type::Func { .. });
+    let binding_id = simple_owned_binding_name(binding).and_then(|name| tc.local_binding_id(name));
+    tc.closure.bind_local(
+        binding_id,
+        binding.value.node.id,
+        function_value,
+        binding.value.span,
+    );
+}
+
+fn simple_owned_binding_name(binding: &Binding) -> Option<Ident> {
+    if !matches!(mode_for_binding(binding), PatternBindMode::Owned { .. }) {
+        return None;
     }
+    let Pattern::Ident(name) = &binding.pattern.node else {
+        return None;
+    };
+    Some(*name)
 }
 
 fn check_type_alias(alias_node: &TypeAliasDeclNode, tc: &mut TypeChecker) {
@@ -6187,6 +6680,7 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
         }
         (Some(expr), None) => {
             let actual = check_value_expr_checked_with_hint(expr, None, tc);
+            tc.record_escaping_use(expr);
             tc.reject_extern_any_escape(&actual, expr.span);
         }
         (None, Some(ReturnMode::Explicit { ret, .. })) if !ret.ty.is_void() => {
@@ -6205,6 +6699,7 @@ fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
 fn check_discarded_return_value(ret: &Return, tc: &mut TypeChecker) {
     if let Some(expr) = &ret.value {
         let actual = check_value_expr_checked_with_hint(expr, None, tc);
+        tc.record_escaping_use(expr);
         tc.reject_extern_any_escape(&actual, expr.span);
     }
 }
@@ -6232,6 +6727,7 @@ fn check_return_expr(
 
     let expected = (!matches!(ret.ty, Type::InferReturn)).then(|| tc.type_handle(&ret.ty));
     let actual = check_value_expr_checked_with_hint(expr, expected.clone(), tc);
+    tc.record_escaping_use(expr);
     tc.reject_extern_any_escape(&actual, expr.span);
     if let Some(expected) = expected {
         tc.expect_assignable_expr(expr.span, expr.node.id, actual.handle.clone(), expected);
@@ -6639,12 +7135,9 @@ fn check_expr_checked_with_hint(
             checked_from_type(expr, Type::Infer, tc)
         }
         ExprKind::Ident(name) => match tc.lookup_local_symbol_checked(*name, expr.span) {
-            LocalSymbolLookup::Found(ref symbol @ LocalSymbol::Value(ref info), depth) => {
-                let value = LocalValue {
-                    info: info.clone(),
-                    depth,
-                    requires_runtime_capture: symbol.requires_runtime_capture(),
-                };
+            LocalSymbolLookup::Found(LocalSymbol::Value(ref info), depth) => {
+                let value = tc.local_value_from_info(*name, info.clone(), depth);
+                tc.record_local_read(expr.node.id, &value);
                 let access = tc.local_value_access(&value);
                 tc.check_mut_downcast_root_use(Some(*name), &access.identity, expr.span);
                 if let Some((_, value_name, value)) = tc.lookup_named_value(*name)
@@ -6678,7 +7171,7 @@ fn check_expr_checked_with_hint(
                 }
             }
             LocalSymbolLookup::Blocked(error) => {
-                tc.push_error(error);
+                tc.push_error(*error);
                 checked_from_type(expr, Type::Infer, tc)
             }
             LocalSymbolLookup::Missing => match tc.lookup_named_value(*name) {
@@ -6742,19 +7235,33 @@ fn check_expr_checked_with_hint(
         ExprKind::Try(try_node) => {
             checked_from_checked(expr, check_try(try_node, expected, tc), tc)
         }
-        ExprKind::Block(block_node) => checked_from_checked(
-            expr,
-            check_block_checked_with_hint(block_node, expected, tc),
-            tc,
-        ),
-        ExprKind::If(if_node) => {
-            checked_from_checked(expr, check_if_checked_with_hint(if_node, expected, tc), tc)
+        ExprKind::Block(block_node) => {
+            let checked = check_block_checked_with_hint(block_node, expected, tc);
+            if let Some(tail) = &block_node.node.tail {
+                tc.closure.copy_expr_flow(tail.node.id, expr.node.id);
+            }
+            checked_from_checked(expr, checked, tc)
         }
-        ExprKind::Ternary(ternary_node) => checked_from_checked(
-            expr,
-            check_ternary_checked_with_hint(ternary_node, expected, tc),
-            tc,
-        ),
+        ExprKind::If(if_node) => {
+            let checked = check_if_checked_with_hint(if_node, expected, tc);
+            if let Some(tail) = &if_node.node.then_block.node.tail {
+                tc.closure.copy_expr_flow(tail.node.id, expr.node.id);
+            }
+            if let Some(else_block) = &if_node.node.else_block
+                && let Some(tail) = &else_block.node.tail
+            {
+                tc.closure.copy_expr_flow(tail.node.id, expr.node.id);
+            }
+            checked_from_checked(expr, checked, tc)
+        }
+        ExprKind::Ternary(ternary_node) => {
+            let checked = check_ternary_checked_with_hint(ternary_node, expected, tc);
+            tc.closure
+                .copy_expr_flow(ternary_node.node.then_expr.node.id, expr.node.id);
+            tc.closure
+                .copy_expr_flow(ternary_node.node.else_expr.node.id, expr.node.id);
+            checked_from_checked(expr, checked, tc)
+        }
         ExprKind::Assign(assign_node) => {
             check_assign(expr.node.id, assign_node, tc);
             checked_from_type(expr, Type::Void, tc)
@@ -6770,16 +7277,26 @@ fn check_expr_checked_with_hint(
         ExprKind::Index(node) => check_index_expr(expr, node, tc),
         ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected, tc),
         ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected, tc),
-        ExprKind::IfLet(if_let_node) => checked_from_checked(
-            expr,
-            check_if_let_checked_with_hint(if_let_node, expected, tc),
-            tc,
-        ),
-        ExprKind::Match(match_node) => checked_from_checked(
-            expr,
-            check_match_checked_with_hint(match_node, expected, tc),
-            tc,
-        ),
+        ExprKind::IfLet(if_let_node) => {
+            let checked = check_if_let_checked_with_hint(if_let_node, expected, tc);
+            if let Some(tail) = &if_let_node.node.then_block.node.tail {
+                tc.closure.copy_expr_flow(tail.node.id, expr.node.id);
+            }
+            if let Some(else_block) = &if_let_node.node.else_block
+                && let Some(tail) = &else_block.node.tail
+            {
+                tc.closure.copy_expr_flow(tail.node.id, expr.node.id);
+            }
+            checked_from_checked(expr, checked, tc)
+        }
+        ExprKind::Match(match_node) => {
+            let checked = check_match_checked_with_hint(match_node, expected, tc);
+            for arm in &match_node.node.arms {
+                tc.closure
+                    .copy_expr_flow(arm.node.body.node.id, expr.node.id);
+            }
+            checked_from_checked(expr, checked, tc)
+        }
         ExprKind::StringInterp(parts) => check_string_interp(expr, parts, tc),
         ExprKind::MapLiteral(lit) => check_map_lit_hint(expr, lit, expected, tc),
         ExprKind::IntrinsicCall(call) => check_intrinsic_call(expr, call, tc),
@@ -7744,6 +8261,33 @@ fn join_branches_with_hint(
     }
 }
 
+fn check_closure_flow_branch<R>(
+    tc: &mut TypeChecker,
+    check: impl FnOnce(&mut TypeChecker) -> R,
+) -> R {
+    let flow = tc.closure.closure_flow_snapshot();
+    let ret = check(tc);
+    let branch_flow = tc.closure.closure_flow_snapshot();
+    tc.closure.join_closure_flow_snapshots(&flow, &branch_flow);
+    ret
+}
+
+fn check_closure_flow_branches<R>(
+    tc: &mut TypeChecker,
+    left: impl FnOnce(&mut TypeChecker) -> R,
+    right: impl FnOnce(&mut TypeChecker) -> R,
+) -> (R, R) {
+    let flow = tc.closure.closure_flow_snapshot();
+    let left_ret = left(tc);
+    let left_flow = tc.closure.closure_flow_snapshot();
+    tc.closure.restore_closure_flow(&flow);
+    let right_ret = right(tc);
+    let right_flow = tc.closure.closure_flow_snapshot();
+    tc.closure
+        .join_closure_flow_snapshots(&left_flow, &right_flow);
+    (left_ret, right_ret)
+}
+
 fn check_if_checked_with_hint(
     if_node: &IfNode,
     expected: Option<TypeHandle>,
@@ -7754,7 +8298,7 @@ fn check_if_checked_with_hint(
     let known_cond = intrinsic_bool_value(&if_node.node.cond, tc);
     let Some(else_block) = &if_node.node.else_block else {
         if known_cond != Some(false) {
-            check_block_checked(&if_node.node.then_block, tc);
+            check_closure_flow_branch(tc, |tc| check_block_checked(&if_node.node.then_block, tc));
         }
         return checked_void(tc);
     };
@@ -7764,8 +8308,11 @@ fn check_if_checked_with_hint(
     if known_cond == Some(false) {
         return check_block_checked_with_hint(else_block, expected, tc);
     }
-    let then = check_block_checked_with_hint(&if_node.node.then_block, expected.clone(), tc);
-    let else_checked = check_block_checked_with_hint(else_block, expected.clone(), tc);
+    let (then, else_checked) = check_closure_flow_branches(
+        tc,
+        |tc| check_block_checked_with_hint(&if_node.node.then_block, expected.clone(), tc),
+        |tc| check_block_checked_with_hint(else_block, expected.clone(), tc),
+    );
     join_branches_with_hint(
         expected,
         CheckedBranch {
@@ -7797,8 +8344,11 @@ fn check_ternary_checked_with_hint(
     if known_cond == Some(false) {
         return check_value_expr_checked_with_hint(&node.else_expr, expected, tc);
     }
-    let then = check_value_expr_checked_with_hint(&node.then_expr, expected.clone(), tc);
-    let else_checked = check_value_expr_checked_with_hint(&node.else_expr, expected.clone(), tc);
+    let (then, else_checked) = check_closure_flow_branches(
+        tc,
+        |tc| check_value_expr_checked_with_hint(&node.then_expr, expected.clone(), tc),
+        |tc| check_value_expr_checked_with_hint(&node.else_expr, expected.clone(), tc),
+    );
     join_branches_with_hint(
         expected,
         CheckedBranch {
@@ -7868,7 +8418,14 @@ fn check_lambda_expr(
                         |param| param.ty.clone(),
                     ),
             };
-            FuncParam::new(ty, param.mutable, param.cast_accept)
+            tc.validate_func_param_escape(
+                param.escape,
+                param.mutable,
+                param.cast_accept,
+                &ty,
+                lambda.span,
+            );
+            FuncParam::new(ty, param.mutable, param.cast_accept, param.escape)
         })
         .collect::<Vec<_>>();
 
@@ -7883,12 +8440,13 @@ fn check_lambda_expr(
     let expected_ret = explicit_ret.or_else(|| expected_func.as_ref().map(|(_, ret)| ret.clone()));
 
     let flow = tc.enter_function_control_flow();
-    tc.enter_lambda();
+    tc.enter_lambda(expr.node.id);
     tc.push_scope();
     let mut source = None;
     for (param, param_ty) in lambda.node.params.iter().zip(&params) {
         let kind = LocalBindingKind::from_param(param.mutable, &param_ty.ty);
         let type_id = tc.define_value(param.name, param_ty.ty.clone(), kind, None);
+        tc.mark_non_escaping_callback_param(param.name, type_id, param_ty, param.ty.as_ref());
         if source.is_none() && param.mutable {
             source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
         }
@@ -7917,8 +8475,10 @@ fn check_lambda_expr(
     let frame = tc.pop_return_frame();
     let inferred_ret = frame.and_then(|frame| infer_return_type(frame, tc));
     tc.pop_scope();
-    tc.exit_lambda();
+    tc.closure.exit_lambda();
+    tc.closure.drain_escape_events(expr.span);
     tc.exit_function_control_flow(flow);
+    tc.closure.lambda_value(expr.node.id);
 
     let ret = expected_ret
         .or_else(|| inferred_ret.map(ReturnSpec::value))
@@ -8002,8 +8562,18 @@ fn check_cast_expr(expr: &ExprNode, cast: &CastNode, tc: &mut TypeChecker) -> Ch
     let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
     let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
     let from = checked.ty;
-    let valid = tc.has_explicit_cast_conversion(&from, &target);
-    let ty = if valid || matches!(from, Type::Infer) || matches!(target, Type::Infer) {
+    let conversion = tc.explicit_cast_conversion(&from, &target);
+    match conversion {
+        Some(ExplicitCast::Identity) => tc
+            .closure
+            .copy_expr_flow(cast.node.expr.node.id, expr.node.id),
+        Some(ExplicitCast::CastFrom { escape }) => {
+            tc.check_argument_escape(&cast.node.expr, escape);
+        }
+        Some(ExplicitCast::Builtin) | None => {}
+    }
+    let ty = if conversion.is_some() || matches!(from, Type::Infer) || matches!(target, Type::Infer)
+    {
         target
     } else {
         tc.push_error(TypeError::InvalidCast {
@@ -8186,7 +8756,9 @@ fn check_map_lit_hint(
     let mut contains_extern_any = false;
     for (key_expr, value_expr) in &lit.node.entries {
         let key_checked = check_expected(key_expr, key.clone(), tc);
+        tc.record_aggregate_elem_flow(expr.node.id, key_expr);
         let value_checked = check_expected(value_expr, value.clone(), tc);
+        tc.record_aggregate_elem_flow(expr.node.id, value_expr);
         contains_extern_any |= key_checked.contains_extern_any || value_checked.contains_extern_any;
     }
 
@@ -8236,6 +8808,7 @@ fn check_array_lit_hint(
     let mut contains_extern_any = false;
     for value in &lit.node.elements {
         let checked = check_expected(value, elem.clone(), tc);
+        tc.record_aggregate_elem_flow(expr.node.id, value);
         contains_extern_any |= checked.contains_extern_any;
     }
     let mut checked = solve_and_checked_from_handle(expr, array, tc);
@@ -8277,6 +8850,7 @@ fn check_array_fill_hint(
         )
     });
     let value = check_expected(&fill.node.value, elem.clone(), tc);
+    tc.record_aggregate_elem_flow(expr.node.id, &fill.node.value);
     let array = collection_literal_handle(kind, elem, len, tc);
     let mut checked = solve_and_checked_from_handle(expr, array, tc);
     checked.contains_extern_any = value.contains_extern_any;
@@ -8309,6 +8883,7 @@ fn check_tuple_checked_with_hint(
     let mut contains_extern_any = false;
     for (elem, hint) in elems.iter().zip(&hints) {
         let checked = check_expected(elem, hint.clone(), tc);
+        tc.record_aggregate_elem_flow(expr.node.id, elem);
         contains_extern_any |= checked.contains_extern_any;
     }
     let tuple = tc.tuple_handle(hints);
@@ -8319,6 +8894,8 @@ fn check_tuple_checked_with_hint(
 
 fn check_tuple_index(expr: &ExprNode, node: &TupleIndexNode, tc: &mut TypeChecker) -> CheckedType {
     let target = check_expr_checked(&node.node.target, tc);
+    tc.closure
+        .copy_place_identity(node.node.target.node.id, expr.node.id);
     check_tuple_index_access(expr, node, &target, tc)
 }
 
@@ -8377,6 +8954,8 @@ impl CheckedIndex {
 
 fn check_index_expr(expr: &ExprNode, node: &IndexNode, tc: &mut TypeChecker) -> CheckedType {
     let target = check_expr_checked(&node.node.target, tc);
+    tc.closure
+        .copy_place_identity(node.node.target.node.id, expr.node.id);
     let indexed = check_index_access(node, &target, tc);
     let mut checked = checked_from_type(expr, indexed.read_ty, tc);
     checked.contains_extern_any = indexed.contains_extern_any;
@@ -8652,6 +9231,7 @@ fn check_struct_lit_hint(
     };
     let expected_ok = inf.bind_expected(&key, &agg.generics, expected_ty.as_ref(), lit.span, tc);
     let field_check = check_nominal_fields(
+        expr.node.id,
         &lit.node.fields,
         &agg.fields,
         nominal_type(&key),
@@ -8708,6 +9288,7 @@ fn check_enum_struct_variant_lit(
     let expected_ok =
         inf.bind_expected(&key, &resolved.generics, expected_ty.as_ref(), lit.span, tc);
     let field_check = check_variant_literal_fields(
+        expr.node.id,
         &lit.node.fields,
         fields,
         &key,
@@ -8774,8 +9355,14 @@ fn check_extern_lit(
         tc.expect_equal(lit.span, actual, expected);
     }
 
-    let fields_failed =
-        check_extern_literal_fields(&lit.node.fields, owner, &init.field_init, lit.span, tc);
+    let fields_failed = check_extern_literal_fields(
+        expr.node.id,
+        &lit.node.fields,
+        owner,
+        &init.field_init,
+        lit.span,
+        tc,
+    );
     if fields_failed {
         return checked_from_type(expr, Type::Infer, tc);
     }
@@ -8787,6 +9374,7 @@ fn check_extern_lit(
 }
 
 fn check_extern_literal_fields(
+    aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
     owner: ExternTypeId,
     explicit_init: &[Ident],
@@ -8797,7 +9385,8 @@ fn check_extern_literal_fields(
     let mut seen = HashMap::new();
     let mut failed = false;
     for (name, value) in fields {
-        if seen.insert(*name, value.span).is_some() {
+        let duplicate = seen.insert(*name, value.span).is_some();
+        if duplicate {
             tc.push_error(TypeError::DuplicateField {
                 name: *name,
                 span: tc.error_span(value.span),
@@ -8832,6 +9421,9 @@ fn check_extern_literal_fields(
         }
         let hint = tc.type_handle(&field_ty.ty);
         let checked = check_expr_checked_with_hint(value, Some(hint), tc);
+        if !duplicate && allowed {
+            tc.record_aggregate_elem_flow(aggregate, value);
+        }
         failed |= !extern_boundary::check_checked_value(value, &checked, &field_ty, tc);
     }
 
@@ -8927,6 +9519,7 @@ fn check_inferred_enum_hint(
             for (arg, param) in args.iter().zip(params) {
                 let hint = inf.instantiate(param, tc);
                 let checked = check_expected(arg, hint, tc);
+                tc.record_aggregate_elem_flow(expr.node.id, arg);
                 contains_extern_any |= checked.contains_extern_any;
                 failed |= tc.solve_constraints();
             }
@@ -8946,6 +9539,7 @@ fn check_inferred_enum_hint(
         }
         (VariantPayload::Struct(fields), InferredEnumArgs::Struct(args)) => {
             let field_check = check_variant_literal_fields(
+                expr.node.id,
                 args,
                 fields,
                 &key,
@@ -8995,6 +9589,7 @@ struct NominalFieldCheck {
 }
 
 fn check_nominal_fields(
+    aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
     schema: &HashMap<Ident, FieldSchema>,
     owner_ty: Type,
@@ -9003,6 +9598,7 @@ fn check_nominal_fields(
     tc: &mut TypeChecker,
 ) -> NominalFieldCheck {
     check_expr_fields(
+        aggregate,
         fields,
         schema,
         field_check::FieldOwner::Nominal(owner_ty),
@@ -9014,6 +9610,7 @@ fn check_nominal_fields(
 }
 
 fn check_variant_literal_fields(
+    aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
     schema: &HashMap<Ident, FieldSchema>,
     key: &NominalKey,
@@ -9023,6 +9620,7 @@ fn check_variant_literal_fields(
     tc: &mut TypeChecker,
 ) -> NominalFieldCheck {
     check_expr_fields(
+        aggregate,
         fields,
         schema,
         field_check::FieldOwner::Variant {
@@ -9037,6 +9635,7 @@ fn check_variant_literal_fields(
 }
 
 fn check_expr_fields(
+    aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
     schema: &HashMap<Ident, FieldSchema>,
     owner: field_check::FieldOwner,
@@ -9074,6 +9673,7 @@ fn check_expr_fields(
         tc.check_matched_field_access_policy(&owner, field.name, &field.policy, value.span);
         let hint = inf.instantiate(&field.ty, tc);
         let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
+        tc.record_aggregate_elem_flow(aggregate, value);
         check.contains_extern_any |= checked.contains_extern_any;
         tc.expect_assignable_expr(value.span, value.node.id, checked.handle, hint);
         check.failed |= tc.solve_constraints();
@@ -9240,6 +9840,29 @@ fn literal_target_seeds(generics: &GenericParams, expanded: &Type) -> GenericSol
     seeds
 }
 
+fn sync_assigned_flow(
+    target: &ExprNode,
+    value: &ExprNode,
+    function_value: bool,
+    tc: &mut TypeChecker,
+) {
+    let ExprKind::Ident(name) = target.node.kind else {
+        tc.record_escaping_use(value);
+        return;
+    };
+    if tc.lookup_local_symbol(name).is_none() {
+        tc.record_escaping_use(value);
+        return;
+    }
+
+    let Some(binding_id) = tc.local_binding_id(name) else {
+        tc.record_escaping_use(value);
+        return;
+    };
+    tc.closure
+        .assign_local_or_use(binding_id, value.node.id, function_value, value.span);
+}
+
 fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
     let target = check_place(&assign.node.target, tc);
     if let Some(error) = target.value.access.assign_error(
@@ -9256,6 +9879,7 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
                 Some(target.checked().handle.clone()),
                 tc,
             );
+            let function_value = matches!(value.ty, Type::Func { .. });
             if !target.accepts_extern_any() {
                 tc.reject_extern_any_escape(&value, assign.node.value.span);
             }
@@ -9268,6 +9892,7 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
                 );
             }
             if target.value.access.can_assign() {
+                sync_assigned_flow(&assign.node.target, &assign.node.value, function_value, tc);
                 place::record_write(assign.node.target.node.id, &target, tc);
             }
         }
@@ -9335,9 +9960,11 @@ fn check_while(while_node: &WhileNode, tc: &mut TypeChecker) {
 }
 
 fn check_loop_body(body: &BlockNode, tc: &mut TypeChecker) {
+    tc.closure.enter_loop_flow();
     tc.enter_loop();
     check_block_checked(body, tc);
     tc.exit_loop();
+    tc.closure.exit_loop_flow();
 }
 
 fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
@@ -9679,30 +10306,33 @@ fn check_if_let_exact_downcast(
         );
     }
 
-    tc.push_scope();
-    let handle = tc.type_handle(&target);
-    if binding.mutable {
-        let alias = place::AliasTarget {
-            access: PlaceAccess::Mutable,
-            identity: source.value.identity.clone(),
-            facts: source.value.facts.clone(),
-            accepts_extern_any: source.accepts_extern_any(),
-        };
-        tc.define_alias_binding_from_handle(binding.name, &handle, alias);
-        tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
-            identity: source.value.identity.clone(),
-            allowed: binding.name,
-        });
-    } else {
-        tc.define_pattern_binding_from_handle(binding.name, &handle, false);
-    }
+    let then_expected = expected.clone();
+    check_if_let_branches(node, expected, tc, |tc| {
+        tc.push_scope();
+        let handle = tc.type_handle(&target);
+        if binding.mutable {
+            let alias = place::AliasTarget {
+                access: PlaceAccess::Mutable,
+                identity: source.value.identity.clone(),
+                facts: source.value.facts.clone(),
+                accepts_extern_any: source.accepts_extern_any(),
+            };
+            tc.define_downcast_alias_from_handle(binding.name, &handle, alias);
+            tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
+                identity: source.value.identity.clone(),
+                allowed: binding.name,
+            });
+        } else {
+            tc.define_pattern_binding_from_handle(binding.name, &handle, false);
+        }
 
-    let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
-    if binding.mutable {
-        tc.active_mut_downcast_roots.pop();
-    }
-    tc.pop_scope();
-    finish_if_let_branches(node, then, expected, tc)
+        let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
+        if binding.mutable {
+            tc.active_mut_downcast_roots.pop();
+        }
+        tc.pop_scope();
+        then
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -9771,26 +10401,32 @@ fn check_downcast_branches(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    tc.push_scope();
-    if let Some(binding) = binding {
-        let handle = tc.type_handle(&binding_ty);
-        tc.define_pattern_binding_from_handle(binding.name, &handle, binding.mutable);
-    }
-    let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
-    tc.pop_scope();
-    finish_if_let_branches(node, then, expected, tc)
+    let then_expected = expected.clone();
+    check_if_let_branches(node, expected, tc, |tc| {
+        tc.push_scope();
+        if let Some(binding) = binding {
+            let handle = tc.type_handle(&binding_ty);
+            tc.define_pattern_binding_from_handle(binding.name, &handle, binding.mutable);
+        }
+        let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
+        tc.pop_scope();
+        then
+    })
 }
 
-fn finish_if_let_branches(
+fn check_if_let_branches(
     node: &IfLet,
-    then: CheckedType,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
+    then: impl FnOnce(&mut TypeChecker) -> CheckedType,
 ) -> CheckedType {
     let Some(else_block) = &node.else_block else {
+        check_closure_flow_branch(tc, then);
         return checked_void(tc);
     };
-    let else_checked = check_block_checked_with_hint(else_block, expected, tc);
+    let (then, else_checked) = check_closure_flow_branches(tc, then, |tc| {
+        check_block_checked_with_hint(else_block, expected, tc)
+    });
     join_checked(
         then,
         node.then_block.span,
@@ -9812,18 +10448,21 @@ fn check_if_let_checked_with_hint(
 
     let mode = mode_for_head(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
-    tc.push_scope();
-    pattern::check_place_at(
-        &node.pattern,
-        value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
-        mode,
-        node.value.node.id,
-        PatternContext::IfLet,
-        tc,
-    );
-    let then = check_block_checked_with_hint(&node.then_block, expected.clone(), tc);
-    tc.pop_scope();
-    finish_if_let_branches(node, then, expected, tc)
+    let then_expected = expected.clone();
+    check_if_let_branches(node, expected, tc, |tc| {
+        tc.push_scope();
+        pattern::check_place_at(
+            &node.pattern,
+            value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
+            mode,
+            node.value.node.id,
+            PatternContext::IfLet,
+            tc,
+        );
+        let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
+        tc.pop_scope();
+        then
+    })
 }
 
 fn check_match_checked_with_hint(
@@ -9842,7 +10481,10 @@ fn check_match_checked_with_hint(
     }
     let mut arms = Vec::with_capacity(node.arms.len());
     let mut outcomes = Vec::with_capacity(node.arms.len());
+    let flow = tc.closure.closure_flow_snapshot();
+    let mut arm_flows = Vec::with_capacity(node.arms.len());
     for arm in &node.arms {
+        tc.closure.restore_closure_flow(&flow);
         tc.push_scope();
         let outcome = pattern::check_place_at(
             &arm.node.pattern,
@@ -9867,8 +10509,14 @@ fn check_match_checked_with_hint(
             }
         }
         tc.pop_scope();
+        arm_flows.push(tc.closure.closure_flow_snapshot());
         outcomes.push(outcome);
         arms.push((arm.node.body.span, body));
+    }
+    tc.closure.restore_closure_flow(&flow);
+    for flow in arm_flows {
+        let current = tc.closure.closure_flow_snapshot();
+        tc.closure.join_closure_flow_snapshots(&current, &flow);
     }
     match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
     if arms[0].1.ty.is_void() {
@@ -9883,6 +10531,7 @@ fn check_match_checked_with_hint(
             tc.expect_assignable(span, arm.handle, result.clone());
         }
     }
+    tc.solve_constraints();
     CheckedType {
         ty: tc.handle_type(&result),
         handle: result,

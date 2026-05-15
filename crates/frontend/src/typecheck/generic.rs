@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::{
     ArgumentProjectionMap, CallMap, ContractWitnessMap, DynCallMap, DynConversionMap,
-    DynDowncastMap, DynWeakeningMap, ExternUseMap, GlobalAccessMap, MemberPathMap,
+    DynDowncastMap, DynWeakeningMap, ExternUseMap, GlobalAccessMap, MemberPathMap, TypecheckFacts,
     const_term::ConstTerm, decls::CallableId, type_ops::TypeFolder,
 };
 use crate::{
@@ -89,6 +89,7 @@ pub(crate) struct SpecializedBodyFacts {
     pub(crate) dyn_calls: DynCallMap,
     pub(crate) dyn_downcasts: DynDowncastMap,
     pub(crate) global_accesses: GlobalAccessMap,
+    pub(crate) closure: TypecheckFacts,
 }
 
 #[derive(Clone)]
@@ -316,7 +317,7 @@ pub(crate) fn substitute(ty: &Type, ts: &TypeSubst, cs: &ConstSubst) -> Type {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ConstValue, FuncParam, Ident, NominalKind};
+    use crate::ast::{ConstValue, EscapeMode, FuncParam, Ident, NominalKind};
 
     fn tv(id: u32) -> TypeVarId {
         TypeVarId(id)
@@ -424,14 +425,24 @@ mod tests {
     fn substitute_func_type() {
         let ts = HashMap::from([(tv(0), Type::Int), (tv(1), Type::Bool)]);
         let ty = Type::Func {
-            params: vec![FuncParam::new(Type::Var(tv(0)), false, false)],
+            params: vec![FuncParam::new(
+                Type::Var(tv(0)),
+                false,
+                false,
+                EscapeMode::NonEscaping,
+            )],
             ret: Box::new(crate::ast::ReturnSpec::value(Type::Var(tv(1)))),
         };
         let result = substitute(&ty, &ts, &HashMap::new());
         assert_eq!(
             result,
             Type::Func {
-                params: vec![FuncParam::new(Type::Int, false, false)],
+                params: vec![FuncParam::new(
+                    Type::Int,
+                    false,
+                    false,
+                    EscapeMode::NonEscaping
+                )],
                 ret: Box::new(crate::ast::ReturnSpec::value(Type::Bool)),
             }
         );

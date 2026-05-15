@@ -159,7 +159,7 @@ fn anonymous_requirements(surface: &AnonymousContract) -> Vec<ContractRequiremen
             params: req
                 .params
                 .iter()
-                .map(|param| FuncParam::new(param.ty.clone(), param.mutable, false))
+                .map(|param| FuncParam::new(param.ty.clone(), param.mutable, false, param.escape))
                 .collect(),
             required_params: req.params.len(),
             ret: req.ret.clone(),
@@ -378,6 +378,7 @@ impl CandidateSig {
                         param.ty.ty.clone(),
                         matches!(param.flow, ParamFlow::MutBorrow),
                         false,
+                        param.escape,
                     )
                 })
                 .collect(),

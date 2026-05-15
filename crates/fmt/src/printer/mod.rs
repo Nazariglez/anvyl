@@ -90,6 +90,15 @@ impl<'a> Printer<'a> {
         write!(self.buf, "{val}").unwrap();
     }
 
+    fn format_param_prefix(&mut self, escape: ast::EscapeMode, cast_accept: bool) {
+        if escape.is_escaping() {
+            self.write("escaping ");
+        }
+        if cast_accept {
+            self.write("as ");
+        }
+    }
+
     fn writeln(&mut self) {
         self.buf.push('\n');
     }

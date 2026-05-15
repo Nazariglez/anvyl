@@ -164,7 +164,12 @@ pub(crate) trait TypeFolder {
     }
 
     fn fold_func_param(&mut self, param: &FuncParam) -> FuncParam {
-        FuncParam::new(self.fold_type(&param.ty), param.mutable, param.cast_accept)
+        FuncParam::new(
+            self.fold_type(&param.ty),
+            param.mutable,
+            param.cast_accept,
+            param.escape,
+        )
     }
 
     fn fold_return_spec(&mut self, ret: &ReturnSpec) -> ReturnSpec {
@@ -200,6 +205,7 @@ pub(crate) trait TypeFolder {
                             .iter()
                             .map(|param| AnonymousContractParam {
                                 mutable: param.mutable,
+                                escape: param.escape,
                                 name: param.name,
                                 ty: self.fold_type(&param.ty),
                             })

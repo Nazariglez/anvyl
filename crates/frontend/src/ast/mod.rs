@@ -154,32 +154,52 @@ pub enum ArrayLen {
     Param(ConstParamId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EscapeMode {
+    #[default]
+    NonEscaping,
+    Escaping,
+}
+
+impl EscapeMode {
+    pub fn is_escaping(self) -> bool {
+        matches!(self, Self::Escaping)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncParam {
     pub ty: Type,
     pub mutable: bool,
     pub cast_accept: bool,
+    pub escape: EscapeMode,
 }
 
 impl FuncParam {
-    pub fn new(ty: Type, mutable: bool, cast_accept: bool) -> Self {
+    pub fn new(ty: Type, mutable: bool, cast_accept: bool, escape: EscapeMode) -> Self {
         Self {
             ty,
             mutable,
             cast_accept,
+            escape,
         }
     }
+
     pub fn immut(ty: Type) -> Self {
         Self {
             ty,
             mutable: false,
             cast_accept: false,
+            escape: EscapeMode::NonEscaping,
         }
     }
 }
 
 impl Display for FuncParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.escape.is_escaping() {
+            write!(f, "escaping ")?;
+        }
         if self.cast_accept {
             write!(f, "as {}", self.ty)
         } else {
@@ -248,13 +268,14 @@ pub struct AnonymousContractRequirement {
 #[derive(Debug, Clone)]
 pub struct AnonymousContractParam {
     pub mutable: bool,
+    pub escape: EscapeMode,
     pub name: Ident,
     pub ty: Type,
 }
 
 impl PartialEq for AnonymousContractParam {
     fn eq(&self, other: &Self) -> bool {
-        self.mutable == other.mutable && self.ty == other.ty
+        self.mutable == other.mutable && self.escape == other.escape && self.ty == other.ty
     }
 }
 
@@ -263,6 +284,7 @@ impl Eq for AnonymousContractParam {}
 impl std::hash::Hash for AnonymousContractParam {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&self.mutable, state);
+        std::hash::Hash::hash(&self.escape, state);
         std::hash::Hash::hash(&self.ty, state);
     }
 }
@@ -298,6 +320,7 @@ impl ReturnSpec {
         Self::value(Type::Void)
     }
 
+    #[must_use]
     pub fn with_ty(&self, ty: Type) -> Self {
         Self {
             access: self.access,
@@ -654,7 +677,11 @@ impl Display for ContractRef {
                         if param.mutable {
                             write!(f, "var ")?;
                         }
-                        write!(f, "{}: {}", param.name, param.ty)?;
+                        write!(f, "{}: ", param.name)?;
+                        if param.escape.is_escaping() {
+                            write!(f, "escaping ")?;
+                        }
+                        write!(f, "{}", param.ty)?;
                     }
                     if requirement.ret.is_implicit_void() {
                         write!(f, "); ")?;
@@ -904,6 +931,7 @@ pub struct Func {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub mutability: Mutability,
+    pub escape: EscapeMode,
     pub name: Ident,
     pub ty: Type,
     pub default: Option<ExprNode>,
@@ -1349,6 +1377,7 @@ pub struct LambdaParam {
     pub ty: Option<Type>,
     pub mutable: bool,
     pub cast_accept: bool,
+    pub escape: EscapeMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -241,6 +241,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_escaping_params() {
+        assert_fmt(
+            "fn on_click(f:escaping fn()){f();}",
+            "fn on_click(f: escaping fn()) {\n    f();\n}\n",
+        );
+        assert_fmt(
+            "fn main(){let f=|cb:escaping fn()|{cb();};}",
+            "fn main() {\n    let f = |cb: escaping fn()| {\n        cb();\n    };\n}\n",
+        );
+        assert_fmt(
+            "type Higher=fn(escaping fn());",
+            "type Higher = fn(escaping fn());\n",
+        );
+    }
+
+    #[test]
     fn exact_frontend_extern_members() {
         assert_fmt(
             "extern type T { init; ro: int; rw: int; computed cached: int; computed live: int; fn a(self); fn b(shared self); fn c(var self); }",

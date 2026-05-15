@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn later(f: escaping fn()) {
+    f();
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn each(f: fn()) {
+    f();
+}
+
+fn main(f: fn()) {
+    each(f);
+}

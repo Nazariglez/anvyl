@@ -111,7 +111,12 @@ fn fn_type_var_return() {
     };
     assert_eq!(
         params,
-        vec![ast::FuncParam::new(ast::Type::Int, true, false)]
+        vec![ast::FuncParam::new(
+            ast::Type::Int,
+            true,
+            false,
+            ast::EscapeMode::NonEscaping
+        )]
     );
     assert_eq!(ret.access, ast::ReturnAccess::Place);
     assert_eq!(ret.ty, ast::Type::Int);
@@ -301,7 +306,12 @@ fn fn_type_var_param() {
         ast::Type::Func { params, ret } => {
             assert_eq!(
                 params,
-                vec![ast::FuncParam::new(ast::Type::Int, true, false)]
+                vec![ast::FuncParam::new(
+                    ast::Type::Int,
+                    true,
+                    false,
+                    ast::EscapeMode::NonEscaping
+                )]
             );
             assert_eq!(ret.ty, ast::Type::Void);
         }
@@ -317,7 +327,7 @@ fn fn_type_mixed_var() {
             assert_eq!(
                 params,
                 vec![
-                    ast::FuncParam::new(ast::Type::Int, true, false),
+                    ast::FuncParam::new(ast::Type::Int, true, false, ast::EscapeMode::NonEscaping),
                     ast::FuncParam::immut(ast::Type::String),
                 ]
             );

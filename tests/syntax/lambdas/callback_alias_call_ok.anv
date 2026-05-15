@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main(f: fn()) {
+    let g = f;
+    g();
+}

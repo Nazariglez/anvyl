@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn make(f: fn()) -> fn() {
+    var g: fn() = f;
+    g = || {};
+    g
+}

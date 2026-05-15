@@ -65,14 +65,13 @@ impl Printer<'_> {
     }
 
     pub(super) fn format_param(&mut self, param: &ast::Param) {
-        if matches!(param.mutability, ast::Mutability::Mutable) {
+        let mutable = matches!(param.mutability, ast::Mutability::Mutable);
+        if mutable {
             self.write("var ");
         }
         self.write_fmt(param.name);
         self.write(": ");
-        if param.cast_accept {
-            self.write("as ");
-        }
+        self.format_param_prefix(param.escape, param.cast_accept);
         self.format_type(&param.ty);
         if let Some(default) = &param.default {
             self.write(" = ");

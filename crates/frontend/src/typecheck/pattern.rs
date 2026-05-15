@@ -609,8 +609,12 @@ impl<'tc> PatternChecker<'tc> {
                         .cloned()
                         .collect();
                     let target = place::AliasTarget::merged(group, targets);
-                    self.tc
-                        .define_alias_binding_from_handle(name, &binding.ty, target);
+                    self.tc.define_alias_binding_from_handle(
+                        name,
+                        &binding.ty,
+                        target,
+                        self.context,
+                    );
                 }
             }
         }

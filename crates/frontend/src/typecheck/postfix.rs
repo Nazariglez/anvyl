@@ -21,8 +21,8 @@ use super::{
 };
 use crate::{
     ast::{
-        CallNode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg, Ident,
-        MethodReceiver, ReturnSpec, Type, Visibility,
+        CallNode, EscapeMode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg,
+        Ident, MethodReceiver, ReturnSpec, Type, Visibility,
     },
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
@@ -166,6 +166,7 @@ fn local_value_subject(
     tc: &mut TypeChecker,
 ) -> Subject {
     let checked = super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
+    tc.record_local_read(expr.node.id, value);
     let access = tc.local_value_access(value);
     let mut value = PlaceValue::new(checked, access.access, access.facts);
     value.identity = access.identity;
@@ -185,20 +186,11 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
                 super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth)
                     if depth > 0 =>
                 {
-                    let requires_runtime_capture = info.kind.requires_runtime_capture();
-                    return Some(local_value_subject(
-                        expr,
-                        *name,
-                        &super::LocalValue {
-                            info,
-                            depth,
-                            requires_runtime_capture,
-                        },
-                        tc,
-                    ));
+                    let value = tc.local_value_from_info(*name, info, depth);
+                    return Some(local_value_subject(expr, *name, &value, tc));
                 }
                 super::LocalSymbolLookup::Blocked(error) => {
-                    tc.push_error(error);
+                    tc.push_error(*error);
                     return Some(Subject::Error);
                 }
                 local => local,
@@ -209,17 +201,8 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
                 ));
             }
             if let super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth) = local {
-                let requires_runtime_capture = info.kind.requires_runtime_capture();
-                return Some(local_value_subject(
-                    expr,
-                    *name,
-                    &super::LocalValue {
-                        info,
-                        depth,
-                        requires_runtime_capture,
-                    },
-                    tc,
-                ));
+                let value = tc.local_value_from_info(*name, info, depth);
+                return Some(local_value_subject(expr, *name, &value, tc));
             }
             if let Some(scope) = tc.lookup_module_alias(*name) {
                 return Some(Subject::Module(scope));
@@ -591,6 +574,8 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     checked.contains_extern_any = indexed.contains_extern_any;
 
     if indexed_place {
+        tc.closure
+            .copy_place_identity(index.node.target.node.id, expr.node.id);
         let mut value = PlaceValue::new(
             checked,
             place::projected_field_access(target.value.access),
@@ -655,6 +640,8 @@ fn apply_value_field(
     let receiver_access = receiver.access;
     let receiver_place = &receiver.facts;
     let receiver_identity = receiver.identity.clone();
+
+    tc.closure.copy_place_identity(receiver_id, field_id);
 
     match kind {
         MemberAccessKind::Field => {
@@ -1351,7 +1338,6 @@ fn mutating_receiver_error(
     match access {
         PlaceAccess::Mutable | PlaceAccess::DynView => None,
         PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
-        PlaceAccess::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
         PlaceAccess::Immutable
         | PlaceAccess::Const
         | PlaceAccess::ReadonlySelf
@@ -1374,6 +1360,7 @@ fn call_value(
                     ty: tc.type_handle(&param.ty),
                     mutable: param.mutable,
                     cast_accept: param.cast_accept,
+                    escape: param.escape,
                 })
                 .collect::<Vec<_>>();
             let args_check = if check_arg_count(&call.node.args, params.len(), call.span, tc) {
@@ -1446,7 +1433,7 @@ fn check_dyn_hole_method_call(
             });
             failed = true;
         }
-        params.push(FuncParam::new(ty, false, false));
+        params.push(FuncParam::new(ty, false, false, EscapeMode::NonEscaping));
     }
 
     let ret = match expected {
@@ -1572,6 +1559,7 @@ struct CallParam {
     ty: TypeHandle,
     mutable: bool,
     cast_accept: bool,
+    escape: EscapeMode,
 }
 
 struct GenericCallSource<'a> {
@@ -1682,6 +1670,7 @@ fn instantiate_call_params(
             ty: tc.solver.instantiate_generic_type(&param.ty, vars),
             mutable: param.mutable,
             cast_accept: param.cast_accept,
+            escape: param.escape,
         })
         .collect()
 }
@@ -1802,7 +1791,6 @@ fn var_arg_error(
     match access {
         PlaceAccess::Mutable | PlaceAccess::DynView => None,
         PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
-        PlaceAccess::Captured => Some(TypeError::CannotMutateCapturedVariable { name, span }),
         PlaceAccess::Immutable | PlaceAccess::Const => {
             Some(TypeError::VarArgImmutableBinding { name, span })
         }
@@ -1818,12 +1806,14 @@ fn check_source_arg(
     arg_index: usize,
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
-    match (param.mutable, param.cast_accept) {
+    let checked = match (param.mutable, param.cast_accept) {
         (true, true) => check_projecting_var_arg(arg, param, call_id, arg_index, tc),
         (true, false) => check_var_arg(arg, param, tc),
         (false, true) => check_cast_accept_arg(arg, param, tc),
         (false, false) => check_value_arg(arg, param, tc),
-    }
+    };
+    tc.check_argument_escape(arg, param.escape);
+    checked
 }
 
 fn check_var_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
@@ -1991,7 +1981,8 @@ fn check_cast_accept_arg(
         };
     }
     let target = tc.handle_type(&param.ty);
-    if tc.has_cast_from_conversion(&checked.ty, &target) {
+    if let Some(escape) = tc.cast_from_conversion_escape(&checked.ty, &target) {
+        tc.check_argument_escape(arg, escape);
         return SourceArgCheck {
             failed: tc.solve_constraints(),
             mutable_arg: None,
@@ -2056,6 +2047,7 @@ fn substitute_params_checked(
                 tc.substitute_checked(&param.ty, type_subst, const_subst, span),
                 param.mutable,
                 param.cast_accept,
+                param.escape,
             )
         })
         .collect()
@@ -2096,7 +2088,7 @@ fn check_enum_variant_call(
     else {
         return checked_type(Type::Infer, tc);
     };
-    check_callable_call_with_args(
+    let checked = check_callable_call_with_args(
         &callee,
         &call.node.args,
         &call.node.generic_args,
@@ -2107,7 +2099,11 @@ fn check_enum_variant_call(
         expected,
         tc,
     )
-    .checked
+    .checked;
+    for arg in &call.node.args {
+        tc.record_aggregate_elem_flow(call_id, arg);
+    }
+    checked
 }
 
 fn check_callable_call(
@@ -2609,6 +2605,7 @@ pub(super) fn check_args(
             ty: tc.type_handle(&param.ty),
             mutable: param.mutable,
             cast_accept: param.cast_accept,
+            escape: param.escape,
         })
         .collect::<Vec<_>>();
     check_source_args(args, &params, call_id, None, tc).failed

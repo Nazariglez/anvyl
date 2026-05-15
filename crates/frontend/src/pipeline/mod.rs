@@ -203,14 +203,9 @@ pub fn check_packages<L: PackageSourceLoader>(
         report: diagnostic_report(&sources, errors.iter().map(diagnose_type_error)),
     })?;
 
+    let (warnings, _facts) = typecheck_result.into_parts();
     Ok(CheckOk {
-        report: diagnostic_report(
-            &sources,
-            typecheck_result
-                .warnings()
-                .iter()
-                .map(diagnose_type_warning),
-        ),
+        report: diagnostic_report(&sources, warnings.iter().map(diagnose_type_warning)),
     })
 }
 

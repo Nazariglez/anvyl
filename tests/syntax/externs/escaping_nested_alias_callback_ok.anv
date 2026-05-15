@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Handler = fn();
+extern fn higher(callback: fn(escaping Handler) -> void) -> void;

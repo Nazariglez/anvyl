@@ -1,7 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: cannot mutate captured variable
 
 struct Player {
     hp: int,

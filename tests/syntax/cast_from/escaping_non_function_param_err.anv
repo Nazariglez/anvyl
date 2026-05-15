@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: `escaping` is only valid on function-typed parameters
+// @frontend: new
+
+struct Value { n: int }
+
+extend Value {
+    cast from(n: escaping int) { Value { n } }
+}

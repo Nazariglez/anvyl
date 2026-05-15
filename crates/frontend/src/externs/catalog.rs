@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use anvyx_externs::{
-    BinaryOp, ExternEffects, ExternOperator, ExternParam, ExternRep, ExternSignature,
-    ExternTypeExpr, OperatorReturn, ParamFlow, ReceiverMode, UnaryOp,
+    BinaryOp, CallbackEscape, ExternEffects, ExternOperator, ExternParam, ExternRep,
+    ExternSignature, ExternTypeExpr, OperatorReturn, ParamFlow, ReceiverMode, UnaryOp,
 };
 
 use crate::{
-    ast::{FuncParam, GenericArg, Ident, NominalKind, ReturnSpec, Type},
+    ast::{EscapeMode, FuncParam, GenericArg, Ident, NominalKind, ReturnSpec, Type},
     externs::{
         extern_module_path, extern_module_scope,
         raw::{
@@ -98,11 +98,25 @@ impl ResolvedExternSignature {
     }
 }
 
+fn callback_escape_mode(escape: CallbackEscape, ty: &ExternTypeExpr) -> EscapeMode {
+    let esc_from_param = matches!(escape, CallbackEscape::Escaping);
+    let esc_from_callback = match ty {
+        ExternTypeExpr::Callback(callback) => callback.policy.escape == CallbackEscape::Escaping,
+        _ => false,
+    };
+    if esc_from_param || esc_from_callback {
+        EscapeMode::Escaping
+    } else {
+        EscapeMode::NonEscaping
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedExternParam {
     pub(crate) name: Option<Ident>,
     pub(crate) ty: ResolvedExternTy,
     pub(crate) flow: ParamFlow,
+    pub(crate) escape: EscapeMode,
 }
 
 impl ResolvedExternParam {
@@ -111,6 +125,7 @@ impl ResolvedExternParam {
             self.ty.ty.clone(),
             matches!(self.flow, ParamFlow::MutBorrow),
             false,
+            self.escape,
         )
     }
 }
@@ -888,6 +903,7 @@ impl<'a> CatalogBuilder<'a> {
                 name: param.name.as_deref().map(Ident::new),
                 ty: self.resolve_ty(ctx, &param.ty),
                 flow: param.flow,
+                escape: callback_escape_mode(param.escape, &param.ty),
             })
             .collect()
     }
@@ -923,7 +939,14 @@ impl<'a> CatalogBuilder<'a> {
                 let params = callback
                     .params
                     .iter()
-                    .map(|param| FuncParam::immut(self.resolve_ty(ctx, param).ty))
+                    .map(|param| {
+                        FuncParam::new(
+                            self.resolve_ty(ctx, &param.ty).ty,
+                            false,
+                            false,
+                            callback_escape_mode(param.escape, &param.ty),
+                        )
+                    })
                     .collect();
                 Type::Func {
                     params,
@@ -1405,10 +1428,11 @@ fn invalid_type(
 #[cfg(test)]
 mod tests {
     use anvyx_externs::{
-        BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackSignature,
-        ExternFieldDescriptor, ExternFunctionDescriptor, ExternInitDescriptor,
-        ExternModuleDescriptor, ExternOperator, ExternParam, ExternSignature, ExternTypeDescriptor,
-        ExternTypeExpr, ModulePath as ExternModulePath, ProviderDescriptor, ProviderId, UnaryOp,
+        BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackParam,
+        ExternCallbackSignature, ExternFieldDescriptor, ExternFunctionDescriptor,
+        ExternInitDescriptor, ExternModuleDescriptor, ExternOperator, ExternParam, ExternSignature,
+        ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath, ProviderDescriptor,
+        ProviderId, UnaryOp,
     };
 
     use super::*;
@@ -1702,7 +1726,12 @@ mod tests {
             name: Some(name.to_string()),
             ty,
             flow: ParamFlow::Value,
+            escape: CallbackEscape::NonEscaping,
         }
+    }
+
+    fn cb_param(ty: ExternTypeExpr, escape: CallbackEscape) -> ExternCallbackParam {
+        ExternCallbackParam { ty, escape }
     }
 
     fn ext_signature(params: Vec<ExternParam>, ret: ExternTypeExpr) -> ExternSignature {
@@ -1762,6 +1791,7 @@ mod tests {
                     name: None,
                     ty: unresolved_ty("FreeParam"),
                     flow: ParamFlow::Value,
+                    escape: EscapeMode::NonEscaping,
                 }],
                 ret: unresolved_ty("FreeRet"),
             };
@@ -1775,6 +1805,7 @@ mod tests {
                     name: None,
                     ty: unresolved_ty("MethodParam"),
                     flow: ParamFlow::Value,
+                    escape: EscapeMode::NonEscaping,
                 }],
                 ret: unresolved_ty("MethodRet"),
             };
@@ -1787,6 +1818,7 @@ mod tests {
                     name: None,
                     ty: unresolved_ty("OperatorParam"),
                     flow: ParamFlow::Value,
+                    escape: EscapeMode::NonEscaping,
                 }],
                 ret: unresolved_ty("OperatorRet"),
             };
@@ -2172,9 +2204,59 @@ mod tests {
         }
 
         #[test]
+        fn provider_callback_policy_sets_param_escape() {
+            let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+                params: vec![cb_param(
+                    ExternTypeExpr::Callback(ExternCallbackSignature {
+                        params: vec![],
+                        ret: Box::new(ExternTypeExpr::Void),
+                        policy: CallbackPolicy {
+                            escape: CallbackEscape::NonEscaping,
+                            thread: CallbackThread::SameThread,
+                        },
+                    }),
+                    CallbackEscape::NonEscaping,
+                )],
+                ret: Box::new(ExternTypeExpr::Void),
+                policy: CallbackPolicy {
+                    escape: CallbackEscape::Escaping,
+                    thread: CallbackThread::SameThread,
+                },
+            });
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "use_cb".to_string(),
+                    doc: None,
+                    signature: ext_signature(
+                        vec![ext_param("callback", callback)],
+                        ExternTypeExpr::Void,
+                    ),
+                    effects: ExternEffects::default(),
+                }],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build_catalog(raw, &decls).unwrap();
+            let signature = &catalog
+                .function(
+                    catalog
+                        .function_by_key(&function_key(provider_scope("host"), "use_cb"))
+                        .unwrap(),
+                )
+                .signature;
+            let Type::Func { params, .. } = &signature.params[0].ty.ty else {
+                panic!("expected callback type");
+            };
+
+            assert_eq!(signature.params[0].escape, EscapeMode::Escaping);
+            assert_eq!(params[0].escape, EscapeMode::NonEscaping);
+        }
+
+        #[test]
         fn recursive_containers_and_any_resolve() {
             let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-                params: vec![ExternTypeExpr::Any],
+                params: vec![cb_param(ExternTypeExpr::Any, CallbackEscape::NonEscaping)],
                 ret: Box::new(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::Escaping,
@@ -2483,7 +2565,7 @@ mod tests {
         #[test]
         fn nested_callback_names() {
             let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-                params: vec![named("Handle")],
+                params: vec![cb_param(named("Handle"), CallbackEscape::NonEscaping)],
                 ret: Box::new(ExternTypeExpr::Option(Box::new(named("Handle")))),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::NonEscaping,
@@ -2530,7 +2612,7 @@ mod tests {
         #[test]
         fn any_survives_catalog_validation() {
             let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-                params: vec![ExternTypeExpr::Any],
+                params: vec![cb_param(ExternTypeExpr::Any, CallbackEscape::NonEscaping)],
                 ret: Box::new(ExternTypeExpr::Any),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::Escaping,

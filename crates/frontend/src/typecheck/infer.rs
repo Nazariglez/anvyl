@@ -7,8 +7,8 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParamId, ContractRef, ExprId, FuncParam, GenericArg, Ident,
-        ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type, TypeVarId,
+        ArrayLen, ConstArg, ConstParamId, ContractRef, EscapeMode, ExprId, FuncParam, GenericArg,
+        Ident, ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type, TypeVarId,
     },
     span::{SourceSpan, Span},
 };
@@ -21,6 +21,7 @@ struct TyFuncParam {
     ty: Ty,
     mutable: bool,
     cast_accept: bool,
+    escape: EscapeMode,
 }
 
 impl TyFuncParam {
@@ -29,6 +30,7 @@ impl TyFuncParam {
             ty: Ty::from_recovery_type(&param.ty),
             mutable: param.mutable,
             cast_accept: param.cast_accept,
+            escape: param.escape,
         }
     }
 
@@ -37,6 +39,7 @@ impl TyFuncParam {
             ty: self.ty.try_to_type_no_infer()?,
             mutable: self.mutable,
             cast_accept: self.cast_accept,
+            escape: self.escape,
         })
     }
 }
@@ -998,6 +1001,7 @@ impl Solver {
                         ty: self.instantiate_type_template(&param.ty, vars),
                         mutable: param.mutable,
                         cast_accept: param.cast_accept,
+                        escape: param.escape,
                     })
                     .collect(),
                 ret: Box::new(TyReturnSpec {
@@ -1100,6 +1104,7 @@ impl Solver {
                                 .iter()
                                 .map(|param| crate::ast::AnonymousContractParam {
                                     mutable: param.mutable,
+                                    escape: param.escape,
                                     name: param.name,
                                     ty: self
                                         .instantiate_type_template(&param.ty, vars)
@@ -1403,16 +1408,18 @@ impl Solver {
             .into_iter()
             .zip(found_func.params)
             .map(|(expected, found)| {
-                if expected.mutable != found.mutable {
+                if expected.mutable != found.mutable || expected.escape != found.escape {
                     return Err(SolveError::func_param_mismatch(expected, found, span));
                 }
                 let mutable = expected.mutable;
                 let cast_accept = expected.cast_accept || found.cast_accept;
+                let escape = expected.escape;
                 let ty = self.unify_tys_equal(span, &expected.ty, &found.ty)?;
                 Ok(TyFuncParam {
                     ty,
                     mutable,
                     cast_accept,
+                    escape,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1974,6 +1981,7 @@ impl Solver {
                         ty: self.resolve_ty(&param.ty),
                         mutable: param.mutable,
                         cast_accept: param.cast_accept,
+                        escape: param.escape,
                     })
                     .collect(),
                 ret: Box::new(ret.with_ty(self.resolve_ty(&ret.ty))),
@@ -2112,6 +2120,7 @@ impl Solver {
                         ty: self.finalize_ty_inner(&param.ty, cx),
                         mutable: param.mutable,
                         cast_accept: param.cast_accept,
+                        escape: param.escape,
                     })
                     .collect(),
                 ret: Box::new(ReturnSpec {
@@ -2554,10 +2563,19 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_func_mutability() {
+    fn roundtrip_func_params() {
         assert_roundtrip(Type::Func {
             params: vec![
-                FuncParam::new(Type::Int, true, false),
+                FuncParam::new(Type::Int, true, false, EscapeMode::NonEscaping),
+                FuncParam::new(
+                    Type::Func {
+                        params: vec![],
+                        ret: Box::new(ReturnSpec::void()),
+                    },
+                    false,
+                    false,
+                    EscapeMode::Escaping,
+                ),
                 FuncParam::immut(Type::Bool),
             ],
             ret: Box::new(ReturnSpec::value(Type::String)),
@@ -3100,6 +3118,7 @@ mod tests {
                 ty: Ty::Int,
                 mutable: false,
                 cast_accept: false,
+                escape: EscapeMode::NonEscaping,
             }],
             ret: Box::new(TyReturnSpec::value(Ty::Bool)),
         };
@@ -3112,6 +3131,7 @@ mod tests {
                 ty: Ty::Int,
                 mutable: true,
                 cast_accept: false,
+                escape: EscapeMode::NonEscaping,
             }],
             ret: Box::new(TyReturnSpec::value(Ty::Bool)),
         };
@@ -3397,6 +3417,7 @@ mod tests {
                 ty: Ty::Int,
                 mutable: false,
                 cast_accept: false,
+                escape: EscapeMode::NonEscaping,
             }],
             ret: Box::new(TyReturnSpec::value(Ty::Int)),
         };
@@ -3405,6 +3426,7 @@ mod tests {
                 ty: Ty::Int,
                 mutable: false,
                 cast_accept: false,
+                escape: EscapeMode::NonEscaping,
             }],
             ret: Box::new(TyReturnSpec::value(ty_option(Ty::Int))),
         };

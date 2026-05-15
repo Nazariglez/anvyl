@@ -3,8 +3,8 @@ use chumsky::{error::Rich, prelude::*};
 use super::{
     AnvParser, BoxedParser,
     common::{
-        TupleShapeResult, block_stmt, field_name_ident, identifier, literal, return_spec,
-        validate_tuple_shape_raw,
+        TupleShapeResult, block_stmt, callable_param_type, field_name_ident, identifier, literal,
+        return_spec, validate_tuple_shape_raw,
     },
     new_expr_id,
     ops::{
@@ -582,29 +582,26 @@ fn lambda_expr<'src>(
     .or_not()
     .map(|opt| opt.is_some());
 
-    let as_kw = select! {
-        Token::Keyword(Keyword::As) => (),
-    }
-    .or_not()
-    .map(|opt| opt.is_some());
-
     let lambda_param = var_kw
         .then(identifier())
         .then(
             colon
-                .ignore_then(as_kw.then(type_ident()))
+                .ignore_then(callable_param_type(type_ident()))
                 .or_not()
                 .map(|opt| match opt {
-                    Some((cast_accept, ty)) => (Some(ty), cast_accept),
-                    None => (None, false),
+                    Some((cast_accept, escape, ty)) => (Some(ty), cast_accept, escape),
+                    None => (None, false, ast::EscapeMode::NonEscaping),
                 }),
         )
-        .map(|((mutable, name), (ty, cast_accept))| ast::LambdaParam {
-            name,
-            ty,
-            mutable,
-            cast_accept,
-        });
+        .map(
+            |((mutable, name), (ty, cast_accept, escape))| ast::LambdaParam {
+                name,
+                ty,
+                mutable,
+                cast_accept,
+                escape,
+            },
+        );
 
     // |param, param: Type| or ||
     let with_params = pipe

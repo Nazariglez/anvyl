@@ -303,9 +303,7 @@ impl Printer<'_> {
         self.write_fmt(param.name);
         if let Some(ty) = &param.ty {
             self.write(": ");
-            if param.cast_accept {
-                self.write("as ");
-            }
+            self.format_param_prefix(param.escape, param.cast_accept);
             self.format_type(ty);
         }
     }

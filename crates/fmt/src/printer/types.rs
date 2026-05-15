@@ -69,10 +69,14 @@ impl Printer<'_> {
                     if p.mutable {
                         self.write("var ");
                     }
+                    self.format_param_prefix(p.escape, p.cast_accept);
                     self.format_type(&p.ty);
                 }
-                self.write(") -> ");
-                self.format_return_spec_tail(ret);
+                self.write(")");
+                if !ret.is_implicit_void() {
+                    self.write(" -> ");
+                    self.format_return_spec_tail(ret);
+                }
             }
             ast::Type::Dyn(contract) => {
                 self.write("dyn ");

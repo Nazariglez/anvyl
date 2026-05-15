@@ -82,6 +82,7 @@ pub struct ExternParam {
     pub name: Option<String>,
     pub ty: ExternTypeExpr,
     pub flow: ParamFlow,
+    pub escape: CallbackEscape,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -130,9 +131,15 @@ pub struct ExternEffects {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExternCallbackSignature {
-    pub params: Vec<ExternTypeExpr>,
+    pub params: Vec<ExternCallbackParam>,
     pub ret: Box<ExternTypeExpr>,
     pub policy: CallbackPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExternCallbackParam {
+    pub ty: ExternTypeExpr,
+    pub escape: CallbackEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -177,6 +184,7 @@ mod tests {
                     name: Some("dx".to_string()),
                     ty: ExternTypeExpr::Float,
                     flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
                 }],
                 ret: ExternTypeExpr::Void,
             },
@@ -198,16 +206,19 @@ mod tests {
                         name: Some("a".to_string()),
                         ty: ExternTypeExpr::Float,
                         flow: ParamFlow::Value,
+                        escape: CallbackEscape::NonEscaping,
                     },
                     ExternParam {
                         name: Some("b".to_string()),
                         ty: ExternTypeExpr::Float,
                         flow: ParamFlow::Borrow,
+                        escape: CallbackEscape::NonEscaping,
                     },
                     ExternParam {
                         name: Some("out".to_string()),
                         ty: ExternTypeExpr::Float,
                         flow: ParamFlow::MutBorrow,
+                        escape: CallbackEscape::NonEscaping,
                     },
                 ],
                 ret: ExternTypeExpr::Void,
@@ -239,6 +250,7 @@ mod tests {
                     name: None,
                     ty: ExternTypeExpr::Float,
                     flow: ParamFlow::Borrow,
+                    escape: CallbackEscape::NonEscaping,
                 }],
                 ret: ExternTypeExpr::Float,
             },

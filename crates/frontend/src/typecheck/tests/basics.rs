@@ -4,7 +4,8 @@ use super::support::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstValue, FuncParam, GenericArg, Ident, NominalKind, ReturnSpec, Type,
+        ArrayLen, ConstArg, ConstValue, EscapeMode, FuncParam, GenericArg, Ident, NominalKind,
+        ReturnSpec, Type,
     },
     span::SourceSpan,
     typecheck::{ArityError, DeclError, TypeError, type_closure_facts},
@@ -342,7 +343,12 @@ mod constraints {
     #[test]
     fn nested_func_ret_infer_guard() {
         let ty = Type::Func {
-            params: vec![FuncParam::new(Type::Int, false, false)],
+            params: vec![FuncParam::new(
+                Type::Int,
+                false,
+                false,
+                EscapeMode::NonEscaping,
+            )],
             ret: Box::new(ReturnSpec::value(Type::Tuple(vec![Type::Infer]))),
         };
         assert!(type_closure_facts(&ty).infer.contains_type);

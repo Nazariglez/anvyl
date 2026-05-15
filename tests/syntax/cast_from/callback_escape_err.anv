@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'f' is non-escaping by default, but it escapes here
+// @frontend: new
+
+struct Handler {}
+
+extend Handler {
+    cast from(f: escaping fn()) { Handler {} }
+}
+
+fn bad(f: fn()) -> Handler {
+    f as Handler
+}

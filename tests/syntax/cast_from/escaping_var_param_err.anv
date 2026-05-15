@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: `escaping` cannot be combined with `var`
+// @frontend: new
+
+struct Handler {}
+
+extend Handler {
+    cast from(var f: escaping fn()) { Handler {} }
+}

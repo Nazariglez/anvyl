@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn touch(var self) {
+        let f = || { self.value = 1; };
+        f();
+    }
+}
+
+fn main() {
+    var c = Counter { value: 0 };
+    c.touch();
+}

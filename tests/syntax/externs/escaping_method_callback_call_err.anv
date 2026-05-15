@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'f' is non-escaping by default, but it escapes here
+// @frontend: new
+
+extern type Button {
+    fn later(self, f: escaping fn());
+}
+
+fn bad(button: Button, f: fn()) {
+    button.later(f);
+}

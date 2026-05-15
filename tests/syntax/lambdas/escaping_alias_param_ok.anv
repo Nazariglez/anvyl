@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+type Handler = fn();
+
+fn later(f: escaping Handler) {
+    f();
+}

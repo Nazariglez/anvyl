@@ -526,6 +526,7 @@ fn resolve_extern_params(
         .into_iter()
         .map(|p| ast::Param {
             mutability: p.mutability,
+            escape: p.escape,
             name: p.name,
             ty: resolve_type_params_with_self(
                 &p.ty,
@@ -893,6 +894,7 @@ fn function_body<'src>(
                     let ty = resolve_type_params(&p.ty, &type_param_map, &const_param_map);
                     ast::Param {
                         mutability: p.mutability,
+                        escape: p.escape,
                         name: p.name,
                         ty,
                         default: p.default,
@@ -1283,6 +1285,7 @@ fn aggregate_declaration<'src>(
                         .iter()
                         .map(|p| ast::Param {
                             mutability: p.mutability,
+                            escape: p.escape,
                             name: p.name,
                             ty: resolve_type_params_with_self(
                                 &p.ty,
@@ -1538,6 +1541,7 @@ fn cast_from_decl<'src>(
             }
             let param = param_list.into_iter().next().unwrap_or_else(|| ast::Param {
                 mutability: ast::Mutability::Immutable,
+                escape: ast::EscapeMode::NonEscaping,
                 name: ast::Ident(internment::Intern::new("_".to_string())),
                 ty: ast::Type::Infer,
                 default: None,
@@ -2061,6 +2065,7 @@ fn resolve_type_params_with_self(
                         ),
                         p.mutable,
                         p.cast_accept,
+                        p.escape,
                     )
                 })
                 .collect::<Vec<_>>();

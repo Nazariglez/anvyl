@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'f' is non-escaping by default, but it escapes here
+// @frontend: new
+struct Holder {
+    f: fn(),
+}
+
+fn bad(f: fn()) -> Holder {
+    Holder { f }
+}

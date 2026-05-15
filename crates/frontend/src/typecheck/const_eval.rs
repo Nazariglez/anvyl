@@ -97,6 +97,7 @@ impl TypeChecker {
         env: CallableTemplateEnv,
     ) -> LocalConstInfo {
         let info = LocalConstInfo {
+            binding_id: self.fresh_binding_id(),
             type_id: self.solver.alloc_local_type(&Type::Infer),
             id: LocalConstId(self.local_consts.len() as u32),
         };
@@ -290,7 +291,7 @@ impl TypeChecker {
             LocalSymbolLookup::Found(LocalSymbol::Callable(_), _) => {
                 return ConstNameLookup::NotConstLocal;
             }
-            LocalSymbolLookup::Blocked(error) => return ConstNameLookup::Error(error),
+            LocalSymbolLookup::Blocked(error) => return ConstNameLookup::Error(*error),
             LocalSymbolLookup::Missing => {}
         }
 

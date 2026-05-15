@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture borrowed parameter 'x' in an escaping lambda
+// @frontend: new
+
+extern fn later(f: escaping fn()) -> void;
+
+fn bad(var x: int) {
+    later(|| { x = 1; });
+}

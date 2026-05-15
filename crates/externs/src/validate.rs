@@ -363,7 +363,7 @@ fn check_type_expr(
         ExternTypeExpr::Callback(callback) => {
             let param_position = position.callback_param_position();
             for param in &callback.params {
-                check_type_expr(param, param_position, errors);
+                check_type_expr(&param.ty, param_position, errors);
             }
             check_type_expr(&callback.ret, TypePosition::Return, errors);
         }
@@ -482,7 +482,10 @@ mod tests {
                         params: vec![ExternParam {
                             name: Some("f".to_string()),
                             ty: ExternTypeExpr::Callback(ExternCallbackSignature {
-                                params: vec![ExternTypeExpr::Float],
+                                params: vec![ExternCallbackParam {
+                                    ty: ExternTypeExpr::Float,
+                                    escape: CallbackEscape::NonEscaping,
+                                }],
                                 ret: Box::new(ExternTypeExpr::Void),
                                 policy: CallbackPolicy {
                                     escape: CallbackEscape::NonEscaping,
@@ -490,6 +493,7 @@ mod tests {
                                 },
                             }),
                             flow: ParamFlow::Borrow,
+                            escape: CallbackEscape::NonEscaping,
                         }],
                         ret: ExternTypeExpr::Void,
                     },
@@ -568,6 +572,7 @@ mod tests {
             name: Some("x".to_string()),
             ty: ExternTypeExpr::Float,
             flow: ParamFlow::Value,
+            escape: CallbackEscape::NonEscaping,
         }];
 
         let errors = validate(&provider).unwrap_err();
@@ -686,6 +691,7 @@ mod tests {
                         name: None,
                         ty: ExternTypeExpr::Float,
                         flow: ParamFlow::Value,
+                        escape: CallbackEscape::NonEscaping,
                     }],
                     ret: ExternTypeExpr::Float,
                 },
@@ -713,11 +719,13 @@ mod tests {
                             name: None,
                             ty: ExternTypeExpr::Float,
                             flow: ParamFlow::Value,
+                            escape: CallbackEscape::NonEscaping,
                         },
                         ExternParam {
                             name: None,
                             ty: ExternTypeExpr::Float,
                             flow: ParamFlow::Value,
+                            escape: CallbackEscape::NonEscaping,
                         },
                     ],
                     ret: ExternTypeExpr::Float,
@@ -775,6 +783,7 @@ mod tests {
                         name: None,
                         ty: ExternTypeExpr::Float,
                         flow: ParamFlow::Value,
+                        escape: CallbackEscape::NonEscaping,
                     }],
                     ret: ExternTypeExpr::Float,
                 },
@@ -790,6 +799,7 @@ mod tests {
                         name: None,
                         ty: ExternTypeExpr::Float,
                         flow: ParamFlow::Value,
+                        escape: CallbackEscape::NonEscaping,
                     }],
                     ret: ExternTypeExpr::Named {
                         module: None,
@@ -809,6 +819,7 @@ mod tests {
                         name: None,
                         ty: ExternTypeExpr::Float,
                         flow: ParamFlow::Value,
+                        escape: CallbackEscape::NonEscaping,
                     }],
                     ret: ExternTypeExpr::Void,
                 },
@@ -871,6 +882,7 @@ mod tests {
                     name: None,
                     ty: ExternTypeExpr::Float,
                     flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
                 }],
                 ret: ExternTypeExpr::Named {
                     module: None,
@@ -924,7 +936,10 @@ mod tests {
         let mut provider = valid_provider();
         provider.modules[0].functions[0].signature.params[0].ty =
             ExternTypeExpr::Callback(ExternCallbackSignature {
-                params: vec![ExternTypeExpr::Void],
+                params: vec![ExternCallbackParam {
+                    ty: ExternTypeExpr::Void,
+                    escape: CallbackEscape::NonEscaping,
+                }],
                 ret: Box::new(ExternTypeExpr::Named {
                     module: Some(ModulePath { segments: vec![] }),
                     name: String::new(),

@@ -6,9 +6,10 @@ use crate::{
     span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
     typecheck::{
-        self, ArgumentProjectionMap, CallMap, ContractWitnessMap, DeprecatedUseKind, DynCallMap,
-        DynConversionMap, DynDowncastMap, DynWeakeningMap, ExternUseMap, GlobalAccessMap,
-        MemberPathMap, TypeError, TypeWarning, decls::DeclarationIndex,
+        self, ArgumentProjectionMap, BindingPromotionMap, CallMap, ContractWitnessMap,
+        DeprecatedUseKind, DynCallMap, DynConversionMap, DynDowncastMap, DynWeakeningMap,
+        ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap, TypeError,
+        TypeWarning, TypecheckFacts, decls::DeclarationIndex,
     },
 };
 
@@ -24,6 +25,7 @@ pub(crate) struct TypecheckTestResult {
     dyn_calls: DynCallMap,
     dyn_downcasts: DynDowncastMap,
     global_accesses: GlobalAccessMap,
+    facts: TypecheckFacts,
     warnings: Vec<TypeWarning>,
     decls: DeclarationIndex,
     externs: ExternCatalog,
@@ -72,6 +74,18 @@ impl TypecheckTestResult {
 
     pub(crate) fn global_accesses(&self) -> &GlobalAccessMap {
         &self.global_accesses
+    }
+
+    pub(crate) fn lambda_escapes(&self) -> &LambdaEscapeMap {
+        self.facts.lambda_escapes()
+    }
+
+    pub(crate) fn lambda_captures(&self) -> &LambdaCaptureMap {
+        self.facts.lambda_captures()
+    }
+
+    pub(crate) fn binding_promotions(&self) -> &BindingPromotionMap {
+        self.facts.binding_promotions()
     }
 
     pub(crate) fn warnings(&self) -> &[TypeWarning] {
@@ -170,7 +184,7 @@ pub(crate) fn check_with_raw_externs(
         raw_externs,
         typecheck::TypecheckConfig::default(),
     )?;
-    let source_types = tc.finish()?;
+    let (source_types, facts) = tc.finish()?;
     let types = source_types
         .into_iter()
         .map(|(id, (span, ty))| {
@@ -192,6 +206,7 @@ pub(crate) fn check_with_raw_externs(
         dyn_calls: tc.dyn_calls,
         dyn_downcasts: tc.dyn_downcasts,
         global_accesses: tc.global_accesses,
+        facts,
         warnings: tc.warnings,
         decls: tc.decls,
         externs: tc.externs,

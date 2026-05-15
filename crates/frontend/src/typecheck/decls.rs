@@ -11,10 +11,10 @@ use super::{
 };
 use crate::{
     ast::{
-        self, AggregateKind, ArrayLen, ConstArg, ConstParam, ContractRef, FuncParam, GenericArg,
-        Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
-        NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type, TypeParam, VariantKind,
-        Visibility,
+        self, AggregateKind, ArrayLen, ConstArg, ConstParam, ContractRef, EscapeMode, FuncParam,
+        GenericArg, Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin,
+        Mutability, NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type, TypeParam,
+        VariantKind, Visibility,
     },
     externs::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
@@ -1369,7 +1369,7 @@ pub(crate) struct ExtendSchema {
 
 #[derive(Clone)]
 pub(crate) struct CastConversionSchema {
-    pub(crate) source: Type,
+    pub(crate) param: FuncParam,
     pub(crate) ret: Option<ReturnSpec>,
     pub(crate) span: SourceSpan,
 }
@@ -1395,7 +1395,7 @@ pub(crate) enum ExtendMethodMatch<'a> {
 }
 
 pub(crate) enum CastConversionMatch {
-    Match,
+    Match { escape: EscapeMode },
     Ambiguous,
 }
 
@@ -1779,7 +1779,7 @@ impl DeclarationIndex {
                     generics: generics.clone(),
                     type_params: extend_type_params.clone(),
                 };
-                cast.source = f(site.clone(), cast.source.clone());
+                cast.param.ty = f(site.clone(), cast.param.ty.clone());
                 if let Some(ret) = &mut cast.ret {
                     ret.ty = f(site, ret.ty.clone());
                 }
@@ -2497,7 +2497,12 @@ impl DeclarationIndex {
                         .cast_froms
                         .iter()
                         .map(|cast| CastConversionSchema {
-                            source: cast.node.param.ty.clone(),
+                            param: FuncParam::new(
+                                cast.node.param.ty.clone(),
+                                matches!(cast.node.param.mutability, Mutability::Mutable),
+                                cast.node.param.cast_accept,
+                                cast.node.param.escape,
+                            ),
                             ret: cast.node.ret.clone(),
                             span: SourceSpan::from_byte_span(source, cast.span),
                         })
@@ -3408,7 +3413,7 @@ impl DeclarationIndex {
         for extend in self.extends.iter().filter(|extend| visible(extend)) {
             let target_template = generic_template_type(&extend.target, &extend.generics);
             for cast in &extend.cast_froms {
-                let source_template = generic_template_type(&cast.source, &extend.generics);
+                let source_template = generic_template_type(&cast.param.ty, &extend.generics);
                 if match_cast_conversion(
                     &extend.generics,
                     &source_template,
@@ -3423,10 +3428,10 @@ impl DeclarationIndex {
                 if selected.is_some() {
                     return Some(CastConversionMatch::Ambiguous);
                 }
-                selected = Some(());
+                selected = Some(cast.param.escape);
             }
         }
-        selected.map(|()| CastConversionMatch::Match)
+        selected.map(|escape| CastConversionMatch::Match { escape })
     }
 
     fn module_surface_contains(&self, module: &ModuleScope, origin: &ModuleScope) -> bool {
@@ -3654,6 +3659,7 @@ impl DeclarationIndex {
                     generic_template_type(&param.ty, &extend.generics),
                     param.mutable,
                     param.cast_accept,
+                    param.escape,
                 )
             })
             .collect::<Vec<_>>();
@@ -3762,6 +3768,7 @@ fn substitute_func_params(
                 substitute(&param.ty, type_subst, const_subst),
                 param.mutable,
                 param.cast_accept,
+                param.escape,
             )
         })
         .collect()
@@ -4128,6 +4135,7 @@ pub(crate) fn func_type_from_params(params: &[Param], ret: &ReturnSpec) -> Type 
                 p.ty.clone(),
                 matches!(p.mutability, Mutability::Mutable),
                 p.cast_accept,
+                p.escape,
             )
         })
         .collect();
@@ -4145,6 +4153,7 @@ pub(crate) fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
                 p.ty.clone(),
                 matches!(p.mutability, Mutability::Mutable),
                 p.cast_accept,
+                p.escape,
             )
         })
         .collect()
@@ -5078,9 +5087,9 @@ pub(crate) fn nominal_type_with_args(
 #[cfg(test)]
 mod tests {
     use anvyx_externs::{
-        ExternEffects, ExternFunctionDescriptor, ExternModuleDescriptor, ExternParam, ExternRep,
-        ExternSignature, ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath,
-        ParamFlow, ProviderDescriptor, ProviderId,
+        CallbackEscape, ExternEffects, ExternFunctionDescriptor, ExternModuleDescriptor,
+        ExternParam, ExternRep, ExternSignature, ExternTypeDescriptor, ExternTypeExpr,
+        ModulePath as ExternModulePath, ParamFlow, ProviderDescriptor, ProviderId,
     };
 
     use super::*;
@@ -5177,6 +5186,7 @@ mod tests {
                     name: Some("x".to_string()),
                     ty: ExternTypeExpr::Int,
                     flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
                 }],
                 ret: ExternTypeExpr::Float,
             },

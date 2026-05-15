@@ -1,16 +1,16 @@
 use anvyx_externs::{
-    CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackSignature, ExternEffects,
-    ExternFieldDescriptor, ExternFunctionDescriptor, ExternInitDescriptor, ExternMethodDescriptor,
-    ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
-    ExternStaticDescriptor, ExternTypeExpr, ModulePath, ParamFlow, ReceiverMode,
+    CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackParam, ExternCallbackSignature,
+    ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor, ExternInitDescriptor,
+    ExternMethodDescriptor, ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep,
+    ExternSignature, ExternStaticDescriptor, ExternTypeExpr, ModulePath, ParamFlow, ReceiverMode,
 };
 
 use super::raw::*;
 use crate::{
     ast::{
-        self, BinaryOp, ExternFuncNode, ExternReceiverMode, ExternTypeMember, ExternTypeNode,
-        ExternTypeRep, GenericArg, Mutability, Param, Program, ReturnSpec, Stmt, Type, UnaryOp,
-        Visibility,
+        self, BinaryOp, EscapeMode, ExternFuncNode, ExternReceiverMode, ExternTypeMember,
+        ExternTypeNode, ExternTypeRep, GenericArg, Mutability, Param, Program, ReturnSpec, Stmt,
+        Type, UnaryOp, Visibility,
     },
     resolve::{ModuleId, ResolveResult},
     source::SourceId,
@@ -140,6 +140,7 @@ fn normalize_type(
                     name: None,
                     ty: ExternTypeExpr::Int,
                     flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
                 };
                 init.params.len()
             ],
@@ -246,6 +247,7 @@ fn normalize_member(
                         name: None,
                         ty: type_expr(source, other_ty, span)?,
                         flow: ParamFlow::Value,
+                        escape: CallbackEscape::NonEscaping,
                     }],
                     ret: type_expr(source, ret, span)?,
                 },
@@ -318,6 +320,7 @@ fn lower_param(source: SourceId, param: &Param, span: Span) -> SourceResult<Exte
         name: Some(param.name.to_string()),
         ty: type_expr(source, &param.ty, span)?,
         flow: ParamFlow::Value,
+        escape: callback_escape(param.escape),
     })
 }
 
@@ -334,6 +337,13 @@ fn unsupported_param(
             reason,
         },
     })
+}
+
+fn callback_escape(escape: EscapeMode) -> CallbackEscape {
+    match escape {
+        EscapeMode::NonEscaping => CallbackEscape::NonEscaping,
+        EscapeMode::Escaping => CallbackEscape::Escaping,
+    }
 }
 
 fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternTypeExpr> {
@@ -381,7 +391,12 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
             Ok(ExternTypeExpr::Callback(ExternCallbackSignature {
                 params: params
                     .iter()
-                    .map(|param| type_expr(source, &param.ty, span))
+                    .map(|param| {
+                        Ok(ExternCallbackParam {
+                            ty: type_expr(source, &param.ty, span)?,
+                            escape: callback_escape(param.escape),
+                        })
+                    })
                     .collect::<SourceResult<Vec<_>>>()?,
                 ret: Box::new(type_expr(source, &ret.ty, span)?),
                 policy: CallbackPolicy {

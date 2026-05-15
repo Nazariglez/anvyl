@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: `escaping` cannot be used on local variable, field, or return types
+// @frontend: new
+
+fn main() {
+    let f: escaping fn() = || { };
+}

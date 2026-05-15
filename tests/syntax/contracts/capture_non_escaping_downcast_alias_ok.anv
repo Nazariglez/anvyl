@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Enemy {
+    hp: int,
+
+    fn update(var self) {}
+}
+
+fn touch(var actor: dyn Updatable) {
+    if var enemy = actor as? Enemy {
+        let f = || { enemy.hp = 1; };
+        f();
+    }
+}
+
+fn main() {
+    var actor: dyn Updatable = Enemy { hp: 0 };
+    touch(actor);
+}

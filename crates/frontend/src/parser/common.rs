@@ -33,6 +33,40 @@ pub(super) fn field_name_ident<'src>() -> BoxedParser<'src, ast::Ident> {
     choice((identifier(), keyword_as_ident())).boxed()
 }
 
+pub(super) fn escaping_kw<'src>() -> BoxedParser<'src, ()> {
+    select! { Token::Ident(ident) if ident.0.as_ref() == "escaping" => () }.boxed()
+}
+
+pub(super) fn escaping_type<'src>(
+    ty: impl AnvParser<'src, ast::Type>,
+) -> BoxedParser<'src, (ast::EscapeMode, ast::Type)> {
+    choice((
+        escaping_kw()
+            .ignore_then(ty.clone())
+            .map(|ty| (ast::EscapeMode::Escaping, ty)),
+        ty.map(|ty| (ast::EscapeMode::NonEscaping, ty)),
+    ))
+    .boxed()
+}
+
+pub(super) fn callable_param_type<'src>(
+    ty: impl AnvParser<'src, ast::Type>,
+) -> BoxedParser<'src, (bool, ast::EscapeMode, ast::Type)> {
+    let as_kw = select! { Token::Keyword(Keyword::As) => () }
+        .or_not()
+        .map(|opt| opt.is_some());
+    choice((
+        escaping_kw()
+            .ignore_then(as_kw)
+            .then(ty.clone())
+            .map(|(cast_accept, ty)| (cast_accept, ast::EscapeMode::Escaping, ty)),
+        as_kw
+            .then(escaping_type(ty))
+            .map(|(cast_accept, (escape, ty))| (cast_accept, escape, ty)),
+    ))
+    .boxed()
+}
+
 pub(super) fn literal<'src>() -> BoxedParser<'src, ast::Lit> {
     select! {
         Token::Literal(lit) => match lit {
@@ -86,27 +120,21 @@ pub(super) fn param<'src>(
         None => ast::Mutability::Immutable,
     });
 
-    let as_kw = select! {
-        Token::Keyword(Keyword::As) => (),
-    }
-    .or_not()
-    .map(|opt| opt.is_some());
-
     var_kw
         .then(identifier())
         .then_ignore(select! {
             Token::Colon => (),
         })
-        .then(as_kw)
-        .then(param_type_ident())
+        .then(callable_param_type(param_type_ident()))
         .then(
             select! { Token::Op(Op::Assign) => () }
                 .ignore_then(expression(stmt))
                 .or_not(),
         )
         .map(
-            |((((mutability, name), cast_accept), ty), default)| ast::Param {
+            |(((mutability, name), (cast_accept, escape, ty)), default)| ast::Param {
                 mutability,
+                escape,
                 name,
                 ty,
                 default,

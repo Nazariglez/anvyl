@@ -520,6 +520,7 @@ fn anonymous_contract_ref(requirements: &[ContractRequirementSchema]) -> Contrac
                     .enumerate()
                     .map(|(index, param)| AnonymousContractParam {
                         mutable: param.mutable,
+                        escape: param.escape,
                         name: Ident::new(format!("arg{index}")),
                         ty: param.ty.clone(),
                     })

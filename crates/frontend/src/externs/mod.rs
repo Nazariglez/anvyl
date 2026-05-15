@@ -48,12 +48,13 @@ pub(crate) fn raw_extern_module_ids(raw: &RawExterns) -> HashSet<crate::resolve:
 #[cfg(test)]
 mod tests {
     use anvyx_externs::{
-        BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackSignature,
-        ExternDescriptorError, ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor,
-        ExternInitDescriptor, ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor,
-        ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
-        ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, ModulePath, OperatorReturn,
-        ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, TypeContext,
+        BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackParam,
+        ExternCallbackSignature, ExternDescriptorError, ExternEffects, ExternFieldDescriptor,
+        ExternFunctionDescriptor, ExternInitDescriptor, ExternMemberSelector,
+        ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator, ExternOperatorDescriptor,
+        ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor, ExternTypeDescriptor,
+        ExternTypeExpr, ModulePath, OperatorReturn, ParamFlow, ProviderDescriptor, ProviderId,
+        ReceiverMode, TypeContext,
     };
 
     use super::*;
@@ -95,7 +96,12 @@ mod tests {
             name: Some(name.to_string()),
             ty,
             flow: ParamFlow::Value,
+            escape: CallbackEscape::NonEscaping,
         }
+    }
+
+    fn cb_param(ty: ExternTypeExpr, escape: CallbackEscape) -> ExternCallbackParam {
+        ExternCallbackParam { ty, escape }
     }
 
     fn signature(params: Vec<ExternParam>, ret: ExternTypeExpr) -> ExternSignature {
@@ -713,7 +719,10 @@ mod tests {
             else {
                 panic!("expected callback type");
             };
-            assert_eq!(callback.params, [ExternTypeExpr::Int]);
+            assert_eq!(
+                callback.params,
+                [cb_param(ExternTypeExpr::Int, CallbackEscape::NonEscaping)]
+            );
             assert_eq!(*callback.ret, ExternTypeExpr::String);
             assert_eq!(
                 callback.policy,
@@ -722,6 +731,78 @@ mod tests {
                     thread: CallbackThread::SameThread,
                 }
             );
+        }
+
+        #[test]
+        fn normalizes_source_escaping_callback_type() {
+            let root = parse("extern fn each(callback: escaping fn(int) -> string) -> void;");
+            let raw = collect_source_externs(&root, &empty_resolved()).unwrap();
+
+            let param = &raw.groups[0].modules[0].functions[0].decl.signature.params[0];
+            let ExternTypeExpr::Callback(callback) = &param.ty else {
+                panic!("expected callback type");
+            };
+            assert_eq!(param.escape, CallbackEscape::Escaping);
+            assert_eq!(
+                callback.params,
+                [cb_param(ExternTypeExpr::Int, CallbackEscape::NonEscaping)]
+            );
+            assert_eq!(*callback.ret, ExternTypeExpr::String);
+            assert_eq!(
+                callback.policy,
+                CallbackPolicy {
+                    escape: CallbackEscape::NonEscaping,
+                    thread: CallbackThread::SameThread,
+                }
+            );
+        }
+
+        #[test]
+        fn normalizes_source_alias_callback_escape_type() {
+            let root =
+                parse("type Handler = fn(); extern fn each(callback: escaping Handler) -> void;");
+            let raw = collect_source_externs(&root, &empty_resolved()).unwrap();
+            let param = &raw.groups[0].modules[0].functions[0].decl.signature.params[0];
+
+            assert_eq!(param.escape, CallbackEscape::Escaping);
+            assert!(matches!(param.ty, ExternTypeExpr::Named { .. }));
+        }
+
+        #[test]
+        fn normalizes_source_nested_alias_callback_escape_type() {
+            let root = parse(
+                "type Handler = fn(); extern fn higher(callback: fn(escaping Handler) -> void) -> void;",
+            );
+            let raw = collect_source_externs(&root, &empty_resolved()).unwrap();
+
+            let ExternTypeExpr::Callback(callback) =
+                &raw.groups[0].modules[0].functions[0].decl.signature.params[0].ty
+            else {
+                panic!("expected callback type");
+            };
+            assert_eq!(callback.params[0].escape, CallbackEscape::Escaping);
+            assert!(matches!(
+                callback.params[0].ty,
+                ExternTypeExpr::Named { .. }
+            ));
+        }
+
+        #[test]
+        fn normalizes_source_nested_callback_escape_type() {
+            let root = parse("extern fn higher(callback: fn(escaping fn()) -> void) -> void;");
+            let raw = collect_source_externs(&root, &empty_resolved()).unwrap();
+
+            let ExternTypeExpr::Callback(callback) =
+                &raw.groups[0].modules[0].functions[0].decl.signature.params[0].ty
+            else {
+                panic!("expected callback type");
+            };
+            let ExternTypeExpr::Callback(nested) = &callback.params[0].ty else {
+                panic!("expected nested callback type");
+            };
+            assert_eq!(callback.policy.escape, CallbackEscape::NonEscaping);
+            assert_eq!(callback.params[0].escape, CallbackEscape::Escaping);
+            assert_eq!(nested.policy.escape, CallbackEscape::NonEscaping);
         }
 
         #[test]
@@ -1102,7 +1183,7 @@ mod tests {
         #[test]
         fn preserves_descriptor_child_facts() {
             let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-                params: vec![ExternTypeExpr::Int],
+                params: vec![cb_param(ExternTypeExpr::Int, CallbackEscape::NonEscaping)],
                 ret: Box::new(ExternTypeExpr::Float),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::Escaping,
@@ -1137,6 +1218,7 @@ mod tests {
                                     name: Some("dx".to_string()),
                                     ty: ExternTypeExpr::Float,
                                     flow: ParamFlow::Borrow,
+                                    escape: CallbackEscape::NonEscaping,
                                 }],
                                 ExternTypeExpr::Void,
                             ),

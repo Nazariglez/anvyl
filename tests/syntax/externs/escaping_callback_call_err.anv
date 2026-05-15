@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'f' is non-escaping by default, but it escapes here
+// @frontend: new
+
+extern fn later(f: escaping fn()) -> void;
+
+fn bad(f: fn()) {
+    later(f);
+}

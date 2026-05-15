@@ -36,11 +36,13 @@ pub(super) fn check_call(
 }
 
 pub(super) fn check_arg(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
-    match param.flow {
+    let ok = match param.flow {
         ParamFlow::Value => check_arg_expr(arg, param, tc),
         ParamFlow::Borrow => check_arg_borrow(arg, param, tc),
         ParamFlow::MutBorrow => check_arg_place(arg, param, tc),
-    }
+    };
+    tc.check_argument_escape(arg, param.escape);
+    ok
 }
 
 fn check_arg_borrow(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
@@ -50,21 +52,13 @@ fn check_arg_borrow(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeCh
     check_checked_value(arg, &checked, &param.ty, tc)
 }
 
-pub(super) fn check_arg_expr(
-    arg: &ExprNode,
-    param: &ResolvedExternParam,
-    tc: &mut TypeChecker,
-) -> bool {
+fn check_arg_expr(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     let expected = tc.type_handle(&param.ty.ty);
     let checked = check_value_expr_checked_with_hint(arg, Some(expected), tc);
     check_checked_value(arg, &checked, &param.ty, tc)
 }
 
-pub(super) fn check_arg_place(
-    arg: &ExprNode,
-    param: &ResolvedExternParam,
-    tc: &mut TypeChecker,
-) -> bool {
+fn check_arg_place(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     let checked = check_place(arg, tc);
     let is_mutable = checked.value.access.can_mut_borrow();
     if !is_mutable {

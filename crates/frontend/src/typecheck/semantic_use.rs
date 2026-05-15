@@ -23,6 +23,72 @@ pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
 pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
 pub(crate) type DynDowncastMap = HashMap<ExprId, DynDowncastFact>;
 pub(crate) type GlobalAccessMap = HashMap<ExprId, GlobalAccessFact>;
+pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
+pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
+pub(crate) type BindingPromotionMap = HashMap<BindingId, BindingPromotionFact>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct BindingId(pub(crate) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LambdaEscapeKind {
+    NonEscaping,
+    Escaping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LambdaEscapeFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) escape: LambdaEscapeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CaptureStorageOrigin {
+    Owned,
+    BorrowedParam,
+    VarSelf,
+    DynView,
+    PatternAlias,
+    MutableDowncastAlias,
+    ForVarAlias,
+    Const,
+    ReadonlySelf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CaptureAccess {
+    Read,
+    Mutable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CaptureStorage {
+    NoRuntime,
+    OwnedReadonly,
+    OwnedMutableScoped,
+    OwnedMutableUpvalue,
+    BorrowedScoped,
+    BorrowedEscaping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LambdaCaptureFact {
+    pub(crate) lambda_id: ExprId,
+    pub(crate) binding_id: BindingId,
+    pub(crate) name: Ident,
+    pub(crate) ty: Type,
+    pub(crate) origin: CaptureStorageOrigin,
+    pub(crate) source_mutable: bool,
+    pub(crate) access: CaptureAccess,
+    pub(crate) storage: CaptureStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BindingPromotionFact {
+    pub(crate) binding_id: BindingId,
+    pub(crate) name: Ident,
+    pub(crate) ty: Type,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallTarget {
