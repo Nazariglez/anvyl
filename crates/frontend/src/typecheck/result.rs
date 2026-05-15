@@ -1,18 +1,31 @@
-use super::{BindingPromotionMap, LambdaCaptureMap, LambdaEscapeMap, TypeWarning, map_delta};
+use super::{
+    BindingPromotionMap, CompileWarning, ImportId, ImportRecord, LambdaCaptureMap, LambdaEscapeMap,
+    map_delta,
+};
+use crate::lint::LintEvent;
 
 pub struct TypecheckResult {
-    warnings: Vec<TypeWarning>,
+    warnings: Vec<CompileWarning>,
+    lint_events: Vec<LintEvent>,
     facts: TypecheckFacts,
 }
 
 impl TypecheckResult {
-    pub(crate) fn new(warnings: Vec<TypeWarning>, facts: TypecheckFacts) -> Self {
+    pub(crate) fn new(
+        warnings: Vec<CompileWarning>,
+        lint_events: Vec<LintEvent>,
+        facts: TypecheckFacts,
+    ) -> Self {
         facts.validate();
-        Self { warnings, facts }
+        Self {
+            warnings,
+            lint_events,
+            facts,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<TypeWarning>, TypecheckFacts) {
-        (self.warnings, self.facts)
+    pub(crate) fn into_parts(self) -> (Vec<CompileWarning>, Vec<LintEvent>, TypecheckFacts) {
+        (self.warnings, self.lint_events, self.facts)
     }
 }
 
@@ -21,6 +34,8 @@ pub struct TypecheckFacts {
     pub(super) lambda_escapes: LambdaEscapeMap,
     pub(super) lambda_captures: LambdaCaptureMap,
     pub(super) binding_promotions: BindingPromotionMap,
+    pub(super) import_records: Vec<ImportRecord>,
+    pub(super) used_imports: std::collections::HashSet<ImportId>,
 }
 
 impl TypecheckFacts {
@@ -36,11 +51,21 @@ impl TypecheckFacts {
         &self.binding_promotions
     }
 
+    pub(crate) fn import_records(&self) -> &[ImportRecord] {
+        &self.import_records
+    }
+
+    pub(crate) fn used_imports(&self) -> &std::collections::HashSet<ImportId> {
+        &self.used_imports
+    }
+
     pub(crate) fn delta_since(&self, old: &Self) -> Self {
         Self {
             lambda_escapes: map_delta(&old.lambda_escapes, &self.lambda_escapes),
             lambda_captures: map_delta(&old.lambda_captures, &self.lambda_captures),
             binding_promotions: map_delta(&old.binding_promotions, &self.binding_promotions),
+            import_records: self.import_records.clone(),
+            used_imports: self.used_imports.clone(),
         }
     }
 

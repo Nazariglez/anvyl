@@ -1,19 +1,17 @@
 use std::{collections::HashMap, fs, path::Path};
 
-use anvyx_lang::{CompilationContext, LintConfig, LintLevel, Profile, TargetArch, TargetOs};
+use anvyx_lang::{CompilationContext, LintConfig, Profile, TargetArch, TargetOs};
 use anvyx_lang2::{
-    CheckError as FrontendCheckError, CheckFileInput, CheckPackageInput,
-    CompilationContext as FrontendCompilationContext, Diagnostic, DiagnosticLabel,
-    DiagnosticReport, FrontendConfig, LintConfig as FrontendLintConfig,
-    LintLevel as FrontendLintLevel, PackageId as FrontendPackageId, PackageSource,
-    Profile as FrontendProfile, SourceBundle, TargetArch as FrontendTargetArch,
-    TargetOs as FrontendTargetOs, render_rich_report,
+    CheckError as FrontendCheckError, CompilationContext as FrontendCompilationContext, Diagnostic,
+    DiagnosticLabel, DiagnosticReport, DiagnosticSeverity, DiagnosticTag, FrontendConfig,
+    LintConfig as FrontendLintConfig, Profile as FrontendProfile, TargetArch as FrontendTargetArch,
+    TargetOs as FrontendTargetOs, implemented_lints, render_rich_report,
 };
 use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::{
-    manifest::{Manifest, PackageGraph, PackageId},
+    manifest::Manifest,
     std_support::{collect_core, collect_std},
 };
 
@@ -21,6 +19,21 @@ use crate::{
 pub enum CheckOutputFormat {
     Text,
     Json,
+}
+
+pub fn render_lint_list() -> String {
+    let mut lines = vec!["Lint                          Default  Group  Description".to_string()];
+    for lint in implemented_lints() {
+        let default = lint.default_level().to_string();
+        lines.push(format!(
+            "{:<29} {:<8} {:<6} {}",
+            lint.name(),
+            default,
+            lint.group(),
+            lint.description()
+        ));
+    }
+    lines.join("\n")
 }
 
 pub fn cmd(
@@ -49,28 +62,17 @@ pub fn cmd(
 
 pub fn new_frontend_cmd(
     file: &Path,
-    lint: LintConfig,
+    lint: FrontendLintConfig,
     ctx: &CompilationContext,
     format: CheckOutputFormat,
+    warnings_are_errors: bool,
 ) -> Result<(), String> {
-    let sources = new_frontend_source_bundle()?;
-    let manifest_path = Path::new("anvyx.toml");
-    let result = if manifest_path.exists() {
-        let graph = crate::manifest::load_package_graph(manifest_path)?;
-        let input =
-            package_check_input(&graph, file, sources)?.with_config(new_frontend_config(lint, ctx));
-        anvyx_lang2::check_package(input)
-    } else {
-        let input = CheckFileInput::new(file.to_path_buf(), sources)
-            .map_err(|error| error.to_string())?
-            .with_config(new_frontend_config(lint, ctx));
-        anvyx_lang2::check_file(input)
-    };
+    let result = anvyx_project::check::check_path(file, new_frontend_config(lint, ctx))?;
 
     match result {
-        Ok(ok) => emit_report(&ok.report, format),
+        Ok(ok) => emit_final_report(&ok.report, format, warnings_are_errors),
         Err(error) => {
-            emit_error_report(&error, format)?;
+            emit_error_report(&error, format, warnings_are_errors)?;
             if error.report().is_some() {
                 Err(error.summary())
             } else {
@@ -80,15 +82,9 @@ pub fn new_frontend_cmd(
     }
 }
 
-fn new_frontend_config(lint: LintConfig, ctx: &CompilationContext) -> FrontendConfig {
+fn new_frontend_config(lint: FrontendLintConfig, ctx: &CompilationContext) -> FrontendConfig {
     FrontendConfig {
-        lint: FrontendLintConfig {
-            internal_access: match lint.internal_access {
-                LintLevel::Allow => FrontendLintLevel::Allow,
-                LintLevel::Warn => FrontendLintLevel::Warn,
-                LintLevel::Error => FrontendLintLevel::Error,
-            },
-        },
+        lint,
         context: new_frontend_context(ctx),
         ..FrontendConfig::default()
     }
@@ -116,6 +112,27 @@ fn new_frontend_context(ctx: &CompilationContext) -> FrontendCompilationContext 
     }
 }
 
+pub fn reject_new_frontend_inputs(manifest: Option<&Manifest>) -> Result<(), String> {
+    anvyx_project::manifest::reject_clean_frontend_inputs(manifest)
+}
+
+fn emit_final_report(
+    report: &DiagnosticReport,
+    format: CheckOutputFormat,
+    warnings_are_errors: bool,
+) -> Result<(), String> {
+    let has_warning = report
+        .diagnostics()
+        .iter()
+        .any(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Warning);
+    let report = report_for_cli(report, warnings_are_errors);
+    emit_report(&report, format)?;
+    if warnings_are_errors && has_warning {
+        return Err("warnings treated as errors".to_string());
+    }
+    Ok(())
+}
+
 fn emit_report(report: &DiagnosticReport, format: CheckOutputFormat) -> Result<(), String> {
     match format {
         CheckOutputFormat::Text => emit_text_report(report),
@@ -124,11 +141,20 @@ fn emit_report(report: &DiagnosticReport, format: CheckOutputFormat) -> Result<(
     Ok(())
 }
 
-fn emit_error_report(error: &FrontendCheckError, format: CheckOutputFormat) -> Result<(), String> {
+fn emit_error_report(
+    error: &FrontendCheckError,
+    format: CheckOutputFormat,
+    warnings_are_errors: bool,
+) -> Result<(), String> {
     match (format, error.report()) {
-        (CheckOutputFormat::Text, Some(report)) => emit_text_report(report),
+        (CheckOutputFormat::Text, Some(report)) => {
+            emit_text_report(&report_for_cli(report, warnings_are_errors));
+        }
         (CheckOutputFormat::Text, None) => {}
-        (CheckOutputFormat::Json, Some(report)) => println!("{}", render_json_report(report)?),
+        (CheckOutputFormat::Json, Some(report)) => println!(
+            "{}",
+            render_json_report(&report_for_cli(report, warnings_are_errors))?
+        ),
         (CheckOutputFormat::Json, None) => {
             println!(
                 "{}",
@@ -137,6 +163,19 @@ fn emit_error_report(error: &FrontendCheckError, format: CheckOutputFormat) -> R
         }
     }
     Ok(())
+}
+
+fn report_for_cli(report: &DiagnosticReport, warnings_are_errors: bool) -> DiagnosticReport {
+    if !warnings_are_errors {
+        return report.clone();
+    }
+    let mut report = report.clone();
+    for diagnostic in &mut report.diagnostics {
+        if diagnostic.severity() == DiagnosticSeverity::Warning {
+            *diagnostic = diagnostic.clone().with_severity(DiagnosticSeverity::Error);
+        }
+    }
+    report
 }
 
 fn emit_text_report(report: &DiagnosticReport) {
@@ -184,6 +223,9 @@ struct JsonSource<'a> {
 #[derive(Serialize)]
 struct JsonDiagnostic<'a> {
     severity: &'static str,
+    source: Option<&'static str>,
+    code: Option<&'a str>,
+    tags: Vec<&'static str>,
     message: &'a str,
     labels: Vec<JsonLabel<'a>>,
     notes: &'a [String],
@@ -224,11 +266,21 @@ impl<'a> From<&'a Diagnostic> for JsonDiagnostic<'a> {
     fn from(diagnostic: &'a Diagnostic) -> Self {
         Self {
             severity: diagnostic.severity().as_str(),
+            source: diagnostic.code().map(|code| code.source),
+            code: diagnostic.code().map(|code| code.code.as_str()),
+            tags: diagnostic.tags().iter().copied().map(json_tag).collect(),
             message: diagnostic.message(),
             labels: diagnostic.labels().iter().map(JsonLabel::from).collect(),
             notes: diagnostic.notes(),
             help: diagnostic.help(),
         }
+    }
+}
+
+fn json_tag(tag: DiagnosticTag) -> &'static str {
+    match tag {
+        DiagnosticTag::Deprecated => "deprecated",
+        DiagnosticTag::Unnecessary => "unnecessary",
     }
 }
 
@@ -244,69 +296,11 @@ impl<'a> From<&'a DiagnosticLabel> for JsonLabel<'a> {
     }
 }
 
-fn package_check_input(
-    graph: &PackageGraph,
-    file: &Path,
-    sources: SourceBundle,
-) -> Result<CheckPackageInput, String> {
-    let root = graph.root();
-    let root_id = frontend_package_id(&root.id);
-    let packages = graph
-        .packages()
-        .iter()
-        .map(|package| {
-            let dependencies = package
-                .dependencies
-                .iter()
-                .map(|(alias, id)| (alias.clone(), frontend_package_id(id)))
-                .collect();
-            match (&package.entry, &package.source_root) {
-                (Some(entry), Some(source_root)) => PackageSource::new(
-                    frontend_package_id(&package.id),
-                    entry.clone(),
-                    source_root.clone(),
-                    dependencies,
-                )
-                .map_err(|error| error.to_string()),
-                (None, None) => Ok(PackageSource::native_only(
-                    frontend_package_id(&package.id),
-                    dependencies,
-                )),
-                _ => Err(format!(
-                    "package {} has inconsistent source entry/source root state",
-                    package.id
-                )),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    CheckPackageInput::new(root_id, file.to_path_buf(), packages, sources)
-        .map_err(|error| error.to_string())
-}
-
-fn frontend_package_id(id: &PackageId) -> FrontendPackageId {
-    FrontendPackageId::new(id.manifest_path().display().to_string())
-}
-
-pub fn reject_new_frontend_inputs(manifest: Option<&Manifest>) -> Result<(), String> {
-    let Some(manifest) = manifest else {
-        return Ok(());
-    };
-
-    if manifest.has_externs() {
-        return Err("--new-frontend does not support extern providers yet".to_string());
-    }
-
-    Ok(())
-}
-
-fn new_frontend_source_bundle() -> Result<SourceBundle, String> {
-    crate::frontend_sources::source_bundle()
-}
-
 #[cfg(test)]
 mod tests {
-    use anvyx_lang::{LintConfig, StdModuleSource};
+    use std::sync::{Mutex, OnceLock};
+
+    use anvyx_lang2::CheckFileInput;
 
     use super::*;
     use crate::manifest::{DependencyEntry, ExternEntry, Project};
@@ -314,36 +308,166 @@ mod tests {
     fn check_new_frontend(file: &Path) -> Result<(), String> {
         new_frontend_cmd(
             file,
-            LintConfig::default(),
+            FrontendLintConfig::default(),
             &CompilationContext::from_host(Profile::Debug),
             CheckOutputFormat::Text,
+            false,
         )
     }
 
     fn check_new_frontend_error(file: &Path) -> String {
-        let sources = new_frontend_source_bundle().unwrap();
+        let sources = anvyx_project::source_bundle().unwrap();
         let input = CheckFileInput::new(file.to_path_buf(), sources).unwrap();
         anvyx_lang2::check_file(input).unwrap_err().to_string()
     }
 
-    fn source(code: &str) -> StdModuleSource {
-        StdModuleSource {
-            anv_source: code.to_string(),
-        }
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn sources(items: &[(&str, &str)]) -> HashMap<String, StdModuleSource> {
-        items
-            .iter()
-            .map(|(name, code)| ((*name).to_string(), source(code)))
-            .collect()
+    #[test]
+    fn check_new_frontend_standalone_uses_project_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.anv");
+        fs::write(&main, "fn main() {}\n").unwrap();
+
+        check_new_frontend(&main).unwrap();
     }
 
-    fn path(segments: &[&str]) -> Vec<String> {
-        segments
-            .iter()
-            .map(|segment| (*segment).to_string())
-            .collect()
+    #[test]
+    fn check_new_frontend_manifest_uses_project_input() {
+        let _guard = cwd_lock().lock().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(
+            temp.path().join("anvyx.toml"),
+            "[project]\nentry = \"src/main.anv\"\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("src/main.anv"), "fn main() {}\n").unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let result = check_new_frontend(Path::new("src/main.anv"));
+
+        std::env::set_current_dir(previous).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn list_lints_output_is_stable() {
+        let rendered = render_lint_list();
+
+        assert!(rendered.starts_with("Lint                          Default  Group  Description"));
+        assert!(rendered.contains(
+            "internal_access               warn     api    cross-module access to @internal members"
+        ));
+        assert!(rendered.contains(
+            "deprecated                    warn     api    use of declarations marked @deprecated"
+        ));
+        assert!(rendered.contains(
+            "public_inferred_dyn_contract  warn     api    exported function uses inferred dyn contract"
+        ));
+        assert!(rendered.contains(
+            "unused_import                 warn     unused unused private import has no binding or activation use"
+        ));
+    }
+
+    #[test]
+    fn warn_as_error_projection_upgrades_warnings_only() {
+        let report = DiagnosticReport {
+            diagnostics: vec![
+                Diagnostic::warning("careful").with_code("anvyx", "deprecated"),
+                Diagnostic::error("bad"),
+            ],
+            ..DiagnosticReport::default()
+        };
+
+        let projected = report_for_cli(&report, true);
+
+        assert_eq!(
+            projected.diagnostics()[0].severity(),
+            DiagnosticSeverity::Error
+        );
+        assert_eq!(
+            projected.diagnostics()[0].code().unwrap().code,
+            "deprecated"
+        );
+        assert_eq!(
+            projected.diagnostics()[1].severity(),
+            DiagnosticSeverity::Error
+        );
+        assert_eq!(
+            report.diagnostics()[0].severity(),
+            DiagnosticSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn warn_as_error_json_uses_upgraded_severity() {
+        let report = DiagnosticReport {
+            diagnostics: vec![Diagnostic::warning("careful")],
+            ..DiagnosticReport::default()
+        };
+        let projected = report_for_cli(&report, true);
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json_report(&projected).unwrap()).unwrap();
+
+        assert_eq!(json["diagnostics"][0]["severity"], "error");
+    }
+
+    #[test]
+    fn warn_as_error_fails_on_final_warning_report() {
+        let report = DiagnosticReport {
+            diagnostics: vec![Diagnostic::warning("careful")],
+            ..DiagnosticReport::default()
+        };
+
+        let error = emit_final_report(&report, CheckOutputFormat::Json, true).unwrap_err();
+
+        assert_eq!(error, "warnings treated as errors");
+    }
+
+    #[test]
+    fn unused_import_json_contains_code_and_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.anv");
+        fs::write(&main, "import helper; fn main() {}\n").unwrap();
+        fs::write(temp.path().join("helper.anv"), "pub fn f() {}\n").unwrap();
+        let input = anvyx_project::check::standalone_check_input(&main).unwrap();
+        let report = anvyx_lang2::check_file(input).unwrap().report;
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json_report(&report).unwrap()).unwrap();
+        let diagnostic = &json["diagnostics"][0];
+
+        assert_eq!(diagnostic["source"], "anvyx");
+        assert_eq!(diagnostic["code"], "unused_import");
+        assert_eq!(diagnostic["tags"], serde_json::json!(["unnecessary"]));
+    }
+
+    #[test]
+    fn unused_import_error_level_fails_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.anv");
+        fs::write(&main, "import helper; fn main() {}\n").unwrap();
+        fs::write(temp.path().join("helper.anv"), "pub fn f() {}\n").unwrap();
+        let mut lint = FrontendLintConfig::default();
+        lint.set(
+            anvyx_lang2::LintId::UnusedImport,
+            anvyx_lang2::LintLevel::Error,
+        );
+
+        let error = new_frontend_cmd(
+            &main,
+            lint,
+            &CompilationContext::from_host(Profile::Debug),
+            CheckOutputFormat::Json,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("typecheck"), "{error}");
     }
 
     fn plain_manifest() -> Manifest {
@@ -354,7 +478,7 @@ mod tests {
             },
             dependencies: HashMap::new(),
             externs: HashMap::new(),
-            lint: LintConfig::default(),
+            lint: Default::default(),
         }
     }
 
@@ -374,22 +498,10 @@ mod tests {
             file
         }
 
-        fn sorted_std_paths(bundle: &SourceBundle) -> Vec<Vec<String>> {
-            let mut paths = bundle
-                .std()
-                .unwrap()
-                .modules()
-                .iter()
-                .map(|module| module.path().to_vec())
-                .collect::<Vec<_>>();
-            paths.sort();
-            paths
-        }
-
         fn frontend_error(code: &str) -> FrontendCheckError {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", code);
-            let sources = new_frontend_source_bundle().unwrap();
+            let sources = anvyx_project::source_bundle().unwrap();
             let input = CheckFileInput::new(main, sources).unwrap();
             anvyx_lang2::check_file(input).unwrap_err()
         }
@@ -404,246 +516,6 @@ mod tests {
 
         fn json_value(report: &DiagnosticReport) -> serde_json::Value {
             serde_json::from_str(&render_json_report(report).unwrap()).unwrap()
-        }
-
-        mod bundle {
-            use anvyx_lang2::{ModuleSource, SourceText, SystemPackageSource};
-
-            use super::*;
-
-            fn bundle_from_sources(
-                core_prelude: String,
-                core_sources: HashMap<String, StdModuleSource>,
-                std_sources: HashMap<String, StdModuleSource>,
-            ) -> Result<SourceBundle, String> {
-                let prelude =
-                    SourceText::new(core_prelude, "<core>").map_err(|error| error.to_string())?;
-
-                let core_modules = sorted_modules(core_sources)
-                    .into_iter()
-                    .map(|(name, source)| {
-                        let path = vec![name.clone()];
-                        let label = format!("<core.{name}>");
-                        ModuleSource::new(path, source.anv_source, label)
-                            .map_err(|error| error.to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                let std_modules = sorted_modules(std_sources)
-                    .into_iter()
-                    .map(|(name, source)| {
-                        let path = vec![name.clone()];
-                        let label = format!("<std.{name}>");
-                        ModuleSource::new(path, source.anv_source, label)
-                            .map_err(|error| error.to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let std_root = std_modules
-                    .iter()
-                    .map(|module| format!("pub import {};", module.path().join(".")))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let core = SystemPackageSource::new(prelude, core_modules)
-                    .map_err(|error| error.to_string())?;
-                let std = SystemPackageSource::new(
-                    SourceText::new(std_root, "<std>").map_err(|error| error.to_string())?,
-                    std_modules,
-                )
-                .map_err(|error| error.to_string())?;
-
-                Ok(SourceBundle::new(Some(core), Some(std)))
-            }
-
-            fn sorted_modules(
-                sources: HashMap<String, StdModuleSource>,
-            ) -> Vec<(String, StdModuleSource)> {
-                let mut sources = sources.into_iter().collect::<Vec<_>>();
-                sources.sort_by(|left, right| left.0.cmp(&right.0));
-                sources
-            }
-
-            #[test]
-            fn prelude() {
-                let bundle =
-                    bundle_from_sources("fn p() {}".to_string(), HashMap::new(), HashMap::new())
-                        .unwrap();
-                let prelude = bundle.core().unwrap().root();
-
-                assert_eq!(prelude.label(), "<core>");
-                assert_eq!(prelude.code(), "fn p() {}");
-            }
-
-            #[test]
-            fn core_modules() {
-                let bundle = bundle_from_sources(
-                    String::new(),
-                    sources(&[("core_int", "extend int {}")]),
-                    HashMap::new(),
-                )
-                .unwrap();
-                let modules = bundle.core().unwrap().modules();
-
-                assert_eq!(modules.len(), 1);
-                assert_eq!(modules[0].path(), path(&["core_int"]));
-                assert_eq!(modules[0].label(), "<core.core_int>");
-                assert_eq!(modules[0].code(), "extend int {}");
-            }
-
-            #[test]
-            fn std_root() {
-                let bundle = bundle_from_sources(
-                    String::new(),
-                    HashMap::new(),
-                    sources(&[("math", "extern fn sin(x: float) -> float;")]),
-                )
-                .unwrap();
-                let module = bundle.std().unwrap().module(&path(&["math"])).unwrap();
-
-                assert_eq!(module.path(), path(&["math"]));
-                assert_eq!(module.label(), "<std.math>");
-                assert_eq!(module.code(), "extern fn sin(x: float) -> float;");
-            }
-
-            #[test]
-            fn orders_modules() {
-                let bundle = bundle_from_sources(
-                    String::new(),
-                    sources(&[
-                        ("core_string", "extend string {}"),
-                        ("core_int", "extend int {}"),
-                    ]),
-                    sources(&[("maps", ""), ("math", "")]),
-                )
-                .unwrap();
-                let core_paths = bundle
-                    .core()
-                    .unwrap()
-                    .modules()
-                    .iter()
-                    .map(|module| module.path().to_vec())
-                    .collect::<Vec<_>>();
-
-                assert_eq!(core_paths, [path(&["core_int"]), path(&["core_string"])]);
-            }
-
-            #[test]
-            fn rejects_bad_builtin_name() {
-                let error = bundle_from_sources(
-                    String::new(),
-                    sources(&[("", "extend int {}")]),
-                    HashMap::new(),
-                )
-                .expect_err("empty built-in module name should be invalid");
-
-                assert!(error.contains("module path must not contain empty segments"));
-            }
-
-            #[test]
-            fn clean_frontend_core_surface_is_explicit() {
-                let bundle = new_frontend_source_bundle().unwrap();
-                let core = bundle.core().unwrap();
-                let core_paths = core
-                    .modules()
-                    .iter()
-                    .map(|module| module.path().to_vec())
-                    .collect::<Vec<_>>();
-                let expected = [
-                    path(&["option"]),
-                    path(&["result"]),
-                    path(&["range"]),
-                    path(&["collections"]),
-                    path(&["core_int"]),
-                    path(&["core_float"]),
-                    path(&["core_string"]),
-                ];
-
-                assert_eq!(core.root().label(), "crates/core2/src/lib.anv");
-                assert_eq!(core_paths, expected);
-                assert!(core.root().code().contains("pub import core_int { * };"));
-                assert!(core.root().code().contains("pub import core_float { * };"));
-                assert!(core.root().code().contains("pub import core_string { * };"));
-                assert!(core.root().code().contains("pub import option { * };"));
-                assert!(core.root().code().contains("pub import result { * };"));
-                assert!(core.root().code().contains("pub import range { * };"));
-                assert!(core.root().code().contains("pub import collections { * };"));
-            }
-
-            #[test]
-            fn clean_frontend_std_surface_is_explicit() {
-                let bundle = new_frontend_source_bundle().unwrap();
-
-                assert_eq!(sorted_std_paths(&bundle), [path(&["mem"])]);
-            }
-
-            #[test]
-            fn clean_frontend_bundle_has_no_legacy_type_spellings() {
-                let bundle = new_frontend_source_bundle().unwrap();
-                let mut code = String::new();
-                code.push_str(bundle.core().unwrap().root().code());
-                for module in bundle.core().unwrap().modules() {
-                    code.push_str(module.code());
-                }
-                for module in bundle.std().unwrap().modules() {
-                    code.push_str(module.code());
-                }
-
-                assert!(!code.contains("double"));
-                assert!(!code.contains("PI_D"));
-                assert!(!code.contains("EPSILON_D"));
-                assert!(!code.contains("Option<string>"));
-                assert!(!code.contains("Option<int>"));
-                assert!(!code.contains("Option<float>"));
-                assert!(!code.contains("Option<bool>"));
-                assert!(!code.contains("Option<any>"));
-                assert!(!code.contains("import ext:int"));
-                assert!(!code.contains("import ext:float"));
-                assert!(!code.contains("import ext:string"));
-            }
-
-            #[test]
-            fn target_system_package_shape() {
-                let bundle = new_frontend_source_bundle().unwrap();
-
-                assert_eq!(
-                    bundle.core().unwrap().root().label(),
-                    "crates/core2/src/lib.anv"
-                );
-                assert_eq!(
-                    bundle
-                        .std()
-                        .unwrap()
-                        .module(&path(&["mem"]))
-                        .unwrap()
-                        .label(),
-                    "crates/stdlib2/src/mem.anv"
-                );
-            }
-
-            #[test]
-            fn target_adapter_paths_removed() {
-                let bundle = new_frontend_source_bundle().unwrap();
-                let core_paths = bundle
-                    .core()
-                    .unwrap()
-                    .modules()
-                    .iter()
-                    .map(|module| module.path().to_vec())
-                    .collect::<Vec<_>>();
-
-                assert_eq!(
-                    core_paths,
-                    [
-                        path(&["option"]),
-                        path(&["result"]),
-                        path(&["range"]),
-                        path(&["collections"]),
-                        path(&["core_int"]),
-                        path(&["core_float"]),
-                        path(&["core_string"]),
-                    ]
-                );
-                assert_eq!(sorted_std_paths(&bundle), [path(&["mem"])]);
-            }
         }
 
         mod integration {
@@ -670,8 +542,7 @@ mod tests {
             fn check_manifest_file(dir: &tempfile::TempDir, file: &Path) -> Result<(), String> {
                 let graph =
                     crate::manifest::load_package_graph(&dir.path().join("game/anvyx.toml"))?;
-                let sources = new_frontend_source_bundle()?;
-                let input = package_check_input(&graph, file, sources)?;
+                let input = anvyx_project::check::package_check_input(&graph, file)?;
                 anvyx_lang2::check_package(input)
                     .map(|_| ())
                     .map_err(|error| error.to_string())
@@ -930,6 +801,9 @@ mod tests {
                 .unwrap();
 
             assert_eq!(diagnostic["severity"], "error");
+            assert!(diagnostic["source"].is_null());
+            assert!(diagnostic["code"].is_null());
+            assert!(diagnostic["tags"].as_array().unwrap().is_empty());
             assert_eq!(label["style"], "primary");
             let start = label["start"].as_u64().unwrap() as usize;
             let end = label["end"].as_u64().unwrap() as usize;
@@ -980,7 +854,7 @@ mod tests {
         }
 
         #[test]
-        fn json_report_serializes_warnings_labels_notes_and_help() {
+        fn json_report_serializes_warnings_labels_notes_help_and_metadata() {
             let mut sources = anvyx_lang2::SourceTable::default();
             let source = sources.add(
                 anvyx_lang2::SourceKind::Virtual,
@@ -989,6 +863,9 @@ mod tests {
                 "fn main() {}",
             );
             let diagnostic = Diagnostic::warning("careful")
+                .with_code("anvyx", "deprecated")
+                .with_tag(DiagnosticTag::Deprecated)
+                .with_tag(DiagnosticTag::Unnecessary)
                 .with_primary_message(
                     anvyx_lang2::SourceSpan::new(source, 0, 2),
                     "compile warning emitted here",
@@ -1003,6 +880,12 @@ mod tests {
             let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
 
             assert_eq!(json["diagnostics"][0]["severity"], "warning");
+            assert_eq!(json["diagnostics"][0]["source"], "anvyx");
+            assert_eq!(json["diagnostics"][0]["code"], "deprecated");
+            assert_eq!(
+                json["diagnostics"][0]["tags"],
+                serde_json::json!(["deprecated", "unnecessary"])
+            );
             assert_eq!(
                 json["diagnostics"][0]["labels"][0]["message"],
                 "compile warning emitted here"
@@ -1033,7 +916,9 @@ mod tests {
             #[test]
             fn accepts_manifest_lint() {
                 let mut manifest = plain_manifest();
-                manifest.lint.internal_access = LintLevel::Error;
+                manifest
+                    .lint
+                    .insert("internal_access".to_string(), "error".to_string());
 
                 reject_new_frontend_inputs(Some(&manifest)).unwrap();
             }
@@ -1052,7 +937,7 @@ mod tests {
 
                 assert_eq!(
                     error,
-                    "--new-frontend does not support extern providers yet"
+                    "clean frontend does not support extern providers yet"
                 );
             }
 

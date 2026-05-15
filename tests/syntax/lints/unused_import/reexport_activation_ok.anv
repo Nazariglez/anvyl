@@ -1,0 +1,8 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+import facade;
+
+fn main() { let x = 1.0.double_val(); }

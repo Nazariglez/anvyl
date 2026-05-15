@@ -62,6 +62,10 @@ impl CheckFileInput {
     pub fn sources(&self) -> &SourceBundle {
         &self.sources
     }
+
+    pub fn source_overrides(&self) -> &[SourceOverride] {
+        &self.source_overrides
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +124,26 @@ impl CheckPackageInput {
     pub fn with_source_overrides(mut self, source_overrides: Vec<SourceOverride>) -> Self {
         self.source_overrides = source_overrides;
         self
+    }
+
+    pub fn root_package(&self) -> &PackageId {
+        &self.root_package
+    }
+
+    pub fn root_file(&self) -> &Path {
+        &self.root_file
+    }
+
+    pub fn packages(&self) -> &[PackageSource] {
+        &self.packages
+    }
+
+    pub fn sources(&self) -> &SourceBundle {
+        &self.sources
+    }
+
+    pub fn source_overrides(&self) -> &[SourceOverride] {
+        &self.source_overrides
     }
 }
 

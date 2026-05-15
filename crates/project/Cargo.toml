@@ -1,0 +1,18 @@
+[package]
+name = "anvyx-project"
+description.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anvyx-lang2 = { path = "../lang2" }
+anvyx-core2 = { path = "../core2" }
+anvyx-stdlib2 = { path = "../stdlib2" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

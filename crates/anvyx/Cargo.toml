@@ -12,8 +12,8 @@ anvyx-externs = { path = "../externs" }
 anvyx-fmt = { path = "../fmt" }
 anvyx-std = { path = "../std" }
 anvyx-core = { path = "../core" }
-anvyx-stdlib2 = { path = "../stdlib2" }
-anvyx-core2 = { path = "../core2" }
+anvyx-project = { path = "../project" }
+anvyx-lsp = { path = "../lsp" }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

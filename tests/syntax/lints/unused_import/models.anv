@@ -1,0 +1,4 @@
+// @helper
+
+pub struct Vec2 { x: float, y: float }
+pub struct Actor {}

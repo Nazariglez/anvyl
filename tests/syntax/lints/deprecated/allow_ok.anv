@@ -1,0 +1,11 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: deprecated=allow
+
+@deprecated
+fn old() {}
+
+fn main() {
+    old();
+}

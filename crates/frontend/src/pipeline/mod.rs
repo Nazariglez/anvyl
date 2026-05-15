@@ -3,29 +3,32 @@
 mod diagnostics;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use self::diagnostics::{
-    diagnose_conditional_error, diagnose_extern_input_error, diagnose_lex_error,
-    diagnose_parse_error, diagnose_resolve_error, diagnose_type_error, diagnose_type_warning,
+    diagnose_compile_warning, diagnose_conditional_error, diagnose_extern_input_error,
+    diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error, diagnose_type_error,
 };
 pub use crate::diagnostic::{
-    Diagnostic, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity, LabelStyle, Severity,
+    Diagnostic, DiagnosticCode, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity,
+    DiagnosticTag, LabelStyle, Severity,
 };
 use crate::{
     ast::Program,
     conditional,
     config::{CompilationContext, LintConfig},
     externs::{self, ExternInputs},
-    lexer, parser,
+    lexer,
+    lint::{LintEvent, apply_lints},
+    parser,
     resolve::{
         self, LoadedModule, LocalSourceLoad, LocalSourceRequest, ModuleId, ModuleLoadError,
         ModuleLoader, PackageId, PackageInput as ResolvePackageInput, PackageKind, PreloadedModule,
         ResolveFailure, SystemPackages,
     },
     source::{SourceId, SourceKind, SourceTable},
-    typecheck,
+    typecheck::{self, CompileWarning, ImportRecord, ModuleScope, TypecheckFacts},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,12 +193,12 @@ pub fn check_packages<L: PackageSourceLoader>(
     externs::validate_raw_identities(&raw_externs)
         .map_err(|errors| extern_error(&sources, errors))?;
 
+    let lint_config = config.lint.clone();
     let typecheck_result = typecheck::check_with_modules(
         &root.program,
         &resolved,
         raw_externs,
         typecheck::TypecheckConfig {
-            lint: config.lint,
             context: config.context,
         },
     )
@@ -203,10 +206,21 @@ pub fn check_packages<L: PackageSourceLoader>(
         report: diagnostic_report(&sources, errors.iter().map(diagnose_type_error)),
     })?;
 
-    let (warnings, _facts) = typecheck_result.into_parts();
-    Ok(CheckOk {
-        report: diagnostic_report(&sources, warnings.iter().map(diagnose_type_warning)),
-    })
+    let (warnings, mut lint_events, facts) = typecheck_result.into_parts();
+    lint_events.extend(unused_import_events(&facts));
+    let report = typecheck_report(&sources, &lint_config, &warnings, lint_events);
+    finish_typecheck_report(report)
+}
+
+fn finish_typecheck_report<E>(report: DiagnosticReport) -> Result<CheckOk, CheckError<E>> {
+    if report
+        .diagnostics()
+        .iter()
+        .any(|diagnostic| diagnostic.severity() == Severity::Error)
+    {
+        return Err(CheckError::Type { report });
+    }
+    Ok(CheckOk { report })
 }
 
 fn extern_error<E>(sources: &SourceTable, errors: Vec<externs::ExternInputError>) -> CheckError<E> {
@@ -218,6 +232,81 @@ fn extern_error<E>(sources: &SourceTable, errors: Vec<externs::ExternInputError>
                 .map(|error| diagnose_extern_input_error(&error)),
         ),
     }
+}
+
+fn unused_import_events(facts: &TypecheckFacts) -> Vec<LintEvent> {
+    facts
+        .import_records()
+        .iter()
+        .filter(|import| unused_import_candidate(import, facts))
+        .map(unused_import_event)
+        .collect()
+}
+
+fn unused_import_candidate(import: &ImportRecord, facts: &TypecheckFacts) -> bool {
+    import.visibility == crate::ast::Visibility::Private
+        && !is_system_import(import)
+        && !facts.used_imports().contains(&import.id)
+}
+
+fn is_system_import(import: &ImportRecord) -> bool {
+    let ModuleScope::Package(module) = &import.id.module else {
+        return false;
+    };
+    module
+        .package_context()
+        .is_some_and(|package| package == &PackageId::core() || package == &PackageId::std())
+}
+
+fn unused_import_event(import: &ImportRecord) -> LintEvent {
+    LintEvent {
+        id: crate::lint::LintId::UnusedImport,
+        span: import.span,
+        message: format!(
+            "unused import from '{}'",
+            render_import_module(&import.target_module)
+        ),
+        label: None,
+        notes: vec![],
+        help: Some("remove this import".to_string()),
+        tags: vec![DiagnosticTag::Unnecessary],
+    }
+}
+
+fn render_import_module(module: &ModuleScope) -> String {
+    match module {
+        ModuleScope::Root => "<root>".to_string(),
+        ModuleScope::Named(path) => path.segments().join("."),
+        ModuleScope::Package(module) => module
+            .module_path()
+            .map(|path| path.segments().join("."))
+            .or_else(|| {
+                module
+                    .source_file()
+                    .map(|file| source_module_name(file.path()))
+            })
+            .unwrap_or_else(|| "<root>".to_string()),
+    }
+}
+
+fn source_module_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<source>")
+        .to_string()
+}
+
+fn typecheck_report(
+    sources: &SourceTable,
+    lint: &LintConfig,
+    warnings: &[CompileWarning],
+    lint_events: Vec<LintEvent>,
+) -> DiagnosticReport {
+    let diagnostics = warnings
+        .iter()
+        .map(diagnose_compile_warning)
+        .chain(apply_lints(lint, lint_events));
+    diagnostic_report(sources, diagnostics)
 }
 
 fn diagnostic_report(
@@ -437,14 +526,18 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        CheckError, CheckOk, Diagnostic, DiagnosticReport, FrontendConfig, PackageModuleInput,
-        PackageProgramInput, PackageSourceInput, PackageSourceLoader, Source, SourceLoadError,
-        check_packages as pipeline_check,
+        CheckError, CheckOk, Diagnostic, DiagnosticReport, FrontendConfig, LintConfig,
+        PackageModuleInput, PackageProgramInput, PackageSourceInput, PackageSourceLoader, Severity,
+        Source, SourceLoadError, check_packages as pipeline_check, finish_typecheck_report,
+        typecheck_report,
     };
     use crate::{
+        diagnostic::DiagnosticTag,
         externs::{ExternInputs, PackageExternInputs},
+        lint::{LintEvent, LintId, LintLevel},
         resolve::{ModuleId, ModulePath, PackageId, PackageKind, SystemPackages},
-        source::{SourceFile, SourceKind},
+        source::{SourceFile, SourceKind, SourceTable},
+        span::SourceSpan,
     };
 
     #[derive(Default)]
@@ -504,12 +597,126 @@ mod tests {
         }
     }
 
+    fn lint_event() -> (SourceTable, LintEvent) {
+        let mut sources = SourceTable::default();
+        let source = sources.add(SourceKind::Virtual, "main.anv", None, "bad");
+        (
+            sources,
+            LintEvent {
+                id: LintId::Deprecated,
+                span: SourceSpan::new(source, 0, 3),
+                message: "deprecated".to_string(),
+                label: Some("used here".to_string()),
+                notes: vec![],
+                help: None,
+                tags: vec![DiagnosticTag::Deprecated],
+            },
+        )
+    }
+
     fn source(code: &str, label: &str) -> Source {
         Source {
             code: code.to_string(),
             label: label.to_string(),
             path: None,
         }
+    }
+
+    #[test]
+    fn typecheck_report_keeps_warn_lints_non_fatal() {
+        let (sources, event) = lint_event();
+
+        let report = typecheck_report(&sources, &LintConfig::default(), &[], vec![event]);
+
+        assert_eq!(report.diagnostics()[0].severity(), Severity::Warning);
+        assert_eq!(report.diagnostics()[0].code().unwrap().code, "deprecated");
+    }
+
+    #[test]
+    fn typecheck_report_applies_error_lint_level() {
+        let (sources, event) = lint_event();
+        let mut lint = LintConfig::default();
+        lint.set(LintId::Deprecated, LintLevel::Error);
+
+        let report = typecheck_report(&sources, &lint, &[], vec![event]);
+
+        assert_eq!(report.diagnostics()[0].severity(), Severity::Error);
+    }
+
+    #[test]
+    fn typecheck_report_with_error_lint_fails() {
+        let (sources, event) = lint_event();
+        let mut lint = LintConfig::default();
+        lint.set(LintId::Deprecated, LintLevel::Error);
+        let report = typecheck_report(&sources, &lint, &[], vec![event]);
+
+        let error = finish_typecheck_report::<std::convert::Infallible>(report).unwrap_err();
+
+        assert!(matches!(error, CheckError::Type { .. }));
+    }
+
+    #[test]
+    fn typecheck_report_suppresses_allowed_lints() {
+        let (sources, event) = lint_event();
+        let mut lint = LintConfig::default();
+        lint.set(LintId::Deprecated, LintLevel::Allow);
+
+        let report = typecheck_report(&sources, &lint, &[], vec![event]);
+
+        assert!(report.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn internal_access_allow_suppresses_real_lint_event() {
+        let mut loader = TestLoader::default();
+        loader.source(
+            &["lib"],
+            "pub struct Item { name: string, @internal cache: string }",
+        );
+        let mut config = FrontendConfig::default();
+        config.lint.set(LintId::InternalAccess, LintLevel::Allow);
+
+        let result = check_with_config(
+            input(
+                &mut loader,
+                source(
+                    "import lib { Item }; fn main() { let i = Item { name: \"test\", cache: \"\" }; println(i.cache); }",
+                    "main.anv",
+                ),
+                None,
+                vec![],
+            ),
+            config,
+        )
+        .unwrap();
+
+        assert!(result.report.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn explicit_warning_is_not_a_lint() {
+        let mut config = FrontendConfig::default();
+        config.lint.set(LintId::InternalAccess, LintLevel::Allow);
+        config.lint.set(LintId::Deprecated, LintLevel::Allow);
+        config
+            .lint
+            .set(LintId::PublicInferredDynContract, LintLevel::Allow);
+        let mut loader = TestLoader::default();
+
+        let result = check_with_config(
+            input(
+                &mut loader,
+                source("fn main() { #warning(\"careful\"); }", "main.anv"),
+                None,
+                vec![],
+            ),
+            config,
+        )
+        .unwrap();
+
+        let diagnostic = &result.report.diagnostics()[0];
+        assert_eq!(diagnostic.severity(), Severity::Warning);
+        assert!(diagnostic.code().is_none());
     }
 
     fn module_path(path: &[&str]) -> ModulePath {
@@ -639,6 +846,13 @@ mod tests {
         input: PackageProgramInput<'_, L>,
     ) -> Result<CheckOk, CheckError<L::FatalError>> {
         pipeline_check(input, FrontendConfig::default())
+    }
+
+    fn check_with_config<L: PackageSourceLoader>(
+        input: PackageProgramInput<'_, L>,
+        config: FrontendConfig,
+    ) -> Result<CheckOk, CheckError<L::FatalError>> {
+        pipeline_check(input, config)
     }
 
     fn check_source(source_code: &str) -> Result<CheckOk, CheckError> {

@@ -1,0 +1,6 @@
+// @helper
+
+pub extend float {
+    fn double_val(self) -> float { self * 2.0 }
+    fn tag() -> string { "static" }
+}

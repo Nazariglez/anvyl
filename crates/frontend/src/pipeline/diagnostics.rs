@@ -24,9 +24,9 @@ use crate::{
     source::SourceId,
     span::SourceSpan,
     typecheck::{
-        ArityError, BindingNamespace, BindingOrigin, CaptureStorageOrigin, ConstDiagnostic,
-        DeclError, DeprecatedUseKind, DynContainerConversionKind, MemberAccessKind, ModuleScope,
-        TryCarrierKind, TypeError, TypeWarning, VariantShape,
+        ArityError, BindingNamespace, BindingOrigin, CaptureStorageOrigin, CompileWarning,
+        ConstDiagnostic, DeclError, DynContainerConversionKind, ModuleScope, TryCarrierKind,
+        TypeError, VariantShape,
     },
 };
 
@@ -482,41 +482,9 @@ fn render_extern_member_selector(selector: &anvyx_externs::ExternMemberSelector)
     }
 }
 
-pub(super) fn diagnose_type_warning(warning: &TypeWarning) -> Diagnostic {
-    Diagnostic::warning(match warning {
-        TypeWarning::DeprecatedAccess {
-            kind, name, reason, ..
-        } => render_deprecated_access(*kind, *name, reason.as_deref()),
-        TypeWarning::InternalAccess {
-            kind,
-            name,
-            owner,
-            reason,
-            ..
-        } => render_internal_access(*kind, *name, owner, reason.as_deref()),
-        TypeWarning::CompileMessage { message, .. } => message.clone(),
-    })
-    .with_primary_message(type_warning_span(warning), type_warning_label(warning))
-}
-
-fn type_warning_label(warning: &TypeWarning) -> String {
-    match warning {
-        TypeWarning::DeprecatedAccess { kind, .. } => {
-            format!("deprecated {} used here", render_deprecated_use_kind(*kind))
-        }
-        TypeWarning::InternalAccess { kind, .. } => {
-            format!("internal {} used here", render_member_access_kind(*kind))
-        }
-        TypeWarning::CompileMessage { .. } => "compile warning emitted here".to_string(),
-    }
-}
-
-fn type_warning_span(warning: &TypeWarning) -> SourceSpan {
-    match warning {
-        TypeWarning::DeprecatedAccess { span, .. }
-        | TypeWarning::InternalAccess { span, .. }
-        | TypeWarning::CompileMessage { span, .. } => *span,
-    }
+pub(super) fn diagnose_compile_warning(warning: &CompileWarning) -> Diagnostic {
+    Diagnostic::warning(warning.message.clone())
+        .with_primary_message(warning.span, "compile warning emitted here")
 }
 
 pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
@@ -768,7 +736,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         | TypeError::UnknownMember {
             ty, member, kind, ..
         } => {
-            let kind = render_member_access_kind(*kind);
+            let kind = kind.diagnostic_name();
             format!("Unknown {kind} '{member}' for type '{ty}'")
         }
         TypeError::AmbiguousPromotedField {
@@ -834,13 +802,6 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ReadonlyMethodMutation { .. } => {
             "readonly method cannot mutate self".to_string()
         }
-        TypeError::InternalAccess {
-            kind,
-            name,
-            owner,
-            reason,
-            ..
-        } => render_internal_access(*kind, *name, owner, reason.as_deref()),
         TypeError::UnknownIntrinsic { name, .. } => format!("unknown intrinsic '#{name}'"),
         TypeError::IntrinsicArgCount {
             name,
@@ -1251,7 +1212,6 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::InstanceMethodOnType { span, .. }
         | TypeError::StaticMethodOnValue { span, .. }
         | TypeError::ReadonlyMethodMutation { span, .. }
-        | TypeError::InternalAccess { span, .. }
         | TypeError::UnknownIntrinsic { span, .. }
         | TypeError::IntrinsicArgCount { span, .. }
         | TypeError::IntrinsicExpectedIdent { span, .. }
@@ -1753,52 +1713,6 @@ fn render_scoped_name(module: &ModuleScope, name: Ident) -> String {
     }
 }
 
-fn render_member_access_kind(kind: MemberAccessKind) -> &'static str {
-    match kind {
-        MemberAccessKind::Field => "field",
-        MemberAccessKind::Method => "method",
-    }
-}
-
-fn render_internal_access(
-    kind: MemberAccessKind,
-    name: Ident,
-    owner: &Type,
-    reason: Option<&str>,
-) -> String {
-    let kind = render_member_access_kind(kind);
-    match reason {
-        Some(reason) => format!("accessing internal {kind} '{name}' of type '{owner}': {reason}"),
-        None => format!("accessing internal {kind} '{name}' of type '{owner}'"),
-    }
-}
-
-fn render_deprecated_access(kind: DeprecatedUseKind, name: Ident, reason: Option<&str>) -> String {
-    let kind = render_deprecated_use_kind(kind);
-    match reason {
-        Some(reason) => format!("use of deprecated {kind} '{name}': {reason}"),
-        None => format!("use of deprecated {kind} '{name}'"),
-    }
-}
-
-fn render_deprecated_use_kind(kind: DeprecatedUseKind) -> &'static str {
-    match kind {
-        DeprecatedUseKind::Function => "function",
-        DeprecatedUseKind::ExternFunction => "extern function",
-        DeprecatedUseKind::Const => "const",
-        DeprecatedUseKind::Global => "runtime global",
-        DeprecatedUseKind::ExternType => "extern type",
-        DeprecatedUseKind::TypeAlias => "type alias",
-        DeprecatedUseKind::Contract => "contract",
-        DeprecatedUseKind::Struct => "struct",
-        DeprecatedUseKind::DataRef => "dataref",
-        DeprecatedUseKind::Enum => "enum",
-        DeprecatedUseKind::EnumVariant => "variant",
-        DeprecatedUseKind::Field => "field",
-        DeprecatedUseKind::Method => "method",
-    }
-}
-
 fn render_qualified_name(qualifier: Option<Ident>, name: Ident) -> String {
     match qualifier {
         Some(qualifier) => format!("{qualifier}.{name}"),
@@ -2053,7 +1967,9 @@ fn render_binding_namespace(namespace: BindingNamespace) -> &'static str {
 fn render_binding_origin(origin: &BindingOrigin) -> String {
     match origin {
         BindingOrigin::Local => "local declarations".to_string(),
-        BindingOrigin::Import { source } | BindingOrigin::Reexport { source } => {
+        BindingOrigin::Import { source, .. }
+        | BindingOrigin::Reexport { source, .. }
+        | BindingOrigin::ImplicitImport { source } => {
             format!("'{}'", render_module_scope(source))
         }
     }
@@ -2306,6 +2222,7 @@ mod tests {
         parser,
         source::{SourceKind, SourceTable},
         span::SourceSpan,
+        typecheck::MemberAccessKind,
     };
 
     fn ident(name: &str) -> Ident {
@@ -2430,89 +2347,14 @@ mod tests {
     }
 
     #[test]
-    fn renders_deprecated_warnings() {
-        let cases = [
-            (
-                DeprecatedUseKind::Function,
-                "use of deprecated function 'old'",
-            ),
-            (
-                DeprecatedUseKind::ExternFunction,
-                "use of deprecated extern function 'old'",
-            ),
-            (DeprecatedUseKind::Const, "use of deprecated const 'old'"),
-            (
-                DeprecatedUseKind::ExternType,
-                "use of deprecated extern type 'old'",
-            ),
-            (
-                DeprecatedUseKind::TypeAlias,
-                "use of deprecated type alias 'old'",
-            ),
-            (
-                DeprecatedUseKind::Contract,
-                "use of deprecated contract 'old'",
-            ),
-            (DeprecatedUseKind::Struct, "use of deprecated struct 'old'"),
-            (DeprecatedUseKind::Enum, "use of deprecated enum 'old'"),
-            (
-                DeprecatedUseKind::EnumVariant,
-                "use of deprecated variant 'old'",
-            ),
-            (DeprecatedUseKind::Field, "use of deprecated field 'old'"),
-            (DeprecatedUseKind::Method, "use of deprecated method 'old'"),
-        ];
-
-        for (kind, expected) in cases {
-            assert_msg(
-                diagnose_type_warning(&TypeWarning::DeprecatedAccess {
-                    kind,
-                    name: ident("old"),
-                    reason: None,
-                    span: resolve_span(),
-                }),
-                expected,
-            );
-        }
-        assert_msg(
-            diagnose_type_warning(&TypeWarning::DeprecatedAccess {
-                kind: DeprecatedUseKind::DataRef,
-                name: ident("old"),
-                reason: Some("use new".to_string()),
-                span: resolve_span(),
-            }),
-            "use of deprecated dataref 'old': use new",
-        );
-
+    fn renders_compile_warnings() {
         let span = resolve_span();
-        let diagnostic = diagnose_type_warning(&TypeWarning::DeprecatedAccess {
-            kind: DeprecatedUseKind::Function,
-            name: ident("old"),
-            reason: None,
-            span,
-        });
-        assert_eq!(diagnostic.labels()[0].span, span);
-        assert_eq!(
-            diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("deprecated function used here")
-        );
-
-        let diagnostic = diagnose_type_warning(&TypeWarning::InternalAccess {
-            kind: MemberAccessKind::Field,
-            name: ident("secret"),
-            owner: Type::Int,
-            reason: None,
-            span,
-        });
-        assert_eq!(
-            diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("internal field used here")
-        );
-
-        let diagnostic = diagnose_type_warning(&TypeWarning::CompileMessage {
+        let diagnostic = diagnose_compile_warning(&CompileWarning {
             message: "careful".to_string(),
             span,
         });
+        assert_eq!(diagnostic.labels()[0].span, span);
+        assert_eq!(diagnostic.message(), "careful");
         assert_eq!(
             diagnostic.primary_label().unwrap().message.as_deref(),
             Some("compile warning emitted here")
@@ -2616,7 +2458,7 @@ mod tests {
                     module: ModuleScope::Root,
                     name: ident("tools"),
                     first: BindingOrigin::Local,
-                    second: BindingOrigin::Import {
+                    second: BindingOrigin::ImplicitImport {
                         source: module_scope(&["tools"]),
                     },
                     span: Some(resolve_span()),
@@ -2637,7 +2479,7 @@ mod tests {
                     name: ident("Point"),
                     namespace: BindingNamespace::Type,
                     first: BindingOrigin::Local,
-                    second: BindingOrigin::Import {
+                    second: BindingOrigin::ImplicitImport {
                         source: module_scope(&["shapes"]),
                     },
                     span: Some(resolve_span()),
@@ -2649,10 +2491,10 @@ mod tests {
                     module: ModuleScope::Root,
                     name: ident("Point"),
                     namespace: BindingNamespace::Type,
-                    first: BindingOrigin::Import {
+                    first: BindingOrigin::ImplicitImport {
                         source: module_scope(&["alpha"]),
                     },
-                    second: BindingOrigin::Import {
+                    second: BindingOrigin::ImplicitImport {
                         source: module_scope(&["beta"]),
                     },
                     span: Some(resolve_span()),
@@ -2664,10 +2506,10 @@ mod tests {
                     module: ModuleScope::Root,
                     name: ident("Point"),
                     namespace: BindingNamespace::Type,
-                    first: BindingOrigin::Reexport {
+                    first: BindingOrigin::ImplicitImport {
                         source: module_scope(&["alpha"]),
                     },
-                    second: BindingOrigin::Reexport {
+                    second: BindingOrigin::ImplicitImport {
                         source: module_scope(&["beta"]),
                     },
                     span: Some(resolve_span()),

@@ -1,0 +1,16 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: public_inferred_dyn_contract=allow
+
+struct Actor {
+    fn draw(self) {}
+}
+
+pub fn take(actor: dyn _) {
+    actor.draw();
+}
+
+fn main() {
+    take(Actor {});
+}

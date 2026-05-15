@@ -1,0 +1,8 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @warn-contains: [unused_import] Warning: unused import from 'helper'
+
+import helper;
+
+fn main() {}

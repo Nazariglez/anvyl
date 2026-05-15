@@ -1,0 +1,3 @@
+// @helper
+
+pub contract Drawable { fn draw(self); }

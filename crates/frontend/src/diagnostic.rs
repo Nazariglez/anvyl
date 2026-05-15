@@ -49,8 +49,22 @@ pub struct DiagnosticLabel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticCode {
+    pub source: &'static str,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticTag {
+    Deprecated,
+    Unnecessary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     severity: Severity,
+    code: Option<DiagnosticCode>,
+    tags: Vec<DiagnosticTag>,
     message: String,
     labels: Vec<DiagnosticLabel>,
     notes: Vec<String>,
@@ -104,6 +118,8 @@ impl Diagnostic {
     fn new(severity: Severity, message: impl Into<String>) -> Self {
         Self {
             severity,
+            code: None,
+            tags: vec![],
             message: message.into(),
             labels: vec![],
             notes: vec![],
@@ -127,6 +143,21 @@ impl Diagnostic {
     }
 
     #[must_use]
+    pub fn with_code(mut self, source: &'static str, code: impl Into<String>) -> Self {
+        self.code = Some(DiagnosticCode {
+            source,
+            code: code.into(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_tag(mut self, tag: DiagnosticTag) -> Self {
+        self.tags.push(tag);
+        self
+    }
+
+    #[must_use]
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
         self
@@ -139,8 +170,24 @@ impl Diagnostic {
     }
 
     #[must_use]
+    pub fn with_severity(mut self, severity: Severity) -> Self {
+        self.severity = severity;
+        self
+    }
+
+    #[must_use]
     pub fn severity(&self) -> Severity {
         self.severity
+    }
+
+    #[must_use]
+    pub fn code(&self) -> Option<&DiagnosticCode> {
+        self.code.as_ref()
+    }
+
+    #[must_use]
+    pub fn tags(&self) -> &[DiagnosticTag] {
+        &self.tags
     }
 
     #[must_use]
@@ -207,6 +254,26 @@ mod tests {
         assert_eq!(error.message(), "bad");
         assert_eq!(warning.to_string(), "careful");
         assert!(error.labels().is_empty());
+        assert!(error.code().is_none());
+        assert!(error.tags().is_empty());
+    }
+
+    #[test]
+    fn metadata_builders_preserve_plain_messages() {
+        let diagnostic = Diagnostic::warning("deprecated")
+            .with_code("anvyx", "deprecated")
+            .with_tag(DiagnosticTag::Deprecated)
+            .with_tag(DiagnosticTag::Unnecessary);
+
+        let code = diagnostic.code().unwrap();
+        assert_eq!(code.source, "anvyx");
+        assert_eq!(code.code, "deprecated");
+        assert_eq!(
+            diagnostic.tags(),
+            &[DiagnosticTag::Deprecated, DiagnosticTag::Unnecessary]
+        );
+        assert_eq!(diagnostic.message(), "deprecated");
+        assert_eq!(diagnostic.to_string(), "deprecated");
     }
 
     #[test]

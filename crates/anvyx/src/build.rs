@@ -477,7 +477,7 @@ mod tests {
             },
             dependencies: HashMap::new(),
             externs,
-            lint: anvyx_lang::LintConfig::default(),
+            lint: Default::default(),
         }
     }
 

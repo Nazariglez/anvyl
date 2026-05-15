@@ -1,16 +1,58 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LintLevel {
-    Allow,
-    #[default]
-    Warn,
-    Error,
+pub use crate::lint::LintLevel;
+use crate::lint::{LintId, LintParseError, available_override_names, expand_group, find_lint};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LintConfig {
+    overrides: BTreeMap<LintId, LintLevel>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LintConfig {
-    pub internal_access: LintLevel,
+impl LintConfig {
+    #[must_use]
+    pub fn level(&self, id: LintId) -> LintLevel {
+        self.overrides
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| id.default_level())
+    }
+
+    pub fn set(&mut self, id: LintId, level: LintLevel) {
+        if level == id.default_level() {
+            self.overrides.remove(&id);
+        } else {
+            self.overrides.insert(id, level);
+        }
+    }
+
+    pub fn apply_override(&mut self, text: &str) -> Result<(), LintParseError> {
+        let Some((name, level)) = text.split_once('=') else {
+            return Err(LintParseError::MissingEquals);
+        };
+        if name.is_empty() {
+            return Err(LintParseError::EmptyName);
+        }
+        if level.is_empty() {
+            return Err(LintParseError::EmptyLevel);
+        }
+        let level = level.parse().map_err(|_| LintParseError::UnknownLevel {
+            level: level.into(),
+        })?;
+        if let Some(id) = find_lint(name) {
+            self.set(id, level);
+            return Ok(());
+        }
+        if let Some(ids) = expand_group(name) {
+            for id in ids {
+                self.set(id, level);
+            }
+            return Ok(());
+        }
+        Err(LintParseError::UnknownName {
+            name: name.into(),
+            available: available_override_names(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -133,6 +175,94 @@ impl CompilationContext {
                 .ok_or(PredicateError::UnknownValue),
             "feature" => Ok(self.features.contains(value)),
             _ => Err(PredicateError::UnknownPredicate),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lint_config_uses_registry_defaults() {
+        let config = LintConfig::default();
+
+        assert_eq!(config.level(LintId::InternalAccess), LintLevel::Warn);
+        assert_eq!(config.level(LintId::Deprecated), LintLevel::Warn);
+    }
+
+    #[test]
+    fn lint_config_overrides_levels() {
+        let mut config = LintConfig::default();
+
+        config.set(LintId::InternalAccess, LintLevel::Error);
+
+        assert_eq!(config.level(LintId::InternalAccess), LintLevel::Error);
+        assert_eq!(config.level(LintId::Deprecated), LintLevel::Warn);
+    }
+
+    #[test]
+    fn lint_config_does_not_store_default_overrides() {
+        let mut config = LintConfig::default();
+
+        config.set(LintId::InternalAccess, LintLevel::Error);
+        config.set(LintId::InternalAccess, LintLevel::Warn);
+
+        assert_eq!(config, LintConfig::default());
+    }
+
+    #[test]
+    fn apply_override_accepts_names_groups_and_repetition() {
+        let mut config = LintConfig::default();
+
+        config.apply_override("api=error").unwrap();
+        config.apply_override("deprecated=allow").unwrap();
+
+        assert_eq!(config.level(LintId::InternalAccess), LintLevel::Error);
+        assert_eq!(config.level(LintId::Deprecated), LintLevel::Allow);
+        assert_eq!(
+            config.level(LintId::PublicInferredDynContract),
+            LintLevel::Error
+        );
+    }
+
+    #[test]
+    fn apply_override_accepts_all_group() {
+        let mut config = LintConfig::default();
+
+        config.apply_override("all=allow").unwrap();
+
+        assert_eq!(config.level(LintId::InternalAccess), LintLevel::Allow);
+        assert_eq!(config.level(LintId::Deprecated), LintLevel::Allow);
+        assert_eq!(
+            config.level(LintId::PublicInferredDynContract),
+            LintLevel::Allow
+        );
+    }
+
+    #[test]
+    fn apply_override_rejects_invalid_input() {
+        let cases = [
+            ("deprecated", LintParseError::MissingEquals),
+            ("=warn", LintParseError::EmptyName),
+            ("deprecated=", LintParseError::EmptyLevel),
+            (
+                "deprecated=deny",
+                LintParseError::UnknownLevel {
+                    level: "deny".to_string(),
+                },
+            ),
+            (
+                "unused_variable=warn",
+                LintParseError::UnknownName {
+                    name: "unused_variable".to_string(),
+                    available: available_override_names(),
+                },
+            ),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(LintConfig::default().apply_override(text), Err(expected));
         }
     }
 }

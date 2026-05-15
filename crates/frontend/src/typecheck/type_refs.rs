@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use super::{
     const_term::ConstTerm,
     decls::{
-        ContractKey, DeclarationIndex, ModuleScope, NominalKey, TypeAliasDef, TypeAliasKey,
-        TypeBinding, nominal_type_with_args,
+        ContractKey, DeclarationIndex, ImportId, ModuleScope, NominalKey, TypeAliasDef,
+        TypeAliasKey, TypeBinding, nominal_type_with_args,
     },
     generic::{GenericArgs, GenericParams, substitute},
     type_ops::bare_type_name,
@@ -172,6 +172,7 @@ pub(crate) struct TypeRefWarning {
 pub(crate) struct FinalizedTypeRef {
     pub(crate) ty: Type,
     pub(crate) warnings: Vec<TypeRefWarning>,
+    pub(crate) used_imports: Vec<ImportId>,
 }
 
 pub(crate) type LocalTypeAliasKey = Span;
@@ -252,6 +253,7 @@ struct FinalizeState {
     stack: Vec<AliasExpansionKey>,
     site: Option<Span>,
     warnings: Vec<TypeRefWarning>,
+    used_imports: Vec<ImportId>,
 }
 
 impl FinalizeState {
@@ -261,6 +263,7 @@ impl FinalizeState {
             stack: vec![],
             site,
             warnings: vec![],
+            used_imports: vec![],
         }
     }
 
@@ -270,6 +273,15 @@ impl FinalizeState {
             stack: vec![alias.key.clone()],
             site,
             warnings: vec![],
+            used_imports: vec![],
+        }
+    }
+
+    fn mark_import_used(&mut self, import: Option<ImportId>) {
+        if let Some(import) = import
+            && !self.used_imports.contains(&import)
+        {
+            self.used_imports.push(import);
         }
     }
 
@@ -303,6 +315,7 @@ impl FinalizeState {
         FinalizedTypeRef {
             ty,
             warnings: self.warnings,
+            used_imports: self.used_imports,
         }
     }
 }
@@ -464,13 +477,14 @@ impl<'a> TypeRefResolver<'a> {
             let alias_ref = Self::local_alias_ref(alias);
             return self.expand_alias_ref(module, generics, &alias_ref, &[], state, name);
         }
-        let binding = self
+        let (binding, import) = self
             .decls
-            .resolve_visible_type_binding(module, None, name)
+            .resolve_visible_type_binding_with_import(module, None, name)
             .ok_or(TypeRefError::Unknown {
                 qualifier: None,
                 name,
             })?;
+        state.mark_import_used(import);
         self.finalize_binding(module, generics, binding, &[], state, name)
     }
 
@@ -500,10 +514,11 @@ impl<'a> TypeRefResolver<'a> {
             let alias_ref = Self::local_alias_ref(alias);
             return self.expand_alias_ref(module, generics, &alias_ref, generic_args, state, name);
         }
-        let binding = self
+        let (binding, import) = self
             .decls
-            .resolve_visible_type_binding(module, qualifier, name)
+            .resolve_visible_type_binding_with_import(module, qualifier, name)
             .ok_or(TypeRefError::Unknown { qualifier, name })?;
+        state.mark_import_used(import);
         self.finalize_binding(module, generics, binding, generic_args, state, name)
     }
 
@@ -680,7 +695,8 @@ impl<'a> TypeRefResolver<'a> {
             ContractRef::Named {
                 name, origin: None, ..
             } => {
-                let key = self.resolve_contract_ref(module, contract)?;
+                let (key, import) = self.resolve_contract_ref_with_import(module, contract)?;
+                state.mark_import_used(import);
                 if let Some(schema) = self.decls.contract(&key) {
                     state.warn_deprecated_contract(schema, *name);
                 }
@@ -688,7 +704,8 @@ impl<'a> TypeRefResolver<'a> {
                 Ok(())
             }
             ContractRef::Named { .. } => {
-                let key = self.resolve_contract_ref(module, contract)?;
+                let (key, import) = self.resolve_contract_ref_with_import(module, contract)?;
+                state.mark_import_used(import);
                 refs.push(canonical_contract_ref(&key));
                 Ok(())
             }
@@ -751,6 +768,15 @@ impl<'a> TypeRefResolver<'a> {
         module: &ModuleScope,
         contract: &ContractRef,
     ) -> Result<ContractKey, TypeRefError> {
+        self.resolve_contract_ref_with_import(module, contract)
+            .map(|(key, _)| key)
+    }
+
+    pub(crate) fn resolve_contract_ref_with_import(
+        &self,
+        module: &ModuleScope,
+        contract: &ContractRef,
+    ) -> Result<(ContractKey, Option<ImportId>), TypeRefError> {
         let ContractRef::Named {
             qualifier,
             name,
@@ -763,7 +789,7 @@ impl<'a> TypeRefResolver<'a> {
         if let Some(origin) = origin {
             let module = ModuleScope::from_nominal_origin(origin);
             return match self.decls.local_type_binding(&module, *name) {
-                Some(TypeBinding::Contract(key)) => Ok(key),
+                Some(TypeBinding::Contract(key)) => Ok((key, None)),
                 _ => Err(TypeRefError::UnknownContract {
                     qualifier: None,
                     name: *name,
@@ -773,9 +799,9 @@ impl<'a> TypeRefResolver<'a> {
 
         match self
             .decls
-            .resolve_visible_type_binding(module, *qualifier, *name)
+            .resolve_visible_type_binding_with_import(module, *qualifier, *name)
         {
-            Some(TypeBinding::Contract(key)) => Ok(key),
+            Some((TypeBinding::Contract(key), import)) => Ok((key, import)),
             _ => Err(TypeRefError::UnknownContract {
                 qualifier: *qualifier,
                 name: *name,

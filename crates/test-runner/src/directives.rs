@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn parses_cli_options_in_order() {
         let directives = directives(
-            "// @lint: unused\n\
+            "// @lint: deprecated=allow\n\
              // @feature: gc\n\
              // @cfg: debug\n\
              fn main() {}\n",
@@ -739,7 +739,7 @@ mod tests {
             args,
             vec![
                 CliFlag::Lint.cli_flag(),
-                "unused",
+                "deprecated=allow",
                 CliFlag::Feature.cli_flag(),
                 "gc",
                 CliFlag::Cfg.cli_flag(),

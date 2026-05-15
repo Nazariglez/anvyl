@@ -2,14 +2,16 @@ use std::collections::HashMap;
 
 use crate::{
     ast::{ExprId, Ident, Type},
+    diagnostic::DiagnosticTag,
     externs::{self, RawExterns, catalog::ExternCatalog},
+    lint::{LintEvent, LintId},
     span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
     typecheck::{
-        self, ArgumentProjectionMap, BindingPromotionMap, CallMap, ContractWitnessMap,
-        DeprecatedUseKind, DynCallMap, DynConversionMap, DynDowncastMap, DynWeakeningMap,
-        ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap, TypeError,
-        TypeWarning, TypecheckFacts, decls::DeclarationIndex,
+        self, ArgumentProjectionMap, BindingPromotionMap, CallMap, CompileWarning,
+        ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap, DynDowncastMap,
+        DynWeakeningMap, ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap,
+        MemberPathMap, TypeError, TypecheckFacts, decls::DeclarationIndex,
     },
 };
 
@@ -26,7 +28,8 @@ pub(crate) struct TypecheckTestResult {
     dyn_downcasts: DynDowncastMap,
     global_accesses: GlobalAccessMap,
     facts: TypecheckFacts,
-    warnings: Vec<TypeWarning>,
+    warnings: Vec<CompileWarning>,
+    lint_events: Vec<LintEvent>,
     decls: DeclarationIndex,
     externs: ExternCatalog,
 }
@@ -88,8 +91,12 @@ impl TypecheckTestResult {
         self.facts.binding_promotions()
     }
 
-    pub(crate) fn warnings(&self) -> &[TypeWarning] {
+    pub(crate) fn warnings(&self) -> &[CompileWarning] {
         &self.warnings
+    }
+
+    pub(crate) fn lint_events(&self) -> &[LintEvent] {
+        &self.lint_events
     }
 
     pub(crate) fn decls(&self) -> &DeclarationIndex {
@@ -107,19 +114,15 @@ pub(crate) fn assert_deprecated_warning(
     name: &str,
     reason: Option<&str>,
 ) {
-    let warnings = result.warnings();
-    assert_eq!(warnings.len(), 1);
-    assert!(matches!(
-        &warnings[0],
-        TypeWarning::DeprecatedAccess {
-            kind: warning_kind,
-            name: warning_name,
-            reason: warning_reason,
-            ..
-        } if *warning_kind == kind
-            && *warning_name == Ident::new(name)
-            && warning_reason.as_deref() == reason
-    ));
+    let events = result.lint_events();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.id, LintId::Deprecated);
+    assert_eq!(event.tags, [DiagnosticTag::Deprecated]);
+    assert_eq!(
+        event.message,
+        super::super::render_deprecated_access(kind, Ident::new(name), reason)
+    );
 }
 
 pub(crate) fn assert_typecheck_closed(result: &TypecheckTestResult) {
@@ -208,6 +211,7 @@ pub(crate) fn check_with_raw_externs(
         global_accesses: tc.global_accesses,
         facts,
         warnings: tc.warnings,
+        lint_events: tc.lint_events,
         decls: tc.decls,
         externs: tc.externs,
     })

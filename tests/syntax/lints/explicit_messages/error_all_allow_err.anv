@@ -1,0 +1,9 @@
+// @frontend: new
+// @mode: check
+// @expect: error
+// @lint: all=allow
+// @contains: Error: not supported
+
+fn main() {
+    #error("not supported");
+}

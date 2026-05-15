@@ -1,8 +1,8 @@
 use super::{
-    DeprecatedUseKind, GenericArgs, GenericParams, TypeChecker, TypeError, TypeWarning,
-    VariantShape,
+    DeprecatedUseKind, GenericArgs, GenericParams, TypeChecker, TypeError, VariantShape,
     annotation::AccessPolicy,
     decls::{NominalKey, VariantSchema, nominal_generic_args, nominal_type},
+    deprecated_lint,
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
@@ -50,15 +50,15 @@ pub(super) fn resolve_use(
         return None;
     };
     let generics = schema.generics.clone();
-    let warning = resolved_use_warning(
+    let warning = resolved_use_lint(
         key.name,
         variant,
         &schema.policy,
         &variant_schema.policy,
         tc.source_span(span),
     );
-    if let Some(warning) = warning {
-        tc.push_warning(warning);
+    if let Some(event) = warning {
+        tc.push_lint_event(event);
     }
     Some(ResolvedEnumVariant {
         key: key.clone(),
@@ -68,29 +68,29 @@ pub(super) fn resolve_use(
     })
 }
 
-fn resolved_use_warning(
+fn resolved_use_lint(
     enum_name: Ident,
     variant: Ident,
     enum_policy: &AccessPolicy,
     variant_policy: &AccessPolicy,
     span: crate::span::SourceSpan,
-) -> Option<TypeWarning> {
+) -> Option<crate::lint::LintEvent> {
     if variant_policy.has_deprecated() {
-        return Some(TypeWarning::DeprecatedAccess {
-            kind: DeprecatedUseKind::EnumVariant,
-            name: variant,
-            reason: variant_policy.deprecated_reason().map(str::to_string),
+        return Some(deprecated_lint(
+            DeprecatedUseKind::EnumVariant,
+            variant,
+            variant_policy.deprecated_reason().map(str::to_string),
             span,
-        });
+        ));
     }
-    enum_policy
-        .has_deprecated()
-        .then(|| TypeWarning::DeprecatedAccess {
-            kind: DeprecatedUseKind::Enum,
-            name: enum_name,
-            reason: enum_policy.deprecated_reason().map(str::to_string),
+    enum_policy.has_deprecated().then(|| {
+        deprecated_lint(
+            DeprecatedUseKind::Enum,
+            enum_name,
+            enum_policy.deprecated_reason().map(str::to_string),
             span,
-        })
+        )
+    })
 }
 
 pub(super) fn resolve_pattern(

@@ -6,8 +6,11 @@ use super::{Diagnostic, DiagnosticReport, LabelStyle, Severity};
 use crate::source::{SourceFile, SourceId};
 
 pub fn render_plain_diagnostic(diagnostic: &Diagnostic) -> String {
-    let severity = diagnostic.severity().as_str();
-    format!("{severity}: {}", diagnostic.message())
+    format!(
+        "{}: {}",
+        diagnostic_header(diagnostic),
+        diagnostic.message()
+    )
 }
 
 pub fn render_plain_report(report: &DiagnosticReport) -> String {
@@ -51,6 +54,9 @@ fn render_rich_diagnostic(report: &DiagnosticReport, diagnostic: &Diagnostic) ->
                 .with_index_type(IndexType::Byte),
         )
         .with_message(diagnostic.message());
+    if let Some(code) = diagnostic.code() {
+        builder = builder.with_code(&code.code);
+    }
 
     for label in diagnostic.labels() {
         let Some(file) = report.source(label.span.source()) else {
@@ -100,6 +106,14 @@ impl fmt::Display for RenderSource {
     }
 }
 
+fn diagnostic_header(diagnostic: &Diagnostic) -> String {
+    let severity = diagnostic.severity().as_str();
+    match diagnostic.code() {
+        Some(code) => format!("{severity}[{}]", code.code),
+        None => severity.to_string(),
+    }
+}
+
 fn source_key(file: &SourceFile) -> RenderSource {
     RenderSource {
         id: file.id(),
@@ -144,6 +158,30 @@ mod tests {
         assert_eq!(
             render_plain_diagnostic(&Diagnostic::warning("careful")),
             "warning: careful"
+        );
+    }
+
+    #[test]
+    fn plain_renderer_includes_code() {
+        assert_eq!(
+            render_plain_diagnostic(&Diagnostic::warning("careful").with_code("anvyx", "lint_id")),
+            "warning[lint_id]: careful"
+        );
+    }
+
+    #[test]
+    fn rich_renderer_includes_code() {
+        let report = report_with_source("let x = true;", |source| {
+            Diagnostic::warning("careful")
+                .with_code("anvyx", "lint_id")
+                .with_primary(SourceSpan::new(source, 0, 3))
+        });
+
+        let rendered = render_rich_report(&report);
+
+        assert!(
+            rendered.contains("[lint_id] Warning: careful"),
+            "{rendered}"
         );
     }
 

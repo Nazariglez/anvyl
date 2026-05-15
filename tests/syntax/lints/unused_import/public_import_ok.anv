@@ -1,0 +1,8 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+pub import helper;
+
+fn main() {}

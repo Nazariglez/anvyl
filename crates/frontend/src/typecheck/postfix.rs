@@ -701,13 +701,12 @@ fn apply_value_field(
                     )
                 }
                 member::MethodResolution::Extend(method) => {
+                    tc.mark_activation_imports_used(&method.extend.origin);
                     check_extend_method_access(
                         &mut super::AccessPolicyOutput {
                             source: tc.source_id(),
                             current_module: &tc.current_module,
-                            config: &tc.config,
-                            warnings: &mut tc.warnings,
-                            errors: &mut tc.errors,
+                            lint_events: &mut tc.lint_events,
                         },
                         &method.extend,
                         &method.method,
@@ -1103,15 +1102,15 @@ fn static_extend_subject(
     let matched = decls.find_static_extend_method(target, name, |ext| {
         TypeChecker::extend_visible_in(decls, current_module, ext)
     })?;
+    let mut activation_origin = None;
     let subject = match member::extend_method_parts(target.clone(), name, &matched) {
         Ok((extend, method, _, owner_args)) => {
+            activation_origin = Some(extend.origin.clone());
             check_extend_method_access(
                 &mut super::AccessPolicyOutput {
                     source: tc.source_id(),
                     current_module: &tc.current_module,
-                    config: &tc.config,
-                    warnings: &mut tc.warnings,
-                    errors: &mut tc.errors,
+                    lint_events: &mut tc.lint_events,
                 },
                 extend,
                 method,
@@ -1129,6 +1128,9 @@ fn static_extend_subject(
             Subject::Error
         }
     };
+    if let Some(origin) = activation_origin {
+        tc.mark_activation_imports_used(&origin);
+    }
     Some(subject)
 }
 
@@ -2289,9 +2291,7 @@ fn check_qualified_extend_call(
         &mut super::AccessPolicyOutput {
             source: tc.source_id(),
             current_module: &tc.current_module,
-            config: &tc.config,
-            warnings: &mut tc.warnings,
-            errors: &mut tc.errors,
+            lint_events: &mut tc.lint_events,
         },
         extend,
         method,

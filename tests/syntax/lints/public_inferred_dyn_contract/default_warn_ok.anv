@@ -1,0 +1,16 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @warn-contains: [public_inferred_dyn_contract] Warning: exported function uses inferred dynamic contract
+
+struct Actor {
+    fn draw(self) {}
+}
+
+pub fn take(actor: dyn _) {
+    actor.draw();
+}
+
+fn main() {
+    take(Actor {});
+}

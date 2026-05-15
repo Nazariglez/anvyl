@@ -12,6 +12,7 @@ use crate::{
         AnonymousContract, AnonymousContractParam, AnonymousContractRequirement, ContractRef,
         DynContractHoleId, ExprId, Ident, ReturnSpec, Type,
     },
+    lint::{LintEvent, LintId},
     span::{SourceSpan, Span},
 };
 
@@ -308,9 +309,14 @@ impl DynInference {
         }
 
         if hole.exported {
-            tc.push_warning(super::TypeWarning::CompileMessage {
-                message: "exported function uses inferred dynamic contract; declare a named contract and use `dyn Name`".to_string(),
+            tc.push_lint_event(LintEvent {
+                id: LintId::PublicInferredDynContract,
                 span: hole.span,
+                message: "exported function uses inferred dynamic contract".to_string(),
+                label: None,
+                notes: vec![],
+                help: Some("declare a named contract and use dyn Name".to_string()),
+                tags: vec![],
             });
         }
 

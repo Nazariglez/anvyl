@@ -1,0 +1,6 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+fn main() { let x: Option<int> = nil; }

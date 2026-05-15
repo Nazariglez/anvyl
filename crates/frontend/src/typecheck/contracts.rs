@@ -5,7 +5,7 @@ use anvyx_externs::{ParamFlow, ReceiverMode};
 use super::{
     ContractKey, ContractRequirementKey, ContractRequirementSchema, ContractSetKey, DeclError,
     DeclarationIndex, DeprecatedUseKind, Exposure, FuncParam, MemberAccessKind, MethodMode,
-    MethodReceiver, TypeChecker, TypeError, TypeWarning,
+    MethodReceiver, TypeChecker, TypeError, deprecated_lint,
     member::{self, PromotedMethodTarget},
     semantic_use::{ContractWitnessKey, WitnessId, WitnessSlot, WitnessSlotTarget},
     type_ops::TypeVisitor,
@@ -13,6 +13,7 @@ use super::{
 };
 use crate::{
     ast::{AnonymousContract, ContractRef, Ident, ReturnSpec, Type},
+    lint::LintEvent,
     span::{SourceSpan, Span},
 };
 
@@ -538,7 +539,7 @@ fn extern_receiver(receiver: ReceiverMode) -> MethodReceiver {
 pub(crate) fn finalize_contracts(
     decls: &mut DeclarationIndex,
     errors: &mut Vec<TypeError>,
-    warnings: &mut Vec<TypeWarning>,
+    lint_events: &mut Vec<LintEvent>,
 ) {
     for contract in decls.contracts_mut() {
         let mut by_name: HashMap<Ident, ContractRequirementSchema> = HashMap::new();
@@ -597,7 +598,7 @@ pub(crate) fn finalize_contracts(
         .collect::<Vec<_>>();
     for key in keys {
         let mut stack = vec![];
-        finalize_effective_contract(decls, &key, &mut stack, errors, warnings);
+        finalize_effective_contract(decls, &key, &mut stack, errors, lint_events);
     }
 }
 
@@ -606,7 +607,7 @@ fn finalize_effective_contract(
     key: &ContractKey,
     stack: &mut Vec<ContractKey>,
     errors: &mut Vec<TypeError>,
-    warnings: &mut Vec<TypeWarning>,
+    lint_events: &mut Vec<LintEvent>,
 ) -> Vec<ContractRequirementSchema> {
     if let Some(schema) = decls.contract(key)
         && schema.contract_set.is_some()
@@ -635,11 +636,11 @@ fn finalize_effective_contract(
             &include,
             include_span,
             errors,
-            warnings,
+            lint_events,
         );
         for included_key in included_keys {
             let included =
-                finalize_effective_contract(decls, &included_key, stack, errors, warnings);
+                finalize_effective_contract(decls, &included_key, stack, errors, lint_events);
             if let Err(conflict) = merge_effective_requirements(&mut effective, &included) {
                 errors.push(conflicting_requirement_error(
                     &schema.key,
@@ -672,29 +673,33 @@ fn finalize_effective_contract(
 }
 
 fn resolve_included_contracts(
-    decls: &DeclarationIndex,
+    decls: &mut DeclarationIndex,
     owner: &ContractKey,
     include: &ContractRef,
     span: SourceSpan,
     errors: &mut Vec<TypeError>,
-    warnings: &mut Vec<TypeWarning>,
+    lint_events: &mut Vec<LintEvent>,
 ) -> Vec<ContractKey> {
     match include {
         ContractRef::Named { .. } => {
-            let resolver = TypeRefResolver::module_only(decls);
-            match resolver.resolve_contract_ref(&owner.module, include) {
-                Ok(key) => {
+            let resolved = {
+                let resolver = TypeRefResolver::module_only(decls);
+                resolver.resolve_contract_ref_with_import(&owner.module, include)
+            };
+            match resolved {
+                Ok((key, import)) => {
+                    decls.mark_import_used(import);
                     if let Some(schema) = decls.contract(&key)
                         && schema.policy.has_deprecated()
                     {
-                        let warning = TypeWarning::DeprecatedAccess {
-                            kind: DeprecatedUseKind::Contract,
-                            name: key.name,
-                            reason: schema.policy.deprecated_reason().map(str::to_string),
+                        let event = deprecated_lint(
+                            DeprecatedUseKind::Contract,
+                            key.name,
+                            schema.policy.deprecated_reason().map(str::to_string),
                             span,
-                        };
-                        if !warnings.contains(&warning) {
-                            warnings.push(warning);
+                        );
+                        if !lint_events.contains(&event) {
+                            lint_events.push(event);
                         }
                     }
                     vec![key]
@@ -711,7 +716,7 @@ fn resolve_included_contracts(
         ContractRef::Intersection(contracts) => contracts
             .iter()
             .flat_map(|contract| {
-                resolve_included_contracts(decls, owner, contract, span, errors, warnings)
+                resolve_included_contracts(decls, owner, contract, span, errors, lint_events)
             })
             .collect(),
         ContractRef::Anonymous(_) => {

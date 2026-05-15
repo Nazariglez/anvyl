@@ -785,13 +785,14 @@ impl<'tc> PatternChecker<'tc> {
                 .resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
             return self.struct_pattern_target_from_expanded(expanded);
         }
-        let Some(binding) =
-            self.tc
-                .decls
-                .resolve_visible_type_binding(&self.tc.current_module, None, name)
-        else {
+        let Some((binding, import)) = self.tc.decls.resolve_visible_type_binding_with_import(
+            &self.tc.current_module,
+            None,
+            name,
+        ) else {
             return StructPatternTarget::Missing;
         };
+        self.tc.mark_import_used(import);
         match binding {
             TypeBinding::Nominal(key) => {
                 let ty = nominal_type(&key);

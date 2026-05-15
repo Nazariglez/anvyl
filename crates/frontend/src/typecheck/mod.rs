@@ -38,7 +38,8 @@ pub(crate) use self::{
 };
 use crate::{
     ast::*,
-    config::{CompilationContext, LintConfig, LintLevel, PredicateError},
+    config::{CompilationContext, PredicateError},
+    diagnostic::DiagnosticTag,
     externs::{
         RawExterns,
         catalog::{
@@ -46,6 +47,7 @@ use crate::{
             ExternTypeId,
         },
     },
+    lint::{LintEvent, LintId},
     resolve::ResolveResult,
     source::SourceId,
     span::{SourceSpan, Span},
@@ -95,6 +97,15 @@ pub(crate) enum MemberAccessKind {
     Method,
 }
 
+impl MemberAccessKind {
+    pub(crate) fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Field => "field",
+            Self::Method => "method",
+        }
+    }
+}
+
 impl From<MemberAccessKind> for DeprecatedUseKind {
     fn from(kind: MemberAccessKind) -> Self {
         match kind {
@@ -106,7 +117,6 @@ impl From<MemberAccessKind> for DeprecatedUseKind {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TypecheckConfig {
-    pub(crate) lint: LintConfig,
     pub(crate) context: CompilationContext,
 }
 
@@ -149,25 +159,30 @@ pub(crate) enum DeprecatedUseKind {
     Method,
 }
 
+impl DeprecatedUseKind {
+    pub(crate) fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::ExternFunction => "extern function",
+            Self::Const => "const",
+            Self::Global => "runtime global",
+            Self::ExternType => "extern type",
+            Self::TypeAlias => "type alias",
+            Self::Contract => "contract",
+            Self::Struct => "struct",
+            Self::DataRef => "dataref",
+            Self::Enum => "enum",
+            Self::EnumVariant => "variant",
+            Self::Field => "field",
+            Self::Method => "method",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum TypeWarning {
-    DeprecatedAccess {
-        kind: DeprecatedUseKind,
-        name: Ident,
-        reason: Option<String>,
-        span: SourceSpan,
-    },
-    InternalAccess {
-        kind: MemberAccessKind,
-        name: Ident,
-        owner: Type,
-        reason: Option<String>,
-        span: SourceSpan,
-    },
-    CompileMessage {
-        message: String,
-        span: SourceSpan,
-    },
+pub(crate) struct CompileWarning {
+    pub(crate) message: String,
+    pub(crate) span: SourceSpan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,13 +561,6 @@ pub(crate) enum TypeError {
         span: Option<SourceSpan>,
     },
     ReadonlyMethodMutation {
-        span: Option<SourceSpan>,
-    },
-    InternalAccess {
-        kind: MemberAccessKind,
-        name: Ident,
-        owner: Type,
-        reason: Option<String>,
         span: Option<SourceSpan>,
     },
     UnknownIntrinsic {
@@ -1115,6 +1123,7 @@ struct TypeChecker {
     active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
     dyn_infer_registered_modules: HashSet<ModuleScope>,
     dyn_infer: DynInference,
+    used_imports: HashSet<ImportId>,
     next_witness_id: u32,
     decls: DeclarationIndex,
     externs: ExternCatalog,
@@ -1128,7 +1137,8 @@ struct TypeChecker {
     global_initializer_depth: usize,
     discard_depth: usize,
     errors: Vec<TypeError>,
-    warnings: Vec<TypeWarning>,
+    warnings: Vec<CompileWarning>,
+    lint_events: Vec<LintEvent>,
     config: TypecheckConfig,
     current_module: ModuleScope,
     module_sources: HashMap<ModuleScope, SourceId>,
@@ -1221,6 +1231,7 @@ impl TypeChecker {
             active_mut_downcast_roots: vec![],
             dyn_infer_registered_modules: HashSet::new(),
             dyn_infer: DynInference::default(),
+            used_imports: HashSet::new(),
             next_witness_id: 0,
             decls,
             externs,
@@ -1235,6 +1246,7 @@ impl TypeChecker {
             discard_depth: 0,
             errors: vec![],
             warnings: vec![],
+            lint_events: vec![],
             config,
             current_module: ModuleScope::Root,
             module_sources: HashMap::new(),
@@ -1908,6 +1920,22 @@ impl TypeChecker {
     }
 
     fn record_contract_witness(&mut self, key: ContractWitnessKey, span: Span) -> WitnessId {
+        let origins = key
+            .slots
+            .iter()
+            .filter_map(|slot| match &slot.target {
+                WitnessSlotTarget::Extend { extend, .. } => self
+                    .decls
+                    .extend(extend)
+                    .map(|schema| schema.origin.clone()),
+                WitnessSlotTarget::Direct { .. }
+                | WitnessSlotTarget::Extern { .. }
+                | WitnessSlotTarget::Promoted { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for origin in origins {
+            self.mark_activation_imports_used(&origin);
+        }
         if let Some(id) = self.witness_keys.get(&key) {
             return *id;
         }
@@ -2170,10 +2198,26 @@ impl TypeChecker {
         self.errors.push(err);
     }
 
-    fn push_warning(&mut self, warning: TypeWarning) {
+    fn push_warning(&mut self, warning: CompileWarning) {
         if !self.warnings.contains(&warning) {
             self.warnings.push(warning);
         }
+    }
+
+    pub(super) fn push_lint_event(&mut self, event: LintEvent) {
+        if !self.lint_events.contains(&event) {
+            self.lint_events.push(event);
+        }
+    }
+
+    pub(super) fn push_deprecated_lint(
+        &mut self,
+        kind: DeprecatedUseKind,
+        name: Ident,
+        reason: Option<String>,
+        span: SourceSpan,
+    ) {
+        self.push_lint_event(deprecated_lint(kind, name, reason, span));
     }
 
     fn check_matched_field_access_policy(
@@ -2232,12 +2276,12 @@ impl TypeChecker {
             }
             _ => return,
         };
-        self.push_warning(TypeWarning::DeprecatedAccess {
-            kind: DeprecatedUseKind::ExternType,
-            name: key.name,
+        self.push_deprecated_lint(
+            DeprecatedUseKind::ExternType,
+            key.name,
             reason,
-            span: self.source_span(span),
-        });
+            self.source_span(span),
+        );
     }
 
     fn warn_deprecated(
@@ -2247,9 +2291,8 @@ impl TypeChecker {
         name: Ident,
         span: Span,
     ) {
-        if let Some(warning) = deprecated_access_warning(policy, kind, name, self.source_span(span))
-        {
-            self.push_warning(warning);
+        if let Some(event) = deprecated_access_lint(policy, kind, name, self.source_span(span)) {
+            self.push_lint_event(event);
         }
     }
 
@@ -2292,9 +2335,7 @@ impl TypeChecker {
             &mut AccessPolicyOutput {
                 source: self.source_id(),
                 current_module: &self.current_module,
-                config: &self.config,
-                warnings: &mut self.warnings,
-                errors: &mut self.errors,
+                lint_events: &mut self.lint_events,
             },
         );
     }
@@ -2599,7 +2640,7 @@ impl TypeChecker {
             .find_static_extend_method(target, name, |ext| self.extend_visible(ext))
     }
 
-    fn explicit_cast_conversion(&self, source: &Type, target: &Type) -> Option<ExplicitCast> {
+    fn explicit_cast_conversion(&mut self, source: &Type, target: &Type) -> Option<ExplicitCast> {
         if source == target {
             return Some(ExplicitCast::Identity);
         }
@@ -2610,12 +2651,15 @@ impl TypeChecker {
             .map(|escape| ExplicitCast::CastFrom { escape })
     }
 
-    fn cast_from_conversion_escape(&self, source: &Type, target: &Type) -> Option<EscapeMode> {
+    fn cast_from_conversion_escape(&mut self, source: &Type, target: &Type) -> Option<EscapeMode> {
         match self
             .decls
             .find_cast_conversion(source, target, |ext| self.extend_visible(ext))
         {
-            Some(CastConversionMatch::Match { escape }) => Some(escape),
+            Some(CastConversionMatch::Match { escape, origin }) => {
+                self.mark_activation_imports_used(&origin);
+                Some(escape)
+            }
             Some(CastConversionMatch::Ambiguous) | None => None,
         }
     }
@@ -2654,6 +2698,7 @@ impl TypeChecker {
         let resolver = TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes);
         match resolver.finalize_at(&self.current_module, &generics, ty, Some(span)) {
             Ok(finalized) => {
+                self.used_imports.extend(finalized.used_imports);
                 self.push_type_ref_warnings(finalized.warnings);
                 let ty = self.reject_source_dyn_contracts(finalized.ty, span);
                 if matches!(ty, Type::Infer) {
@@ -2748,6 +2793,7 @@ impl TypeChecker {
     ) -> Type {
         match result {
             Ok(finalized) => {
+                self.used_imports.extend(finalized.used_imports);
                 self.push_type_ref_warnings(finalized.warnings);
                 self.finish_resolved_type(finalized.ty, span)
             }
@@ -2788,12 +2834,12 @@ impl TypeChecker {
                 TypeRefWarningKind::TypeAlias => DeprecatedUseKind::TypeAlias,
                 TypeRefWarningKind::Contract => DeprecatedUseKind::Contract,
             };
-            self.push_warning(TypeWarning::DeprecatedAccess {
+            self.push_deprecated_lint(
                 kind,
-                name: warning.name,
-                reason: warning.reason,
-                span: self.source_span(warning.span),
-            });
+                warning.name,
+                warning.reason,
+                self.source_span(warning.span),
+            );
         }
     }
 
@@ -3044,13 +3090,30 @@ impl TypeChecker {
             .unwrap_or(ArrayLen::Infer)
     }
 
-    fn imported_value(&self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
-        self.decls
-            .imported_value(&self.current_module, name)
-            .map(Self::resolved_value)
+    fn mark_import_used(&mut self, import: Option<ImportId>) {
+        if let Some(import) = import {
+            self.used_imports.insert(import);
+        }
     }
 
-    fn lookup_named_value(&self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
+    pub(super) fn mark_activation_imports_used(&mut self, module: &ModuleScope) {
+        self.used_imports.extend(
+            self.decls
+                .active_import_ids(&self.current_module, module)
+                .iter()
+                .cloned(),
+        );
+    }
+
+    fn imported_value(&mut self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
+        let (value, import) = self
+            .decls
+            .imported_value_with_import(&self.current_module, name)?;
+        self.mark_import_used(import);
+        Some(Self::resolved_value(value))
+    }
+
+    fn lookup_named_value(&mut self, name: Ident) -> Option<(ModuleScope, Ident, ValueDecl)> {
         if self
             .lookup_local_symbol(name)
             .is_some_and(|(_, depth)| depth > 0)
@@ -3061,8 +3124,12 @@ impl TypeChecker {
             .or_else(|| self.imported_value(name))
     }
 
-    fn lookup_module_alias(&self, name: Ident) -> Option<ModuleScope> {
-        self.decls.imported_module(&self.current_module, name)
+    fn lookup_module_alias(&mut self, name: Ident) -> Option<ModuleScope> {
+        let (module, import) = self
+            .decls
+            .imported_module_with_import(&self.current_module, name)?;
+        self.mark_import_used(import);
+        Some(module)
     }
 
     fn visible_type_subject(&mut self, name: Ident, span: Span) -> Option<Type> {
@@ -3073,9 +3140,12 @@ impl TypeChecker {
             let ty = self.resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
             return (!matches!(ty, Type::Infer)).then_some(ty);
         }
-        let binding = self
-            .decls
-            .resolve_visible_type_binding(&self.current_module, None, name)?;
+        let (binding, import) = self.decls.resolve_visible_type_binding_with_import(
+            &self.current_module,
+            None,
+            name,
+        )?;
+        self.mark_import_used(import);
         match binding {
             TypeBinding::Nominal(key) => {
                 self.warn_extern_type_deprecated(&key, span);
@@ -3137,7 +3207,10 @@ impl TypeChecker {
     fn finish(&mut self) -> Result<(SourceExprTypes, TypecheckFacts), Vec<TypeError>> {
         self.solve_constraints();
         self.solve_dyn_inference();
-        let facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
+        let mut facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
+        facts.import_records = self.decls.import_records().to_vec();
+        facts.used_imports = self.decls.used_imports().clone();
+        facts.used_imports.extend(self.used_imports.clone());
         let escape_events = self.closure.take_escape_events();
         self.push_escape_events(escape_events);
         if !self.errors.is_empty() {
@@ -3160,7 +3233,7 @@ impl TypeChecker {
 
     fn into_result(mut self) -> Result<TypecheckResult, Vec<TypeError>> {
         let (_, facts) = self.finish()?;
-        Ok(TypecheckResult::new(self.warnings, facts))
+        Ok(TypecheckResult::new(self.warnings, self.lint_events, facts))
     }
 
     fn result_closure_errors(&self, types: &SourceExprTypes) -> Vec<TypeError> {
@@ -3303,7 +3376,7 @@ impl TypeChecker {
             self.push_error(generic_param_decl_type_error(error, source));
         }
         validate_type_alias_decls(&decls, &mut self.errors);
-        contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.warnings);
+        contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.lint_events);
         validate_public_contract_types(&decls, &mut self.errors);
         validate_dyn_infer_decls(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
@@ -3345,6 +3418,7 @@ impl TypeChecker {
         let resolver = TypeRefResolver::module_only(decls);
         match resolver.finalize_at(&site.module, &site.generics, &ty, Some(site.span)) {
             Ok(finalized) => {
+                self.used_imports.extend(finalized.used_imports);
                 self.push_type_ref_warnings(finalized.warnings);
                 finalized.ty
             }
@@ -3587,28 +3661,64 @@ fn map_key_type_error(
     })
 }
 
-fn deprecated_access_warning(
+fn deprecated_access_lint(
     policy: &annotation::AccessPolicy,
     kind: DeprecatedUseKind,
     name: Ident,
     span: SourceSpan,
-) -> Option<TypeWarning> {
-    policy
-        .has_deprecated()
-        .then(|| TypeWarning::DeprecatedAccess {
+) -> Option<LintEvent> {
+    policy.has_deprecated().then(|| {
+        deprecated_lint(
             kind,
             name,
-            reason: policy.deprecated_reason().map(str::to_string),
+            policy.deprecated_reason().map(str::to_string),
             span,
-        })
+        )
+    })
+}
+
+pub(super) fn deprecated_lint(
+    kind: DeprecatedUseKind,
+    name: Ident,
+    reason: Option<String>,
+    span: SourceSpan,
+) -> LintEvent {
+    LintEvent {
+        id: LintId::Deprecated,
+        span,
+        message: render_deprecated_access(kind, name, reason.as_deref()),
+        label: Some(format!("deprecated {} used here", kind.diagnostic_name())),
+        notes: vec![],
+        help: None,
+        tags: vec![DiagnosticTag::Deprecated],
+    }
+}
+
+fn render_deprecated_access(kind: DeprecatedUseKind, name: Ident, reason: Option<&str>) -> String {
+    let kind = kind.diagnostic_name();
+    match reason {
+        Some(reason) => format!("use of deprecated {kind} '{name}': {reason}"),
+        None => format!("use of deprecated {kind} '{name}'"),
+    }
 }
 
 struct AccessPolicyOutput<'a> {
     source: SourceId,
     current_module: &'a ModuleScope,
-    config: &'a TypecheckConfig,
-    warnings: &'a mut Vec<TypeWarning>,
-    errors: &'a mut Vec<TypeError>,
+    lint_events: &'a mut Vec<LintEvent>,
+}
+
+fn render_internal_access(
+    kind: MemberAccessKind,
+    name: Ident,
+    owner: &Type,
+    reason: Option<&str>,
+) -> String {
+    let kind = kind.diagnostic_name();
+    match reason {
+        Some(reason) => format!("accessing internal {kind} '{name}' of type '{owner}': {reason}"),
+        None => format!("accessing internal {kind} '{name}' of type '{owner}'"),
+    }
 }
 
 fn emit_access_policy(
@@ -3620,40 +3730,30 @@ fn emit_access_policy(
     span: Span,
     out: &mut AccessPolicyOutput<'_>,
 ) {
-    if let Some(warning) = deprecated_access_warning(
+    if let Some(event) = deprecated_access_lint(
         policy,
         DeprecatedUseKind::from(kind),
         name,
         SourceSpan::from_byte_span(out.source, span),
     ) {
-        out.warnings.push(warning);
+        out.lint_events.push(event);
     }
 
-    if !policy.has_internal()
-        || origin == out.current_module
-        || out.config.lint.internal_access == LintLevel::Allow
-    {
+    if !policy.has_internal() || origin == out.current_module {
         return;
     }
 
     let reason = policy.internal_reason().map(str::to_string);
-    match out.config.lint.internal_access {
-        LintLevel::Allow => unreachable!("allow returned before diagnostic emission"),
-        LintLevel::Warn => out.warnings.push(TypeWarning::InternalAccess {
-            kind,
-            name,
-            owner: owner.clone(),
-            reason,
-            span: SourceSpan::from_byte_span(out.source, span),
-        }),
-        LintLevel::Error => out.errors.push(TypeError::InternalAccess {
-            kind,
-            name,
-            owner: owner.clone(),
-            reason,
-            span: Some(SourceSpan::from_byte_span(out.source, span)),
-        }),
-    }
+    let span = SourceSpan::from_byte_span(out.source, span);
+    out.lint_events.push(LintEvent {
+        id: LintId::InternalAccess,
+        span,
+        message: render_internal_access(kind, name, owner, reason.as_deref()),
+        label: Some(format!("internal {} used here", kind.diagnostic_name())),
+        notes: vec![],
+        help: None,
+        tags: vec![],
+    });
 }
 
 pub(crate) fn check_with_modules(
@@ -7362,7 +7462,7 @@ fn check_intrinsic_call(
                     span: tc.error_span(call.span),
                 });
             } else {
-                tc.push_warning(TypeWarning::CompileMessage {
+                tc.push_warning(CompileWarning {
                     message,
                     span: tc.source_span(call.span),
                 });
@@ -9758,7 +9858,7 @@ fn resolve_struct_target(
         return struct_literal_target_from_expanded(lit, expanded, tc);
     }
 
-    let Some(binding) = tc.decls.resolve_visible_type_binding(
+    let Some((binding, import)) = tc.decls.resolve_visible_type_binding_with_import(
         &tc.current_module,
         lit.node.qualifier,
         lit.node.name,
@@ -9770,6 +9870,7 @@ fn resolve_struct_target(
         });
         return None;
     };
+    tc.mark_import_used(import);
     match binding {
         TypeBinding::Nominal(key) => Some(StructLiteralTarget { key, seeds: None }),
         TypeBinding::Alias(key) => {

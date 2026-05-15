@@ -1,0 +1,9 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+import models { Vec2 };
+import casts;
+
+fn main() { let v = 1.0 as Vec2; }

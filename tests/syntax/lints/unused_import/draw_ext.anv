@@ -1,0 +1,7 @@
+// @helper
+
+import models { Actor };
+
+pub extend Actor {
+    fn draw(self) {}
+}

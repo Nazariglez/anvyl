@@ -1,0 +1,10 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+import models { Actor };
+import api { Drawable };
+import draw_ext;
+
+fn main() { let actor: dyn Drawable = Actor {}; }

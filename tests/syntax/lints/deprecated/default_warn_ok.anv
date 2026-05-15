@@ -1,0 +1,11 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @warn-contains: [deprecated] Warning: use of deprecated function 'old'
+
+@deprecated
+fn old() {}
+
+fn main() {
+    old();
+}

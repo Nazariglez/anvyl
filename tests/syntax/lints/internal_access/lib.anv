@@ -1,0 +1,6 @@
+// @helper
+
+pub struct Item {
+    name: string,
+    @internal cache: string,
+}

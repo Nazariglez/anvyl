@@ -1,0 +1,17 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+import models { Actor };
+import api { Drawable };
+import draw_ext;
+
+struct Local { fn draw(self) {} }
+
+fn main() {
+    let value: dyn Drawable = Local {};
+    if let actor = value as? Actor {
+        actor.draw();
+    }
+}

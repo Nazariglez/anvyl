@@ -1,0 +1,11 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: internal_access=allow
+
+import lib { Item };
+
+fn main() {
+    let i = Item { name: "test", cache: "" };
+    println(i.cache);
+}

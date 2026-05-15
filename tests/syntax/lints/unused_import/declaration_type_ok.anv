@@ -1,0 +1,10 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+import models { Actor };
+
+struct Slot { actor: Actor }
+
+fn main() {}

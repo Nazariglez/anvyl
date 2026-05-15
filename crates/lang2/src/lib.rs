@@ -4,11 +4,15 @@ mod error;
 mod source;
 
 pub use anvyx_frontend::{
-    config::{CompilationContext, LintConfig, LintLevel, Profile, TargetArch, TargetOs},
+    config::{CompilationContext, LintConfig, Profile, TargetArch, TargetOs},
     diagnostic::render::{render_plain_diagnostic, render_plain_report, render_rich_report},
+    lint::{
+        LintId, LintInfo, LintLevel, LintParseError, available_group_names, available_lint_names,
+        available_override_names, expand_group, find_lint, implemented_lints,
+    },
     pipeline::{
-        Diagnostic, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity, FrontendConfig,
-        LabelStyle,
+        Diagnostic, DiagnosticCode, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity,
+        DiagnosticTag, FrontendConfig, LabelStyle,
     },
     resolve::PackageId,
     source::{SourceFile, SourceId, SourceKind, SourceTable},

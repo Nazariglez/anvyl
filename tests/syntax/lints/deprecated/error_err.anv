@@ -1,0 +1,12 @@
+// @frontend: new
+// @mode: check
+// @expect: error
+// @lint: deprecated=error
+// @contains: [deprecated] Error: use of deprecated function 'old'
+
+@deprecated
+fn old() {}
+
+fn main() {
+    old();
+}

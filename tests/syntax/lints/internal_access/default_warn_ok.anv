@@ -1,0 +1,11 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @warn-contains: [internal_access] Warning: accessing internal field 'cache' of type 'Item'
+
+import lib { Item };
+
+fn main() {
+    let i = Item { name: "test", cache: "" };
+    println(i.cache);
+}

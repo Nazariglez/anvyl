@@ -1,0 +1,9 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: all=allow
+// @warn-contains: Warning: placeholder
+
+fn main() {
+    #warning("placeholder");
+}
