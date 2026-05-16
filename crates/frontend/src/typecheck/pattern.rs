@@ -1,4 +1,4 @@
-use super::*;
+use super::{literal::type_from_lit, *};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PatternCover {
@@ -1020,16 +1020,13 @@ impl<'tc> PatternChecker<'tc> {
         else {
             return PatternOutcome::error();
         };
-        match resolved.schema.payload {
-            VariantPayload::Unit => PatternOutcome::refutable(PatternCover::EnumVariant {
-                key: resolved.key,
-                variant,
-            }),
-            VariantPayload::Tuple(_) | VariantPayload::Struct(_) => {
-                enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Unit, span);
-                PatternOutcome::error()
-            }
+        if !enum_variant::expect_unit(self.tc, &resolved, span) {
+            return PatternOutcome::error();
         }
+        PatternOutcome::refutable(PatternCover::EnumVariant {
+            key: resolved.key,
+            variant,
+        })
     }
 
     fn check_enum_tuple(
@@ -1049,8 +1046,7 @@ impl<'tc> PatternChecker<'tc> {
                 bindings,
             };
         };
-        let VariantPayload::Tuple(payloads) = &resolved.schema.payload else {
-            enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Tuple, span);
+        let Some(payloads) = enum_variant::expect_tuple(self.tc, &resolved, span) else {
             let bindings = self.check_tuple_fields_recovery(fields, input.access);
             return PatternCheckResult {
                 outcome: PatternOutcome::error(),
@@ -1106,8 +1102,7 @@ impl<'tc> PatternChecker<'tc> {
             self.check_field_patterns(fields, input.access);
             return PatternCheckResult::empty(PatternOutcome::error());
         };
-        let VariantPayload::Struct(schema) = &resolved.schema.payload else {
-            enum_variant::push_shape_mismatch(self.tc, &resolved, VariantShape::Struct, span);
+        let Some(schema) = enum_variant::expect_struct(self.tc, &resolved, span) else {
             self.check_field_patterns(fields, input.access);
             return PatternCheckResult::empty(PatternOutcome::error());
         };
@@ -1189,7 +1184,7 @@ impl<'tc> PatternChecker<'tc> {
         resolved: &enum_variant::ResolvedEnumVariant,
         expected: &Type,
     ) -> Option<GenericArgs> {
-        resolved.owner_args_from_expected(expected, self.tc)
+        resolved.owner_args_from_type(expected, self.tc)
     }
 
     fn extern_field_alias_facts(
@@ -1300,4 +1295,496 @@ pub(super) fn check_roots(
         had_error,
         refutability,
     }
+}
+
+pub(super) fn mode_for_head(head: PatternHead) -> PatternBindMode {
+    match head {
+        PatternHead::Let => PatternBindMode::Owned { mutable: false },
+        PatternHead::Var => PatternBindMode::Alias,
+    }
+}
+
+pub(super) fn mode_for_binding(binding: &Binding) -> PatternBindMode {
+    match binding.mutability {
+        Mutability::Immutable => PatternBindMode::Owned { mutable: false },
+        Mutability::Mutable if matches!(binding.pattern.node, Pattern::Ident(_)) => {
+            PatternBindMode::Owned { mutable: true }
+        }
+        Mutability::Mutable => PatternBindMode::Alias,
+    }
+}
+
+pub(super) struct PatternScrutinee {
+    pub(super) checked: CheckedType,
+    access: PlaceAccess,
+    facts: PlaceUseFacts,
+    identity: PlaceIdentity,
+    accepts_extern_any: bool,
+}
+
+impl PatternScrutinee {
+    fn owned(checked: CheckedType) -> Self {
+        Self {
+            checked,
+            access: PlaceAccess::Mutable,
+            facts: PlaceUseFacts::default(),
+            identity: PlaceIdentity::unknown(),
+            accepts_extern_any: false,
+        }
+    }
+
+    fn alias(place: place::CheckedPlace) -> Self {
+        let accepts_extern_any = place.accepts_extern_any();
+        let place::PlaceValue {
+            checked,
+            access,
+            facts,
+            identity,
+            ..
+        } = place.value;
+        Self {
+            checked,
+            access,
+            facts,
+            identity,
+            accepts_extern_any,
+        }
+    }
+
+    pub(super) fn pattern_place(
+        &self,
+        expected_handle: TypeHandle,
+        expected_ty: Type,
+    ) -> PatternPlace {
+        PatternPlace {
+            expected_handle,
+            expected_ty,
+            access: self.access,
+            facts: self.facts.clone(),
+            identity: self.identity.clone(),
+            accepts_extern_any: self.accepts_extern_any,
+        }
+    }
+}
+
+pub(super) fn check_pattern_scrutinee(
+    expr: &ExprNode,
+    mode: PatternBindMode,
+    tc: &mut TypeChecker,
+) -> PatternScrutinee {
+    match mode {
+        PatternBindMode::Owned { .. } => {
+            PatternScrutinee::owned(check_value_expr_checked_with_hint(expr, None, tc))
+        }
+        PatternBindMode::Alias => PatternScrutinee::alias(check_alias_scrutinee(expr, tc)),
+    }
+}
+
+fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
+    if let Some(annot_inner) = tc.decls.core_option_inner(annot) {
+        let value_inner = tc.decls.core_option_inner(value).unwrap_or(value);
+        let inner = refined_binding_type(annot_inner, value_inner, tc);
+        return tc
+            .decls
+            .core_option_of(inner)
+            .unwrap_or_else(|| annot.clone());
+    }
+    match (annot, value) {
+        (
+            Type::Array { elem, len },
+            Type::Array {
+                elem: value_elem,
+                len: value_len,
+            },
+        ) => Type::Array {
+            elem: Box::new(refined_binding_type(elem, value_elem, tc)),
+            len: if matches!(len, ArrayLen::Infer) {
+                *value_len
+            } else {
+                *len
+            },
+        },
+        (Type::List { elem }, Type::List { elem: value_elem }) => Type::List {
+            elem: Box::new(refined_binding_type(elem, value_elem, tc)),
+        },
+        (Type::Slice { elem }, Type::Slice { elem: value_elem }) => Type::Slice {
+            elem: Box::new(refined_binding_type(elem, value_elem, tc)),
+        },
+        (
+            Type::Map { key, value },
+            Type::Map {
+                key: value_key,
+                value: value_value,
+            },
+        ) => Type::Map {
+            key: Box::new(refined_binding_type(key, value_key, tc)),
+            value: Box::new(refined_binding_type(value, value_value, tc)),
+        },
+        (Type::Tuple(types), Type::Tuple(value_types)) if types.len() == value_types.len() => {
+            Type::Tuple(
+                types
+                    .iter()
+                    .zip(value_types)
+                    .map(|(ty, value_ty)| refined_binding_type(ty, value_ty, tc))
+                    .collect(),
+            )
+        }
+        _ => annot.clone(),
+    }
+}
+
+pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
+    let binding = &binding_node.node;
+    let mode = mode_for_binding(binding);
+    let value_ty = match &binding.ty {
+        Some(annot) => {
+            let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
+            let annot_handle = tc.type_handle(&annot_ty);
+            let value = match mode {
+                PatternBindMode::Owned { .. } => {
+                    PatternScrutinee::owned(check_value_expr_checked_with_hint(
+                        &binding.value,
+                        Some(annot_handle.clone()),
+                        tc,
+                    ))
+                }
+                PatternBindMode::Alias => {
+                    PatternScrutinee::alias(check_alias_scrutinee(&binding.value, tc))
+                }
+            };
+            tc.reject_extern_any_escape(&value.checked, binding.value.span);
+            tc.expect_assignable_expr(
+                binding.value.span,
+                binding.value.node.id,
+                value.checked.handle.clone(),
+                annot_handle,
+            );
+            tc.solve_constraints();
+            let value_ty = value.checked.ty.clone();
+            let binding_ty = refined_binding_type(&annot_ty, &value.checked.ty, tc);
+            let binding_handle = tc.type_handle(&binding_ty);
+            check_place_at(
+                &binding.pattern,
+                value.pattern_place(binding_handle, binding_ty),
+                mode,
+                binding.value.node.id,
+                PatternContext::Binding,
+                tc,
+            );
+            value_ty
+        }
+        None => {
+            let value = check_pattern_scrutinee(&binding.value, mode, tc);
+            tc.reject_extern_any_escape(&value.checked, binding.value.span);
+            tc.reject_user_any_type(&value.checked.ty, binding_node.span);
+            let value_ty = value.checked.ty.clone();
+            check_place_at(
+                &binding.pattern,
+                value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
+                mode,
+                binding.value.node.id,
+                PatternContext::Binding,
+                tc,
+            );
+            value_ty
+        }
+    };
+
+    let function_value = matches!(value_ty, Type::Func { .. });
+    let binding_id = simple_owned_binding_name(binding).and_then(|name| tc.local_binding_id(name));
+    tc.closure.bind_local(
+        binding_id,
+        binding.value.node.id,
+        function_value,
+        binding.value.span,
+    );
+}
+
+fn simple_owned_binding_name(binding: &Binding) -> Option<Ident> {
+    if !matches!(mode_for_binding(binding), PatternBindMode::Owned { .. }) {
+        return None;
+    }
+    let Pattern::Ident(name) = &binding.pattern.node else {
+        return None;
+    };
+    Some(*name)
+}
+
+pub(super) fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
+    let node = &let_else_node.node;
+    let mode = mode_for_head(node.head);
+    let value = check_pattern_scrutinee(&node.value, mode, tc);
+    tc.push_scope();
+    check_block_checked(&node.else_block, tc);
+    tc.pop_scope();
+    if !control_flow::block_diverges(&node.else_block) {
+        tc.push_error(TypeError::LetElseMustDiverge {
+            span: tc.error_span(node.else_block.span),
+        });
+    }
+    check_place_at(
+        &node.pattern,
+        value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
+        mode,
+        node.value.node.id,
+        PatternContext::LetElse,
+        tc,
+    );
+}
+
+pub(super) fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
+    let node = &while_let_node.node;
+    let mode = mode_for_head(node.head);
+    let value = check_pattern_scrutinee(&node.value, mode, tc);
+    tc.push_scope();
+    check_place_at(
+        &node.pattern,
+        value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
+        mode,
+        node.value.node.id,
+        PatternContext::WhileLet,
+        tc,
+    );
+    control_flow::check_loop_body(&node.body, tc);
+    tc.pop_scope();
+}
+
+fn check_if_let_exact_downcast(
+    if_let_node: &IfLetNode,
+    downcast: &ExactDowncastNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let node = &if_let_node.node;
+    let binding = exact_downcast_binding(node, tc);
+    let target = tc.resolve_downcast_target_type_at(&downcast.node.target, downcast.span);
+    let target = runtime_downcast_target(tc, target, downcast.span);
+    let source = check_place(&downcast.node.expr, tc);
+    let source_contract = match &source.checked().ty {
+        Type::Dyn(contract) => Some(contract.clone()),
+        Type::Infer => None,
+        _ => {
+            tc.push_error(TypeError::CompileError {
+                message: "exact downcast source must be a dynamic value".to_string(),
+                span: tc.error_span(downcast.node.expr.span),
+            });
+            None
+        }
+    };
+    let mut source_valid = source_contract.is_some();
+
+    match binding {
+        Some(binding) if binding.mutable => {
+            if let Some(error) = source
+                .value
+                .access
+                .mut_borrow_error(binding.name, tc.error_span(downcast.node.expr.span))
+            {
+                tc.push_error(error);
+                source_valid = false;
+            }
+        }
+        Some(_) if matches!(source.value.access, PlaceAccess::NotPlace) => {
+            tc.push_error(TypeError::CompileError {
+                message: "exact downcast source must be a dynamic place".to_string(),
+                span: tc.error_span(downcast.node.expr.span),
+            });
+            source_valid = false;
+        }
+        _ => {}
+    }
+
+    let binding_ty = target.clone().unwrap_or(Type::Infer);
+    checked_from_type(&node.value, binding_ty.clone(), tc);
+    let Some(binding) = binding else {
+        return check_downcast_branches(node, None, binding_ty, expected, tc);
+    };
+    let Some(target) = target else {
+        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
+    };
+    if !source_valid {
+        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
+    }
+    let source_contract = source_contract.expect("valid downcast source has contract");
+
+    if let Some(source) =
+        contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, &source_contract)
+    {
+        tc.record_dyn_downcast(DynDowncastFact {
+            expr_id: node.value.node.id,
+            source_id: downcast.node.expr.node.id,
+            source,
+            target: target.clone(),
+            mutable: binding.mutable,
+            span: tc.source_span(node.value.span),
+        });
+    } else if let Some(hole) = dyn_infer::hole_id(&source_contract) {
+        tc.dyn_infer.add_downcast(
+            tc.current_module.clone(),
+            node.value.node.id,
+            downcast.node.expr.node.id,
+            hole,
+            target.clone(),
+            binding.mutable,
+            tc.source_span(node.value.span),
+        );
+    }
+
+    let then_expected = expected.clone();
+    check_if_let_branches(node, expected, tc, |tc| {
+        tc.push_scope();
+        let handle = tc.type_handle(&target);
+        if binding.mutable {
+            let alias = place::AliasTarget {
+                access: PlaceAccess::Mutable,
+                identity: source.value.identity.clone(),
+                facts: source.value.facts.clone(),
+                accepts_extern_any: source.accepts_extern_any(),
+            };
+            tc.define_downcast_alias_from_handle(binding.name, &handle, alias);
+            tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
+                identity: source.value.identity.clone(),
+                allowed: binding.name,
+            });
+        } else {
+            tc.define_pattern_binding_from_handle(binding.name, &handle, false);
+        }
+
+        let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
+        if binding.mutable {
+            tc.active_mut_downcast_roots.pop();
+        }
+        tc.pop_scope();
+        then
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ExactDowncastBinding {
+    name: Ident,
+    mutable: bool,
+}
+
+fn exact_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<ExactDowncastBinding> {
+    match node.pattern.node {
+        Pattern::Ident(name) => Some(ExactDowncastBinding {
+            name,
+            mutable: matches!(node.head, PatternHead::Var),
+        }),
+        _ => {
+            tc.push_error(TypeError::CompileError {
+                message: "exact downcast currently binds a single identifier".to_string(),
+                span: tc.error_span(node.pattern.span),
+            });
+            None
+        }
+    }
+}
+
+fn runtime_downcast_target(tc: &mut TypeChecker, target: Type, span: Span) -> Option<Type> {
+    match &target {
+        Type::Dyn(_) => {
+            tc.push_error(TypeError::CompileError {
+                message: "downcast tests the stored concrete type; use a wider dynamic type at the conversion site instead of downcasting to another contract".to_string(),
+                span: tc.error_span(span),
+            });
+            return None;
+        }
+        Type::Infer => return None,
+        _ => {}
+    }
+    let facts = type_closure_facts(&target);
+    if facts.first_unresolved.is_some()
+        || facts.infer.contains_type
+        || facts.infer.contains_return
+        || facts.contains_unresolved_const
+        || type_depends_on_generics(&target)
+    {
+        tc.push_error(TypeError::CompileError {
+            message: "exact downcast target must be a fully concrete runtime-identifiable type"
+                .to_string(),
+            span: tc.error_span(span),
+        });
+        return None;
+    }
+    if tc.decls.key_for_type(&target).is_some() {
+        Some(target)
+    } else {
+        tc.push_error(TypeError::CompileError {
+            message: "exact downcast target must be a concrete nominal type".to_string(),
+            span: tc.error_span(span),
+        });
+        None
+    }
+}
+
+fn check_downcast_branches(
+    node: &IfLet,
+    binding: Option<ExactDowncastBinding>,
+    binding_ty: Type,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let then_expected = expected.clone();
+    check_if_let_branches(node, expected, tc, |tc| {
+        tc.push_scope();
+        if let Some(binding) = binding {
+            let handle = tc.type_handle(&binding_ty);
+            tc.define_pattern_binding_from_handle(binding.name, &handle, binding.mutable);
+        }
+        let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
+        tc.pop_scope();
+        then
+    })
+}
+
+fn check_if_let_branches(
+    node: &IfLet,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+    then: impl FnOnce(&mut TypeChecker) -> CheckedType,
+) -> CheckedType {
+    let Some(else_block) = &node.else_block else {
+        closure::check_closure_flow_branch(tc, then);
+        return checked_void(tc);
+    };
+    let (then, else_checked) = closure::check_closure_flow_branches(tc, then, |tc| {
+        check_block_checked_with_hint(else_block, expected, tc)
+    });
+    join_checked(
+        then,
+        node.then_block.span,
+        else_checked,
+        else_block.span,
+        tc,
+    )
+}
+
+pub(super) fn check_if_let_checked_with_hint(
+    if_let_node: &IfLetNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let node = &if_let_node.node;
+    if let ExprKind::ExactDowncast(downcast) = &node.value.node.kind {
+        return check_if_let_exact_downcast(if_let_node, downcast, expected, tc);
+    }
+
+    let mode = mode_for_head(node.head);
+    let value = check_pattern_scrutinee(&node.value, mode, tc);
+    let then_expected = expected.clone();
+    check_if_let_branches(node, expected, tc, |tc| {
+        tc.push_scope();
+        check_place_at(
+            &node.pattern,
+            value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
+            mode,
+            node.value.node.id,
+            PatternContext::IfLet,
+            tc,
+        );
+        let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
+        tc.pop_scope();
+        then
+    })
 }

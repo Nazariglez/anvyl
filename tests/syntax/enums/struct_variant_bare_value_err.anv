@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: variant 'Event.Move' is not a unit variant
+
+enum Event { Move { dx: int, dy: int } }
+
+fn main() {
+    let x = Event.Move;
+}

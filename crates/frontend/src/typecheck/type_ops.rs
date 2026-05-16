@@ -349,3 +349,85 @@ pub(crate) trait TypeVisitor {
         false
     }
 }
+
+pub(super) fn type_contains_dyn_value(
+    ty: &Type,
+    decls: &super::DeclarationIndex,
+    seen: &mut std::collections::HashSet<super::NominalKey>,
+) -> bool {
+    match ty {
+        Type::Dyn(_) => true,
+        Type::Tuple(elems) => elems
+            .iter()
+            .any(|elem| type_contains_dyn_value(elem, decls, seen)),
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+            type_contains_dyn_value(elem, decls, seen)
+        }
+        Type::Map { key, value } => {
+            type_contains_dyn_value(key, decls, seen) || type_contains_dyn_value(value, decls, seen)
+        }
+        Type::Nominal(_) => nominal_contains_dyn_value(ty, decls, seen),
+        Type::Func { .. }
+        | Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Var(_)
+        | Type::UnresolvedName(_)
+        | Type::UnresolvedNominal { .. } => false,
+    }
+}
+
+fn nominal_contains_dyn_value(
+    ty: &Type,
+    decls: &super::DeclarationIndex,
+    seen: &mut std::collections::HashSet<super::NominalKey>,
+) -> bool {
+    let Some(key) = decls.key_for_type(ty) else {
+        return false;
+    };
+    if !seen.insert(key.clone()) {
+        return false;
+    }
+    let contains = match key.kind {
+        super::NominalKind::Struct | super::NominalKind::DataRef => {
+            decls.aggregate(&key).is_some_and(|agg| {
+                agg.fields.values().any(|field| {
+                    let field_ty = super::substitute_aggregate_member(ty, &agg.generics, &field.ty);
+                    type_contains_dyn_value(&field_ty, decls, seen)
+                })
+            })
+        }
+        super::NominalKind::Enum => decls.enum_schema(&key).is_some_and(|schema| {
+            let Some(nominal) = ty.as_nominal() else {
+                return false;
+            };
+            let args = super::GenericArgs {
+                type_args: nominal.type_args.clone(),
+                const_args: super::ConstTerm::from_args(&nominal.const_args),
+            };
+            let (type_subst, const_subst) = schema.generics.substitutions(&args);
+            schema
+                .variants
+                .values()
+                .any(|variant| match &variant.payload {
+                    super::VariantPayload::Unit => false,
+                    super::VariantPayload::Tuple(types) => types.iter().any(|ty| {
+                        let ty = super::substitute(ty, &type_subst, &const_subst);
+                        type_contains_dyn_value(&ty, decls, seen)
+                    }),
+                    super::VariantPayload::Struct(fields) => fields.values().any(|field| {
+                        let ty = super::substitute(&field.ty, &type_subst, &const_subst);
+                        type_contains_dyn_value(&ty, decls, seen)
+                    }),
+                })
+        }),
+        super::NominalKind::Extern => false,
+    };
+    seen.remove(&key);
+    contains
+}

@@ -1,10 +1,5 @@
-use super::support::{assert_deprecated_warning, check, check_named, errors};
-use crate::{
-    ast::Ident,
-    typecheck::{
-        DeprecatedUseKind, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect, TypeError,
-    },
-};
+use super::support::{check, check_named};
+use crate::typecheck::{GlobalAccessFact, GlobalAccessMode, GlobalInitEffect};
 
 fn modes(
     result: &super::support::TypecheckTestResult,
@@ -124,36 +119,4 @@ fn records_qualified_global_root_assignment() {
             ..
         }]
     ));
-}
-
-#[test]
-fn infers_forward_global_reference() {
-    check(
-        "lazy let A = B;
-         lazy let B = 1;
-         fn main() { let x: int = A; }",
-    )
-    .expect("typecheck");
-}
-
-#[test]
-fn rejects_runtime_global_in_const_position() {
-    let errors = errors("lazy let Size = 4; fn main() { let xs = [0; Size]; }");
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::RuntimeGlobalInConstPosition { global, .. }
-            if global.name == Ident::new("Size")
-    )));
-}
-
-#[test]
-fn warns_on_deprecated_global_read() {
-    let result = check(
-        "@deprecated(\"use Other\")
-         lazy let Old = 1;
-         fn main() { let x = Old; }",
-    )
-    .expect("typecheck");
-
-    assert_deprecated_warning(&result, DeprecatedUseKind::Global, "Old", Some("use Other"));
 }

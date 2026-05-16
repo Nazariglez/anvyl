@@ -1,20 +1,65 @@
 use std::collections::HashMap;
 
 use super::{
-    ArgumentProjectionMap, CallMap, ContractWitnessMap, DynCallMap, DynConversionMap,
-    DynDowncastMap, DynWeakeningMap, ExternUseMap, GlobalAccessMap, MemberPathMap, TypecheckFacts,
-    const_term::ConstTerm, decls::CallableId, type_ops::TypeFolder,
+    ArgumentProjectionMap, CallMap, CallableRef, CallableTemplate, ContractWitnessMap, DynCallMap,
+    DynConversionMap, DynDowncastMap, DynWeakeningMap, ExternUseMap, GenericTypeContext,
+    GlobalAccessMap, MemberPathMap, TypeChecker, TypecheckFacts,
+    const_term::ConstTerm,
+    decls::CallableId,
+    infer::{GenericSolverSeeds, Solver},
+    semantic_use::map_delta,
+    type_ops::TypeFolder,
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef, ExprId, GenericArg, Type,
-        TypeParam, TypeVarId,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef, ExprId, GenericArg,
+        Ident, Type, TypeParam, TypeVarId,
     },
     span::Span,
 };
 
 pub(crate) type TypeSubst = HashMap<TypeVarId, Type>;
 pub(crate) type ConstSubst = HashMap<ConstParamId, ConstTerm>;
+
+struct CheckedSubstituter<'a, 'tc> {
+    tc: &'tc mut TypeChecker,
+    span: Span,
+    types: &'a TypeSubst,
+    consts: &'a ConstSubst,
+}
+
+impl TypeFolder for CheckedSubstituter<'_, '_> {
+    fn fold_var(&mut self, id: TypeVarId) -> Type {
+        self.types.get(&id).cloned().unwrap_or(Type::Var(id))
+    }
+
+    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
+        match arg {
+            ConstArg::Param(id) => self
+                .consts
+                .get(id)
+                .and_then(ConstTerm::to_arg_no_infer)
+                .unwrap_or_else(|| arg.clone()),
+            ConstArg::Value(_) | ConstArg::Name(_) => arg.clone(),
+        }
+    }
+
+    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
+        match len {
+            ArrayLen::Param(id) => match self.consts.get(&id).cloned() {
+                Some(term) => self
+                    .tc
+                    .array_len_from_term(term, self.span)
+                    .unwrap_or(ArrayLen::Infer),
+                None => ArrayLen::Param(id),
+            },
+            other => self
+                .tc
+                .array_len_from_term(ConstTerm::from_array_len(other), self.span)
+                .unwrap_or(ArrayLen::Infer),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ArityError {
@@ -74,6 +119,13 @@ pub(crate) struct SpecializationKey {
     pub(crate) args: GenericArgs,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct GenericOwnerFrame {
+    pub(super) params: GenericParams,
+    pub(super) args: GenericArgs,
+    pub(super) generics: GenericTypeContext,
+}
+
 pub(crate) type SpecializedBodyTypes = HashMap<ExprId, (Span, Type)>;
 
 #[derive(Clone, Default)]
@@ -102,6 +154,222 @@ pub(crate) struct SpecializedBody {
 pub(crate) enum SpecializationState {
     InProgress,
     Done(Box<SpecializedBody>),
+}
+
+pub(super) fn combined_callable_params(callee: &CallableRef) -> GenericParams {
+    let mut params = callee.def.sig.owner_generics.clone();
+    params
+        .type_params
+        .extend(callee.def.sig.generics.type_params.clone());
+    params
+        .const_params
+        .extend(callee.def.sig.generics.const_params.clone());
+    params
+}
+
+fn const_param_bindings(params: &GenericParams, args: &GenericArgs) -> Vec<(Ident, ConstValue)> {
+    params
+        .const_params
+        .iter()
+        .zip(&args.const_args)
+        .filter_map(|(param, term)| match term {
+            ConstTerm::Value(value) => Some((param.name, value.clone())),
+            ConstTerm::Name(_)
+            | ConstTerm::Param(_)
+            | ConstTerm::ArrayInfer
+            | ConstTerm::Infer(_) => None,
+        })
+        .collect()
+}
+
+pub(super) fn callable_const_bindings(
+    owner_params: &GenericParams,
+    owner_args: &GenericArgs,
+    callable_params: &GenericParams,
+    callable_args: &GenericArgs,
+) -> Vec<(Ident, ConstValue)> {
+    let mut bindings = const_param_bindings(owner_params, owner_args);
+    bindings.extend(const_param_bindings(callable_params, callable_args));
+    bindings
+}
+
+pub(super) fn specialized_body_facts(
+    old: &SpecializedBodyFacts,
+    current: &SpecializedBodyFacts,
+) -> SpecializedBodyFacts {
+    SpecializedBodyFacts {
+        types: map_delta(&old.types, &current.types),
+        calls: map_delta(&old.calls, &current.calls),
+        extern_uses: map_delta(&old.extern_uses, &current.extern_uses),
+        member_paths: map_delta(&old.member_paths, &current.member_paths),
+        argument_projections: map_delta(&old.argument_projections, &current.argument_projections),
+        contract_witnesses: map_delta(&old.contract_witnesses, &current.contract_witnesses),
+        dyn_conversions: map_delta(&old.dyn_conversions, &current.dyn_conversions),
+        dyn_weakenings: map_delta(&old.dyn_weakenings, &current.dyn_weakenings),
+        dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
+        dyn_downcasts: map_delta(&old.dyn_downcasts, &current.dyn_downcasts),
+        global_accesses: map_delta(&old.global_accesses, &current.global_accesses),
+        closure: current.closure.delta_since(&old.closure),
+    }
+}
+
+pub(super) fn specialization_key(id: CallableId, args: &GenericArgs) -> SpecializationKey {
+    SpecializationKey {
+        target: id,
+        args: args.clone(),
+    }
+}
+
+pub(super) fn check_with_specialization(
+    key: SpecializationKey,
+    type_subst: TypeSubst,
+    const_subst: ConstSubst,
+    owner_frame: GenericOwnerFrame,
+    tc: &mut TypeChecker,
+    check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
+) -> Option<Type> {
+    tc.solve_constraints();
+    let old_facts = tc.specialization_facts();
+    tc.store_specialization(key.clone(), SpecializationState::InProgress);
+    tc.push_type_subst(type_subst);
+    tc.push_const_subst(const_subst);
+    tc.push_generic_context(owner_frame.generics.clone());
+    tc.push_generic_owner_frame(owner_frame);
+    let inferred_ret = check_body(tc);
+    tc.solve_constraints();
+    tc.pop_generic_owner_frame();
+    tc.pop_generic_context();
+    tc.pop_const_subst();
+    tc.pop_type_subst();
+    tc.store_specialization(
+        key,
+        SpecializationState::Done(Box::new(SpecializedBody {
+            facts: specialized_body_facts(&old_facts, &tc.specialization_facts()),
+            inferred_ret: inferred_ret.clone(),
+        })),
+    );
+    inferred_ret
+}
+
+impl TypeChecker {
+    pub(super) fn substitute_checked(
+        &mut self,
+        ty: &Type,
+        types: &TypeSubst,
+        consts: &ConstSubst,
+        span: Span,
+    ) -> Type {
+        CheckedSubstituter {
+            tc: self,
+            span,
+            types,
+            consts,
+        }
+        .fold_type(ty)
+    }
+
+    pub(super) fn push_generic_context(&mut self, generics: GenericTypeContext) {
+        self.generic_contexts.push(generics);
+    }
+
+    pub(super) fn pop_generic_context(&mut self) {
+        self.generic_contexts.pop();
+    }
+
+    pub(super) fn push_generic_owner_frame(&mut self, frame: GenericOwnerFrame) {
+        self.generic_owner_frames.push(frame);
+    }
+
+    pub(super) fn pop_generic_owner_frame(&mut self) {
+        self.generic_owner_frames.pop();
+    }
+
+    pub(super) fn visible_generic_owner(&self) -> GenericOwnerFrame {
+        self.generic_owner_frames
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn substituted_type_param(&self, name: Ident) -> Option<Type> {
+        let id = self
+            .generic_contexts
+            .iter()
+            .rev()
+            .find_map(|ctx| ctx.type_param(name))?;
+        self.type_substs
+            .iter()
+            .rev()
+            .find_map(|subst| subst.get(&id).cloned())
+            .or(Some(Type::Var(id)))
+    }
+
+    pub(super) fn store_callable_template(&mut self, id: CallableId, template: CallableTemplate) {
+        self.callable_templates.insert(id, template);
+    }
+
+    pub(super) fn callable_template(&self, id: &CallableId) -> Option<&CallableTemplate> {
+        self.callable_templates.get(id)
+    }
+
+    pub(super) fn specialization(&self, key: &SpecializationKey) -> Option<&SpecializationState> {
+        self.specializations.get(key)
+    }
+
+    pub(super) fn store_specialization(
+        &mut self,
+        key: SpecializationKey,
+        state: SpecializationState,
+    ) {
+        self.specializations.insert(key, state);
+    }
+
+    pub(super) fn closure_fact_snapshot(&self) -> TypecheckFacts {
+        self.closure
+            .fact_snapshot(|id| self.solver.local_type_to_type(id))
+    }
+
+    pub(super) fn specialization_facts(&self) -> SpecializedBodyFacts {
+        SpecializedBodyFacts {
+            types: self.expr_types(),
+            calls: self.calls.clone(),
+            extern_uses: self.extern_uses.clone(),
+            member_paths: self.member_paths.clone(),
+            argument_projections: self.argument_projections.clone(),
+            contract_witnesses: self.contract_witnesses.clone(),
+            dyn_conversions: self.dyn_conversions.clone(),
+            dyn_weakenings: self.dyn_weakenings.clone(),
+            dyn_calls: self.dyn_calls.clone(),
+            dyn_downcasts: self.dyn_downcasts.clone(),
+            global_accesses: self.global_accesses.clone(),
+            closure: self.closure_fact_snapshot(),
+        }
+    }
+
+    pub(super) fn restore_specialization(&mut self, facts: SpecializedBodyFacts) {
+        for (id, (span, ty)) in facts.types {
+            self.set_type(id, ty, span);
+        }
+        self.calls.extend(facts.calls);
+        self.extern_uses.extend(facts.extern_uses);
+        for fact in facts.member_paths.into_values() {
+            self.record_member_path(fact);
+        }
+        for fact in facts.argument_projections.into_values() {
+            self.record_argument_projection(fact);
+        }
+        for fact in facts.contract_witnesses.into_values() {
+            self.next_witness_id = self.next_witness_id.max(fact.id.0 + 1);
+            self.witness_keys.insert(fact.key.clone(), fact.id);
+            self.contract_witnesses.insert(fact.id, fact);
+        }
+        self.dyn_conversions.extend(facts.dyn_conversions);
+        self.dyn_weakenings.extend(facts.dyn_weakenings);
+        self.dyn_calls.extend(facts.dyn_calls);
+        self.dyn_downcasts.extend(facts.dyn_downcasts);
+        self.global_accesses.extend(facts.global_accesses);
+        self.closure.extend_facts(facts.closure);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,10 +582,133 @@ pub(crate) fn substitute(ty: &Type, ts: &TypeSubst, cs: &ConstSubst) -> Type {
     .fold_type(ty)
 }
 
+pub(crate) fn same_extend_target(
+    a: &Type,
+    a_generics: &GenericParams,
+    b: &Type,
+    b_generics: &GenericParams,
+) -> bool {
+    let Some(a_template) = try_generic_template_type(a, a_generics) else {
+        return false;
+    };
+    let Some(b_template) = try_generic_template_type(b, b_generics) else {
+        return false;
+    };
+    match_generic_template_args(a_generics, &a_template, &b_template).is_some()
+        && match_generic_template_args(b_generics, &b_template, &a_template).is_some()
+}
+
+struct GenericTemplate {
+    generics: GenericTypeContext,
+}
+
+impl TypeFolder for GenericTemplate {
+    fn fold_unresolved_name(&mut self, name: Ident) -> Type {
+        self.generics
+            .type_param(name)
+            .map_or(Type::UnresolvedName(name), Type::Var)
+    }
+
+    fn fold_unresolved_nominal(
+        &mut self,
+        qualifier: Option<Ident>,
+        name: Ident,
+        generic_args: &[GenericArg],
+    ) -> Type {
+        if qualifier.is_none()
+            && generic_args.is_empty()
+            && let Some(id) = self.generics.type_param(name)
+        {
+            return Type::Var(id);
+        }
+        self.fold_unresolved_nominal_default(qualifier, name, generic_args)
+    }
+
+    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
+        match arg {
+            ConstArg::Name(name) => self
+                .generics
+                .const_param(*name)
+                .map_or_else(|| arg.clone(), ConstArg::Param),
+            ConstArg::Value(_) | ConstArg::Param(_) => arg.clone(),
+        }
+    }
+
+    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
+        match len {
+            ArrayLen::Named(name) => self
+                .generics
+                .const_param(name)
+                .map_or(ArrayLen::Named(name), ArrayLen::Param),
+            other => other,
+        }
+    }
+}
+
+type GenericTemplateMatch = Result<GenericArgs, Vec<Ident>>;
+
+pub(crate) fn match_generic_template_args(
+    generics: &GenericParams,
+    template: &Type,
+    concrete: &Type,
+) -> Option<GenericTemplateMatch> {
+    match_cast_conversion(generics, template, concrete, template, concrete)
+}
+
+pub(crate) fn match_cast_conversion(
+    generics: &GenericParams,
+    source_template: &Type,
+    source: &Type,
+    target_template: &Type,
+    target: &Type,
+) -> Option<GenericTemplateMatch> {
+    let span = None;
+    if generics.is_empty() {
+        return (source_template == source && target_template == target)
+            .then(|| Ok(GenericArgs::default()));
+    }
+
+    let mut solver = Solver::default();
+    let seeds = GenericSolverSeeds::default();
+    let vars = solver.generic_solver_vars(generics, &seeds, span);
+    let source_template = solver.instantiate_generic_type(source_template, &vars);
+    let target_template = solver.instantiate_generic_type(target_template, &vars);
+    let source = solver.concrete_type(source);
+    let target = solver.concrete_type(target);
+    solver.add_handle_equal(span, source_template, source);
+    solver.add_handle_equal(span, target_template, target);
+    if !solver.solve_pending().is_empty() {
+        return None;
+    }
+
+    Some(solver.finalize_generic_args(generics, &vars))
+}
+
+fn try_generic_template_type(ty: &Type, generics: &GenericParams) -> Option<Type> {
+    let generics =
+        GenericTypeContext::try_from_params(&generics.type_params, &generics.const_params).ok()?;
+    Some(GenericTemplate { generics }.fold_type(ty))
+}
+
+pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type {
+    GenericTemplate {
+        generics: GenericTypeContext::try_from_params(
+            &generics.type_params,
+            &generics.const_params,
+        )
+        .expect("generic_template_type requires validated generic params"),
+    }
+    .fold_type(ty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{ConstValue, EscapeMode, FuncParam, Ident, NominalKind};
+
+    fn ident(name: &str) -> Ident {
+        Ident::new(name)
+    }
 
     fn tv(id: u32) -> TypeVarId {
         TypeVarId(id)
@@ -610,5 +1001,31 @@ mod tests {
         let cap = struct_const("FixedBuf", vec![Type::Var(tv(0))], vec![carg(5)]);
         let ints = struct_const("FixedBuf", vec![Type::Int], vec![ConstArg::Param(cp(0))]);
         assert_eq!(compare_specificity(&cap, &ints), Specificity::Incomparable);
+    }
+    #[test]
+    fn generic_template_nominal_args() {
+        let generics = GenericParams {
+            type_params: vec![TypeParam {
+                name: ident("T"),
+                id: TypeVarId(0),
+                bounds: vec![],
+            }],
+            const_params: vec![],
+        };
+        let ty = Type::UnresolvedNominal {
+            qualifier: None,
+            name: ident("Foo"),
+            generic_args: vec![GenericArg::Type(Type::UnresolvedName(ident("T")))],
+        };
+        let result = generic_template_type(&ty, &generics);
+
+        assert_eq!(
+            result,
+            Type::UnresolvedNominal {
+                qualifier: None,
+                name: ident("Foo"),
+                generic_args: vec![GenericArg::Type(Type::Var(TypeVarId(0)))],
+            }
+        );
     }
 }

@@ -1,31 +1,8 @@
 use super::support::{assert_err, assert_err_count, assert_single_error, assert_ty, errors};
-use crate::{
-    ast::{Ident, Type},
-    typecheck::{TypeError, VariantShape},
-};
+use crate::{ast::Type, typecheck::TypeError};
 
 mod binding_patterns {
     use super::*;
-
-    #[test]
-    fn let_tuple_ok() {
-        assert_ty("fn main() { let (x, y) = (1, true); x; }", Type::Int);
-    }
-
-    #[test]
-    fn let_tuple_yields_bool() {
-        assert_ty("fn main() { let (x, y) = (1, true); y; }", Type::Bool);
-    }
-
-    #[test]
-    fn let_tuple_arity_err() {
-        assert_err("fn main() { let (x, y) = (1, 2, 3); }");
-    }
-
-    #[test]
-    fn let_tuple_non_tuple_err() {
-        assert_err("fn main() { let (x, y) = 1; }");
-    }
 
     #[test]
     fn let_literal_int_ok() {
@@ -52,16 +29,6 @@ mod for_patterns {
     use super::*;
 
     #[test]
-    fn for_wildcard() {
-        assert_err_count("fn main(xs: [int]) { for _ in xs {} }", 0);
-    }
-
-    #[test]
-    fn for_ident() {
-        assert_err_count("fn main(xs: [int]) { for x in xs {} }", 0);
-    }
-
-    #[test]
     fn for_tuple_non_tuple_err() {
         assert_err("fn main(x: int) { for (a, b) in x {} }");
     }
@@ -76,23 +43,8 @@ mod while_let {
     }
 
     #[test]
-    fn ident_binds() {
-        assert_err_count("fn main() { while let x = true { let y = x; } }", 0);
-    }
-
-    #[test]
     fn scope() {
         assert_err("fn main() { while let x = true {} x; }");
-    }
-
-    #[test]
-    fn break_ok() {
-        assert_err_count("fn main() { while let true = true { break; } }", 0);
-    }
-
-    #[test]
-    fn continue_ok() {
-        assert_err_count("fn main() { while let true = true { continue; } }", 0);
     }
 
     #[test]
@@ -131,39 +83,8 @@ mod if_let {
     }
 
     #[test]
-    fn tuple_ok() {
-        assert_ty(
-            "fn main() { if let (a, b) = (1, true) { a } else { 0 }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn tuple_arity_err() {
-        assert_err("fn main() { if let (a, b) = (1, 2, 3) {} }");
-    }
-
-    #[test]
     fn non_tuple_err() {
         assert_err("fn main() { if let (a, b) = 1 {} }");
-    }
-
-    #[test]
-    fn branch_match() {
-        assert_ty(
-            "fn main() { if let true = true { 1 } else { 2 }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn branch_mismatch() {
-        assert_err("fn main() { if let true = true { 1 } else { \"hi\" }; }");
-    }
-
-    #[test]
-    fn no_else_void() {
-        assert_ty("fn main() { if let true = true { 1 }; }", Type::Void);
     }
 }
 
@@ -184,11 +105,6 @@ mod match_stmt {
     }
 
     #[test]
-    fn wildcard() {
-        assert_ty("fn main() { let _ = match 1 { _ => 42 }; }", Type::Int);
-    }
-
-    #[test]
     fn ident_binds() {
         assert_ty("fn main() { let _ = match 1 { x => x }; }", Type::Int);
     }
@@ -202,41 +118,11 @@ mod match_stmt {
     }
 
     #[test]
-    fn tuple_ok() {
-        assert_ty(
-            "fn main() { let _ = match (1, true) { (a, b) => a }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
     fn tuple_false_ok() {
         assert_ty(
             "fn main() { let _ = match (1, false) { (a, false) => a }; }",
             Type::Int,
         );
-    }
-
-    #[test]
-    fn bool_exhaustive() {
-        assert_ty(
-            "fn main() { let _ = match true { true => 1, false => 0 }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn bool_non_exhaustive() {
-        assert_single_error("fn main() { match true { true => {} } }", |err| {
-            matches!(err, TypeError::NonExhaustiveMatch { .. })
-        });
-    }
-
-    #[test]
-    fn int_requires_catch_all() {
-        assert_single_error("fn main() { match 1 { 1 => {} } }", |err| {
-            matches!(err, TypeError::NonExhaustiveMatch { .. })
-        });
     }
 
     #[test]
@@ -254,40 +140,10 @@ mod match_stmt {
     }
 
     #[test]
-    fn struct_scrutinee_rejected() {
-        assert_single_error(
-            "struct Point { x: int } fn main() { let p = Point { x: 1 }; match p { _ => {} } }",
-            |err| matches!(err, TypeError::UnsupportedMatchScrutinee { .. }),
-        );
-    }
-
-    #[test]
-    fn invalid_literal_pattern() {
-        assert_single_error("fn main() { match 1 { true => {}, _ => {} } }", |err| {
-            matches!(err, TypeError::InvalidLiteralPattern { .. })
-        });
-    }
-
-    #[test]
-    fn optional_on_plain_type() {
-        assert_single_error("fn main() { match 1 { x? => {}, _ => {} } }", |err| {
-            matches!(err, TypeError::OptionalPatternOnNonOptional { .. })
-        });
-    }
-
-    #[test]
     fn if_let_bare_optional() {
         assert_single_error("fn main() { let x: int? = nil; if let v = x {} }", |err| {
             matches!(err, TypeError::RequiresUnwrappingPattern { .. })
         });
-    }
-
-    #[test]
-    fn let_else_binds() {
-        assert_ty(
-            "enum Option<T> { Some(T), None } fn main() { let opt: int? = 1; let Option.Some(x) = opt else { return; } x; }",
-            Type::Int,
-        );
     }
 
     #[test]
@@ -296,13 +152,6 @@ mod match_stmt {
             "fn main() { let x: int? = 1; let v? = x else { { return; } } }",
             0,
         );
-    }
-
-    #[test]
-    fn let_else_irrefutable() {
-        assert_single_error("fn main() { let x = 1 else { return; } }", |err| {
-            matches!(err, TypeError::IrrefutableLetElse { .. })
-        });
     }
 
     #[test]
@@ -318,21 +167,6 @@ mod match_stmt {
     }
 
     #[test]
-    fn nested_optional() {
-        let errors = errors("fn main() { let x: int? = nil; match x { (v?)? => {} } }");
-        assert!(
-            errors
-                .iter()
-                .any(|err| matches!(err, TypeError::NestedOptionalPattern { .. }))
-        );
-    }
-
-    #[test]
-    fn tuple_arity_err() {
-        assert_err("fn main() { let _ = match (1, 2, 3) { (a, b) => a }; }");
-    }
-
-    #[test]
     fn non_tuple_pattern() {
         assert_err("fn main() { let _ = match 1 { (a, b) => a }; }");
     }
@@ -340,11 +174,6 @@ mod match_stmt {
     #[test]
     fn arm_scope() {
         assert_err("fn main() { let _ = match 1 { x => 1 }; x; }");
-    }
-
-    #[test]
-    fn arm_type_mismatch() {
-        assert_err("fn main() { let _ = match 1 { 1 => 1, 2 => \"hi\" }; }");
     }
 
     #[test]
@@ -367,77 +196,6 @@ mod match_stmt {
     #[test]
     fn range_unsupported() {
         assert_err("fn main() { let _ = match 1 { 1..5 => 1 }; }");
-    }
-
-    #[test]
-    fn enum_unit() {
-        assert_ty(
-            "enum State { A, B } fn main() { let s = State.A; match s { State.A => 1, State.B => 2 }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn inferred_enum_unit() {
-        assert_ty(
-            "enum State { A, B } fn main() { let s = State.A; match s { .A => 1, .B => 2 }; }",
-            Type::Int,
-        );
-    }
-}
-
-mod or_patterns {
-    use super::*;
-
-    #[test]
-    fn enum_tuple_alias_alternatives() {
-        assert_ty(
-            "enum E { A(int), B(int) } fn main() { var e = E.A(1); match var e { E.A(x) | E.B(x) => x }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn swapped_tuple_aliases() {
-        assert_err_count(
-            "fn touch(var a: int, var b: int) {} fn main() { var pair = (1, 2); match var pair { (x, y) | (y, x) => { touch(x, y); }, } }",
-            0,
-        );
-    }
-
-    #[test]
-    fn nested_alias_alternatives() {
-        assert_err_count(
-            "enum E { A((int, int)), B((int, int)) } fn main() { var e = E.A((1, 2)); match var e { E.A((x, _)) | E.B((_, x)) => {}, } }",
-            0,
-        );
-    }
-
-    #[test]
-    fn binding_name_mismatch() {
-        assert_single_error(
-            "enum E { A(int), B(int) } fn main() { let e = E.A(1); match e { E.A(x) | E.B(y) => {}, } }",
-            |err| matches!(err, TypeError::OrPatternBindingMismatch { .. }),
-        );
-    }
-
-    #[test]
-    fn binding_type_mismatch() {
-        assert_single_error(
-            "enum E { A(int), B(string) } fn main() { let e = E.A(1); match e { E.A(x) | E.B(x) => {}, } }",
-            |err| matches!(err, TypeError::OrPatternBindingTypeMismatch { .. }),
-        );
-    }
-
-    #[test]
-    fn duplicate_binding_in_alternative() {
-        let errors =
-            errors("fn main() { let pair = (1, 2); match pair { (x, x) | (_, _) => {}, } }");
-        assert!(
-            errors
-                .iter()
-                .any(|err| matches!(err, TypeError::DuplicateName { .. }))
-        );
     }
 }
 
@@ -466,50 +224,10 @@ mod enum_unit_patterns {
             matches!(err, TypeError::CannotInferEnum { .. })
         });
     }
-
-    #[test]
-    fn wrong_owner() {
-        assert_single_error(
-            "enum A { X } enum B { X } fn main() { let b = B.X; match b { A.X => 1 }; }",
-            |err| matches!(err, TypeError::EnumPatternTypeMismatch { .. }),
-        );
-    }
-
-    #[test]
-    fn unknown_variant() {
-        assert_single_error(
-            "enum State { A } fn main() { let s = State.A; match s { State.B => 1 }; }",
-            |err| matches!(err, TypeError::UnknownEnumVariant { variant, .. } if *variant == Ident::new("B")),
-        );
-    }
 }
 
 mod enum_payload_patterns {
     use super::*;
-
-    #[test]
-    fn tuple_binds_payload() {
-        assert_ty(
-            "enum Message { Data(int), Empty } fn main() { let m = Message.Data(1); match m { Message.Data(x) => x, Message.Empty => 0 }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn generic_tuple_payload() {
-        assert_ty(
-            "enum Box<T> { Value(T), Empty } fn main() { let b: Box<string> = Box.Value(\"x\"); match b { Box.Value(x) => x, Box.Empty => \"\" }; }",
-            Type::String,
-        );
-    }
-
-    #[test]
-    fn nested_tuple() {
-        assert_ty(
-            "enum Option<T> { Some(T), None } enum Wrap { Value(Option<int>) } fn main() { let w = Wrap.Value(Option.Some(1)); match w { Wrap.Value(Option.Some(x)) => x, Wrap.Value(Option.None) => 0 }; }",
-            Type::Int,
-        );
-    }
 
     #[test]
     fn tuple_arity() {
@@ -529,66 +247,10 @@ mod enum_payload_patterns {
     }
 
     #[test]
-    fn tuple_on_unit() {
-        assert_single_error(
-            "enum Message { Empty } fn main() { let m = Message.Empty; match m { Message.Empty(x) => x }; }",
-            |err| {
-                matches!(
-                    err,
-                    TypeError::EnumVariantShapeMismatch {
-                        expected: VariantShape::Tuple,
-                        ..
-                    }
-                )
-            },
-        );
-    }
-
-    #[test]
-    fn struct_pattern_binds_fields() {
-        assert_ty(
-            "enum Event { Move { dx: int, dy: int }, Stop } fn main() { let e = Event.Move { dx: 1, dy: 2 }; match e { Event.Move { dx, dy } => dx + dy, Event.Stop => 0 }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
     fn struct_pattern_explicit_binding() {
         assert_ty(
             "enum Event { Move { dx: int, dy: int }, Stop } fn main() { let e = Event.Move { dx: 1, dy: 2 }; match e { Event.Move { dx: x, dy: y } => x + y, Event.Stop => 0 }; }",
             Type::Int,
-        );
-    }
-
-    #[test]
-    fn struct_pattern_rest() {
-        assert_ty(
-            "enum Event { Move { dx: int, dy: int }, Stop } fn main() { let e = Event.Move { dx: 1, dy: 2 }; match e { Event.Move { dx, .. } => dx, Event.Stop => 0 }; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn struct_missing_field() {
-        assert_single_error(
-            "enum Event { Move { dx: int, dy: int } } fn main() { let e = Event.Move { dx: 1, dy: 2 }; match e { Event.Move { dx } => dx }; }",
-            |err| matches!(err, TypeError::MissingVariantField { field, .. } if *field == Ident::new("dy")),
-        );
-    }
-
-    #[test]
-    fn enum_non_exhaustive() {
-        assert_single_error(
-            "enum Color { Red, Green } fn main() { let c = Color.Red; match c { Color.Red => {} } }",
-            |err| matches!(err, TypeError::NonExhaustiveMatch { .. }),
-        );
-    }
-
-    #[test]
-    fn option_none_non_exhaustive() {
-        assert_single_error(
-            "enum Option<T> { Some(T), None } fn main() { let x: int? = nil; match x { Option.None => {} } }",
-            |err| matches!(err, TypeError::NonExhaustiveMatch { .. }),
         );
     }
 }

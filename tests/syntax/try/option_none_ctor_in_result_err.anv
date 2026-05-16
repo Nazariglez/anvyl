@@ -4,6 +4,6 @@
 // @frontend: new
 
 fn bad() -> Result<int, string> {
-    let value: int = try Option.None;
+    let value: int = try <Option<int>>.None;
     Result.Ok(value)
 }

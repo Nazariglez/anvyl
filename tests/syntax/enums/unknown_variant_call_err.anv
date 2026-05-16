@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variant 'Yellow' for enum 'Color'
+// @contains: Unknown variable 'missing'
+
+enum Color { Red }
+
+fn main() {
+    Color.Yellow(missing);
+}

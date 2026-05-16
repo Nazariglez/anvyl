@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: variant 'Message.Data' is not a unit variant
+
+enum Message { Data(int) }
+
+fn main() {
+    let msg = Message.Data(1);
+    match msg {
+        Message.Data => {}
+    }
+}

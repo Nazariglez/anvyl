@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: wrong number of type parameters: expected 0, found 1
+
+enum Box<T> { Full(T) }
+
+fn main() {
+    <Box<int>>.Full<string>(1);
+}

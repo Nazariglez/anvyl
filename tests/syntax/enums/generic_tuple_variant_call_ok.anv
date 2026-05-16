@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Box<T> { Full(T), Empty }
+
+fn main() {
+    let a: Box<int> = Box.Full(1);
+    let b: Box<string> = Box.Full("x");
+}

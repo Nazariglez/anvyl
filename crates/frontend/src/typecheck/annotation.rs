@@ -1,8 +1,13 @@
 use std::{collections::HashSet, fmt};
 
-use super::decls::DeclError;
+use super::{
+    MemberAccessKind, ModuleScope, NominalKey, NominalKind, TypeChecker, ValueDecl,
+    decls::DeclError, field_check, nominal_type, substitute_aggregate_member,
+};
 use crate::{
-    ast::{AnnotationArgs, AnnotationNode, Ident, Lit},
+    ast::{AnnotationArgs, AnnotationNode, Ident, Lit, Type},
+    diagnostic::DiagnosticTag,
+    lint::{LintEvent, LintId},
     source::SourceId,
     span::{SourceSpan, Span},
 };
@@ -46,6 +51,283 @@ impl AccessPolicy {
     fn set_deprecated(&mut self, reason: Option<String>) {
         self.deprecated = Some(AnnotationPolicy { reason });
     }
+}
+
+impl From<MemberAccessKind> for DeprecatedUseKind {
+    fn from(kind: MemberAccessKind) -> Self {
+        match kind {
+            MemberAccessKind::Field => Self::Field,
+            MemberAccessKind::Method => Self::Method,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeprecatedUseKind {
+    Function,
+    ExternFunction,
+    Const,
+    Global,
+    ExternType,
+    TypeAlias,
+    Contract,
+    Struct,
+    DataRef,
+    Enum,
+    EnumVariant,
+    Field,
+    Method,
+}
+
+impl DeprecatedUseKind {
+    pub(crate) fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::ExternFunction => "extern function",
+            Self::Const => "const",
+            Self::Global => "runtime global",
+            Self::ExternType => "extern type",
+            Self::TypeAlias => "type alias",
+            Self::Contract => "contract",
+            Self::Struct => "struct",
+            Self::DataRef => "dataref",
+            Self::Enum => "enum",
+            Self::EnumVariant => "variant",
+            Self::Field => "field",
+            Self::Method => "method",
+        }
+    }
+}
+
+impl TypeChecker {
+    pub(super) fn check_matched_field_access_policy(
+        &mut self,
+        owner: &field_check::FieldOwner,
+        name: Ident,
+        policy: &AccessPolicy,
+        span: Span,
+    ) {
+        match owner {
+            field_check::FieldOwner::Nominal(owner_ty) => {
+                if let Some(key) = self.decls.key_for_type(owner_ty) {
+                    self.check_access_policy(
+                        policy,
+                        MemberAccessKind::Field,
+                        name,
+                        owner_ty,
+                        &key.module,
+                        span,
+                    );
+                }
+            }
+            field_check::FieldOwner::Variant { key, .. } => {
+                self.check_access_policy(
+                    policy,
+                    MemberAccessKind::Field,
+                    name,
+                    &nominal_type(key),
+                    &key.module,
+                    span,
+                );
+            }
+        }
+    }
+
+    pub(super) fn warn_named_value_deprecated(
+        &mut self,
+        value: &ValueDecl,
+        name: Ident,
+        span: Span,
+    ) {
+        if let Some(kind) = value.deprecated_kind() {
+            self.warn_deprecated(value.policy(), kind, name, span);
+        }
+    }
+
+    pub(super) fn warn_named_const_deprecated(&mut self, name: Ident, span: Span) {
+        let Some((_, _, ValueDecl::Const(sig))) = self.lookup_named_value(name) else {
+            return;
+        };
+        self.warn_deprecated(&sig.policy, DeprecatedUseKind::Const, name, span);
+    }
+
+    pub(super) fn warn_extern_type_deprecated(&mut self, key: &NominalKey, span: Span) {
+        if key.kind != NominalKind::Extern {
+            return;
+        }
+        let event = match self.decls.extern_type_policy(key) {
+            Some(policy) if policy.has_deprecated() => deprecated_lint(
+                DeprecatedUseKind::ExternType,
+                key.name,
+                policy.deprecated_reason(),
+                self.source_span(span),
+            ),
+            _ => return,
+        };
+        self.push_lint_event(event);
+    }
+
+    pub(super) fn warn_deprecated(
+        &mut self,
+        policy: &AccessPolicy,
+        kind: DeprecatedUseKind,
+        name: Ident,
+        span: Span,
+    ) {
+        if let Some(event) = deprecated_access_lint(policy, kind, name, self.source_span(span)) {
+            self.push_lint_event(event);
+        }
+    }
+
+    pub(super) fn check_access_policy(
+        &mut self,
+        policy: &AccessPolicy,
+        kind: MemberAccessKind,
+        name: Ident,
+        owner: &Type,
+        origin: &ModuleScope,
+        span: Span,
+    ) {
+        emit_access_policy(
+            policy,
+            kind,
+            name,
+            owner,
+            origin,
+            span,
+            &mut AccessPolicyOutput {
+                source: self.source_id(),
+                current_module: &self.current_module,
+                lint_events: &mut self.lint_events,
+            },
+        );
+    }
+
+    pub(super) fn check_stored_field_path_access(
+        &mut self,
+        owner: &Type,
+        path: &[Ident],
+        span: Span,
+    ) {
+        let mut owner = owner.clone();
+        for name in path {
+            let Some(key) = self.decls.key_for_type(&owner) else {
+                return;
+            };
+            let Some(aggregate) = self.decls.aggregate(&key) else {
+                return;
+            };
+            let Some(field) = aggregate.fields.get(name) else {
+                return;
+            };
+            let policy = field.policy.clone();
+            let field_ty = substitute_aggregate_member(&owner, &aggregate.generics, &field.ty);
+            let origin = key.module;
+            self.check_access_policy(
+                &policy,
+                MemberAccessKind::Field,
+                *name,
+                &owner,
+                &origin,
+                span,
+            );
+            owner = field_ty;
+        }
+    }
+}
+
+fn deprecated_access_lint(
+    policy: &AccessPolicy,
+    kind: DeprecatedUseKind,
+    name: Ident,
+    span: SourceSpan,
+) -> Option<LintEvent> {
+    policy
+        .has_deprecated()
+        .then(|| deprecated_lint(kind, name, policy.deprecated_reason(), span))
+}
+
+pub(super) fn deprecated_lint(
+    kind: DeprecatedUseKind,
+    name: Ident,
+    reason: Option<&str>,
+    span: SourceSpan,
+) -> LintEvent {
+    LintEvent {
+        id: LintId::Deprecated,
+        span,
+        message: render_deprecated_access(kind, name, reason),
+        label: Some(format!("deprecated {} used here", kind.diagnostic_name())),
+        notes: vec![],
+        help: None,
+        tags: vec![DiagnosticTag::Deprecated],
+    }
+}
+
+pub(super) fn render_deprecated_access(
+    kind: DeprecatedUseKind,
+    name: Ident,
+    reason: Option<&str>,
+) -> String {
+    let kind = kind.diagnostic_name();
+    match reason {
+        Some(reason) => format!("use of deprecated {kind} '{name}': {reason}"),
+        None => format!("use of deprecated {kind} '{name}'"),
+    }
+}
+
+pub(super) struct AccessPolicyOutput<'a> {
+    pub(super) source: SourceId,
+    pub(super) current_module: &'a ModuleScope,
+    pub(super) lint_events: &'a mut Vec<LintEvent>,
+}
+
+fn render_internal_access(
+    kind: MemberAccessKind,
+    name: Ident,
+    owner: &Type,
+    reason: Option<&str>,
+) -> String {
+    let kind = kind.diagnostic_name();
+    match reason {
+        Some(reason) => format!("accessing internal {kind} '{name}' of type '{owner}': {reason}"),
+        None => format!("accessing internal {kind} '{name}' of type '{owner}'"),
+    }
+}
+
+pub(super) fn emit_access_policy(
+    policy: &AccessPolicy,
+    kind: MemberAccessKind,
+    name: Ident,
+    owner: &Type,
+    origin: &ModuleScope,
+    span: Span,
+    out: &mut AccessPolicyOutput<'_>,
+) {
+    if let Some(event) = deprecated_access_lint(
+        policy,
+        DeprecatedUseKind::from(kind),
+        name,
+        SourceSpan::from_byte_span(out.source, span),
+    ) {
+        out.lint_events.push(event);
+    }
+
+    if !policy.has_internal() || origin == out.current_module {
+        return;
+    }
+
+    let reason = policy.internal_reason().map(str::to_string);
+    let span = SourceSpan::from_byte_span(out.source, span);
+    out.lint_events.push(LintEvent {
+        id: LintId::InternalAccess,
+        span,
+        message: render_internal_access(kind, name, owner, reason.as_deref()),
+        label: Some(format!("internal {} used here", kind.diagnostic_name())),
+        notes: vec![],
+        help: None,
+        tags: vec![],
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

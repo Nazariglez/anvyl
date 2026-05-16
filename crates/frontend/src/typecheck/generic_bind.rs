@@ -156,7 +156,7 @@ impl ExplicitGenericBinder for TypeCheckerGenericBinder<'_> {
     }
 
     fn eval_const_arg(&mut self, term: ConstTerm, span: Span) -> Option<ConstTerm> {
-        self.tc.eval_const_term(term, span)
+        self.tc.eval_const_term(term, span, true)
     }
 
     fn push_arity_error(&mut self, expected: usize, found: usize, _: Span) {

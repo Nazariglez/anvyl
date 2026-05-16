@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Could not infer type parameter 'T'
+
+enum Box<T> { Empty }
+
+fn main() {
+    let x = Box.Empty;
+}

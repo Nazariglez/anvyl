@@ -8,5 +8,5 @@ import exts { keep };
 
 fn main() {
     keep();
-    let n: int = Mode.Open();
+    let m: Mode = Mode.Open;
 }

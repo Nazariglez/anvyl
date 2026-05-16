@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: variant 'State.Idle' is not a struct variant
+
+enum State { Idle }
+
+fn main() {
+    let state = State.Idle;
+    match state {
+        State.Idle {} => {}
+    }
+}

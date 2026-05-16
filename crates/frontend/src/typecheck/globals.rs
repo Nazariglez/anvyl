@@ -1,9 +1,10 @@
 use super::{
-    GlobalKey, TypeChecker, check_value_expr_checked_with_hint, push_source_scope,
-    register_declarations,
+    CheckedType, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect, GlobalKey, GlobalSig, Type,
+    TypeChecker, TypeError, ValueDecl, check_value_expr_checked_with_hint, push_source_scope,
+    push_type_closure_error, register_declarations, type_closure_facts,
 };
 use crate::{
-    ast::{GlobalDeclNode, Program, Stmt},
+    ast::{ExprId, GlobalDeclNode, Program, Stmt},
     typecheck::ModuleScope,
 };
 
@@ -31,6 +32,96 @@ pub(super) fn check_global_initializers(
         }
         tc.pop_scope();
     });
+}
+
+impl TypeChecker {
+    pub(super) fn record_global_access(
+        &mut self,
+        expr_id: ExprId,
+        key: &GlobalKey,
+        root: bool,
+        mode: GlobalAccessMode,
+    ) {
+        let init_effect = if root && mode == GlobalAccessMode::RootAssign {
+            GlobalInitEffect::StoreWithoutInit
+        } else {
+            GlobalInitEffect::InitializeFirst
+        };
+        self.global_accesses.insert(
+            expr_id,
+            GlobalAccessFact {
+                expr_id,
+                key: key.clone(),
+                mode,
+                init_effect,
+            },
+        );
+    }
+
+    pub(super) fn seed_global_types(&mut self) {
+        let globals = self
+            .decls
+            .values()
+            .filter_map(|value| match &value.decl {
+                ValueDecl::Global(sig) => {
+                    Some((sig.key.clone(), sig.ty.clone(), sig.initializer_span))
+                }
+                ValueDecl::Func(_) | ValueDecl::Const(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (key, ty, span) in globals {
+            let id = if matches!(ty, Type::Infer) {
+                self.solver.alloc_fresh_local_type(Some(span))
+            } else {
+                self.solver.alloc_local_type(&ty)
+            };
+            self.global_types.insert(key, id);
+        }
+    }
+
+    pub(super) fn global_handle(&self, key: &GlobalKey) -> super::TypeHandle {
+        let id = *self
+            .global_types
+            .get(key)
+            .expect("global type was not seeded");
+        self.local_handle(id)
+    }
+
+    pub(super) fn global_checked(&self, sig: &GlobalSig) -> CheckedType {
+        let handle = self.global_handle(&sig.key);
+        CheckedType {
+            ty: self.handle_type(&handle),
+            handle,
+            contains_extern_any: false,
+        }
+    }
+
+    pub(super) fn sync_global_types(&mut self) {
+        let globals = self
+            .global_types
+            .iter()
+            .map(|(key, id)| (key.clone(), *id))
+            .collect::<Vec<_>>();
+
+        for (key, id) in globals {
+            let ty = self.solver.local_type_to_type(id);
+            if let Some(sig) = self.decls.global(&key) {
+                if type_closure_facts(&ty).contains_any {
+                    self.push_error_once(TypeError::AnyOutsideExternBoundary {
+                        span: Some(sig.span),
+                    });
+                }
+                let mut errors = vec![];
+                push_type_closure_error(&mut errors, &ty, Some(sig.initializer_span));
+                for error in errors {
+                    self.push_error_once(error);
+                }
+            }
+            self.decls.set_global_type(&key, &ty);
+            self.solver.set_local_type_from_type(id, &ty);
+        }
+    }
 }
 
 fn check_global_initializer(module: &ModuleScope, global: &GlobalDeclNode, tc: &mut TypeChecker) {

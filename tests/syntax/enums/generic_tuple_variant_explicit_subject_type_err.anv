@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected 'int', found 'string'
+
+enum Box<T> { Full(T), Empty }
+
+fn main() {
+    <Box<int>>.Full("x");
+}

@@ -1,13 +1,12 @@
 use super::support::{
     TypecheckTestResult, assert_calls, assert_deprecated_warning, assert_err, assert_err_count,
-    assert_single_error, assert_ty, assert_ty_mods, assert_ty_named, assert_typecheck_closed,
-    check, check_named, errors,
+    assert_single_error, assert_ty, assert_ty_named, assert_typecheck_closed, check, check_named,
+    errors,
 };
 use crate::{
     ast::{ArrayLen, Ident, NominalKind, Type},
     typecheck::{
         CallTarget, DeprecatedUseKind, GenericArgs, MemberAccessKind, MemberPathKind, TypeError,
-        VariantShape,
         decls::{
             CallableId, DeclError, ExtendId, MethodKey, MethodSurface, ModuleScope, NominalKey,
             VariantPayload, VariantSchema,
@@ -34,34 +33,6 @@ fn nominal(
 
 mod field_access {
     use super::*;
-
-    #[test]
-    fn field_access() {
-        assert_ty(
-            "struct Point { 
-                x: int, 
-                y: int 
-            } 
-            fn main() { 
-                let p = Point { x: 1, y: 2 };
-                p.x; 
-            }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn nested_field_access() {
-        assert_ty(
-            "struct Pos { x: int } 
-            struct Player { pos: Pos } 
-            fn main() { 
-                let p = Player { pos: Pos { x: 1 } }; 
-                p.pos.x; 
-            }",
-            Type::Int,
-        );
-    }
 
     #[test]
     fn promoted_field_access_records_canonical_path() {
@@ -192,27 +163,6 @@ mod field_access {
     }
 
     #[test]
-    fn unknown_field() {
-        assert_single_error(
-            "struct Point { x: int } 
-            fn main() { 
-                let p = Point { x: 1 }; 
-                p.z; 
-            }",
-            |err| {
-                matches!(
-                    err,
-                    TypeError::UnknownMember {
-                        member,
-                        kind: MemberAccessKind::Field,
-                        ..
-                    } if *member == Ident::new("z")
-                )
-            },
-        );
-    }
-
-    #[test]
     fn field_on_int() {
         assert_single_error("fn main() { let x = 1; x.y; }", |err| {
             matches!(
@@ -225,19 +175,6 @@ mod field_access {
                 } if *member == Ident::new("y")
             )
         });
-    }
-
-    #[test]
-    fn imported_field_access() {
-        assert_ty_mods(
-            "import gamekit { Point }; 
-            fn main() { 
-                let p = Point { x: 1, y: 2 }; 
-                p.x; 
-            }",
-            "pub struct Point { x: int, y: int }",
-            Type::Int,
-        );
     }
 
     #[test]
@@ -292,14 +229,6 @@ mod field_access {
     }
 
     #[test]
-    fn receiver_args() {
-        assert_ty(
-            "struct Wrapper<T> { value: T } fn main() { let w = Wrapper { value: 42 }; w.value; }",
-            Type::Int,
-        );
-    }
-
-    #[test]
     fn dataref_receiver_args() {
         assert_ty(
             "dataref Box<T> { value: T } fn main() { let b = Box { value: true }; b.value; }",
@@ -321,97 +250,16 @@ mod field_access {
             Type::Int,
         );
     }
-
-    #[test]
-    fn imported_receiver_args() {
-        assert_ty_mods(
-            "import gamekit { Wrapper }; fn main() { let w = Wrapper { value: 42 }; w.value; }",
-            "pub struct Wrapper<T> { value: T }",
-            Type::Int,
-        );
-    }
 }
 
 mod struct_literal {
     use super::*;
 
     #[test]
-    fn local_struct_literal() {
-        assert_ty(
-            "struct Point { x: int, y: int } fn main() { Point { x: 1, y: 2 }; }",
-            nominal(NominalKind::Struct, "Point", vec![], None),
-        );
-    }
-
-    #[test]
-    fn struct_literal_missing_field() {
-        assert_err_count(
-            "struct Point { x: int, y: int } fn main() { Point { x: 1 }; }",
-            1,
-        );
-    }
-
-    #[test]
-    fn struct_literal_unknown_field() {
-        assert_err_count(
-            "struct Point { x: int } fn main() { Point { x: 1, z: 3 }; }",
-            1,
-        );
-    }
-
-    #[test]
-    fn struct_literal_duplicate_field() {
-        assert_err_count(
-            "struct Point { x: int } fn main() { Point { x: 1, x: 2 }; }",
-            1,
-        );
-    }
-
-    #[test]
-    fn struct_literal_type_mismatch() {
-        assert_err_count(
-            "struct Point { x: int } fn main() { Point { x: true }; }",
-            1,
-        );
-    }
-
-    #[test]
-    fn module_struct_literal() {
-        assert_ty_mods(
-            "import gamekit { Point }; fn main() { Point { x: 1, y: 2 }; }",
-            "pub struct Point { x: int, y: int }",
-            nominal(
-                NominalKind::Struct,
-                "Point",
-                vec![],
-                Some(std::rc::Rc::from(
-                    vec![String::from("gamekit")].into_boxed_slice(),
-                )),
-            ),
-        );
-    }
-
-    #[test]
-    fn struct_infer() {
-        assert_ty(
-            "struct Wrapper<T> { value: T } fn main() { Wrapper { value: 42 }; }",
-            nominal(NominalKind::Struct, "Wrapper", vec![Type::Int], None),
-        );
-    }
-
-    #[test]
     fn dataref_infer() {
         assert_ty(
             "dataref Box<T> { value: T } fn main() { Box { value: \"hi\" }; }",
             nominal(NominalKind::DataRef, "Box", vec![Type::String], None),
-        );
-    }
-
-    #[test]
-    fn annotation_unconstrained() {
-        assert_ty(
-            "struct Token<T> {} fn main() { let value: Token<int> = Token {}; value; }",
-            nominal(NominalKind::Struct, "Token", vec![Type::Int], None),
         );
     }
 
@@ -723,22 +571,6 @@ mod method_calls {
     }
 
     #[test]
-    fn method_call() {
-        assert_ty(
-            "struct Point { x: int, fn len(self) -> int { 0 } } fn main() -> int { let p = Point { x: 1 }; p.len() }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn method_call_with_args() {
-        assert_ty(
-            "struct Point { x: int, fn add(self, v: int) -> int { 0 } } fn main() -> int { let p = Point { x: 1 }; p.add(2) }",
-            Type::Int,
-        );
-    }
-
-    #[test]
     fn promoted_method_call_records_origin_and_receiver_path() {
         let result = check(
             "struct Health { fn damage(self, amount: int) {} }
@@ -839,38 +671,6 @@ mod method_calls {
     }
 
     #[test]
-    fn unknown_method_on_aggregate() {
-        assert_single_error(
-            "struct Point { x: int } fn main() { let p = Point { x: 1 }; p.move(); }",
-            |err| {
-                matches!(
-                    err,
-                    TypeError::UnknownMember {
-                        member,
-                        kind: MemberAccessKind::Method,
-                        ..
-                    } if *member == Ident::new("move")
-                )
-            },
-        );
-    }
-
-    #[test]
-    fn unknown_method_on_primitive() {
-        assert_single_error("fn main() { 1.foo(); }", |err| {
-            matches!(
-                err,
-                TypeError::MemberAccessOnNonAggregate {
-                    ty: Type::Int,
-                    member,
-                    kind: MemberAccessKind::Method,
-                    ..
-                } if *member == Ident::new("foo")
-            )
-        });
-    }
-
-    #[test]
     fn collection_pop_not_builtin() {
         assert_single_error("fn main() { let xs = [1]; xs.pop(); }", |err| {
             matches!(
@@ -882,60 +682,6 @@ mod method_calls {
                 } if *member == Ident::new("pop")
             )
         });
-    }
-
-    #[test]
-    fn unknown_enum_variant_call() {
-        assert_single_error("enum Color { Red } fn main() { Color.Yellow(); }", |err| {
-            matches!(
-                err,
-                TypeError::UnknownEnumVariant {
-                    enum_name,
-                    variant,
-                    ..
-                } if *enum_name == Ident::new("Color") && *variant == Ident::new("Yellow")
-            )
-        });
-    }
-
-    #[test]
-    fn enum_struct_literal() {
-        assert_ty(
-            "enum Event { Move { dx: int, dy: int } } fn main() { let e = Event.Move { dx: 1, dy: 2 }; e; }",
-            nominal(NominalKind::Enum, "Event", vec![], None),
-        );
-    }
-
-    #[test]
-    fn enum_struct_unknown_field() {
-        let errors = errors("enum Event { Move { dx: int } } fn main() { Event.Move { dz: 1 }; }");
-        assert!(errors.iter().any(|err| {
-            matches!(err, TypeError::UnknownVariantField { field, .. } if *field == Ident::new("dz"))
-        }));
-    }
-
-    #[test]
-    fn enum_struct_missing_field() {
-        assert_single_error(
-            "enum Event { Move { dx: int, dy: int } } fn main() { Event.Move { dx: 1 }; }",
-            |err| matches!(err, TypeError::MissingVariantField { field, .. } if *field == Ident::new("dy")),
-        );
-    }
-
-    #[test]
-    fn enum_struct_on_tuple() {
-        assert_single_error(
-            "enum Event { Move(int) } fn main() { Event.Move { dx: 1 }; }",
-            |err| {
-                matches!(
-                    err,
-                    TypeError::EnumVariantShapeMismatch {
-                        expected: VariantShape::Struct,
-                        ..
-                    }
-                )
-            },
-        );
     }
 
     #[test]
@@ -1017,54 +763,9 @@ mod method_calls {
     }
 
     #[test]
-    fn type_name_is_not_receiver() {
-        assert_err("struct Point { x: int, fn len(self) -> int { 0 } } fn main() { Point.len(); }");
-    }
-
-    #[test]
-    fn static_explicit_args() {
-        assert_ty(
-            "struct Foo { fn make<T>(x: T) -> T { x } } fn main() -> int { Foo.make<int>(42) }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn static_infer_args() {
-        assert_ty(
-            "struct Foo { fn make<T>(x: T) -> T { x } } fn main() -> string { Foo.make(\"hi\") }",
-            Type::String,
-        );
-    }
-
-    #[test]
-    fn instance_explicit_args() {
-        assert_ty(
-            "struct Foo { fn pair<A, B>(self, a: A, b: B) -> B { b } } fn main() -> string { let f = Foo {}; f.pair<int, string>(1, \"ok\") }",
-            Type::String,
-        );
-    }
-
-    #[test]
-    fn instance_infer_args() {
-        assert_ty(
-            "struct Foo { fn pair<A, B>(self, a: A, b: B) -> B { b } } fn main() -> int { let f = Foo {}; f.pair(\"x\", 7) }",
-            Type::Int,
-        );
-    }
-
-    #[test]
     fn owner_instance_receiver_args() {
         assert_ty(
             "struct Wrapper<T> { value: T, fn get(self) -> T { self.value } } fn main() -> int { let w = Wrapper { value: 42 }; w.get() }",
-            Type::Int,
-        );
-    }
-
-    #[test]
-    fn owner_static_infer_args() {
-        assert_ty(
-            "struct Wrapper<T> { value: T, fn new(value: T) -> Self { Wrapper { value: value } } } fn main() -> int { Wrapper.new(42).value }",
             Type::Int,
         );
     }
@@ -1679,28 +1380,8 @@ mod extend_calls {
 mod enum_variants {
     use super::*;
 
-    fn color_type() -> Type {
-        nominal(NominalKind::Enum, "Color", vec![], None)
-    }
-
     fn option_type(inner: Type) -> Type {
         nominal(NominalKind::Enum, "Option", vec![inner], None)
-    }
-
-    #[test]
-    fn enum_unit_variant() {
-        assert_ty(
-            "enum Color { Red, Blue } fn main() { Color.Red; }",
-            color_type(),
-        );
-    }
-
-    #[test]
-    fn enum_tuple_variant() {
-        assert_ty(
-            "enum Color { Rgb(int, int, int) } fn main() { Color.Rgb(1, 2, 3); }",
-            color_type(),
-        );
     }
 
     #[test]
@@ -1742,77 +1423,6 @@ mod enum_variants {
     }
 
     #[test]
-    fn tuple_variant_wrong_args() {
-        assert_err("enum Color { Rgb(int, int, int) } fn main() { Color.Rgb(1, 2); }");
-    }
-
-    #[test]
-    fn tuple_variant_type_mismatch() {
-        assert_err("enum Color { Rgb(int, int, int) } fn main() { Color.Rgb(1, 2, true); }");
-    }
-
-    #[test]
-    fn unit_variant_no_args() {
-        assert_ty(
-            "enum Color { Red } fn main() { Color.Red(); }",
-            color_type(),
-        );
-    }
-
-    #[test]
-    fn unit_variant_args_err() {
-        assert_err("enum Color { Red } fn main() { Color.Red(42); }");
-    }
-
-    #[test]
-    fn unit_variant_via_variable() {
-        assert_ty(
-            "enum Color { Red, Blue } fn main() { let c = Color.Red; c; }",
-            color_type(),
-        );
-    }
-
-    #[test]
-    fn tuple_infer() {
-        assert_ty(
-            "enum Option<T> { Some(T), None } fn main() { Option.Some(42); }",
-            option_type(Type::Int),
-        );
-    }
-
-    #[test]
-    fn tuple_explicit_args() {
-        assert_ty(
-            "enum Option<T> { Some(T), None } fn main() { Option.Some<int>(42); }",
-            option_type(Type::Int),
-        );
-    }
-
-    #[test]
-    fn tuple_payload_mismatch() {
-        assert_err_count(
-            "enum Option<T> { Some(T), None } fn main() { Option.Some<int>(true); }",
-            1,
-        );
-    }
-
-    #[test]
-    fn unit_unconstrained_err() {
-        assert_err_count(
-            "enum Option<T> { Some(T), None } fn main() { Option.None(); }",
-            1,
-        );
-    }
-
-    #[test]
-    fn unit_explicit_args() {
-        assert_ty(
-            "enum Option<T> { Some(T), None } fn main() { Option.None<int>(); }",
-            option_type(Type::Int),
-        );
-    }
-
-    #[test]
     fn tuple_optional_nil() {
         assert_ty(
             "enum Option<T> { Some(T), None } fn main() { let x: Option<int?> = Option.Some(nil); x; }",
@@ -1827,21 +1437,5 @@ mod enum_variants {
         )
         .expect("typecheck failed");
         assert_typecheck_closed(&checked);
-    }
-
-    #[test]
-    fn unit_expected_return() {
-        assert_ty(
-            "enum Option<T> { Some(T), None } fn main() -> Option<int> { Option.None() }",
-            option_type(Type::Int),
-        );
-    }
-
-    #[test]
-    fn unit_expected_binding() {
-        assert_ty(
-            "enum Option<T> { Some(T), None } fn main() -> Option<int> { let x: Option<int> = Option.None; x }",
-            option_type(Type::Int),
-        );
     }
 }

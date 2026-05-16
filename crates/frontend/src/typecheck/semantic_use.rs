@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, Type,
@@ -26,6 +26,20 @@ pub(crate) type GlobalAccessMap = HashMap<ExprId, GlobalAccessFact>;
 pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
 pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
 pub(crate) type BindingPromotionMap = HashMap<BindingId, BindingPromotionFact>;
+
+pub(super) fn map_delta<K, V>(old: &HashMap<K, V>, current: &HashMap<K, V>) -> HashMap<K, V>
+where
+    K: Copy + Eq + Hash,
+    V: Clone + PartialEq,
+{
+    current
+        .iter()
+        .filter_map(|(id, item)| match old.get(id) {
+            Some(old_item) if old_item == item => None,
+            _ => Some((*id, item.clone())),
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BindingId(pub(crate) u32);

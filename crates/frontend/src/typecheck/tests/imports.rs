@@ -124,46 +124,6 @@ fn qualified_type() {
 }
 
 #[test]
-fn selective_self_type() {
-    let dep = "pub struct GameKit {}";
-    let root = "
-        import gamekit { self };
-        fn use_it(x: gamekit.GameKit) {}
-    ";
-    assert_ty_mods(root, dep, Type::Void);
-}
-
-#[test]
-fn selective_self_alias_type() {
-    let dep = "pub struct GameKit {}";
-    let root = "
-        import gamekit { self as gk };
-        fn use_it(x: gk.GameKit) {}
-    ";
-    assert_ty_mods(root, dep, Type::Void);
-}
-
-#[test]
-fn selective_imported_type() {
-    let dep = "pub struct GameKit {}";
-    let root = "
-        import gamekit { GameKit };
-        fn use_it(x: GameKit) {}
-    ";
-    assert_ty_mods(root, dep, Type::Void);
-}
-
-#[test]
-fn selective_imported_enum() {
-    let dep = "pub enum Color { Red, Green, Blue }";
-    let root = "
-        import gamekit { Color };
-        fn use_it(x: Color) {}
-    ";
-    assert_ty_mods(root, dep, Type::Void);
-}
-
-#[test]
 fn enum_variant_origin() {
     let root = "
         import colors { Color };

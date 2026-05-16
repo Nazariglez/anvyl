@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Box<T> { Empty }
+
+fn main() {
+    let x: Box<int> = Box.Empty;
+}

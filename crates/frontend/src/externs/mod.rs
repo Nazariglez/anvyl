@@ -557,24 +557,6 @@ mod tests {
         }
 
         #[test]
-        fn rejects_source_init_params() {
-            let raw = collect_source_externs(
-                &parse("extern type Point { init(x: float, y: float); }"),
-                &empty_resolved(),
-            )
-            .unwrap();
-
-            let errors = validate_raw_shapes(&raw).unwrap_err();
-            assert!(matches!(
-                errors[0],
-                ExternInputError::InvalidRawDescriptor {
-                    error: ExternDescriptorError::UnsupportedInitParams { count: 2, .. },
-                    ..
-                }
-            ));
-        }
-
-        #[test]
         fn normalizes_source_receiver_modes() {
             let ty = collect_root_type(
                 r"
@@ -803,25 +785,6 @@ mod tests {
             assert_eq!(callback.policy.escape, CallbackEscape::NonEscaping);
             assert_eq!(callback.params[0].escape, CallbackEscape::Escaping);
             assert_eq!(nested.policy.escape, CallbackEscape::NonEscaping);
-        }
-
-        #[test]
-        fn rejects_mutable_source_callback_params() {
-            let errors = collect_source_externs(
-                &parse("extern fn each(callback: fn(var int) -> void);"),
-                &empty_resolved(),
-            )
-            .unwrap_err();
-
-            assert!(matches!(
-                errors[0],
-                ExternInputError::UnsupportedSource {
-                    kind: UnsupportedSourceKind::CallbackParam {
-                        reason: UnsupportedSourceParamReason::Mutable
-                    },
-                    ..
-                }
-            ));
         }
 
         #[test]

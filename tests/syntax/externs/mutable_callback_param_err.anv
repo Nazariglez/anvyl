@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: unsupported source extern callback parameter
+// @contains: mutable callback parameters are not supported
 
 extern fn bad(callback: fn(var int) -> void);

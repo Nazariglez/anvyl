@@ -5,8 +5,8 @@ use super::support::{
 use crate::{
     ast::{Ident, NominalKind, Type},
     typecheck::{
-        ArityError, CallTarget, CallableId, ConstDiagnostic, DeprecatedUseKind, GenericArgs,
-        ModuleScope, TypeError, call_target_closure_facts,
+        CallTarget, CallableId, ConstDiagnostic, DeprecatedUseKind, GenericArgs, ModuleScope,
+        TypeError, call_target_closure_facts,
         const_term::{ConstInferVarId, ConstTerm},
     },
 };
@@ -22,14 +22,6 @@ fn option_type(inner: Type) -> Type {
 }
 
 #[test]
-fn direct_call_typechecks() {
-    assert_ty(
-        "fn foo() -> int { 0 } fn main() -> int { foo() }",
-        Type::Int,
-    );
-}
-
-#[test]
 fn deprecated_generic_call_warns_once() {
     let result = check(
         "@deprecated(\"use newer\") fn old<T>(value: T) -> T { value }
@@ -42,13 +34,6 @@ fn deprecated_generic_call_warns_once() {
         "old",
         Some("use newer"),
     );
-}
-
-#[test]
-fn non_callable_call() {
-    assert_single_error("fn main() { 1(); }", |err| {
-        matches!(err, TypeError::NotCallable { ty: Type::Int, .. })
-    });
 }
 
 #[test]
@@ -78,22 +63,6 @@ fn builtin_calls_in_named_modules() {
 #[test]
 fn direct_call_target() {
     assert_calls("fn foo() -> int { 0 } fn main() { foo(); }", 1);
-}
-
-#[test]
-fn generic_fn_inferred() {
-    assert_ty(
-        "fn id<T>(x: T) -> T { x } fn main() -> int { id(1) }",
-        Type::Int,
-    );
-}
-
-#[test]
-fn generic_fn_explicit() {
-    assert_ty(
-        "fn id<T>(x: T) -> T { x } fn main() -> string { id<string>(\"ok\") }",
-        Type::String,
-    );
 }
 
 #[test]
@@ -147,7 +116,7 @@ fn cached_generic_specialization_restores_call_targets() {
 #[test]
 fn projected_var_as_records_argument_projection() {
     let result = check(
-        r#"
+        r"
         struct Entity { x: int }
         struct Enemy { @as embed entity: Entity }
         fn move_entity(var entity: as Entity) { entity.x += 1; }
@@ -155,7 +124,7 @@ fn projected_var_as_records_argument_projection() {
             var enemy = Enemy { entity: Entity { x: 1 } };
             move_entity(enemy);
         }
-        "#,
+        ",
     )
     .unwrap();
     let fact = result
@@ -181,7 +150,7 @@ fn projected_var_as_records_argument_projection() {
 #[test]
 fn dependent_projected_var_as_records_specialized_argument_projection() {
     let result = check(
-        r#"
+        r"
         struct Entity { x: int }
         struct Box<T> { @as embed value: T }
         fn move_entity(var entity: as Entity) { entity.x += 1; }
@@ -191,7 +160,7 @@ fn dependent_projected_var_as_records_specialized_argument_projection() {
             move_box<Entity>(box);
             move_box<Entity>(box);
         }
-        "#,
+        ",
     )
     .unwrap();
     let fact = result
@@ -217,7 +186,7 @@ fn dependent_projected_var_as_records_specialized_argument_projection() {
 #[test]
 fn exact_var_as_records_no_projection() {
     let result = check(
-        r#"
+        r"
         struct Entity { x: int }
         struct Enemy { @as embed entity: Entity }
         fn move_entity(var entity: as Entity) { entity.x += 1; }
@@ -225,7 +194,7 @@ fn exact_var_as_records_no_projection() {
             var enemy = Enemy { entity: Entity { x: 1 } };
             move_entity(enemy.entity);
         }
-        "#,
+        ",
     )
     .unwrap();
 
@@ -235,7 +204,7 @@ fn exact_var_as_records_no_projection() {
 #[test]
 fn by_value_as_records_no_projection() {
     let result = check(
-        r#"
+        r"
         struct Entity { x: int }
         struct Enemy { @as embed entity: Entity }
         extend Entity {
@@ -246,7 +215,7 @@ fn by_value_as_records_no_projection() {
             let enemy = Enemy { entity: Entity { x: 1 } };
             take(enemy);
         }
-        "#,
+        ",
     )
     .unwrap();
 
@@ -256,7 +225,7 @@ fn by_value_as_records_no_projection() {
 #[test]
 fn explicit_cast_records_no_projection() {
     let result = check(
-        r#"
+        r"
         struct Entity { x: int }
         struct Enemy { @as embed entity: Entity }
         extend Entity {
@@ -266,7 +235,7 @@ fn explicit_cast_records_no_projection() {
             let enemy = Enemy { entity: Entity { x: 1 } };
             let entity: Entity = enemy as Entity;
         }
-        "#,
+        ",
     )
     .unwrap();
 
@@ -289,36 +258,6 @@ fn explicit_prefix_call_target() {
                 const_args: vec![],
             }
         )
-    );
-}
-
-#[test]
-fn generic_fn_repeated_param_conflict() {
-    let result = check("fn same<T>(a: T, b: T) -> T { a } fn main() { same(1, true); }");
-    assert!(result.is_err(), "expected repeated type param conflict");
-}
-
-#[test]
-fn generic_fn_body_err() {
-    let result = check(
-        "fn mul2(x: int) -> int { x * 2 } fn duplicate<T>(x: T) -> T { mul2(x) } fn main() { duplicate<string>(\"x\"); }",
-    );
-    assert!(result.is_err(), "expected specialized body error");
-}
-
-#[test]
-fn too_many_explicit_args_err() {
-    assert_single_error(
-        "fn id<T>(x: T) -> T { x } fn main() { id<int, string>(1); }",
-        |err| {
-            matches!(
-                err,
-                TypeError::GenericArity(ArityError::TypeArgs {
-                    expected: 1,
-                    found: 2,
-                })
-            )
-        },
     );
 }
 
@@ -349,14 +288,6 @@ fn explicit_plain_nil_err() {
 }
 
 #[test]
-fn arg_conflict_mismatch() {
-    assert_single_error(
-        "fn id<T>(x: T) -> T { x } fn main() { id<int>(1.5); }",
-        |err| matches!(err, TypeError::TypeMismatch { .. }),
-    );
-}
-
-#[test]
 fn expected_nil_arg() {
     assert_ty(
         "fn id<T>(x: T) -> T { x } fn main() { let x: int? = id(nil); x; }",
@@ -370,23 +301,6 @@ fn expected_binding() {
         "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() { let x: Option<int> = none(); x; }",
         option_type(Type::Int),
     );
-}
-
-#[test]
-fn expected_return() {
-    assert_ty(
-        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() -> Option<int> { none() }",
-        option_type(Type::Int),
-    );
-}
-
-#[test]
-fn expected_return_no_leak() {
-    let checked = check(
-        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() -> Option<int> { none() }",
-    )
-    .expect("typecheck failed");
-    assert_typecheck_closed(&checked);
 }
 
 #[test]
@@ -414,90 +328,10 @@ fn expected_explicit_mismatch() {
 }
 
 #[test]
-fn generic_const_array_inference() {
-    assert_ty(
-        "fn len<T, N: int>(xs: [T; N]) -> int { N } fn main(xs: [int; 3]) -> int { len(xs) }",
-        Type::Int,
-    );
-}
-
-#[test]
-fn const_target() {
-    let result =
-        check("fn len<T, N: int>(xs: [T; N]) -> int { N } fn main() { len([1, 2, 3]); }").unwrap();
-    let target = result.calls().values().next().expect("missing call target");
-    assert_eq!(
-        target,
-        &CallTarget::new(
-            CallableId::function(ModuleScope::Root, Ident::new("len")),
-            GenericArgs {
-                type_args: vec![Type::Int],
-                const_args: vec![ConstTerm::from_usize(3)],
-            }
-        )
-    );
-}
-
-#[test]
-fn const_conflict() {
-    assert_single_error(
-        "fn same<T, N: int>(a: [T; N], b: [T; N]) -> T { a[0] } fn main() { same([1, 2, 3], [4, 5]); }",
-        |err| {
-            matches!(
-                err,
-                TypeError::ConstMismatch {
-                    expected: ConstDiagnostic::Value(_),
-                    found: ConstDiagnostic::Value(_),
-                    ..
-                }
-            )
-        },
-    );
-}
-
-#[test]
 fn generic_const_array_explicit_named() {
     assert_ty(
         "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) -> int { len<int, CAP>(xs) }",
         Type::Int,
-    );
-}
-
-#[test]
-fn generic_const_call_target() {
-    let result = check(
-        "fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, 3>(xs); }",
-    )
-    .unwrap();
-    let target = result.calls().values().next().expect("missing call target");
-    assert_eq!(
-        target,
-        &CallTarget::new(
-            CallableId::function(ModuleScope::Root, Ident::new("len")),
-            GenericArgs {
-                type_args: vec![Type::Int],
-                const_args: vec![ConstTerm::from_usize(3)],
-            }
-        )
-    );
-}
-
-#[test]
-fn generic_const_named_target() {
-    let result = check(
-        "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, CAP>(xs); }",
-    )
-    .unwrap();
-    let target = result.calls().values().next().expect("missing call target");
-    assert_eq!(
-        target,
-        &CallTarget::new(
-            CallableId::function(ModuleScope::Root, Ident::new("len")),
-            GenericArgs {
-                type_args: vec![Type::Int],
-                const_args: vec![ConstTerm::from_usize(3)],
-            }
-        )
     );
 }
 
@@ -523,39 +357,6 @@ fn generic_const_unknown_name_arg_err() {
         "fn take<T, N: int>(xs: [T; N]) {} fn main(xs: [int; 3]) { take<int, N>(xs); }",
         |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("N")),
     );
-}
-
-#[test]
-fn call_target_facts_distinguish_const_infer() {
-    let facts = call_target_closure_facts(&CallTarget::new(
-        CallableId::function(ModuleScope::Root, Ident::new("take")),
-        GenericArgs {
-            type_args: vec![],
-            const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
-        },
-    ));
-
-    assert!(!facts.types.infer.contains_type);
-    assert!(facts.types.first_unresolved.is_none());
-    assert!(!facts.contains_unresolved_const());
-    assert!(facts.consts.contains_infer);
-}
-
-#[test]
-fn call_target_const_infer_error() {
-    let target = CallTarget::new(
-        CallableId::function(ModuleScope::Root, Ident::new("take")),
-        GenericArgs {
-            type_args: vec![],
-            const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
-        },
-    );
-    let span = None;
-    let mut errors = vec![];
-
-    super::super::push_call_target_closure_error(&mut errors, &target, span);
-
-    assert_eq!(errors, vec![TypeError::CannotInferConst { span }]);
 }
 
 #[test]
@@ -599,19 +400,125 @@ fn generic_method_const_return() {
 }
 
 #[test]
-fn method_args_bind_method_generics() {
-    assert_ty(
-        "struct Box<T> { value: T, fn keep<U>(self, x: U) -> U { x } } fn main(b: Box<int>) -> string { b.keep<string>(\"ok\") }",
-        Type::String,
-    );
-}
-
-#[test]
 fn generic_method_named_const_arg() {
     assert_ty(
         "const CAP = 3; struct Arrays { fn len<T, N: int>(xs: [T; N]) -> int { N } } fn main(xs: [int; 3]) -> int { Arrays.len<int, CAP>(xs) }",
         Type::Int,
     );
+}
+
+#[test]
+fn expected_return_no_leak() {
+    let checked = check(
+        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() -> Option<int> { none() }",
+    )
+    .expect("typecheck failed");
+    assert_typecheck_closed(&checked);
+}
+
+#[test]
+fn const_target() {
+    let result =
+        check("fn len<T, N: int>(xs: [T; N]) -> int { N } fn main() { len([1, 2, 3]); }").unwrap();
+    let target = result.calls().values().next().expect("missing call target");
+    assert_eq!(
+        target,
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("len")),
+            GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![ConstTerm::from_usize(3)],
+            }
+        )
+    );
+}
+
+#[test]
+fn const_conflict() {
+    assert_single_error(
+        "fn same<T, N: int>(a: [T; N], b: [T; N]) -> T { a[0] } fn main() { same([1, 2, 3], [4, 5]); }",
+        |err| {
+            matches!(
+                err,
+                TypeError::ConstMismatch {
+                    expected: ConstDiagnostic::Value(_),
+                    found: ConstDiagnostic::Value(_),
+                    ..
+                }
+            )
+        },
+    );
+}
+
+#[test]
+fn generic_const_call_target() {
+    let result = check(
+        "fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, 3>(xs); }",
+    )
+    .unwrap();
+    let target = result.calls().values().next().expect("missing call target");
+    assert_eq!(
+        target,
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("len")),
+            GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![ConstTerm::from_usize(3)],
+            }
+        )
+    );
+}
+
+#[test]
+fn generic_const_named_target() {
+    let result = check(
+        "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<int, CAP>(xs); }",
+    )
+    .unwrap();
+    let target = result.calls().values().next().expect("missing call target");
+    assert_eq!(
+        target,
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("len")),
+            GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![ConstTerm::from_usize(3)],
+            }
+        )
+    );
+}
+
+#[test]
+fn call_target_facts_distinguish_const_infer() {
+    let facts = call_target_closure_facts(&CallTarget::new(
+        CallableId::function(ModuleScope::Root, Ident::new("take")),
+        GenericArgs {
+            type_args: vec![],
+            const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
+        },
+    ));
+
+    assert!(!facts.types.infer.contains_type);
+    assert!(facts.types.first_unresolved.is_none());
+    assert!(!facts.contains_unresolved_const());
+    assert!(facts.consts.contains_infer);
+}
+
+#[test]
+fn call_target_const_infer_error() {
+    let target = CallTarget::new(
+        CallableId::function(ModuleScope::Root, Ident::new("take")),
+        GenericArgs {
+            type_args: vec![],
+            const_args: vec![ConstTerm::Infer(ConstInferVarId(0))],
+        },
+    );
+    let span = None;
+    let mut errors = vec![];
+
+    super::super::push_call_target_closure_error(&mut errors, &target, span);
+
+    assert_eq!(errors, vec![TypeError::CannotInferConst { span }]);
 }
 
 #[test]
@@ -654,59 +561,4 @@ fn unknown_module_member() {
     ";
     let result = check_mods(root, dep);
     assert!(result.is_err(), "expected error for unknown module member");
-}
-
-#[test]
-fn mutable_args_reject_root_and_field_alias() {
-    assert_single_error(
-        "fn set(var pair: (int, int), var item: int) {}
-         fn main() { var pair = (1, 2); set(pair, pair.0); }",
-        |err| matches!(err, TypeError::MutableAlias { .. }),
-    );
-}
-
-#[test]
-fn mutable_args_accept_distinct_tuple_fields() {
-    check(
-        "fn set(var left: int, var right: int) {}
-         fn main() { var pair = (1, 2); set(pair.0, pair.1); }",
-    )
-    .unwrap();
-}
-
-#[test]
-fn mutable_args_reject_alias_binding_and_original_field() {
-    assert_single_error(
-        "struct Pair { a: int, b: int }
-         fn set(var left: int, var right: int) {}
-         fn main() { var pair = Pair { a: 1, b: 2 }; var Pair { a } = pair; set(a, pair.a); }",
-        |err| matches!(err, TypeError::MutableAlias { .. }),
-    );
-}
-
-#[test]
-fn mutable_args_accept_swapped_or_pattern_aliases() {
-    check(
-        "fn touch(var a: int, var b: int) {}
-         fn main() { var pair = (1, 2); match var pair { (x, y) | (y, x) => { touch(x, y); }, } }",
-    )
-    .unwrap();
-}
-
-#[test]
-fn mutable_args_reject_or_pattern_whole_and_part_aliases() {
-    assert_single_error(
-        "fn touch_pair(var p: (int, int), var n: int) {}
-         fn main() { var pair = (1, 2); match var pair { (x, _) | (_, x) => { touch_pair(pair, x); }, } }",
-        |err| matches!(err, TypeError::MutableAlias { .. }),
-    );
-}
-
-#[test]
-fn mutable_args_reject_same_path_or_pattern_aliases() {
-    assert_single_error(
-        "fn touch(var a: int, var b: int) {}
-         fn main() { var pair = (1, 2); match var pair { (x, _) | (x, _) => { touch(x, x); }, } }",
-        |err| matches!(err, TypeError::MutableAlias { .. }),
-    );
 }

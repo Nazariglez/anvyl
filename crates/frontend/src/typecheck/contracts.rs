@@ -5,7 +5,8 @@ use anvyx_externs::{ParamFlow, ReceiverMode};
 use super::{
     ContractKey, ContractRequirementKey, ContractRequirementSchema, ContractSetKey, DeclError,
     DeclarationIndex, DeprecatedUseKind, Exposure, FuncParam, MemberAccessKind, MethodMode,
-    MethodReceiver, TypeChecker, TypeError, deprecated_lint,
+    MethodReceiver, TypeChecker, TypeError,
+    annotation::deprecated_lint,
     member::{self, PromotedMethodTarget},
     semantic_use::{ContractWitnessKey, WitnessId, WitnessSlot, WitnessSlotTarget},
     type_ops::TypeVisitor,
@@ -695,7 +696,7 @@ fn resolve_included_contracts(
                         let event = deprecated_lint(
                             DeprecatedUseKind::Contract,
                             key.name,
-                            schema.policy.deprecated_reason().map(str::to_string),
+                            schema.policy.deprecated_reason(),
                             span,
                         );
                         if !lint_events.contains(&event) {

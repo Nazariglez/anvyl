@@ -5,11 +5,19 @@ use std::{
 
 use super::{
     BindingId, BindingMutability, BindingPromotionFact, CaptureAccess, CaptureStorage,
-    CaptureStorageOrigin, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LambdaEscapeMap,
-    LocalBindingKind, TypecheckFacts, infer::LocalTypeId,
+    CaptureStorageOrigin, CheckedType, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind,
+    LambdaEscapeMap, LocalBindingKind, LocalValue, ReturnAccess, ReturnSpec, TypeChecker,
+    TypeError, TypecheckFacts,
+    body::{
+        CallableBody, CallableParamBinding, check_callable_body_frame, with_callable_body_scope,
+    },
+    checked_from_type,
+    decl_validate::{has_mutable_func_param, validate_return_spec},
+    expected_assignable_type,
+    infer::{LocalTypeId, TypeHandle},
 };
 use crate::{
-    ast::{ExprId, Ident, Type},
+    ast::{EscapeMode, ExprId, ExprNode, FuncParam, Ident, LambdaNode, Type},
     span::Span,
 };
 
@@ -29,6 +37,124 @@ pub(super) struct ClosureClassifier {
     reported_non_escaping_callback_escapes: HashSet<LocalTypeId>,
     reported_borrowed_escaping_captures: HashSet<BindingId>,
     active_lambdas: Vec<ActiveLambda>,
+}
+
+impl TypeChecker {
+    pub(super) fn record_escaping_use(&mut self, expr: &ExprNode) {
+        self.closure.record_escaping_use(expr.node.id, expr.span);
+    }
+
+    pub(super) fn push_escape_events(&mut self, events: Vec<EscapeEvent>) {
+        for event in events {
+            match event {
+                EscapeEvent::Callback { origin, span } => {
+                    self.push_non_escaping_callback_escape(&origin, span);
+                }
+                EscapeEvent::Borrowed { capture, span } => {
+                    self.push_borrowed_escaping_capture(&capture, span);
+                }
+            }
+        }
+    }
+
+    pub(super) fn check_argument_escape(&mut self, arg: &ExprNode, escape: EscapeMode) {
+        if escape.is_escaping() {
+            self.record_escaping_use(arg);
+        }
+    }
+
+    fn mark_non_escaping_callback_binding(&mut self, name: Ident, origin: NonEscapingCallback) {
+        let Some(binding_id) = self.local_binding_id(name) else {
+            return;
+        };
+        self.closure.add_binding_callback(binding_id, origin);
+    }
+
+    pub(super) fn record_aggregate_elem_flow(&mut self, aggregate: ExprId, elem: &ExprNode) {
+        self.record_escaping_use(elem);
+        self.closure.copy_expr_flow(elem.node.id, aggregate);
+    }
+
+    pub(super) fn mark_non_escaping_callback_param(
+        &mut self,
+        name: Ident,
+        type_id: LocalTypeId,
+        param: &FuncParam,
+        source_ty: Option<&Type>,
+    ) {
+        if param.escape.is_escaping() || !matches!(param.ty, Type::Func { .. }) {
+            return;
+        }
+        let ty = source_ty.unwrap_or(&param.ty);
+        let help = Some(format!("mark the parameter as `{name}: escaping {ty}`"));
+        self.mark_non_escaping_callback_binding(
+            name,
+            NonEscapingCallback {
+                id: type_id,
+                name,
+                help,
+            },
+        );
+    }
+
+    fn push_non_escaping_callback_escape(&mut self, origin: &NonEscapingCallback, span: Span) {
+        if !self.closure.record_non_escaping_callback_escape(origin.id) {
+            return;
+        }
+        let help = origin.help.clone().or_else(|| {
+            let ty = self.solver.local_type_to_type(origin.id);
+            matches!(ty, Type::Func { .. })
+                .then(|| format!("mark the parameter as `{}: escaping {ty}`", origin.name))
+        });
+        self.push_error(TypeError::NonEscapingCallbackEscapes {
+            name: origin.name,
+            help,
+            span: self.error_span(span),
+        });
+    }
+
+    pub(super) fn record_local_read(&mut self, expr: ExprId, value: &LocalValue) {
+        self.closure
+            .record_local_read(expr, value.info.binding_id, value.source_depth);
+    }
+
+    fn push_borrowed_escaping_capture(&mut self, capture: &BorrowedCapture, span: Span) {
+        if !self.closure.record_borrowed_escaping_capture(capture.id) {
+            return;
+        }
+        self.push_error(TypeError::BorrowedCaptureEscapes {
+            name: capture.name,
+            origin: capture.origin,
+            span: self.error_span(span),
+        });
+    }
+}
+
+pub(super) fn check_closure_flow_branch<R>(
+    tc: &mut TypeChecker,
+    check: impl FnOnce(&mut TypeChecker) -> R,
+) -> R {
+    let flow = tc.closure.closure_flow_snapshot();
+    let ret = check(tc);
+    let branch_flow = tc.closure.closure_flow_snapshot();
+    tc.closure.join_closure_flow_snapshots(&flow, &branch_flow);
+    ret
+}
+
+pub(super) fn check_closure_flow_branches<R>(
+    tc: &mut TypeChecker,
+    left: impl FnOnce(&mut TypeChecker) -> R,
+    right: impl FnOnce(&mut TypeChecker) -> R,
+) -> (R, R) {
+    let flow = tc.closure.closure_flow_snapshot();
+    let left_ret = left(tc);
+    let left_flow = tc.closure.closure_flow_snapshot();
+    tc.closure.restore_closure_flow(&flow);
+    let right_ret = right(tc);
+    let right_flow = tc.closure.closure_flow_snapshot();
+    tc.closure
+        .join_closure_flow_snapshots(&left_flow, &right_flow);
+    (left_ret, right_ret)
 }
 
 impl ClosureClassifier {
@@ -235,13 +361,9 @@ impl ClosureClassifier {
                 .get(&binding_id)
                 .cloned()
                 .unwrap_or_default();
-            flow.union(
-                right
-                    .local_flows
-                    .get(&binding_id)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+            if let Some(right_flow) = right.local_flows.get(&binding_id) {
+                flow.union(right_flow);
+            }
             self.local_flows.insert(binding_id, flow);
         }
         self.active_lambdas = merge_active_lambdas(&left.active_lambdas, &right.active_lambdas);
@@ -301,7 +423,9 @@ impl ClosureClassifier {
                     .get(binding_id)
                     .cloned()
                     .unwrap_or_default();
-                flow.union(state.get(binding_id).cloned().unwrap_or_default());
+                if let Some(step_flow) = state.get(binding_id) {
+                    flow.union(step_flow);
+                }
                 if self.local_flows.get(binding_id) != Some(&flow) {
                     self.local_flows.insert(*binding_id, flow);
                     changed = true;
@@ -357,7 +481,9 @@ impl ClosureClassifier {
         }
         let mut flow = assignment.flow.clone();
         for source in &assignment.sources {
-            flow.union(state.get(source).cloned().unwrap_or_default());
+            if let Some(source_flow) = state.get(source) {
+                flow.union(source_flow);
+            }
         }
         state.insert(assignment.target, flow);
     }
@@ -438,7 +564,7 @@ impl ClosureClassifier {
 
     pub(super) fn copy_expr_flow(&mut self, from: ExprId, to: ExprId) {
         if let Some(flow) = self.expr_flows.get(&from).cloned() {
-            self.expr_flows.entry(to).or_default().union(flow);
+            self.expr_flows.entry(to).or_default().union(&flow);
         }
         if let Some(sources) = self.expr_sources.get(&from).cloned() {
             self.expr_sources.entry(to).or_default().extend(sources);
@@ -625,7 +751,7 @@ impl ClosureClassifier {
             return;
         }
         self.with_capturing_active_lambdas(source_depth, |frame| {
-            frame.captured_flow.union(flow.clone());
+            frame.captured_flow.union(flow);
         });
     }
 
@@ -640,7 +766,7 @@ impl ClosureClassifier {
         }
         for frame in &mut self.active_lambdas {
             if frame.captures.contains_key(&binding_id) {
-                frame.captured_flow.union(flow.clone());
+                frame.captured_flow.union(flow);
             }
         }
 
@@ -652,7 +778,7 @@ impl ClosureClassifier {
                 .iter()
                 .any(|capture| capture.binding_id == binding_id)
             {
-                lambda.captured_flow.union(flow.clone());
+                lambda.captured_flow.union(flow);
                 escaped |= lambda_escapes
                     .get(&lambda.expr_id)
                     .is_some_and(|fact| matches!(fact.escape, LambdaEscapeKind::Escaping));
@@ -802,8 +928,8 @@ impl EscapeFlow {
         self.origins.insert(FlowOrigin::Lambda(expr));
     }
 
-    fn union(&mut self, other: Self) {
-        self.origins.extend(other.origins);
+    fn union(&mut self, other: &Self) {
+        self.origins.extend(other.origins.iter().cloned());
     }
 
     fn callbacks(&self) -> impl Iterator<Item = &NonEscapingCallback> {
@@ -942,7 +1068,7 @@ fn union_loop_state(
     source: HashMap<BindingId, EscapeFlow>,
 ) {
     for (binding_id, flow) in source {
-        target.entry(binding_id).or_default().union(flow);
+        target.entry(binding_id).or_default().union(&flow);
     }
 }
 
@@ -954,7 +1080,7 @@ fn merge_active_lambdas(left: &[ActiveLambda], right: &[ActiveLambda]) -> Vec<Ac
             debug_assert_eq!(left.expr_id, right.expr_id);
             debug_assert_eq!(left.start_scope, right.start_scope);
             let mut frame = left.clone();
-            frame.captured_flow.union(right.captured_flow.clone());
+            frame.captured_flow.union(&right.captured_flow);
             for capture in right.captures.values() {
                 frame
                     .captures
@@ -1019,4 +1145,115 @@ fn capture_storage(
             unreachable!("borrowed capture origin returned early")
         }
     }
+}
+
+pub(super) fn check_lambda_expr(
+    expr: &ExprNode,
+    lambda: &LambdaNode,
+    expected: Option<&TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let expected_func = expected_assignable_type(expected, tc).and_then(|ty| match ty {
+        Type::Func { params, ret } => Some((params, *ret)),
+        _ => None,
+    });
+    if let Some((params, _)) = &expected_func
+        && params.len() != lambda.node.params.len()
+    {
+        tc.push_error(TypeError::LambdaParamCountMismatch {
+            expected: params.len(),
+            found: lambda.node.params.len(),
+            span: tc.error_span(lambda.span),
+        });
+        return checked_from_type(expr, Type::Infer, tc);
+    }
+
+    let params = lambda
+        .node
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let ty = match &param.ty {
+                Some(ty) => tc.resolve_callable_param_type(ty, lambda.span, false),
+                None => expected_func
+                    .as_ref()
+                    .and_then(|(params, _)| params.get(index))
+                    .map_or_else(
+                        || {
+                            tc.push_error(TypeError::CannotInferType {
+                                span: tc.error_span(lambda.span),
+                            });
+                            Type::Infer
+                        },
+                        |param| param.ty.clone(),
+                    ),
+            };
+            tc.validate_func_param_escape(
+                param.escape,
+                param.mutable,
+                param.cast_accept,
+                &ty,
+                lambda.span,
+            );
+            FuncParam::new(ty, param.mutable, param.cast_accept, param.escape)
+        })
+        .collect::<Vec<_>>();
+
+    let explicit_ret = lambda
+        .node
+        .ret_type
+        .as_ref()
+        .map(|ret| ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty, lambda.span)));
+    if let Some(ret) = &explicit_ret {
+        validate_return_spec(ret, false, has_mutable_func_param(&params), lambda.span, tc);
+    }
+    let expected_ret = explicit_ret.or_else(|| expected_func.as_ref().map(|(_, ret)| ret.clone()));
+
+    let inferred_ret = with_callable_body_scope(
+        tc,
+        |tc| {
+            tc.closure.mark_lambda_non_escaping(expr.node.id);
+            tc.closure.enter_lambda(expr.node.id, tc.scopes.len());
+        },
+        |tc| {
+            let bindings = lambda
+                .node
+                .params
+                .iter()
+                .zip(&params)
+                .map(|(param, ty)| CallableParamBinding {
+                    name: param.name,
+                    source_ty: param.ty.as_ref(),
+                    ty,
+                })
+                .collect::<Vec<_>>();
+            check_callable_body_frame(
+                &bindings,
+                expected_ret.as_ref(),
+                ReturnAccess::Value,
+                None,
+                CallableBody::Expr(&lambda.node.body),
+                lambda.span,
+                tc,
+            )
+        },
+        |tc| {
+            tc.closure.exit_lambda();
+            tc.closure.drain_escape_events(expr.span);
+        },
+    );
+    tc.closure.lambda_value(expr.node.id);
+
+    let ret = expected_ret
+        .or_else(|| inferred_ret.map(ReturnSpec::value))
+        .unwrap_or_else(|| ReturnSpec::value(Type::Infer));
+    checked_from_type(
+        expr,
+        Type::Func {
+            params,
+            ret: Box::new(ret),
+        },
+        tc,
+    )
 }

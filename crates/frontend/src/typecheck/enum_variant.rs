@@ -1,11 +1,18 @@
+use std::collections::HashMap;
+
 use super::{
-    DeprecatedUseKind, GenericArgs, GenericParams, TypeChecker, TypeError, VariantShape,
-    annotation::AccessPolicy,
-    decls::{NominalKey, VariantSchema, nominal_generic_args, nominal_type},
-    deprecated_lint,
+    DeprecatedUseKind, FieldSchema, GenericArgs, GenericParams, TypeChecker, TypeError,
+    VariantShape,
+    annotation::{AccessPolicy, deprecated_lint},
+    const_term::ConstTerm,
+    decls::{
+        CallableDef, CallableId, CallableRef, CallableSig, NominalKey, VariantPayload,
+        VariantSchema, nominal_generic_args, nominal_type, nominal_type_with_args, owner_template,
+    },
+    infer::GenericSolverSeeds,
 };
 use crate::{
-    ast::{Ident, NominalKind, Type},
+    ast::{FuncParam, Ident, NominalKind, ReturnSpec, Type},
     span::Span,
 };
 
@@ -22,16 +29,144 @@ impl ResolvedEnumVariant {
         nominal_type(&self.key)
     }
 
-    pub(super) fn owner_args_from_expected(
-        &self,
-        expected: &Type,
-        tc: &TypeChecker,
-    ) -> Option<GenericArgs> {
-        if tc.decls.key_for_type(expected).as_ref() != Some(&self.key) {
+    pub(super) fn owner_args_from_type(&self, ty: &Type, tc: &TypeChecker) -> Option<GenericArgs> {
+        if tc.decls.key_for_type(ty).as_ref() != Some(&self.key) {
             return None;
         }
-        nominal_generic_args(expected)
+        let args = nominal_generic_args(ty)?;
+        let has_type_args = args.type_args.len() == self.generics.type_params.len();
+        let has_const_args = args.const_args.len() == self.generics.const_params.len();
+        (has_type_args && has_const_args).then_some(args)
     }
+
+    fn owner_ty_from_args(&self, args: &GenericArgs) -> Option<Type> {
+        let const_args = ConstTerm::to_args_no_infer(&args.const_args)?;
+        Some(nominal_type_with_args(
+            &self.key,
+            &args.type_args,
+            &const_args,
+        ))
+    }
+}
+
+pub(super) enum VariantPayloadRef<'a> {
+    Unit,
+    Tuple(&'a [Type]),
+    Struct(&'a HashMap<Ident, FieldSchema>),
+}
+
+pub(super) fn expect_shape<'a>(
+    tc: &mut TypeChecker,
+    resolved: &'a ResolvedEnumVariant,
+    expected: VariantShape,
+    span: Span,
+) -> Option<VariantPayloadRef<'a>> {
+    let payload = match (&resolved.schema.payload, expected) {
+        (VariantPayload::Unit, VariantShape::Unit) => VariantPayloadRef::Unit,
+        (VariantPayload::Tuple(types), VariantShape::Tuple) => VariantPayloadRef::Tuple(types),
+        (VariantPayload::Struct(fields), VariantShape::Struct) => VariantPayloadRef::Struct(fields),
+        _ => {
+            push_shape_mismatch(tc, resolved, expected, span);
+            return None;
+        }
+    };
+    Some(payload)
+}
+
+pub(super) fn expect_unit(
+    tc: &mut TypeChecker,
+    resolved: &ResolvedEnumVariant,
+    span: Span,
+) -> bool {
+    expect_shape(tc, resolved, VariantShape::Unit, span).is_some()
+}
+
+pub(super) fn expect_tuple<'a>(
+    tc: &mut TypeChecker,
+    resolved: &'a ResolvedEnumVariant,
+    span: Span,
+) -> Option<&'a [Type]> {
+    match expect_shape(tc, resolved, VariantShape::Tuple, span) {
+        Some(VariantPayloadRef::Tuple(types)) => Some(types),
+        _ => None,
+    }
+}
+
+pub(super) fn tuple_callable_ref(
+    resolved: &ResolvedEnumVariant,
+    payload_types: &[Type],
+    owner_args: GenericArgs,
+) -> CallableRef {
+    let params = payload_types
+        .iter()
+        .cloned()
+        .map(FuncParam::immut)
+        .collect();
+    let ret = owner_template(&resolved.key, &resolved.generics);
+
+    CallableRef {
+        def: CallableDef {
+            id: CallableId::enum_variant(resolved.key.clone(), resolved.variant),
+            sig: CallableSig {
+                owner_generics: resolved.generics.clone(),
+                generics: GenericParams::default(),
+                required_params: payload_types.len(),
+                params,
+                ret: ReturnSpec::value(ret),
+            },
+        },
+        receiver_ty: None,
+        owner_args,
+    }
+}
+
+pub(super) fn expect_struct<'a>(
+    tc: &mut TypeChecker,
+    resolved: &'a ResolvedEnumVariant,
+    span: Span,
+) -> Option<&'a HashMap<Ident, FieldSchema>> {
+    match expect_shape(tc, resolved, VariantShape::Struct, span) {
+        Some(VariantPayloadRef::Struct(fields)) => Some(fields),
+        _ => None,
+    }
+}
+
+pub(super) fn solve_unit_owner_ty(
+    tc: &mut TypeChecker,
+    resolved: &ResolvedEnumVariant,
+    explicit_args: Option<&GenericArgs>,
+    expected: Option<&Type>,
+    span: Span,
+) -> Option<Type> {
+    let seeds = explicit_args.map_or_else(GenericSolverSeeds::default, |args| {
+        GenericSolverSeeds::from_args(&resolved.generics, args)
+    });
+    let vars = tc
+        .solver
+        .generic_solver_vars(&resolved.generics, &seeds, tc.error_span(span));
+
+    if let Some(expected) =
+        expected.filter(|ty| tc.decls.key_for_type(ty).as_ref() == Some(&resolved.key))
+    {
+        let template = owner_template(&resolved.key, &resolved.generics);
+        let template = tc.solver.instantiate_generic_type(&template, &vars);
+        let expected = tc.type_handle(expected);
+        tc.expect_equal(span, template, expected);
+    }
+    if tc.solve_constraints() {
+        return None;
+    }
+    let args = match tc.solver.finalize_generic_args(&resolved.generics, &vars) {
+        Ok(args) => args,
+        Err(unbound) => {
+            tc.push_unbound_generic_errors(unbound, span);
+            return None;
+        }
+    };
+    if !tc.check_generic_bounds(&resolved.generics, &args, span) {
+        return None;
+    }
+    resolved.owner_ty_from_args(&args)
 }
 
 pub(super) fn resolve_use(
@@ -79,7 +214,7 @@ fn resolved_use_lint(
         return Some(deprecated_lint(
             DeprecatedUseKind::EnumVariant,
             variant,
-            variant_policy.deprecated_reason().map(str::to_string),
+            variant_policy.deprecated_reason(),
             span,
         ));
     }
@@ -87,7 +222,7 @@ fn resolved_use_lint(
         deprecated_lint(
             DeprecatedUseKind::Enum,
             enum_name,
-            enum_policy.deprecated_reason().map(str::to_string),
+            enum_policy.deprecated_reason(),
             span,
         )
     })
@@ -174,7 +309,7 @@ fn resolve_inferred_pattern(
     }
 }
 
-pub(super) fn push_shape_mismatch(
+fn push_shape_mismatch(
     tc: &mut TypeChecker,
     resolved: &ResolvedEnumVariant,
     expected: VariantShape,

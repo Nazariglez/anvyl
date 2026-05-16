@@ -485,16 +485,6 @@ enum ConstraintKind {
     Assignable { from: TypeRef, to: TypeRef },
 }
 
-impl ConstraintKind {
-    fn is_equal(&self) -> bool {
-        matches!(self, Self::Equal(..))
-    }
-
-    fn is_assignable(&self) -> bool {
-        matches!(self, Self::Assignable { .. })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SolveError {
     TypeMismatch {
@@ -1204,10 +1194,10 @@ impl Solver {
         let constraints = std::mem::take(&mut self.constraints);
         let equal = constraints
             .iter()
-            .filter(|constraint| constraint.kind.is_equal());
+            .filter(|constraint| matches!(constraint.kind, ConstraintKind::Equal(..)));
         let assignable = constraints
             .iter()
-            .filter(|constraint| constraint.kind.is_assignable());
+            .filter(|constraint| matches!(constraint.kind, ConstraintKind::Assignable { .. }));
         let mut errors = vec![];
 
         for constraint in equal.chain(assignable) {

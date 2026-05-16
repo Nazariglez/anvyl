@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variant 'B' for enum 'State'
+
+enum State { A }
+
+fn main() {
+    let s = State.A;
+    match s {
+        State.B => 1,
+        _ => 0,
+    };
+}

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected 'int', found 'string'
+
+enum Box<T> { Empty }
+
+fn main() {
+    let x: Box<string> = <Box<int>>.Empty;
+}

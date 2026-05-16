@@ -1,14 +1,72 @@
 use super::{
-    DynContainerConversionKind, DynConversionFact, DynWeakeningFact, TypeChecker, TypeError,
-    TypeHandle,
+    CastConversionMatch, CheckedType, DynContainerConversionKind, DynConversionFact,
+    DynWeakeningFact, EscapeMode, TypeChecker, TypeError, TypeHandle,
+    check_value_expr_checked_with_hint, checked_from_type,
     contracts::{self, ContractMatchError, RequirementError},
+    type_ops::TypeVisitor,
 };
 use crate::{
-    ast::{ContractRef, ExprId, Ident, Type},
+    ast::{CastNode, ContractRef, ExprId, ExprNode, Ident, Type},
     span::Span,
 };
 
-pub(super) fn expect_assignable(
+#[derive(Clone, Copy)]
+enum ExplicitCast {
+    Identity,
+    Builtin,
+    CastFrom { escape: EscapeMode },
+}
+
+impl TypeChecker {
+    pub(super) fn expect_assignable(&mut self, span: Span, from: TypeHandle, to: TypeHandle) {
+        expect_assignable(self, span, None, from, to);
+    }
+
+    pub(super) fn expect_assignable_expr(
+        &mut self,
+        span: Span,
+        expr_id: ExprId,
+        from: TypeHandle,
+        to: TypeHandle,
+    ) {
+        expect_assignable(self, span, Some(expr_id), from, to);
+    }
+
+    pub(super) fn expect_equal(&mut self, span: Span, left: TypeHandle, right: TypeHandle) {
+        self.solver
+            .add_handle_equal(self.error_span(span), left, right);
+    }
+
+    fn explicit_cast_conversion(&mut self, source: &Type, target: &Type) -> Option<ExplicitCast> {
+        if source == target {
+            return Some(ExplicitCast::Identity);
+        }
+        if builtin_numeric_cast(source, target) {
+            return Some(ExplicitCast::Builtin);
+        }
+        self.cast_from_conversion_escape(source, target)
+            .map(|escape| ExplicitCast::CastFrom { escape })
+    }
+
+    pub(super) fn cast_from_conversion_escape(
+        &mut self,
+        source: &Type,
+        target: &Type,
+    ) -> Option<EscapeMode> {
+        match self
+            .decls
+            .find_cast_conversion(source, target, |ext| self.extend_visible(ext))
+        {
+            Some(CastConversionMatch::Match { escape, origin }) => {
+                self.mark_activation_imports_used(&origin);
+                Some(escape)
+            }
+            Some(CastConversionMatch::Ambiguous) | None => None,
+        }
+    }
+}
+
+fn expect_assignable(
     tc: &mut TypeChecker,
     span: Span,
     expr_id: Option<ExprId>,
@@ -79,26 +137,14 @@ fn dyn_elem_mismatch(from: &Type, to: &Type) -> bool {
 }
 
 fn contains_dyn(ty: &Type) -> bool {
-    match ty {
-        Type::Dyn(_) => true,
-        Type::Func { params, ret } => {
-            params.iter().any(|param| contains_dyn(&param.ty)) || contains_dyn(&ret.ty)
-        }
-        Type::Tuple(elems) => elems.iter().any(contains_dyn),
-        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => contains_dyn(elem),
-        Type::Map { key, value } => contains_dyn(key) || contains_dyn(value),
-        Type::Nominal(nominal) => nominal.type_args.iter().any(contains_dyn),
-        Type::Infer
-        | Type::InferReturn
-        | Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Var(_)
-        | Type::UnresolvedName(_)
-        | Type::UnresolvedNominal { .. } => false,
+    DynTypeVisitor.visit_type(ty)
+}
+
+struct DynTypeVisitor;
+
+impl TypeVisitor for DynTypeVisitor {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        matches!(ty, Type::Dyn(_))
     }
 }
 
@@ -299,4 +345,45 @@ fn requirement_error_detail(name: Ident, error: &RequirementError) -> String {
         RequirementError::Return { .. } => "has an incompatible return type",
     };
     format!("method '{name}' {reason}")
+}
+
+fn builtin_numeric_cast(source: &Type, target: &Type) -> bool {
+    matches!(
+        (source, target),
+        (Type::Int, Type::Float) | (Type::Float, Type::Int)
+    )
+}
+
+pub(super) fn check_cast_expr(
+    expr: &ExprNode,
+    cast: &CastNode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
+    let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
+    let from = checked.ty;
+    let conversion = tc.explicit_cast_conversion(&from, &target);
+    match conversion {
+        Some(ExplicitCast::Identity) => tc
+            .closure
+            .copy_expr_flow(cast.node.expr.node.id, expr.node.id),
+        Some(ExplicitCast::CastFrom { escape }) => {
+            tc.check_argument_escape(&cast.node.expr, escape);
+        }
+        Some(ExplicitCast::Builtin) | None => {}
+    }
+    let ty = if conversion.is_some() || matches!(from, Type::Infer) || matches!(target, Type::Infer)
+    {
+        target
+    } else {
+        tc.push_error(TypeError::InvalidCast {
+            from,
+            to: target,
+            span: tc.error_span(cast.span),
+        });
+        Type::Infer
+    };
+    let mut casted = checked_from_type(expr, ty, tc);
+    casted.contains_extern_any = checked.contains_extern_any;
+    casted
 }

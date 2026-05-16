@@ -1,20 +1,19 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use super::{
-    ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, Specificity, TypeSubst, annotation,
-    compare_specificity,
+    ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, TypeSubst, annotation,
     const_term::ConstTerm,
-    infer::{GenericSolverSeeds, Solver},
-    substitute,
-    type_ops::{TypeFolder, type_depends_on_generics},
+    generic_template_type, match_cast_conversion, same_extend_target, substitute,
+    surface::{dependent_embed_template_valid, projection_entry_valid},
+    type_ops::type_depends_on_generics,
     type_refs::{GenericParamError, GenericTypeContext, TypeRefError, TypeRefResolver},
 };
 use crate::{
     ast::{
-        self, AggregateKind, ArrayLen, ConstArg, ConstParam, ContractRef, EscapeMode, FuncParam,
-        GenericArg, Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin,
-        Mutability, NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type, TypeParam,
-        VariantKind, Visibility,
+        self, AggregateKind, ConstArg, ConstParam, ContractRef, EscapeMode, FuncParam, GenericArg,
+        Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
+        NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type, TypeParam, VariantKind,
+        Visibility,
     },
     externs::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
@@ -22,10 +21,7 @@ use crate::{
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveResult, SourceFileId},
     source::SourceId,
     span::{SourceSpan, Span},
-    typecheck::{
-        CanonicalTypeKey, Exposure, PromotedAlias, PromotedFieldAlias, PromotedMethodAlias,
-        PromotedSurface, SurfaceSlot, annotation::AccessPolicy,
-    },
+    typecheck::{CanonicalTypeKey, Exposure, PromotedSurface, annotation::AccessPolicy},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -955,7 +951,7 @@ impl ImportScopeBuilder {
                     self.copy_wildcard_members(
                         &dep.exports,
                         span,
-                        self.origin(source.clone(), import_id),
+                        &self.origin(source.clone(), import_id),
                     );
                 }
             }
@@ -1030,7 +1026,7 @@ impl ImportScopeBuilder {
         &mut self,
         source: &Namespace,
         span: Option<SourceSpan>,
-        origin: BindingOrigin,
+        origin: &BindingOrigin,
     ) {
         for (name, key) in &source.types {
             self.insert_type(*name, key.clone(), origin.clone(), span);
@@ -1985,56 +1981,6 @@ impl DeclarationIndex {
         errors
     }
 
-    pub(crate) fn build_promoted_surfaces(&mut self, externs: &ExternCatalog) -> Vec<DeclError> {
-        self.build_dependent_embed_templates();
-        let mut builder = SurfaceBuilder::new(self, externs);
-        let mut keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
-        keys.sort_by_key(nominal_key_sort_key);
-        for key in &keys {
-            builder.build(key, None);
-        }
-        let SurfaceBuilder {
-            surfaces, errors, ..
-        } = builder;
-        for (key, surface) in surfaces {
-            if let Some(aggregate) = self.aggregates.get_mut(&key) {
-                aggregate.promoted = surface;
-            }
-        }
-        errors
-    }
-
-    fn build_dependent_embed_templates(&mut self) {
-        let mut keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
-        keys.sort_by_key(nominal_key_sort_key);
-        for key in keys {
-            let Some(schema) = self.aggregates.get(&key) else {
-                continue;
-            };
-            let mut templates = vec![];
-            let mut fields = schema.fields.iter().collect::<Vec<_>>();
-            fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-            for (name, field) in fields {
-                let Some(embed) = &field.embed else {
-                    continue;
-                };
-                if !type_depends_on_generics(&field.ty) {
-                    continue;
-                }
-                templates.push(DependentEmbedTemplate {
-                    field_path: vec![*name],
-                    target_ty: field.ty.clone(),
-                    selector: embed.selector.clone(),
-                    exposure: embed.exposure,
-                    span: embed.span,
-                });
-            }
-            if let Some(schema) = self.aggregates.get_mut(&key) {
-                schema.dependent_embeds = templates;
-            }
-        }
-    }
-
     pub(crate) fn type_span(&self, key: &NominalKey) -> Option<Span> {
         self.type_spans.get(key).copied()
     }
@@ -2900,7 +2846,7 @@ impl DeclarationIndex {
         builder.copy_wildcard_members(
             &decls.exports,
             None,
-            ImportScopeBuilder::implicit_origin(core.clone()),
+            &ImportScopeBuilder::implicit_origin(core.clone()),
         );
         builder.active_modules.insert(core);
     }
@@ -3212,11 +3158,10 @@ impl DeclarationIndex {
         self.modules
             .get(module)
             .and_then(|decls| decls.imports.active_module_imports.get(imported))
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[], Vec::as_slice)
     }
 
-    pub(crate) fn set_const_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
+    pub(crate) fn set_const_type(&mut self, scope: &ModuleScope, name: Ident, ty: &Type) {
         self.update_values(|value| {
             if value.module == *scope
                 && value.name == name
@@ -3227,7 +3172,7 @@ impl DeclarationIndex {
         });
     }
 
-    pub(crate) fn set_func_type(&mut self, scope: &ModuleScope, name: Ident, ty: Type) {
+    pub(crate) fn set_func_type(&mut self, scope: &ModuleScope, name: Ident, ty: &Type) {
         self.update_values(|value| {
             if value.module == *scope
                 && value.name == name
@@ -3238,7 +3183,7 @@ impl DeclarationIndex {
         });
     }
 
-    pub(crate) fn set_global_type(&mut self, key: &GlobalKey, ty: Type) {
+    pub(crate) fn set_global_type(&mut self, key: &GlobalKey, ty: &Type) {
         self.update_values(|value| {
             if let ValueDecl::Global(sig) = &mut value.decl
                 && sig.key == *key
@@ -3285,21 +3230,6 @@ impl DeclarationIndex {
 
     pub(crate) fn aggregate_mut(&mut self, key: &NominalKey) -> Option<&mut AggregateSchema> {
         self.aggregates.get_mut(key)
-    }
-
-    pub(crate) fn promoted_surface_for(
-        &self,
-        receiver: &Type,
-        externs: &ExternCatalog,
-    ) -> Option<(PromotedSurface, Vec<DeclError>)> {
-        let key = self.key_for_type(receiver)?;
-        let aggregate = self.aggregate(&key)?;
-        if aggregate.dependent_embeds.is_empty() {
-            return Some((aggregate.promoted.clone(), vec![]));
-        }
-        let mut builder = SurfaceBuilder::new(self, externs);
-        let surface = builder.build_type(receiver, None);
-        Some((surface, builder.errors))
     }
 
     pub(crate) fn projection_from(&self, source: &Type, target: &Type) -> ProjectionLookup {
@@ -3661,53 +3591,9 @@ impl DeclarationIndex {
         receiver: &Type,
         name: Ident,
     ) -> Option<ExtendMethodMatch<'_>> {
-        self.find_instance_extend_method(receiver, name, |ext| {
+        self.find_extend_method(MethodSurface::Instance, receiver, name, |ext| {
             ext.exported && self.module_surface_contains(module, &ext.origin)
         })
-    }
-
-    pub(crate) fn find_instance_extend_method<F>(
-        &self,
-        receiver: &Type,
-        name: Ident,
-        visible: F,
-    ) -> Option<ExtendMethodMatch<'_>>
-    where
-        F: FnMut(&ExtendSchema) -> bool,
-    {
-        self.find_extend_method(MethodSurface::Instance, receiver, name, visible)
-    }
-
-    pub(crate) fn find_static_extend_method<F>(
-        &self,
-        target: &Type,
-        name: Ident,
-        visible: F,
-    ) -> Option<ExtendMethodMatch<'_>>
-    where
-        F: FnMut(&ExtendSchema) -> bool,
-    {
-        self.find_extend_method(MethodSurface::Static, target, name, visible)
-    }
-
-    fn find_extend_method<F>(
-        &self,
-        surface: MethodSurface,
-        subject: &Type,
-        name: Ident,
-        mut visible: F,
-    ) -> Option<ExtendMethodMatch<'_>>
-    where
-        F: FnMut(&ExtendSchema) -> bool,
-    {
-        let method_key = MethodKey::new(name, surface);
-        let candidates = self
-            .extends()
-            .filter(|ext| visible(ext))
-            .filter_map(|ext| extend_candidate(ext, method_key, subject))
-            .collect::<Vec<_>>();
-
-        select_extend_candidate(candidates)
     }
 
     pub(crate) fn callable_for_value(&self, value: &ResolvedValue) -> Option<CallableRef> {
@@ -3883,37 +3769,6 @@ impl DeclarationIndex {
             owner_args,
         }
     }
-
-    pub(crate) fn callable_for_variant(
-        &self,
-        enum_key: &NominalKey,
-        variant: Ident,
-        schema: &VariantSchema,
-    ) -> Option<CallableRef> {
-        let params = match &schema.payload {
-            VariantPayload::Unit => vec![],
-            VariantPayload::Tuple(types) => types.iter().cloned().map(FuncParam::immut).collect(),
-            VariantPayload::Struct(_) => return None,
-        };
-        let enum_schema = self.enum_schema(enum_key)?;
-        let owner_generics = enum_schema.generics.clone();
-        let ret = owner_template(enum_key, &owner_generics);
-
-        Some(CallableRef {
-            def: CallableDef {
-                id: CallableId::enum_variant(enum_key.clone(), variant),
-                sig: CallableSig {
-                    owner_generics,
-                    generics: GenericParams::default(),
-                    required_params: params.len(),
-                    params,
-                    ret: ReturnSpec::value(ret),
-                },
-            },
-            receiver_ty: None,
-            owner_args: GenericArgs::default(),
-        })
-    }
 }
 
 pub(crate) fn substitute_aggregate_member(
@@ -3989,182 +3844,6 @@ pub(crate) fn owner_template(owner: &NominalKey, generics: &GenericParams) -> Ty
     nominal_type_with_args(owner, &type_args, &const_args)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExtendReceiverMatch {
-    Exact,
-    SliceView,
-}
-
-struct ExtendCandidate<'a> {
-    extend: &'a ExtendSchema,
-    method: &'a ExtendMethodSchema,
-    target: Type,
-    receiver_ty: Type,
-    owner_args: Result<GenericArgs, Vec<Ident>>,
-    receiver_match: ExtendReceiverMatch,
-}
-
-type GenericTemplateMatch = Result<GenericArgs, Vec<Ident>>;
-
-fn extend_candidate<'a>(
-    ext: &'a ExtendSchema,
-    method_key: MethodKey,
-    subject: &Type,
-) -> Option<ExtendCandidate<'a>> {
-    let method = ext.methods.get(&method_key)?;
-    let target = generic_template_type(&ext.target, &ext.generics);
-    let (receiver_ty, owner_args, receiver_match) =
-        extend_receiver_match(&ext.generics, &target, subject, method_key.surface)?;
-    Some(ExtendCandidate {
-        extend: ext,
-        method,
-        target,
-        receiver_ty,
-        owner_args,
-        receiver_match,
-    })
-}
-
-fn extend_receiver_match(
-    generics: &GenericParams,
-    target: &Type,
-    subject: &Type,
-    surface: MethodSurface,
-) -> Option<(Type, Result<GenericArgs, Vec<Ident>>, ExtendReceiverMatch)> {
-    if surface == MethodSurface::Static && static_nominal_family_match(target, subject) {
-        return Some((
-            subject.clone(),
-            Ok(GenericArgs::default()),
-            ExtendReceiverMatch::Exact,
-        ));
-    }
-
-    match match_generic_template_args(generics, target, subject) {
-        Some(owner_args) => return Some((subject.clone(), owner_args, ExtendReceiverMatch::Exact)),
-        None if surface != MethodSurface::Instance => return None,
-        None => {}
-    }
-    let Type::Slice { elem: target_elem } = target else {
-        return None;
-    };
-    let (Type::List { elem: subject_elem }
-    | Type::Array {
-        elem: subject_elem, ..
-    }) = subject
-    else {
-        return None;
-    };
-    let receiver_ty = Type::Slice {
-        elem: subject_elem.clone(),
-    };
-    let owner_args = match_generic_template_args(generics, target_elem, subject_elem)?;
-    Some((receiver_ty, owner_args, ExtendReceiverMatch::SliceView))
-}
-
-fn static_nominal_family_match(target: &Type, subject: &Type) -> bool {
-    let (Type::Nominal(target), Type::Nominal(subject)) = (target, subject) else {
-        return false;
-    };
-    target.kind == subject.kind
-        && target.name == subject.name
-        && target.origin == subject.origin
-        && subject.type_args.is_empty()
-        && subject.const_args.is_empty()
-}
-
-fn select_extend_candidate(
-    mut candidates: Vec<ExtendCandidate<'_>>,
-) -> Option<ExtendMethodMatch<'_>> {
-    if candidates
-        .iter()
-        .any(|candidate| candidate.receiver_match == ExtendReceiverMatch::Exact)
-    {
-        candidates.retain(|candidate| candidate.receiver_match == ExtendReceiverMatch::Exact);
-    }
-
-    match candidates.len() {
-        0 => None,
-        1 => {
-            let candidate = candidates.pop().expect("one extend candidate");
-            Some(ExtendMethodMatch::Match {
-                extend: candidate.extend,
-                method: candidate.method,
-                receiver_ty: candidate.receiver_ty,
-                owner_args: candidate.owner_args,
-            })
-        }
-        _ => Some(most_specific_extend(candidates)),
-    }
-}
-
-fn match_generic_template_args(
-    generics: &GenericParams,
-    template: &Type,
-    concrete: &Type,
-) -> Option<GenericTemplateMatch> {
-    match_cast_conversion(generics, template, concrete, template, concrete)
-}
-
-fn match_cast_conversion(
-    generics: &GenericParams,
-    source_template: &Type,
-    source: &Type,
-    target_template: &Type,
-    target: &Type,
-) -> Option<GenericTemplateMatch> {
-    let span = None;
-    if generics.is_empty() {
-        return (source_template == source && target_template == target)
-            .then(|| Ok(GenericArgs::default()));
-    }
-
-    let mut solver = Solver::default();
-    let seeds = GenericSolverSeeds::default();
-    let vars = solver.generic_solver_vars(generics, &seeds, span);
-    let source_template = solver.instantiate_generic_type(source_template, &vars);
-    let target_template = solver.instantiate_generic_type(target_template, &vars);
-    let source = solver.concrete_type(source);
-    let target = solver.concrete_type(target);
-    solver.add_handle_equal(span, source_template, source);
-    solver.add_handle_equal(span, target_template, target);
-    if !solver.solve_pending().is_empty() {
-        return None;
-    }
-
-    Some(solver.finalize_generic_args(generics, &vars))
-}
-
-fn most_specific_extend(mut candidates: Vec<ExtendCandidate<'_>>) -> ExtendMethodMatch<'_> {
-    let winner = (1..candidates.len()).fold(0, |best, i| {
-        if more_specific(&candidates[i].target, &candidates[best].target) {
-            i
-        } else {
-            best
-        }
-    });
-
-    let winner_target = &candidates[winner].target;
-    let dominates_all = candidates
-        .iter()
-        .enumerate()
-        .all(|(i, candidate)| i == winner || more_specific(winner_target, &candidate.target));
-    if !dominates_all {
-        return ExtendMethodMatch::Ambiguous;
-    }
-
-    let candidate = candidates.swap_remove(winner);
-    ExtendMethodMatch::Match {
-        extend: candidate.extend,
-        method: candidate.method,
-        receiver_ty: candidate.receiver_ty,
-        owner_args: candidate.owner_args,
-    }
-}
-
-fn more_specific(a: &Type, b: &Type) -> bool {
-    compare_specificity(a, b) == Specificity::MoreSpecific
-}
-
 impl DeclarationIndex {
     pub(crate) fn finalize_type_ref(
         &self,
@@ -4238,86 +3917,6 @@ fn sync_namespace_values(
     }
 }
 
-struct GenericTemplate {
-    generics: GenericTypeContext,
-}
-
-impl TypeFolder for GenericTemplate {
-    fn fold_unresolved_name(&mut self, name: Ident) -> Type {
-        self.generics
-            .type_param(name)
-            .map_or(Type::UnresolvedName(name), Type::Var)
-    }
-
-    fn fold_unresolved_nominal(
-        &mut self,
-        qualifier: Option<Ident>,
-        name: Ident,
-        generic_args: &[GenericArg],
-    ) -> Type {
-        if qualifier.is_none()
-            && generic_args.is_empty()
-            && let Some(id) = self.generics.type_param(name)
-        {
-            return Type::Var(id);
-        }
-        self.fold_unresolved_nominal_default(qualifier, name, generic_args)
-    }
-
-    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
-        match arg {
-            ConstArg::Name(name) => self
-                .generics
-                .const_param(*name)
-                .map_or_else(|| arg.clone(), ConstArg::Param),
-            ConstArg::Value(_) | ConstArg::Param(_) => arg.clone(),
-        }
-    }
-
-    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
-        match len {
-            ArrayLen::Named(name) => self
-                .generics
-                .const_param(name)
-                .map_or(ArrayLen::Named(name), ArrayLen::Param),
-            other => other,
-        }
-    }
-}
-
-pub(crate) fn same_extend_target(
-    a: &Type,
-    a_generics: &GenericParams,
-    b: &Type,
-    b_generics: &GenericParams,
-) -> bool {
-    let Some(a_template) = try_generic_template_type(a, a_generics) else {
-        return false;
-    };
-    let Some(b_template) = try_generic_template_type(b, b_generics) else {
-        return false;
-    };
-    match_generic_template_args(a_generics, &a_template, &b_template).is_some()
-        && match_generic_template_args(b_generics, &b_template, &a_template).is_some()
-}
-
-fn try_generic_template_type(ty: &Type, generics: &GenericParams) -> Option<Type> {
-    let generics =
-        GenericTypeContext::try_from_params(&generics.type_params, &generics.const_params).ok()?;
-    Some(GenericTemplate { generics }.fold_type(ty))
-}
-
-pub(crate) fn generic_template_type(ty: &Type, generics: &GenericParams) -> Type {
-    GenericTemplate {
-        generics: GenericTypeContext::try_from_params(
-            &generics.type_params,
-            &generics.const_params,
-        )
-        .expect("generic_template_type requires validated generic params"),
-    }
-    .fold_type(ty)
-}
-
 pub(crate) fn generic_params(
     type_params: &[TypeParam],
     const_params: &[ConstParam],
@@ -4375,818 +3974,7 @@ pub(crate) fn required_param_count(params: &[Param]) -> usize {
         .unwrap_or(params.len())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SurfaceState {
-    Visiting,
-    Done,
-}
-
-struct SurfaceBuilder<'a> {
-    decls: &'a DeclarationIndex,
-    externs: &'a ExternCatalog,
-    states: HashMap<NominalKey, SurfaceState>,
-    surfaces: HashMap<NominalKey, PromotedSurface>,
-    type_states: HashMap<CanonicalTypeKey, SurfaceState>,
-    type_surfaces: HashMap<CanonicalTypeKey, PromotedSurface>,
-    reported_cycles: HashSet<NominalKey>,
-    errors: Vec<DeclError>,
-}
-
-impl<'a> SurfaceBuilder<'a> {
-    fn new(decls: &'a DeclarationIndex, externs: &'a ExternCatalog) -> Self {
-        Self {
-            decls,
-            externs,
-            states: HashMap::new(),
-            surfaces: HashMap::new(),
-            type_states: HashMap::new(),
-            type_surfaces: HashMap::new(),
-            reported_cycles: HashSet::new(),
-            errors: vec![],
-        }
-    }
-
-    fn build(&mut self, key: &NominalKey, cycle_span: Option<SourceSpan>) -> PromotedSurface {
-        match self.states.get(key).copied() {
-            Some(SurfaceState::Done) => {
-                return self.surfaces.get(key).cloned().unwrap_or_default();
-            }
-            Some(SurfaceState::Visiting) => {
-                if self.reported_cycles.insert(key.clone()) {
-                    self.errors.push(DeclError::EmbedSurfaceCycle {
-                        owner: key.clone(),
-                        target: key.clone(),
-                        span: cycle_span,
-                    });
-                }
-                return PromotedSurface::default();
-            }
-            None => {}
-        }
-
-        self.states.insert(key.clone(), SurfaceState::Visiting);
-        let mut surface = PromotedSurface::default();
-        let Some(schema) = self.decls.aggregates.get(key) else {
-            self.states.insert(key.clone(), SurfaceState::Done);
-            self.surfaces.insert(key.clone(), surface.clone());
-            return surface;
-        };
-
-        let mut fields = schema.fields.iter().collect::<Vec<_>>();
-        fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-        for (name, field) in fields {
-            self.add_embed_members(&mut surface, *name, field);
-        }
-        self.merge_surface(key, schema, &mut surface);
-        surface.sort();
-        self.states.insert(key.clone(), SurfaceState::Done);
-        self.surfaces.insert(key.clone(), surface.clone());
-        surface
-    }
-
-    fn build_type(&mut self, ty: &Type, cycle_span: Option<SourceSpan>) -> PromotedSurface {
-        let cache_key = CanonicalTypeKey(ty.clone());
-        match self.type_states.get(&cache_key).copied() {
-            Some(SurfaceState::Done) => {
-                return self
-                    .type_surfaces
-                    .get(&cache_key)
-                    .cloned()
-                    .unwrap_or_default();
-            }
-            Some(SurfaceState::Visiting) => {
-                if let Some(key) = self.decls.key_for_type(ty)
-                    && self.reported_cycles.insert(key.clone())
-                {
-                    self.errors.push(DeclError::EmbedSurfaceCycle {
-                        owner: key.clone(),
-                        target: key,
-                        span: cycle_span,
-                    });
-                }
-                return PromotedSurface::default();
-            }
-            None => {}
-        }
-
-        let Some(key) = self.decls.key_for_type(ty) else {
-            return PromotedSurface::default();
-        };
-        let Some(schema) = self.decls.aggregates.get(&key) else {
-            return PromotedSurface::default();
-        };
-
-        self.type_states
-            .insert(cache_key.clone(), SurfaceState::Visiting);
-        let mut surface = self.build(&key, cycle_span);
-        for template in &schema.dependent_embeds {
-            self.add_dependent_embed(&mut surface, ty, schema, template);
-        }
-        self.merge_surface(&key, schema, &mut surface);
-        surface.sort();
-        self.type_states
-            .insert(cache_key.clone(), SurfaceState::Done);
-        self.type_surfaces.insert(cache_key, surface.clone());
-        surface
-    }
-
-    fn add_dependent_embed(
-        &mut self,
-        surface: &mut PromotedSurface,
-        owner_ty: &Type,
-        schema: &AggregateSchema,
-        template: &DependentEmbedTemplate,
-    ) {
-        let Some(embed_name) = template.field_path.first().copied() else {
-            return;
-        };
-        let target_ty =
-            substitute_aggregate_member(owner_ty, &schema.generics, &template.target_ty);
-        if !concrete_surface_type(&target_ty) {
-            return;
-        }
-        let field = FieldSchema {
-            ty: target_ty,
-            has_default: false,
-            policy: AccessPolicy::default(),
-            span: Some(template.span),
-            embed: Some(EmbedFieldSchema {
-                selector: template.selector.clone(),
-                exposure: template.exposure,
-                as_projection: false,
-                span: template.span,
-            }),
-        };
-        self.add_embed_members(surface, embed_name, &field);
-    }
-
-    fn add_embed_members(
-        &mut self,
-        surface: &mut PromotedSurface,
-        embed_name: Ident,
-        field: &FieldSchema,
-    ) {
-        let Some(embed) = &field.embed else {
-            return;
-        };
-        if !concrete_surface_type(&field.ty) {
-            return;
-        }
-
-        let Some(target_key) = self.decls.key_for_type(&field.ty) else {
-            if let Some(selector) = &embed.selector {
-                self.add_unknown_selector_errors(field, selector);
-            }
-            return;
-        };
-        match &embed.selector {
-            Some(selector) => {
-                self.add_selected_members(surface, embed_name, field, &target_key, selector);
-            }
-            None => match target_key.kind {
-                NominalKind::Struct | NominalKind::DataRef => {
-                    self.add_aggregate_fields(surface, embed_name, field, &target_key);
-                    self.add_aggregate_methods(surface, embed_name, field, &target_key);
-                }
-                NominalKind::Extern => {
-                    self.add_extern_fields(surface, embed_name, field, &target_key);
-                    self.add_extern_methods(surface, embed_name, field, &target_key);
-                }
-                NominalKind::Enum => {}
-            },
-        }
-    }
-
-    fn add_unknown_selector_errors(&mut self, field: &FieldSchema, selector: &ast::EmbedSelector) {
-        for item in &selector.items {
-            let span = SourceSpan::from_byte_span(
-                field.span.expect("embedded field has span").source,
-                item.span,
-            );
-            match item.kind {
-                ast::EmbedSelectorKind::Field => {
-                    self.errors.push(DeclError::UnknownEmbedFieldSelector {
-                        name: item.name,
-                        span: Some(span),
-                    });
-                }
-                ast::EmbedSelectorKind::Method => {
-                    self.errors.push(DeclError::UnknownEmbedMethodSelector {
-                        name: item.name,
-                        span: Some(span),
-                    });
-                }
-            }
-        }
-    }
-
-    fn merge_surface(
-        &mut self,
-        owner: &NominalKey,
-        schema: &AggregateSchema,
-        surface: &mut PromotedSurface,
-    ) {
-        surface.sort();
-        self.merge_field_surface(owner, schema, surface);
-        self.merge_method_surface(owner, schema, surface);
-    }
-
-    fn merge_field_surface(
-        &mut self,
-        owner: &NominalKey,
-        schema: &AggregateSchema,
-        surface: &mut PromotedSurface,
-    ) {
-        let direct_fields = schema.fields.keys().copied().collect::<HashSet<_>>();
-        let mut names = surface.fields.keys().copied().collect::<Vec<_>>();
-        names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for name in names {
-            let Some(slot) = surface.fields.remove(&name) else {
-                continue;
-            };
-            let explicit = explicit_aliases(&slot);
-            if direct_fields.contains(&name) {
-                for alias in explicit {
-                    self.errors.push(DeclError::EmbedFieldConflictsWithDirect {
-                        owner: owner.clone(),
-                        name,
-                        span: alias.selector_span,
-                    });
-                }
-                continue;
-            }
-
-            let aliases = merged_aliases(slot, |alias| {
-                self.errors.push(DeclError::DuplicateExplicitEmbedField {
-                    owner: owner.clone(),
-                    name,
-                    span: alias.selector_span,
-                });
-            });
-            insert_merged_aliases(&mut surface.fields, name, aliases);
-        }
-    }
-
-    fn merge_method_surface(
-        &mut self,
-        owner: &NominalKey,
-        schema: &AggregateSchema,
-        surface: &mut PromotedSurface,
-    ) {
-        let direct_methods = schema
-            .methods
-            .keys()
-            .filter(|key| key.surface == MethodSurface::Instance)
-            .map(|key| key.name)
-            .collect::<HashSet<_>>();
-        let mut names = surface.methods.keys().copied().collect::<Vec<_>>();
-        names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for name in names {
-            let Some(slot) = surface.methods.remove(&name) else {
-                continue;
-            };
-            let explicit = explicit_aliases(&slot);
-            if direct_methods.contains(&name) {
-                for alias in explicit {
-                    self.errors.push(DeclError::EmbedMethodConflictsWithDirect {
-                        owner: owner.clone(),
-                        name,
-                        span: alias.selector_span,
-                    });
-                }
-                continue;
-            }
-
-            let aliases = merged_aliases(slot, |alias| {
-                self.errors.push(DeclError::DuplicateExplicitEmbedMethod {
-                    owner: owner.clone(),
-                    name,
-                    span: alias.selector_span,
-                });
-            });
-            insert_merged_aliases(&mut surface.methods, name, aliases);
-        }
-    }
-
-    fn add_selected_members(
-        &mut self,
-        surface: &mut PromotedSurface,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-        selector: &ast::EmbedSelector,
-    ) {
-        for item in &selector.items {
-            let exposed = item.alias.unwrap_or(item.name);
-            match item.kind {
-                ast::EmbedSelectorKind::Field => {
-                    for alias in self.selected_field_aliases(embed_name, field, target_key, item) {
-                        surface.insert_field(exposed, alias);
-                    }
-                }
-                ast::EmbedSelectorKind::Method => {
-                    for alias in self.selected_method_aliases(embed_name, field, target_key, item) {
-                        surface.insert_method(exposed, alias);
-                    }
-                }
-            }
-        }
-    }
-
-    fn selected_field_aliases(
-        &mut self,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-        item: &ast::EmbedSelectorItem,
-    ) -> Vec<PromotedFieldAlias> {
-        let span = SourceSpan::from_byte_span(
-            field.span.expect("embedded field has span").source,
-            item.span,
-        );
-        match target_key.kind {
-            NominalKind::Struct | NominalKind::DataRef => {
-                self.selected_aggregate_field_aliases(embed_name, field, target_key, item, span)
-            }
-            NominalKind::Extern => {
-                self.selected_extern_field_alias(embed_name, field, target_key, item, span)
-            }
-            NominalKind::Enum => {
-                self.errors.push(DeclError::UnknownEmbedFieldSelector {
-                    name: item.name,
-                    span: Some(span),
-                });
-                vec![]
-            }
-        }
-    }
-
-    fn selected_aggregate_field_aliases(
-        &mut self,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-        item: &ast::EmbedSelectorItem,
-        span: SourceSpan,
-    ) -> Vec<PromotedFieldAlias> {
-        let target_surface = self.build_type(&field.ty, field.span);
-        let Some(target) = self.decls.aggregates.get(target_key) else {
-            self.errors.push(DeclError::UnknownEmbedFieldSelector {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        };
-        if target.fields.contains_key(&item.name) {
-            return vec![PromotedFieldAlias::new(
-                vec![embed_name, item.name],
-                CanonicalTypeKey(field.ty.clone()),
-                item.name,
-                Exposure::Explicit,
-                Some(span),
-            )];
-        }
-        if let Some(slot) = target_surface.fields.get(&item.name) {
-            if slot.ambiguous || slot.aliases.len() != 1 {
-                self.errors.push(DeclError::AmbiguousEmbedFieldSelector {
-                    name: item.name,
-                    span: Some(span),
-                });
-                return vec![];
-            }
-            return vec![slot.aliases[0].with_prefix(embed_name, Exposure::Explicit, Some(span))];
-        }
-        if aggregate_has_method_name(target, &target_surface, item.name) {
-            self.errors.push(DeclError::EmbedFieldSelectorNamesMethod {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        }
-        self.errors.push(DeclError::UnknownEmbedFieldSelector {
-            name: item.name,
-            span: Some(span),
-        });
-        vec![]
-    }
-
-    fn selected_extern_field_alias(
-        &mut self,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-        item: &ast::EmbedSelectorItem,
-        span: SourceSpan,
-    ) -> Vec<PromotedFieldAlias> {
-        let Some(owner) = self.externs.type_by_nominal(target_key) else {
-            self.errors.push(DeclError::UnknownEmbedFieldSelector {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        };
-        if self.externs.field(owner, item.name).is_some() {
-            return vec![PromotedFieldAlias::new(
-                vec![embed_name, item.name],
-                CanonicalTypeKey(field.ty.clone()),
-                item.name,
-                Exposure::Explicit,
-                Some(span),
-            )];
-        }
-        if self.externs.method(owner, item.name).is_some()
-            || self.externs.static_method(owner, item.name).is_some()
-        {
-            self.errors.push(DeclError::EmbedFieldSelectorNamesMethod {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        }
-        self.errors.push(DeclError::UnknownEmbedFieldSelector {
-            name: item.name,
-            span: Some(span),
-        });
-        vec![]
-    }
-
-    fn selected_method_aliases(
-        &mut self,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-        item: &ast::EmbedSelectorItem,
-    ) -> Vec<PromotedMethodAlias> {
-        let span = SourceSpan::from_byte_span(
-            field.span.expect("embedded field has span").source,
-            item.span,
-        );
-        if item.name == to_string_ident() {
-            self.errors
-                .push(DeclError::EmbedMethodSelectorNamesToString { span: Some(span) });
-            return vec![];
-        }
-        match target_key.kind {
-            NominalKind::Struct | NominalKind::DataRef => {
-                self.selected_aggregate_method_aliases(embed_name, field, target_key, item, span)
-            }
-            NominalKind::Extern => {
-                self.selected_extern_method_alias(embed_name, field, target_key, item, span)
-            }
-            NominalKind::Enum => {
-                self.errors.push(DeclError::UnknownEmbedMethodSelector {
-                    name: item.name,
-                    span: Some(span),
-                });
-                vec![]
-            }
-        }
-    }
-
-    fn selected_aggregate_method_aliases(
-        &mut self,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-        item: &ast::EmbedSelectorItem,
-        span: SourceSpan,
-    ) -> Vec<PromotedMethodAlias> {
-        let target_surface = self.build_type(&field.ty, field.span);
-        let Some(target) = self.decls.aggregates.get(target_key) else {
-            self.errors.push(DeclError::UnknownEmbedMethodSelector {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        };
-        if target.methods.contains_key(&MethodKey::instance(item.name)) {
-            return vec![PromotedMethodAlias::new(
-                vec![embed_name],
-                CanonicalTypeKey(field.ty.clone()),
-                item.name,
-                Exposure::Explicit,
-                Some(span),
-            )];
-        }
-        if let Some(slot) = target_surface.methods.get(&item.name) {
-            if slot.ambiguous || slot.aliases.len() != 1 {
-                self.errors.push(DeclError::AmbiguousEmbedMethodSelector {
-                    name: item.name,
-                    span: Some(span),
-                });
-                return vec![];
-            }
-            return vec![slot.aliases[0].with_prefix(embed_name, Exposure::Explicit, Some(span))];
-        }
-        if target.methods.contains_key(&MethodKey::static_(item.name)) {
-            self.errors.push(DeclError::EmbedMethodSelectorNamesStatic {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        }
-        if aggregate_has_field_name(target, &target_surface, item.name) {
-            self.errors.push(DeclError::EmbedMethodSelectorNamesField {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        }
-        self.errors.push(DeclError::UnknownEmbedMethodSelector {
-            name: item.name,
-            span: Some(span),
-        });
-        vec![]
-    }
-
-    fn selected_extern_method_alias(
-        &mut self,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-        item: &ast::EmbedSelectorItem,
-        span: SourceSpan,
-    ) -> Vec<PromotedMethodAlias> {
-        let Some(owner) = self.externs.type_by_nominal(target_key) else {
-            self.errors.push(DeclError::UnknownEmbedMethodSelector {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        };
-        if self.externs.method(owner, item.name).is_some() {
-            return vec![PromotedMethodAlias::new(
-                vec![embed_name],
-                CanonicalTypeKey(field.ty.clone()),
-                item.name,
-                Exposure::Explicit,
-                Some(span),
-            )];
-        }
-        if self.externs.static_method(owner, item.name).is_some() {
-            self.errors.push(DeclError::EmbedMethodSelectorNamesStatic {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        }
-        if self.externs.field(owner, item.name).is_some() {
-            self.errors.push(DeclError::EmbedMethodSelectorNamesField {
-                name: item.name,
-                span: Some(span),
-            });
-            return vec![];
-        }
-        self.errors.push(DeclError::UnknownEmbedMethodSelector {
-            name: item.name,
-            span: Some(span),
-        });
-        vec![]
-    }
-
-    fn add_aggregate_fields(
-        &mut self,
-        surface: &mut PromotedSurface,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-    ) {
-        let target_surface = self.build_type(&field.ty, field.span);
-        let Some(target) = self.decls.aggregates.get(target_key) else {
-            return;
-        };
-
-        let mut direct_fields = target.fields.keys().copied().collect::<Vec<_>>();
-        direct_fields.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for name in direct_fields {
-            let alias = PromotedFieldAlias::new(
-                vec![embed_name, name],
-                CanonicalTypeKey(field.ty.clone()),
-                name,
-                Exposure::Implicit,
-                None,
-            );
-            surface.insert_field(name, alias);
-        }
-
-        for (name, slot) in target_surface.fields {
-            for alias in slot.aliases {
-                surface.insert_field(
-                    name,
-                    alias.with_prefix(embed_name, Exposure::Implicit, None),
-                );
-            }
-        }
-    }
-
-    fn add_aggregate_methods(
-        &mut self,
-        surface: &mut PromotedSurface,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-    ) {
-        let target_surface = self.build_type(&field.ty, field.span);
-        let Some(target) = self.decls.aggregates.get(target_key) else {
-            return;
-        };
-
-        let mut direct_methods = target
-            .methods
-            .keys()
-            .filter(|key| key.surface == MethodSurface::Instance && key.name != to_string_ident())
-            .map(|key| key.name)
-            .collect::<Vec<_>>();
-        direct_methods.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for name in direct_methods {
-            let alias = PromotedMethodAlias::new(
-                vec![embed_name],
-                CanonicalTypeKey(field.ty.clone()),
-                name,
-                Exposure::Implicit,
-                None,
-            );
-            surface.insert_method(name, alias);
-        }
-
-        for (name, slot) in target_surface.methods {
-            for alias in slot.aliases {
-                surface.insert_method(
-                    name,
-                    alias.with_prefix(embed_name, Exposure::Implicit, None),
-                );
-            }
-        }
-    }
-
-    fn add_extern_fields(
-        &self,
-        surface: &mut PromotedSurface,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-    ) {
-        let Some(owner) = self.externs.type_by_nominal(target_key) else {
-            return;
-        };
-        let mut fields = self.externs.ty(owner).fields.iter().collect::<Vec<_>>();
-        fields.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-        for extern_field in fields {
-            let name = extern_field.name;
-            let alias = PromotedFieldAlias::new(
-                vec![embed_name, name],
-                CanonicalTypeKey(field.ty.clone()),
-                name,
-                Exposure::Implicit,
-                None,
-            );
-            surface.insert_field(name, alias);
-        }
-    }
-
-    fn add_extern_methods(
-        &self,
-        surface: &mut PromotedSurface,
-        embed_name: Ident,
-        field: &FieldSchema,
-        target_key: &NominalKey,
-    ) {
-        let Some(owner) = self.externs.type_by_nominal(target_key) else {
-            return;
-        };
-        let mut methods = self.externs.ty(owner).methods.iter().collect::<Vec<_>>();
-        methods.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-        for extern_method in methods {
-            let name = extern_method.name;
-            if name == to_string_ident() {
-                continue;
-            }
-            let alias = PromotedMethodAlias::new(
-                vec![embed_name],
-                CanonicalTypeKey(field.ty.clone()),
-                name,
-                Exposure::Implicit,
-                None,
-            );
-            surface.insert_method(name, alias);
-        }
-    }
-}
-
-fn explicit_aliases(slot: &SurfaceSlot<PromotedAlias>) -> Vec<PromotedAlias> {
-    slot.aliases
-        .iter()
-        .filter(|alias| alias.exposure == Exposure::Explicit)
-        .cloned()
-        .collect()
-}
-
-fn merged_aliases(
-    slot: SurfaceSlot<PromotedAlias>,
-    mut duplicate_explicit: impl FnMut(&PromotedAlias),
-) -> Vec<PromotedAlias> {
-    let explicit = explicit_aliases(&slot);
-    match explicit.len() {
-        0 => shortest_implicit_aliases(slot.aliases),
-        1 => explicit,
-        _ => {
-            for alias in explicit.iter().skip(1) {
-                duplicate_explicit(alias);
-            }
-            explicit
-        }
-    }
-}
-
-fn insert_merged_aliases(
-    map: &mut HashMap<Ident, SurfaceSlot<PromotedAlias>>,
-    name: Ident,
-    aliases: Vec<PromotedAlias>,
-) {
-    if !aliases.is_empty() {
-        map.insert(
-            name,
-            SurfaceSlot {
-                ambiguous: aliases.len() > 1,
-                aliases,
-            },
-        );
-    }
-}
-
-fn shortest_implicit_aliases(aliases: Vec<PromotedAlias>) -> Vec<PromotedAlias> {
-    let Some(path_len) = aliases.iter().map(PromotedAlias::path_len).min() else {
-        return vec![];
-    };
-    aliases
-        .into_iter()
-        .filter(|alias| alias.path_len() == path_len)
-        .collect()
-}
-
-fn aggregate_has_field_name(
-    aggregate: &AggregateSchema,
-    surface: &PromotedSurface,
-    name: Ident,
-) -> bool {
-    aggregate.fields.contains_key(&name) || surface.fields.contains_key(&name)
-}
-
-fn aggregate_has_method_name(
-    aggregate: &AggregateSchema,
-    surface: &PromotedSurface,
-    name: Ident,
-) -> bool {
-    aggregate.methods.keys().any(|key| key.name == name) || surface.methods.contains_key(&name)
-}
-
-fn to_string_ident() -> Ident {
-    Ident::new("to_string")
-}
-
-fn dependent_embed_template_valid(template: &DependentEmbedTemplate) -> bool {
-    template.field_path.len() == 1
-        && type_depends_on_generics(&template.target_ty)
-        && template.span.span.start <= template.span.span.end
-        && template.exposure == Exposure::from_selector(template.selector.is_some())
-}
-
-fn projection_entry_valid(entry: &ProjectionEntry) -> bool {
-    entry.target.0 == entry.target_ty
-        && entry.field_path.len() == 1
-        && entry.field_span.span.start <= entry.field_span.span.end
-}
-
-fn concrete_surface_type(ty: &Type) -> bool {
-    match ty {
-        Type::Infer
-        | Type::InferReturn
-        | Type::Var(_)
-        | Type::UnresolvedName(_)
-        | Type::UnresolvedNominal { .. } => false,
-        Type::Func { params, ret } => {
-            params.iter().all(|param| concrete_surface_type(&param.ty))
-                && concrete_surface_type(&ret.ty)
-        }
-        Type::Dyn(_) => true,
-        Type::Tuple(elems) => elems.iter().all(concrete_surface_type),
-        Type::Nominal(nominal) => {
-            nominal.type_args.iter().all(concrete_surface_type)
-                && nominal.const_args.iter().all(concrete_const_arg)
-        }
-        Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
-            concrete_surface_type(elem)
-        }
-        Type::Map { key, value } => concrete_surface_type(key) && concrete_surface_type(value),
-        Type::Any | Type::Int | Type::Float | Type::Bool | Type::String | Type::Void => true,
-    }
-}
-
-fn concrete_const_arg(arg: &ConstArg) -> bool {
-    matches!(arg, ConstArg::Value(_))
-}
-
-fn nominal_key_sort_key(key: &NominalKey) -> String {
+pub(super) fn nominal_key_sort_key(key: &NominalKey) -> String {
     format!("{:?}:{:?}:{}", key.module, key.kind, key.name)
 }
 
@@ -5295,9 +4083,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ast::TypeVarId,
         test_support::{parse_program, resolved_modules, resolved_modules_with_external},
-        typecheck::{TypecheckFacts, type_ops::type_closure_facts},
+        typecheck::type_ops::type_closure_facts,
     };
 
     fn ident(name: &str) -> Ident {
@@ -5339,20 +4126,6 @@ mod tests {
         .expect("typecheck failed");
         tc.finish().expect("typecheck failed");
         tc.decls.clone()
-    }
-
-    fn checked_facts(root: &str, modules: &[(&str, &str)]) -> TypecheckFacts {
-        let root = parse(root);
-        let resolved = resolved_modules(&root, modules);
-        let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
-        let mut tc = super::super::typechecker_for_modules(
-            &root,
-            &resolved,
-            externs,
-            super::super::TypecheckConfig::default(),
-        )
-        .expect("typecheck failed");
-        tc.finish().expect("typecheck failed").1
     }
 
     fn provider_index(root: &str, provider: ProviderDescriptor) -> DeclarationIndex {
@@ -5450,380 +4223,6 @@ mod tests {
 
     fn assert_deprecated_reason(policy: &AccessPolicy, reason: &str) {
         assert_eq!(policy.deprecated_reason(), Some(reason));
-    }
-
-    fn promoted_slot<'a>(
-        index: &'a DeclarationIndex,
-        owner: &str,
-        field: &str,
-    ) -> Option<&'a SurfaceSlot<PromotedFieldAlias>> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.promoted.fields.get(&ident(field))
-    }
-
-    fn promoted_paths(index: &DeclarationIndex, owner: &str, field: &str) -> Vec<Vec<Ident>> {
-        promoted_slot(index, owner, field)
-            .map(|slot| {
-                slot.aliases
-                    .iter()
-                    .map(|alias| alias.path.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn promoted_method_slot<'a>(
-        index: &'a DeclarationIndex,
-        owner: &str,
-        method: &str,
-    ) -> Option<&'a SurfaceSlot<PromotedMethodAlias>> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.promoted.methods.get(&ident(method))
-    }
-
-    fn promoted_method_paths(
-        index: &DeclarationIndex,
-        owner: &str,
-        method: &str,
-    ) -> Vec<Vec<Ident>> {
-        promoted_method_slot(index, owner, method)
-            .map(|slot| {
-                slot.aliases
-                    .iter()
-                    .map(|alias| alias.path.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn projections(index: &DeclarationIndex, owner: &str) -> Vec<ProjectionEntry> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.projections.clone()
-    }
-
-    fn dependent_embeds(index: &DeclarationIndex, owner: &str) -> Vec<DependentEmbedTemplate> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.dependent_embeds.clone()
-    }
-
-    #[test]
-    fn bare_embed_builds_field_surface() {
-        let index = checked_index(
-            "struct Health { hp: int, max_hp: int } struct Enemy { embed health: Health }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "hp"),
-            vec![vec![ident("health"), ident("hp")]]
-        );
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "max_hp"),
-            vec![vec![ident("health"), ident("max_hp")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_transitive_field_surface() {
-        let index = checked_index(
-            "struct Health { hp: int } struct Actor { embed health: Health } struct Enemy { embed actor: Actor }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "health"),
-            vec![vec![ident("actor"), ident("health")]]
-        );
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "hp"),
-            vec![vec![ident("actor"), ident("health"), ident("hp")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_extern_fields() {
-        let index = checked_index(
-            "extern type Point { x: float; y: float; } struct Enemy { embed point: Point }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "x"),
-            vec![vec![ident("point"), ident("x")]]
-        );
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "y"),
-            vec![vec![ident("point"), ident("y")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_method_surface() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} fn to_string(self) -> string { \"hp\" } } struct Enemy { embed health: Health }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "damage"),
-            vec![vec![ident("health")]]
-        );
-        assert!(promoted_method_paths(&index, "Enemy", "to_string").is_empty());
-    }
-
-    #[test]
-    fn bare_embed_imports_transitive_method_surface() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} } struct Actor { embed health: Health } struct Enemy { embed actor: Actor }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "damage"),
-            vec![vec![ident("actor"), ident("health")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_extern_methods() {
-        let index = checked_index(
-            "extern type Host { fn damage(self, amount: int); } struct Enemy { embed host: Host }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "damage"),
-            vec![vec![ident("host")]]
-        );
-    }
-
-    #[test]
-    fn as_embed_builds_projection_entry() {
-        let index = checked_index(
-            "struct Entity { id: int } struct Enemy { @as embed entity: Entity }",
-            &[],
-        );
-        let projections = projections(&index, "Enemy");
-
-        assert_eq!(projections.len(), 1);
-        assert_eq!(projections[0].field_path, vec![ident("entity")]);
-        assert_eq!(
-            projections[0].target_ty,
-            Type::nominal(NominalKind::Struct, ident("Entity"), vec![], vec![], None)
-        );
-    }
-
-    #[test]
-    fn as_embed_allows_distinct_projection_targets() {
-        let index = checked_index(
-            "struct Entity { id: int } struct Body { mass: int } struct Enemy { @as embed entity: Entity, @as embed body: Body }",
-            &[],
-        );
-
-        assert_eq!(projections(&index, "Enemy").len(), 2);
-    }
-
-    #[test]
-    fn generic_embed_target_records_dependent_template_only() {
-        let index = checked_index("struct Box<T> { embed value: T }", &[]);
-        let templates = dependent_embeds(&index, "Box");
-
-        assert!(promoted_paths(&index, "Box", "value").is_empty());
-        assert!(promoted_method_paths(&index, "Box", "value").is_empty());
-        assert_eq!(templates.len(), 1);
-        assert_eq!(templates[0].field_path, vec![ident("value")]);
-        assert!(matches!(templates[0].target_ty, Type::Var(_)));
-        assert!(templates[0].selector.is_none());
-        assert_eq!(templates[0].exposure, Exposure::Implicit);
-    }
-
-    #[test]
-    fn generic_embed_selector_records_dependent_template_only() {
-        let index = checked_index("struct Box<T> { embed value: T { x as y } }", &[]);
-        let templates = dependent_embeds(&index, "Box");
-
-        assert!(promoted_paths(&index, "Box", "y").is_empty());
-        assert_eq!(templates.len(), 1);
-        assert_eq!(templates[0].field_path, vec![ident("value")]);
-        assert!(templates[0].selector.is_some());
-        assert_eq!(templates[0].exposure, Exposure::Explicit);
-    }
-
-    #[test]
-    fn concrete_embed_of_generic_target_uses_dependent_target_surface() {
-        let index = checked_index(
-            "struct Health { hp: int }
-            struct Box<T> { embed value: T }
-            struct Enemy { embed health: Box<Health> }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "hp"),
-            vec![vec![ident("health"), ident("value"), ident("hp")]]
-        );
-    }
-
-    #[test]
-    fn selector_builds_explicit_field_surface() {
-        let index = checked_index(
-            "struct Health { hp: int, max_hp: int } struct Enemy { embed health: Health { hp as health_hp } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "health_hp"),
-            vec![vec![ident("health"), ident("hp")]]
-        );
-        assert!(promoted_paths(&index, "Enemy", "max_hp").is_empty());
-    }
-
-    #[test]
-    fn selector_can_import_target_promoted_field() {
-        let index = checked_index(
-            "struct Health { hp: int } struct Actor { embed health: Health } struct Enemy { embed actor: Actor { hp as enemy_hp } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "enemy_hp"),
-            vec![vec![ident("actor"), ident("health"), ident("hp")]]
-        );
-    }
-
-    #[test]
-    fn selector_builds_explicit_method_surface() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} } struct Enemy { embed health: Health { fn damage as hit } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "hit"),
-            vec![vec![ident("health")]]
-        );
-        assert!(promoted_method_paths(&index, "Enemy", "damage").is_empty());
-    }
-
-    #[test]
-    fn selector_can_import_target_promoted_method() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} } struct Actor { embed health: Health } struct Enemy { embed actor: Actor { fn damage as hit } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "hit"),
-            vec![vec![ident("actor"), ident("health")]]
-        );
-    }
-
-    #[test]
-    fn direct_field_suppresses_implicit_promoted_field() {
-        let index = checked_index(
-            "struct Health { hp: int } struct Enemy { hp: int, embed health: Health }",
-            &[],
-        );
-
-        assert!(promoted_paths(&index, "Enemy", "hp").is_empty());
-    }
-
-    #[test]
-    fn direct_method_suppresses_implicit_promoted_method() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} } struct Enemy { embed health: Health, fn damage(self) {} }",
-            &[],
-        );
-
-        assert!(promoted_method_paths(&index, "Enemy", "damage").is_empty());
-    }
-
-    #[test]
-    fn explicit_field_suppresses_implicit_promoted_field() {
-        let index = checked_index(
-            "struct A { x: int } struct B { x: int } struct Enemy { embed a: A, embed b: B { x } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "x"),
-            vec![vec![ident("b"), ident("x")]]
-        );
-    }
-
-    #[test]
-    fn shorter_implicit_field_suppresses_longer_implicit_field() {
-        let index = checked_index(
-            "struct A { x: int } struct Inner { embed a: A } struct B { x: int } struct Enemy { embed inner: Inner, embed b: B }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "x"),
-            vec![vec![ident("b"), ident("x")]]
-        );
-    }
-
-    #[test]
-    fn explicit_method_suppresses_implicit_promoted_method() {
-        let index = checked_index(
-            "struct A { fn tick(self) {} } struct B { fn tick(self) {} } struct Enemy { embed a: A, embed b: B { fn tick } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "tick"),
-            vec![vec![ident("b")]]
-        );
-    }
-
-    #[test]
-    fn shorter_implicit_method_suppresses_longer_implicit_method() {
-        let index = checked_index(
-            "struct A { fn tick(self) {} } struct Inner { embed a: A } struct B { fn tick(self) {} } struct Enemy { embed inner: Inner, embed b: B }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "tick"),
-            vec![vec![ident("b")]]
-        );
-    }
-
-    #[test]
-    fn same_length_implicit_fields_remain_ambiguous() {
-        let index = checked_index(
-            "struct A { x: int } struct B { x: int } struct Enemy { embed a: A, embed b: B }",
-            &[],
-        );
-        let slot = promoted_slot(&index, "Enemy", "x").expect("missing promoted field");
-
-        assert!(slot.ambiguous);
-        assert_eq!(slot.aliases.len(), 2);
-    }
-
-    #[test]
-    fn same_length_implicit_methods_remain_ambiguous() {
-        let index = checked_index(
-            "struct A { fn tick(self) {} } struct B { fn tick(self) {} } struct Enemy { embed a: A, embed b: B }",
-            &[],
-        );
-        let slot = promoted_method_slot(&index, "Enemy", "tick").expect("missing promoted method");
-
-        assert!(slot.ambiguous);
-        assert_eq!(slot.aliases.len(), 2);
     }
 
     #[test]
@@ -5925,33 +4324,6 @@ mod tests {
         let field = fields.get(&ident("old_x")).expect("missing field");
 
         assert_deprecated_reason(&field.policy, "use x");
-    }
-
-    #[test]
-    fn generic_template_nominal_args() {
-        let generics = GenericParams {
-            type_params: vec![TypeParam {
-                name: ident("T"),
-                id: TypeVarId(0),
-                bounds: vec![],
-            }],
-            const_params: vec![],
-        };
-        let ty = Type::UnresolvedNominal {
-            qualifier: None,
-            name: ident("Foo"),
-            generic_args: vec![GenericArg::Type(Type::UnresolvedName(ident("T")))],
-        };
-        let result = generic_template_type(&ty, &generics);
-
-        assert_eq!(
-            result,
-            Type::UnresolvedNominal {
-                qualifier: None,
-                name: ident("Foo"),
-                generic_args: vec![GenericArg::Type(Type::Var(TypeVarId(0)))],
-            }
-        );
     }
 
     #[test]
@@ -6367,14 +4739,6 @@ mod tests {
     }
 
     #[test]
-    fn typecheck_facts_include_import_records() {
-        let facts = checked_facts("import math;", &[("math", "")]);
-
-        assert_eq!(facts.import_records().len(), 1);
-        assert_eq!(facts.import_records()[0].target_module, scope("math"));
-    }
-
-    #[test]
     fn reexported_value_origin() {
         let index = index(
             "import facade { dup };",
@@ -6650,7 +5014,7 @@ mod tests {
             receiver_ty: _,
             owner_args: Ok(owner_args),
         } = index
-            .find_instance_extend_method(&Type::Int, ident("id"), |_| true)
+            .find_extend_method(MethodSurface::Instance, &Type::Int, ident("id"), |_| true)
             .unwrap()
         else {
             panic!("expected extend match");
@@ -6674,50 +5038,12 @@ mod tests {
     }
 
     #[test]
-    fn enum_variant_callables() {
-        let index = index("enum E<T> { A, B(T), C { x: T } }", &[]);
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident("E"))
-            .unwrap();
-        let enm = index.enum_schema(&key).unwrap();
-
-        let unit = index
-            .callable_for_variant(&key, ident("A"), enm.variants.get(&ident("A")).unwrap())
-            .unwrap();
-        let tuple = index
-            .callable_for_variant(&key, ident("B"), enm.variants.get(&ident("B")).unwrap())
-            .unwrap();
-
-        assert_eq!(unit.def.id.kind, CallableKind::EnumVariant);
-        assert!(unit.def.sig.params.is_empty());
-        assert_eq!(
-            tuple.def.sig.params,
-            vec![FuncParam::immut(Type::Var(TypeVarId(0)))]
-        );
-        assert_eq!(
-            tuple.def.sig.ret.ty,
-            Type::nominal(
-                NominalKind::Enum,
-                ident("E"),
-                vec![Type::Var(TypeVarId(0))],
-                vec![],
-                None
-            )
-        );
-        assert!(
-            index
-                .callable_for_variant(&key, ident("C"), enm.variants.get(&ident("C")).unwrap())
-                .is_none()
-        );
-    }
-
-    #[test]
     fn set_const_type_syncs_copies() {
         let mut index = index(
             "import tools { SIZE };",
             &[("tools", "pub const SIZE = 1;")],
         );
-        index.set_const_type(&scope("tools"), ident("SIZE"), Type::Int);
+        index.set_const_type(&scope("tools"), ident("SIZE"), &Type::Int);
 
         let exported = index
             .exported_value(&scope("tools"), ident("SIZE"))

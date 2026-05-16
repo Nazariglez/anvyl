@@ -1,8 +1,11 @@
 use super::{
-    CallableRef, Exposure, ExtendMethodMatch, ExtendMethodSchema, ExtendSchema, GenericArgs,
-    MethodKey, MethodMode, ModuleScope, TypeChecker,
+    CallableRef, DeclarationIndex, Exposure, ExtendMethodMatch, ExtendMethodSchema, ExtendSchema,
+    GenericArgs, GenericParams, MethodKey, MethodMode, MethodSurface, ModuleScope, PromotedAlias,
+    Specificity, SurfaceSlot, TypeChecker,
     annotation::AccessPolicy,
+    compare_specificity,
     decls::nominal_type,
+    generic_template_type, match_generic_template_args,
     place::{self, PlaceAccess},
 };
 use crate::{
@@ -124,6 +127,200 @@ pub(super) enum ExtendMethodError {
     Ambiguous { receiver: Type, name: Ident },
 }
 
+impl TypeChecker {
+    pub(super) fn extend_visible(&self, extend: &ExtendSchema) -> bool {
+        Self::extend_visible_in(&self.decls, &self.current_module, extend)
+    }
+
+    pub(super) fn extend_visible_in(
+        decls: &DeclarationIndex,
+        current_module: &ModuleScope,
+        extend: &ExtendSchema,
+    ) -> bool {
+        extend.origin == *current_module
+            || (extend.exported && decls.imports_module(current_module, &extend.origin))
+    }
+
+    pub(super) fn find_extend_method(
+        &self,
+        receiver: &Type,
+        name: Ident,
+    ) -> Option<ExtendMethodMatch<'_>> {
+        self.decls
+            .find_extend_method(MethodSurface::Instance, receiver, name, |ext| {
+                self.extend_visible(ext)
+            })
+    }
+
+    pub(super) fn find_static_extend_method(
+        &self,
+        target: &Type,
+        name: Ident,
+    ) -> Option<ExtendMethodMatch<'_>> {
+        self.decls
+            .find_extend_method(MethodSurface::Static, target, name, |ext| {
+                self.extend_visible(ext)
+            })
+    }
+}
+
+impl DeclarationIndex {
+    pub(crate) fn find_extend_method<F>(
+        &self,
+        surface: MethodSurface,
+        subject: &Type,
+        name: Ident,
+        mut visible: F,
+    ) -> Option<ExtendMethodMatch<'_>>
+    where
+        F: FnMut(&ExtendSchema) -> bool,
+    {
+        let method_key = MethodKey::new(name, surface);
+        let candidates = self
+            .extends()
+            .filter(|ext| visible(ext))
+            .filter_map(|ext| extend_candidate(ext, method_key, subject))
+            .collect::<Vec<_>>();
+
+        select_extend_candidate(candidates)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtendReceiverMatch {
+    Exact,
+    SliceView,
+}
+
+struct ExtendCandidate<'a> {
+    extend: &'a ExtendSchema,
+    method: &'a ExtendMethodSchema,
+    target: Type,
+    receiver_ty: Type,
+    owner_args: Result<GenericArgs, Vec<Ident>>,
+    receiver_match: ExtendReceiverMatch,
+}
+
+fn extend_candidate<'a>(
+    ext: &'a ExtendSchema,
+    method_key: MethodKey,
+    subject: &Type,
+) -> Option<ExtendCandidate<'a>> {
+    let method = ext.methods.get(&method_key)?;
+    let target = generic_template_type(&ext.target, &ext.generics);
+    let (receiver_ty, owner_args, receiver_match) =
+        extend_receiver_match(&ext.generics, &target, subject, method_key.surface)?;
+    Some(ExtendCandidate {
+        extend: ext,
+        method,
+        target,
+        receiver_ty,
+        owner_args,
+        receiver_match,
+    })
+}
+
+fn extend_receiver_match(
+    generics: &GenericParams,
+    target: &Type,
+    subject: &Type,
+    surface: MethodSurface,
+) -> Option<(Type, Result<GenericArgs, Vec<Ident>>, ExtendReceiverMatch)> {
+    if surface == MethodSurface::Static && static_nominal_family_match(target, subject) {
+        return Some((
+            subject.clone(),
+            Ok(GenericArgs::default()),
+            ExtendReceiverMatch::Exact,
+        ));
+    }
+
+    match match_generic_template_args(generics, target, subject) {
+        Some(owner_args) => return Some((subject.clone(), owner_args, ExtendReceiverMatch::Exact)),
+        None if surface != MethodSurface::Instance => return None,
+        None => {}
+    }
+    let Type::Slice { elem: target_elem } = target else {
+        return None;
+    };
+    let (Type::List { elem: subject_elem }
+    | Type::Array {
+        elem: subject_elem, ..
+    }) = subject
+    else {
+        return None;
+    };
+    let receiver_ty = Type::Slice {
+        elem: subject_elem.clone(),
+    };
+    let owner_args = match_generic_template_args(generics, target_elem, subject_elem)?;
+    Some((receiver_ty, owner_args, ExtendReceiverMatch::SliceView))
+}
+
+fn static_nominal_family_match(target: &Type, subject: &Type) -> bool {
+    let (Type::Nominal(target), Type::Nominal(subject)) = (target, subject) else {
+        return false;
+    };
+    target.kind == subject.kind
+        && target.name == subject.name
+        && target.origin == subject.origin
+        && subject.type_args.is_empty()
+        && subject.const_args.is_empty()
+}
+
+fn select_extend_candidate(
+    mut candidates: Vec<ExtendCandidate<'_>>,
+) -> Option<ExtendMethodMatch<'_>> {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.receiver_match == ExtendReceiverMatch::Exact)
+    {
+        candidates.retain(|candidate| candidate.receiver_match == ExtendReceiverMatch::Exact);
+    }
+
+    match candidates.len() {
+        0 => None,
+        1 => {
+            let candidate = candidates.pop().expect("one extend candidate");
+            Some(ExtendMethodMatch::Match {
+                extend: candidate.extend,
+                method: candidate.method,
+                receiver_ty: candidate.receiver_ty,
+                owner_args: candidate.owner_args,
+            })
+        }
+        _ => Some(most_specific_extend(candidates)),
+    }
+}
+
+fn most_specific_extend(mut candidates: Vec<ExtendCandidate<'_>>) -> ExtendMethodMatch<'_> {
+    let winner = (1..candidates.len()).fold(0, |best, i| {
+        if compare_specificity(&candidates[i].target, &candidates[best].target)
+            == Specificity::MoreSpecific
+        {
+            i
+        } else {
+            best
+        }
+    });
+
+    let winner_target = &candidates[winner].target;
+    let dominates_all = candidates.iter().enumerate().all(|(i, candidate)| {
+        i == winner
+            || compare_specificity(winner_target, &candidate.target) == Specificity::MoreSpecific
+    });
+    if !dominates_all {
+        return ExtendMethodMatch::Ambiguous;
+    }
+
+    let candidate = candidates.swap_remove(winner);
+    ExtendMethodMatch::Match {
+        extend: candidate.extend,
+        method: candidate.method,
+        receiver_ty: candidate.receiver_ty,
+        owner_args: candidate.owner_args,
+    }
+}
+
 pub(super) fn resolve_field(
     receiver: &Type,
     name: Ident,
@@ -177,19 +374,16 @@ fn resolve_promoted_field(
     tc: &mut TypeChecker,
 ) -> Option<FieldResolution> {
     let surface = tc.promoted_surface_for(receiver)?;
-    let slot = surface.fields.get(&name)?;
-    if slot.ambiguous || slot.aliases.len() != 1 {
-        return Some(FieldResolution::AmbiguousPromoted {
-            ty: receiver.clone(),
-            name,
-            candidates: slot
-                .aliases
-                .iter()
-                .map(|alias| alias.path.clone())
-                .collect(),
-        });
-    }
-    let alias = &slot.aliases[0];
+    let alias = match single_promoted_alias(surface.fields.get(&name)?) {
+        Ok(alias) => alias,
+        Err(candidates) => {
+            return Some(FieldResolution::AmbiguousPromoted {
+                ty: receiver.clone(),
+                name,
+                candidates,
+            });
+        }
+    };
     let origin_owner = alias.origin.0.clone();
     let origin_field = alias.origin_member;
     if let Some(owner) = tc.extern_type_id(&origin_owner) {
@@ -318,19 +512,16 @@ fn resolve_promoted_method(
     tc: &mut TypeChecker,
 ) -> Option<MethodResolution> {
     let surface = tc.promoted_surface_for(receiver)?;
-    let slot = surface.methods.get(&name)?;
-    if slot.ambiguous || slot.aliases.len() != 1 {
-        return Some(MethodResolution::AmbiguousPromoted {
-            ty: receiver.clone(),
-            name,
-            candidates: slot
-                .aliases
-                .iter()
-                .map(|alias| alias.path.clone())
-                .collect(),
-        });
-    }
-    let alias = &slot.aliases[0];
+    let alias = match single_promoted_alias(surface.methods.get(&name)?) {
+        Ok(alias) => alias,
+        Err(candidates) => {
+            return Some(MethodResolution::AmbiguousPromoted {
+                ty: receiver.clone(),
+                name,
+                candidates,
+            });
+        }
+    };
     let origin_owner = alias.origin.0.clone();
     let origin_method = alias.origin_member;
     if let Some(owner) = tc.extern_type_id(&origin_owner) {
@@ -364,6 +555,15 @@ fn resolve_promoted_method(
             origin: key.module,
         })),
     })))
+}
+
+fn single_promoted_alias(
+    slot: &SurfaceSlot<PromotedAlias>,
+) -> Result<&PromotedAlias, Vec<Vec<Ident>>> {
+    match slot.aliases.as_slice() {
+        [alias] if !slot.ambiguous => Ok(alias),
+        aliases => Err(aliases.iter().map(|alias| alias.path.clone()).collect()),
+    }
 }
 
 fn resolve_extern_field(

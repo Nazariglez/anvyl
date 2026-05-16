@@ -1,20 +1,24 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
+    ArityError, DeclError, DeprecatedUseKind, TypeChecker, TypeError,
+    annotation::deprecated_lint,
     const_term::ConstTerm,
+    contracts,
     decls::{
-        ContractKey, DeclarationIndex, ImportId, ModuleScope, NominalKey, TypeAliasDef,
-        TypeAliasKey, TypeBinding, nominal_type_with_args,
+        ContractKey, DeclTypeSite, DeclarationIndex, ImportId, ModuleScope, NominalKey,
+        TypeAliasDef, TypeAliasKey, TypeBinding, nominal_generic_args, nominal_type_with_args,
     },
+    dyn_infer::DynInference,
     generic::{GenericArgs, GenericParams, substitute},
-    type_ops::bare_type_name,
+    type_ops::{TypeVisitor, bare_type_name, type_depends_on_generics},
 };
 use crate::{
     ast::{
         AnonymousContractRequirement, ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef,
         FuncParam, GenericArg, Ident, Type, TypeParam, TypeVarId,
     },
-    span::Span,
+    span::{SourceSpan, Span},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +179,51 @@ pub(crate) struct FinalizedTypeRef {
     pub(crate) used_imports: Vec<ImportId>,
 }
 
+pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> TypeError {
+    match error {
+        TypeRefError::Unknown { qualifier, name } => TypeError::UnknownType {
+            qualifier,
+            name,
+            span,
+        },
+        TypeRefError::GenericArity { expected, found } => {
+            TypeError::GenericArity(ArityError::TypeArgs { expected, found })
+        }
+        TypeRefError::GenericArgKindMismatch { expected } => {
+            TypeError::GenericArgKindMismatch { expected, span }
+        }
+        TypeRefError::AliasCycle { name } => TypeError::CompileError {
+            message: format!("type alias '{name}' depends on itself"),
+            span,
+        },
+        TypeRefError::ContractAsType { name } => TypeError::CompileError {
+            message: format!(
+                "contract '{name}' is not a concrete type; use 'dyn {name}' or a generic bound"
+            ),
+            span,
+        },
+        TypeRefError::UnknownContract { qualifier, name } => TypeError::CompileError {
+            message: match qualifier {
+                Some(qualifier) => format!("unknown contract '{qualifier}.{name}'"),
+                None => format!("unknown contract '{name}'"),
+            },
+            span,
+        },
+        TypeRefError::DuplicateContractRequirement { name } => TypeError::CompileError {
+            message: format!("duplicate contract requirement '{name}'"),
+            span,
+        },
+        TypeRefError::ConflictingContractRequirement { name } => TypeError::CompileError {
+            message: format!("conflicting contract requirement '{name}'"),
+            span,
+        },
+        TypeRefError::UnsupportedContractComposition => TypeError::CompileError {
+            message: "inferred dynamic contracts are not supported yet".to_string(),
+            span,
+        },
+    }
+}
+
 pub(crate) type LocalTypeAliasKey = Span;
 
 #[derive(Clone)]
@@ -229,6 +278,431 @@ impl LocalTypeScopes {
             .flat_map(|scope| scope.values())
             .find(|alias| alias.key == key)
     }
+}
+
+#[derive(Clone, Copy)]
+struct TypeUsePolicy {
+    warn_extern_deprecated: bool,
+    validate_param_escape: bool,
+}
+
+impl TypeChecker {
+    pub(super) fn finalize_decl_type(
+        &mut self,
+        decls: &DeclarationIndex,
+        site: DeclTypeSite,
+        ty: Type,
+    ) -> Type {
+        let resolver = TypeRefResolver::module_only(decls);
+        match resolver.finalize_at(&site.module, &site.generics, &ty, Some(site.span)) {
+            Ok(finalized) => {
+                self.used_imports.extend(finalized.used_imports);
+                self.push_type_ref_warnings(finalized.warnings);
+                finalized.ty
+            }
+            Err(TypeRefError::Unknown { qualifier, name }) => {
+                self.push_error(TypeError::Decl(DeclError::UnknownType {
+                    module: site.module,
+                    qualifier,
+                    name,
+                    span: Some(self.source_span(site.span)),
+                }));
+                Type::Infer
+            }
+            Err(error) => {
+                self.push_error(type_ref_error(error, self.error_span(site.span)));
+                Type::Infer
+            }
+        }
+    }
+
+    pub(super) fn resolve_type_subject(&mut self, ty: &Type, span: Span) -> Option<Type> {
+        let ty = self.resolve_type_for_tc_at(ty, span);
+        (!matches!(ty, Type::Infer)).then_some(ty)
+    }
+
+    pub(super) fn resolve_type_for_tc_at(&mut self, ty: &Type, span: Span) -> Type {
+        let result = self.type_ref_resolver().finalize_at(
+            &self.current_module,
+            &self.current_generic_context(),
+            ty,
+            Some(span),
+        );
+        self.finish_source_type_ref(result, span)
+    }
+
+    pub(super) fn resolve_downcast_target_type_at(&mut self, ty: &Type, span: Span) -> Type {
+        let result = self.type_ref_resolver().finalize_at(
+            &self.current_module,
+            &self.current_generic_context(),
+            ty,
+            Some(span),
+        );
+        match result {
+            Ok(finalized) => {
+                self.used_imports.extend(finalized.used_imports);
+                self.push_type_ref_warnings(finalized.warnings);
+                let ty = self.reject_source_dyn_contracts(finalized.ty, span);
+                if matches!(ty, Type::Infer) {
+                    Type::Infer
+                } else if type_depends_on_generics(&ty) {
+                    self.push_error(TypeError::CompileError {
+                        message:
+                            "exact downcast target must be a fully concrete runtime-identifiable type"
+                                .to_string(),
+                        span: self.error_span(span),
+                    });
+                    Type::Infer
+                } else {
+                    self.finish_resolved_type(ty, span)
+                }
+            }
+            Err(error) => {
+                self.push_error_once(type_ref_error(error, self.error_span(span)));
+                Type::Infer
+            }
+        }
+    }
+
+    pub(super) fn resolve_callable_param_type(
+        &mut self,
+        ty: &Type,
+        span: Span,
+        exported: bool,
+    ) -> Type {
+        if matches!(ty, Type::Dyn(ContractRef::Infer)) {
+            let result = self.type_ref_resolver().finalize_at(
+                &self.current_module,
+                &self.current_generic_context(),
+                ty,
+                Some(span),
+            );
+            let ty = self.finish_type_ref_result(result, span);
+            return self.dyn_infer.assign_holes(
+                &self.current_module,
+                &ty,
+                self.source_span(span),
+                exported,
+            );
+        }
+        self.resolve_type_for_tc_at(ty, span)
+    }
+
+    pub(super) fn resolve_type_binding_for_tc_at(
+        &mut self,
+        binding: TypeBinding,
+        args: &[GenericArg],
+        span: Span,
+        use_name: Ident,
+    ) -> Type {
+        let result = self.type_ref_resolver().finalize_type_binding_at(
+            &self.current_module,
+            &self.current_generic_context(),
+            binding,
+            args,
+            Some(span),
+            use_name,
+        );
+        self.finish_source_type_ref(result, span)
+    }
+
+    pub(super) fn resolve_module_alias_target_for_tc_at(
+        &mut self,
+        key: &TypeAliasKey,
+        span: Span,
+        use_name: Ident,
+    ) -> Type {
+        let result =
+            self.type_ref_resolver()
+                .finalize_module_alias_target_at(key, Some(span), use_name);
+        self.finish_source_type_ref(result, span)
+    }
+
+    pub(super) fn resolve_local_alias_target_for_tc_at(
+        &mut self,
+        alias: &LocalTypeAlias,
+        span: Span,
+        use_name: Ident,
+    ) -> Type {
+        let result =
+            self.type_ref_resolver()
+                .finalize_local_alias_target_at(alias, Some(span), use_name);
+        self.finish_source_type_ref(result, span)
+    }
+
+    fn finish_source_type_ref(
+        &mut self,
+        result: Result<FinalizedTypeRef, TypeRefError>,
+        span: Span,
+    ) -> Type {
+        let ty = self.finish_type_ref_result(result, span);
+        self.reject_source_dyn_contracts(ty, span)
+    }
+
+    fn current_generic_context(&self) -> GenericTypeContext {
+        self.generic_contexts.last().cloned().unwrap_or_default()
+    }
+
+    fn type_ref_resolver(&self) -> TypeRefResolver<'_> {
+        TypeRefResolver::with_local_types(&self.decls, &self.local_type_scopes)
+    }
+
+    pub(super) fn validate_nominal_uses(&mut self, ty: &Type, span: Span) {
+        let decls = self.decls.clone();
+        self.validate_type_uses(
+            &decls,
+            ty,
+            span,
+            TypeUsePolicy {
+                warn_extern_deprecated: true,
+                validate_param_escape: false,
+            },
+        );
+    }
+
+    pub(super) fn validate_nominal_uses_in(
+        &mut self,
+        decls: &DeclarationIndex,
+        ty: &Type,
+        span: Span,
+    ) {
+        self.validate_type_uses(
+            decls,
+            ty,
+            span,
+            TypeUsePolicy {
+                warn_extern_deprecated: false,
+                validate_param_escape: true,
+            },
+        );
+    }
+
+    fn validate_type_uses(
+        &mut self,
+        decls: &DeclarationIndex,
+        ty: &Type,
+        span: Span,
+        policy: TypeUsePolicy,
+    ) {
+        match ty {
+            Type::Nominal(nominal) => {
+                for arg in &nominal.type_args {
+                    self.validate_type_uses(decls, arg, span, policy);
+                }
+                let Some(key) = decls.key_for_type(ty) else {
+                    return;
+                };
+                if policy.warn_extern_deprecated {
+                    self.warn_extern_type_deprecated(&key, span);
+                }
+                let Some(generics) = decls.nominal_generics(&key) else {
+                    return;
+                };
+                let args = nominal_generic_args(ty).expect("nominal type");
+                self.validate_nominal_args(decls, &key, &generics, &args, span);
+            }
+            Type::Func { params, ret } => {
+                for param in params {
+                    if policy.validate_param_escape {
+                        self.validate_func_param_escape(
+                            param.escape,
+                            param.mutable,
+                            param.cast_accept,
+                            &param.ty,
+                            span,
+                        );
+                    }
+                    self.validate_type_uses(decls, &param.ty, span, policy);
+                }
+                self.validate_type_uses(decls, &ret.ty, span, policy);
+            }
+            Type::Dyn(contract) => self.validate_contract_ref_uses(decls, contract, span, policy),
+            Type::Tuple(elems) => {
+                for elem in elems {
+                    self.validate_type_uses(decls, elem, span, policy);
+                }
+            }
+            Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
+                self.validate_type_uses(decls, elem, span, policy);
+            }
+            Type::Map { key, value } => {
+                self.validate_type_uses(decls, key, span, policy);
+                if let Some(err) = map_key_type_error(decls, key, self.error_span(span)) {
+                    self.push_error(err);
+                }
+                self.validate_type_uses(decls, value, span, policy);
+            }
+            Type::Infer
+            | Type::InferReturn
+            | Type::Any
+            | Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Var(_)
+            | Type::UnresolvedName(_)
+            | Type::UnresolvedNominal { .. } => {}
+        }
+    }
+
+    fn validate_contract_ref_uses(
+        &mut self,
+        decls: &DeclarationIndex,
+        contract: &ContractRef,
+        span: Span,
+        policy: TypeUsePolicy,
+    ) {
+        if let Some(name) = contract_surface_conflict(decls, &self.current_module, contract) {
+            self.push_error(TypeError::CompileError {
+                message: format!("conflicting contract requirement '{name}'"),
+                span: self.error_span(span),
+            });
+        }
+        match contract {
+            ContractRef::Anonymous(surface) => {
+                for req in &surface.requirements {
+                    for param in &req.params {
+                        if policy.validate_param_escape {
+                            self.validate_func_param_escape(
+                                param.escape,
+                                param.mutable,
+                                false,
+                                &param.ty,
+                                span,
+                            );
+                        }
+                        self.validate_type_uses(decls, &param.ty, span, policy);
+                    }
+                    self.validate_type_uses(decls, &req.ret.ty, span, policy);
+                }
+            }
+            ContractRef::Intersection(contracts) => {
+                for contract in contracts {
+                    self.validate_contract_ref_uses(decls, contract, span, policy);
+                }
+            }
+            ContractRef::Named { .. } | ContractRef::Infer | ContractRef::Hole(_) => {}
+        }
+    }
+
+    fn finish_type_ref_result(
+        &mut self,
+        result: Result<FinalizedTypeRef, TypeRefError>,
+        span: Span,
+    ) -> Type {
+        match result {
+            Ok(finalized) => {
+                self.used_imports.extend(finalized.used_imports);
+                self.push_type_ref_warnings(finalized.warnings);
+                self.finish_resolved_type(finalized.ty, span)
+            }
+            Err(error) => {
+                self.push_error_once(type_ref_error(error, self.error_span(span)));
+                Type::Infer
+            }
+        }
+    }
+
+    fn reject_source_dyn_contracts(&mut self, ty: Type, span: Span) -> Type {
+        if type_contains_anonymous_contract(&ty) {
+            self.push_error(TypeError::CompileError {
+                message: "anonymous dynamic contract syntax is not supported; declare a named contract or use dyn _ in a callable parameter".to_string(),
+                span: self.error_span(span),
+            });
+            return Type::Infer;
+        }
+        self.reject_raw_dyn_infer(ty, span)
+    }
+
+    fn reject_raw_dyn_infer(&mut self, ty: Type, span: Span) -> Type {
+        if !DynInference::has_raw_hole(&ty) {
+            return ty;
+        }
+        let message = if type_contains_raw_dyn_infer_func(&ty) {
+            "inferred dynamic contracts are not allowed in nested function types because they have no body that can own inference"
+        } else {
+            "inferred dynamic contracts are only allowed as direct parameters of callables with bodies"
+        };
+        self.push_error(TypeError::CompileError {
+            message: message.to_string(),
+            span: self.error_span(span),
+        });
+        Type::Infer
+    }
+
+    fn push_type_ref_warnings(&mut self, warnings: Vec<TypeRefWarning>) {
+        for warning in warnings {
+            let kind = match warning.kind {
+                TypeRefWarningKind::TypeAlias => DeprecatedUseKind::TypeAlias,
+                TypeRefWarningKind::Contract => DeprecatedUseKind::Contract,
+            };
+            self.push_lint_event(deprecated_lint(
+                kind,
+                warning.name,
+                warning.reason.as_deref(),
+                self.source_span(warning.span),
+            ));
+        }
+    }
+}
+
+pub(super) fn map_key_type_error(
+    decls: &DeclarationIndex,
+    ty: &Type,
+    span: Option<SourceSpan>,
+) -> Option<TypeError> {
+    let err = decls.map_key_error(ty)?;
+    Some(TypeError::NonKeyableMapKey {
+        ty: err.ty,
+        field: err.field,
+        span,
+    })
+}
+
+fn contract_surface_conflict(
+    decls: &DeclarationIndex,
+    module: &ModuleScope,
+    contract: &ContractRef,
+) -> Option<Ident> {
+    match contracts::requirements_for_ref(decls, module, contract) {
+        Err(contracts::ContractSetError::ConflictingRequirement(name)) => Some(name),
+        Ok(_) | Err(contracts::ContractSetError::UnknownContract) => None,
+    }
+}
+
+fn type_contains_anonymous_contract(ty: &Type) -> bool {
+    struct AnonymousContractVisitor;
+
+    impl TypeVisitor for AnonymousContractVisitor {
+        fn visit_contract_ref_leaf(&mut self, contract: &ContractRef) -> bool {
+            matches!(contract, ContractRef::Anonymous(_))
+        }
+    }
+
+    let mut visitor = AnonymousContractVisitor;
+    visitor.visit_type(ty)
+}
+
+fn type_contains_raw_dyn_infer_func(ty: &Type) -> bool {
+    struct RawDynInferFunc;
+
+    impl TypeVisitor for RawDynInferFunc {
+        fn visit_type(&mut self, ty: &Type) -> bool {
+            match ty {
+                Type::Func { params, ret } => {
+                    params
+                        .iter()
+                        .any(|param| DynInference::has_raw_hole(&param.ty))
+                        || DynInference::has_raw_hole(&ret.ty)
+                }
+                _ => self.visit_type_children(ty),
+            }
+        }
+    }
+
+    let mut visitor = RawDynInferFunc;
+    visitor.visit_type(ty)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -992,72 +1466,5 @@ fn finalize_array_len(
             Ok(finalize_const_name(generics, name)?.map_or(ArrayLen::Named(name), ArrayLen::Param))
         }
         ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Param(_) => Ok(len),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ident(name: &str) -> Ident {
-        Ident::new(name)
-    }
-
-    fn type_param(name: &str, id: u32) -> TypeParam {
-        TypeParam {
-            name: ident(name),
-            id: TypeVarId(id),
-            bounds: vec![],
-        }
-    }
-
-    fn const_param(name: &str, id: u32) -> ConstParam {
-        ConstParam {
-            name: ident(name),
-            id: ConstParamId(id),
-        }
-    }
-
-    #[test]
-    fn shadow_type_with_type() {
-        let owner = GenericTypeContext::try_from_params(&[type_param("T", 0)], &[]).unwrap();
-        let inner = owner
-            .try_with_shadowing_params(&[type_param("T", 1)], &[])
-            .unwrap();
-
-        assert_eq!(inner.type_param(ident("T")), Some(TypeVarId(1)));
-        assert_eq!(inner.type_param_name(TypeVarId(0)), None);
-    }
-
-    #[test]
-    fn shadow_type_with_const() {
-        let owner = GenericTypeContext::try_from_params(&[type_param("T", 0)], &[]).unwrap();
-        let inner = owner
-            .try_with_shadowing_params(&[], &[const_param("T", 1)])
-            .unwrap();
-
-        assert_eq!(inner.type_param(ident("T")), None);
-        assert_eq!(inner.const_param(ident("T")), Some(ConstParamId(1)));
-    }
-
-    #[test]
-    fn shadow_const_with_type() {
-        let owner = GenericTypeContext::try_from_params(&[], &[const_param("N", 0)]).unwrap();
-        let inner = owner
-            .try_with_shadowing_params(&[type_param("N", 1)], &[])
-            .unwrap();
-
-        assert_eq!(inner.const_param(ident("N")), None);
-        assert_eq!(inner.type_param(ident("N")), Some(TypeVarId(1)));
-    }
-
-    #[test]
-    fn shadow_const_with_const() {
-        let owner = GenericTypeContext::try_from_params(&[], &[const_param("N", 0)]).unwrap();
-        let inner = owner
-            .try_with_shadowing_params(&[], &[const_param("N", 1)])
-            .unwrap();
-
-        assert_eq!(inner.const_param(ident("N")), Some(ConstParamId(1)));
     }
 }

@@ -121,7 +121,7 @@ pub(crate) fn assert_deprecated_warning(
     assert_eq!(event.tags, [DiagnosticTag::Deprecated]);
     assert_eq!(
         event.message,
-        super::super::render_deprecated_access(kind, Ident::new(name), reason)
+        super::super::annotation::render_deprecated_access(kind, Ident::new(name), reason)
     );
 }
 

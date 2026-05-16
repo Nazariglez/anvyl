@@ -3,14 +3,17 @@ use anvyx_externs::ReceiverMode;
 use super::{
     ArgumentProjectionFact, CallForm, CallTarget, CheckedType, ConstSubst, DynCallFact, Exposure,
     ExternUseTarget, GenericArgs, GenericParams, MemberAccessKind, MemberPathFact, MemberPathKind,
-    PlaceAccess, TypeChecker, TypeError, TypeSubst, VariantShape, check_arg_count, check_arg_range,
-    check_expr_checked, checked_type,
+    PlaceAccess, TypeChecker, TypeError, TypeSubst,
+    annotation::{AccessPolicyOutput, emit_access_policy},
+    body::check_specialized_callable_body,
+    check_arg_count, check_arg_range, check_expr_checked, check_value_expr_checked_with_hint,
+    checked_from_type, checked_type,
     contracts::{self, DynamicMethodError},
     decls::{
         CallableKind, CallableParent, CallableRef, ContractRequirementSchema, ContractSetKey,
         DeclError, ExtendMethodSchema, ExtendSchema, MethodKey, MethodMode, MethodSurface,
         ModuleMemberLookup, ModuleScope, ProjectionLookup, ResolvedValue, TypeBinding, ValueDecl,
-        VariantPayload, nominal_type, owner_template,
+        nominal_type, owner_template,
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
@@ -22,7 +25,7 @@ use super::{
 use crate::{
     ast::{
         CallNode, EscapeMode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg,
-        Ident, MethodReceiver, ReturnSpec, Type, Visibility,
+        Ident, IndexNode, MethodReceiver, ReturnSpec, TupleIndexNode, Type, Visibility,
     },
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
@@ -31,7 +34,7 @@ use crate::{
     span::Span,
 };
 
-pub(super) enum Subject {
+enum Subject {
     Value(PlaceValue),
     Module(ModuleScope),
     Type(Type),
@@ -47,39 +50,25 @@ pub(super) enum Subject {
     },
     EnumVariant {
         resolved: ResolvedEnumVariant,
+        explicit_args: Option<GenericArgs>,
         surface_ty: Type,
     },
     ExternMethod {
         method_ref: ExternMethodRef,
         receiver: ReceiverMode,
-        receiver_access: PlaceAccess,
-        receiver_place: PlaceUseFacts,
-        receiver_identity: place::PlaceIdentity,
-        receiver_root_name: Option<Ident>,
-        receiver_global: Option<place::GlobalPlace>,
-        receiver_id: ExprId,
+        receiver_use: ReceiverUse,
         name: Ident,
         signature: ResolvedExternSignature,
     },
     DynMethod {
         contract: ContractSetKey,
         requirement: ContractRequirementSchema,
-        receiver_access: PlaceAccess,
-        receiver_place: PlaceUseFacts,
-        receiver_identity: place::PlaceIdentity,
-        receiver_root_name: Option<Ident>,
-        receiver_global: Option<place::GlobalPlace>,
-        receiver_id: ExprId,
+        receiver_use: ReceiverUse,
         name: Ident,
     },
     DynHoleMethod {
         hole: crate::ast::DynContractHoleId,
-        receiver_access: PlaceAccess,
-        receiver_place: PlaceUseFacts,
-        receiver_identity: place::PlaceIdentity,
-        receiver_root_name: Option<Ident>,
-        receiver_global: Option<place::GlobalPlace>,
-        receiver_id: ExprId,
+        receiver_use: ReceiverUse,
         name: Ident,
     },
     ExternStatic {
@@ -105,24 +94,54 @@ pub(super) struct PostfixChain<'a> {
     pub steps: Vec<PostfixStep<'a>>,
 }
 
-pub(super) struct SourceReceiver {
-    mutable: bool,
+struct ReceiverUse {
     access: PlaceAccess,
     facts: PlaceUseFacts,
     identity: place::PlaceIdentity,
     root_name: Option<Ident>,
     global: Option<place::GlobalPlace>,
-    expr_id: ExprId,
+    id: ExprId,
+}
+
+struct SourceReceiver {
+    mutable: bool,
+    use_: ReceiverUse,
     name: Ident,
 }
 
-struct DynReceiver<'a> {
-    access: PlaceAccess,
-    facts: &'a PlaceUseFacts,
-    identity: &'a place::PlaceIdentity,
-    root_name: Option<Ident>,
-    global: Option<place::GlobalPlace>,
-    id: ExprId,
+impl ReceiverUse {
+    fn check_root(&self, span: Span, tc: &mut TypeChecker) {
+        tc.check_mut_downcast_root_use(self.root_name, &self.identity, span);
+    }
+
+    fn value(&self, tc: &TypeChecker) -> PlaceValue {
+        PlaceValue {
+            checked: checked_type(Type::Infer, tc),
+            access: self.access,
+            facts: self.facts.clone(),
+            identity: self.identity.clone(),
+            root_name: self.root_name,
+            global: self.global.clone(),
+        }
+    }
+
+    fn record_read(&self, tc: &mut TypeChecker) {
+        place::record_value_read(self.id, &self.value(tc), tc);
+    }
+
+    fn record_mut(&self, tc: &mut TypeChecker) {
+        place::record_mut_receiver(self.id, &self.value(tc), tc);
+    }
+
+    fn return_source(&self) -> ReturnPlaceSource {
+        ReturnPlaceSource {
+            access: self.access,
+            facts: self.facts.clone(),
+            identity: self.identity.clone(),
+            root_name: self.root_name,
+            global: self.global.clone(),
+        }
+    }
 }
 
 pub(super) fn collect_postfix_chain(expr: &ExprNode) -> Option<PostfixChain<'_>> {
@@ -174,7 +193,7 @@ fn local_value_subject(
     Subject::Value(value)
 }
 
-pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subject> {
+fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subject> {
     match &expr.node.kind {
         ExprKind::Ident(name) => {
             let local = match tc.lookup_local_symbol_checked(*name, expr.span) {
@@ -186,7 +205,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
                 super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth)
                     if depth > 0 =>
                 {
-                    let value = tc.local_value_from_info(*name, info, depth);
+                    let value = tc.local_value_from_info(info, depth);
                     return Some(local_value_subject(expr, *name, &value, tc));
                 }
                 super::LocalSymbolLookup::Blocked(error) => {
@@ -201,7 +220,7 @@ pub(super) fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subj
                 ));
             }
             if let super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth) = local {
-                let value = tc.local_value_from_info(*name, info, depth);
+                let value = tc.local_value_from_info(info, depth);
                 return Some(local_value_subject(expr, *name, &value, tc));
             }
             if let Some(scope) = tc.lookup_module_alias(*name) {
@@ -296,27 +315,50 @@ pub(super) fn check_postfix_chain_place(
         };
     }
 
-    if let Subject::Callable { callee, .. } = &subject
-        && callee.def.sig.ret.is_infer()
-    {
-        tc.push_error(TypeError::InferReturnValue {
-            span: tc.error_span(expr.span),
-        });
-    }
-
-    if let Subject::Value(value) = &subject {
-        tc.check_mut_downcast_root_use(value.root_name, &value.identity, expr.span);
-        if record_final_read {
-            place::record_value_read(expr.node.id, value, tc);
+    match &subject {
+        Subject::EnumVariant {
+            resolved,
+            explicit_args,
+            ..
+        } => {
+            let expected_ty = expected_for_chain(expected, optional_chain, tc)
+                .as_ref()
+                .map(|handle| tc.handle_type(handle));
+            let ty = if enum_variant::expect_unit(tc, resolved, expr.span) {
+                enum_variant::solve_unit_owner_ty(
+                    tc,
+                    resolved,
+                    explicit_args.as_ref(),
+                    expected_ty.as_ref(),
+                    expr.span,
+                )
+                .unwrap_or(Type::Infer)
+            } else {
+                Type::Infer
+            };
+            let ty = wrap_optional(ty, optional_chain, tc);
+            let checked = checked_from_type(expr, ty, tc);
+            return PlaceValue::not_place(checked);
         }
-    }
-
-    if let Subject::Type(ty) = &subject {
-        tc.push_error(TypeError::TypeUsedAsValue {
-            ty: ty.clone(),
-            span: tc.error_span(expr.span),
-        });
-        return PlaceValue::not_place(super::checked_from_type(expr, Type::Infer, tc));
+        Subject::Callable { callee, .. } if callee.def.sig.ret.is_infer() => {
+            tc.push_error(TypeError::InferReturnValue {
+                span: tc.error_span(expr.span),
+            });
+        }
+        Subject::Value(value) => {
+            tc.check_mut_downcast_root_use(value.root_name, &value.identity, expr.span);
+            if record_final_read {
+                place::record_value_read(expr.node.id, value, tc);
+            }
+        }
+        Subject::Type(ty) => {
+            tc.push_error(TypeError::TypeUsedAsValue {
+                ty: ty.clone(),
+                span: tc.error_span(expr.span),
+            });
+            return PlaceValue::not_place(checked_from_type(expr, Type::Infer, tc));
+        }
+        _ => {}
     }
 
     let ty = chain_type(&subject, optional_chain, tc);
@@ -529,17 +571,21 @@ fn named_value_subject(
 
 fn enum_variant_subject(
     resolved: ResolvedEnumVariant,
+    subject_ty: &Type,
     expected: Option<&TypeHandle>,
     tc: &TypeChecker,
 ) -> Subject {
     let expected_ty = expected.map(|handle| tc.handle_type(handle));
+    let explicit_args = resolved.owner_args_from_type(subject_ty, tc);
     let surface_ty = expected_ty
         .as_ref()
         .filter(|ty| tc.decls.key_for_type(ty).as_ref() == Some(&resolved.key))
         .cloned()
+        .or_else(|| explicit_args.as_ref().map(|_| subject_ty.clone()))
         .unwrap_or_else(|| resolved.owner_ty());
     Subject::EnumVariant {
         resolved,
+        explicit_args,
         surface_ty,
     }
 }
@@ -559,7 +605,7 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     };
 
     let target = place::check_place(&index.node.target, tc);
-    let indexed = super::check_index_access(index, &target.value.checked, tc);
+    let indexed = check_index_access(index, &target.value.checked, tc);
     let indexed_place = !index.node.safe
         && matches!(
             &target.value.checked.ty,
@@ -570,25 +616,18 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     } else {
         indexed.read_ty
     };
-    let mut checked = super::checked_from_type(expr, ty, tc);
+    let mut checked = checked_from_type(expr, ty, tc);
     checked.contains_extern_any = indexed.contains_extern_any;
 
     if indexed_place {
         tc.closure
             .copy_place_identity(index.node.target.node.id, expr.node.id);
-        let mut value = PlaceValue::new(
+        return target.value.projected(
             checked,
             place::projected_field_access(target.value.access),
-            target.value.facts,
+            target.value.facts.clone(),
+            target.value.identity.clone().index(),
         );
-        value.identity = target.value.identity.index();
-        value.root_name = target.value.root_name;
-        value.global = target
-            .value
-            .global
-            .as_ref()
-            .map(place::GlobalPlace::projected);
-        return value;
     }
 
     place::record_value_read(index.node.target.node.id, &target.value, tc);
@@ -617,12 +656,14 @@ fn source_receiver(
 ) -> SourceReceiver {
     SourceReceiver {
         mutable: matches!(mode, MethodMode::Instance { mutable: true }),
-        access,
-        facts: facts.clone(),
-        identity,
-        root_name,
-        global,
-        expr_id,
+        use_: ReceiverUse {
+            access,
+            facts: facts.clone(),
+            identity,
+            root_name,
+            global,
+            id: expr_id,
+        },
         name,
     }
 }
@@ -665,12 +706,14 @@ fn apply_value_field(
             if let Type::Dyn(contract) = receiver_ty {
                 return apply_dyn_method(
                     contract,
-                    receiver_access,
-                    receiver_place.clone(),
-                    receiver_identity,
-                    receiver.root_name,
-                    receiver.global.clone(),
-                    receiver_id,
+                    ReceiverUse {
+                        access: receiver_access,
+                        facts: receiver_place.clone(),
+                        identity: receiver_identity,
+                        root_name: receiver.root_name,
+                        global: receiver.global.clone(),
+                        id: receiver_id,
+                    },
                     name,
                     span,
                     tc,
@@ -703,7 +746,7 @@ fn apply_value_field(
                 member::MethodResolution::Extend(method) => {
                     tc.mark_activation_imports_used(&method.extend.origin);
                     check_extend_method_access(
-                        &mut super::AccessPolicyOutput {
+                        &mut AccessPolicyOutput {
                             source: tc.source_id(),
                             current_module: &tc.current_module,
                             lint_events: &mut tc.lint_events,
@@ -768,15 +811,14 @@ fn apply_value_field(
                         member::PromotedMethodTarget::Extern(method) => Subject::ExternMethod {
                             method_ref: method.method_ref,
                             receiver: method.receiver,
-                            receiver_access: promoted_access,
-                            receiver_place: receiver_place.clone(),
-                            receiver_identity: promoted_identity,
-                            receiver_root_name: receiver.root_name,
-                            receiver_global: receiver
-                                .global
-                                .as_ref()
-                                .map(place::GlobalPlace::projected),
-                            receiver_id: field_id,
+                            receiver_use: ReceiverUse {
+                                access: promoted_access,
+                                facts: receiver_place.clone(),
+                                identity: promoted_identity,
+                                root_name: receiver.root_name,
+                                global: receiver.global.as_ref().map(place::GlobalPlace::projected),
+                                id: field_id,
+                            },
                             name,
                             signature: method.signature,
                         },
@@ -798,12 +840,14 @@ fn apply_value_field(
                 member::MethodResolution::Extern(method) => Subject::ExternMethod {
                     method_ref: method.method_ref,
                     receiver: method.receiver,
-                    receiver_access,
-                    receiver_place: receiver_place.clone(),
-                    receiver_identity,
-                    receiver_root_name: receiver.root_name,
-                    receiver_global: receiver.global.clone(),
-                    receiver_id,
+                    receiver_use: ReceiverUse {
+                        access: receiver_access,
+                        facts: receiver_place.clone(),
+                        identity: receiver_identity,
+                        root_name: receiver.root_name,
+                        global: receiver.global.clone(),
+                        id: receiver_id,
+                    },
                     name: method.name,
                     signature: method.signature,
                 },
@@ -832,12 +876,7 @@ fn apply_value_field(
 
 fn apply_dyn_method(
     contract: &crate::ast::ContractRef,
-    receiver_access: PlaceAccess,
-    receiver_place: PlaceUseFacts,
-    receiver_identity: place::PlaceIdentity,
-    receiver_root_name: Option<Ident>,
-    receiver_global: Option<place::GlobalPlace>,
-    receiver_id: ExprId,
+    receiver_use: ReceiverUse,
     name: Ident,
     span: Span,
     tc: &mut TypeChecker,
@@ -845,12 +884,7 @@ fn apply_dyn_method(
     if let Some(hole) = super::dyn_infer::hole_id(contract) {
         return Subject::DynHoleMethod {
             hole,
-            receiver_access,
-            receiver_place,
-            receiver_identity,
-            receiver_root_name,
-            receiver_global,
-            receiver_id,
+            receiver_use,
             name,
         };
     }
@@ -859,12 +893,7 @@ fn apply_dyn_method(
         Ok((contract, requirement)) => Subject::DynMethod {
             contract,
             requirement,
-            receiver_access,
-            receiver_place,
-            receiver_identity,
-            receiver_root_name,
-            receiver_global,
-            receiver_id,
+            receiver_use,
             name,
         },
         Err(DynamicMethodError::Missing { contract }) => {
@@ -893,14 +922,14 @@ fn apply_dyn_method(
 }
 
 fn check_extend_method_access(
-    out: &mut super::AccessPolicyOutput<'_>,
+    out: &mut AccessPolicyOutput<'_>,
     extend: &ExtendSchema,
     method: &ExtendMethodSchema,
     owner_ty: &Type,
     name: Ident,
     span: Span,
 ) {
-    super::emit_access_policy(
+    emit_access_policy(
         &method.policy,
         MemberAccessKind::Method,
         name,
@@ -1014,7 +1043,7 @@ fn apply_type_field(
             if has_variant {
                 let resolved = enum_variant::resolve_use(tc, &key, name, span)
                     .expect("variant exists in enum schema");
-                return enum_variant_subject(resolved, expected, tc);
+                return enum_variant_subject(resolved, target, expected, tc);
             }
             enum_key = Some(key);
         } else if let Some(agg) = tc.decls.aggregate(&key).cloned() {
@@ -1099,7 +1128,7 @@ fn static_extend_subject(
 ) -> Option<Subject> {
     let decls = &tc.decls;
     let current_module = &tc.current_module;
-    let matched = decls.find_static_extend_method(target, name, |ext| {
+    let matched = decls.find_extend_method(MethodSurface::Static, target, name, |ext| {
         TypeChecker::extend_visible_in(decls, current_module, ext)
     })?;
     let mut activation_origin = None;
@@ -1107,7 +1136,7 @@ fn static_extend_subject(
         Ok((extend, method, _, owner_args)) => {
             activation_origin = Some(extend.origin.clone());
             check_extend_method_access(
-                &mut super::AccessPolicyOutput {
+                &mut AccessPolicyOutput {
                     source: tc.source_id(),
                     current_module: &tc.current_module,
                     lint_events: &mut tc.lint_events,
@@ -1155,30 +1184,29 @@ fn apply_call(
             check_qualified_extend_call(module, *name, *span, call, call_id, expected, tc)
                 .into_place_value()
         }
-        Subject::EnumVariant { resolved, .. } => PlaceValue::not_place(check_enum_variant_call(
-            resolved, call, call_id, expected, tc,
+        Subject::EnumVariant {
+            resolved,
+            explicit_args,
+            ..
+        } => PlaceValue::not_place(check_enum_variant_call(
+            resolved,
+            explicit_args.as_ref(),
+            call,
+            call_id,
+            expected,
+            tc,
         )),
         Subject::ExternMethod {
             method_ref,
             receiver,
-            receiver_access,
-            receiver_place,
-            receiver_identity,
-            receiver_root_name,
-            receiver_global,
-            receiver_id,
+            receiver_use,
             name,
             signature,
         } => PlaceValue::not_place(check_extern_method_call(
             ExternMethodCall {
                 method_ref: *method_ref,
                 receiver: *receiver,
-                receiver_access: *receiver_access,
-                receiver_place,
-                receiver_identity,
-                receiver_root_name: *receiver_root_name,
-                receiver_global: receiver_global.clone(),
-                receiver_id: *receiver_id,
+                receiver_use,
                 name: *name,
                 signature,
             },
@@ -1190,24 +1218,12 @@ fn apply_call(
         Subject::DynMethod {
             contract,
             requirement,
-            receiver_access,
-            receiver_place,
-            receiver_identity,
-            receiver_root_name,
-            receiver_global,
-            receiver_id,
+            receiver_use,
             name,
         } => PlaceValue::not_place(check_dyn_method_call(
             contract,
             requirement,
-            DynReceiver {
-                access: *receiver_access,
-                facts: receiver_place,
-                identity: receiver_identity,
-                root_name: *receiver_root_name,
-                global: receiver_global.clone(),
-                id: *receiver_id,
-            },
+            receiver_use,
             *name,
             call,
             call_id,
@@ -1216,23 +1232,11 @@ fn apply_call(
         )),
         Subject::DynHoleMethod {
             hole,
-            receiver_access,
-            receiver_place,
-            receiver_identity,
-            receiver_root_name,
-            receiver_global,
-            receiver_id,
+            receiver_use,
             name,
         } => PlaceValue::not_place(check_dyn_hole_method_call(
             *hole,
-            DynReceiver {
-                access: *receiver_access,
-                facts: receiver_place,
-                identity: receiver_identity,
-                root_name: *receiver_root_name,
-                global: receiver_global.clone(),
-                id: *receiver_id,
-            },
+            receiver_use,
             *name,
             call,
             call_id,
@@ -1273,63 +1277,23 @@ fn check_source_receiver(
     span: Span,
     tc: &mut TypeChecker,
 ) -> Option<MutableArg> {
-    tc.check_mut_downcast_root_use(receiver.root_name, &receiver.identity, span);
+    receiver.use_.check_root(span, tc);
     if receiver.mutable {
         if let Some(error) =
-            mutating_receiver_error(receiver.access, receiver.name, tc.error_span(span))
+            mutating_receiver_error(receiver.use_.access, receiver.name, tc.error_span(span))
         {
             tc.push_error(error);
             return None;
         }
-        let receiver_value = receiver_place_value(
-            receiver.access,
-            &receiver.facts,
-            &receiver.identity,
-            receiver.root_name,
-            receiver.global.clone(),
-            tc,
-        );
-        place::record_mut_receiver(receiver.expr_id, &receiver_value, tc);
+        receiver.use_.record_mut(tc);
         return Some(MutableArg {
-            identity: receiver.identity.clone(),
+            identity: receiver.use_.identity.clone(),
             span,
-            source: ReturnPlaceSource {
-                access: receiver.access,
-                facts: receiver.facts.clone(),
-                identity: receiver.identity.clone(),
-                root_name: receiver.root_name,
-                global: receiver.global.clone(),
-            },
+            source: receiver.use_.return_source(),
         });
     }
-    let receiver_value = receiver_place_value(
-        receiver.access,
-        &receiver.facts,
-        &receiver.identity,
-        receiver.root_name,
-        receiver.global.clone(),
-        tc,
-    );
-    place::record_value_read(receiver.expr_id, &receiver_value, tc);
+    receiver.use_.record_read(tc);
     None
-}
-
-fn receiver_place_value(
-    access: PlaceAccess,
-    facts: &PlaceUseFacts,
-    identity: &place::PlaceIdentity,
-    root_name: Option<Ident>,
-    global: Option<place::GlobalPlace>,
-    tc: &TypeChecker,
-) -> PlaceValue {
-    PlaceValue {
-        checked: checked_type(Type::Infer, tc),
-        access,
-        facts: facts.clone(),
-        identity: identity.clone(),
-        root_name,
-        global,
-    }
 }
 
 fn mutating_receiver_error(
@@ -1387,7 +1351,7 @@ fn call_value(
 
 fn check_dyn_hole_method_call(
     hole: crate::ast::DynContractHoleId,
-    receiver: DynReceiver<'_>,
+    receiver: &ReceiverUse,
     name: Ident,
     call: &CallNode,
     call_id: ExprId,
@@ -1401,26 +1365,18 @@ fn check_dyn_hole_method_call(
         MethodReceiver::Value
     };
     let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
-    tc.check_mut_downcast_root_use(receiver.root_name, receiver.identity, call.span);
-    let receiver_value = receiver_place_value(
-        receiver.access,
-        receiver.facts,
-        receiver.identity,
-        receiver.root_name,
-        receiver.global.clone(),
-        tc,
-    );
+    receiver.check_root(call.span, tc);
     if requires_mutable {
         match mutating_receiver_error(receiver.access, name, tc.error_span(call.span)) {
             Some(error) => {
                 tc.push_error(error);
             }
             None => {
-                place::record_mut_receiver(receiver.id, &receiver_value, tc);
+                receiver.record_mut(tc);
             }
         }
     } else {
-        place::record_value_read(receiver.id, &receiver_value, tc);
+        receiver.record_read(tc);
     }
 
     let mut failed = false;
@@ -1483,7 +1439,7 @@ fn check_dyn_hole_method_call(
 fn check_dyn_method_call(
     contract: &ContractSetKey,
     requirement: &ContractRequirementSchema,
-    receiver: DynReceiver<'_>,
+    receiver: &ReceiverUse,
     name: Ident,
     call: &CallNode,
     call_id: ExprId,
@@ -1494,16 +1450,8 @@ fn check_dyn_method_call(
         .receiver
         .expect("contract requirements are finalized with receivers");
     let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
-    tc.check_mut_downcast_root_use(receiver.root_name, receiver.identity, call.span);
+    receiver.check_root(call.span, tc);
     let mut failed = false;
-    let receiver_value = receiver_place_value(
-        receiver.access,
-        receiver.facts,
-        receiver.identity,
-        receiver.root_name,
-        receiver.global.clone(),
-        tc,
-    );
     if requires_mutable {
         if let Some(error) =
             mutating_receiver_error(receiver.access, name, tc.error_span(call.span))
@@ -1511,10 +1459,10 @@ fn check_dyn_method_call(
             tc.push_error(error);
             failed = true;
         } else {
-            place::record_mut_receiver(receiver.id, &receiver_value, tc);
+            receiver.record_mut(tc);
         }
     } else {
-        place::record_value_read(receiver.id, &receiver_value, tc);
+        receiver.record_read(tc);
     }
 
     failed |= check_args(&call.node.args, &requirement.params, call.span, call_id, tc);
@@ -1534,16 +1482,10 @@ fn check_dyn_method_call(
     checked_type(requirement.ret.ty.clone(), tc)
 }
 
-#[derive(Clone)]
 struct ExternMethodCall<'a> {
     method_ref: ExternMethodRef,
     receiver: ReceiverMode,
-    receiver_access: PlaceAccess,
-    receiver_place: &'a PlaceUseFacts,
-    receiver_identity: &'a place::PlaceIdentity,
-    receiver_root_name: Option<Ident>,
-    receiver_global: Option<place::GlobalPlace>,
-    receiver_id: ExprId,
+    receiver_use: &'a ReceiverUse,
     name: Ident,
     signature: &'a ResolvedExternSignature,
 }
@@ -1913,18 +1855,12 @@ fn check_projecting_var_arg(
         }
     };
 
-    let mut projected = PlaceValue::new(
+    let projected = place.value.projected(
         checked_type(projection.target_ty.clone(), tc),
         place::projected_field_access(place.value.access),
         place.value.facts.clone(),
+        place.value.identity.clone().fields(&projection.field_path),
     );
-    projected.identity = place.value.identity.fields(&projection.field_path);
-    projected.root_name = place.value.root_name;
-    projected.global = place
-        .value
-        .global
-        .as_ref()
-        .map(place::GlobalPlace::projected);
     tc.reject_extern_any_escape(&projected.checked, arg.span);
     tc.expect_assignable_expr(
         arg.span,
@@ -1973,7 +1909,7 @@ fn check_cast_accept_arg(
     param: &CallParam,
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
-    let checked = super::check_value_expr_checked_with_hint(arg, None, tc);
+    let checked = check_value_expr_checked_with_hint(arg, None, tc);
     tc.reject_extern_any_escape(&checked, arg.span);
     if can_assign_without_errors(arg.span, checked.handle.clone(), param.ty.clone(), tc) {
         tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
@@ -1998,7 +1934,7 @@ fn check_cast_accept_arg(
 }
 
 fn check_value_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
-    let checked = super::check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc);
+    let checked = check_value_expr_checked_with_hint(arg, Some(param.ty.clone()), tc);
     tc.reject_extern_any_escape(&checked, arg.span);
     let dyn_format = matches!(tc.handle_type(&param.ty), Type::Any)
         && tc.reject_dyn_implicit_format(&checked.ty, arg.span);
@@ -2057,23 +1993,23 @@ fn substitute_params_checked(
 
 fn check_enum_variant_call(
     resolved: &ResolvedEnumVariant,
+    explicit_args: Option<&GenericArgs>,
     call: &CallNode,
     call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let can_call = match &resolved.schema.payload {
-        VariantPayload::Tuple(_) => true,
-        VariantPayload::Unit => call.node.args.is_empty(),
-        VariantPayload::Struct(_) => false,
+    let Some(params) = enum_variant::expect_tuple(tc, resolved, call.span) else {
+        return check_unhinted_args(&call.node.args, tc);
     };
-    if !can_call {
-        enum_variant::push_shape_mismatch(tc, resolved, VariantShape::Tuple, call.span);
+    if explicit_args.is_some() && !call.node.generic_args.is_empty() {
+        tc.push_error(TypeError::GenericArity(super::ArityError::TypeArgs {
+            expected: 0,
+            found: call.node.generic_args.len(),
+        }));
         return check_unhinted_args(&call.node.args, tc);
     }
-    if let VariantPayload::Tuple(params) = &resolved.schema.payload
-        && params.len() != call.node.args.len()
-    {
+    if params.len() != call.node.args.len() {
         enum_variant::push_arg_count_mismatch(
             tc,
             resolved.key.name,
@@ -2084,12 +2020,8 @@ fn check_enum_variant_call(
         );
         return check_unhinted_args(&call.node.args, tc);
     }
-    let Some(callee) =
-        tc.decls
-            .callable_for_variant(&resolved.key, resolved.variant, &resolved.schema)
-    else {
-        return checked_type(Type::Infer, tc);
-    };
+    let owner_args = explicit_args.cloned().unwrap_or_default();
+    let callee = enum_variant::tuple_callable_ref(resolved, params, owner_args);
     let checked = check_callable_call_with_args(
         &callee,
         &call.node.args,
@@ -2206,16 +2138,14 @@ fn check_callable_call_with_args(
         place_source,
         ..
     } = inst;
-    let body_ret = ret.clone();
-
-    if let Some(inferred_ret) = super::check_specialized_callable_body(
+    if let Some(inferred_ret) = check_specialized_callable_body(
         callee,
         &concrete_params,
-        body_ret,
+        &ret,
         &args,
         type_subst,
         const_subst,
-        const_bindings,
+        &const_bindings,
         tc,
     ) {
         ret.ty = inferred_ret;
@@ -2288,7 +2218,7 @@ fn check_qualified_extend_call(
         name,
     );
     check_extend_method_access(
-        &mut super::AccessPolicyOutput {
+        &mut AccessPolicyOutput {
             source: tc.source_id(),
             current_module: &tc.current_module,
             lint_events: &mut tc.lint_events,
@@ -2374,32 +2304,21 @@ fn check_extern_method_call(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    tc.check_mut_downcast_root_use(
-        method.receiver_root_name,
-        method.receiver_identity,
-        call.span,
-    );
-    let receiver_value = receiver_place_value(
-        method.receiver_access,
-        method.receiver_place,
-        method.receiver_identity,
-        method.receiver_root_name,
-        method.receiver_global,
-        tc,
-    );
+    method.receiver_use.check_root(call.span, tc);
     match method.receiver {
         ReceiverMode::Mutable => {
             if let Some(error) = method
-                .receiver_access
+                .receiver_use
+                .access
                 .mut_borrow_error(method.name, tc.error_span(call.span))
             {
                 tc.push_error(error);
             } else {
-                place::record_mut_receiver(method.receiver_id, &receiver_value, tc);
+                method.receiver_use.record_mut(tc);
             }
         }
         ReceiverMode::Value | ReceiverMode::Shared => {
-            place::record_value_read(method.receiver_id, &receiver_value, tc);
+            method.receiver_use.record_read(tc);
         }
     }
     check_extern_call(
@@ -2588,7 +2507,7 @@ fn unknown_member(
     Subject::Error
 }
 
-pub(super) fn check_args(
+fn check_args(
     args: &[ExprNode],
     params: &[FuncParam],
     call_span: Span,
@@ -2609,4 +2528,206 @@ pub(super) fn check_args(
         })
         .collect::<Vec<_>>();
     check_source_args(args, &params, call_id, None, tc).failed
+}
+
+pub(super) fn check_tuple_index(
+    expr: &ExprNode,
+    node: &TupleIndexNode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let target = check_expr_checked(&node.node.target, tc);
+    tc.closure
+        .copy_place_identity(node.node.target.node.id, expr.node.id);
+    check_tuple_index_access(expr, node, &target, tc)
+}
+
+pub(super) fn check_tuple_index_access(
+    expr: &ExprNode,
+    node: &TupleIndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let Type::Tuple(elems) = &target.ty else {
+        tc.push_error(TypeError::TupleIndexOnNonTuple {
+            ty: target.ty.clone(),
+            index: node.node.index,
+            span: tc.error_span(node.span),
+        });
+        return checked_from_type(expr, Type::Infer, tc);
+    };
+
+    let Some(elem_ty) = elems.get(node.node.index as usize).cloned() else {
+        tc.push_error(TypeError::TupleIndexOutOfBounds {
+            index: node.node.index,
+            len: elems.len(),
+            span: tc.error_span(node.span),
+        });
+        return checked_from_type(expr, Type::Infer, tc);
+    };
+
+    let mut checked = checked_from_type(expr, elem_ty, tc);
+    checked.contains_extern_any = target.contains_extern_any;
+    checked
+}
+
+pub(super) struct CheckedIndex {
+    pub(super) read_ty: Type,
+    pub(super) write_ty: Type,
+    pub(super) contains_extern_any: bool,
+}
+
+impl CheckedIndex {
+    fn new(read_ty: Type, write_ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+        Self {
+            read_ty,
+            write_ty,
+            contains_extern_any: target.contains_extern_any || index.contains_extern_any,
+        }
+    }
+
+    fn same(ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+        Self::new(ty.clone(), ty, target, index)
+    }
+
+    fn infer(target: &CheckedType, index: &CheckedType) -> Self {
+        Self::same(Type::Infer, target, index)
+    }
+}
+
+pub(super) fn check_index_expr(
+    expr: &ExprNode,
+    node: &IndexNode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let target = check_expr_checked(&node.node.target, tc);
+    tc.closure
+        .copy_place_identity(node.node.target.node.id, expr.node.id);
+    let indexed = check_index_access(node, &target, tc);
+    let mut checked = checked_from_type(expr, indexed.read_ty, tc);
+    checked.contains_extern_any = indexed.contains_extern_any;
+    checked
+}
+
+pub(super) fn check_index_access(
+    node: &IndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedIndex {
+    if node.node.safe || has_safe_postfix(&node.node.target) {
+        let inner = tc.optional_chain_inner_type(&target.ty, node.span);
+        let inner_target = CheckedType {
+            ty: inner,
+            handle: target.handle.clone(),
+            contains_extern_any: target.contains_extern_any,
+        };
+        let indexed = check_index_access_inner(node, &inner_target, tc);
+        return CheckedIndex {
+            read_ty: tc.optional_chain_result_type(indexed.read_ty),
+            write_ty: Type::Infer,
+            contains_extern_any: indexed.contains_extern_any,
+        };
+    }
+
+    check_index_access_inner(node, target, tc)
+}
+
+fn has_safe_postfix(expr: &ExprNode) -> bool {
+    match &expr.node.kind {
+        ExprKind::Field(field) => field.node.safe || has_safe_postfix(&field.node.target),
+        ExprKind::Call(call) => call.node.safe || has_safe_postfix(&call.node.func),
+        ExprKind::Index(index) => index.node.safe || has_safe_postfix(&index.node.target),
+        _ => false,
+    }
+}
+
+fn check_index_access_inner(
+    node: &IndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedIndex {
+    if matches!(node.node.index.node.kind, ExprKind::Range(_)) {
+        return check_range_index_access(node, target, tc);
+    }
+
+    match &target.ty {
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+            let index = check_value_expr_checked_with_hint(
+                &node.node.index,
+                Some(tc.type_handle(&Type::Int)),
+                tc,
+            );
+            if !matches!(index.ty, Type::Infer | Type::Int) {
+                tc.push_error(TypeError::IndexNotInt {
+                    found: index.ty.clone(),
+                    span: tc.error_span(node.node.index.span),
+                });
+            }
+            CheckedIndex::same((**elem).clone(), target, &index)
+        }
+        Type::Map { key, value } => {
+            let key_handle = tc.type_handle(key);
+            let index =
+                check_value_expr_checked_with_hint(&node.node.index, Some(key_handle.clone()), tc);
+            tc.expect_assignable(node.node.index.span, index.handle.clone(), key_handle);
+            tc.solve_constraints();
+            let value = (**value).clone();
+            CheckedIndex::new(
+                tc.decls
+                    .core_option_of(value.clone())
+                    .unwrap_or(Type::Infer),
+                value,
+                target,
+                &index,
+            )
+        }
+        Type::Infer => {
+            let index = check_expr_checked(&node.node.index, tc);
+            CheckedIndex::infer(target, &index)
+        }
+        found => {
+            let index = check_expr_checked(&node.node.index, tc);
+            if !found.is_void() {
+                tc.push_error(TypeError::IndexOnNonIndexable {
+                    found: found.clone(),
+                    span: tc.error_span(node.span),
+                });
+            }
+            CheckedIndex::infer(target, &index)
+        }
+    }
+}
+
+fn check_range_index_access(
+    node: &IndexNode,
+    target: &CheckedType,
+    tc: &mut TypeChecker,
+) -> CheckedIndex {
+    let index = check_expr_checked(&node.node.index, tc);
+    match &target.ty {
+        Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
+            if !matches!(
+                tc.decls.core_range_inner(&index.ty),
+                Some(Type::Int | Type::Infer)
+            ) {
+                tc.push_error(TypeError::RangeIndexNotInt {
+                    found: index.ty.clone(),
+                    span: tc.error_span(node.node.index.span),
+                });
+            }
+            CheckedIndex::new(
+                Type::Slice { elem: elem.clone() },
+                Type::Infer,
+                target,
+                &index,
+            )
+        }
+        Type::Infer => CheckedIndex::infer(target, &index),
+        found => {
+            tc.push_error(TypeError::RangeIndexUnsupported {
+                found: found.clone(),
+                span: tc.error_span(node.span),
+            });
+            CheckedIndex::infer(target, &index)
+        }
+    }
 }

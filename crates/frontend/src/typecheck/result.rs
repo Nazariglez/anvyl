@@ -1,8 +1,15 @@
+use std::path::Path;
+
 use super::{
     BindingPromotionMap, CompileWarning, ImportId, ImportRecord, LambdaCaptureMap, LambdaEscapeMap,
-    map_delta,
+    ModuleScope, semantic_use::map_delta,
 };
-use crate::lint::LintEvent;
+use crate::{
+    ast::Visibility,
+    diagnostic::DiagnosticTag,
+    lint::{LintEvent, LintId},
+    resolve::PackageId,
+};
 
 pub struct TypecheckResult {
     warnings: Vec<CompileWarning>,
@@ -51,12 +58,18 @@ impl TypecheckFacts {
         &self.binding_promotions
     }
 
-    pub(crate) fn import_records(&self) -> &[ImportRecord] {
-        &self.import_records
+    pub(crate) fn unused_import_events(&self) -> Vec<LintEvent> {
+        self.import_records
+            .iter()
+            .filter(|import| self.unused_import_candidate(import))
+            .map(unused_import_event)
+            .collect()
     }
 
-    pub(crate) fn used_imports(&self) -> &std::collections::HashSet<ImportId> {
-        &self.used_imports
+    fn unused_import_candidate(&self, import: &ImportRecord) -> bool {
+        import.visibility == Visibility::Private
+            && !is_system_import(import)
+            && !self.used_imports.contains(&import.id)
     }
 
     pub(crate) fn delta_since(&self, old: &Self) -> Self {
@@ -81,4 +94,51 @@ impl TypecheckFacts {
             debug_assert_eq!(*binding_id, fact.binding_id);
         }
     }
+}
+
+fn is_system_import(import: &ImportRecord) -> bool {
+    let ModuleScope::Package(module) = &import.id.module else {
+        return false;
+    };
+    module
+        .package_context()
+        .is_some_and(|package| package == &PackageId::core() || package == &PackageId::std())
+}
+
+fn unused_import_event(import: &ImportRecord) -> LintEvent {
+    LintEvent {
+        id: LintId::UnusedImport,
+        span: import.span,
+        message: format!(
+            "unused import from '{}'",
+            render_import_module(&import.target_module)
+        ),
+        label: None,
+        notes: vec![],
+        help: Some("remove this import".to_string()),
+        tags: vec![DiagnosticTag::Unnecessary],
+    }
+}
+
+fn render_import_module(module: &ModuleScope) -> String {
+    match module {
+        ModuleScope::Root => "<root>".to_string(),
+        ModuleScope::Named(path) => path.segments().join("."),
+        ModuleScope::Package(module) => module
+            .module_path()
+            .map(|path| path.segments().join("."))
+            .or_else(|| {
+                module
+                    .source_file()
+                    .map(|file| source_module_name(file.path()))
+            })
+            .unwrap_or_else(|| "<root>".to_string()),
+    }
+}
+
+fn source_module_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<source>")
+        .to_string()
 }

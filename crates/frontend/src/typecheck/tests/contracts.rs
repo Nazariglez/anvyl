@@ -5,7 +5,7 @@ use crate::{
     span::Span,
     test_support::{empty_resolved, module_path, parse_program, resolved_modules},
     typecheck::{
-        DeclError, DeprecatedUseKind, ModuleScope, TypeError, TypecheckConfig, contracts,
+        DeprecatedUseKind, ModuleScope, TypeError, TypecheckConfig, contracts,
         contracts::{ContractMatchError, ContractSlotTarget, RequirementError},
         typechecker_for_modules,
     },
@@ -41,38 +41,6 @@ fn root_type(tc: &mut crate::typecheck::TypeChecker, name: &str) -> Type {
 
 fn module(name: &str) -> ModuleScope {
     ModuleScope::Named(module_path(name))
-}
-
-#[test]
-fn duplicate_direct_requirement_is_error() {
-    let errors = errors(
-        "contract Drawable {
-            fn draw(self);
-            fn draw(self);
-        }",
-    );
-
-    assert_eq!(errors.len(), 1);
-    assert!(matches!(
-        &errors[0],
-        TypeError::Decl(DeclError::DuplicateContractRequirement { name, .. })
-            if name.as_str() == "draw"
-    ));
-}
-
-#[test]
-fn conflicting_direct_requirement_is_error() {
-    let errors = errors(
-        "contract Drawable {
-            fn draw(self);
-            fn draw(self, layer: int);
-        }",
-    );
-
-    assert_eq!(errors.len(), 1);
-    assert!(
-        matches!(&errors[0], TypeError::CompileError { message, .. } if message.contains("conflicting contract requirement 'draw' in contract 'Drawable'"))
-    );
 }
 
 #[test]
@@ -117,21 +85,6 @@ fn inclusion_duplicate_requirement_collapses() {
 }
 
 #[test]
-fn inclusion_conflict_is_error() {
-    let errors = errors(
-        "contract A { fn draw(self); }
-        contract B { fn draw(self, layer: int); }
-        contract C { A; B; }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("conflicting contract requirement 'draw' in contract 'C'")
-    )));
-}
-
-#[test]
 fn inclusion_cycle_is_error() {
     let errors = errors("contract A { B; } contract B { A; }");
 
@@ -172,17 +125,6 @@ fn deprecated_contract_inclusion_warns() {
 }
 
 #[test]
-fn static_bound_accepts_satisfying_concrete_arg() {
-    check(
-        "contract A { fn a(self) -> int; }
-        struct Thing { fn a(self) -> int { 1 } }
-        fn add<T: A>(value: T) -> int { value.a() }
-        fn main() { let x = add(Thing {}); }",
-    )
-    .expect("typecheck failed");
-}
-
-#[test]
 fn static_bound_uses_declaration_module() {
     checker_with_modules(
         "import api { take };
@@ -208,57 +150,6 @@ fn deprecated_contract_bound_warns() {
     .expect("typecheck failed");
 
     assert_deprecated_warning(&result, DeprecatedUseKind::Contract, "Old", Some("use New"));
-}
-
-#[test]
-fn static_bound_rejects_unsatisfied_concrete_arg() {
-    let errors = errors(
-        "contract A { fn a(self) -> int; }
-        struct Thing {}
-        fn add<T: A>(value: T) -> int { 1 }
-        fn main() { let x = add(Thing {}); }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("does not satisfy contract bound 'A'")
-    )));
-}
-
-#[test]
-fn static_bound_accepts_dynamic_subset() {
-    check(
-        "contract A { fn a(self); }
-        contract B { fn b(self); }
-        struct Both { fn a(self) {} fn b(self) {} }
-        fn take<T: A>(value: T) {}
-        fn main() {
-            let value: dyn A + B = Both {};
-            take(value);
-        }",
-    )
-    .expect("typecheck failed");
-}
-
-#[test]
-fn static_bound_rejects_dynamic_missing_requirement() {
-    let errors = errors(
-        "contract A { fn a(self); }
-        contract B { fn b(self); }
-        struct OnlyA { fn a(self) {} }
-        fn take<T: A + B>(value: T) {}
-        fn main() {
-            let value: dyn A = OnlyA {};
-            take(value);
-        }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("does not satisfy contract bound 'B'")
-    )));
 }
 
 #[test]
@@ -292,15 +183,6 @@ fn static_bound_does_not_create_witness_for_concrete_arg() {
 }
 
 #[test]
-fn inferred_dynamic_param_collects_method() {
-    checker(
-        "struct Actor { fn draw(self) {} }
-        fn use_actor(actor: dyn _) { actor.draw(); }
-        fn main() { use_actor(Actor {}); }",
-    );
-}
-
-#[test]
 fn inferred_dynamic_receiver_mutability_uses_access() {
     checker(
         "struct Actor { fn update(var self, dt: float) {} }
@@ -318,21 +200,6 @@ fn inferred_dynamic_expected_context_solves_empty_surface() {
         fn use_actor(actor: dyn _) { take(actor); }
         fn main() { use_actor(Actor {}); }",
     );
-}
-
-#[test]
-fn inferred_dynamic_empty_hole_is_error() {
-    let errors = errors(
-        "struct Actor {}
-        fn use_actor(actor: dyn _) {}
-        fn main() { use_actor(Actor {}); }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("cannot infer empty dynamic contract")
-    )));
 }
 
 #[test]
@@ -494,25 +361,6 @@ fn for_var_dynamic_call_records_fact() {
 }
 
 #[test]
-fn dynamic_strengthening_is_rejected() {
-    let errors = errors(
-        "contract A { fn a(self); }
-        contract B { fn b(self); }
-        struct OnlyA { fn a(self) {} }
-        fn main() {
-            let a: dyn A = OnlyA {};
-            let both: dyn A + B = a;
-        }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("implicit dynamic strengthening is not allowed")
-    )));
-}
-
-#[test]
 fn deprecated_contract_declaration_does_not_warn() {
     let result = check("@deprecated contract Old { fn f(self); }").expect("typecheck failed");
 
@@ -548,9 +396,11 @@ fn assert_matches(source: &str, ty_name: &str, contract_name: &str) -> contracts
     let ty = root_type(&mut tc, ty_name);
     match contracts::match_contract(&mut tc, &ty, &contract(contract_name), Span::default()) {
         Ok(matched) => matched,
-        Err(ContractMatchError::UnknownContract)
-        | Err(ContractMatchError::ConflictingRequirement(_))
-        | Err(ContractMatchError::Unsatisfied(_)) => panic!("contract should match"),
+        Err(
+            ContractMatchError::UnknownContract
+            | ContractMatchError::ConflictingRequirement(_)
+            | ContractMatchError::Unsatisfied(_),
+        ) => panic!("contract should match"),
     }
 }
 
@@ -674,9 +524,11 @@ fn imported_extension_method_matches() {
     let matched =
         match contracts::match_contract(&mut tc, &ty, &contract("Updatable"), Span::default()) {
             Ok(matched) => matched,
-            Err(ContractMatchError::UnknownContract)
-            | Err(ContractMatchError::ConflictingRequirement(_))
-            | Err(ContractMatchError::Unsatisfied(_)) => panic!("extension should match"),
+            Err(
+                ContractMatchError::UnknownContract
+                | ContractMatchError::ConflictingRequirement(_)
+                | ContractMatchError::Unsatisfied(_),
+            ) => panic!("extension should match"),
         };
 
     assert!(matches!(
@@ -823,11 +675,11 @@ fn witness_key_includes_selected_extension() {
         let matched =
             match contracts::match_contract(tc, &ty, &contract("Updatable"), Span::default()) {
                 Ok(matched) => matched,
-                Err(ContractMatchError::UnknownContract)
-                | Err(ContractMatchError::ConflictingRequirement(_))
-                | Err(ContractMatchError::Unsatisfied(_)) => {
-                    panic!("aggressive witness should match")
-                }
+                Err(
+                    ContractMatchError::UnknownContract
+                    | ContractMatchError::ConflictingRequirement(_)
+                    | ContractMatchError::Unsatisfied(_),
+                ) => panic!("aggressive witness should match"),
             };
         contracts::plan_witness(tc, &matched, Span::default())
     });
@@ -837,11 +689,11 @@ fn witness_key_includes_selected_extension() {
         let matched =
             match contracts::match_contract(tc, &ty, &contract("Updatable"), Span::default()) {
                 Ok(matched) => matched,
-                Err(ContractMatchError::UnknownContract)
-                | Err(ContractMatchError::ConflictingRequirement(_))
-                | Err(ContractMatchError::Unsatisfied(_)) => {
-                    panic!("passive witness should match")
-                }
+                Err(
+                    ContractMatchError::UnknownContract
+                    | ContractMatchError::ConflictingRequirement(_)
+                    | ContractMatchError::Unsatisfied(_),
+                ) => panic!("passive witness should match"),
             };
         contracts::plan_witness(tc, &matched, Span::default())
     });

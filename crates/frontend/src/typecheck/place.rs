@@ -1,8 +1,8 @@
 use super::{
-    CheckedType, Exposure, ExternUseTarget, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect,
-    GlobalKey, GlobalSig, LocalTypeId, MemberAccessKind, MemberPathFact, MemberPathKind,
-    TypeChecker, TypeError, ValueDecl, check_expr_checked, check_index_access,
-    check_tuple_index_access, member,
+    CheckedType, Exposure, ExternUseTarget, GlobalAccessMode, GlobalKey, GlobalSig, LocalTypeId,
+    MemberAccessKind, MemberPathFact, MemberPathKind, TypeChecker, TypeError, ValueDecl,
+    check_expr_checked, member,
+    postfix::{check_index_access, check_tuple_index_access},
 };
 use crate::{
     ast::{ExprId, ExprKind, ExprNode, Ident, Mutability, Type},
@@ -458,6 +458,23 @@ impl PlaceValue {
     pub(super) fn not_place(checked: CheckedType) -> Self {
         Self::new(checked, PlaceAccess::NotPlace, PlaceUseFacts::default())
     }
+
+    pub(super) fn projected(
+        &self,
+        checked: CheckedType,
+        access: PlaceAccess,
+        facts: PlaceUseFacts,
+        identity: PlaceIdentity,
+    ) -> Self {
+        Self {
+            checked,
+            access,
+            facts,
+            identity,
+            root_name: self.root_name,
+            global: self.global.as_ref().map(GlobalPlace::projected),
+        }
+    }
 }
 
 pub(super) enum FieldValueResult {
@@ -485,14 +502,12 @@ pub(super) fn field_value(
                 &field.origin,
                 span,
             );
-            let mut value = PlaceValue::new(
+            let value = receiver.projected(
                 field_checked(expr, field.ty, false, tc),
                 projected_field_access(receiver.access),
                 receiver.facts.clone(),
+                receiver.identity.clone().field(name),
             );
-            value.identity = receiver.identity.clone().field(name);
-            value.root_name = receiver.root_name;
-            value.global = receiver.global.as_ref().map(GlobalPlace::projected);
             FieldValueResult::Value(Box::new(value), false)
         }
         member::FieldResolution::Promoted(promoted) => {
@@ -566,14 +581,12 @@ fn promoted_field_value(
                 &field.origin,
                 span,
             );
-            let mut value = PlaceValue::new(
+            let value = receiver.projected(
                 field_checked(expr, field.ty, false, tc),
                 projected_field_access(receiver.access),
                 receiver.facts.clone(),
+                receiver.identity.clone().fields(&promoted.path),
             );
-            value.identity = receiver.identity.clone().fields(&promoted.path);
-            value.root_name = receiver.root_name;
-            value.global = receiver.global.as_ref().map(GlobalPlace::projected);
             FieldValueResult::Value(Box::new(value), false)
         }
         member::PromotedFieldTarget::Extern(field) => extern_field_value(
@@ -593,14 +606,12 @@ fn extern_field_value(
     field: member::ExternFieldAccess,
     tc: &mut TypeChecker,
 ) -> FieldValueResult {
-    let mut value = PlaceValue::new(
+    let value = receiver.projected(
         field_checked(expr, field.ty, field.contains_any, tc),
         field.access,
         PlaceUseFacts::for_extern_field(&receiver.facts, field.field_ref),
+        identity,
     );
-    value.identity = identity;
-    value.root_name = receiver.root_name;
-    value.global = receiver.global.as_ref().map(GlobalPlace::projected);
     FieldValueResult::Value(Box::new(value), field.contains_any)
 }
 
@@ -698,13 +709,16 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
         let mut checked = super::checked_from_type(expr, indexed.write_ty, tc);
         checked.contains_extern_any = indexed.contains_extern_any;
         let access = projected_field_access(target.value.access);
-        let mut place = CheckedPlace::new(checked, access);
-        place.value.facts = target.value.facts;
-        place.value.identity = target.value.identity.index();
-        place.value.root_name = target.value.root_name;
-        place.value.global = target.value.global.as_ref().map(GlobalPlace::projected);
-        place.accepts_extern_any = target.accepts_extern_any;
-        return place;
+        let value = target.value.projected(
+            checked,
+            access,
+            target.value.facts.clone(),
+            target.value.identity.clone().index(),
+        );
+        return CheckedPlace {
+            value,
+            accepts_extern_any: target.accepts_extern_any,
+        };
     }
 
     if let ExprKind::TupleIndex(index) = &expr.node.kind {
@@ -713,13 +727,20 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
             .copy_place_identity(index.node.target.node.id, expr.node.id);
         let checked = check_tuple_index_access(expr, index, &target.value.checked, tc);
         let access = projected_field_access(target.value.access);
-        let mut place = CheckedPlace::new(checked, access);
-        place.value.facts = target.value.facts;
-        place.value.identity = target.value.identity.tuple(index.node.index as usize);
-        place.value.root_name = target.value.root_name;
-        place.value.global = target.value.global.as_ref().map(GlobalPlace::projected);
-        place.accepts_extern_any = target.accepts_extern_any;
-        return place;
+        let value = target.value.projected(
+            checked,
+            access,
+            target.value.facts.clone(),
+            target
+                .value
+                .identity
+                .clone()
+                .tuple(index.node.index as usize),
+        );
+        return CheckedPlace {
+            value,
+            accepts_extern_any: target.accepts_extern_any,
+        };
     }
 
     if let ExprKind::Field(field) = &expr.node.kind {
@@ -788,13 +809,13 @@ pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeC
     } else {
         GlobalAccessMode::ProjectedAssign
     };
-    record_global_access(expr_id, &place.value, mode, tc);
+    record_place_global_access(expr_id, &place.value, mode, tc);
     record_value_write(expr_id, &place.value, tc);
 }
 
 pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
     tc.closure.mutably_use_place(expr_id);
-    record_global_access(expr_id, &place.value, GlobalAccessMode::CompoundAssign, tc);
+    record_place_global_access(expr_id, &place.value, GlobalAccessMode::CompoundAssign, tc);
     record_prefix_reads(expr_id, &place.value.facts, tc);
     record_target_reads(expr_id, &place.value.facts, tc);
     record_target_writes(expr_id, &place.value.facts, tc);
@@ -802,31 +823,31 @@ pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &
 
 pub(super) fn record_value_read(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.read_place(expr_id);
-    record_global_access(expr_id, value, GlobalAccessMode::Read, tc);
+    record_place_global_access(expr_id, value, GlobalAccessMode::Read, tc);
     record_facts_read(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_var_argument(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.mutably_use_place(expr_id);
-    record_global_access(expr_id, value, GlobalAccessMode::VarArgument, tc);
+    record_place_global_access(expr_id, value, GlobalAccessMode::VarArgument, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_mut_receiver(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.mutably_use_place(expr_id);
-    record_global_access(expr_id, value, GlobalAccessMode::MutReceiver, tc);
+    record_place_global_access(expr_id, value, GlobalAccessMode::MutReceiver, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_immutable_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.read_place(expr_id);
-    record_global_access(expr_id, value, GlobalAccessMode::ImmutableBorrow, tc);
+    record_place_global_access(expr_id, value, GlobalAccessMode::ImmutableBorrow, tc);
     record_facts_read(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_mut_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.mutably_use_place(expr_id);
-    record_global_access(expr_id, value, GlobalAccessMode::MutableBorrow, tc);
+    record_place_global_access(expr_id, value, GlobalAccessMode::MutableBorrow, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
@@ -835,7 +856,7 @@ pub(super) fn record_value_write(expr_id: ExprId, value: &PlaceValue, tc: &mut T
     record_facts_write(expr_id, &value.facts, tc);
 }
 
-fn record_global_access(
+fn record_place_global_access(
     expr_id: ExprId,
     value: &PlaceValue,
     mode: GlobalAccessMode,
@@ -844,21 +865,7 @@ fn record_global_access(
     let Some(global) = &value.global else {
         return;
     };
-    let init_effect = classify_global_access(global, mode);
-    tc.record_global_access(GlobalAccessFact {
-        expr_id,
-        key: global.key.clone(),
-        mode,
-        init_effect,
-    });
-}
-
-fn classify_global_access(global: &GlobalPlace, mode: GlobalAccessMode) -> GlobalInitEffect {
-    if global.root && mode == GlobalAccessMode::RootAssign {
-        GlobalInitEffect::StoreWithoutInit
-    } else {
-        GlobalInitEffect::InitializeFirst
-    }
+    tc.record_global_access(expr_id, &global.key, global.root, mode);
 }
 
 pub(super) fn record_facts_read(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {

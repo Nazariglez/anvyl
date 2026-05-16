@@ -179,46 +179,6 @@ mod constraints {
     }
 
     #[test]
-    fn ternary_join_same_type() {
-        assert_ty("fn main(cond: bool) { cond ? 1 : 2; }", Type::Int);
-    }
-
-    #[test]
-    fn ternary_condition_must_be_bool() {
-        assert_error_span("fn main() { 1 ? 2 : 3; }", "1", |error| {
-            let TypeError::TernaryConditionNotBool { span, .. } = error else {
-                return None;
-            };
-            *span
-        });
-    }
-
-    #[test]
-    fn if_condition_must_be_bool() {
-        assert_error_span("fn main() { if 1 {} }", "1", |error| {
-            let TypeError::IfConditionNotBool { span, .. } = error else {
-                return None;
-            };
-            *span
-        });
-    }
-
-    #[test]
-    fn while_condition_must_be_bool() {
-        assert_error_span("fn main() { while 1 {} }", "1", |error| {
-            let TypeError::WhileConditionNotBool { span, .. } = error else {
-                return None;
-            };
-            *span
-        });
-    }
-
-    #[test]
-    fn ternary_branch_mismatch() {
-        assert_err_count("fn main(cond: bool) { cond ? 1 : \"x\"; }", 1);
-    }
-
-    #[test]
     fn ternary_tail_expression() {
         assert_ty("fn f(cond: bool) -> int { cond ? 1 : 2 }", Type::Int);
     }
@@ -242,38 +202,10 @@ mod constraints {
     }
 
     #[test]
-    fn nil_unresolved_once() {
-        let Err(errors) = check("fn main() { let x = nil; }") else {
-            panic!("expected cannot infer");
-        };
-        assert_eq!(errors.len(), 1);
-        assert!(matches!(errors[0], TypeError::CannotInferType { .. }));
-    }
-
-    #[test]
     fn nil_shared_once() {
         assert_single_error("fn main() { let x = nil; x; }", |err| {
             matches!(err, TypeError::CannotInferType { .. })
         });
-    }
-
-    #[test]
-    fn nil_contextual_optional() {
-        assert_ty(
-            "fn main() { let x: int? = nil; x; }",
-            Type::option_of(Type::Int),
-        );
-    }
-
-    #[test]
-    fn nil_return_optional() {
-        assert_ty("fn f() -> int? { nil }", Type::option_of(Type::Int));
-    }
-
-    #[test]
-    fn nil_rejects_plain_target() {
-        assert_err_count("fn main() { let x: int = nil; }", 1);
-        assert_err_count("fn f() -> int { nil }", 1);
     }
 
     #[test]
@@ -377,35 +309,6 @@ mod constraints {
     }
 }
 
-mod literals {
-    use super::*;
-
-    #[test]
-    fn int_literal() {
-        assert_ty("fn main() { 1; }", Type::Int);
-    }
-
-    #[test]
-    fn float_literal() {
-        assert_ty("fn main() { 1.0; }", Type::Float);
-    }
-
-    #[test]
-    fn bool_true() {
-        assert_ty("fn main() { true; }", Type::Bool);
-    }
-
-    #[test]
-    fn bool_false() {
-        assert_ty("fn main() { false; }", Type::Bool);
-    }
-
-    #[test]
-    fn string_literal() {
-        assert_ty("fn main() { \"hi\"; }", Type::String);
-    }
-}
-
 mod consts {
     use super::*;
 
@@ -461,50 +364,11 @@ mod consts {
     }
 
     #[test]
-    fn cycle_err() {
-        assert_err("const A = B; const B = A; fn main() { A; }");
-    }
-
-    #[test]
-    fn div_zero_err() {
-        assert_err("const X = 1 / 0; fn main() { X; }");
-    }
-
-    #[test]
     fn bool_short_circuit() {
         check(
             "const X = false && (1 / 0 == 0); const N = X ? 1 : 2; fn main() { let xs: [int; N] = [1, 2]; }",
         )
         .expect("typecheck failed");
-    }
-
-    #[test]
-    fn type_mismatch_err() {
-        assert_err("const X: int = \"x\"; fn main() { X; }");
-    }
-
-    #[test]
-    fn duplicate_err() {
-        assert_err("const X = 1; const X = 2; fn main() {}");
-    }
-
-    #[test]
-    fn non_const_initializer_err() {
-        assert_err("fn f() -> int { 1 } const X = f(); fn main() { X; }");
-    }
-
-    #[test]
-    fn ternary_branch_type_mismatch_err() {
-        assert_single_error("const X = true ? 1 : \"x\"; fn main() { X; }", |err| {
-            matches!(err, TypeError::TypeMismatch { .. })
-        });
-    }
-
-    #[test]
-    fn ternary_checks_inactive_branch_err() {
-        assert_single_error("const X = true ? 1 : MISSING; fn main() { X; }", |err| {
-            matches!(err, TypeError::UndefinedVariable { .. })
-        });
     }
 }
 
@@ -579,14 +443,6 @@ mod nominals {
 
     fn packets(src: &str) -> String {
         format!("enum Packet<T, N: int> {{ Inline([T; N]) }} {src}")
-    }
-
-    #[test]
-    fn literal() {
-        assert_ty(
-            &buf("fn main(x: FixedBuf<int, 3>) -> FixedBuf<int, 3> { x }"),
-            fixed(3),
-        );
     }
 
     #[test]
@@ -982,24 +838,6 @@ mod arrays {
     }
 
     #[test]
-    fn literal() {
-        assert_ty("fn main() { [1, 2, 3]; }", array(Type::Int, 3));
-    }
-
-    #[test]
-    fn fill_const_len() {
-        assert_ty("const N = 3; fn main() { [0; N]; }", array(Type::Int, 3));
-    }
-
-    #[test]
-    fn annotation_const_len() {
-        assert_ty(
-            "const N = 3; fn main() { let xs: [int; N] = [1, 2, 3]; xs; }",
-            array(Type::Int, 3),
-        );
-    }
-
-    #[test]
     fn unknown_const_len_err() {
         assert_single_error(
             "fn main() { let xs: [int; N] = []; }",
@@ -1054,32 +892,6 @@ mod arrays {
     }
 
     #[test]
-    fn optional_elements_context() {
-        assert_ty(
-            "fn main() { let xs: [int?; 2] = [nil, 1]; xs; }",
-            array(Type::option_of(Type::Int), 2),
-        );
-    }
-
-    #[test]
-    fn optional_fill_context() {
-        assert_ty(
-            "fn main() { let xs: [int?; 2] = [nil; 2]; xs; }",
-            array(Type::option_of(Type::Int), 2),
-        );
-    }
-
-    #[test]
-    fn list_context() {
-        assert_ty(
-            "fn main() { let xs: [int?] = [nil, 1]; xs; }",
-            Type::List {
-                elem: Box::new(Type::option_of(Type::Int)),
-            },
-        );
-    }
-
-    #[test]
     fn nested_optional_context() {
         assert_ty(
             "fn main() { let xs: [[int?; 1]; 1] = [[nil]]; xs; }",
@@ -1092,21 +904,6 @@ mod arrays {
         assert_single_error("fn main() { let xs = []; }", |err| {
             matches!(err, TypeError::CannotInferType { .. })
         });
-    }
-
-    #[test]
-    fn nil_no_context_err() {
-        assert_err("fn main() { let xs = [nil, nil]; }");
-    }
-
-    #[test]
-    fn literal_element_mismatch_err() {
-        assert_err_count("fn main() { let xs: [int; 2] = [1, \"x\"]; }", 1);
-    }
-
-    #[test]
-    fn literal_len_mismatch_err() {
-        assert_err_count("fn main() { let xs: [int; 3] = [1, 2]; }", 1);
     }
 
     #[test]
@@ -1192,23 +989,8 @@ mod bindings {
     }
 
     #[test]
-    fn let_infer() {
-        assert_ty("fn main() { let x = 1; x; }", Type::Int);
-    }
-
-    #[test]
-    fn let_annotated() {
-        assert_ty("fn main() { let x: int = 1; x; }", Type::Int);
-    }
-
-    #[test]
     fn let_mismatch() {
         assert_err("fn main() { let x: int = \"hi\"; }");
-    }
-
-    #[test]
-    fn var_binding() {
-        assert_ty("fn main() { var x = 1; x = 2; x; }", Type::Int);
     }
 
     #[test]
@@ -1219,99 +1001,6 @@ mod bindings {
     #[test]
     fn undefined_var() {
         assert_err("fn main() { x; }");
-    }
-}
-
-mod binary_ops {
-    use super::*;
-
-    #[test]
-    fn add_ints() {
-        assert_ty("fn main() { 1 + 2; }", Type::Int);
-    }
-
-    #[test]
-    fn add_floats() {
-        assert_ty("fn main() { 1.0 + 2.0; }", Type::Float);
-    }
-
-    #[test]
-    fn add_strings() {
-        assert_ty("fn main() { \"a\" + \"b\"; }", Type::String);
-    }
-
-    #[test]
-    fn add_string_int() {
-        assert_ty("fn main() { \"hi\" + 1; }", Type::String);
-    }
-
-    #[test]
-    fn add_mixed_num() {
-        assert_err("fn main() { 1 + 2.0; }");
-    }
-
-    #[test]
-    fn compare_ints() {
-        assert_ty("fn main() { 1 < 2; }", Type::Bool);
-    }
-
-    #[test]
-    fn eq_ints() {
-        assert_ty("fn main() { 1 == 2; }", Type::Bool);
-    }
-
-    #[test]
-    fn and_bools() {
-        assert_ty("fn main() { true && false; }", Type::Bool);
-    }
-
-    #[test]
-    fn or_bools() {
-        assert_ty("fn main() { true || false; }", Type::Bool);
-    }
-
-    #[test]
-    fn bitor_ints() {
-        assert_ty("fn main() { 1 | 2; }", Type::Int);
-    }
-
-    #[test]
-    fn bitand_ints() {
-        assert_ty("fn main() { 1 & 2; }", Type::Int);
-    }
-
-    #[test]
-    fn eq_mismatch() {
-        assert_err("fn main() { 1 == \"hi\"; }");
-    }
-}
-
-mod unary_ops {
-    use super::*;
-
-    #[test]
-    fn neg_int() {
-        assert_ty("fn main() { -1; }", Type::Int);
-    }
-
-    #[test]
-    fn neg_float() {
-        assert_ty("fn main() { -1.0; }", Type::Float);
-    }
-
-    #[test]
-    fn not_bool() {
-        assert_ty("fn main() { !true; }", Type::Bool);
-    }
-
-    #[test]
-    fn bitnot_int() {
-        assert_ty("fn main() { ~1; }", Type::Int);
-    }
-
-    #[test]
-    fn neg_type_mismatch() {
-        assert_err("fn main() { -\"hi\"; }");
     }
 }
 
@@ -1524,68 +1213,6 @@ mod functions {
             0,
         );
     }
-
-    #[test]
-    fn fn_no_params() {
-        assert_err_count("fn foo() -> int { return 1; } fn main() { foo(); }", 0);
-    }
-
-    #[test]
-    fn fn_with_params() {
-        assert_err_count(
-            "fn add(a: int, b: int) -> int { return a + b; } fn main() { add(1, 2); }",
-            0,
-        );
-    }
-
-    #[test]
-    fn fn_wrong_ret() {
-        assert_err("fn foo() -> int { return \"hi\"; }");
-    }
-
-    #[test]
-    fn fn_wrong_arg_count() {
-        assert_err("fn foo(a: int) -> int { return a; } fn main() { foo(1, 2); }");
-    }
-
-    #[test]
-    fn fn_wrong_arg_type() {
-        assert_err("fn foo(a: int) -> int { return a; } fn main() { foo(\"hi\"); }");
-    }
-
-    #[test]
-    fn fn_void_ret() {
-        assert_err_count("fn foo() {} fn main() { foo(); }", 0);
-    }
-
-    #[test]
-    fn fn_missing_return() {
-        assert_err("fn foo() -> int {} ");
-    }
-}
-
-mod if_expr {
-    use super::*;
-
-    #[test]
-    fn if_both_int() {
-        assert_ty("fn main() { if true { 1 } else { 2 }; }", Type::Int);
-    }
-
-    #[test]
-    fn if_mismatch() {
-        assert_err("fn main() { if true { 1 } else { \"hi\" }; }");
-    }
-
-    #[test]
-    fn if_no_else() {
-        assert_ty("fn main() { if true { 1 }; }", Type::Void);
-    }
-
-    #[test]
-    fn if_condition_not_bool() {
-        assert_err("fn main() { if 1 { } }");
-    }
 }
 
 mod blocks {
@@ -1599,92 +1226,5 @@ mod blocks {
     #[test]
     fn block_void() {
         assert_ty("fn main() { { }; }", Type::Void);
-    }
-}
-
-mod while_stmt {
-    use super::*;
-
-    #[test]
-    fn while_bool() {
-        assert_err_count("fn main() { while true {} }", 0);
-    }
-
-    #[test]
-    fn while_non_bool() {
-        assert_err("fn main() { while 1 {} }");
-    }
-
-    #[test]
-    fn while_inner_break() {
-        assert_err_count("fn main() { while true { break; } }", 0);
-    }
-
-    #[test]
-    fn while_inner_continue() {
-        assert_err_count("fn main() { while true { continue; } }", 0);
-    }
-
-    #[test]
-    fn nested_break() {
-        assert_err_count("fn main() { while true { while true { break; } } }", 0);
-    }
-
-    #[test]
-    fn nested_continue() {
-        assert_err_count("fn main() { while true { while true { continue; } } }", 0);
-    }
-}
-
-mod loop_control {
-    use super::*;
-
-    #[test]
-    fn break_outside() {
-        assert_err("fn main() { break; }");
-    }
-
-    #[test]
-    fn continue_outside() {
-        assert_err("fn main() { continue; }");
-    }
-}
-
-mod for_stmt {
-    use super::*;
-
-    #[test]
-    fn for_list_param() {
-        assert_err_count("fn main(xs: [int]) { for x in xs {} }", 0);
-    }
-
-    #[test]
-    fn for_array_param() {
-        assert_err_count("fn main(xs: [int; 3]) { for x in xs {} }", 0);
-    }
-
-    #[test]
-    fn for_non_iterable() {
-        assert_err("fn main(x: int) { for y in x {} }");
-    }
-
-    #[test]
-    fn for_binding_scope() {
-        assert_err("fn main(xs: [int]) { for x in xs {} x; }");
-    }
-
-    #[test]
-    fn for_wildcard() {
-        assert_err_count("fn main(xs: [int]) { for _ in xs {} }", 0);
-    }
-
-    #[test]
-    fn for_step_expr_checked() {
-        assert_err("fn main(xs: [int]) { for x in xs step missing {} }");
-    }
-
-    #[test]
-    fn for_item_type() {
-        assert_ty("fn main(xs: [int]) { for x in xs { x; } }", Type::Int);
     }
 }

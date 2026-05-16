@@ -411,41 +411,6 @@ mod calls {
         assert_use_total(&result, 1);
         assert_typecheck_closed(&result);
     }
-
-    #[test]
-    fn rejects_arity() {
-        let Err(errors) = check(
-            r"
-            extern fn tick(dt: float) -> void;
-            fn main() { tick(); }
-            ",
-        ) else {
-            panic!("wrong arity should fail");
-        };
-
-        assert!(matches!(
-            errors.as_slice(),
-            [TypeError::WrongArgCount { .. }]
-        ));
-    }
-
-    #[test]
-    fn rejects_arg_type() {
-        let Err(errors) = check(
-            r#"
-            extern fn take(x: int) -> void;
-            fn main() { take("bad"); }
-            "#,
-        ) else {
-            panic!("wrong argument type should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
-        );
-    }
 }
 
 fn expect_type_errors(result: Result<TypecheckTestResult, Vec<TypeError>>) -> Vec<TypeError> {
@@ -525,24 +490,6 @@ mod any {
             ",
         )
         .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_bind() {
-        let Err(errors) = check(
-            r"
-            extern fn get() -> any;
-            fn main() { let value = get(); }
-            ",
-        ) else {
-            panic!("extern any local binding should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ExternAnyEscape { .. }))
-        );
     }
 
     #[test]
@@ -642,19 +589,6 @@ mod any {
             ",
         )
         .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_user_fn_type() {
-        let Err(errors) = check("fn id(value: any) -> any { value }") else {
-            panic!("user any signature should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::AnyOutsideExternBoundary { .. }))
-        );
     }
 
     #[test]
@@ -1566,24 +1500,6 @@ mod methods {
     }
 
     #[test]
-    fn rejects_arg_type() {
-        let Err(errors) = check(
-            r#"
-            extern type Point { fn move_by(self, dx: float); }
-            fn move(p: Point) { p.move_by("bad"); }
-            "#,
-        ) else {
-            panic!("wrong type should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
-        );
-    }
-
-    #[test]
     fn accepts_mut_receiver() {
         let result = check(
             r"
@@ -1604,24 +1520,6 @@ mod methods {
         assert_use(&result, ExternUseTarget::Method(method));
         assert_use_total(&result, 1);
         assert_typecheck_closed(&result);
-    }
-
-    #[test]
-    fn rejects_immutable_receiver() {
-        let Err(errors) = check(
-            r"
-            extern type Point { fn move_by(var self, dx: float); }
-            fn move(p: Point) { p.move_by(1.0); }
-            ",
-        ) else {
-            panic!("immutable receiver should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ImmutableAssignment { .. }))
-        );
     }
 
     #[test]
@@ -1717,38 +1615,6 @@ mod methods {
 
         assert_has_error(&errors, |error| {
             matches!(error, TypeError::RequiresMutablePlace { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_instance_on_type() {
-        let Err(errors) = check(
-            r"
-            extern type Point { fn len(self) -> float; }
-            fn read() -> float { Point.len() }
-            ",
-        ) else {
-            panic!("instance method on type should fail");
-        };
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::InstanceMethodOnType { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_static_on_value() {
-        let Err(errors) = check(
-            r"
-            extern type Point { fn origin() -> Point; }
-            fn make(p: Point) -> Point { p.origin() }
-            ",
-        ) else {
-            panic!("static method on value should fail");
-        };
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::StaticMethodOnValue { .. })
         });
     }
 

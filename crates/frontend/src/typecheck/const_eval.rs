@@ -1,11 +1,12 @@
 use super::{
     CallableTemplateEnv, DeprecatedUseKind, LocalConstId, LocalConstInfo, LocalSymbol,
     LocalSymbolLookup, ModuleScope, TypeChecker, TypeError, ValueDecl,
+    body::with_callable_body_env, const_term::ConstTerm, type_ops::TypeFolder,
 };
 use crate::{
     ast::{
-        BinaryOp, CastNode, ConstDeclNode, ConstValue, ExprKind, ExprNode, FieldAccessNode, Ident,
-        Lit, Program, Stmt, StringPart, Type, UnaryOp,
+        ArrayLen, BinaryOp, CastNode, ConstArg, ConstDeclNode, ConstValue, ExprKind, ExprNode,
+        FieldAccessNode, Ident, Lit, Program, Stmt, StringPart, Type, UnaryOp,
     },
     span::{SourceSpan, Span},
 };
@@ -46,6 +47,49 @@ pub(super) enum ConstNameLookup {
     Missing,
 }
 
+struct ConstNormalizer<'tc> {
+    tc: &'tc mut TypeChecker,
+    span: Span,
+}
+
+impl TypeFolder for ConstNormalizer<'_> {
+    fn fold_const_arg(&mut self, arg: &ConstArg) -> ConstArg {
+        self.tc.normalize_const_arg(arg, self.span)
+    }
+
+    fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
+        self.tc.normalize_array_len(len, self.span)
+    }
+}
+
+pub(super) fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
+    let c = &const_node.node;
+    let value = match tc.eval_const_expr(&c.value, true) {
+        Ok(value) => value,
+        Err(err) => {
+            tc.push_error(err);
+            return;
+        }
+    };
+    let value_ty = const_type(&value);
+    let ty = match &c.ty {
+        Some(annot) => {
+            let annot_ty = tc.resolve_type_for_tc_at(annot, const_node.span);
+            tc.reject_user_any_type(&annot_ty, const_node.span);
+            if annot_ty != value_ty {
+                tc.push_error(TypeError::ConstTypeMismatch {
+                    expected: annot_ty.clone(),
+                    found: value_ty,
+                    span: tc.error_span(const_node.span),
+                });
+            }
+            annot_ty
+        }
+        None => value_ty,
+    };
+    tc.define_const(c.name, ty, value);
+}
+
 pub(super) fn const_type(value: &ConstValue) -> Type {
     match value {
         ConstValue::Int(_) => Type::Int,
@@ -74,6 +118,117 @@ pub(super) fn const_usize(
 }
 
 impl TypeChecker {
+    pub(super) fn normalize_type_consts(&mut self, ty: &Type, span: Span) -> Type {
+        ConstNormalizer { tc: self, span }.fold_type(ty)
+    }
+
+    pub(super) fn eval_const_term(
+        &mut self,
+        term: ConstTerm,
+        span: Span,
+        warn_deprecated: bool,
+    ) -> Option<ConstTerm> {
+        match term {
+            ConstTerm::Value(_) => Some(term),
+            ConstTerm::Name(name) => {
+                if warn_deprecated {
+                    self.warn_named_const_deprecated(name, span);
+                }
+                match self.lookup_visible_const_name(name, span) {
+                    ConstNameLookup::Value(value) => Some(ConstTerm::Value(value)),
+                    ConstNameLookup::RuntimeGlobal(global) => {
+                        self.push_error_once(TypeError::RuntimeGlobalInConstPosition {
+                            global,
+                            span: self.error_span(span),
+                        });
+                        None
+                    }
+                    ConstNameLookup::Error(error) => {
+                        self.push_error(error);
+                        None
+                    }
+                    ConstNameLookup::NotConstLocal => {
+                        self.push_error_once(TypeError::NonConstExpression {
+                            span: self.error_span(span),
+                        });
+                        None
+                    }
+                    ConstNameLookup::Missing => {
+                        self.push_error_once(TypeError::UnknownConst {
+                            name,
+                            span: self.error_span(span),
+                        });
+                        None
+                    }
+                }
+            }
+            ConstTerm::Param(id) => match self
+                .const_substs
+                .last()
+                .and_then(|subst| subst.get(&id).cloned())
+            {
+                Some(term) => self.eval_const_term(term, span, warn_deprecated),
+                None => Some(ConstTerm::Param(id)),
+            },
+            ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
+        }
+    }
+
+    pub(super) fn require_usize_const(
+        &mut self,
+        term: ConstTerm,
+        span: Span,
+        warn_deprecated: bool,
+    ) -> Option<usize> {
+        match self.eval_const_term(term, span, warn_deprecated)? {
+            ConstTerm::Value(value) => match const_usize(&value, self.error_span(span)) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    self.push_error(err);
+                    None
+                }
+            },
+            ConstTerm::Name(name) => {
+                self.push_error(TypeError::UnknownConst {
+                    name,
+                    span: self.error_span(span),
+                });
+                None
+            }
+            ConstTerm::Param(_) | ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
+        }
+    }
+
+    pub(super) fn array_len_from_term(&mut self, term: ConstTerm, span: Span) -> Option<ArrayLen> {
+        match term {
+            ConstTerm::ArrayInfer => Some(ArrayLen::Infer),
+            ConstTerm::Param(id) => match self
+                .const_substs
+                .last()
+                .and_then(|subst| subst.get(&id).cloned())
+            {
+                Some(term) => self.array_len_from_term(term, span),
+                None => Some(ArrayLen::Param(id)),
+            },
+            ConstTerm::Value(_) | ConstTerm::Name(_) => self
+                .require_usize_const(term, span, true)
+                .map(ArrayLen::Fixed),
+            ConstTerm::Infer(_) => None,
+        }
+    }
+
+    pub(super) fn normalize_const_arg(&mut self, arg: &ConstArg, span: Span) -> ConstArg {
+        let Some(term) = self.eval_const_term(ConstTerm::from_arg(arg), span, true) else {
+            return arg.clone();
+        };
+        term.to_arg_no_infer().unwrap_or_else(|| arg.clone())
+    }
+
+    pub(super) fn normalize_array_len(&mut self, len: ArrayLen, span: Span) -> ArrayLen {
+        self.array_len_from_term(ConstTerm::from_array_len(len), span)
+            .unwrap_or(ArrayLen::Infer)
+    }
+
     pub(super) fn collect_const_decls(&mut self, module: &ModuleScope, program: &Program) {
         for stmt in &program.stmts {
             let Stmt::Const(node) = &stmt.node else {
@@ -374,7 +529,7 @@ impl TypeChecker {
             )
         };
 
-        let result = super::with_callable_body_env(&module, &env, self, |tc| {
+        let result = with_callable_body_env(&module, &env, self, |tc| {
             eval_const_decl(ty.as_ref(), &value_expr, decl_span, tc)
         });
 
@@ -435,7 +590,7 @@ impl TypeChecker {
                 if let Some(entry) = self.consts.get_mut(&key) {
                     entry.state = ConstState::Evaluated(value.clone());
                 }
-                self.decls.set_const_type(module, name, ty.clone());
+                self.decls.set_const_type(module, name, &ty);
                 self.set_current_scope_const(module, name, &ty, value.clone());
                 Ok(value)
             }
