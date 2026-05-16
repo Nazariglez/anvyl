@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: Unknown variable 'dyn'
+// @contains: unknown variable `dyn`
 
 fn main() {
     let x = dyn;

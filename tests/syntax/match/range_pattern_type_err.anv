@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: mismatch
+// @contains: mismatch expected 'int', found 'float'
 
 fn main() {
     let x = 5;

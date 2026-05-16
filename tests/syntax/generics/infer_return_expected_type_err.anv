@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: expected 'string', found 'int'
+// @contains: expected `string`, found `int`
 
 fn id<T>(x: T) -> _ {
     x

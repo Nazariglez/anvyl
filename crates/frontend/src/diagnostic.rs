@@ -52,6 +52,37 @@ pub struct DiagnosticLabel {
 pub struct DiagnosticCode {
     pub source: &'static str,
     pub code: String,
+    pub kind: DiagnosticCodeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticCodeKind {
+    Plain,
+    Lint {
+        level: crate::lint::LintLevel,
+        origin: crate::config::LintLevelOrigin,
+    },
+}
+
+impl DiagnosticCode {
+    #[must_use]
+    pub fn metadata_note(&self) -> Option<String> {
+        let DiagnosticCodeKind::Lint { level, origin } = self.kind else {
+            return None;
+        };
+        let name = &self.code;
+        Some(match origin {
+            crate::config::LintLevelOrigin::Default => format!("lint `{name}` is on by default"),
+            crate::config::LintLevelOrigin::Configured => {
+                let level = match level {
+                    crate::lint::LintLevel::Allow => "allow",
+                    crate::lint::LintLevel::Warn => "warning",
+                    crate::lint::LintLevel::Error => "error",
+                };
+                format!("lint `{name}` was set to {level}")
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +106,28 @@ pub struct Diagnostic {
 pub struct DiagnosticReport {
     pub sources: SourceTable,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiagnosticProjection<'a> {
+    pub severity: Option<Severity>,
+    pub extra_note: Option<&'a str>,
+}
+
+impl DiagnosticProjection<'_> {
+    #[must_use]
+    pub fn severity_for(self, diagnostic: &Diagnostic) -> Severity {
+        self.severity.unwrap_or_else(|| diagnostic.severity())
+    }
+
+    #[must_use]
+    pub fn notes_for(self, diagnostic: &Diagnostic) -> Vec<String> {
+        let mut notes = diagnostic.notes_with_metadata();
+        if let Some(note) = self.extra_note {
+            notes.push(note.to_string());
+        }
+        notes
+    }
 }
 
 impl DiagnosticReport {
@@ -147,6 +200,23 @@ impl Diagnostic {
         self.code = Some(DiagnosticCode {
             source,
             code: code.into(),
+            kind: DiagnosticCodeKind::Plain,
+        });
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_lint_code(
+        mut self,
+        source: &'static str,
+        code: impl Into<String>,
+        level: crate::lint::LintLevel,
+        origin: crate::config::LintLevelOrigin,
+    ) -> Self {
+        self.code = Some(DiagnosticCode {
+            source,
+            code: code.into(),
+            kind: DiagnosticCodeKind::Lint { level, origin },
         });
         self
     }
@@ -166,12 +236,6 @@ impl Diagnostic {
     #[must_use]
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_severity(mut self, severity: Severity) -> Self {
-        self.severity = severity;
         self
     }
 
@@ -210,6 +274,15 @@ impl Diagnostic {
     #[must_use]
     pub fn notes(&self) -> &[String] {
         &self.notes
+    }
+
+    #[must_use]
+    pub fn notes_with_metadata(&self) -> Vec<String> {
+        let mut notes = self.notes.clone();
+        if let Some(note) = self.code.as_ref().and_then(DiagnosticCode::metadata_note) {
+            notes.push(note);
+        }
+        notes
     }
 
     #[must_use]
@@ -268,12 +341,44 @@ mod tests {
         let code = diagnostic.code().unwrap();
         assert_eq!(code.source, "anvyx");
         assert_eq!(code.code, "deprecated");
+        assert_eq!(code.kind, DiagnosticCodeKind::Plain);
         assert_eq!(
             diagnostic.tags(),
             &[DiagnosticTag::Deprecated, DiagnosticTag::Unnecessary]
         );
         assert_eq!(diagnostic.message(), "deprecated");
         assert_eq!(diagnostic.to_string(), "deprecated");
+    }
+
+    #[test]
+    fn lint_code_generates_metadata_notes() {
+        let default = Diagnostic::warning("lint")
+            .with_lint_code(
+                "anvyx",
+                "unused_import",
+                crate::lint::LintLevel::Warn,
+                crate::config::LintLevelOrigin::Default,
+            )
+            .with_note("real note");
+        let configured = Diagnostic::error("lint").with_lint_code(
+            "anvyx",
+            "unused_import",
+            crate::lint::LintLevel::Error,
+            crate::config::LintLevelOrigin::Configured,
+        );
+
+        assert_eq!(default.notes(), &["real note"]);
+        assert_eq!(
+            default.notes_with_metadata(),
+            vec![
+                "real note".to_string(),
+                "lint `unused_import` is on by default".to_string()
+            ]
+        );
+        assert_eq!(
+            configured.notes_with_metadata(),
+            vec!["lint `unused_import` was set to error".to_string()]
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Unknown variable 'float_sin'
+// @contains: unknown variable `float_sin`
 
 fn main() {
     float_sin(1.0);

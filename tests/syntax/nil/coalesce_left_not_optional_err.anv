@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Invalid operand
+// @contains: invalid operand
 
 fn main() {
     let a: int = 1 ?? 2;

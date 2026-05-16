@@ -54,6 +54,12 @@ impl SourceFile {
     pub fn line_index(&self) -> &LineIndex {
         &self.line_index
     }
+
+    pub fn line_text(&self, line: u32) -> Option<&str> {
+        let start = self.line_index.line_start(line)?;
+        let end = self.line_index.line_end(line)?;
+        self.text.get(start..end)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -199,6 +205,14 @@ impl LineIndex {
             .get(line)?
             .utf16_to_byte(position.character)?;
         Some(line_start + column)
+    }
+
+    pub fn line_start(&self, line: u32) -> Option<usize> {
+        self.line_starts.get(line as usize).copied()
+    }
+
+    pub fn line_end(&self, line: u32) -> Option<usize> {
+        self.line_ends.get(line as usize).copied()
     }
 
     fn line_for_byte(&self, byte: usize) -> Option<usize> {

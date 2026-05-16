@@ -8,13 +8,36 @@ pub struct LintConfig {
     overrides: BTreeMap<LintId, LintLevel>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LintLevelInfo {
+    pub level: LintLevel,
+    pub origin: LintLevelOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintLevelOrigin {
+    Default,
+    Configured,
+}
+
 impl LintConfig {
     #[must_use]
     pub fn level(&self, id: LintId) -> LintLevel {
-        self.overrides
-            .get(&id)
-            .copied()
-            .unwrap_or_else(|| id.default_level())
+        self.level_info(id).level
+    }
+
+    #[must_use]
+    pub fn level_info(&self, id: LintId) -> LintLevelInfo {
+        match self.overrides.get(&id).copied() {
+            Some(level) => LintLevelInfo {
+                level,
+                origin: LintLevelOrigin::Configured,
+            },
+            None => LintLevelInfo {
+                level: id.default_level(),
+                origin: LintLevelOrigin::Default,
+            },
+        }
     }
 
     pub fn set(&mut self, id: LintId, level: LintLevel) {
@@ -199,6 +222,20 @@ mod tests {
 
         assert_eq!(config.level(LintId::InternalAccess), LintLevel::Error);
         assert_eq!(config.level(LintId::Deprecated), LintLevel::Warn);
+        assert_eq!(
+            config.level_info(LintId::InternalAccess),
+            LintLevelInfo {
+                level: LintLevel::Error,
+                origin: LintLevelOrigin::Configured,
+            }
+        );
+        assert_eq!(
+            config.level_info(LintId::Deprecated),
+            LintLevelInfo {
+                level: LintLevel::Warn,
+                origin: LintLevelOrigin::Default,
+            }
+        );
     }
 
     #[test]

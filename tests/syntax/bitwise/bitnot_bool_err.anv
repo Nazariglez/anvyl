@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: cannot be applied
+// @contains: operator `~` cannot be applied to `bool`
 
 fn main() {
     let x = ~true;

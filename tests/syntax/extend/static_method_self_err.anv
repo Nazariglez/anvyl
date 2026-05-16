@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: Unknown variable 'self'
+// @contains: unknown variable `self`
 
 struct Counter {
     value: int,

@@ -10,10 +10,6 @@ use self::diagnostics::{
     diagnose_compile_warning, diagnose_conditional_error, diagnose_extern_input_error,
     diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error, diagnose_type_error,
 };
-pub use crate::diagnostic::{
-    Diagnostic, DiagnosticCode, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity,
-    DiagnosticTag, LabelStyle, Severity,
-};
 use crate::{
     ast::Program,
     conditional,
@@ -29,6 +25,13 @@ use crate::{
     },
     source::{SourceId, SourceKind, SourceTable},
     typecheck::{self, CompileWarning},
+};
+pub use crate::{
+    config::LintLevelOrigin,
+    diagnostic::{
+        Diagnostic, DiagnosticCode, DiagnosticCodeKind, DiagnosticLabel, DiagnosticProjection,
+        DiagnosticReport, DiagnosticSeverity, DiagnosticTag, LabelStyle, Severity,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1274,10 +1277,10 @@ mod tests {
         let CheckError::Type { report } = err else {
             panic!("expected type error");
         };
-        assert_eq!(report.diagnostics()[0].message(), "Mismatched types");
+        assert_eq!(report.diagnostics()[0].message(), "mismatched types");
         assert_user_diagnostics(report.diagnostics());
         assert_primary_label(&report);
-        assert_primary_label_message(&report, "expected 'int', found 'bool'");
+        assert_primary_label_message(&report, "expected `int`, found `bool`");
     }
 
     #[test]

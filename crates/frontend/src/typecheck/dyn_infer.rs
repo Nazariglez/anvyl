@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use super::{
-    DynCallFact, DynConversionFact, DynWeakeningFact, FuncParam, MethodReceiver, TypeChecker,
-    TypeError, contracts,
+    DynCallFact, DynConversionFact, DynWeakeningFact, FuncParam, MethodReceiver, ParamTypeSpans,
+    TypeChecker, TypeError, contracts,
     convert::push_match_error,
     decls::{ContractRequirementSchema, ModuleScope},
     type_ops::{TypeFolder, TypeVisitor},
@@ -171,6 +171,7 @@ impl DynInference {
         let requirement = ContractRequirementSchema {
             name: method,
             receiver: Some(receiver),
+            param_spans: ParamTypeSpans::default(),
             required_params: params.len(),
             params,
             ret: ReturnSpec::value(ret),
@@ -313,9 +314,9 @@ impl DynInference {
                 id: LintId::PublicInferredDynContract,
                 span: hole.span,
                 message: "exported function uses inferred dynamic contract".to_string(),
-                label: None,
+                label: "inferred dynamic contract in exported API".to_string(),
                 notes: vec![],
-                help: Some("declare a named contract and use dyn Name".to_string()),
+                help: Some("declare a named contract and use `dyn Name`".to_string()),
                 tags: vec![],
             });
         }

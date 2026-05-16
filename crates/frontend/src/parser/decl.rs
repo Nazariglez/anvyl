@@ -524,18 +524,14 @@ fn resolve_extern_params(
 ) -> Vec<ast::Param> {
     params
         .into_iter()
-        .map(|p| ast::Param {
-            mutability: p.mutability,
-            escape: p.escape,
-            name: p.name,
-            ty: resolve_type_params_with_self(
+        .map(|p| {
+            let ty = resolve_type_params_with_self(
                 &p.ty,
                 type_param_map,
                 const_param_map,
                 Some(self_type),
-            ),
-            default: p.default,
-            cast_accept: p.cast_accept,
+            );
+            ast::Param { ty, ..p }
         })
         .collect()
 }
@@ -892,14 +888,7 @@ fn function_body<'src>(
                 .into_iter()
                 .map(|p| {
                     let ty = resolve_type_params(&p.ty, &type_param_map, &const_param_map);
-                    ast::Param {
-                        mutability: p.mutability,
-                        escape: p.escape,
-                        name: p.name,
-                        ty,
-                        default: p.default,
-                        cast_accept: p.cast_accept,
-                    }
+                    ast::Param { ty, ..p }
                 })
                 .collect();
 
@@ -1282,19 +1271,15 @@ fn aggregate_declaration<'src>(
                     let resolved_params = m
                         .sig
                         .params
-                        .iter()
-                        .map(|p| ast::Param {
-                            mutability: p.mutability,
-                            escape: p.escape,
-                            name: p.name,
-                            ty: resolve_type_params_with_self(
+                        .into_iter()
+                        .map(|p| {
+                            let ty = resolve_type_params_with_self(
                                 &p.ty,
                                 &combined_type_param_map,
                                 &combined_const_param_map,
                                 Some(&self_type),
-                            ),
-                            default: p.default.clone(),
-                            cast_accept: p.cast_accept,
+                            );
+                            ast::Param { ty, ..p }
                         })
                         .collect();
 
@@ -1544,6 +1529,7 @@ fn cast_from_decl<'src>(
                 escape: ast::EscapeMode::NonEscaping,
                 name: ast::Ident(internment::Intern::new("_".to_string())),
                 ty: ast::Type::Infer,
+                ty_span: s.byte(),
                 default: None,
                 cast_accept: false,
             });

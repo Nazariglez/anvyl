@@ -315,8 +315,7 @@ pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                 };
                 tc.define(func.name, func_ty, false);
             }
-            Stmt::Aggregate(_) | Stmt::Enum(_) => {}
-            Stmt::ExternFunc(_) | Stmt::ExternType(_) => {}
+            Stmt::Aggregate(_) | Stmt::Enum(_) | Stmt::ExternFunc(_) | Stmt::ExternType(_) => {}
             Stmt::Const(const_node) => {
                 let c = &const_node.node;
                 let ty = match &c.ty {
@@ -473,7 +472,7 @@ fn resolve_callable_sig_types(
     tc: &mut TypeChecker,
 ) -> (Vec<FuncParam>, ReturnSpec) {
     tc.push_generic_context(generics);
-    let params = tc.resolve_callable_params(params, span, exported);
+    let params = tc.resolve_callable_params(params, exported);
     let ret = ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty, span));
     tc.pop_generic_context();
     (params, ret)
@@ -502,7 +501,7 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     tc.push_generic_context(generic_context.clone());
     tc.resolve_generic_bounds_for_tc(&mut generics, span);
     let exported = matches!(func.visibility, Visibility::Public);
-    let params = tc.resolve_callable_params(&func.params, span, exported);
+    let params = tc.resolve_callable_params(&func.params, exported);
     let ret = func
         .ret
         .with_ty(tc.resolve_type_for_tc_at(&func.ret.ty, span));
@@ -1153,6 +1152,7 @@ pub(super) fn check_callable_body_place_return(
                 &checked,
                 control_flow::block_diverges(block),
                 expected_ret,
+                block.span.to_end(),
                 callable_span,
                 tc,
             );
@@ -1193,6 +1193,7 @@ fn finish_missing_place_return(
     checked: &CheckedType,
     diverges: bool,
     expected_ret: Option<&ReturnSpec>,
+    missing_span: Span,
     callable_span: Span,
     tc: &mut TypeChecker,
 ) {
@@ -1200,7 +1201,7 @@ fn finish_missing_place_return(
         match expected_ret {
             Some(ret) if !ret.ty.is_void() => tc.push_error(TypeError::MissingReturn {
                 expected: ret.ty.clone(),
-                span: tc.error_span(callable_span),
+                span: tc.error_span(missing_span),
             }),
             None => tc.push_inferred_return(callable_span, tc.type_handle(&Type::Void)),
             _ => {}
@@ -1220,7 +1221,7 @@ fn finish_callable_body_value_return(
             Some(ret) if !ret.ty.is_void() && !body.diverges() => {
                 tc.push_error(TypeError::MissingReturn {
                     expected: ret.ty.clone(),
-                    span: tc.error_span(callable_span),
+                    span: tc.error_span(body.span().to_end()),
                 });
             }
             None if !body.diverges() => {

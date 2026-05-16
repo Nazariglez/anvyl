@@ -1,7 +1,7 @@
 // @frontend: new
 // @mode: check
 // @expect: success
-// @warn-contains: [deprecated] Warning: use of deprecated function 'old'
+// @warn-contains: Warning: use of deprecated function 'old'
 
 @deprecated
 fn old() {}

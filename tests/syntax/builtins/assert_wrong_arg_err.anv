@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected 'bool', found 'int'
+// @contains: expected `bool`, found `int`
 
 fn main() {
     assert(42)

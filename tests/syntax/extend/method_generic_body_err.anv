@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: expected 'string', found 'int'
+// @contains: expected `string`, found `int`
 // @frontend: new
 
 extend int {

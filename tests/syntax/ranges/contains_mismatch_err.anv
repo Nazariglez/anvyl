@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: mismatch
+// @contains: expected `int`, found `float`
 
 fn main() {
     let r = 0..10;

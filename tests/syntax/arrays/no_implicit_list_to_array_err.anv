@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected '[int; 2]', found '[int]'
+// @contains: expected `[int; 2]`, found `[int]`
 
 fn main() {
     let lst: [int] = [1, 2];

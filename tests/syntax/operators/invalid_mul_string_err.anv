@@ -1,7 +1,8 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Invalid operand type
-// @contains: operator '*' cannot be applied to 'string'
+// @contains: invalid operand type
+// @contains: operator `*` cannot be applied to `string`
 
 fn main() {
     let x = "hi" * "lo";

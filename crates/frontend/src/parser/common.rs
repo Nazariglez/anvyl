@@ -120,23 +120,27 @@ pub(super) fn param<'src>(
         None => ast::Mutability::Immutable,
     });
 
+    let ty =
+        callable_param_type(param_type_ident()).map_with(|ty, extra| (ty, extra.span().byte()));
+
     var_kw
         .then(identifier())
         .then_ignore(select! {
             Token::Colon => (),
         })
-        .then(callable_param_type(param_type_ident()))
+        .then(ty)
         .then(
             select! { Token::Op(Op::Assign) => () }
                 .ignore_then(expression(stmt))
                 .or_not(),
         )
         .map(
-            |(((mutability, name), (cast_accept, escape, ty)), default)| ast::Param {
+            |(((mutability, name), ((cast_accept, escape, ty), ty_span)), default)| ast::Param {
                 mutability,
                 escape,
                 name,
                 ty,
+                ty_span,
                 default,
                 cast_accept,
             },

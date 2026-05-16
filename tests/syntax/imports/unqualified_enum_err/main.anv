@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: Unknown
+// @contains: unknown
 
 import colors;
 

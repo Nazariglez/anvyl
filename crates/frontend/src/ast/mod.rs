@@ -934,6 +934,7 @@ pub struct Param {
     pub escape: EscapeMode,
     pub name: Ident,
     pub ty: Type,
+    pub ty_span: Span,
     pub default: Option<ExprNode>,
     pub cast_accept: bool,
 }

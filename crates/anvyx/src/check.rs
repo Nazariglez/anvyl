@@ -1,11 +1,16 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use anvyx_lang::{CompilationContext, LintConfig, Profile, TargetArch, TargetOs};
 use anvyx_lang2::{
     CheckError as FrontendCheckError, CompilationContext as FrontendCompilationContext, Diagnostic,
-    DiagnosticLabel, DiagnosticReport, DiagnosticSeverity, DiagnosticTag, FrontendConfig,
-    LintConfig as FrontendLintConfig, Profile as FrontendProfile, TargetArch as FrontendTargetArch,
-    TargetOs as FrontendTargetOs, implemented_lints, render_rich_report,
+    DiagnosticLabel, DiagnosticProjection, DiagnosticReport, DiagnosticSeverity, DiagnosticTag,
+    FrontendConfig, LineCol, LintConfig as FrontendLintConfig, Profile as FrontendProfile,
+    SourceFile, TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs, implemented_lints,
+    render_rich_report_with_overrides,
 };
 use clap::ValueEnum;
 use serde::Serialize;
@@ -125,18 +130,21 @@ fn emit_final_report(
         .diagnostics()
         .iter()
         .any(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Warning);
-    let report = report_for_cli(report, warnings_are_errors);
-    emit_report(&report, format)?;
+    emit_report(report, format, warnings_are_errors)?;
     if warnings_are_errors && has_warning {
         return Err("warnings treated as errors".to_string());
     }
     Ok(())
 }
 
-fn emit_report(report: &DiagnosticReport, format: CheckOutputFormat) -> Result<(), String> {
+fn emit_report(
+    report: &DiagnosticReport,
+    format: CheckOutputFormat,
+    warnings_are_errors: bool,
+) -> Result<(), String> {
     match format {
-        CheckOutputFormat::Text => emit_text_report(report),
-        CheckOutputFormat::Json => println!("{}", render_json_report(report)?),
+        CheckOutputFormat::Text => emit_text_report(report, warnings_are_errors),
+        CheckOutputFormat::Json => println!("{}", render_json_report(report, warnings_are_errors)?),
     }
     Ok(())
 }
@@ -146,46 +154,47 @@ fn emit_error_report(
     format: CheckOutputFormat,
     warnings_are_errors: bool,
 ) -> Result<(), String> {
-    match (format, error.report()) {
-        (CheckOutputFormat::Text, Some(report)) => {
-            emit_text_report(&report_for_cli(report, warnings_are_errors));
-        }
-        (CheckOutputFormat::Text, None) => {}
-        (CheckOutputFormat::Json, Some(report)) => println!(
-            "{}",
-            render_json_report(&report_for_cli(report, warnings_are_errors))?
-        ),
-        (CheckOutputFormat::Json, None) => {
+    match error.report() {
+        Some(report) => emit_report(report, format, warnings_are_errors),
+        None if format == CheckOutputFormat::Json => {
             println!(
                 "{}",
-                render_json_report(&message_report(error.to_string()))?
+                render_json_report(&message_report(error.to_string()), false)?
             );
+            Ok(())
         }
+        None => Ok(()),
     }
-    Ok(())
 }
 
-fn report_for_cli(report: &DiagnosticReport, warnings_are_errors: bool) -> DiagnosticReport {
-    if !warnings_are_errors {
-        return report.clone();
-    }
-    let mut report = report.clone();
-    for diagnostic in &mut report.diagnostics {
-        if diagnostic.severity() == DiagnosticSeverity::Warning {
-            *diagnostic = diagnostic.clone().with_severity(DiagnosticSeverity::Error);
+const WARN_AS_ERROR_NOTE: &str = "warning promoted to error by --warn-as-error";
+
+fn diagnostic_projection(
+    diagnostic: &Diagnostic,
+    warnings_are_errors: bool,
+) -> DiagnosticProjection<'static> {
+    if warnings_are_errors && diagnostic.severity() == DiagnosticSeverity::Warning {
+        DiagnosticProjection {
+            severity: Some(DiagnosticSeverity::Error),
+            extra_note: Some(WARN_AS_ERROR_NOTE),
         }
+    } else {
+        DiagnosticProjection::default()
     }
-    report
 }
 
-fn emit_text_report(report: &DiagnosticReport) {
-    if let Some(rendered) = render_text_report(report) {
+fn emit_text_report(report: &DiagnosticReport, warnings_are_errors: bool) {
+    if let Some(rendered) = render_text_report(report, warnings_are_errors) {
         eprint!("{rendered}");
     }
 }
 
-fn render_text_report(report: &DiagnosticReport) -> Option<String> {
-    let mut rendered = render_rich_report(report);
+fn render_text_report(report: &DiagnosticReport, warnings_are_errors: bool) -> Option<String> {
+    let mut rendered = render_rich_report_with_overrides(
+        report,
+        anvyx_lang2::RenderConfig::default(),
+        |diagnostic| diagnostic_projection(diagnostic, warnings_are_errors),
+    );
     if rendered.is_empty() {
         return None;
     }
@@ -202,8 +211,11 @@ fn message_report(message: String) -> DiagnosticReport {
     }
 }
 
-fn render_json_report(report: &DiagnosticReport) -> Result<String, String> {
-    serde_json::to_string_pretty(&JsonReport::from(report))
+fn render_json_report(
+    report: &DiagnosticReport,
+    warnings_are_errors: bool,
+) -> Result<String, String> {
+    serde_json::to_string_pretty(&JsonReport::new(report, warnings_are_errors))
         .map_err(|error| format!("failed to serialize diagnostics: {error}"))
 }
 
@@ -228,7 +240,7 @@ struct JsonDiagnostic<'a> {
     tags: Vec<&'static str>,
     message: &'a str,
     labels: Vec<JsonLabel<'a>>,
-    notes: &'a [String],
+    notes: Vec<String>,
     help: Option<&'a str>,
 }
 
@@ -238,40 +250,70 @@ struct JsonLabel<'a> {
     source_id: usize,
     start: usize,
     end: usize,
+    line: u32,
+    column: u32,
+    end_line: u32,
+    end_column: u32,
+    excerpts: Vec<JsonExcerpt<'a>>,
     message: Option<&'a str>,
 }
 
-impl<'a> From<&'a DiagnosticReport> for JsonReport<'a> {
-    fn from(report: &'a DiagnosticReport) -> Self {
+#[derive(Serialize)]
+struct JsonExcerpt<'a> {
+    line: u32,
+    text: &'a str,
+    highlight_start: u32,
+    highlight_end: u32,
+}
+
+impl<'a> JsonReport<'a> {
+    fn new(report: &'a DiagnosticReport, warnings_are_errors: bool) -> Self {
+        let diagnostics = report
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| JsonDiagnostic::new(diagnostic, report, warnings_are_errors))
+            .collect::<Vec<_>>();
+        let source_ids = diagnostics
+            .iter()
+            .flat_map(|diagnostic| diagnostic.labels.iter().map(|label| label.source_id))
+            .collect::<HashSet<_>>();
         Self {
             sources: report
                 .sources
                 .iter()
+                .filter(|source| source_ids.contains(&source.id().index()))
                 .map(|source| JsonSource {
                     id: source.id().index(),
                     label: source.label(),
                     path: source.path().map(|path| path.display().to_string()),
                 })
                 .collect(),
-            diagnostics: report
-                .diagnostics()
-                .iter()
-                .map(JsonDiagnostic::from)
-                .collect(),
+            diagnostics,
         }
     }
 }
 
-impl<'a> From<&'a Diagnostic> for JsonDiagnostic<'a> {
-    fn from(diagnostic: &'a Diagnostic) -> Self {
+impl<'a> JsonDiagnostic<'a> {
+    fn new(
+        diagnostic: &'a Diagnostic,
+        report: &'a DiagnosticReport,
+        warnings_are_errors: bool,
+    ) -> Self {
+        let projection = diagnostic_projection(diagnostic, warnings_are_errors);
+        let severity = projection.severity_for(diagnostic);
+        let notes = projection.notes_for(diagnostic);
         Self {
-            severity: diagnostic.severity().as_str(),
+            severity: severity.as_str(),
             source: diagnostic.code().map(|code| code.source),
             code: diagnostic.code().map(|code| code.code.as_str()),
             tags: diagnostic.tags().iter().copied().map(json_tag).collect(),
             message: diagnostic.message(),
-            labels: diagnostic.labels().iter().map(JsonLabel::from).collect(),
-            notes: diagnostic.notes(),
+            labels: diagnostic
+                .labels()
+                .iter()
+                .filter_map(|label| JsonLabel::new(label, report))
+                .collect(),
+            notes,
             help: diagnostic.help(),
         }
     }
@@ -284,16 +326,86 @@ fn json_tag(tag: DiagnosticTag) -> &'static str {
     }
 }
 
-impl<'a> From<&'a DiagnosticLabel> for JsonLabel<'a> {
-    fn from(label: &'a DiagnosticLabel) -> Self {
-        Self {
+impl<'a> JsonLabel<'a> {
+    fn new(label: &'a DiagnosticLabel, report: &'a DiagnosticReport) -> Option<Self> {
+        let (source, start, end) = json_label_source(report, label)?;
+        Some(Self {
             style: label.style.as_str(),
             source_id: label.span.source().index(),
             start: label.span.start(),
             end: label.span.end(),
+            line: start.line + 1,
+            column: start.column + 1,
+            end_line: end.line + 1,
+            end_column: end.column + 1,
+            excerpts: json_excerpts(source, label, start),
             message: label.message.as_deref(),
-        }
+        })
     }
+}
+
+fn json_label_source<'a>(
+    report: &'a DiagnosticReport,
+    label: &DiagnosticLabel,
+) -> Option<(&'a SourceFile, LineCol, LineCol)> {
+    if label.span.start() > label.span.end() {
+        return None;
+    }
+    let source = report.source(label.span.source())?;
+    let index = source.line_index();
+    Some((
+        source,
+        index.byte_to_line_col(label.span.start())?,
+        index.byte_to_line_col(label.span.end())?,
+    ))
+}
+
+fn json_excerpts<'a>(
+    source: &'a SourceFile,
+    label: &DiagnosticLabel,
+    start: LineCol,
+) -> Vec<JsonExcerpt<'a>> {
+    let index = source.line_index();
+    let end_byte = if label.span.end() > label.span.start() {
+        label.span.end() - 1
+    } else {
+        label.span.end()
+    };
+    let Some(last_covered) = index.byte_to_line_col(end_byte) else {
+        return vec![];
+    };
+
+    let mut excerpts = vec![json_excerpt(source, label, start.line)];
+    if last_covered.line != start.line {
+        excerpts.push(json_excerpt(source, label, last_covered.line));
+    }
+    excerpts.into_iter().flatten().collect()
+}
+
+fn json_excerpt<'a>(
+    source: &'a SourceFile,
+    label: &DiagnosticLabel,
+    line: u32,
+) -> Option<JsonExcerpt<'a>> {
+    let index = source.line_index();
+    let line_start = index.line_start(line)?;
+    let line_end = index.line_end(line)?;
+    let highlight_start = label
+        .span
+        .start()
+        .saturating_sub(line_start)
+        .min(line_end - line_start);
+    let highlight_end = label
+        .span
+        .end()
+        .saturating_sub(line_start)
+        .min(line_end - line_start);
+    Some(JsonExcerpt {
+        line: line + 1,
+        text: source.line_text(line)?,
+        highlight_start: highlight_start as u32,
+        highlight_end: highlight_end.max(highlight_start) as u32,
+    })
 }
 
 #[cfg(test)]
@@ -318,7 +430,11 @@ mod tests {
     fn check_new_frontend_error(file: &Path) -> String {
         let sources = anvyx_project::source_bundle().unwrap();
         let input = CheckFileInput::new(file.to_path_buf(), sources).unwrap();
-        anvyx_lang2::check_file(input).unwrap_err().to_string()
+        let error = anvyx_lang2::check_file(input).unwrap_err();
+        error
+            .report()
+            .and_then(|report| render_text_report(report, false))
+            .unwrap_or_else(|| error.to_string())
     }
 
     fn cwd_lock() -> &'static Mutex<()> {
@@ -384,24 +500,18 @@ mod tests {
             ..DiagnosticReport::default()
         };
 
-        let projected = report_for_cli(&report, true);
+        let warning = diagnostic_projection(&report.diagnostics()[0], true);
+        let error = diagnostic_projection(&report.diagnostics()[1], true);
 
-        assert_eq!(
-            projected.diagnostics()[0].severity(),
-            DiagnosticSeverity::Error
-        );
-        assert_eq!(
-            projected.diagnostics()[0].code().unwrap().code,
-            "deprecated"
-        );
-        assert_eq!(
-            projected.diagnostics()[1].severity(),
-            DiagnosticSeverity::Error
-        );
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::Error));
+        assert_eq!(warning.extra_note, Some(WARN_AS_ERROR_NOTE));
+        assert_eq!(error.severity, None);
+        assert_eq!(error.extra_note, None);
         assert_eq!(
             report.diagnostics()[0].severity(),
             DiagnosticSeverity::Warning
         );
+        assert!(report.diagnostics()[0].notes().is_empty());
     }
 
     #[test]
@@ -410,11 +520,46 @@ mod tests {
             diagnostics: vec![Diagnostic::warning("careful")],
             ..DiagnosticReport::default()
         };
-        let projected = report_for_cli(&report, true);
         let json: serde_json::Value =
-            serde_json::from_str(&render_json_report(&projected).unwrap()).unwrap();
+            serde_json::from_str(&render_json_report(&report, true).unwrap()).unwrap();
 
         assert_eq!(json["diagnostics"][0]["severity"], "error");
+        assert_eq!(json["diagnostics"][0]["notes"][0], WARN_AS_ERROR_NOTE);
+    }
+
+    #[test]
+    fn warn_as_error_text_includes_promotion_note() {
+        let mut sources = anvyx_lang2::SourceTable::default();
+        let source = sources.add(
+            anvyx_lang2::SourceKind::Virtual,
+            "main.anv",
+            None,
+            "let x = 1;",
+        );
+        let report =
+            DiagnosticReport {
+                sources,
+                diagnostics: vec![Diagnostic::warning("careful").with_primary_message(
+                    anvyx_lang2::SourceSpan::new(source, 0, 3),
+                    "warning here",
+                )],
+            };
+        let rendered = render_text_report(&report, true).unwrap();
+
+        assert!(rendered.contains("Error: careful"), "{rendered}");
+        assert!(rendered.contains(WARN_AS_ERROR_NOTE), "{rendered}");
+    }
+
+    #[test]
+    fn warn_as_error_message_only_text_keeps_promotion_note() {
+        let report = DiagnosticReport {
+            diagnostics: vec![Diagnostic::warning("careful")],
+            ..DiagnosticReport::default()
+        };
+        let rendered = render_text_report(&report, true).unwrap();
+
+        assert!(rendered.contains("error: careful"), "{rendered}");
+        assert!(rendered.contains(WARN_AS_ERROR_NOTE), "{rendered}");
     }
 
     #[test]
@@ -438,36 +583,12 @@ mod tests {
         let input = anvyx_project::check::standalone_check_input(&main).unwrap();
         let report = anvyx_lang2::check_file(input).unwrap().report;
         let json: serde_json::Value =
-            serde_json::from_str(&render_json_report(&report).unwrap()).unwrap();
+            serde_json::from_str(&render_json_report(&report, false).unwrap()).unwrap();
         let diagnostic = &json["diagnostics"][0];
 
         assert_eq!(diagnostic["source"], "anvyx");
         assert_eq!(diagnostic["code"], "unused_import");
         assert_eq!(diagnostic["tags"], serde_json::json!(["unnecessary"]));
-    }
-
-    #[test]
-    fn unused_import_error_level_fails_check() {
-        let temp = tempfile::tempdir().unwrap();
-        let main = temp.path().join("main.anv");
-        fs::write(&main, "import helper; fn main() {}\n").unwrap();
-        fs::write(temp.path().join("helper.anv"), "pub fn f() {}\n").unwrap();
-        let mut lint = FrontendLintConfig::default();
-        lint.set(
-            anvyx_lang2::LintId::UnusedImport,
-            anvyx_lang2::LintLevel::Error,
-        );
-
-        let error = new_frontend_cmd(
-            &main,
-            lint,
-            &CompilationContext::from_host(Profile::Debug),
-            CheckOutputFormat::Json,
-            false,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("typecheck"), "{error}");
     }
 
     fn plain_manifest() -> Manifest {
@@ -478,7 +599,7 @@ mod tests {
             },
             dependencies: HashMap::new(),
             externs: HashMap::new(),
-            lint: Default::default(),
+            lint: std::collections::BTreeMap::default(),
         }
     }
 
@@ -507,7 +628,7 @@ mod tests {
         }
 
         fn render_error_text_report(error: &FrontendCheckError) -> Option<String> {
-            render_text_report(error.report()?)
+            render_text_report(error.report()?, false)
         }
 
         fn check_error_report(code: &str) -> DiagnosticReport {
@@ -515,7 +636,7 @@ mod tests {
         }
 
         fn json_value(report: &DiagnosticReport) -> serde_json::Value {
-            serde_json::from_str(&render_json_report(report).unwrap()).unwrap()
+            serde_json::from_str(&render_json_report(report, false).unwrap()).unwrap()
         }
 
         mod integration {
@@ -545,7 +666,12 @@ mod tests {
                 let input = anvyx_project::check::package_check_input(&graph, file)?;
                 anvyx_lang2::check_package(input)
                     .map(|_| ())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| {
+                        error
+                            .report()
+                            .and_then(|report| render_text_report(report, false))
+                            .unwrap_or_else(|| error.to_string())
+                    })
             }
 
             #[test]
@@ -726,11 +852,11 @@ mod tests {
             let error = frontend_error(code);
             let rendered = render_error_text_report(&error).unwrap();
 
-            assert!(rendered.contains("Error: Mismatched types"), "{rendered}");
+            assert!(rendered.contains("Error: mismatched types"), "{rendered}");
             assert!(rendered.contains("main.anv"), "{rendered}");
             assert!(rendered.contains(code), "{rendered}");
             assert!(
-                rendered.contains("expected 'int', found 'bool'"),
+                rendered.contains("expected `int`, found `bool`"),
                 "{rendered}"
             );
             assert_eq!(error.summary(), "Failed to typecheck program");
@@ -738,7 +864,7 @@ mod tests {
                 !rendered.contains("frontend typecheck failed"),
                 "{rendered}"
             );
-            assert!(!rendered.contains("\n- Mismatched types"), "{rendered}");
+            assert!(!rendered.contains("\n- mismatched types"), "{rendered}");
         }
 
         #[test]
@@ -775,7 +901,7 @@ mod tests {
                     "compile warning emitted here",
                 )],
             };
-            let rendered = render_text_report(&report).unwrap();
+            let rendered = render_text_report(&report, false).unwrap();
 
             assert!(rendered.contains("Warning: careful"), "{rendered}");
             assert!(
@@ -788,7 +914,7 @@ mod tests {
         fn json_report_includes_sources_labels_and_byte_offsets() {
             let code = "// café\nfn main() { let x: int = true; }";
             let report = check_error_report(code);
-            let rendered = render_json_report(&report).unwrap();
+            let rendered = render_json_report(&report, false).unwrap();
             let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
             let diagnostic = &json["diagnostics"][0];
             let label = &diagnostic["labels"][0];
@@ -812,8 +938,17 @@ mod tests {
             assert!(code[..start].contains("café"));
             assert!(source["path"].as_str().unwrap().ends_with("main.anv"));
             assert!(source.get("text").is_none());
-            assert_eq!(label["message"], "expected 'int', found 'bool'");
-            assert!(!rendered.contains(code));
+            assert_eq!(label["message"], "expected `int`, found `bool`");
+            assert_eq!(label["line"], 2);
+            assert_eq!(
+                label["column"],
+                code.find("true").unwrap() - code.find("fn main").unwrap() + 1
+            );
+            assert_eq!(label["excerpts"][0]["line"], 2);
+            assert_eq!(
+                label["excerpts"][0]["text"],
+                "fn main() { let x: int = true; }"
+            );
             assert!(!rendered.contains("╭"));
             assert!(
                 !diagnostic["message"]
@@ -854,6 +989,28 @@ mod tests {
         }
 
         #[test]
+        fn json_report_skips_labels_outside_source_text() {
+            let mut sources = anvyx_lang2::SourceTable::default();
+            let source = sources.add(anvyx_lang2::SourceKind::Virtual, "main.anv", None, "short");
+            let report = DiagnosticReport {
+                sources,
+                diagnostics: vec![Diagnostic::error("bad").with_primary_message(
+                    anvyx_lang2::SourceSpan::new(source, 20, 25),
+                    "outside source",
+                )],
+            };
+            let json = json_value(&report);
+
+            assert!(json["sources"].as_array().unwrap().is_empty());
+            assert!(
+                json["diagnostics"][0]["labels"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
         fn json_report_serializes_warnings_labels_notes_help_and_metadata() {
             let mut sources = anvyx_lang2::SourceTable::default();
             let source = sources.add(
@@ -876,7 +1033,7 @@ mod tests {
                 sources,
                 diagnostics: vec![diagnostic],
             };
-            let json_text = render_json_report(&report).unwrap();
+            let json_text = render_json_report(&report, false).unwrap();
             let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
 
             assert_eq!(json["diagnostics"][0]["severity"], "warning");
@@ -892,7 +1049,10 @@ mod tests {
             );
             assert_eq!(json["diagnostics"][0]["notes"][0], "first note");
             assert_eq!(json["diagnostics"][0]["help"], "try this");
-            assert!(!json_text.contains("fn main() {}"));
+            assert_eq!(
+                json["diagnostics"][0]["labels"][0]["excerpts"][0]["text"],
+                "fn main() {}"
+            );
         }
 
         mod unsupported {

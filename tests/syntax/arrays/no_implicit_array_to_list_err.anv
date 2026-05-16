@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected '[int]', found '[int; 2]'
+// @contains: expected `[int]`, found `[int; 2]`
 
 fn main() {
     let arr: [int; 2] = [1, 2];

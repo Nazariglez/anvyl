@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Invalid operand type
+// @contains: invalid operand type
 
 fn add<T>(a: T, b: T) -> T {
     a + b

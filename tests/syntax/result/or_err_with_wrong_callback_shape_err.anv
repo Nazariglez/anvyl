@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: expected '_', found 'fn(int) -> string'
+// @contains: expected `_`, found `fn(int) -> string`
 // @frontend: new
 
 fn wrong(x: int) -> string {

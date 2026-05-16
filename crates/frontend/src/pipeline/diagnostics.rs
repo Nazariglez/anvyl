@@ -2,7 +2,7 @@ use anvyx_externs::{
     ExternDescriptorError, ExternOperator, ExternTypeExpr, ExternTypeKey,
     ModulePath as ExternModulePath, NameKind, OperatorReturn, TypeContext,
 };
-use chumsky::error::{Rich, RichReason};
+use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::{
     ast::{
@@ -19,7 +19,7 @@ use crate::{
         },
         raw_module_scope,
     },
-    lexer::Token,
+    lexer::{Delimiter, Op, Token},
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError, SourceFileId},
     source::SourceId,
     span::SourceSpan,
@@ -60,18 +60,64 @@ pub(super) fn diagnose_lex_error(
 pub(super) fn diagnose_parse_error(error: &Rich<'_, Token, SourceSpan>) -> Diagnostic {
     let (message, label) = match error.reason() {
         RichReason::Custom(message) => (message.clone(), message.clone()),
-        RichReason::ExpectedFound { found, .. } => match found.as_deref() {
-            Some(token) => (
-                format!("Unexpected token '{token}'"),
-                "unexpected token".to_string(),
-            ),
-            None => (
-                "Unexpected end of input".to_string(),
-                "end of file".to_string(),
-            ),
-        },
+        RichReason::ExpectedFound { expected, found } => {
+            match parse_expected_context(expected, found.as_deref()) {
+                Some((message, label)) => (message.to_string(), label.to_string()),
+                None => match found.as_deref() {
+                    Some(token) => (
+                        format!("Unexpected token '{token}'"),
+                        "unexpected token".to_string(),
+                    ),
+                    None => (
+                        "Unexpected end of input".to_string(),
+                        "end of file".to_string(),
+                    ),
+                },
+            }
+        }
     };
     Diagnostic::error(message).with_primary_message(*error.span(), label)
+}
+
+fn parse_expected_context(
+    expected: &[RichPattern<'_, Token>],
+    found: Option<&Token>,
+) -> Option<(&'static str, &'static str)> {
+    let expects_type = expected_label(expected, "type");
+    let expects_return_type = expected_label(expected, "return type");
+    let expects_name =
+        expected_label(expected, "identifier") || expected_label(expected, "parameter");
+    let expects_expression = expected_label(expected, "expression");
+
+    if expects_return_type && matches!(found, None | Some(Token::Open(Delimiter::Brace))) {
+        return Some(("expected return type", "expected a return type here"));
+    }
+    if expects_type
+        && matches!(
+            found,
+            Some(Token::Comma | Token::Close(Delimiter::Parent) | Token::Op(Op::ThinArrow))
+        )
+    {
+        return Some(("expected type after :", "expected a type here"));
+    }
+    if expects_type && matches!(found, Some(Token::Open(Delimiter::Brace))) {
+        return Some(("expected type", "expected a type here"));
+    }
+    if expects_name && matches!(found, Some(Token::Colon | Token::Comma)) {
+        return Some(("expected parameter name", "expected a parameter name here"));
+    }
+    if expects_expression {
+        return Some(("expected expression", "expected an expression here"));
+    }
+
+    None
+}
+
+fn expected_label(expected: &[RichPattern<'_, Token>], label: &str) -> bool {
+    expected.iter().any(|expected| match expected {
+        RichPattern::Label(found) => found == label,
+        _ => false,
+    })
 }
 
 pub(super) fn diagnose_conditional_error(source: SourceId, error: &ConditionalError) -> Diagnostic {
@@ -489,8 +535,12 @@ pub(super) fn diagnose_compile_warning(warning: &CompileWarning) -> Diagnostic {
 
 pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
     let span = type_error_span(error);
-    if let (Some(span), Some((message, label))) = (span, type_error_rich_message(error)) {
-        return Diagnostic::error(message).with_primary_message(span, label);
+    if let Some((message, label)) = type_error_rich_message(error) {
+        let diagnostic = Diagnostic::error(message);
+        return match span {
+            Some(span) => diagnostic.with_primary_message(span, label),
+            None => Diagnostic::error(format!("{message}: {label}")),
+        };
     }
 
     let diagnostic = Diagnostic::error(match error {
@@ -552,7 +602,8 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::InferReturnRecursive { .. } => {
             "recursive inferred return type requires an explicit return type".to_string()
         }
-        TypeError::UnsupportedPlaceReturn { message, .. } => (*message).to_string(),
+        TypeError::UnsupportedPlaceReturn { message, .. }
+        | TypeError::ForIterationModifier { message, .. } => (*message).to_string(),
         TypeError::UnknownType {
             qualifier, name, ..
         } => format!(
@@ -678,7 +729,6 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ForMutableMapEntry { .. } => {
             "mutable map entry iteration is not supported; use `for k, var v in map` to mutate values".to_string()
         }
-        TypeError::ForIterationModifier { message, .. } => (*message).to_string(),
         TypeError::InfiniteSize { name, .. } => {
             format!("type '{name}' has infinite size")
         }
@@ -964,10 +1014,6 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         } => diagnostic.with_help(help.clone()),
         _ => diagnostic,
     };
-    with_primary_if_known(diagnostic, span)
-}
-
-fn with_primary_if_known(diagnostic: Diagnostic, span: Option<SourceSpan>) -> Diagnostic {
     match span {
         Some(span) => diagnostic.with_primary(span),
         None => diagnostic,
@@ -1008,27 +1054,27 @@ fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> 
             expected, found, ..
         } => {
             let (expected, found) = render_type_mismatch_parts(expected, found);
-            ("Mismatched types", expected_found_label(&expected, &found))
+            ("mismatched types", expected_found_label(&expected, &found))
         }
         TypeError::ConstMismatch {
             expected, found, ..
         } => (
-            "Mismatched types",
+            "mismatched types",
             format!(
-                "expected const '{}', found '{}'",
+                "expected const `{}`, found `{}`",
                 render_const_diagnostic(expected),
                 render_const_diagnostic(found)
             ),
         ),
         TypeError::UndefinedVariable { name, .. } => {
-            ("Unknown variable", format!("Unknown variable '{name}'"))
+            ("unknown variable", format!("unknown variable `{name}`"))
         }
         TypeError::InvalidOperand {
             op, operand_type, ..
         } => (
-            "Invalid operand type",
+            "invalid operand type",
             format!(
-                "operator '{op}' cannot be applied to '{}'",
+                "operator `{op}` cannot be applied to `{}`",
                 render_surface_type(operand_type)
             ),
         ),
@@ -1044,17 +1090,39 @@ fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> 
             "Wrong number of arguments",
             format!("expected between {min} and {max}, found {found}"),
         ),
-        TypeError::IfConditionNotBool { found, .. } => (
-            "If condition must be bool",
-            condition_type_label("if expression", found),
-        ),
+        TypeError::IfConditionNotBool { found, .. } => {
+            ("if condition must be bool", condition_type_label(found))
+        }
         TypeError::TernaryConditionNotBool { found, .. } => (
-            "Ternary condition must be bool",
-            condition_type_label("ternary expression", found),
+            "ternary condition must be bool",
+            condition_type_label(found),
         ),
-        TypeError::WhileConditionNotBool { found, .. } => (
-            "While condition must be bool",
-            condition_type_label("while", found),
+        TypeError::WhileConditionNotBool { found, .. } => {
+            ("while condition must be bool", condition_type_label(found))
+        }
+        TypeError::MissingReturn { expected, .. } => (
+            "missing return value",
+            format!("expected `{}`, found `void`", render_surface_type(expected)),
+        ),
+        TypeError::BreakOutsideLoop { .. } => (
+            "break outside of loop",
+            "`break` can only be used inside a loop".to_string(),
+        ),
+        TypeError::ContinueOutsideLoop { .. } => (
+            "continue outside of loop",
+            "`continue` can only be used inside a loop".to_string(),
+        ),
+        TypeError::ReturnInsideDefer { .. } => (
+            "return inside defer",
+            "`return` is not allowed inside `defer`".to_string(),
+        ),
+        TypeError::BreakInsideDefer { .. } => (
+            "break inside defer",
+            "`break` is not allowed inside `defer`".to_string(),
+        ),
+        TypeError::ContinueInsideDefer { .. } => (
+            "continue inside defer",
+            "`continue` is not allowed inside `defer`".to_string(),
         ),
         TypeError::ImmutableAssignment { name, .. } => (
             "Cannot assign to immutable value",
@@ -1113,12 +1181,12 @@ fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> 
 }
 
 fn expected_found_label(expected: &str, found: &str) -> String {
-    format!("expected '{expected}', found '{found}'")
+    format!("expected `{expected}`, found `{found}`")
 }
 
-fn condition_type_label(kind: &str, found: &Type) -> String {
+fn condition_type_label(found: &Type) -> String {
     format!(
-        "Condition of {kind} must be bool; found '{}'",
+        "condition must be `bool`, found `{}`",
         render_surface_type(found)
     )
 }
@@ -2552,7 +2620,7 @@ mod tests {
                     found: Type::Bool,
                     span: Some(type_span()),
                 }),
-                "Mismatched types",
+                "mismatched types",
             ),
             (
                 diagnose_type_error(&TypeError::TypeMismatch {
@@ -2560,7 +2628,7 @@ mod tests {
                     found: Type::Tuple(vec![Type::option_of(Type::String)]),
                     span: Some(type_span()),
                 }),
-                "Mismatched types",
+                "mismatched types",
             ),
             (
                 diagnose_type_error(&TypeError::TypeMismatch {
@@ -2568,14 +2636,14 @@ mod tests {
                     found: package_nominal("right", "Vec2"),
                     span: Some(type_span()),
                 }),
-                "Mismatched types",
+                "mismatched types",
             ),
             (
                 diagnose_type_error(&TypeError::UndefinedVariable {
                     name: ident("x"),
                     span: Some(type_span()),
                 }),
-                "Unknown variable",
+                "unknown variable",
             ),
             (
                 diagnose_type_error(&TypeError::InvalidOperand {
@@ -2583,7 +2651,7 @@ mod tests {
                     operand_type: Type::Bool,
                     span: Some(type_span()),
                 }),
-                "Invalid operand type",
+                "invalid operand type",
             ),
             (
                 diagnose_type_error(&TypeError::ConstAssignment {
@@ -2759,7 +2827,7 @@ mod tests {
         assert_eq!(diagnostic.labels()[0].span, span);
         assert_eq!(
             diagnostic.labels()[0].message.as_deref(),
-            Some("Unknown variable 'x'")
+            Some("unknown variable `x`")
         );
 
         let diagnostic = diagnose_type_error(&TypeError::TypeMismatch {
@@ -2767,10 +2835,10 @@ mod tests {
             found: Type::Bool,
             span: Some(type_span()),
         });
-        assert_eq!(diagnostic.message(), "Mismatched types");
+        assert_eq!(diagnostic.message(), "mismatched types");
         assert_eq!(
             diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("expected 'int', found 'bool'")
+            Some("expected `int`, found `bool`")
         );
 
         let diagnostic = diagnose_type_error(&TypeError::InvalidOperand {
@@ -2780,7 +2848,7 @@ mod tests {
         });
         assert_eq!(
             diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("operator '-' cannot be applied to 'bool'")
+            Some("operator `-` cannot be applied to `bool`")
         );
 
         let diagnostic = diagnose_type_error(&TypeError::WrongArgRange {
@@ -2799,10 +2867,10 @@ mod tests {
             found: Type::Int,
             span: Some(type_span()),
         });
-        assert_eq!(diagnostic.message(), "If condition must be bool");
+        assert_eq!(diagnostic.message(), "if condition must be bool");
         assert_eq!(
             diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("Condition of if expression must be bool; found 'int'")
+            Some("condition must be `bool`, found `int`")
         );
     }
 
@@ -2818,7 +2886,7 @@ mod tests {
         });
         assert_msg(
             &diagnostic,
-            "Mismatched types: expected 'int', found 'bool'",
+            "mismatched types: expected `int`, found `bool`",
         );
         assert!(diagnostic.labels().is_empty());
 
@@ -3335,6 +3403,24 @@ mod tests {
         assert_eq!(
             diagnostic.primary_label().unwrap().message.as_deref(),
             Some("end of file")
+        );
+    }
+
+    #[test]
+    fn parser_type_context_distinguishes_colon_sites() {
+        assert_eq!(
+            parse_expected_context(
+                &[RichPattern::Label("type".into())],
+                Some(&Token::Close(Delimiter::Parent)),
+            ),
+            Some(("expected type after :", "expected a type here"))
+        );
+        assert_eq!(
+            parse_expected_context(
+                &[RichPattern::Label("type".into())],
+                Some(&Token::Open(Delimiter::Brace)),
+            ),
+            Some(("expected type", "expected a type here"))
         );
     }
 

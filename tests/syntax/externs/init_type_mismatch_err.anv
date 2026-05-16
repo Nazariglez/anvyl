@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: Mismatched types
+// @contains: mismatched types
 
 extern type Point {
     init;

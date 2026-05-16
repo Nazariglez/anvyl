@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @contains: try requires Option
-// @contains: Unknown variable 'missing'
+// @contains: unknown variable `missing`
 // @frontend: new
 
 fn bad() -> int? {

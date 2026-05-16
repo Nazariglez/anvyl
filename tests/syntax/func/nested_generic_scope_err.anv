@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: Unknown variable
+// @contains: unknown variable
 
 fn owner() {
     fn id<T>(x: T) -> T { x }

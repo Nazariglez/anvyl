@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected 'string', found 'int'
+// @contains: expected `string`, found `int`
 
 fn main() {
     assert_msg(true, 42)

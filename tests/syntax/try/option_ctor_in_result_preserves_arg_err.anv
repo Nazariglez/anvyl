@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: expected 'int', found 'string'
+// @contains: expected `int`, found `string`
 // @contains: try requires Result, found 'Option<int>'
 // @frontend: new
 

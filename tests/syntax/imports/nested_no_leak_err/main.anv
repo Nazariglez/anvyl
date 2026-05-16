@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Unknown variable
+// @contains: unknown variable
 
 import utils.math;
 

@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected 'int'
+// @contains: expected `int`
 
 dataref Counter {
     value: int,

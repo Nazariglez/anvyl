@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected
+// @contains: Unexpected token 'as'
 
 fn main() {
     let x: as int = 1;

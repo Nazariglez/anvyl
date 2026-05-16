@@ -821,7 +821,7 @@ mod tests {
         );
         assert_eq!(
             publishes[0].diagnostics[0].message,
-            "Mismatched types: expected 'int', found 'bool'"
+            "mismatched types: expected `int`, found `bool`"
         );
 
         let clears = adapter
@@ -901,23 +901,34 @@ mod tests {
         let uri = path_uri(&path);
         let mut adapter = LspAdapter::default();
 
-        let publishes = adapter
-            .open_document(
-                uri,
-                Some(1),
-                "struct Actor { fn draw(self) {} } pub fn take(actor: dyn _) { actor.draw(); }",
-            )
-            .unwrap();
+        let code = "struct Actor { fn draw(self) {} } pub fn take(actor: dyn _) { actor.draw(); }";
+        let publishes = adapter.open_document(uri, Some(1), code).unwrap();
+        let diagnostic = &publishes[0].diagnostics[0];
+        let dyn_start = code.find("dyn _").unwrap() as u32;
 
+        assert_eq!(diagnostic.severity, Some(LspSeverity::ERROR));
         assert_eq!(
-            publishes[0].diagnostics[0].severity,
-            Some(LspSeverity::ERROR)
-        );
-        assert_eq!(
-            publishes[0].diagnostics[0].code,
+            diagnostic.code,
             Some(NumberOrString::String(
                 "public_inferred_dyn_contract".to_string()
             ))
+        );
+        assert_eq!(diagnostic.range.start.character, dyn_start);
+        assert_eq!(diagnostic.range.end.character, dyn_start + 5);
+        assert!(
+            diagnostic
+                .message
+                .contains("inferred dynamic contract in exported API")
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains("declare a named contract and use `dyn Name`")
+        );
+        assert!(
+            !diagnostic
+                .message
+                .contains("lint `public_inferred_dyn_contract`")
         );
     }
 

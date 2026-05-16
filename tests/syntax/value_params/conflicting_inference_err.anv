@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Mismatched types
+// @contains: mismatched types
 
 fn same_len<T, N: int>(a: [T; N], b: [T; N]) -> T {
     a[0]

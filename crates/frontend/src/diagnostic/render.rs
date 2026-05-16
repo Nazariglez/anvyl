@@ -2,46 +2,57 @@ use std::fmt;
 
 use ariadne::{Color, Config, IndexType, Label, Report, ReportKind};
 
-use super::{Diagnostic, DiagnosticReport, LabelStyle, Severity};
+use super::{Diagnostic, DiagnosticProjection, DiagnosticReport, LabelStyle, Severity};
 use crate::source::{SourceFile, SourceId};
 
-pub fn render_plain_diagnostic(diagnostic: &Diagnostic) -> String {
-    format!(
-        "{}: {}",
-        diagnostic_header(diagnostic),
-        diagnostic.message()
-    )
-}
-
-pub fn render_plain_report(report: &DiagnosticReport) -> String {
-    report
-        .diagnostics()
-        .iter()
-        .map(render_plain_diagnostic)
-        .collect::<Vec<_>>()
-        .join("\n")
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderConfig {
+    pub color: bool,
 }
 
 pub fn render_rich_report(report: &DiagnosticReport) -> String {
+    render_rich_report_with_config(report, RenderConfig::default())
+}
+
+pub fn render_rich_report_with_config(report: &DiagnosticReport, config: RenderConfig) -> String {
+    render_rich_report_with_overrides(report, config, |_| DiagnosticProjection::default())
+}
+
+pub fn render_rich_report_with_overrides<'a>(
+    report: &'a DiagnosticReport,
+    config: RenderConfig,
+    overrides: impl Fn(&'a Diagnostic) -> DiagnosticProjection<'a>,
+) -> String {
     let mut output = String::new();
     for diagnostic in report.diagnostics() {
         if !output.is_empty() {
             output.push('\n');
         }
-        output.push_str(&render_rich_diagnostic(report, diagnostic));
+        output.push_str(&render_rich_diagnostic(
+            report,
+            diagnostic,
+            config,
+            overrides(diagnostic),
+        ));
     }
     output
 }
 
-fn render_rich_diagnostic(report: &DiagnosticReport, diagnostic: &Diagnostic) -> String {
+fn render_rich_diagnostic<'a>(
+    report: &DiagnosticReport,
+    diagnostic: &'a Diagnostic,
+    render_config: RenderConfig,
+    render_override: DiagnosticProjection<'a>,
+) -> String {
     let Some(anchor) = report.anchor_label(diagnostic) else {
-        return render_plain_diagnostic(diagnostic);
+        return render_summary(diagnostic, render_override);
     };
-    let Some(anchor_file) = report.source(anchor.span.source()) else {
-        return render_plain_diagnostic(diagnostic);
-    };
+    let anchor_file = report
+        .source(anchor.span.source())
+        .expect("anchor label source must exist");
 
-    let kind = match diagnostic.severity() {
+    let severity = render_override.severity_for(diagnostic);
+    let kind = match severity {
         Severity::Error => ReportKind::Error,
         Severity::Warning => ReportKind::Warning,
     };
@@ -50,20 +61,16 @@ fn render_rich_diagnostic(report: &DiagnosticReport, diagnostic: &Diagnostic) ->
     let mut builder = Report::build(kind, (anchor_source.clone(), anchor_range))
         .with_config(
             Config::default()
-                .with_color(false)
+                .with_color(render_config.color)
                 .with_index_type(IndexType::Byte),
         )
         .with_message(diagnostic.message());
-    if let Some(code) = diagnostic.code() {
-        builder = builder.with_code(&code.code);
-    }
-
     for label in diagnostic.labels() {
         let Some(file) = report.source(label.span.source()) else {
             continue;
         };
         let color = match label.style {
-            LabelStyle::Primary => Color::Red,
+            LabelStyle::Primary => primary_label_color(severity),
             LabelStyle::Secondary => Color::Blue,
         };
         let mut ariadne_label =
@@ -74,7 +81,7 @@ fn render_rich_diagnostic(report: &DiagnosticReport, diagnostic: &Diagnostic) ->
         builder = builder.with_label(ariadne_label);
     }
 
-    for note in diagnostic.notes() {
+    for note in render_override.notes_for(diagnostic) {
         builder = builder.with_note(note);
     }
     if let Some(help) = diagnostic.help() {
@@ -89,9 +96,9 @@ fn render_rich_diagnostic(report: &DiagnosticReport, diagnostic: &Diagnostic) ->
     );
     let mut bytes = Vec::new();
     if builder.finish().write(&mut cache, &mut bytes).is_err() {
-        return render_plain_diagnostic(diagnostic);
+        return render_summary(diagnostic, render_override);
     }
-    String::from_utf8(bytes).unwrap_or_else(|_| render_plain_diagnostic(diagnostic))
+    String::from_utf8(bytes).unwrap_or_else(|_| render_summary(diagnostic, render_override))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -106,11 +113,24 @@ impl fmt::Display for RenderSource {
     }
 }
 
-fn diagnostic_header(diagnostic: &Diagnostic) -> String {
-    let severity = diagnostic.severity().as_str();
-    match diagnostic.code() {
-        Some(code) => format!("{severity}[{}]", code.code),
-        None => severity.to_string(),
+fn render_summary(diagnostic: &Diagnostic, render_override: DiagnosticProjection<'_>) -> String {
+    let severity = render_override.severity_for(diagnostic);
+    let mut rendered = format!("{}: {}", severity.as_str(), diagnostic.message());
+    for note in render_override.notes_for(diagnostic) {
+        rendered.push_str("\nnote: ");
+        rendered.push_str(&note);
+    }
+    if let Some(help) = diagnostic.help() {
+        rendered.push_str("\nhelp: ");
+        rendered.push_str(help);
+    }
+    rendered
+}
+
+fn primary_label_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Error => Color::Red,
+        Severity::Warning => Color::Yellow,
     }
 }
 
@@ -125,7 +145,7 @@ fn source_key(file: &SourceFile) -> RenderSource {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{render_plain_diagnostic, render_rich_report};
+    use super::{RenderConfig, render_rich_report, render_rich_report_with_config};
     use crate::{
         diagnostic::{Diagnostic, DiagnosticReport},
         source::{SourceKind, SourceTable},
@@ -154,35 +174,44 @@ mod tests {
     }
 
     #[test]
-    fn plain_renderer_keeps_message_shape() {
-        assert_eq!(
-            render_plain_diagnostic(&Diagnostic::warning("careful")),
-            "warning: careful"
-        );
-    }
-
-    #[test]
-    fn plain_renderer_includes_code() {
-        assert_eq!(
-            render_plain_diagnostic(&Diagnostic::warning("careful").with_code("anvyx", "lint_id")),
-            "warning[lint_id]: careful"
-        );
-    }
-
-    #[test]
-    fn rich_renderer_includes_code() {
+    fn configured_color_uses_ariadne_color() {
         let report = report_with_source("let x = true;", |source| {
             Diagnostic::warning("careful")
-                .with_code("anvyx", "lint_id")
-                .with_primary(SourceSpan::new(source, 0, 3))
+                .with_primary_message(SourceSpan::new(source, 0, 3), "lint happened here")
+        });
+
+        let plain = render_rich_report(&report);
+        let colored = render_rich_report_with_config(&report, RenderConfig { color: true });
+
+        assert!(!plain.contains("\u{1b}["), "{plain}");
+        assert!(colored.contains("\u{1b}["), "{colored:?}");
+        assert!(colored.contains("Warning"), "{colored:?}");
+        assert!(colored.contains("lint happened here"), "{colored:?}");
+    }
+
+    #[test]
+    fn lint_code_does_not_lead_human_header() {
+        let report = report_with_source("let x = true;", |source| {
+            Diagnostic::warning("careful")
+                .with_lint_code(
+                    "anvyx",
+                    "lint_id",
+                    crate::lint::LintLevel::Warn,
+                    crate::config::LintLevelOrigin::Default,
+                )
+                .with_primary_message(SourceSpan::new(source, 0, 3), "lint happened here")
         });
 
         let rendered = render_rich_report(&report);
 
+        assert!(rendered.contains("Warning: careful"), "{rendered}");
+        assert!(rendered.contains("lint happened here"), "{rendered}");
         assert!(
-            rendered.contains("[lint_id] Warning: careful"),
+            rendered.contains("lint `lint_id` is on by default"),
             "{rendered}"
         );
+        assert!(!rendered.contains("[lint_id] Warning"), "{rendered}");
+        assert!(!rendered.contains("warning[lint_id]"), "{rendered}");
     }
 
     #[test]
@@ -223,6 +252,8 @@ mod tests {
         let rendered = render_rich_report(&report);
 
         assert!(rendered.contains("Error: bad bool"), "{rendered}");
+        assert!(rendered.contains("main.anv"), "{rendered}");
+        assert!(rendered.contains("let x = true;"), "{rendered}");
         assert!(rendered.contains("related bool"), "{rendered}");
     }
 
@@ -278,31 +309,78 @@ mod tests {
     #[test]
     fn renders_empty_eof_span() {
         let report = report_with_source("fn", |source| {
-            Diagnostic::error("Unexpected end of input").with_primary(SourceSpan::empty(source, 2))
+            Diagnostic::error("Unexpected end of input")
+                .with_primary_message(SourceSpan::empty(source, 2), "expected declaration")
         });
 
         let rendered = render_rich_report(&report);
 
         assert!(rendered.contains("Unexpected end of input"), "{rendered}");
+        assert!(rendered.contains("main.anv"), "{rendered}");
         assert!(rendered.contains("fn"), "{rendered}");
+        assert!(rendered.contains("expected declaration"), "{rendered}");
     }
 
     #[test]
     fn renders_non_ascii_byte_offsets() {
         let report = report_with_source("let café = 1;\nlet x = café;", |source| {
-            Diagnostic::error("bad name").with_primary(SourceSpan::new(source, 4, 9))
+            Diagnostic::error("bad name")
+                .with_primary_message(SourceSpan::new(source, 4, 9), "identifier is here")
         });
 
         let rendered = render_rich_report(&report);
 
+        assert!(rendered.contains("bad name"), "{rendered}");
         assert!(rendered.contains("let café = 1;"), "{rendered}");
-        assert!(rendered.contains("1:5"), "{rendered}");
+        assert!(rendered.contains("identifier is here"), "{rendered}");
+    }
+
+    #[test]
+    fn renders_cross_file_secondary_labels() {
+        let mut sources = SourceTable::default();
+        let main = sources.add(SourceKind::Virtual, "main.anv", None, "use helper;\n");
+        let helper = sources.add(SourceKind::Virtual, "helper.anv", None, "fn helper() {}\n");
+        let diagnostic = Diagnostic::error("duplicate")
+            .with_primary_message(SourceSpan::new(main, 0, 10), "imported here")
+            .with_secondary_message(SourceSpan::new(helper, 0, 2), "defined here");
+        let report = DiagnosticReport {
+            sources,
+            diagnostics: vec![diagnostic],
+        };
+
+        let rendered = render_rich_report(&report);
+
+        assert!(rendered.contains("main.anv"), "{rendered}");
+        assert!(rendered.contains("helper.anv"), "{rendered}");
+        assert!(rendered.contains("use helper;"), "{rendered}");
+        assert!(rendered.contains("fn helper() {}"), "{rendered}");
+        assert!(rendered.contains("imported here"), "{rendered}");
+        assert!(rendered.contains("defined here"), "{rendered}");
+    }
+
+    #[test]
+    fn ignores_missing_source_ids() {
+        let mut other_sources = SourceTable::default();
+        let other = other_sources.add(SourceKind::Virtual, "other.anv", None, "let x = true;");
+        let report = DiagnosticReport {
+            sources: SourceTable::default(),
+            diagnostics: vec![
+                Diagnostic::error("bad bool")
+                    .with_primary_message(SourceSpan::new(other, 8, 12), "missing source"),
+            ],
+        };
+
+        let rendered = render_rich_report(&report);
+
+        assert_eq!(rendered, "error: bad bool");
     }
 
     #[test]
     fn message_only_diagnostic_uses_plain_shape() {
         let report = report("", Diagnostic::error("provider failed"));
+        let rendered = render_rich_report(&report);
 
-        assert_eq!(render_rich_report(&report), "error: provider failed");
+        assert_eq!(rendered, "error: provider failed");
+        assert!(!rendered.contains("main.anv"), "{rendered}");
     }
 }

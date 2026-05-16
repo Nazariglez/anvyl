@@ -5,7 +5,7 @@ use anvyx_externs::{ParamFlow, ReceiverMode};
 use super::{
     ContractKey, ContractRequirementKey, ContractRequirementSchema, ContractSetKey, DeclError,
     DeclarationIndex, DeprecatedUseKind, Exposure, FuncParam, MemberAccessKind, MethodMode,
-    MethodReceiver, TypeChecker, TypeError,
+    MethodReceiver, ParamTypeSpans, TypeChecker, TypeError,
     annotation::deprecated_lint,
     member::{self, PromotedMethodTarget},
     semantic_use::{ContractWitnessKey, WitnessId, WitnessSlot, WitnessSlotTarget},
@@ -163,6 +163,7 @@ fn anonymous_requirements(surface: &AnonymousContract) -> Vec<ContractRequiremen
                 .iter()
                 .map(|param| FuncParam::new(param.ty.clone(), param.mutable, false, param.escape))
                 .collect(),
+            param_spans: ParamTypeSpans::default(),
             required_params: req.params.len(),
             ret: req.ret.clone(),
             generics_empty: true,

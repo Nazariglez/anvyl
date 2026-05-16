@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Mismatched types
+// @contains: mismatched types
 
 fn do_something<A, B>(a: A, b: B) -> B {
     if true {

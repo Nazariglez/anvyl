@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Unknown variable 'int_abs'
+// @contains: unknown variable `int_abs`
 
 fn main() {
     int_abs(-5);

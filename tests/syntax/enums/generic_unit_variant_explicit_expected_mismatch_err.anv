@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: expected 'int', found 'string'
+// @contains: expected `int`, found `string`
 
 enum Box<T> { Empty }
 

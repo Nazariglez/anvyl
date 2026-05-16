@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: Unknown variable 'N'
+// @contains: unknown variable `N`
 
 fn main() {
     fn f<T>(x: T) -> int { N }

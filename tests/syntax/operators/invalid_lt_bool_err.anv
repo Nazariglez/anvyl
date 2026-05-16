@@ -1,7 +1,8 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Invalid operand type
-// @contains: operator '<' cannot be applied to 'bool'
+// @contains: invalid operand type
+// @contains: operator `<` cannot be applied to `bool`
 
 fn main() {
     let x = true < false;

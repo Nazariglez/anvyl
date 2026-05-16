@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: operator '-' cannot be applied to 'string'
+// @contains: operator `-` cannot be applied to `string`
 
 struct Pair<T> {
     a: T,

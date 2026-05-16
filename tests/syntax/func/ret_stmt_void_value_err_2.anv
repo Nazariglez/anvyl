@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Mismatched types
+// @contains: mismatched types
 
 fn g() {
     return 1;

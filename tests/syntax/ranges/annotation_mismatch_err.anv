@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Mismatched types
+// @contains: mismatched types
 
 fn main() {
     let annotated: Range<int> = 0.0..10.0;

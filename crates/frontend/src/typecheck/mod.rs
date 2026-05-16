@@ -2036,7 +2036,7 @@ impl TypeChecker {
         span: Span,
         exported: bool,
     ) -> Type {
-        let resolved_params = self.resolve_callable_params(params, span, exported);
+        let resolved_params = self.resolve_callable_params(params, exported);
         let resolved_ret = ret.with_ty(self.resolve_type_for_tc_at(&ret.ty, span));
         Type::Func {
             params: resolved_params,
@@ -2044,22 +2044,17 @@ impl TypeChecker {
         }
     }
 
-    fn resolve_callable_params(
-        &mut self,
-        params: &[Param],
-        span: Span,
-        exported: bool,
-    ) -> Vec<FuncParam> {
+    fn resolve_callable_params(&mut self, params: &[Param], exported: bool) -> Vec<FuncParam> {
         params
             .iter()
             .map(|p| {
-                let ty = self.resolve_callable_param_type(&p.ty, span, exported);
+                let ty = self.resolve_callable_param_type(&p.ty, p.ty_span, exported);
                 self.validate_func_param_escape(
                     p.escape,
                     matches!(p.mutability, Mutability::Mutable),
                     p.cast_accept,
                     &ty,
-                    span,
+                    p.ty_span,
                 );
                 FuncParam::new(
                     ty,

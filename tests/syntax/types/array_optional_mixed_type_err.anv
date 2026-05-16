@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected 'string', found 'int'
+// @contains: expected `string`, found `int`
 
 fn main() {
     let _bad_optional_elem: [string?; _] = [nil, "hola", 1];

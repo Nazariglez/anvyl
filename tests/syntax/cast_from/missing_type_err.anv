@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected
+// @contains: Unexpected token ')'
 
 struct Vec2 { x: float, y: float }
 

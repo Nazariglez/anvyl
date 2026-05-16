@@ -1251,11 +1251,25 @@ impl ValueDecl {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParamTypeSpans(Vec<Span>);
+
+impl ParamTypeSpans {
+    fn from_params(params: &[Param]) -> Self {
+        Self(params.iter().map(|param| param.ty_span).collect())
+    }
+
+    fn span_for(&self, index: usize, fallback: Span) -> Span {
+        self.0.get(index).copied().unwrap_or(fallback)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FuncSig {
     pub(crate) kind: CallableKind,
     pub(crate) generics: GenericParams,
     pub(crate) ty: Type,
+    pub(crate) param_spans: ParamTypeSpans,
     pub(crate) required_params: usize,
     pub(crate) policy: AccessPolicy,
 }
@@ -1372,6 +1386,7 @@ pub(crate) struct ContractRequirementSchema {
     pub(crate) name: Ident,
     pub(crate) receiver: Option<MethodReceiver>,
     pub(crate) params: Vec<FuncParam>,
+    pub(crate) param_spans: ParamTypeSpans,
     pub(crate) required_params: usize,
     pub(crate) ret: ReturnSpec,
     pub(crate) generics_empty: bool,
@@ -1400,6 +1415,7 @@ pub(crate) struct MethodSchema {
     pub(crate) generics: GenericParams,
     pub(crate) mode: MethodMode,
     pub(crate) params: Vec<FuncParam>,
+    pub(crate) param_spans: ParamTypeSpans,
     pub(crate) required_params: usize,
     pub(crate) ret: ReturnSpec,
     pub(crate) policy: AccessPolicy,
@@ -1440,6 +1456,7 @@ pub(crate) struct ExtendSchema {
 #[derive(Clone)]
 pub(crate) struct CastConversionSchema {
     pub(crate) param: FuncParam,
+    pub(crate) param_span: Span,
     pub(crate) ret: Option<ReturnSpec>,
     pub(crate) span: SourceSpan,
 }
@@ -1449,6 +1466,7 @@ pub(crate) struct ExtendMethodSchema {
     pub(crate) mode: MethodMode,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
+    pub(crate) param_spans: ParamTypeSpans,
     pub(crate) required_params: usize,
     pub(crate) ret: ReturnSpec,
     pub(crate) policy: AccessPolicy,
@@ -1682,10 +1700,10 @@ impl DeclarationIndex {
                 map_generic_bounds(&key.module, span, &generics, &mut method.generics, &mut f);
                 let type_params =
                     combined_type_params(&owner_type_params, &method.generics.type_params);
-                for param in &mut method.params {
+                for (index, param) in method.params.iter_mut().enumerate() {
                     let site = DeclTypeSite {
                         module: key.module.clone(),
-                        span,
+                        span: method.param_spans.span_for(index, span),
                         generics: generics.clone(),
                         type_params: type_params.clone(),
                     };
@@ -1756,10 +1774,10 @@ impl DeclarationIndex {
                 let Some(span) = req.span else {
                     continue;
                 };
-                for param in &mut req.params {
+                for (index, param) in req.params.iter_mut().enumerate() {
                     let site = DeclTypeSite {
                         module: key.module.clone(),
-                        span: span.byte(),
+                        span: req.param_spans.span_for(index, span.byte()),
                         generics: GenericTypeContext::default(),
                         type_params: vec![],
                     };
@@ -1842,10 +1860,10 @@ impl DeclarationIndex {
                 );
                 let type_params =
                     combined_type_params(&extend_type_params, &method.generics.type_params);
-                for param in &mut method.params {
+                for (index, param) in method.params.iter_mut().enumerate() {
                     let site = DeclTypeSite {
                         module: origin.clone(),
-                        span,
+                        span: method.param_spans.span_for(index, span),
                         generics: method_generics.clone(),
                         type_params: type_params.clone(),
                     };
@@ -1866,7 +1884,13 @@ impl DeclarationIndex {
                     generics: generics.clone(),
                     type_params: extend_type_params.clone(),
                 };
-                cast.param.ty = f(site.clone(), cast.param.ty.clone());
+                cast.param.ty = f(
+                    DeclTypeSite {
+                        span: cast.param_span,
+                        ..site.clone()
+                    },
+                    cast.param.ty.clone(),
+                );
                 if let Some(ret) = &mut cast.ret {
                     ret.ty = f(site, ret.ty.clone());
                 }
@@ -1909,7 +1933,8 @@ impl DeclarationIndex {
                                 generics,
                                 type_params: sig.generics.type_params.clone(),
                             };
-                            sig.ty = f(site, sig.ty.clone());
+                            sig.ty =
+                                map_func_type_uses(site, sig.ty.clone(), &sig.param_spans, &mut f);
                         }
                     }
                     ValueDecl::Const(sig) => {
@@ -2101,6 +2126,7 @@ impl DeclarationIndex {
                             kind: CallableKind::Function,
                             generics: generic_params(&func.type_params, &func.const_params),
                             ty,
+                            param_spans: ParamTypeSpans::from_params(&func.params),
                             required_params: required_param_count(&func.params),
                             policy,
                         }),
@@ -2179,6 +2205,7 @@ impl DeclarationIndex {
                             ),
                             mode,
                             params: resolve_func_params(&method.sig.params),
+                            param_spans: ParamTypeSpans::from_params(&method.sig.params),
                             required_params: required_param_count(&method.sig.params),
                             ret: method.sig.ret.clone(),
                             policy,
@@ -2429,6 +2456,7 @@ impl DeclarationIndex {
                                 name: req.node.sig.name,
                                 receiver: req.node.sig.receiver,
                                 params: resolve_func_params(&req.node.sig.params),
+                                param_spans: ParamTypeSpans::from_params(&req.node.sig.params),
                                 required_params: required_param_count(&req.node.sig.params),
                                 ret: req.node.sig.ret.clone(),
                                 generics_empty: req.node.sig.type_params.is_empty()
@@ -2505,6 +2533,7 @@ impl DeclarationIndex {
                             mode,
                             generics: generic_params(&m.sig.type_params, &m.sig.const_params),
                             params: resolve_func_params(&m.sig.params),
+                            param_spans: ParamTypeSpans::from_params(&m.sig.params),
                             required_params: required_param_count(&m.sig.params),
                             ret: m.sig.ret.clone(),
                             policy,
@@ -2540,6 +2569,7 @@ impl DeclarationIndex {
                                 cast.node.param.cast_accept,
                                 cast.node.param.escape,
                             ),
+                            param_span: cast.node.param.ty_span,
                             ret: cast.node.ret.clone(),
                             span: SourceSpan::from_byte_span(source, cast.span),
                         })
@@ -2634,6 +2664,7 @@ impl DeclarationIndex {
                         params: vec![],
                         ret: Box::new(ReturnSpec::void()),
                     },
+                    param_spans: ParamTypeSpans::default(),
                     required_params: 0,
                     policy,
                 }),
@@ -3924,6 +3955,44 @@ pub(crate) fn generic_params(
     GenericParams {
         type_params: type_params.to_vec(),
         const_params: const_params.to_vec(),
+    }
+}
+
+fn map_func_type_uses<F>(
+    site: DeclTypeSite,
+    ty: Type,
+    param_spans: &ParamTypeSpans,
+    f: &mut F,
+) -> Type
+where
+    F: FnMut(DeclTypeSite, Type) -> Type,
+{
+    let Type::Func { params, ret } = ty else {
+        return f(site, ty);
+    };
+    let params = params
+        .into_iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let span = param_spans.span_for(index, site.span);
+            FuncParam::new(
+                f(
+                    DeclTypeSite {
+                        span,
+                        ..site.clone()
+                    },
+                    param.ty,
+                ),
+                param.mutable,
+                param.cast_accept,
+                param.escape,
+            )
+        })
+        .collect();
+    let ret_ty = f(site, ret.ty.clone());
+    Type::Func {
+        params,
+        ret: Box::new(ret.with_ty(ret_ty)),
     }
 }
 

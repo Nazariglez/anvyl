@@ -2,7 +2,7 @@
 // @expect: error
 // @frontend: new
 // @contains: Unknown variant 'Yellow' for enum 'Color'
-// @contains: Unknown variable 'missing'
+// @contains: unknown variable `missing`
 
 enum Color { Red }
 

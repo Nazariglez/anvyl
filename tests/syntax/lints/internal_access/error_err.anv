@@ -2,7 +2,7 @@
 // @mode: check
 // @expect: error
 // @lint: internal_access=error
-// @contains: [internal_access] Error: accessing internal field 'cache' of type 'Item'
+// @contains: Error: accessing internal field 'cache' of type 'Item'
 
 import lib { Item };
 

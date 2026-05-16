@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: expected 'int', found 'string'
+// @contains: expected `int`, found `string`
 // @frontend: new
 
 fn main() {

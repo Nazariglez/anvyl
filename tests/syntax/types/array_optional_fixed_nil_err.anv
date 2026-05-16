@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: expected '[int; 2]', found '[int?; 2]'
+// @contains: expected `[int; 2]`, found `[int?; 2]`
 
 fn main() {
     let _bad_fixed: [int; 2] = [1, nil];

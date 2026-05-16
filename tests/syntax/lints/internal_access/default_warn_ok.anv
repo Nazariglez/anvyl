@@ -1,7 +1,7 @@
 // @frontend: new
 // @mode: check
 // @expect: success
-// @warn-contains: [internal_access] Warning: accessing internal field 'cache' of type 'Item'
+// @warn-contains: Warning: accessing internal field 'cache' of type 'Item'
 
 import lib { Item };
 

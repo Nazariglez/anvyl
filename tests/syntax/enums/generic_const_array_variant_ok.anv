@@ -1,4 +1,5 @@
 // @mode: check
+// @frontend: new
 // @expect: success
 
 enum Packet<T, N: int> {

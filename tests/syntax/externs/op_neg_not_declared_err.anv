@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: Invalid operand
+// @contains: invalid operand
 
 extern type Vec2 {
     x: float;

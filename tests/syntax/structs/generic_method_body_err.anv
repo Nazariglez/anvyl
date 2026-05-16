@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Invalid operand type
+// @contains: invalid operand type
 
 struct Foo {
     fn bad<T>(self, x: T) -> T {

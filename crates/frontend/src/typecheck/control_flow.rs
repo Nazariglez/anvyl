@@ -471,7 +471,7 @@ fn check_branch_place_return_expr(
             let Some(else_block) = &if_node.node.else_block else {
                 tc.push_error(TypeError::MissingReturn {
                     expected: ret.ty.clone(),
-                    span: tc.error_span(expr.span),
+                    span: tc.error_span(expr.span.to_end()),
                 });
                 return Some(if then_checked.ty.is_void() {
                     diverged_place_return(ret, tc)

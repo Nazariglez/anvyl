@@ -113,7 +113,7 @@ fn unused_import_event(import: &ImportRecord) -> LintEvent {
             "unused import from '{}'",
             render_import_module(&import.target_module)
         ),
-        label: None,
+        label: "unused import".to_string(),
         notes: vec![],
         help: Some("remove this import".to_string()),
         tags: vec![DiagnosticTag::Unnecessary],

@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Unknown variable 'double_sin'
+// @contains: unknown variable `double_sin`
 
 fn main() {
     double_sin(1.0);

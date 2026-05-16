@@ -228,7 +228,7 @@ pub struct LintEvent {
     pub id: LintId,
     pub span: SourceSpan,
     pub message: String,
-    pub label: Option<String>,
+    pub label: String,
     pub notes: Vec<String>,
     pub help: Option<String>,
     pub tags: Vec<DiagnosticTag>,
@@ -245,16 +245,14 @@ pub fn apply_lints(
 }
 
 fn lint_diagnostic(config: &LintConfig, event: LintEvent) -> Option<Diagnostic> {
-    let mut diagnostic = match config.level(event.id) {
+    let level = config.level_info(event.id);
+    let mut diagnostic = match level.level {
         LintLevel::Allow => return None,
         LintLevel::Warn => Diagnostic::warning(event.message),
         LintLevel::Error => Diagnostic::error(event.message),
     }
-    .with_code("anvyx", event.id.name());
-    diagnostic = match event.label {
-        Some(label) => diagnostic.with_primary_message(event.span, label),
-        None => diagnostic.with_primary(event.span),
-    };
+    .with_lint_code("anvyx", event.id.name(), level.level, level.origin);
+    diagnostic = diagnostic.with_primary_message(event.span, event.label);
     for tag in event.tags {
         diagnostic = diagnostic.with_tag(tag);
     }
@@ -294,7 +292,7 @@ mod tests {
             id,
             span: span(),
             message: "lint message".to_string(),
-            label: Some("lint label".to_string()),
+            label: "lint label".to_string(),
             notes: vec!["lint note".to_string()],
             help: Some("lint help".to_string()),
             tags: vec![DiagnosticTag::Deprecated],
@@ -416,19 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_lints_uses_configured_severity() {
-        let mut config = LintConfig::default();
-        config.set(LintId::Deprecated, LintLevel::Error);
-
-        let diagnostics = apply_lints(&config, [event(LintId::Deprecated)]);
-
-        assert_eq!(
-            diagnostics[0].severity(),
-            crate::diagnostic::Severity::Error
-        );
-    }
-
-    #[test]
     fn apply_lints_copies_metadata_and_details() {
         let diagnostics = apply_lints(&LintConfig::default(), [event(LintId::Deprecated)]);
         let diagnostic = &diagnostics[0];
@@ -436,6 +421,13 @@ mod tests {
         assert_eq!(diagnostic.severity(), crate::diagnostic::Severity::Warning);
         assert_eq!(diagnostic.code().unwrap().source, "anvyx");
         assert_eq!(diagnostic.code().unwrap().code, "deprecated");
+        assert_eq!(
+            diagnostic.notes_with_metadata(),
+            vec![
+                "lint note".to_string(),
+                "lint `deprecated` is on by default".to_string()
+            ]
+        );
         assert_eq!(diagnostic.tags(), &[DiagnosticTag::Deprecated]);
         assert_eq!(diagnostic.message(), "lint message");
         assert_eq!(

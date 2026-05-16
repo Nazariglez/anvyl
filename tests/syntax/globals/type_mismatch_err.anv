@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: expected 'int', found 'string'
+// @contains: expected `int`, found `string`
 
 lazy let count: int = "no";

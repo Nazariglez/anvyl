@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Condition of if expression must be bool
+// @contains: condition must be `bool`, found `int`
 
 fn main() {
     let x: int = 1;

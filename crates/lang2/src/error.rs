@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf};
 
-use anvyx_frontend::pipeline::{CheckError as FCheckError, Diagnostic, DiagnosticReport};
+use anvyx_frontend::pipeline::{CheckError as FCheckError, DiagnosticReport};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckOk {
@@ -65,24 +65,8 @@ impl fmt::Display for CheckError {
                     path.display()
                 )
             }
-            Self::Frontend(error) => display_frontend_error(f, error),
+            Self::Frontend(error) => f.write_str(&frontend_error_summary(error)),
         }
-    }
-}
-
-fn display_frontend_error(
-    f: &mut fmt::Formatter<'_>,
-    error: &FCheckError<CheckError>,
-) -> fmt::Result {
-    match error {
-        FCheckError::Lex { report, .. }
-        | FCheckError::Parse { report, .. }
-        | FCheckError::Resolve { report }
-        | FCheckError::Type { report }
-        | FCheckError::Extern { report } => {
-            write_diagnostics(f, &frontend_error_summary(error), report.diagnostics())
-        }
-        FCheckError::Source(error) => write!(f, "{error}"),
     }
 }
 
@@ -95,38 +79,6 @@ fn frontend_error_summary(error: &FCheckError<CheckError>) -> String {
         FCheckError::Extern { .. } => "Failed to ingest extern inputs".to_string(),
         FCheckError::Source(error) => error.summary(),
     }
-}
-
-fn write_diagnostics(
-    f: &mut fmt::Formatter<'_>,
-    header: &str,
-    diagnostics: &[Diagnostic],
-) -> fmt::Result {
-    write!(f, "{header}:")?;
-    for diagnostic in diagnostics {
-        write!(f, "\n- ")?;
-        write_diagnostic(f, diagnostic)?;
-    }
-    Ok(())
-}
-
-fn write_diagnostic(f: &mut fmt::Formatter<'_>, diagnostic: &Diagnostic) -> fmt::Result {
-    f.write_str(diagnostic.message())?;
-    match diagnostic
-        .primary_label()
-        .or_else(|| diagnostic.labels().first())
-        .and_then(|label| label.message.as_deref())
-    {
-        Some(label) if label != diagnostic.message() => write!(f, ": {label}")?,
-        _ => {}
-    }
-    for note in diagnostic.notes() {
-        write!(f, " (note: {note})")?;
-    }
-    if let Some(help) = diagnostic.help() {
-        write!(f, " (help: {help})")?;
-    }
-    Ok(())
 }
 
 impl std::error::Error for CheckError {}
@@ -143,6 +95,7 @@ impl From<FCheckError<CheckError>> for CheckError {
 #[cfg(test)]
 mod tests {
     use anvyx_frontend::{
+        pipeline::Diagnostic,
         source::{SourceKind, SourceTable},
         span::SourceSpan,
     };
@@ -168,16 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn display_frontend_resolve_error() {
+    fn display_frontend_resolve_error_is_summary_only() {
         let frontend = anvyx_frontend::pipeline::CheckError::Resolve {
             report: report([Diagnostic::error("missing module")]),
         };
         let error = CheckError::Frontend(frontend);
 
-        assert_eq!(
-            error.to_string(),
-            "Failed to resolve program:\n- missing module"
-        );
+        assert_eq!(error.to_string(), "Failed to resolve program");
     }
 
     #[test]
@@ -198,41 +148,7 @@ mod tests {
         };
         let error = CheckError::Frontend(frontend);
 
-        assert_eq!(
-            error.to_string(),
-            "Failed to parse program:\n- expected expression"
-        );
-    }
-
-    #[test]
-    fn display_frontend_error_uses_first_label_when_no_primary_exists() {
-        let diagnostic = Diagnostic::error("bad")
-            .with_secondary_message(SourceSpan::new(source_id(), 0, 1), "related here");
-        let frontend = anvyx_frontend::pipeline::CheckError::Type {
-            report: report([diagnostic]),
-        };
-        let error = CheckError::Frontend(frontend);
-
-        assert_eq!(
-            error.to_string(),
-            "Failed to typecheck program:\n- bad: related here"
-        );
-    }
-
-    #[test]
-    fn display_frontend_error_includes_notes_and_help_without_label() {
-        let diagnostic = Diagnostic::error("bad")
-            .with_note("check this")
-            .with_help("try that");
-        let frontend = anvyx_frontend::pipeline::CheckError::Type {
-            report: report([diagnostic]),
-        };
-        let error = CheckError::Frontend(frontend);
-
-        assert_eq!(
-            error.to_string(),
-            "Failed to typecheck program:\n- bad (note: check this) (help: try that)"
-        );
+        assert_eq!(error.to_string(), "Failed to parse program");
     }
 
     #[test]
@@ -327,10 +243,6 @@ mod tests {
             sources,
             diagnostics: vec![Diagnostic::error("bad").with_primary(span)],
         }
-    }
-
-    fn source_id() -> anvyx_frontend::source::SourceId {
-        SourceTable::default().add(SourceKind::Virtual, "main.anv", None, "x")
     }
 
     fn report(diagnostics: impl IntoIterator<Item = Diagnostic>) -> DiagnosticReport {

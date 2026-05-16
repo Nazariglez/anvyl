@@ -2,7 +2,7 @@
 // @mode: check
 // @expect: error
 // @lint: unused_import=error
-// @contains: [unused_import] Error: unused import from 'helper'
+// @contains: Error: unused import from 'helper'
 
 import helper;
 

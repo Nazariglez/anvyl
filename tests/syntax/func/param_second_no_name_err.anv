@@ -1,5 +1,6 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Unexpected token
+// @contains: expected parameter name
 
 fn check(a: int, :int) -> void {}

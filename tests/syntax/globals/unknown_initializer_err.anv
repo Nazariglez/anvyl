@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: Unknown variable 'missing'
+// @contains: unknown variable `missing`
 
 lazy let count = missing;

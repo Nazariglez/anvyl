@@ -2,7 +2,11 @@
 // @mode: check
 // @expect: error
 // @lint: public_inferred_dyn_contract=error
-// @contains: [public_inferred_dyn_contract] Error: exported function uses inferred dynamic contract
+// @contains: Error: exported function uses inferred dynamic contract
+// @contains: inferred dynamic contract in exported API
+// @contains: Help: declare a named contract and use `dyn Name`
+// @contains: Note: lint `public_inferred_dyn_contract` was set to error
+// @contains: pub fn take(actor: dyn _) {
 
 struct Actor {
     fn draw(self) {}

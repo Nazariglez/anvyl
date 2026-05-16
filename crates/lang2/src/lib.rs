@@ -4,18 +4,22 @@ mod error;
 mod source;
 
 pub use anvyx_frontend::{
-    config::{CompilationContext, LintConfig, Profile, TargetArch, TargetOs},
-    diagnostic::render::{render_plain_diagnostic, render_plain_report, render_rich_report},
+    config::{CompilationContext, LintConfig, LintLevelInfo, Profile, TargetArch, TargetOs},
+    diagnostic::render::{
+        RenderConfig, render_rich_report, render_rich_report_with_config,
+        render_rich_report_with_overrides,
+    },
     lint::{
         LintId, LintInfo, LintLevel, LintParseError, available_group_names, available_lint_names,
         available_override_names, expand_group, find_lint, implemented_lints,
     },
     pipeline::{
-        Diagnostic, DiagnosticCode, DiagnosticLabel, DiagnosticReport, DiagnosticSeverity,
-        DiagnosticTag, FrontendConfig, LabelStyle,
+        Diagnostic, DiagnosticCode, DiagnosticCodeKind, DiagnosticLabel, DiagnosticProjection,
+        DiagnosticReport, DiagnosticSeverity, DiagnosticTag, FrontendConfig, LabelStyle,
+        LintLevelOrigin,
     },
     resolve::PackageId,
-    source::{SourceFile, SourceId, SourceKind, SourceTable},
+    source::{LineCol, SourceFile, SourceId, SourceKind, SourceTable},
     span::SourceSpan,
 };
 pub use check::{CheckFileInput, CheckPackageInput, check_file, check_package};

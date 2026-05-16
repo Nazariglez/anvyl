@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: mismatch
+// @contains: expected `float`, found `string`
 
 dataref Bad {
     health: float = "not a number",

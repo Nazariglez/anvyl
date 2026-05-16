@@ -1,6 +1,7 @@
 // @mode: check
+// @frontend: new
 // @expect: error
-// @contains: Mismatched
+// @contains: mismatched
 
 enum Packet<T, N: int> {
     Data([T; N]),
