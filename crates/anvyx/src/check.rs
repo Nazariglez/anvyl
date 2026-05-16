@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::IsTerminal,
     path::Path,
 };
 
@@ -192,7 +193,9 @@ fn emit_text_report(report: &DiagnosticReport, warnings_are_errors: bool) {
 fn render_text_report(report: &DiagnosticReport, warnings_are_errors: bool) -> Option<String> {
     let mut rendered = render_rich_report_with_overrides(
         report,
-        anvyx_lang2::RenderConfig::default(),
+        anvyx_lang2::RenderConfig {
+            color: std::io::stderr().is_terminal(),
+        },
         |diagnostic| diagnostic_projection(diagnostic, warnings_are_errors),
     );
     if rendered.is_empty() {
