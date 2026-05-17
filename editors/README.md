@@ -2,28 +2,58 @@
 
 This folder contains editor support for Anvyx `.anv` files.
 
-Right now there are two options:
+Available integrations:
 
-- `vscode/` for VS Code
+- `vscode/` for VS Code syntax highlighting and LSP diagnostics
 - `nvim/` for Neovim with Tree-sitter
-
-The goal of this README is simple: help you get syntax highlighting working.
 
 ## VS Code
 
-The easiest way to try the extension is to open your editor with the extension loaded from this repo.
+The VS Code extension registers `.anv` files, provides TextMate highlighting, and starts `anvyx lsp` for diagnostics. Hover, completion, formatting, go-to-definition, and semantic tokens are not implemented yet.
+
+Build the compiler binary from the repo root:
 
 ```bash
-code --extensionDevelopmentPath="$(pwd)/editors/vscode"
+rtk cargo build -p anvyx
 ```
 
-If you want to keep it installed locally, symlink the folder into your extensions directory and restart the editor:
+Build and launch the extension from this repo for one VS Code development session:
 
 ```bash
-ln -s "$(pwd)/editors/vscode" ~/.vscode/extensions/anvyx
+cd editors/vscode
+npm install
+npm run compile
+code --extensionDevelopmentPath="$(pwd)"
 ```
 
-After that, open any `.anv` file. Highlighting should start automatically.
+To keep this checkout installed permanently in VS Code, build it once and symlink it into your VS Code extensions directory:
+
+```bash
+cd editors/vscode
+npm install
+npm run compile
+mkdir -p ~/.vscode/extensions
+ln -sfn "$(pwd)" ~/.vscode/extensions/anvyx
+```
+
+Then reload VS Code. After that, opening any `.anv` file from any workspace loads this extension. Re-run `npm run compile` after changing the extension TypeScript.
+
+
+For local development, set `anvyx.serverPath` to the absolute path of the compiler binary, for example:
+
+```json
+"anvyx.serverPath": "/path/to/anvyx-clean/target/debug/anvyx"
+```
+
+Reload the VS Code window after changing `anvyx.serverPath`.
+
+For an installed compiler, run this from the repo root:
+
+```bash
+just install
+```
+
+Then leave `anvyx.serverPath` as the default `anvyx` if the installed binary is on your `PATH`.
 
 ## Neovim
 

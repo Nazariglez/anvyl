@@ -1,18 +1,42 @@
 {
   "name": "anvyx",
   "displayName": "Anvyx",
-  "description": "Syntax highlighting for the Anvyx programming language",
+  "description": "Syntax highlighting and diagnostics for the Anvyx programming language",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.75.0"
   },
-  "categories": ["Programming Languages"],
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:anvyx"
+  ],
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^8.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "1.75.0",
+    "typescript": "^5.4.0"
+  },
   "contributes": {
     "languages": [
       {
         "id": "anvyx",
-        "aliases": ["Anvyx", "anvyx"],
-        "extensions": [".anv"],
+        "aliases": [
+          "Anvyx",
+          "anvyx"
+        ],
+        "extensions": [
+          ".anv"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -22,6 +46,17 @@
         "scopeName": "source.anvyx",
         "path": "./syntaxes/anvyx.tmLanguage.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Anvyx",
+      "properties": {
+        "anvyx.serverPath": {
+          "type": "string",
+          "default": "anvyx",
+          "scope": "machine",
+          "description": "Path to the Anvyx executable used for the language server. Reload the VS Code window after changing this setting."
+        }
+      }
+    }
   }
 }

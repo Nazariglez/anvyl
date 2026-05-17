@@ -40,12 +40,10 @@ pub fn run_stdio() -> Result<(), String> {
 
 fn initialize_result() -> Value {
     json!({
-        "capabilities": {
-            "textDocumentSync": {
-                "openClose": true,
-                "change": 1,
-                "save": true
-            }
+        "textDocumentSync": {
+            "openClose": true,
+            "change": 1,
+            "save": true
         }
     })
 }
@@ -632,12 +630,9 @@ mod tests {
     fn initialize_result_advertises_full_text_sync() {
         let result = initialize_result();
 
-        assert_eq!(
-            result["capabilities"]["textDocumentSync"]["openClose"],
-            true
-        );
-        assert_eq!(result["capabilities"]["textDocumentSync"]["change"], 1);
-        assert_eq!(result["capabilities"]["textDocumentSync"]["save"], true);
+        assert_eq!(result["textDocumentSync"]["openClose"], true);
+        assert_eq!(result["textDocumentSync"]["change"], 1);
+        assert_eq!(result["textDocumentSync"]["save"], true);
     }
 
     #[test]
