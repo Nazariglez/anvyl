@@ -16,7 +16,7 @@ use crate::{
     config::{CompilationContext, LintConfig},
     externs::{self, ExternInputs},
     lexer,
-    lint::{LintEvent, apply_lints},
+    lint::apply_lints,
     parser,
     resolve::{
         self, LoadedModule, LocalSourceLoad, LocalSourceRequest, ModuleId, ModuleLoadError,
@@ -24,7 +24,7 @@ use crate::{
         ResolveFailure, SystemPackages,
     },
     source::{SourceId, SourceKind, SourceTable},
-    typecheck::{self, CompileWarning},
+    typecheck,
 };
 pub use crate::{
     config::LintLevelOrigin,
@@ -98,42 +98,83 @@ pub struct FrontendConfig {
     pub context: CompilationContext,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CheckOk {
-    pub report: DiagnosticReport,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckPhase {
+    Lex,
+    Parse,
+    Resolve,
+    Extern,
+    Type,
+}
+
+impl CheckPhase {
+    #[must_use]
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Lex => "Failed to lex program",
+            Self::Parse => "Failed to parse program",
+            Self::Resolve => "Failed to resolve program",
+            Self::Extern => "Failed to ingest extern inputs",
+            Self::Type => "Failed to typecheck program",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckError<E = std::convert::Infallible> {
-    Lex {
-        label: String,
-        report: DiagnosticReport,
-    },
-    Parse {
-        label: String,
-        report: DiagnosticReport,
-    },
-    Resolve {
-        report: DiagnosticReport,
-    },
-    Type {
-        report: DiagnosticReport,
-    },
-    Extern {
-        report: DiagnosticReport,
-    },
-    Source(Box<E>),
+pub enum CheckStatus {
+    Passed,
+    Failed { phase: CheckPhase },
 }
 
-impl<E> CheckError<E> {
-    pub fn report(&self) -> Option<&DiagnosticReport> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckOutput {
+    pub report: DiagnosticReport,
+    pub status: CheckStatus,
+}
+
+impl CheckOutput {
+    #[must_use]
+    pub fn passed(report: DiagnosticReport) -> Self {
+        debug_assert!(!report.has_errors());
+        Self {
+            report,
+            status: CheckStatus::Passed,
+        }
+    }
+
+    #[must_use]
+    pub fn failed(phase: CheckPhase, report: DiagnosticReport) -> Self {
+        debug_assert!(report.has_errors());
+        Self {
+            report,
+            status: CheckStatus::Failed { phase },
+        }
+    }
+
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.report.has_errors()
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> &'static str {
+        match self.status {
+            CheckStatus::Passed => "Program checked successfully",
+            CheckStatus::Failed { phase } => phase.summary(),
+        }
+    }
+}
+
+enum PipelineStop<E> {
+    Diagnostic(CheckOutput),
+    Fatal(E),
+}
+
+impl<E> PipelineStop<E> {
+    fn into_check_result(self) -> Result<CheckOutput, E> {
         match self {
-            Self::Lex { report, .. }
-            | Self::Parse { report, .. }
-            | Self::Resolve { report }
-            | Self::Type { report }
-            | Self::Extern { report } => Some(report),
-            Self::Source(_) => None,
+            Self::Diagnostic(output) => Ok(output),
+            Self::Fatal(error) => Err(error),
         }
     }
 }
@@ -141,20 +182,32 @@ impl<E> CheckError<E> {
 pub fn check_packages<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
-) -> Result<CheckOk, CheckError<L::FatalError>> {
+) -> Result<CheckOutput, L::FatalError> {
     let FrontendConfig {
         externs: extern_inputs,
         lint,
         context,
     } = config;
     let mut sources = SourceTable::default();
-    let root = parse_package_module(&mut sources, input.main, SourceKind::Root, &context)?;
+    let root = match parse_package_module(&mut sources, input.main, SourceKind::Root, &context) {
+        Ok(root) => root,
+        Err(stop) => return stop.into_check_result(),
+    };
 
-    let packages = parse_package_inputs(&mut sources, input.packages, &context)?;
-    let preloaded_modules = parse_package_modules(&mut sources, input.preloaded_modules, &context)?;
+    let packages = match parse_package_inputs(&mut sources, input.packages, &context) {
+        Ok(packages) => packages,
+        Err(stop) => return stop.into_check_result(),
+    };
+    let preloaded_modules =
+        match parse_package_modules(&mut sources, input.preloaded_modules, &context) {
+            Ok(modules) => modules,
+            Err(stop) => return stop.into_check_result(),
+        };
 
-    let mut raw_externs = externs::ingest_providers(extern_inputs)
-        .map_err(|errors| extern_error(&sources, errors))?;
+    let mut raw_externs = match externs::ingest_providers(extern_inputs) {
+        Ok(externs) => externs,
+        Err(errors) => return Ok(extern_failure(&sources, errors)),
+    };
     let external_modules = externs::raw_extern_module_ids(&raw_externs);
 
     let resolved = {
@@ -184,68 +237,64 @@ pub fn check_packages<L: PackageSourceLoader>(
     };
     let resolved = match resolved {
         Ok(resolved) => resolved,
-        Err(ResolveFailure::Fatal(error)) => return Err(error),
+        Err(ResolveFailure::Fatal(stop)) => return stop.into_check_result(),
         Err(ResolveFailure::Resolve(errors)) => {
-            return Err(CheckError::Resolve {
-                report: diagnostic_report(&sources, errors.iter().map(diagnose_resolve_error)),
-            });
+            let report = diagnostic_report(&sources, errors.iter().map(diagnose_resolve_error));
+            return Ok(CheckOutput::failed(CheckPhase::Resolve, report));
         }
     };
 
-    let source_externs = externs::collect_source_externs(&root.program, &resolved)
-        .map_err(|errors| extern_error(&sources, errors))?;
+    let source_externs = match externs::collect_source_externs(&root.program, &resolved) {
+        Ok(externs) => externs,
+        Err(errors) => return Ok(extern_failure(&sources, errors)),
+    };
     raw_externs.append(source_externs);
-    externs::validate_raw_shapes(&raw_externs).map_err(|errors| extern_error(&sources, errors))?;
-    externs::validate_raw_identities(&raw_externs)
-        .map_err(|errors| extern_error(&sources, errors))?;
+    if let Err(errors) = externs::validate_raw_shapes(&raw_externs) {
+        return Ok(extern_failure(&sources, errors));
+    }
+    if let Err(errors) = externs::validate_raw_identities(&raw_externs) {
+        return Ok(extern_failure(&sources, errors));
+    }
 
-    let typecheck_result = typecheck::check_with_modules(
+    let typecheck_output = typecheck::check_with_modules(
         &root.program,
         &resolved,
         raw_externs,
         typecheck::TypecheckConfig { context },
-    )
-    .map_err(|errors| CheckError::Type {
-        report: diagnostic_report(&sources, errors.iter().map(diagnose_type_error)),
-    })?;
+    );
 
-    let (warnings, mut lint_events, facts) = typecheck_result.into_parts();
-    lint_events.extend(facts.unused_import_events());
-    let report = typecheck_report(&sources, &lint, &warnings, lint_events);
-    finish_typecheck_report(report)
+    let report = typecheck_report(&sources, &lint, typecheck_output);
+    Ok(if report.has_errors() {
+        CheckOutput::failed(CheckPhase::Type, report)
+    } else {
+        CheckOutput::passed(report)
+    })
 }
 
-fn finish_typecheck_report<E>(report: DiagnosticReport) -> Result<CheckOk, CheckError<E>> {
-    if report
-        .diagnostics()
-        .iter()
-        .any(|diagnostic| diagnostic.severity() == Severity::Error)
-    {
-        return Err(CheckError::Type { report });
-    }
-    Ok(CheckOk { report })
-}
-
-fn extern_error<E>(sources: &SourceTable, errors: Vec<externs::ExternInputError>) -> CheckError<E> {
-    CheckError::Extern {
-        report: diagnostic_report(
-            sources,
-            errors
-                .into_iter()
-                .map(|error| diagnose_extern_input_error(&error)),
-        ),
-    }
+fn extern_failure(sources: &SourceTable, errors: Vec<externs::ExternInputError>) -> CheckOutput {
+    let report = diagnostic_report(
+        sources,
+        errors
+            .into_iter()
+            .map(|error| diagnose_extern_input_error(&error)),
+    );
+    CheckOutput::failed(CheckPhase::Extern, report)
 }
 
 fn typecheck_report(
     sources: &SourceTable,
     lint: &LintConfig,
-    warnings: &[CompileWarning],
-    lint_events: Vec<LintEvent>,
+    output: typecheck::TypecheckOutput,
 ) -> DiagnosticReport {
-    let diagnostics = warnings
+    let (errors, warnings, mut lint_events, facts) = output.into_parts();
+    if let Some(facts) = facts {
+        // TypecheckFacts are complete only on successful typechecking; skip fact-derived lints otherwise.
+        lint_events.extend(facts.unused_import_events());
+    }
+    let diagnostics = errors
         .iter()
-        .map(diagnose_compile_warning)
+        .map(diagnose_type_error)
+        .chain(warnings.iter().map(diagnose_compile_warning))
         .chain(apply_lints(lint, lint_events));
     diagnostic_report(sources, diagnostics)
 }
@@ -254,17 +303,16 @@ fn diagnostic_report(
     sources: &SourceTable,
     diagnostics: impl IntoIterator<Item = Diagnostic>,
 ) -> DiagnosticReport {
-    DiagnosticReport {
-        sources: sources.clone(),
-        diagnostics: diagnostics.into_iter().collect(),
-    }
+    DiagnosticReport::new(sources.clone(), diagnostics.into_iter().collect()).sorted()
 }
 
 fn parse_package_inputs<E>(
     sources: &mut SourceTable,
     packages: HashMap<PackageId, PackageSourceInput>,
     ctx: &CompilationContext,
-) -> Result<HashMap<PackageId, ResolvePackageInput>, CheckError<E>> {
+) -> Result<HashMap<PackageId, ResolvePackageInput>, PipelineStop<E>> {
+    let mut packages = packages.into_iter().collect::<Vec<_>>();
+    packages.sort_by(|(left, _), (right, _)| left.cmp(right));
     packages
         .into_iter()
         .map(|(id, package)| {
@@ -298,7 +346,7 @@ fn parse_package_module<E>(
     module: PackageModuleInput,
     kind: SourceKind,
     ctx: &CompilationContext,
-) -> Result<LoadedModule, CheckError<E>> {
+) -> Result<LoadedModule, PipelineStop<E>> {
     let parsed = parse_source(sources, &module.source, kind, ctx)?;
     Ok(LoadedModule {
         module: module.module,
@@ -311,7 +359,7 @@ fn parse_package_modules<E>(
     sources: &mut SourceTable,
     modules: Vec<PackageModuleInput>,
     ctx: &CompilationContext,
-) -> Result<Vec<PreloadedModule>, CheckError<E>> {
+) -> Result<Vec<PreloadedModule>, PipelineStop<E>> {
     modules
         .into_iter()
         .map(|module| {
@@ -335,34 +383,50 @@ fn parse_source<E>(
     source: &Source,
     kind: SourceKind,
     ctx: &CompilationContext,
-) -> Result<ParsedSource, CheckError<E>> {
+) -> Result<ParsedSource, PipelineStop<E>> {
     let source_id = register_module_source(sources, source, kind);
-    let code = conditional::filter_with_context(&source.code, ctx).map_err(|errors| {
-        CheckError::Parse {
-            label: source.label.clone(),
-            report: diagnostic_report(
+    let code = match conditional::filter_with_context(&source.code, ctx) {
+        Ok(code) => code,
+        Err(errors) => {
+            let report = diagnostic_report(
                 sources,
                 errors
                     .iter()
                     .map(|error| diagnose_conditional_error(source_id, error)),
-            ),
+            );
+            return Err(PipelineStop::Diagnostic(CheckOutput::failed(
+                CheckPhase::Parse,
+                report,
+            )));
         }
-    })?;
+    };
 
-    let tokens = lexer::tokenize(source_id, &code).map_err(|errors| CheckError::Lex {
-        label: source.label.clone(),
-        report: diagnostic_report(
-            sources,
-            errors
-                .iter()
-                .map(|error| diagnose_lex_error(source_id, source.code.len(), error)),
-        ),
-    })?;
+    let tokens = match lexer::tokenize(source_id, &code) {
+        Ok(tokens) => tokens,
+        Err(errors) => {
+            let report = diagnostic_report(
+                sources,
+                errors
+                    .iter()
+                    .map(|error| diagnose_lex_error(source_id, source.code.len(), error)),
+            );
+            return Err(PipelineStop::Diagnostic(CheckOutput::failed(
+                CheckPhase::Lex,
+                report,
+            )));
+        }
+    };
 
-    let program = parser::parse_ast(&tokens).map_err(|errors| CheckError::Parse {
-        label: source.label.clone(),
-        report: diagnostic_report(sources, errors.iter().map(diagnose_parse_error)),
-    })?;
+    let program = match parser::parse_ast(&tokens) {
+        Ok(program) => program,
+        Err(errors) => {
+            let report = diagnostic_report(sources, errors.iter().map(diagnose_parse_error));
+            return Err(PipelineStop::Diagnostic(CheckOutput::failed(
+                CheckPhase::Parse,
+                report,
+            )));
+        }
+    };
     Ok(ParsedSource {
         id: source_id,
         program,
@@ -406,7 +470,7 @@ impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
     fn parse_loaded(
         &mut self,
         module: PackageModuleInput,
-    ) -> Result<LoadedModule, ModuleLoadError<CheckError<L::FatalError>>> {
+    ) -> Result<LoadedModule, ModuleLoadError<PipelineStop<L::FatalError>>> {
         if let Some(loaded) = self.parsed.get(&module.module) {
             return Ok(loaded.clone());
         }
@@ -420,17 +484,15 @@ impl<'a, L: PackageSourceLoader> InputModuleLoader<'a, L> {
     }
 }
 
-fn module_load_error<E>(error: SourceLoadError<E>) -> ModuleLoadError<CheckError<E>> {
+fn module_load_error<E>(error: SourceLoadError<E>) -> ModuleLoadError<PipelineStop<E>> {
     match error {
         SourceLoadError::LoadFailed(message) => ModuleLoadError::LoadFailed(message),
-        SourceLoadError::Fatal(error) => {
-            ModuleLoadError::Fatal(CheckError::Source(Box::new(error)))
-        }
+        SourceLoadError::Fatal(error) => ModuleLoadError::Fatal(PipelineStop::Fatal(error)),
     }
 }
 
 impl<L: PackageSourceLoader> ModuleLoader for InputModuleLoader<'_, L> {
-    type FatalError = CheckError<L::FatalError>;
+    type FatalError = PipelineStop<L::FatalError>;
 
     fn load(
         &mut self,
@@ -464,12 +526,12 @@ impl<L: PackageSourceLoader> ModuleLoader for InputModuleLoader<'_, L> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, convert::Infallible};
 
     use super::{
-        CheckError, CheckOk, Diagnostic, DiagnosticReport, FrontendConfig, PackageModuleInput,
-        PackageProgramInput, PackageSourceInput, PackageSourceLoader, Source, SourceLoadError,
-        check_packages as pipeline_check,
+        CheckOutput, CheckPhase, CheckStatus, Diagnostic, DiagnosticReport, FrontendConfig,
+        PackageModuleInput, PackageProgramInput, PackageSourceInput, PackageSourceLoader, Source,
+        SourceLoadError, check_packages as pipeline_check,
     };
     use crate::{
         externs::{ExternInputs, PackageExternInputs},
@@ -664,11 +726,11 @@ mod tests {
 
     fn check<L: PackageSourceLoader>(
         input: PackageProgramInput<'_, L>,
-    ) -> Result<CheckOk, CheckError<L::FatalError>> {
+    ) -> Result<CheckOutput, L::FatalError> {
         pipeline_check(input, FrontendConfig::default())
     }
 
-    fn check_source(source_code: &str) -> Result<CheckOk, CheckError> {
+    fn check_source(source_code: &str) -> Result<CheckOutput, Infallible> {
         let mut loader = TestLoader::default();
         check(input(
             &mut loader,
@@ -681,7 +743,7 @@ mod tests {
     #[test]
     fn accepts_valid_provider_descriptors() {
         let mut loader = TestLoader::default();
-        pipeline_check(
+        let output = pipeline_check(
             input(
                 &mut loader,
                 source("fn main() {}", "main.anv"),
@@ -694,6 +756,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -711,15 +774,15 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Resolve { .. }));
+        assert_failed(&err, CheckPhase::Resolve);
     }
 
     #[test]
     fn ext_import_resolves_provider_module() {
         let mut loader = TestLoader::default();
-        pipeline_check(
+        let output = pipeline_check(
             input(
                 &mut loader,
                 source(
@@ -735,6 +798,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -742,7 +806,7 @@ mod tests {
         let game = PackageId::new("game");
         let host = PackageId::new("host");
         let mut loader = TestLoader::default();
-        pipeline_check(
+        let output = pipeline_check(
             PackageProgramInput {
                 root_package: game.clone(),
                 main: root_source(
@@ -771,6 +835,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -802,9 +867,9 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Resolve { .. }));
+        assert_failed(&err, CheckPhase::Resolve);
     }
 
     #[test]
@@ -840,9 +905,9 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Type { .. }));
+        assert_failed(&err, CheckPhase::Type);
     }
 
     #[test]
@@ -850,7 +915,7 @@ mod tests {
         let game = PackageId::new("game");
         let math = PackageId::new("math");
         let mut loader = TestLoader::default();
-        pipeline_check(
+        let output = pipeline_check(
             PackageProgramInput {
                 root_package: game.clone(),
                 main: root_source(
@@ -882,6 +947,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -889,7 +955,7 @@ mod tests {
         let game = PackageId::new("game");
         let math = PackageId::new("math");
         let mut loader = TestLoader::default();
-        pipeline_check(
+        let output = pipeline_check(
             PackageProgramInput {
                 root_package: game.clone(),
                 main: root_source(
@@ -921,6 +987,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -938,9 +1005,9 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Resolve { .. }));
+        assert_failed(&err, CheckPhase::Resolve);
     }
 
     #[test]
@@ -959,13 +1026,13 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Resolve { .. }));
+        assert_failed(&err, CheckPhase::Resolve);
     }
 
     #[test]
-    fn invalid_provider_descriptor_is_extern_error() {
+    fn invalid_provider_descriptor_is_extern_failure() {
         let mut loader = TestLoader::default();
         let err = pipeline_check(
             input(
@@ -979,11 +1046,9 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        let CheckError::Extern { report } = err else {
-            panic!("expected extern error");
-        };
+        let report = assert_failed(&err, CheckPhase::Extern);
         assert_eq!(
             diagnostic_messages(report.diagnostics()),
             [
@@ -1009,11 +1074,9 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        let CheckError::Extern { report } = err else {
-            panic!("expected extern error");
-        };
+        let report = assert_failed(&err, CheckPhase::Extern);
         assert_eq!(
             diagnostic_messages(report.diagnostics()),
             [
@@ -1024,16 +1087,16 @@ mod tests {
 
     #[test]
     fn new_source_extern_parser_errors_take_precedence() {
-        let err = check_source("extern type T { computed let x: int; } fn main() {}").unwrap_err();
+        let err = check_source("extern type T { computed let x: int; } fn main() {}").unwrap();
 
-        assert!(matches!(err, CheckError::Parse { .. }));
+        assert_failed(&err, CheckPhase::Parse);
     }
 
     #[test]
     fn invalid_unary_operand_is_parse_error() {
-        let err = check_source("extern type T { op -int -> int; }").unwrap_err();
+        let err = check_source("extern type T { op -int -> int; }").unwrap();
 
-        assert!(matches!(err, CheckError::Parse { .. }));
+        assert_failed(&err, CheckPhase::Parse);
     }
 
     #[test]
@@ -1046,9 +1109,9 @@ mod tests {
                 ..FrontendConfig::default()
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Parse { .. }));
+        assert_failed(&err, CheckPhase::Parse);
     }
 
     fn valid_provider_descriptor() -> anvyx_externs::ProviderDescriptor {
@@ -1093,6 +1156,17 @@ mod tests {
         assert!(!diagnostics.is_empty());
     }
 
+    fn assert_passed(output: &CheckOutput) {
+        assert_eq!(output.status, CheckStatus::Passed);
+        assert!(!output.has_errors());
+    }
+
+    fn assert_failed(output: &CheckOutput, phase: CheckPhase) -> &DiagnosticReport {
+        assert_eq!(output.status, CheckStatus::Failed { phase });
+        assert!(output.has_errors());
+        &output.report
+    }
+
     fn assert_primary_label(report: &DiagnosticReport) {
         let file = report.sources.iter().next().expect("expected source");
         let label = &report.diagnostics()[0].labels()[0];
@@ -1112,20 +1186,16 @@ mod tests {
 
     #[test]
     fn renders_lex_errors_through_check() {
-        let err = check_source("fn main() { \"unterminated }").unwrap_err();
-        let CheckError::Lex { report, .. } = err else {
-            panic!("expected lex error");
-        };
+        let err = check_source("fn main() { \"unterminated }").unwrap();
+        let report = assert_failed(&err, CheckPhase::Lex);
         assert_user_diagnostics(report.diagnostics());
         assert_primary_label(&report);
     }
 
     #[test]
     fn lex_error_report_carries_registered_source() {
-        let err = check_source("fn main() { \"unterminated }").unwrap_err();
-        let CheckError::Lex { report, .. } = err else {
-            panic!("expected lex error");
-        };
+        let err = check_source("fn main() { \"unterminated }").unwrap();
+        let report = assert_failed(&err, CheckPhase::Lex);
         let file = report.sources.iter().next().expect("expected source");
 
         assert_eq!(report.sources.len(), 1);
@@ -1135,10 +1205,8 @@ mod tests {
 
     #[test]
     fn renders_parse_errors_through_check() {
-        let err = check_source("fn main( {}").unwrap_err();
-        let CheckError::Parse { report, .. } = err else {
-            panic!("expected parse error");
-        };
+        let err = check_source("fn main( {}").unwrap();
+        let report = assert_failed(&err, CheckPhase::Parse);
         assert_user_diagnostics(report.diagnostics());
         assert_primary_label(&report);
     }
@@ -1146,10 +1214,8 @@ mod tests {
     #[test]
     fn conditional_errors_have_source_labels() {
         let source = "#if platform(macos)\n#end\nfn main() {}";
-        let err = check_source(source).unwrap_err();
-        let CheckError::Parse { report, .. } = err else {
-            panic!("expected parse error");
-        };
+        let err = check_source(source).unwrap();
+        let report = assert_failed(&err, CheckPhase::Parse);
         let label = report.diagnostics()[0].primary_label().unwrap();
 
         assert_eq!(
@@ -1163,11 +1229,9 @@ mod tests {
     #[test]
     fn eof_parse_error_uses_empty_eof_label() {
         let source = "fn";
-        let err = check_source(source).unwrap_err();
-        let CheckError::Parse { report, .. } = err else {
-            panic!("expected parse error");
-        };
-        assert_primary_label(&report);
+        let err = check_source(source).unwrap();
+        let report = assert_failed(&err, CheckPhase::Parse);
+        assert_primary_label(report);
         let label = &report.diagnostics()[0].labels()[0];
         assert_eq!(label.span.start(), source.len());
         assert_eq!(label.span.end(), source.len());
@@ -1175,10 +1239,8 @@ mod tests {
 
     #[test]
     fn renders_resolve_errors_through_check() {
-        let err = check_source("import missing as m; fn main() {} ").unwrap_err();
-        let CheckError::Resolve { report } = err else {
-            panic!("expected resolve error");
-        };
+        let err = check_source("import missing as m; fn main() {} ").unwrap();
+        let report = assert_failed(&err, CheckPhase::Resolve);
         assert!(
             report.diagnostics()[0]
                 .message()
@@ -1190,10 +1252,8 @@ mod tests {
 
     #[test]
     fn renders_type_errors_through_check() {
-        let err = check_source("fn main() { let x: int = true; } ").unwrap_err();
-        let CheckError::Type { report } = err else {
-            panic!("expected type error");
-        };
+        let err = check_source("fn main() { let x: int = true; } ").unwrap();
+        let report = assert_failed(&err, CheckPhase::Type);
         assert_eq!(report.diagnostics()[0].message(), "mismatched types");
         assert_user_diagnostics(report.diagnostics());
         assert_primary_label(&report);
@@ -1202,16 +1262,69 @@ mod tests {
 
     #[test]
     fn missing_method_through_check_has_no_call_cascade() {
-        let err = check_source("fn main() { 1.foo(); }").unwrap_err();
-        let CheckError::Type { report } = err else {
-            panic!("expected type error");
-        };
+        let err = check_source("fn main() { 1.foo(); }").unwrap();
+        let report = assert_failed(&err, CheckPhase::Type);
         let diagnostics = report.diagnostics();
         assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
         assert_eq!(
             diagnostics[0].message(),
             "Unknown method 'foo' for type 'int'"
         );
+    }
+
+    #[test]
+    fn poisoned_chain_through_check_has_no_cascade() {
+        let err = check_source("fn main() { let x: int = missing.foo(1).bar; }").unwrap();
+        let report = assert_failed(&err, CheckPhase::Type);
+        let diagnostics = report.diagnostics();
+
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert_eq!(diagnostics[0].message(), "unknown variable");
+    }
+
+    #[test]
+    fn poisoned_compound_expression_has_no_mismatch_cascade() {
+        let err = check_source("fn main() { let x: int = [missing]; }").unwrap();
+        let report = assert_failed(&err, CheckPhase::Type);
+        let diagnostics = report.diagnostics();
+
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert_eq!(diagnostics[0].message(), "unknown variable");
+    }
+
+    #[test]
+    fn poisoned_compound_receiver_has_no_member_cascade() {
+        let err = check_source("fn main() { [missing].foo(); }").unwrap();
+        let report = assert_failed(&err, CheckPhase::Type);
+        let diagnostics = report.diagnostics();
+
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert_eq!(diagnostics[0].message(), "unknown variable");
+    }
+
+    #[test]
+    fn poisoned_tuple_index_target_has_no_cascade() {
+        let err = check_source("fn main() { let x: int = (missing).0; }").unwrap();
+        let report = assert_failed(&err, CheckPhase::Type);
+        let diagnostics = report.diagnostics();
+
+        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert_eq!(diagnostics[0].message(), "unknown variable");
+    }
+
+    #[test]
+    fn poisoned_operator_operand_has_no_cascade() {
+        for source in [
+            "fn main() { let x: int = missing + 1; }",
+            "fn main() { let x: int = -missing; }",
+        ] {
+            let err = check_source(source).unwrap();
+            let report = assert_failed(&err, CheckPhase::Type);
+            let diagnostics = report.diagnostics();
+
+            assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+            assert_eq!(diagnostics[0].message(), "unknown variable");
+        }
     }
 
     #[test]
@@ -1229,6 +1342,7 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&ok);
 
         assert_eq!(ok.report.sources.len(), 3);
         assert!(
@@ -1264,6 +1378,7 @@ mod tests {
             vec![],
         ))
         .unwrap();
+        assert_passed(&ok);
         let labels = ok
             .report
             .sources
@@ -1279,19 +1394,20 @@ mod tests {
     #[test]
     fn prelude_declarations_are_visible() {
         let mut loader = TestLoader::default();
-        check(input(
+        let output = check(input(
             &mut loader,
             source("fn main() { let x: int = prelude_value(); }", "main.anv"),
             Some(source("pub fn prelude_value() -> int { 1 }", "<prelude>")),
             vec![],
         ))
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
     fn core_root_reexported_extend_is_visible_without_import() {
         let mut loader = TestLoader::default();
-        check(input(
+        let output = check(input(
             &mut loader,
             source("fn main() { let x: int = 1.plus_one(); }", "main.anv"),
             Some(source("pub import core_int { * };", "<core>")),
@@ -1301,6 +1417,7 @@ mod tests {
             )],
         ))
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1318,8 +1435,8 @@ mod tests {
                 "pub extend int { fn plus_one(self) -> int { self + 1 } }",
             )],
         ))
-        .unwrap_err();
-        assert!(matches!(err, CheckError::Type { .. }));
+        .unwrap();
+        assert_failed(&err, CheckPhase::Type);
     }
 
     #[test]
@@ -1331,10 +1448,8 @@ mod tests {
             None,
             vec![module(&["core_int"], ""), module(&["core_int"], "")],
         ))
-        .unwrap_err();
-        let CheckError::Resolve { report } = err else {
-            panic!("expected resolve error");
-        };
+        .unwrap();
+        let report = assert_failed(&err, CheckPhase::Resolve);
         assert_eq!(
             diagnostic_messages(report.diagnostics()),
             ["module 'core_int' is preloaded more than once"]
@@ -1354,8 +1469,8 @@ mod tests {
                 "pub extend int { fn plus_one(self) -> int { self + 1 } }",
             )],
         ))
-        .unwrap_err();
-        assert!(matches!(err, CheckError::Type { .. }));
+        .unwrap();
+        assert_failed(&err, CheckPhase::Type);
     }
 
     #[test]
@@ -1367,8 +1482,8 @@ mod tests {
             None,
             vec![module(&["helpers"], "pub fn hidden() -> int { 1 }")],
         ))
-        .unwrap_err();
-        assert!(matches!(err, CheckError::Type { .. }));
+        .unwrap();
+        assert_failed(&err, CheckPhase::Type);
     }
 
     #[test]
@@ -1377,7 +1492,7 @@ mod tests {
         let math = PackageId::new("math");
         let mut loader = TestLoader::default();
 
-        check(PackageProgramInput {
+        let output = check(PackageProgramInput {
             root_package: game.clone(),
             main: root_source(
                 &game,
@@ -1399,18 +1514,20 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
     fn private_core_root_declarations_are_preluded() {
         let mut loader = TestLoader::default();
-        check(input(
+        let output = check(input(
             &mut loader,
             source("fn main() { let x: Option<int> = nil; }", "main.anv"),
             Some(source("enum Option<T> { Some(T), None }", "<core>")),
             vec![],
         ))
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1434,9 +1551,9 @@ mod tests {
             preloaded_modules: vec![],
             source_loader: &mut loader,
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Type { .. }));
+        assert_failed(&err, CheckPhase::Type);
     }
 
     #[test]
@@ -1467,9 +1584,9 @@ mod tests {
             preloaded_modules: vec![],
             source_loader: &mut loader,
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, CheckError::Type { .. }));
+        assert_failed(&err, CheckPhase::Type);
     }
 
     #[test]
@@ -1479,7 +1596,7 @@ mod tests {
         let mut loader = TestLoader::default();
         loader.package_source(&physics, &["types"], "pub struct Vec2 {}");
 
-        check(PackageProgramInput {
+        let output = check(PackageProgramInput {
             root_package: game.clone(),
             main: root_source(&game, "import pkg:physics.types { Vec2 };", "main.anv"),
             system: SystemPackages::default(),
@@ -1497,6 +1614,7 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1505,7 +1623,7 @@ mod tests {
         let native = PackageId::new("native");
         let mut loader = TestLoader::default();
 
-        check(PackageProgramInput {
+        let output = check(PackageProgramInput {
             root_package: game.clone(),
             main: root_source(
                 &game,
@@ -1527,6 +1645,7 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1536,7 +1655,7 @@ mod tests {
         let mut loader = TestLoader::default();
         loader.package_source(&native, &["host"], "pub extern fn tick() -> int;");
 
-        check(PackageProgramInput {
+        let output = check(PackageProgramInput {
             root_package: game.clone(),
             main: root_source(
                 &game,
@@ -1558,6 +1677,7 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1571,7 +1691,7 @@ mod tests {
             "pub struct Vec2 {} pub fn make() -> Vec2 { Vec2 {} }",
         );
 
-        check(PackageProgramInput {
+        let output = check(PackageProgramInput {
             root_package: game.clone(),
             main: root_source(
                 &game,
@@ -1590,6 +1710,7 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1599,7 +1720,7 @@ mod tests {
         let mut loader = TestLoader::default();
         loader.package_source(&std, &["math"], "pub const PI: int = 3;");
 
-        check(PackageProgramInput {
+        let output = check(PackageProgramInput {
             root_package: game.clone(),
             main: root_source(
                 &game,
@@ -1618,6 +1739,7 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1627,7 +1749,7 @@ mod tests {
         let mut loader = TestLoader::default();
         loader.package_source(&std, &["math"], "pub const PI: int = 3;");
 
-        check(PackageProgramInput {
+        let output = check(PackageProgramInput {
             root_package: game.clone(),
             main: root_source(
                 &game,
@@ -1646,6 +1768,7 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
     }
 
     #[test]
@@ -1660,10 +1783,12 @@ mod tests {
             None,
             vec![],
         ))
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            matches!(err, CheckError::Resolve { report } if report.diagnostics()[0].message() == "import root 'std' is not supported yet")
+        let report = assert_failed(&err, CheckPhase::Resolve);
+        assert_eq!(
+            report.diagnostics()[0].message(),
+            "import root 'std' is not supported yet"
         );
     }
 
@@ -1677,8 +1802,14 @@ mod tests {
             None,
             vec![],
         ))
-        .unwrap_err();
-        assert!(matches!(err, CheckError::Parse { label, .. } if label == "broken"));
+        .unwrap();
+        let report = assert_failed(&err, CheckPhase::Parse);
+        assert!(
+            report
+                .sources
+                .iter()
+                .any(|source| source.label() == "broken")
+        );
     }
 
     #[test]
@@ -1691,8 +1822,14 @@ mod tests {
             None,
             vec![],
         ))
-        .unwrap_err();
-        assert!(matches!(err, CheckError::Lex { label, .. } if label == "broken"));
+        .unwrap();
+        let report = assert_failed(&err, CheckPhase::Lex);
+        assert!(
+            report
+                .sources
+                .iter()
+                .any(|source| source.label() == "broken")
+        );
     }
 
     #[test]
@@ -1705,10 +1842,8 @@ mod tests {
             None,
             vec![],
         ))
-        .unwrap_err();
-        let CheckError::Resolve { report } = err else {
-            panic!("expected resolve error");
-        };
+        .unwrap();
+        let report = assert_failed(&err, CheckPhase::Resolve);
         assert_eq!(
             diagnostic_messages(report.diagnostics()),
             ["Cannot load module 'broken': disk error"]

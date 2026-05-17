@@ -22,9 +22,6 @@ module.exports = grammar({
     [$._expression, $.lambda_expression],
     [$._pattern],
     [$.defer_statement, $._expression],
-    [$.optional_type, $.function_type],
-    [$._extern_member],
-    [$._extern_member, $.type_identifier],
     [$.field_initializer, $.struct_pattern],
     [$.field_initializer, $.enum_pattern],
     [$.field_initializer, $.inferred_enum_pattern],
@@ -43,6 +40,8 @@ module.exports = grammar({
       $.extend_block,
       $.import_statement,
       $.extern_declaration,
+      $.contract_definition,
+      $.type_alias_definition,
       $.const_declaration,
       $.global_declaration,
     ),
@@ -137,7 +136,8 @@ module.exports = grammar({
     type_parameter: $ => $.identifier,
     const_parameter: $ => seq($.identifier, ':', 'int'),
 
-    parameter_list: $ => seq('(', commaSep($.parameter), ')'),
+    parameter_list: $ => seq('(', commaSep(choice($.method_receiver, $.parameter)), ')'),
+    method_receiver: $ => seq(optional('var'), 'self'),
     parameter: $ => seq(
       optional('var'),
       field('name', $.identifier),
@@ -146,7 +146,7 @@ module.exports = grammar({
       $._type,
       optional(seq('=', $._expression)),
     ),
-    return_type: $ => seq('->', $._type),
+    return_type: $ => prec.right(seq('->', optional('var'), $._type)),
 
     // struct definition
     struct_definition: $ => seq(
@@ -163,11 +163,15 @@ module.exports = grammar({
       repeat($.doc_comment),
       repeat($.annotation),
       optional($.visibility_modifier),
+      optional('embed'),
       field('name', $.identifier),
       ':',
       $._type,
+      optional($.embed_selector),
       optional(seq('=', $._expression)),
     ),
+    embed_selector: $ => seq('{', commaSep1($.embed_selector_item), '}'),
+    embed_selector_item: $ => seq(optional('fn'), $.identifier, optional(seq('as', $.identifier))),
 
     // enum definition
     enum_definition: $ => seq(
@@ -190,6 +194,30 @@ module.exports = grammar({
       )),
     ),
 
+    // contract definition
+    contract_definition: $ => seq(
+      repeat($.annotation),
+      repeat($.doc_comment),
+      optional($.visibility_modifier),
+      'contract',
+      field('name', $.identifier),
+      optional($.type_parameters),
+      '{',
+      repeat($.contract_requirement),
+      '}',
+    ),
+    contract_requirement: $ => choice(
+      seq($.contract_ref, ';'),
+      seq(repeat($.doc_comment), 'fn', field('name', $.identifier), $.parameter_list, optional($.return_type), ';'),
+    ),
+    contract_ref: $ => prec.left(sep1($.contract_ref_item, '+')),
+    contract_ref_item: $ => prec.left(sep1($.identifier, '.')),
+
+    type_alias_definition: $ => seq(
+      optional($.visibility_modifier),
+      'type', field('name', $.identifier), optional($.type_parameters), '=', $._type, ';',
+    ),
+
     // extend block
     extend_block: $ => seq(
       optional($.visibility_modifier),
@@ -201,7 +229,7 @@ module.exports = grammar({
       '}',
     ),
     cast_from_declaration: $ => seq(
-      'fn', 'from', $.parameter_list, optional($.return_type), $.block,
+      'cast', 'from', $.parameter_list, $.return_type, $.block,
     ),
 
     // import statement
@@ -222,20 +250,33 @@ module.exports = grammar({
     extern_declaration: $ => seq(
       repeat($.annotation),
       repeat($.doc_comment),
+      optional($.visibility_modifier),
       'extern',
       choice(
         seq('fn', field('name', $.identifier), $.parameter_list, optional($.return_type), ';'),
-        seq('type', field('name', $.identifier), choice(
+        seq('type', field('name', $.identifier), optional($.extern_representation), choice(
           seq('{', repeat($._extern_member), '}'),
           ';',
         )),
       ),
     ),
-    _extern_member: $ => seq(
-      choice($.identifier, 'fn', 'op'),
-      repeat(choice($.identifier, $._type, $.parameter_list, '->', ';', '=')),
-      ';',
+    extern_representation: $ => seq('rep', choice('shared', 'inline')),
+    _extern_member: $ => choice(
+      $.extern_field,
+      $.extern_init,
+      $.extern_method,
+      $.extern_operator,
     ),
+    extern_field: $ => seq(optional('computed'), field('name', $.identifier), ':', $._type, ';'),
+    extern_init: $ => seq('init', optional($.extern_init_parameter_list), ';'),
+    extern_init_parameter_list: $ => seq('(', commaSep($.parameter), ')'),
+    extern_method: $ => seq('fn', field('name', $.identifier), $.extern_parameter_list, optional($.return_type), ';'),
+    extern_parameter_list: $ => seq('(', commaSep($.extern_parameter), ')'),
+    extern_parameter: $ => choice(seq('shared', 'self'), seq(optional('var'), 'self'), $.parameter),
+    extern_operator: $ => seq('op', choice(
+      seq($._type, choice('+', '-', '*', '/', '%', '==', '!=', '<', '<=', '>', '>='), $._type),
+      seq('-', $._type),
+    ), $.return_type, ';'),
 
     // const declaration
     const_declaration: $ => seq(
@@ -295,7 +336,9 @@ module.exports = grammar({
 
     for_expression: $ => seq(
       'for', $._pattern, 'in',
+      optional('rev'),
       $._expression,
+      optional(seq('step', $._expression)),
       $.block,
     ),
 
@@ -325,6 +368,7 @@ module.exports = grammar({
       'true',
       'false',
       'nil',
+      $.try_expression,
       $.unary_expression,
       $.binary_expression,
       $.call_expression,
@@ -350,6 +394,7 @@ module.exports = grammar({
 
     self_expression: $ => 'self',
 
+    try_expression: $ => prec.right(14, seq('try', $._expression)),
     unary_expression: $ => prec.left(14, seq(choice('-', '!', '~'), $._expression)),
 
     binary_expression: $ => {
@@ -381,20 +426,21 @@ module.exports = grammar({
       $._expression, '?', $._expression, ':', $._expression,
     )),
 
-    cast_expression: $ => prec.left(13, seq($._expression, 'as', $._type)),
+    cast_expression: $ => prec.left(13, seq($._expression, choice('as', 'as?'), $._type)),
 
     call_expression: $ => prec.left(16, seq(
       field('function', $._expression),
-      $.argument_list,
+      choice($.argument_list, $.optional_argument_list),
     )),
     argument_list: $ => seq('(', commaSep($._expression), ')'),
+    optional_argument_list: $ => seq('?(', commaSep($._expression), ')'),
 
     field_expression: $ => prec.left(16, seq(
-      $._expression, '.', field('field', $.identifier),
+      $._expression, choice('.', '?.'), field('field', $.identifier),
     )),
 
     index_expression: $ => prec.left(16, seq(
-      $._expression, '[', $._expression, ']',
+      $._expression, choice(seq('[', $._expression, ']'), seq('?[', $._expression, ']')),
     )),
 
     range_expression: $ => prec.left(10, seq(
@@ -468,6 +514,7 @@ module.exports = grammar({
       $.generic_type,
       $.optional_type,
       $.function_type,
+      $.dynamic_type,
       $.array_type,
       $.list_type,
       $.map_type,
@@ -479,9 +526,10 @@ module.exports = grammar({
     type_identifier: $ => $.identifier,
     generic_type: $ => prec(1, seq($.identifier, '<', commaSep1($._type), '>')),
     optional_type: $ => prec.left(seq($._type, '?')),
-    function_type: $ => seq(
-      'fn', '(', commaSep(seq(optional('var'), $._type)), ')', '->', $._type,
-    ),
+    function_type: $ => prec.right(seq(
+      'fn', '(', commaSep(seq(optional('var'), optional('escaping'), $._type)), ')', optional($.return_type),
+    )),
+    dynamic_type: $ => seq('dyn', choice('_', $.contract_ref)),
     array_type: $ => seq(
       '[', $._type, ';', choice($.integer_literal, $.identifier, '_'), ']',
     ),

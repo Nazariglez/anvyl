@@ -1,0 +1,17 @@
+// @frontend: new
+// @mode: check
+// @expect: error
+// @contains: Cannot assign to immutable value
+// @contains: expected `int`, found `string`
+// @contains: exported function uses inferred dynamic contract
+// @contains: public_inferred_dyn_contract
+
+fn main() {
+    println("ok");
+    let a: int = 10;
+    a = "hola";
+}
+
+pub fn add(a: dyn _) {
+    a.hello();
+}

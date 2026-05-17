@@ -178,6 +178,21 @@ enum Ty {
 }
 
 impl Ty {
+    fn contains_error(&self) -> bool {
+        match self {
+            Self::Error => true,
+            Self::Func { params, ret } => {
+                params.iter().any(|param| param.ty.contains_error()) || ret.ty.contains_error()
+            }
+            Self::Tuple(elems) => elems.iter().any(Self::contains_error),
+            Self::Nominal(nominal) => nominal.type_args.iter().any(Self::contains_error),
+            Self::List { elem } | Self::Slice { elem } => elem.contains_error(),
+            Self::Array { elem, .. } => elem.contains_error(),
+            Self::Map { key, value } => key.contains_error() || value.contains_error(),
+            _ => false,
+        }
+    }
+
     fn from_recovery_types(types: &[Type]) -> Vec<Self> {
         types.iter().map(Self::from_recovery_type).collect()
     }
@@ -857,7 +872,7 @@ impl Solver {
         self.temp_handle(ty)
     }
 
-    pub(super) fn error_expr_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle {
+    pub(super) fn poison_expr_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle {
         self.set_expr_handle(id, span, Ty::Error)
     }
 
@@ -879,6 +894,10 @@ impl Solver {
 
     pub(super) fn handle_to_type(&self, handle: &TypeHandle) -> Type {
         self.type_for_storage(&self.resolve_ref(&handle.0))
+    }
+
+    pub(super) fn handle_is_poison(&self, handle: &TypeHandle) -> bool {
+        self.resolve_ref(&handle.0).contains_error()
     }
 
     pub(super) fn handle_to_partial_type(&self, handle: &TypeHandle) -> Type {

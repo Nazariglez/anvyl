@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::{
     BindingPromotionMap, CompileWarning, ImportId, ImportRecord, LambdaCaptureMap, LambdaEscapeMap,
-    ModuleScope, semantic_use::map_delta,
+    ModuleScope, TypeError, semantic_use::map_delta,
 };
 use crate::{
     ast::Visibility,
@@ -11,28 +11,51 @@ use crate::{
     resolve::PackageId,
 };
 
-pub struct TypecheckResult {
+pub struct TypecheckOutput {
+    errors: Vec<TypeError>,
     warnings: Vec<CompileWarning>,
     lint_events: Vec<LintEvent>,
-    facts: TypecheckFacts,
+    facts: Option<TypecheckFacts>,
 }
 
-impl TypecheckResult {
-    pub(crate) fn new(
+impl TypecheckOutput {
+    pub(crate) fn success(
         warnings: Vec<CompileWarning>,
         lint_events: Vec<LintEvent>,
         facts: TypecheckFacts,
     ) -> Self {
         facts.validate();
         Self {
+            errors: vec![],
             warnings,
             lint_events,
-            facts,
+            facts: Some(facts),
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<CompileWarning>, Vec<LintEvent>, TypecheckFacts) {
-        (self.warnings, self.lint_events, self.facts)
+    pub(crate) fn failed(
+        errors: Vec<TypeError>,
+        warnings: Vec<CompileWarning>,
+        lint_events: Vec<LintEvent>,
+    ) -> Self {
+        debug_assert!(!errors.is_empty());
+        Self {
+            errors,
+            warnings,
+            lint_events,
+            facts: None,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<TypeError>,
+        Vec<CompileWarning>,
+        Vec<LintEvent>,
+        Option<TypecheckFacts>,
+    ) {
+        (self.errors, self.warnings, self.lint_events, self.facts)
     }
 }
 

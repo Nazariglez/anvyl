@@ -7,10 +7,10 @@ use std::{
 
 use anvyx_lang::{CompilationContext, LintConfig, Profile, TargetArch, TargetOs};
 use anvyx_lang2::{
-    CheckError as FrontendCheckError, CompilationContext as FrontendCompilationContext, Diagnostic,
-    DiagnosticLabel, DiagnosticProjection, DiagnosticReport, DiagnosticSeverity, DiagnosticTag,
-    FrontendConfig, LineCol, LintConfig as FrontendLintConfig, Profile as FrontendProfile,
-    SourceFile, TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs, implemented_lints,
+    CompilationContext as FrontendCompilationContext, Diagnostic, DiagnosticLabel,
+    DiagnosticProjection, DiagnosticReport, DiagnosticSeverity, DiagnosticTag, FrontendConfig,
+    LineCol, LintConfig as FrontendLintConfig, Profile as FrontendProfile, SourceFile,
+    TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs, implemented_lints,
     render_rich_report_with_overrides,
 };
 use clap::ValueEnum;
@@ -73,19 +73,36 @@ pub fn new_frontend_cmd(
     format: CheckOutputFormat,
     warnings_are_errors: bool,
 ) -> Result<(), String> {
-    let result = anvyx_project::check::check_path(file, new_frontend_config(lint, ctx))?;
+    let output = match anvyx_project::check::check_path(file, new_frontend_config(lint, ctx)) {
+        Ok(output) => output,
+        Err(error) => return emit_host_error(error, format),
+    };
+    emit_check_output(&output, format, warnings_are_errors)
+}
 
-    match result {
-        Ok(ok) => emit_final_report(&ok.report, format, warnings_are_errors),
-        Err(error) => {
-            emit_error_report(&error, format, warnings_are_errors)?;
-            if error.report().is_some() {
-                Err(error.summary())
-            } else {
-                Err(error.to_string())
-            }
-        }
+fn emit_host_error(error: String, format: CheckOutputFormat) -> Result<(), String> {
+    if format == CheckOutputFormat::Json {
+        println!(
+            "{}",
+            render_json_report(&message_report(error.as_str()), false)?
+        );
     }
+    Err(error)
+}
+
+fn emit_check_output(
+    output: &anvyx_lang2::CheckOutput,
+    format: CheckOutputFormat,
+    warnings_are_errors: bool,
+) -> Result<(), String> {
+    emit_report(&output.report, format, warnings_are_errors)?;
+    if output.has_errors() {
+        return Err(output.summary().to_string());
+    }
+    if warnings_are_errors && output.report.has_warnings() {
+        return Err("warnings treated as errors".to_string());
+    }
+    Ok(())
 }
 
 fn new_frontend_config(lint: FrontendLintConfig, ctx: &CompilationContext) -> FrontendConfig {
@@ -122,22 +139,6 @@ pub fn reject_new_frontend_inputs(manifest: Option<&Manifest>) -> Result<(), Str
     anvyx_project::manifest::reject_clean_frontend_inputs(manifest)
 }
 
-fn emit_final_report(
-    report: &DiagnosticReport,
-    format: CheckOutputFormat,
-    warnings_are_errors: bool,
-) -> Result<(), String> {
-    let has_warning = report
-        .diagnostics()
-        .iter()
-        .any(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Warning);
-    emit_report(report, format, warnings_are_errors)?;
-    if warnings_are_errors && has_warning {
-        return Err("warnings treated as errors".to_string());
-    }
-    Ok(())
-}
-
 fn emit_report(
     report: &DiagnosticReport,
     format: CheckOutputFormat,
@@ -148,24 +149,6 @@ fn emit_report(
         CheckOutputFormat::Json => println!("{}", render_json_report(report, warnings_are_errors)?),
     }
     Ok(())
-}
-
-fn emit_error_report(
-    error: &FrontendCheckError,
-    format: CheckOutputFormat,
-    warnings_are_errors: bool,
-) -> Result<(), String> {
-    match error.report() {
-        Some(report) => emit_report(report, format, warnings_are_errors),
-        None if format == CheckOutputFormat::Json => {
-            println!(
-                "{}",
-                render_json_report(&message_report(error.to_string()), false)?
-            );
-            Ok(())
-        }
-        None => Ok(()),
-    }
 }
 
 const WARN_AS_ERROR_NOTE: &str = "warning promoted to error by --warn-as-error";
@@ -207,11 +190,11 @@ fn render_text_report(report: &DiagnosticReport, warnings_are_errors: bool) -> O
     Some(rendered)
 }
 
-fn message_report(message: String) -> DiagnosticReport {
-    DiagnosticReport {
-        diagnostics: vec![Diagnostic::error(message)],
-        ..DiagnosticReport::default()
-    }
+fn message_report(message: impl Into<String>) -> DiagnosticReport {
+    DiagnosticReport::new(
+        anvyx_lang2::SourceTable::default(),
+        vec![Diagnostic::error(message)],
+    )
 }
 
 fn render_json_report(
@@ -433,11 +416,8 @@ mod tests {
     fn check_new_frontend_error(file: &Path) -> String {
         let sources = anvyx_project::source_bundle().unwrap();
         let input = CheckFileInput::new(file.to_path_buf(), sources).unwrap();
-        let error = anvyx_lang2::check_file(input).unwrap_err();
-        error
-            .report()
-            .and_then(|report| render_text_report(report, false))
-            .unwrap_or_else(|| error.to_string())
+        let output = anvyx_lang2::check_file(input).unwrap();
+        render_text_report(&output.report, false).unwrap_or_else(|| output.summary().to_string())
     }
 
     fn cwd_lock() -> &'static Mutex<()> {
@@ -567,12 +547,12 @@ mod tests {
 
     #[test]
     fn warn_as_error_fails_on_final_warning_report() {
-        let report = DiagnosticReport {
+        let output = anvyx_lang2::CheckOutput::passed(DiagnosticReport {
             diagnostics: vec![Diagnostic::warning("careful")],
             ..DiagnosticReport::default()
-        };
+        });
 
-        let error = emit_final_report(&report, CheckOutputFormat::Json, true).unwrap_err();
+        let error = emit_check_output(&output, CheckOutputFormat::Json, true).unwrap_err();
 
         assert_eq!(error, "warnings treated as errors");
     }
@@ -622,20 +602,16 @@ mod tests {
             file
         }
 
-        fn frontend_error(code: &str) -> FrontendCheckError {
+        fn frontend_error(code: &str) -> anvyx_lang2::CheckOutput {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", code);
             let sources = anvyx_project::source_bundle().unwrap();
             let input = CheckFileInput::new(main, sources).unwrap();
-            anvyx_lang2::check_file(input).unwrap_err()
-        }
-
-        fn render_error_text_report(error: &FrontendCheckError) -> Option<String> {
-            render_text_report(error.report()?, false)
+            anvyx_lang2::check_file(input).unwrap()
         }
 
         fn check_error_report(code: &str) -> DiagnosticReport {
-            frontend_error(code).report().unwrap().clone()
+            frontend_error(code).report
         }
 
         fn json_value(report: &DiagnosticReport) -> serde_json::Value {
@@ -667,14 +643,13 @@ mod tests {
                 let graph =
                     crate::manifest::load_package_graph(&dir.path().join("game/anvyx.toml"))?;
                 let input = anvyx_project::check::package_check_input(&graph, file)?;
-                anvyx_lang2::check_package(input)
-                    .map(|_| ())
-                    .map_err(|error| {
-                        error
-                            .report()
-                            .and_then(|report| render_text_report(report, false))
-                            .unwrap_or_else(|| error.to_string())
-                    })
+                let output =
+                    anvyx_lang2::check_package(input).map_err(|error| error.to_string())?;
+                if output.has_errors() {
+                    return Err(render_text_report(&output.report, false)
+                        .unwrap_or_else(|| output.summary().to_string()));
+                }
+                Ok(())
             }
 
             #[test]
@@ -853,7 +828,7 @@ mod tests {
         fn text_type_error_renders_rich_report_and_short_summary() {
             let code = "fn main() { let hp: int = true; }";
             let error = frontend_error(code);
-            let rendered = render_error_text_report(&error).unwrap();
+            let rendered = render_text_report(&error.report, false).unwrap();
 
             assert!(rendered.contains("Error: mismatched types"), "{rendered}");
             assert!(rendered.contains("main.anv"), "{rendered}");
@@ -873,7 +848,7 @@ mod tests {
         #[test]
         fn text_parse_error_renders_label_and_short_summary() {
             let error = frontend_error("fn");
-            let rendered = render_error_text_report(&error).unwrap();
+            let rendered = render_text_report(&error.report, false).unwrap();
 
             assert!(rendered.contains("Unexpected end of input"), "{rendered}");
             assert!(rendered.contains("end of file"), "{rendered}");
@@ -881,11 +856,10 @@ mod tests {
         }
 
         #[test]
-        fn text_message_only_error_has_no_rich_report() {
-            let error = FrontendCheckError::InvalidInput("bad path".to_string());
+        fn text_message_only_report_renders_plain_message() {
+            let report = message_report("bad path");
 
-            assert!(render_error_text_report(&error).is_none());
-            assert_eq!(error.to_string(), "invalid input: bad path");
+            assert!(render_text_report(&report, false).is_some());
         }
 
         #[test]
@@ -978,7 +952,7 @@ mod tests {
 
         #[test]
         fn json_report_serializes_message_only_diagnostics() {
-            let report = message_report("provider failed".to_string());
+            let report = message_report("provider failed");
             let json = json_value(&report);
 
             assert!(json["sources"].as_array().unwrap().is_empty());

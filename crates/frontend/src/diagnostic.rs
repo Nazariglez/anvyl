@@ -132,6 +132,14 @@ impl DiagnosticProjection<'_> {
 
 impl DiagnosticReport {
     #[must_use]
+    pub fn new(sources: SourceTable, diagnostics: Vec<Diagnostic>) -> Self {
+        Self {
+            sources,
+            diagnostics,
+        }
+    }
+
+    #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
@@ -142,19 +150,66 @@ impl DiagnosticReport {
     }
 
     #[must_use]
-    pub fn anchor_label<'a>(&'a self, diagnostic: &'a Diagnostic) -> Option<&'a DiagnosticLabel> {
-        let mut fallback = None;
-        for label in diagnostic.labels() {
-            if self.source(label.span.source()).is_none() {
-                continue;
-            }
-            if label.style == LabelStyle::Primary {
-                return Some(label);
-            }
-            fallback = fallback.or(Some(label));
-        }
-        fallback
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity() == Severity::Error)
     }
+
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity() == Severity::Warning)
+    }
+
+    #[must_use]
+    pub fn sorted(mut self) -> Self {
+        let sources = &self.sources;
+        self.diagnostics.sort_by(|left, right| {
+            diagnostic_sort_key(sources, left).cmp(&diagnostic_sort_key(sources, right))
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn anchor_label<'a>(&'a self, diagnostic: &'a Diagnostic) -> Option<&'a DiagnosticLabel> {
+        anchor_label(&self.sources, diagnostic)
+    }
+}
+
+fn anchor_label<'a>(
+    sources: &SourceTable,
+    diagnostic: &'a Diagnostic,
+) -> Option<&'a DiagnosticLabel> {
+    let mut fallback = None;
+    for label in diagnostic.labels() {
+        if sources.get(label.span.source()).is_none() {
+            continue;
+        }
+        if label.style == LabelStyle::Primary {
+            return Some(label);
+        }
+        fallback = fallback.or(Some(label));
+    }
+    fallback
+}
+
+fn diagnostic_sort_key<'a>(
+    sources: &SourceTable,
+    diagnostic: &'a Diagnostic,
+) -> ((usize, usize, usize), usize, &'a str, &'a str, &'a str) {
+    let location = anchor_label(sources, diagnostic).map_or((1, usize::MAX, usize::MAX), |label| {
+        (0, label.span.source().index(), label.span.start())
+    });
+    let severity = match diagnostic.severity() {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+    };
+    let (code_source, code) = diagnostic
+        .code()
+        .map_or(("", ""), |code| (code.source, code.code.as_str()));
+    (location, severity, code_source, code, diagnostic.message())
 }
 
 impl Diagnostic {
@@ -428,10 +483,7 @@ mod tests {
         let diagnostic = Diagnostic::error("bad")
             .with_secondary_message(secondary, "related")
             .with_primary(primary);
-        let report = DiagnosticReport {
-            sources,
-            diagnostics: vec![diagnostic],
-        };
+        let report = DiagnosticReport::new(sources, vec![diagnostic]);
 
         assert_eq!(report.source(source).unwrap().label(), "test");
         assert_eq!(
@@ -452,10 +504,7 @@ mod tests {
         let diagnostic = Diagnostic::error("bad")
             .with_primary(primary)
             .with_secondary_message(secondary, "related");
-        let report = DiagnosticReport {
-            sources: report_sources,
-            diagnostics: vec![diagnostic],
-        };
+        let report = DiagnosticReport::new(report_sources, vec![diagnostic]);
 
         assert_eq!(
             report.anchor_label(&report.diagnostics[0]).unwrap().span,
@@ -468,13 +517,49 @@ mod tests {
         let mut sources = SourceTable::default();
         let source = sources.add(SourceKind::Virtual, "test", None, "test source");
         let diagnostic = Diagnostic::error("bad").with_primary(SourceSpan::new(source, 0, 4));
-        let report = DiagnosticReport {
-            sources,
-            diagnostics: vec![diagnostic],
-        };
+        let report = DiagnosticReport::new(sources, vec![diagnostic]);
 
         assert_eq!(report.sources.len(), 1);
         assert_eq!(report.diagnostics[0].message(), "bad");
         assert_eq!(report.diagnostics[0].labels()[0].span.source(), source);
+    }
+
+    #[test]
+    fn report_sorts_by_location_severity_code_and_message() {
+        let mut sources = SourceTable::default();
+        let first = sources.add(SourceKind::Virtual, "first", None, "abcdef");
+        let second = sources.add(SourceKind::Virtual, "second", None, "abcdef");
+        let diagnostics = vec![
+            Diagnostic::warning("unsourced"),
+            Diagnostic::warning("b warning").with_primary(SourceSpan::new(first, 1, 2)),
+            Diagnostic::error("a error").with_primary(SourceSpan::new(first, 1, 2)),
+            Diagnostic::error("second source").with_primary(SourceSpan::new(second, 0, 1)),
+            Diagnostic::error("coded b")
+                .with_primary(SourceSpan::new(first, 1, 2))
+                .with_code("anvyx", "b"),
+            Diagnostic::error("coded a")
+                .with_primary(SourceSpan::new(first, 1, 2))
+                .with_code("anvyx", "a"),
+            Diagnostic::error("first source").with_primary(SourceSpan::new(first, 0, 1)),
+        ];
+        let report = DiagnosticReport::new(sources, diagnostics).sorted();
+        let messages = report
+            .diagnostics()
+            .iter()
+            .map(Diagnostic::message)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages,
+            [
+                "first source",
+                "a error",
+                "coded a",
+                "coded b",
+                "b warning",
+                "second source",
+                "unsourced",
+            ]
+        );
     }
 }

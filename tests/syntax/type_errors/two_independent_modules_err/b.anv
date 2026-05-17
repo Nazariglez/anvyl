@@ -1,0 +1,5 @@
+// @helper
+
+pub fn b() {
+    let name: string = 1;
+}

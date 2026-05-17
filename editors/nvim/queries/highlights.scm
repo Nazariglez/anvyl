@@ -32,6 +32,15 @@
 (enum_definition
   name: (identifier) @type)
 
+(embed_selector_item
+  "fn" @keyword.function)
+
+(contract_definition
+  name: (identifier) @type)
+
+(type_alias_definition
+  name: (identifier) @type)
+
 (generic_type
   (identifier) @type)
 
@@ -40,6 +49,12 @@
 
 (extern_declaration
   "type" name: (identifier) @type)
+
+(dynamic_type
+  "dyn" @type.builtin)
+
+(extern_representation
+  ["rep" "shared" "inline"] @keyword.modifier)
 
 ; -- Functions
 (function_definition
@@ -56,7 +71,21 @@
   "fn" name: (identifier) @function)
 
 (cast_from_declaration
+  "cast" @keyword
   "from" @function.builtin)
+
+(extern_init
+  "init" @keyword.function)
+
+(extern_operator
+  "op" @keyword.operator)
+
+(extern_method
+  name: (identifier) @function)
+
+(extern_parameter
+  "shared" @keyword.modifier
+  "self" @variable.builtin)
 
 ; -- Variables and properties
 (self_expression) @variable.builtin
@@ -101,13 +130,14 @@
 "as" @keyword.operator
 
 ["let" "var" "const" "lazy"] @keyword
-["struct" "enum" "type" "extend" "extern" "dataref"] @keyword
+["struct" "enum" "type" "extend" "extern" "dataref" "contract"] @keyword
+["computed" "embed" "escaping" "rev" "step"] @keyword
 ["break" "continue" "defer" "try"] @keyword
 
 ; -- Operators
 ["+" "-" "*" "/" "%"] @operator
 ["==" "!=" "<" ">" "<=" ">=" "<<" ">>"] @operator
-["&&" "||" "!" "??" "?" "^" "~" "&" "|"] @operator
+["&&" "||" "!" "??" "?" "?." "?(" "?[" "as?" "^" "~" "&" "|"] @operator
 ["->" "=>" ".." "..="] @operator
 ["=" "+=" "-=" "*=" "/=" "^=" "&=" "|=" "<<=" ">>="] @operator
 

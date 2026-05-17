@@ -1,0 +1,10 @@
+// @frontend: new
+// @mode: check
+// @expect: error
+// @contains: expected `int`, found `bool`
+// @contains: expected `string`, found `int`
+
+fn main() {
+    let hp: int = true;
+    let name: string = 1;
+}

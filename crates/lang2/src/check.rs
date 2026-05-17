@@ -260,7 +260,7 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
     source_loader.cache_overrides(source_overrides)?;
     source_loader.cache_sources(cached_sources);
 
-    let ok = pipeline::check_packages(
+    let output = pipeline::check_packages(
         PackageProgramInput {
             root_package,
             main,
@@ -278,7 +278,7 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
         },
     )?;
 
-    Ok(ok.into())
+    Ok(output)
 }
 
 fn read_main(file: &Path, overrides: &[SourceOverride]) -> Result<String, CheckError> {
@@ -412,10 +412,8 @@ fn module_path(path: Vec<String>) -> anvyx_frontend::resolve::ModulePath {
 
 #[cfg(test)]
 mod tests {
-    use anvyx_frontend::pipeline::CheckError as FrontendCheckError;
-
     use super::*;
-    use crate::{ModuleSource, SystemPackageSource};
+    use crate::{CheckPhase, CheckStatus, ModuleSource, SystemPackageSource};
 
     fn write(dir: &tempfile::TempDir, relative: &str, code: &str) -> PathBuf {
         let file = dir.path().join(relative);
@@ -479,9 +477,19 @@ mod tests {
 
     fn unwrap_error(result: CheckResult) -> CheckError {
         match result {
-            Ok(_) => panic!("expected check error"),
+            Ok(_) => panic!("expected host error"),
             Err(error) => error,
         }
+    }
+
+    fn unwrap_failed(
+        result: CheckResult,
+        phase: CheckPhase,
+    ) -> anvyx_frontend::pipeline::CheckOutput {
+        let output = result.unwrap();
+        assert_eq!(output.status, CheckStatus::Failed { phase });
+        assert!(output.has_errors());
+        output
     }
 
     fn package_source(
@@ -580,12 +588,7 @@ mod tests {
             )];
             let input =
                 CheckPackageInput::new(game, game_main, packages, SourceBundle::default()).unwrap();
-            let error = unwrap_error(check_package(input));
-
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Resolve { .. })
-            ));
+            unwrap_failed(check_package(input), CheckPhase::Resolve);
         }
 
         #[test]
@@ -616,13 +619,13 @@ mod tests {
             ];
             let input =
                 CheckPackageInput::new(game, game_main, packages, SourceBundle::default()).unwrap();
-            let error = unwrap_error(check_package(input));
+            let output = unwrap_failed(check_package(input), CheckPhase::Resolve);
 
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Resolve { report })
-                    if report.diagnostics()[0].message().contains("has no package dependency named 'math'")
-            ));
+            assert!(
+                output.report.diagnostics()[0]
+                    .message()
+                    .contains("has no package dependency named 'math'")
+            );
         }
     }
 
@@ -696,13 +699,12 @@ mod tests {
         fn preserves_main_label() {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "fn main( {}");
-            let error = unwrap_error(check_file(empty_input(main.clone())));
+            let output = unwrap_failed(check_file(empty_input(main.clone())), CheckPhase::Parse);
 
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Parse { label, .. })
-                    if label == main.display().to_string()
-            ));
+            assert!(output.report.sources.iter().any(|source| {
+                source.path().is_some_and(|path| path == main.as_path())
+                    || source.label() == main.display().to_string()
+            }));
         }
 
         #[test]
@@ -867,31 +869,22 @@ mod tests {
                 "pub struct Vec2 {} pub fn make() -> Vec2 { Vec2 {} }",
             );
             write(&temp, "b.anv", "pub struct Vec2 {} pub fn take(v: Vec2) {}");
-            let error = unwrap_error(check_file(empty_input(main)));
+            let output = unwrap_failed(check_file(empty_input(main)), CheckPhase::Type);
 
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Type { report })
-                    if report.diagnostics().iter().any(|diagnostic| {
-                        let message = diagnostic
-                            .primary_label()
-                            .and_then(|label| label.message.as_deref())
-                            .unwrap_or_else(|| diagnostic.message());
-                        message.contains("a.anv") && message.contains("b.anv")
-                    })
-            ));
+            assert!(output.report.diagnostics().iter().any(|diagnostic| {
+                let message = diagnostic
+                    .primary_label()
+                    .and_then(|label| label.message.as_deref())
+                    .unwrap_or_else(|| diagnostic.message());
+                message.contains("a.anv") && message.contains("b.anv")
+            }));
         }
 
         #[test]
         fn missing_import_is_resolve_error() {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "import missing; fn main() {}");
-            let error = unwrap_error(check_file(empty_input(main)));
-
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Resolve { .. })
-            ));
+            unwrap_failed(check_file(empty_input(main)), CheckPhase::Resolve);
         }
 
         #[test]
@@ -915,12 +908,7 @@ mod tests {
         fn default_bundle_has_no_std_package() {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "import std:math; fn main() {}");
-            let error = unwrap_error(check_file(empty_input(main)));
-
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Resolve { .. })
-            ));
+            unwrap_failed(check_file(empty_input(main)), CheckPhase::Resolve);
         }
 
         #[test]
@@ -932,12 +920,7 @@ mod tests {
                 vec![],
                 vec![std_module("math", "pub const PI: int = 3;")],
             );
-            let error = unwrap_error(check_file(input(main, sources)));
-
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Type { .. })
-            ));
+            unwrap_failed(check_file(input(main, sources)), CheckPhase::Type);
         }
 
         #[test]
@@ -978,14 +961,16 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "import broken; fn main() {}");
             let broken = write(&temp, "broken.anv", "fn nope( {}");
-            let error = unwrap_error(check_file(empty_input(main)));
+            let output = unwrap_failed(check_file(empty_input(main)), CheckPhase::Parse);
 
             let broken = fs::canonicalize(broken).unwrap();
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Parse { label, .. })
-                    if label == broken.display().to_string()
-            ));
+            assert!(
+                output
+                    .report
+                    .sources
+                    .iter()
+                    .any(|source| source.path() == Some(broken.as_path()))
+            );
         }
 
         #[test]
@@ -993,14 +978,16 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", "import broken; fn main() {}");
             let broken = write(&temp, "broken.anv", "fn main() { \"unterminated }");
-            let error = unwrap_error(check_file(empty_input(main)));
+            let output = unwrap_failed(check_file(empty_input(main)), CheckPhase::Lex);
 
             let broken = fs::canonicalize(broken).unwrap();
-            assert!(matches!(
-                error,
-                CheckError::Frontend(FrontendCheckError::Lex { label, .. })
-                    if label == broken.display().to_string()
-            ));
+            assert!(
+                output
+                    .report
+                    .sources
+                    .iter()
+                    .any(|source| source.path() == Some(broken.as_path()))
+            );
         }
 
         #[test]
@@ -1009,12 +996,9 @@ mod tests {
             let main = write(&temp, "main.anv", "import helper; fn main() {}");
             let helper = write(&temp, "helper.anv", "pub fn bad(a: int = 1, b: int) {}");
             let helper = fs::canonicalize(helper).unwrap();
-            let error = unwrap_error(check_file(empty_input(main)));
-            let CheckError::Frontend(FrontendCheckError::Type { report }) = error else {
-                panic!("expected type error");
-            };
-            let label = report.diagnostics()[0].labels()[0].span;
-            let file = report.sources.get(label.source()).unwrap();
+            let output = unwrap_failed(check_file(empty_input(main)), CheckPhase::Type);
+            let label = output.report.diagnostics()[0].labels()[0].span;
+            let file = output.report.sources.get(label.source()).unwrap();
 
             assert_eq!(file.path(), Some(helper.as_path()));
         }

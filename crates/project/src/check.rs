@@ -4,7 +4,7 @@ use std::{
 };
 
 use anvyx_lang2::{
-    CheckFileInput, CheckPackageInput, CheckResult, FrontendConfig, PackageId as FrontendPackageId,
+    CheckFileInput, CheckOutput, CheckPackageInput, FrontendConfig, PackageId as FrontendPackageId,
     PackageSource, SourceOverride,
 };
 
@@ -13,7 +13,7 @@ use crate::{
     source_bundle,
 };
 
-pub fn check_path(file: &Path, config: FrontendConfig) -> Result<CheckResult, String> {
+pub fn check_path(file: &Path, config: FrontendConfig) -> Result<CheckOutput, String> {
     check_path_with_source_overrides(file, vec![], config)
 }
 
@@ -21,14 +21,14 @@ pub fn check_path_with_source_overrides(
     file: &Path,
     source_overrides: Vec<SourceOverride>,
     config: FrontendConfig,
-) -> Result<CheckResult, String> {
+) -> Result<CheckOutput, String> {
     check_loaded_path(file, source_overrides, config, load_nearest_manifest(file)?)
 }
 
 pub fn check_path_with_manifest_lints(
     file: &Path,
     source_overrides: Vec<SourceOverride>,
-) -> Result<CheckResult, String> {
+) -> Result<CheckOutput, String> {
     let manifest = load_nearest_manifest(file)?;
     let lint = match &manifest {
         Some((_, manifest)) => crate::manifest::lint_config(Some(manifest), &[] as &[String])?,
@@ -58,17 +58,17 @@ fn check_loaded_path(
     source_overrides: Vec<SourceOverride>,
     config: FrontendConfig,
     manifest: Option<(PathBuf, Manifest)>,
-) -> Result<CheckResult, String> {
+) -> Result<CheckOutput, String> {
     let Some((path, manifest)) = manifest else {
         let input =
             standalone_check_input_with_overrides(file, source_overrides)?.with_config(config);
-        return Ok(anvyx_lang2::check_file(input));
+        return anvyx_lang2::check_file(input).map_err(|error| error.to_string());
     };
     crate::manifest::reject_clean_frontend_inputs(Some(&manifest))?;
     let graph = crate::manifest::load_package_graph(&path)?;
     let input =
         package_check_input_with_overrides(&graph, file, source_overrides)?.with_config(config);
-    Ok(anvyx_lang2::check_package(input))
+    anvyx_lang2::check_package(input).map_err(|error| error.to_string())
 }
 
 pub fn standalone_check_input(file: &Path) -> Result<CheckFileInput, String> {

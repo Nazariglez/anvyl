@@ -143,12 +143,18 @@ pub(super) fn check_map_lit_hint(
     }
 
     let mut contains_extern_any = false;
+    let mut contains_poison = false;
     for (key_expr, value_expr) in &lit.node.entries {
         let key_checked = check_expected(key_expr, key.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, key_expr);
         let value_checked = check_expected(value_expr, value.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, value_expr);
         contains_extern_any |= key_checked.contains_extern_any || value_checked.contains_extern_any;
+        contains_poison |=
+            tc.checked_is_poison(&key_checked) || tc.checked_is_poison(&value_checked);
+    }
+    if contains_poison {
+        return checked_from_type(expr, Type::Infer, tc);
     }
 
     let map = tc.map_handle(&key, &value);
@@ -198,10 +204,15 @@ pub(super) fn check_array_lit_hint(
         tc,
     );
     let mut contains_extern_any = false;
+    let mut contains_poison = false;
     for value in &lit.node.elements {
         let checked = check_expected(value, elem.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, value);
         contains_extern_any |= checked.contains_extern_any;
+        contains_poison |= tc.checked_is_poison(&checked);
+    }
+    if contains_poison {
+        return checked_from_type(expr, Type::Infer, tc);
     }
     let mut checked = solve_and_checked_from_handle(expr, array, tc);
     checked.contains_extern_any = contains_extern_any;
@@ -273,10 +284,15 @@ pub(super) fn check_tuple_checked_with_hint(
 ) -> CheckedType {
     let hints = tuple_hints(elems, expected.as_ref(), tc);
     let mut contains_extern_any = false;
+    let mut contains_poison = false;
     for (elem, hint) in elems.iter().zip(&hints) {
         let checked = check_expected(elem, hint.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, elem);
         contains_extern_any |= checked.contains_extern_any;
+        contains_poison |= tc.checked_is_poison(&checked);
+    }
+    if contains_poison {
+        return checked_from_type(expr, Type::Infer, tc);
     }
     let tuple = tc.tuple_handle(hints);
     let mut checked = solve_and_checked_from_handle(expr, tuple, tc);

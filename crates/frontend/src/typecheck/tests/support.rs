@@ -187,7 +187,9 @@ pub(crate) fn check_with_raw_externs(
         raw_externs,
         typecheck::TypecheckConfig::default(),
     )?;
-    let (source_types, facts) = tc.finish()?;
+    let Some((source_types, facts)) = tc.finish() else {
+        return Err(tc.errors);
+    };
     let types = source_types
         .into_iter()
         .map(|(id, (span, ty))| {

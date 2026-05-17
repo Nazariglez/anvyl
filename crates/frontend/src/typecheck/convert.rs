@@ -33,6 +33,9 @@ impl TypeChecker {
     }
 
     pub(super) fn expect_equal(&mut self, span: Span, left: TypeHandle, right: TypeHandle) {
+        if self.handle_is_poison(&left) || self.handle_is_poison(&right) {
+            return;
+        }
         self.solver
             .add_handle_equal(self.error_span(span), left, right);
     }
@@ -73,6 +76,9 @@ fn expect_assignable(
     from: TypeHandle,
     to: TypeHandle,
 ) {
+    if tc.handle_is_poison(&from) || tc.handle_is_poison(&to) {
+        return;
+    }
     let from_ty = tc.handle_type(&from);
     let to_ty = tc.handle_type(&to);
     if try_expected_dyn(tc, span, expr_id, &from_ty, &to_ty) {

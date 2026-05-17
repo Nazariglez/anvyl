@@ -1,0 +1,8 @@
+// @frontend: new
+// @mode: check
+// @expect: error
+// @contains: unknown variable `missing`
+
+fn main() {
+    let x: int = missing.foo(1).bar;
+}

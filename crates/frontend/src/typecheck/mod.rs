@@ -1545,11 +1545,23 @@ impl TypeChecker {
     fn set_type(&mut self, id: ExprId, ty: Type, span: Span) -> TypeHandle {
         let span = self.error_span(span);
         if matches!(ty, Type::Infer) {
-            self.solver.error_expr_type(id, span)
+            self.set_poison_type(id, span)
         } else {
             self.solver.set_expr_type_from_type(id, span, &ty);
             self.solver.expr_handle(id)
         }
+    }
+
+    fn set_poison_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle {
+        self.solver.poison_expr_type(id, span)
+    }
+
+    fn handle_is_poison(&self, handle: &TypeHandle) -> bool {
+        self.solver.handle_is_poison(handle)
+    }
+
+    pub(super) fn checked_is_poison(&self, checked: &CheckedType) -> bool {
+        self.handle_is_poison(&checked.handle)
     }
 
     fn set_nil_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
@@ -2061,17 +2073,13 @@ impl TypeChecker {
             .collect()
     }
 
-    fn finish(&mut self) -> Result<(SourceExprTypes, TypecheckFacts), Vec<TypeError>> {
+    fn finish(&mut self) -> Option<(SourceExprTypes, TypecheckFacts)> {
         self.solve_constraints();
         self.solve_dyn_inference();
-        let mut facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
-        facts.import_records = self.decls.import_records().to_vec();
-        facts.used_imports.clone_from(self.decls.used_imports());
-        facts.used_imports.extend(self.used_imports.clone());
         let escape_events = self.closure.take_escape_events();
         self.push_escape_events(escape_events);
         if !self.errors.is_empty() {
-            return Err(std::mem::take(&mut self.errors));
+            return None;
         }
 
         let (types, finalize_errors) = self.solver.finalize_expr_types();
@@ -2081,16 +2089,27 @@ impl TypeChecker {
                 self.push_error_once(error);
             }
         }
-        if self.errors.is_empty() {
-            Ok((types, facts))
-        } else {
-            Err(std::mem::take(&mut self.errors))
+        if !self.errors.is_empty() {
+            return None;
         }
+        let mut facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
+        facts.import_records = self.decls.import_records().to_vec();
+        facts.used_imports.clone_from(self.decls.used_imports());
+        facts.used_imports.extend(self.used_imports.clone());
+        Some((types, facts))
     }
 
-    fn into_result(mut self) -> Result<TypecheckResult, Vec<TypeError>> {
-        let (_, facts) = self.finish()?;
-        Ok(TypecheckResult::new(self.warnings, self.lint_events, facts))
+    fn into_output(mut self) -> TypecheckOutput {
+        let facts = self.finish().map(|(_, facts)| facts);
+        let errors = std::mem::take(&mut self.errors);
+        let warnings = std::mem::take(&mut self.warnings);
+        let lint_events = std::mem::take(&mut self.lint_events);
+        match facts {
+            Some(facts) if errors.is_empty() => {
+                TypecheckOutput::success(warnings, lint_events, facts)
+            }
+            _ => TypecheckOutput::failed(errors, warnings, lint_events),
+        }
     }
 
     fn result_closure_errors(&self, types: &SourceExprTypes) -> Vec<TypeError> {
@@ -2247,8 +2266,11 @@ pub(crate) fn check_with_modules(
     resolved: &ResolveResult,
     externs: RawExterns,
     config: TypecheckConfig,
-) -> Result<TypecheckResult, Vec<TypeError>> {
-    typechecker_for_modules(program, resolved, externs, config)?.into_result()
+) -> TypecheckOutput {
+    match typechecker_for_modules(program, resolved, externs, config) {
+        Ok(tc) => tc.into_output(),
+        Err(errors) => TypecheckOutput::failed(errors, vec![], vec![]),
+    }
 }
 
 fn typechecker_for_modules(
@@ -2319,7 +2341,7 @@ fn typechecker_for_modules(
     tc.sync_global_types();
     validate_public_value_surfaces(&tc.decls, &mut tc.errors);
     if !tc.errors.is_empty() {
-        return Err(tc.errors);
+        return Ok(tc);
     }
     push_source_scope(&mut tc);
     register_declarations(program, &mut tc);
@@ -2459,9 +2481,21 @@ pub(in crate::typecheck) fn check_value_expr_checked_with_hint(
 }
 
 fn checked_from_type(expr: &ExprNode, ty: Type, tc: &mut TypeChecker) -> CheckedType {
+    if matches!(ty, Type::Infer) {
+        return checked_poison(expr, tc);
+    }
     let handle = tc.set_type(expr.node.id, ty.clone(), expr.span);
     CheckedType {
         ty,
+        handle,
+        contains_extern_any: false,
+    }
+}
+
+fn checked_poison(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
+    let handle = tc.set_poison_type(expr.node.id, tc.error_span(expr.span));
+    CheckedType {
+        ty: Type::Infer,
         handle,
         contains_extern_any: false,
     }
@@ -3313,6 +3347,9 @@ fn check_binary_checked(
     span: Span,
     tc: &mut TypeChecker,
 ) -> CheckedType {
+    if tc.checked_is_poison(&left) || tc.checked_is_poison(&right) {
+        return checked_type(Type::Infer, tc);
+    }
     match builtin_binary_type(op, &left.ty, &right.ty, tc) {
         Ok(ty) => checked_type(ty, tc),
         Err(failure) => {
@@ -3497,6 +3534,9 @@ fn emit_binary_failure(failure: BinaryTypeFailure, span: Span, tc: &mut TypeChec
 
 fn check_unary(expr_id: ExprId, unary: &UnaryNode, tc: &mut TypeChecker) -> CheckedType {
     let operand = check_expr_checked(&unary.node.expr, tc);
+    if tc.checked_is_poison(&operand) {
+        return checked_type(Type::Infer, tc);
+    }
     match builtin_unary_type(unary.node.op, &operand.ty) {
         Ok(ty) => checked_type(ty, tc),
         Err(failure) => extern_ops::check_unary(expr_id, unary.node.op, &operand, tc)

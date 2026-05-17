@@ -24,7 +24,7 @@ pub use anvyx_frontend::{
 };
 pub use check::{CheckFileInput, CheckPackageInput, check_file, check_package};
 pub use dependency::{DependencyAliasError, validate_dependency_alias};
-pub use error::{CheckError, CheckOk, CheckResult};
+pub use error::{CheckError, CheckOutput, CheckPhase, CheckResult, CheckStatus};
 pub use source::{
     ModuleSource, PackageSource, SourceBundle, SourceOverride, SourceText, SystemPackageSource,
 };

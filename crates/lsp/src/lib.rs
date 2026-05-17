@@ -227,18 +227,11 @@ impl LspAdapter {
             Ok(overrides) => overrides,
             Err(error) => return self.document_error(uri, version, error),
         };
-        let result = match anvyx_project::check::check_path_with_manifest_lints(&path, overrides) {
-            Ok(result) => result,
+        let output = match anvyx_project::check::check_path_with_manifest_lints(&path, overrides) {
+            Ok(output) => output,
             Err(error) => return self.document_error(uri, version, error),
         };
-        let report = match result {
-            Ok(ok) => ok.report,
-            Err(error) => match error.report() {
-                Some(report) => report.clone(),
-                None => return self.document_error(uri, version, error.to_string()),
-            },
-        };
-        Ok(self.publish_report_for(uri, &report))
+        Ok(self.publish_report_for(uri, &output.report))
     }
 
     fn document_error(

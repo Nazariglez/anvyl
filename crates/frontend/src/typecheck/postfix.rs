@@ -674,6 +674,9 @@ fn apply_value_field(
     kind: MemberAccessKind,
     tc: &mut TypeChecker,
 ) -> Subject {
+    if tc.checked_is_poison(&receiver.checked) {
+        return Subject::Error;
+    }
     let receiver_ty = &receiver.checked.ty;
     let receiver_access = receiver.access;
     let receiver_place = &receiver.facts;
@@ -2521,6 +2524,9 @@ pub(super) fn check_tuple_index_access(
     target: &CheckedType,
     tc: &mut TypeChecker,
 ) -> CheckedType {
+    if tc.checked_is_poison(target) {
+        return checked_from_type(expr, Type::Infer, tc);
+    }
     let Type::Tuple(elems) = &target.ty else {
         tc.push_error(TypeError::TupleIndexOnNonTuple {
             ty: target.ty.clone(),
