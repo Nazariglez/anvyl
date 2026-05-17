@@ -841,7 +841,7 @@ fn check_aggregate_field_defaults(
             continue;
         }
         if matches!(default.node.kind, ExprKind::Lit(Lit::Nil))
-            && tc.decls.core_option_inner(&schema.ty).is_some()
+            && tc.decls.semantic_option_inner(&schema.ty).is_some()
         {
             continue;
         }

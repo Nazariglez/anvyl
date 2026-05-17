@@ -1,4 +1,24 @@
-use super::{literal::type_from_lit, *};
+use std::collections::HashMap;
+
+use super::{
+    ActiveMutDowncastRoot, CheckedType, DynDowncastFact, TypeChecker, TypeError, TypeHandle,
+    annotation::AccessPolicy,
+    check_block_checked, check_block_checked_with_hint, check_value_expr_checked_with_hint,
+    checked_from_type, checked_void, closure, contracts, control_flow,
+    decls::{FieldSchema, NominalKey, TypeBinding, nominal_type},
+    dyn_infer, enum_variant, field_check,
+    generic::GenericArgs,
+    join_checked,
+    literal::type_from_lit,
+    place,
+    place::{
+        MutableUseKind, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee,
+        check_place,
+    },
+    semantic_use::ExternUseTarget,
+    type_ops::{type_closure_facts, type_depends_on_generics},
+};
+use crate::{ast::*, span::Span};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PatternCover {
@@ -439,7 +459,8 @@ impl<'tc> PatternChecker<'tc> {
     ) {
         match self.context {
             PatternContext::IfLet | PatternContext::WhileLet | PatternContext::LetElse
-                if expected.is_option() && outcome.refutability == Refutability::Irrefutable =>
+                if self.option_inner(expected).is_some()
+                    && outcome.refutability == Refutability::Irrefutable =>
             {
                 self.tc.push_error(TypeError::RequiresUnwrappingPattern {
                     span: self.tc.error_span(pattern.span),
@@ -459,11 +480,11 @@ impl<'tc> PatternChecker<'tc> {
     fn check_ident(&mut self, name: Ident, input: PatternInput, span: Span) -> PatternCheckResult {
         let kind = match self.mode {
             PatternBindMode::Alias => {
-                if !input.access.can_assign() {
-                    self.tc
-                        .push_error(TypeError::VarPatternRequiresMutablePlace {
-                            span: self.tc.error_span(span),
-                        });
+                if let Some(error) = input
+                    .access
+                    .error_for(MutableUseKind::AliasPattern, self.tc.error_span(span))
+                {
+                    self.tc.push_error(error);
                 }
                 PatternBindingKind::Alias(place::AliasTarget {
                     access: input.access,
@@ -667,6 +688,10 @@ impl<'tc> PatternChecker<'tc> {
         }
     }
 
+    fn option_inner<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
+        self.tc.decls.semantic_option_inner(ty)
+    }
+
     fn check_lit(&mut self, span: Span, lit: &Lit, expected: &Type) -> PatternOutcome {
         let lit_ty = type_from_lit(lit);
         if lit_ty != *expected && !matches!(expected, Type::Infer) {
@@ -688,7 +713,7 @@ impl<'tc> PatternChecker<'tc> {
     }
 
     fn check_nil(&mut self, span: Span, expected: &Type) -> PatternOutcome {
-        if !expected.is_option() && !matches!(expected, Type::Infer) {
+        if self.option_inner(expected).is_none() && !matches!(expected, Type::Infer) {
             self.tc.push_error(TypeError::OptionalPatternOnNonOptional {
                 span: self.tc.error_span(span),
             });
@@ -716,7 +741,7 @@ impl<'tc> PatternChecker<'tc> {
             self.check(inner, recovery);
             return PatternCheckResult::empty(PatternOutcome::error());
         }
-        let Some(inner_ty) = input.expected_ty.option_inner() else {
+        let Some(inner_ty) = self.option_inner(&input.expected_ty).cloned() else {
             if !matches!(input.expected_ty, Type::Infer) {
                 self.tc.push_error(TypeError::OptionalPatternOnNonOptional {
                     span: self.tc.error_span(inner.span),
@@ -733,7 +758,7 @@ impl<'tc> PatternChecker<'tc> {
             self.check(inner, recovery);
             return PatternCheckResult::empty(PatternOutcome::error());
         };
-        let inner_input = input.optional_some(inner_ty.clone(), self.tc);
+        let inner_input = input.optional_some(inner_ty, self.tc);
         let result = self.check(inner, inner_input);
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -878,7 +903,7 @@ impl<'tc> PatternChecker<'tc> {
                             FieldSchema {
                                 ty: field.ty.ty.clone(),
                                 has_default: false,
-                                policy: annotation::AccessPolicy::default(),
+                                policy: AccessPolicy::default(),
                                 span: None,
                                 embed: None,
                             },
@@ -960,11 +985,9 @@ impl<'tc> PatternChecker<'tc> {
         shape: &field_check::FieldShape,
         access: PlaceAccess,
     ) {
-        for (index, (_, pattern)) in fields.iter().enumerate() {
-            if shape.fields.iter().all(|field| field.index != index) {
-                let input = PatternInput::recovery(access, self.tc);
-                self.check(pattern, input);
-            }
+        for index in &shape.invalid_indices {
+            let input = PatternInput::recovery(access, self.tc);
+            self.check(&fields[*index].1, input);
         }
     }
 
@@ -996,16 +1019,15 @@ impl<'tc> PatternChecker<'tc> {
         missing: field_check::MissingFields,
         span: Option<Span>,
     ) -> field_check::FieldShape {
-        let uses = fields
-            .iter()
-            .enumerate()
-            .map(|(index, (name, pattern))| field_check::FieldUse {
-                name: *name,
-                span: pattern.span,
-                index,
-            })
-            .collect::<Vec<_>>();
-        field_check::check(&uses, schema, owner, missing, span, self.tc)
+        field_check::check_named(
+            fields,
+            schema,
+            owner,
+            missing,
+            span,
+            |pattern| pattern.span,
+            self.tc,
+        )
     }
 
     fn check_enum_unit(
@@ -1381,13 +1403,10 @@ pub(super) fn check_pattern_scrutinee(
 }
 
 fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
-    if let Some(annot_inner) = tc.decls.core_option_inner(annot) {
-        let value_inner = tc.decls.core_option_inner(value).unwrap_or(value);
+    if let Some(annot_inner) = tc.decls.semantic_option_inner(annot) {
+        let value_inner = tc.decls.semantic_option_inner(value).unwrap_or(value);
         let inner = refined_binding_type(annot_inner, value_inner, tc);
-        return tc
-            .decls
-            .core_option_of(inner)
-            .unwrap_or_else(|| annot.clone());
+        return tc.decls.semantic_option_of(inner);
     }
     match (annot, value) {
         (

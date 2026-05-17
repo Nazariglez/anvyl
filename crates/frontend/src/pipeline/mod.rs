@@ -473,8 +473,9 @@ mod tests {
     };
     use crate::{
         externs::{ExternInputs, PackageExternInputs},
-        resolve::{ModuleId, ModulePath, PackageId, PackageKind, SystemPackages},
+        resolve::{ModuleId, PackageId, PackageKind, SystemPackages},
         source::{SourceFile, SourceKind},
+        test_support::module_path_segments,
     };
 
     #[derive(Default)]
@@ -542,16 +543,12 @@ mod tests {
         }
     }
 
-    fn module_path(path: &[&str]) -> ModulePath {
-        ModulePath::new(path.iter().map(ToString::to_string).collect()).unwrap()
-    }
-
     fn root_package() -> PackageId {
         PackageId::synthetic_root()
     }
 
     fn module_id(path: &[&str]) -> ModuleId {
-        ModuleId::named(root_package(), module_path(path))
+        ModuleId::named(root_package(), module_path_segments(path))
     }
 
     fn extern_inputs(providers: Vec<anvyx_externs::ProviderDescriptor>) -> ExternInputs {
@@ -576,7 +573,7 @@ mod tests {
 
     fn core_module(path: &[&str], code: &str) -> PackageModuleInput {
         PackageModuleInput {
-            module: ModuleId::named(PackageId::core(), module_path(path)),
+            module: ModuleId::named(PackageId::core(), module_path_segments(path)),
             source: source(code, &format!("core.{}", path.join("."))),
         }
     }
@@ -679,13 +676,6 @@ mod tests {
             None,
             vec![],
         ))
-    }
-
-    fn extern_messages(source: &str) -> Vec<String> {
-        let CheckError::Extern { report } = check_source(source).unwrap_err() else {
-            panic!("expected extern error");
-        };
-        diagnostic_messages(report.diagnostics())
     }
 
     #[test]
@@ -1003,14 +993,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_raw_extern_identities_are_extern_errors() {
-        assert_eq!(
-            extern_messages("extern fn f() -> void; extern fn f() -> void;"),
-            ["duplicate extern function 'f' declared in source root and source root"]
-        );
-    }
-
-    #[test]
     fn duplicate_provider_externs_are_rejected_before_typechecking() {
         let mut provider = valid_provider_descriptor();
         provider.provider.name = "other_math".to_string();
@@ -1041,75 +1023,10 @@ mod tests {
     }
 
     #[test]
-    fn source_extern_normalization_errors_are_extern_errors() {
-        assert_eq!(
-            extern_messages("extern fn f(x: (int, int)) -> void;"),
-            ["unsupported source extern type '(int, int)'"]
-        );
-    }
-
-    #[test]
-    fn source_extern_shape_errors_are_extern_errors() {
-        assert_eq!(
-            extern_messages("extern fn f(x: void) -> void;"),
-            [
-                "invalid extern descriptor from source root: void type is not allowed in parameter position"
-            ]
-        );
-    }
-
-    #[test]
-    fn source_extern_new_forms_reach_typechecking() {
-        check_source(
-            r"
-            extern type Vec2 rep inline {
-                init;
-                x: float;
-                y: float;
-                computed length: float;
-                computed bounds: Rect;
-                computed label: string;
-                fn magnitude(shared self) -> float;
-                fn translate(var self, dx: float, dy: float) -> void;
-                fn zero() -> Self;
-                op Self != Self -> bool;
-                op Self < Self -> bool;
-                op Self > Self -> bool;
-                op Self <= Self -> bool;
-                op Self >= Self -> bool;
-            }
-            extern type Rect;
-            fn main() {}
-            ",
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn new_source_extern_parser_errors_take_precedence() {
         let err = check_source("extern type T { computed let x: int; } fn main() {}").unwrap_err();
 
         assert!(matches!(err, CheckError::Parse { .. }));
-    }
-
-    #[test]
-    fn renders_root_scope() {
-        assert_eq!(
-            extern_messages("extern type T { op Self + int -> void; }"),
-            [
-                "invalid extern descriptor from source root: invalid operator '+' on extern type 'T': expected non-void return type, found 'void'"
-            ]
-        );
-    }
-
-    #[test]
-    fn param_decorations_are_extern_errors() {
-        assert_eq!(
-            extern_messages("extern fn f(var x: int) -> void;"),
-            [
-                "unsupported source extern parameter 'x': mutable parameters are not supported in source extern declarations"
-            ]
-        );
     }
 
     #[test]
@@ -1452,22 +1369,6 @@ mod tests {
         ))
         .unwrap_err();
         assert!(matches!(err, CheckError::Type { .. }));
-    }
-
-    #[test]
-    fn local_import_resolved_through_loader() {
-        let mut loader = TestLoader::default();
-        loader.source(&["foo"], "pub fn bar() -> int { 1 }");
-        check(input(
-            &mut loader,
-            source(
-                "import foo { bar }; fn main() { let x: int = bar(); }",
-                "main.anv",
-            ),
-            None,
-            vec![],
-        ))
-        .unwrap();
     }
 
     #[test]

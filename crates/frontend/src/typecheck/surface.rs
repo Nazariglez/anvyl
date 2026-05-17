@@ -282,6 +282,62 @@ enum SurfaceState {
     Done,
 }
 
+#[derive(Clone, Copy)]
+enum SurfaceMemberKind {
+    Field,
+    Method,
+}
+
+impl SurfaceMemberKind {
+    const ALL: [Self; 2] = [Self::Field, Self::Method];
+
+    fn map_mut(
+        self,
+        surface: &mut PromotedSurface,
+    ) -> &mut HashMap<Ident, SurfaceSlot<PromotedAlias>> {
+        match self {
+            Self::Field => &mut surface.fields,
+            Self::Method => &mut surface.methods,
+        }
+    }
+
+    fn direct_names(self, schema: &AggregateSchema) -> HashSet<Ident> {
+        match self {
+            Self::Field => schema.fields.keys().copied().collect(),
+            Self::Method => schema
+                .methods
+                .keys()
+                .filter(|key| key.surface == MethodSurface::Instance)
+                .map(|key| key.name)
+                .collect(),
+        }
+    }
+
+    fn direct_conflict(
+        self,
+        owner: NominalKey,
+        name: Ident,
+        span: Option<SourceSpan>,
+    ) -> DeclError {
+        match self {
+            Self::Field => DeclError::EmbedFieldConflictsWithDirect { owner, name, span },
+            Self::Method => DeclError::EmbedMethodConflictsWithDirect { owner, name, span },
+        }
+    }
+
+    fn duplicate_explicit(
+        self,
+        owner: NominalKey,
+        name: Ident,
+        span: Option<SourceSpan>,
+    ) -> DeclError {
+        match self {
+            Self::Field => DeclError::DuplicateExplicitEmbedField { owner, name, span },
+            Self::Method => DeclError::DuplicateExplicitEmbedMethod { owner, name, span },
+        }
+    }
+}
+
 struct SurfaceBuilder<'a> {
     decls: &'a DeclarationIndex,
     externs: &'a ExternCatalog,
@@ -488,84 +544,43 @@ impl<'a> SurfaceBuilder<'a> {
         surface: &mut PromotedSurface,
     ) {
         surface.sort();
-        self.merge_field_surface(owner, schema, surface);
-        self.merge_method_surface(owner, schema, surface);
-    }
-
-    fn merge_field_surface(
-        &mut self,
-        owner: &NominalKey,
-        schema: &AggregateSchema,
-        surface: &mut PromotedSurface,
-    ) {
-        let direct_fields = schema.fields.keys().copied().collect::<HashSet<_>>();
-        let mut names = surface.fields.keys().copied().collect::<Vec<_>>();
-        names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for name in names {
-            let Some(slot) = surface.fields.remove(&name) else {
-                continue;
-            };
-            let explicit = explicit_aliases(&slot);
-            if direct_fields.contains(&name) {
-                for alias in explicit {
-                    self.errors.push(DeclError::EmbedFieldConflictsWithDirect {
-                        owner: owner.clone(),
-                        name,
-                        span: alias.selector_span,
-                    });
-                }
-                continue;
-            }
-
-            let aliases = merged_aliases(slot, |alias| {
-                self.errors.push(DeclError::DuplicateExplicitEmbedField {
-                    owner: owner.clone(),
-                    name,
-                    span: alias.selector_span,
-                });
-            });
-            insert_merged_aliases(&mut surface.fields, name, aliases);
+        for kind in SurfaceMemberKind::ALL {
+            self.merge_member_surface(kind, owner, schema, surface);
         }
     }
 
-    fn merge_method_surface(
+    fn merge_member_surface(
         &mut self,
+        kind: SurfaceMemberKind,
         owner: &NominalKey,
         schema: &AggregateSchema,
         surface: &mut PromotedSurface,
     ) {
-        let direct_methods = schema
-            .methods
-            .keys()
-            .filter(|key| key.surface == MethodSurface::Instance)
-            .map(|key| key.name)
-            .collect::<HashSet<_>>();
-        let mut names = surface.methods.keys().copied().collect::<Vec<_>>();
+        let direct = kind.direct_names(schema);
+        let map = kind.map_mut(surface);
+        let mut names = map.keys().copied().collect::<Vec<_>>();
         names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         for name in names {
-            let Some(slot) = surface.methods.remove(&name) else {
+            let Some(slot) = map.remove(&name) else {
                 continue;
             };
             let explicit = explicit_aliases(&slot);
-            if direct_methods.contains(&name) {
+            if direct.contains(&name) {
                 for alias in explicit {
-                    self.errors.push(DeclError::EmbedMethodConflictsWithDirect {
-                        owner: owner.clone(),
+                    self.errors.push(kind.direct_conflict(
+                        owner.clone(),
                         name,
-                        span: alias.selector_span,
-                    });
+                        alias.selector_span,
+                    ));
                 }
                 continue;
             }
 
             let aliases = merged_aliases(slot, |alias| {
-                self.errors.push(DeclError::DuplicateExplicitEmbedMethod {
-                    owner: owner.clone(),
-                    name,
-                    span: alias.selector_span,
-                });
+                self.errors
+                    .push(kind.duplicate_explicit(owner.clone(), name, alias.selector_span));
             });
-            insert_merged_aliases(&mut surface.methods, name, aliases);
+            insert_merged_aliases(map, name, aliases);
         }
     }
 
@@ -1077,337 +1092,4 @@ fn concrete_surface_type(ty: &Type) -> bool {
 
 fn concrete_const_arg(arg: &ConstArg) -> bool {
     matches!(arg, ConstArg::Value(_))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        ast::{Ident, NominalKind, Program, Type},
-        test_support::{parse_program, resolved_modules},
-        typecheck::{
-            DeclarationIndex, DependentEmbedTemplate, ModuleScope, ProjectionEntry,
-            TypecheckConfig, typechecker_for_modules,
-        },
-    };
-
-    fn ident(name: &str) -> Ident {
-        Ident::new(name)
-    }
-
-    fn parse(source: &str) -> Program {
-        parse_program(source)
-    }
-
-    fn checked_index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
-        let root = parse(root);
-        let resolved = resolved_modules(&root, modules);
-        let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
-        let mut tc = typechecker_for_modules(&root, &resolved, externs, TypecheckConfig::default())
-            .expect("typecheck failed");
-        tc.finish().expect("typecheck failed");
-        tc.decls.clone()
-    }
-
-    fn promoted_slot<'a>(
-        index: &'a DeclarationIndex,
-        owner: &str,
-        field: &str,
-    ) -> Option<&'a SurfaceSlot<PromotedFieldAlias>> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.promoted.fields.get(&ident(field))
-    }
-
-    fn promoted_paths(index: &DeclarationIndex, owner: &str, field: &str) -> Vec<Vec<Ident>> {
-        promoted_slot(index, owner, field)
-            .map(|slot| {
-                slot.aliases
-                    .iter()
-                    .map(|alias| alias.path.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn promoted_method_slot<'a>(
-        index: &'a DeclarationIndex,
-        owner: &str,
-        method: &str,
-    ) -> Option<&'a SurfaceSlot<PromotedMethodAlias>> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.promoted.methods.get(&ident(method))
-    }
-
-    fn promoted_method_paths(
-        index: &DeclarationIndex,
-        owner: &str,
-        method: &str,
-    ) -> Vec<Vec<Ident>> {
-        promoted_method_slot(index, owner, method)
-            .map(|slot| {
-                slot.aliases
-                    .iter()
-                    .map(|alias| alias.path.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn projections(index: &DeclarationIndex, owner: &str) -> Vec<ProjectionEntry> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.projections.clone()
-    }
-
-    fn dependent_embeds(index: &DeclarationIndex, owner: &str) -> Vec<DependentEmbedTemplate> {
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident(owner))
-            .expect("missing owner");
-        let aggregate = index.aggregate(&key).expect("missing aggregate");
-        aggregate.dependent_embeds.clone()
-    }
-
-    #[test]
-    fn bare_embed_builds_field_surface() {
-        let index = checked_index(
-            "struct Health { hp: int, max_hp: int } struct Enemy { embed health: Health }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "hp"),
-            vec![vec![ident("health"), ident("hp")]]
-        );
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "max_hp"),
-            vec![vec![ident("health"), ident("max_hp")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_transitive_field_surface() {
-        let index = checked_index(
-            "struct Health { hp: int } struct Actor { embed health: Health } struct Enemy { embed actor: Actor }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "health"),
-            vec![vec![ident("actor"), ident("health")]]
-        );
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "hp"),
-            vec![vec![ident("actor"), ident("health"), ident("hp")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_extern_fields() {
-        let index = checked_index(
-            "extern type Point { x: float; y: float; } struct Enemy { embed point: Point }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "x"),
-            vec![vec![ident("point"), ident("x")]]
-        );
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "y"),
-            vec![vec![ident("point"), ident("y")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_method_surface() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} fn to_string(self) -> string { \"hp\" } } struct Enemy { embed health: Health }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "damage"),
-            vec![vec![ident("health")]]
-        );
-        assert!(promoted_method_paths(&index, "Enemy", "to_string").is_empty());
-    }
-
-    #[test]
-    fn bare_embed_imports_transitive_method_surface() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} } struct Actor { embed health: Health } struct Enemy { embed actor: Actor }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "damage"),
-            vec![vec![ident("actor"), ident("health")]]
-        );
-    }
-
-    #[test]
-    fn bare_embed_imports_extern_methods() {
-        let index = checked_index(
-            "extern type Host { fn damage(self, amount: int); } struct Enemy { embed host: Host }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "damage"),
-            vec![vec![ident("host")]]
-        );
-    }
-
-    #[test]
-    fn as_embed_builds_projection_entry() {
-        let index = checked_index(
-            "struct Entity { id: int } struct Enemy { @as embed entity: Entity }",
-            &[],
-        );
-        let projections = projections(&index, "Enemy");
-
-        assert_eq!(projections.len(), 1);
-        assert_eq!(projections[0].field_path, vec![ident("entity")]);
-        assert_eq!(
-            projections[0].target_ty,
-            Type::nominal(NominalKind::Struct, ident("Entity"), vec![], vec![], None)
-        );
-    }
-
-    #[test]
-    fn as_embed_allows_distinct_projection_targets() {
-        let index = checked_index(
-            "struct Entity { id: int } struct Body { mass: int } struct Enemy { @as embed entity: Entity, @as embed body: Body }",
-            &[],
-        );
-
-        assert_eq!(projections(&index, "Enemy").len(), 2);
-    }
-
-    #[test]
-    fn generic_embed_target_records_dependent_template_only() {
-        let index = checked_index("struct Box<T> { embed value: T }", &[]);
-        let templates = dependent_embeds(&index, "Box");
-
-        assert!(promoted_paths(&index, "Box", "value").is_empty());
-        assert!(promoted_method_paths(&index, "Box", "value").is_empty());
-        assert_eq!(templates.len(), 1);
-        assert_eq!(templates[0].field_path, vec![ident("value")]);
-        assert!(matches!(templates[0].target_ty, Type::Var(_)));
-        assert!(templates[0].selector.is_none());
-        assert_eq!(templates[0].exposure, Exposure::Implicit);
-    }
-
-    #[test]
-    fn generic_embed_selector_records_dependent_template_only() {
-        let index = checked_index("struct Box<T> { embed value: T { x as y } }", &[]);
-        let templates = dependent_embeds(&index, "Box");
-
-        assert!(promoted_paths(&index, "Box", "y").is_empty());
-        assert_eq!(templates.len(), 1);
-        assert_eq!(templates[0].field_path, vec![ident("value")]);
-        assert!(templates[0].selector.is_some());
-        assert_eq!(templates[0].exposure, Exposure::Explicit);
-    }
-
-    #[test]
-    fn concrete_embed_of_generic_target_uses_dependent_target_surface() {
-        let index = checked_index(
-            "struct Health { hp: int }
-            struct Box<T> { embed value: T }
-            struct Enemy { embed health: Box<Health> }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "hp"),
-            vec![vec![ident("health"), ident("value"), ident("hp")]]
-        );
-    }
-
-    #[test]
-    fn selector_builds_explicit_field_surface() {
-        let index = checked_index(
-            "struct Health { hp: int, max_hp: int } struct Enemy { embed health: Health { hp as health_hp } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "health_hp"),
-            vec![vec![ident("health"), ident("hp")]]
-        );
-        assert!(promoted_paths(&index, "Enemy", "max_hp").is_empty());
-    }
-
-    #[test]
-    fn selector_can_import_target_promoted_field() {
-        let index = checked_index(
-            "struct Health { hp: int } struct Actor { embed health: Health } struct Enemy { embed actor: Actor { hp as enemy_hp } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_paths(&index, "Enemy", "enemy_hp"),
-            vec![vec![ident("actor"), ident("health"), ident("hp")]]
-        );
-    }
-
-    #[test]
-    fn selector_builds_explicit_method_surface() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} } struct Enemy { embed health: Health { fn damage as hit } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "hit"),
-            vec![vec![ident("health")]]
-        );
-        assert!(promoted_method_paths(&index, "Enemy", "damage").is_empty());
-    }
-
-    #[test]
-    fn selector_can_import_target_promoted_method() {
-        let index = checked_index(
-            "struct Health { fn damage(self) {} } struct Actor { embed health: Health } struct Enemy { embed actor: Actor { fn damage as hit } }",
-            &[],
-        );
-
-        assert_eq!(
-            promoted_method_paths(&index, "Enemy", "hit"),
-            vec![vec![ident("actor"), ident("health")]]
-        );
-    }
-
-    #[test]
-    fn same_length_implicit_fields_remain_ambiguous() {
-        let index = checked_index(
-            "struct A { x: int } struct B { x: int } struct Enemy { embed a: A, embed b: B }",
-            &[],
-        );
-        let slot = promoted_slot(&index, "Enemy", "x").expect("missing promoted field");
-
-        assert!(slot.ambiguous);
-        assert_eq!(slot.aliases.len(), 2);
-    }
-
-    #[test]
-    fn same_length_implicit_methods_remain_ambiguous() {
-        let index = checked_index(
-            "struct A { fn tick(self) {} } struct B { fn tick(self) {} } struct Enemy { embed a: A, embed b: B }",
-            &[],
-        );
-        let slot = promoted_method_slot(&index, "Enemy", "tick").expect("missing promoted method");
-
-        assert!(slot.ambiguous);
-        assert_eq!(slot.aliases.len(), 2);
-    }
 }

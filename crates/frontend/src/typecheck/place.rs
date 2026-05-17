@@ -291,6 +291,15 @@ impl PlacePath {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum MutableUseKind {
+    Assign(Ident),
+    MutBorrow(Ident),
+    MutatingReceiver(Ident),
+    VarArg(Ident),
+    AliasPattern,
+}
+
 impl PlaceAccess {
     pub(super) fn can_assign(self) -> bool {
         matches!(self, Self::Mutable | Self::Settable)
@@ -305,13 +314,7 @@ impl PlaceAccess {
         name: Ident,
         span: Option<crate::span::SourceSpan>,
     ) -> Option<TypeError> {
-        match self {
-            Self::Mutable | Self::Settable => None,
-            Self::DynView => Some(TypeError::BorrowedDynReassign { name, span }),
-            Self::Const => Some(TypeError::ConstAssignment { name, span }),
-            Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
-            Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
-        }
+        self.error_for(MutableUseKind::Assign(name), span)
     }
 
     pub(super) fn mut_borrow_error(
@@ -319,12 +322,57 @@ impl PlaceAccess {
         name: Ident,
         span: Option<crate::span::SourceSpan>,
     ) -> Option<TypeError> {
-        match self {
-            Self::Mutable | Self::DynView => None,
-            Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
-            Self::Const => Some(TypeError::ConstAssignment { name, span }),
-            Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
-            Self::Immutable | Self::NotPlace => Some(TypeError::ImmutableAssignment { name, span }),
+        self.error_for(MutableUseKind::MutBorrow(name), span)
+    }
+
+    pub(super) fn error_for(
+        self,
+        kind: MutableUseKind,
+        span: Option<crate::span::SourceSpan>,
+    ) -> Option<TypeError> {
+        match kind {
+            MutableUseKind::Assign(name) => match self {
+                Self::Mutable | Self::Settable => None,
+                Self::DynView => Some(TypeError::BorrowedDynReassign { name, span }),
+                Self::Const => Some(TypeError::ConstAssignment { name, span }),
+                Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
+                Self::Immutable | Self::NotPlace => {
+                    Some(TypeError::ImmutableAssignment { name, span })
+                }
+            },
+            MutableUseKind::MutBorrow(name) => match self {
+                Self::Mutable | Self::DynView => None,
+                Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+                Self::Const => Some(TypeError::ConstAssignment { name, span }),
+                Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
+                Self::Immutable | Self::NotPlace => {
+                    Some(TypeError::ImmutableAssignment { name, span })
+                }
+            },
+            MutableUseKind::MutatingReceiver(name) => match self {
+                Self::Mutable | Self::DynView => None,
+                Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+                Self::Immutable | Self::Const | Self::ReadonlySelf | Self::NotPlace => {
+                    Some(TypeError::MutatingMethodImmutableReceiver { name, span })
+                }
+            },
+            MutableUseKind::VarArg(name) => match self {
+                Self::Mutable | Self::DynView => None,
+                Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
+                Self::Immutable | Self::Const => {
+                    Some(TypeError::VarArgImmutableBinding { name, span })
+                }
+                Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
+                Self::NotPlace => Some(TypeError::VarArgNonLvalue { span }),
+            },
+            MutableUseKind::AliasPattern => match self {
+                Self::Mutable | Self::Settable => None,
+                Self::DynView
+                | Self::Const
+                | Self::ReadonlySelf
+                | Self::Immutable
+                | Self::NotPlace => Some(TypeError::VarPatternRequiresMutablePlace { span }),
+            },
         }
     }
 }
@@ -631,10 +679,12 @@ fn field_checked(
 
 pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     let place = check_place(expr, tc);
-    if !place.value.access.can_assign() {
-        tc.push_error(TypeError::VarPatternRequiresMutablePlace {
-            span: tc.error_span(expr.span),
-        });
+    if let Some(error) = place
+        .value
+        .access
+        .error_for(MutableUseKind::AliasPattern, tc.error_span(expr.span))
+    {
+        tc.push_error(error);
     }
     record_mut_borrow(expr.node.id, &place.value, tc);
     place

@@ -20,7 +20,7 @@ use super::{
     generic_bind::bind_prefix_generic_seeds,
     infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
     member,
-    place::{self, PlaceUseFacts, PlaceValue},
+    place::{self, MutableUseKind, PlaceUseFacts, PlaceValue},
 };
 use crate::{
     ast::{
@@ -407,10 +407,7 @@ fn subject_type(subject: &Subject) -> Type {
             signature.to_func_type()
         }
         Subject::DynMethod { requirement, .. } => func_type(&requirement.params, &requirement.ret),
-        Subject::DynHoleMethod { .. } => Type::Func {
-            params: vec![],
-            ret: Box::new(ReturnSpec::void()),
-        },
+        Subject::DynHoleMethod { .. } => Type::func(vec![], ReturnSpec::void()),
         Subject::Module(_) => Type::Void,
         Subject::Type(ty) => ty.clone(),
         Subject::QualifiedExtend { .. } | Subject::Error => Type::Infer,
@@ -440,7 +437,7 @@ fn expected_for_chain(
     }
     let ty = tc.handle_type(&expected);
     tc.decls
-        .core_option_inner(&ty)
+        .semantic_option_inner(&ty)
         .map(|inner| tc.type_handle(inner))
 }
 
@@ -1279,9 +1276,10 @@ fn check_source_receiver(
 ) -> Option<MutableArg> {
     receiver.use_.check_root(span, tc);
     if receiver.mutable {
-        if let Some(error) =
-            mutating_receiver_error(receiver.use_.access, receiver.name, tc.error_span(span))
-        {
+        if let Some(error) = receiver.use_.access.error_for(
+            MutableUseKind::MutatingReceiver(receiver.name),
+            tc.error_span(span),
+        ) {
             tc.push_error(error);
             return None;
         }
@@ -1294,21 +1292,6 @@ fn check_source_receiver(
     }
     receiver.use_.record_read(tc);
     None
-}
-
-fn mutating_receiver_error(
-    access: PlaceAccess,
-    name: Ident,
-    span: Option<crate::span::SourceSpan>,
-) -> Option<TypeError> {
-    match access {
-        PlaceAccess::Mutable | PlaceAccess::DynView => None,
-        PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
-        PlaceAccess::Immutable
-        | PlaceAccess::Const
-        | PlaceAccess::ReadonlySelf
-        | PlaceAccess::NotPlace => Some(TypeError::MutatingMethodImmutableReceiver { name, span }),
-    }
 }
 
 fn call_value(
@@ -1367,7 +1350,10 @@ fn check_dyn_hole_method_call(
     let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
     receiver.check_root(call.span, tc);
     if requires_mutable {
-        match mutating_receiver_error(receiver.access, name, tc.error_span(call.span)) {
+        match receiver.access.error_for(
+            MutableUseKind::MutatingReceiver(name),
+            tc.error_span(call.span),
+        ) {
             Some(error) => {
                 tc.push_error(error);
             }
@@ -1453,9 +1439,10 @@ fn check_dyn_method_call(
     receiver.check_root(call.span, tc);
     let mut failed = false;
     if requires_mutable {
-        if let Some(error) =
-            mutating_receiver_error(receiver.access, name, tc.error_span(call.span))
-        {
+        if let Some(error) = receiver.access.error_for(
+            MutableUseKind::MutatingReceiver(name),
+            tc.error_span(call.span),
+        ) {
             tc.push_error(error);
             failed = true;
         } else {
@@ -1727,22 +1714,6 @@ fn validate_mutable_aliases(args: &[MutableArg], tc: &mut TypeChecker) -> bool {
     failed
 }
 
-fn var_arg_error(
-    access: PlaceAccess,
-    name: Ident,
-    span: Option<crate::span::SourceSpan>,
-) -> Option<TypeError> {
-    match access {
-        PlaceAccess::Mutable | PlaceAccess::DynView => None,
-        PlaceAccess::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
-        PlaceAccess::Immutable | PlaceAccess::Const => {
-            Some(TypeError::VarArgImmutableBinding { name, span })
-        }
-        PlaceAccess::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
-        PlaceAccess::NotPlace => Some(TypeError::VarArgNonLvalue { span }),
-    }
-}
-
 fn check_source_arg(
     arg: &ExprNode,
     param: &CallParam,
@@ -1763,7 +1734,10 @@ fn check_source_arg(
 fn check_var_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
     let place = place::check_place(arg, tc);
     let name = super::assignment_target_name(arg);
-    let error = var_arg_error(place.value.access, name, tc.error_span(arg.span));
+    let error = place
+        .value
+        .access
+        .error_for(MutableUseKind::VarArg(name), tc.error_span(arg.span));
     finish_var_arg(arg, param, place, error, tc)
 }
 
@@ -1776,7 +1750,10 @@ fn check_projecting_var_arg(
 ) -> SourceArgCheck {
     let place = place::check_place(arg, tc);
     let name = super::assignment_target_name(arg);
-    let mutability_error = var_arg_error(place.value.access, name, tc.error_span(arg.span));
+    let mutability_error = place
+        .value
+        .access
+        .error_for(MutableUseKind::VarArg(name), tc.error_span(arg.span));
     if can_assign_without_errors(
         arg.span,
         place.value.checked.handle.clone(),
@@ -2469,10 +2446,7 @@ fn not_callable(ty: Type, call: &CallNode, tc: &mut TypeChecker) -> Type {
 }
 
 fn func_type(params: &[FuncParam], ret: &ReturnSpec) -> Type {
-    Type::Func {
-        params: params.to_vec(),
-        ret: Box::new(ret.clone()),
-    }
+    Type::func(params.to_vec(), ret.clone())
 }
 
 fn non_aggregate_member(
@@ -2672,9 +2646,7 @@ fn check_index_access_inner(
             tc.solve_constraints();
             let value = (**value).clone();
             CheckedIndex::new(
-                tc.decls
-                    .core_option_of(value.clone())
-                    .unwrap_or(Type::Infer),
+                tc.decls.semantic_option_of(value.clone()),
                 value,
                 target,
                 &index,

@@ -76,12 +76,10 @@ fn contains_nil(elements: &[ExprNode]) -> bool {
 
 fn option_elem_handle(elem: TypeHandle, tc: &mut TypeChecker) -> TypeHandle {
     let ty = tc.handle_type(&elem);
-    if tc.decls.core_option_inner(&ty).is_some() {
+    if tc.decls.semantic_option_inner(&ty).is_some() {
         return elem;
     }
-    let Some(option_ty) = tc.decls.core_option_of(ty) else {
-        return elem;
-    };
+    let option_ty = tc.decls.semantic_option_of(ty);
     tc.type_handle(&option_ty)
 }
 
@@ -678,25 +676,17 @@ fn check_expr_fields(
     inf: &NominalLiteralSolver,
     tc: &mut TypeChecker,
 ) -> NominalFieldCheck {
-    let uses = fields
-        .iter()
-        .enumerate()
-        .map(|(index, (name, value))| field_check::FieldUse {
-            name: *name,
-            span: value.span,
-            index,
-        })
-        .collect::<Vec<_>>();
-    let shape = field_check::check(&uses, schema, &owner, missing, Some(span), tc);
-    let valid = shape
-        .fields
-        .iter()
-        .map(|field| field.index)
-        .collect::<HashSet<_>>();
-    for (index, (_, value)) in fields.iter().enumerate() {
-        if !valid.contains(&index) {
-            check_expr_checked(value, tc);
-        }
+    let shape = field_check::check_named(
+        fields,
+        schema,
+        &owner,
+        missing,
+        Some(span),
+        |value| value.span,
+        tc,
+    );
+    for index in &shape.invalid_indices {
+        check_expr_checked(&fields[*index].1, tc);
     }
     let mut check = NominalFieldCheck {
         failed: shape.failed,

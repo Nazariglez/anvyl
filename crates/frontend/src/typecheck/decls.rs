@@ -694,6 +694,13 @@ pub(crate) struct Namespace {
     pub(crate) modules: HashMap<Ident, ModuleScope>,
 }
 
+#[derive(Clone, Copy)]
+enum NamespaceMember<'a> {
+    Value(&'a ResolvedValue),
+    Type(&'a TypeBinding),
+    Module(&'a ModuleScope),
+}
+
 pub(crate) type ModuleExports = Namespace;
 
 pub(crate) enum ModuleMemberLookup<T> {
@@ -752,6 +759,7 @@ struct ImportScopeBuilder {
     active_module_imports: HashMap<ModuleScope, Vec<ImportId>>,
     origins: HashMap<OriginKey, BindingOrigin>,
     binding_origins: HashMap<OriginKey, ImportId>,
+    private_reexports: HashSet<Ident>,
     errors: Vec<DeclError>,
     mode: ImportMode,
 }
@@ -774,6 +782,7 @@ pub(crate) struct ModuleDecls {
     locals: Namespace,
     exports: ModuleExports,
     exported_active_modules: HashSet<ModuleScope>,
+    private_reexports: HashSet<Ident>,
     imports: ImportScope,
 }
 
@@ -803,6 +812,24 @@ pub(crate) enum ValueDecl {
     Global(GlobalSig),
 }
 
+impl NamespaceMember<'_> {
+    fn namespace(&self) -> BindingNamespace {
+        match self {
+            Self::Value(_) => BindingNamespace::Value,
+            Self::Type(_) => BindingNamespace::Type,
+            Self::Module(_) => BindingNamespace::Module,
+        }
+    }
+
+    fn module(&self) -> ModuleScope {
+        match self {
+            Self::Value(value) => value.module.clone(),
+            Self::Type(binding) => binding.module().clone(),
+            Self::Module(module) => (*module).clone(),
+        }
+    }
+}
+
 impl Namespace {
     fn value(&self, name: Ident) -> Option<&ResolvedValue> {
         self.values.get(&name)
@@ -822,6 +849,32 @@ impl Namespace {
             || self.modules.contains_key(&name)
     }
 
+    fn for_each_member(&self, mut f: impl FnMut(Ident, NamespaceMember<'_>)) {
+        for (name, value) in &self.values {
+            f(*name, NamespaceMember::Value(value));
+        }
+        for (name, binding) in &self.types {
+            f(*name, NamespaceMember::Type(binding));
+        }
+        for (name, module) in &self.modules {
+            f(*name, NamespaceMember::Module(module));
+        }
+    }
+
+    fn named_members(&self, name: Ident) -> Vec<NamespaceMember<'_>> {
+        let mut members = vec![];
+        if let Some(value) = self.values.get(&name) {
+            members.push(NamespaceMember::Value(value));
+        }
+        if let Some(binding) = self.types.get(&name) {
+            members.push(NamespaceMember::Type(binding));
+        }
+        if let Some(module) = self.modules.get(&name) {
+            members.push(NamespaceMember::Module(module));
+        }
+        members
+    }
+
     fn insert_value(&mut self, visible: Ident, value: ResolvedValue) {
         self.values.insert(visible, value);
     }
@@ -830,8 +883,18 @@ impl Namespace {
         self.types.insert(visible, binding);
     }
 
-    fn insert_module(&mut self, visible: Ident, module: ModuleScope) {
-        self.modules.insert(visible, module);
+    fn insert_member(&mut self, visible: Ident, member: NamespaceMember<'_>) {
+        match member {
+            NamespaceMember::Value(value) => {
+                self.values.insert(visible, value.clone());
+            }
+            NamespaceMember::Type(binding) => {
+                self.types.insert(visible, binding.clone());
+            }
+            NamespaceMember::Module(module) => {
+                self.modules.insert(visible, module.clone());
+            }
+        }
     }
 }
 
@@ -844,6 +907,7 @@ impl ImportScopeBuilder {
             active_module_imports: HashMap::new(),
             origins: HashMap::new(),
             binding_origins: HashMap::new(),
+            private_reexports: HashSet::new(),
             errors: vec![],
             mode,
         }
@@ -862,24 +926,10 @@ impl ImportScopeBuilder {
     }
 
     fn seed_origins(&mut self, namespace: &Namespace, origin: &BindingOrigin) {
-        self.origins.extend(
-            namespace
-                .values
-                .keys()
-                .map(|name| ((BindingNamespace::Value, *name), origin.clone())),
-        );
-        self.origins.extend(
-            namespace
-                .types
-                .keys()
-                .map(|name| ((BindingNamespace::Type, *name), origin.clone())),
-        );
-        self.origins.extend(
-            namespace
-                .modules
-                .keys()
-                .map(|name| ((BindingNamespace::Module, *name), origin.clone())),
-        );
+        namespace.for_each_member(|name, member| {
+            self.origins
+                .insert((member.namespace(), name), origin.clone());
+        });
     }
 
     fn origin(&self, source: ModuleScope, import: ImportId) -> BindingOrigin {
@@ -896,7 +946,7 @@ impl ImportScopeBuilder {
     fn apply_import(
         &mut self,
         kind: &ImportKind,
-        source: ModuleScope,
+        source: &ModuleScope,
         default_name: Ident,
         dep: Option<&ModuleDecls>,
         span: Option<SourceSpan>,
@@ -905,15 +955,20 @@ impl ImportScopeBuilder {
     ) {
         match kind {
             ImportKind::Module => {
-                self.insert_module(
+                self.insert_member(
                     default_name,
-                    source.clone(),
-                    self.origin(source, import_id),
+                    NamespaceMember::Module(source),
+                    self.origin(source.clone(), import_id),
                     span,
                 );
             }
             ImportKind::ModuleAs(alias) => {
-                self.insert_module(*alias, source.clone(), self.origin(source, import_id), span);
+                self.insert_member(
+                    *alias,
+                    NamespaceMember::Module(source),
+                    self.origin(source.clone(), import_id),
+                    span,
+                );
             }
             ImportKind::Selective(items) => {
                 for item in items {
@@ -923,9 +978,9 @@ impl ImportScopeBuilder {
                     });
                     match item.kind {
                         ImportItemKind::SelfModule => {
-                            self.insert_module(
+                            self.insert_member(
                                 target,
-                                source.clone(),
+                                NamespaceMember::Module(source),
                                 self.origin(source.clone(), import_id.clone()),
                                 span,
                             );
@@ -934,7 +989,7 @@ impl ImportScopeBuilder {
                             if let Some(dep) = dep {
                                 self.copy_named_members(
                                     dep,
-                                    &source,
+                                    source,
                                     name,
                                     target,
                                     span,
@@ -948,11 +1003,7 @@ impl ImportScopeBuilder {
             }
             ImportKind::Wildcard => {
                 if let Some(dep) = dep {
-                    self.copy_wildcard_members(
-                        &dep.exports,
-                        span,
-                        &self.origin(source.clone(), import_id),
-                    );
+                    self.copy_wildcard_members(dep, span, &self.origin(source.clone(), import_id));
                 }
             }
         }
@@ -969,25 +1020,26 @@ impl ImportScopeBuilder {
         import_id: ImportId,
     ) {
         let origin = self.origin(origin_module.clone(), import_id);
-        let mut found = false;
-        if let Some(key) = dep.exports.ty(source_name).cloned() {
-            found = true;
-            self.insert_type(target_name, key, origin.clone(), span);
-        }
-        if let Some(value) = dep.exports.value(source_name).cloned() {
-            found = true;
-            self.insert_value(target_name, value, origin.clone(), span);
-        }
-        if let Some(module) = dep.exports.module(source_name).cloned() {
-            found = true;
-            self.insert_module(target_name, module, origin, span);
+        let members = dep.exports.named_members(source_name);
+        let found = !members.is_empty();
+        for member in members {
+            self.insert_member(target_name, member, origin.clone(), span);
         }
         if found || !validate_members {
+            return;
+        }
+        if dep.private_reexports.contains(&source_name) {
+            if self.mode == ImportMode::Reexport {
+                self.private_reexports.insert(target_name);
+            }
             return;
         }
         if dep.locals.contains_member(source_name)
             || dep.imports.namespace.contains_member(source_name)
         {
+            if self.mode == ImportMode::Reexport {
+                self.private_reexports.insert(target_name);
+            }
             self.push_private_member(origin_module.clone(), source_name, span);
         } else {
             self.push_missing_member(origin_module.clone(), source_name, span);
@@ -1024,60 +1076,30 @@ impl ImportScopeBuilder {
 
     fn copy_wildcard_members(
         &mut self,
-        source: &Namespace,
+        dep: &ModuleDecls,
         span: Option<SourceSpan>,
         origin: &BindingOrigin,
     ) {
-        for (name, key) in &source.types {
-            self.insert_type(*name, key.clone(), origin.clone(), span);
-        }
-        for (name, value) in &source.values {
-            self.insert_value(*name, value.clone(), origin.clone(), span);
-        }
-        for (name, module) in &source.modules {
-            self.insert_module(*name, module.clone(), origin.clone(), span);
+        dep.exports.for_each_member(|name, member| {
+            self.insert_member(name, member, origin.clone(), span);
+        });
+        if self.mode == ImportMode::Reexport {
+            self.private_reexports
+                .extend(dep.private_reexports.iter().copied());
         }
     }
 
-    fn insert_value(
+    fn insert_member(
         &mut self,
         name: Ident,
-        value: ResolvedValue,
+        member: NamespaceMember<'_>,
         origin: BindingOrigin,
         span: Option<SourceSpan>,
     ) -> bool {
-        if !self.claim_origin(BindingNamespace::Value, name, origin, span) {
+        if !self.claim_origin(member.namespace(), name, origin, span) {
             return false;
         }
-        self.namespace.insert_value(name, value);
-        true
-    }
-
-    fn insert_type(
-        &mut self,
-        name: Ident,
-        binding: TypeBinding,
-        origin: BindingOrigin,
-        span: Option<SourceSpan>,
-    ) -> bool {
-        if !self.claim_origin(BindingNamespace::Type, name, origin, span) {
-            return false;
-        }
-        self.namespace.insert_type(name, binding);
-        true
-    }
-
-    fn insert_module(
-        &mut self,
-        name: Ident,
-        module: ModuleScope,
-        origin: BindingOrigin,
-        span: Option<SourceSpan>,
-    ) -> bool {
-        if !self.claim_origin(BindingNamespace::Module, name, origin, span) {
-            return false;
-        }
-        self.namespace.insert_module(name, module);
+        self.namespace.insert_member(name, member);
         true
     }
 
@@ -1158,32 +1180,30 @@ impl ImportScopeBuilder {
         )
     }
 
-    fn finish_reexport_scope(self) -> (Namespace, HashSet<ModuleScope>, Vec<DeclError>) {
-        (self.namespace, self.active_modules, self.errors)
+    fn finish_reexport_scope(
+        self,
+    ) -> (
+        Namespace,
+        HashSet<ModuleScope>,
+        HashSet<Ident>,
+        Vec<DeclError>,
+    ) {
+        (
+            self.namespace,
+            self.active_modules,
+            self.private_reexports,
+            self.errors,
+        )
     }
 }
 
 impl ImportScope {
     fn activate_imported_origins(&mut self) {
-        let values = self
-            .namespace
-            .values
-            .iter()
-            .map(|(name, value)| (value.module.clone(), (BindingNamespace::Value, *name)))
-            .collect::<Vec<_>>();
-        let types = self
-            .namespace
-            .types
-            .iter()
-            .map(|(name, binding)| (binding.module().clone(), (BindingNamespace::Type, *name)))
-            .collect::<Vec<_>>();
-        let modules = self
-            .namespace
-            .modules
-            .iter()
-            .map(|(name, module)| (module.clone(), (BindingNamespace::Module, *name)))
-            .collect::<Vec<_>>();
-        for (module, key) in values.into_iter().chain(types).chain(modules) {
+        let mut origins = vec![];
+        self.namespace.for_each_member(|name, member| {
+            origins.push((member.module(), (member.namespace(), name)));
+        });
+        for (module, key) in origins {
             self.activate_imported_origin(module, &key);
         }
     }
@@ -2741,7 +2761,7 @@ impl DeclarationIndex {
         modules: &[ModuleProgram<'_>],
         resolved: &ResolveResult,
     ) {
-        for module in modules {
+        for module in modules.iter().skip(1).chain(modules.first()) {
             let Some(exports) = self
                 .modules
                 .get(&module.scope)
@@ -2763,11 +2783,13 @@ impl DeclarationIndex {
                 &mut builder,
             );
 
-            let (exports, active_modules, errors) = builder.finish_reexport_scope();
+            let (exports, active_modules, private_reexports, errors) =
+                builder.finish_reexport_scope();
             self.errors.extend(errors);
             if let Some(decls) = self.modules.get_mut(&module.scope) {
                 decls.exports = exports;
                 decls.exported_active_modules = active_modules;
+                decls.private_reexports = private_reexports;
             }
         }
     }
@@ -2875,7 +2897,7 @@ impl DeclarationIndex {
             return;
         };
         builder.copy_wildcard_members(
-            &decls.exports,
+            decls,
             None,
             &ImportScopeBuilder::implicit_origin(core.clone()),
         );
@@ -2928,7 +2950,7 @@ impl DeclarationIndex {
             let validate_members = builder.mode == ImportMode::Reexport || !is_public;
             builder.apply_import(
                 &import.node.kind,
-                target.module,
+                &target.module,
                 target.default_name,
                 dep,
                 Some(import_span),
@@ -3118,16 +3140,6 @@ impl DeclarationIndex {
                 .get(&(BindingNamespace::Module, name))
                 .cloned(),
         ))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn visible_type_binding(
-        &self,
-        module: &ModuleScope,
-        name: Ident,
-    ) -> Option<TypeBinding> {
-        self.visible_type_binding_with_import(module, name)
-            .map(|(binding, _)| binding)
     }
 
     pub(crate) fn visible_type_binding_with_import(
@@ -3423,6 +3435,20 @@ impl DeclarationIndex {
         Some(inner)
     }
 
+    pub(crate) fn semantic_option_inner<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
+        self.core_option_inner(ty).or_else(|| {
+            self.core_option_key()
+                .is_none()
+                .then(|| ty.option_inner())
+                .flatten()
+        })
+    }
+
+    pub(crate) fn semantic_option_of(&self, inner: Type) -> Type {
+        self.core_option_of(inner.clone())
+            .unwrap_or_else(|| Type::option_of(inner))
+    }
+
     pub(crate) fn core_range_of(&self, kind: CoreRangeKind, inner: Type) -> Option<Type> {
         let key = self.core_range_key(kind)?;
         Some(nominal_type_with_args(&key, &[inner], &[]))
@@ -3456,7 +3482,7 @@ impl DeclarationIndex {
         ty: &Type,
         seen: &mut HashSet<NominalKey>,
     ) -> Option<MapKeyError> {
-        if self.core_option_inner(ty).is_some() {
+        if self.semantic_option_inner(ty).is_some() {
             return Some(MapKeyError {
                 ty: ty.clone(),
                 field: None,
@@ -3526,7 +3552,7 @@ impl DeclarationIndex {
         }
     }
 
-    fn core_option_key(&self) -> Option<NominalKey> {
+    pub(crate) fn core_option_key(&self) -> Option<NominalKey> {
         self.core_enum_key("option", Type::OPTION_ENUM_NAME)
     }
 
@@ -3990,39 +4016,22 @@ where
         })
         .collect();
     let ret_ty = f(site, ret.ty.clone());
-    Type::Func {
-        params,
-        ret: Box::new(ret.with_ty(ret_ty)),
-    }
+    Type::func(params, ret.with_ty(ret_ty))
 }
 
 pub(crate) fn func_type_from_params(params: &[Param], ret: &ReturnSpec) -> Type {
-    let resolved_params = params
-        .iter()
-        .map(|p| {
-            FuncParam::new(
-                p.ty.clone(),
-                matches!(p.mutability, Mutability::Mutable),
-                p.cast_accept,
-                p.escape,
-            )
-        })
-        .collect();
-    Type::Func {
-        params: resolved_params,
-        ret: Box::new(ret.clone()),
-    }
+    Type::func(resolve_func_params(params), ret.clone())
 }
 
 pub(crate) fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
     params
         .iter()
-        .map(|p| {
+        .map(|param| {
             FuncParam::new(
-                p.ty.clone(),
-                matches!(p.mutability, Mutability::Mutable),
-                p.cast_accept,
-                p.escape,
+                param.ty.clone(),
+                matches!(param.mutability, Mutability::Mutable),
+                param.cast_accept,
+                param.escape,
             )
         })
         .collect()
@@ -4151,39 +4160,31 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        test_support::{parse_program, resolved_modules, resolved_modules_with_external},
-        typecheck::type_ops::type_closure_facts,
+    use crate::test_support::{
+        ident, module_path_segments, parse_program, resolved_modules,
+        resolved_modules_with_external,
     };
 
-    fn ident(name: &str) -> Ident {
-        Ident::new(name)
-    }
-
-    fn parse(source: &str) -> Program {
-        parse_program(source)
-    }
-
     fn scope(name: &str) -> ModuleScope {
-        ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
+        ModuleScope::Named(module_path_segments(&[name]))
     }
 
     fn provider_scope(name: &str) -> ModuleScope {
         ModuleScope::from_module_id(&ModuleId::provider(
             PackageId::synthetic_root(),
-            ModulePath::new(vec![name.to_string()]).unwrap(),
+            module_path_segments(&[name]),
         ))
     }
 
     fn index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
-        let root = parse(root);
+        let root = parse_program(root);
         let resolved = resolved_modules(&root, modules);
         let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
         DeclarationIndex::from_root_and_modules(&root, &resolved, &externs)
     }
 
     fn checked_index(root: &str, modules: &[(&str, &str)]) -> DeclarationIndex {
-        let root = parse(root);
+        let root = parse_program(root);
         let resolved = resolved_modules(&root, modules);
         let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
         let mut tc = super::super::typechecker_for_modules(
@@ -4206,7 +4207,7 @@ mod tests {
         modules: &[(&str, &str)],
         provider: ProviderDescriptor,
     ) -> DeclarationIndex {
-        let root = parse(root);
+        let root = parse_program(root);
         let raw = crate::externs::ingest_providers(crate::externs::ExternInputs {
             packages: vec![crate::externs::PackageExternInputs {
                 package: PackageId::synthetic_root(),
@@ -4262,137 +4263,6 @@ mod tests {
             statics: vec![],
             operators: vec![],
         }
-    }
-
-    fn func_ret(ty: &Type) -> &Type {
-        let Type::Func { ret, .. } = ty else {
-            panic!("expected function type: {ty:?}");
-        };
-        &ret.ty
-    }
-
-    fn assert_nominal(ty: &Type, kind: NominalKind, module: Option<&str>, name: &str) {
-        let Type::Nominal(nominal) = ty else {
-            panic!("expected nominal type: {ty:?}");
-        };
-        assert_eq!(nominal.kind, kind);
-        assert_eq!(nominal.name, ident(name));
-        assert_eq!(
-            nominal.origin,
-            module.map(|name| ModuleOrigin::Module(std::rc::Rc::from(vec![name.to_string()])))
-        );
-    }
-
-    fn assert_no_unresolved_nominal(ty: &Type) {
-        assert!(
-            type_closure_facts(ty).first_unresolved.is_none(),
-            "unresolved nominal survived: {ty:?}"
-        );
-    }
-
-    fn assert_deprecated_reason(policy: &AccessPolicy, reason: &str) {
-        assert_eq!(policy.deprecated_reason(), Some(reason));
-    }
-
-    #[test]
-    fn function_policy() {
-        let index = index("@deprecated(\"use newer\") fn old() {}", &[]);
-        let value = index
-            .local_value(&ModuleScope::Root, ident("old"))
-            .expect("missing function");
-        let ValueDecl::Func(sig) = &value.decl else {
-            panic!("expected function");
-        };
-
-        assert_deprecated_reason(&sig.policy, "use newer");
-    }
-
-    #[test]
-    fn imported_function_policy() {
-        let index = index(
-            "import reexport { old };",
-            &[
-                ("lib", "@deprecated(\"use fresh\") pub fn old() {}"),
-                ("reexport", "pub import lib { old };"),
-            ],
-        );
-        let value = index
-            .imported_value(&ModuleScope::Root, ident("old"))
-            .expect("missing imported function");
-        let ValueDecl::Func(sig) = &value.decl else {
-            panic!("expected function");
-        };
-
-        assert_deprecated_reason(&sig.policy, "use fresh");
-    }
-
-    #[test]
-    fn source_extern_function_policy() {
-        let index = index(
-            "@deprecated(\"use host_new\") extern fn host_old() -> int;",
-            &[],
-        );
-        let value = index
-            .local_value(&ModuleScope::Root, ident("host_old"))
-            .expect("missing extern function");
-        let ValueDecl::Func(sig) = &value.decl else {
-            panic!("expected function");
-        };
-
-        assert_eq!(sig.kind, CallableKind::ExternFunction);
-        assert_deprecated_reason(&sig.policy, "use host_new");
-    }
-
-    #[test]
-    fn aggregate_policy() {
-        let index = index(
-            "@deprecated(\"use NewPoint\") struct OldPoint { x: int }",
-            &[],
-        );
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident("OldPoint"))
-            .expect("missing aggregate");
-        let agg = index.aggregate(&key).expect("missing aggregate schema");
-
-        assert_deprecated_reason(&agg.policy, "use NewPoint");
-    }
-
-    #[test]
-    fn enum_and_variant_policy() {
-        let index = index(
-            "@deprecated(\"use NewStatus\") enum Status { Active, @deprecated(\"use Active\") Disabled }",
-            &[],
-        );
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident("Status"))
-            .expect("missing enum");
-        let enm = index.enum_schema(&key).expect("missing enum schema");
-        let variant = enm
-            .variants
-            .get(&ident("Disabled"))
-            .expect("missing variant");
-
-        assert_deprecated_reason(&enm.policy, "use NewStatus");
-        assert_deprecated_reason(&variant.policy, "use Active");
-    }
-
-    #[test]
-    fn enum_variant_field_policy() {
-        let index = index(
-            "enum Event { Move { @deprecated(\"use x\") old_x: int, x: int } }",
-            &[],
-        );
-        let key = index
-            .local_nominal_type(&ModuleScope::Root, ident("Event"))
-            .expect("missing enum");
-        let enm = index.enum_schema(&key).expect("missing enum schema");
-        let variant = enm.variants.get(&ident("Move")).expect("missing variant");
-        let VariantPayload::Struct(fields) = &variant.payload else {
-            panic!("expected struct variant");
-        };
-        let field = fields.get(&ident("old_x")).expect("missing field");
-
-        assert_deprecated_reason(&field.policy, "use x");
     }
 
     #[test]
@@ -4476,128 +4346,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn private_not_exported() {
-        let index = index("", &[("tools", "fn hidden() {} pub fn shown() {}")]);
-        let tools = scope("tools");
-
-        assert!(index.local_value(&tools, ident("hidden")).is_some());
-        assert!(index.exported_value(&tools, ident("hidden")).is_none());
-        assert!(index.exported_value(&tools, ident("shown")).is_some());
-    }
-
-    #[test]
-    fn value_reexport_preserves_origin() {
-        let index = index(
-            "",
-            &[
-                ("tools", "pub fn id<T>(x: T) -> T { x }"),
-                ("facade", "pub import tools { id as dup };"),
-            ],
-        );
-        let value = index
-            .exported_value(&scope("facade"), ident("dup"))
-            .expect("missing reexport");
-
-        assert_eq!(value.module, scope("tools"));
-        assert_eq!(value.name, ident("id"));
-    }
-
-    #[test]
-    fn type_reexport_origin() {
-        let index = index(
-            "",
-            &[
-                ("tools", "pub struct Point { x: int }"),
-                ("facade", "pub import tools { Point as P };"),
-            ],
-        );
-        let key = index
-            .exported_nominal_type(&scope("facade"), ident("P"))
-            .expect("missing reexport");
-
-        assert_eq!(key.module, scope("tools"));
-        assert_eq!(key.name, ident("Point"));
-        assert_eq!(key.kind, NominalKind::Struct);
-    }
-
-    #[test]
-    fn return_type_module_imports() {
-        let index = checked_index(
-            "import facade { make };",
-            &[
-                ("alpha", "pub struct Item { value: int }"),
-                ("beta", "pub struct Item { label: string }"),
-                (
-                    "facade",
-                    "import alpha { Item }; pub fn make() -> Item { Item { value: 1 } }",
-                ),
-            ],
-        );
-        let value = index
-            .imported_value(&ModuleScope::Root, ident("make"))
-            .expect("missing import");
-
-        assert_no_unresolved_nominal(value.decl.ty());
-        assert_nominal(
-            func_ret(value.decl.ty()),
-            NominalKind::Struct,
-            Some("alpha"),
-            "Item",
-        );
-    }
-
-    #[test]
-    fn reexported_return_origin() {
-        let index = checked_index(
-            "import facade { make };",
-            &[
-                (
-                    "tools",
-                    "pub struct Point { x: int } pub fn make() -> Point { Point { x: 1 } }",
-                ),
-                ("other", "pub struct Point { y: int }"),
-                ("facade", "pub import tools { make };"),
-            ],
-        );
-        let value = index
-            .imported_value(&ModuleScope::Root, ident("make"))
-            .expect("missing import");
-
-        assert_no_unresolved_nominal(value.decl.ty());
-        assert_eq!(value.module, scope("tools"));
-        assert_eq!(value.name, ident("make"));
-        assert_nominal(
-            func_ret(value.decl.ty()),
-            NominalKind::Struct,
-            Some("tools"),
-            "Point",
-        );
-    }
-
-    #[test]
-    fn module_import_not_bare_type() {
-        let index = index(
-            "import shapes;",
-            &[("shapes", "pub struct Point { x: int }")],
-        );
-
-        assert_eq!(
-            index.imported_module(&ModuleScope::Root, ident("shapes")),
-            Some(scope("shapes"))
-        );
-        assert!(
-            index
-                .imported_type_binding(&ModuleScope::Root, ident("Point"))
-                .is_none()
-        );
-        assert!(
-            index
-                .visible_type_binding(&ModuleScope::Root, ident("Point"))
-                .is_none()
-        );
     }
 
     #[test]
@@ -4696,28 +4444,6 @@ mod tests {
         let ty = Type::nominal(NominalKind::Struct, ident("Point"), vec![], vec![], None);
 
         assert!(index.key_for_type(&ty).is_none());
-    }
-
-    #[test]
-    fn enum_return_type_keeps_origin() {
-        let index = checked_index(
-            "import states { current };",
-            &[(
-                "states",
-                "pub enum Status { Active } pub fn current() -> Status { Status.Active }",
-            )],
-        );
-        let value = index
-            .imported_value(&ModuleScope::Root, ident("current"))
-            .expect("missing import");
-
-        assert_no_unresolved_nominal(value.decl.ty());
-        assert_nominal(
-            func_ret(value.decl.ty()),
-            NominalKind::Enum,
-            Some("states"),
-            "Status",
-        );
     }
 
     #[test]
@@ -4881,22 +4607,6 @@ mod tests {
             imports.iter().map(|id| id.ordinal).collect::<Vec<_>>(),
             [0, 1]
         );
-    }
-
-    #[test]
-    fn wildcard_import_keeps_first_value() {
-        let index = index(
-            "import a { * }; import b { * };",
-            &[
-                ("a", "pub fn dup() -> int { 1 }"),
-                ("b", "pub fn dup() -> int { 2 }"),
-            ],
-        );
-        let value = index
-            .imported_value(&ModuleScope::Root, ident("dup"))
-            .expect("missing import");
-
-        assert_eq!(value.module, scope("a"));
     }
 
     #[test]

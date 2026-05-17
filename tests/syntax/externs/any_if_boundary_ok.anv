@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern fn get() -> any;
+extern fn put(value: any);
+
+fn main(cond: bool) {
+    put(if cond { get() } else { get() });
+}

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let forms = (0B1010, 0O17, 0xabcDEF, 0x0, 0b0, 0o0, 0x_FF);
+}

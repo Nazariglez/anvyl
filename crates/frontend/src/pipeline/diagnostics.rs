@@ -2284,25 +2284,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        ast::{Ident, Type},
+        ast::Type,
         externs::RawExternSite,
         lexer::{Keyword, Token, TokenStream},
         parser,
-        source::{SourceKind, SourceTable},
         span::SourceSpan,
-        typecheck::MemberAccessKind,
+        test_support::{ident, module_path_segments, test_source_id},
     };
 
-    fn ident(name: &str) -> Ident {
-        Ident::new(name)
-    }
-
-    fn module_path(path: &[&str]) -> ModulePath {
-        ModulePath::new(path.iter().map(ToString::to_string).collect()).unwrap()
-    }
-
     fn module_id(path: &[&str]) -> ModuleId {
-        ModuleId::named(PackageId::synthetic_root(), module_path(path))
+        ModuleId::named(PackageId::synthetic_root(), module_path_segments(path))
     }
 
     fn root_module_id() -> ModuleId {
@@ -2314,13 +2305,7 @@ mod tests {
     }
 
     fn module_scope(path: &[&str]) -> ModuleScope {
-        ModuleScope::Named(module_path(path))
-    }
-
-    fn source_module_scope(path: &str) -> ModuleScope {
-        ModuleScope::Package(ModuleId::source_without_package(
-            SourceFileId::new(path).unwrap(),
-        ))
+        ModuleScope::Named(module_path_segments(path))
     }
 
     fn catalog_context(module: &[&str], item: ExternContextItem) -> ExternCatalogContext {
@@ -2359,31 +2344,22 @@ mod tests {
         }
     }
 
-    fn test_source(text: &str) -> SourceId {
-        let mut sources = SourceTable::default();
-        sources.add(SourceKind::Virtual, "test", None, text)
-    }
-
     fn token_span() -> SourceSpan {
-        SourceSpan::new(test_source(";"), 0, 1)
+        SourceSpan::new(test_source_id(), 0, 1)
     }
 
     fn lex_source() -> SourceId {
-        test_source("!")
+        test_source_id()
     }
 
     fn resolve_span() -> SourceSpan {
-        SourceSpan::new(test_source("x"), 0, 1)
-    }
-
-    fn type_span() -> SourceSpan {
-        resolve_span()
+        SourceSpan::new(test_source_id(), 0, 1)
     }
 
     fn token_stream(tokens: Vec<(Token, SourceSpan)>) -> TokenStream {
         let source = tokens
             .first()
-            .map_or_else(|| test_source(""), |(_, span)| span.source());
+            .map_or_else(test_source_id, |(_, span)| span.source());
         let len = tokens.iter().map(|(_, span)| span.end()).max().unwrap_or(0);
         TokenStream {
             source,
@@ -2472,7 +2448,7 @@ mod tests {
 
         let diagnostic = diagnose_resolve_error(&ResolveError::SourceImportNotFound {
             importer: SourceFileId::new("/tmp/main.anv").unwrap(),
-            path: module_path(&["missing"]),
+            path: module_path_segments(&["missing"]),
             candidate: Some(std::path::PathBuf::from("missing.anv")),
             span,
         });
@@ -2481,397 +2457,6 @@ mod tests {
             Some("import resolved to no source file")
         );
         assert_eq!(diagnostic.notes(), &["looked for 'missing.anv'"]);
-    }
-
-    #[test]
-    fn renders_decl_errors() {
-        let cases = [
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::DuplicateType {
-                    module: ModuleScope::Root,
-                    name: ident("Point"),
-                    span: Some(resolve_span()),
-                })),
-                "type 'Point' is already defined",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::MissingImportMember {
-                    module: ModuleScope::Root,
-                    imported: module_scope(&["tools"]),
-                    name: ident("Point"),
-                    span: Some(resolve_span()),
-                })),
-                "Unknown member 'Point' in module 'tools'",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::PrivateImportMember {
-                    module: ModuleScope::Root,
-                    imported: module_scope(&["tools"]),
-                    name: ident("secret"),
-                    span: Some(resolve_span()),
-                })),
-                "member 'secret' in module 'tools' is private",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::MissingImportMember {
-                    module: ModuleScope::Root,
-                    imported: source_module_scope("/tmp/lib.anv"),
-                    name: ident("missing"),
-                    span: Some(resolve_span()),
-                })),
-                "Unknown member 'missing' in module 'lib'",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::DuplicateModuleBinding {
-                    module: ModuleScope::Root,
-                    name: ident("tools"),
-                    first: BindingOrigin::Local,
-                    second: BindingOrigin::ImplicitImport {
-                        source: module_scope(&["tools"]),
-                    },
-                    span: Some(resolve_span()),
-                })),
-                "module binding 'tools' is already in use",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::DuplicateGenericParam {
-                    module: ModuleScope::Root,
-                    name: ident("T"),
-                    span: Some(resolve_span()),
-                })),
-                "duplicate generic parameter 'T'",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::ImportConflict {
-                    module: ModuleScope::Root,
-                    name: ident("Point"),
-                    namespace: BindingNamespace::Type,
-                    first: BindingOrigin::Local,
-                    second: BindingOrigin::ImplicitImport {
-                        source: module_scope(&["shapes"]),
-                    },
-                    span: Some(resolve_span()),
-                })),
-                "imported type 'Point' conflicts with a locally defined type",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::ImportConflict {
-                    module: ModuleScope::Root,
-                    name: ident("Point"),
-                    namespace: BindingNamespace::Type,
-                    first: BindingOrigin::ImplicitImport {
-                        source: module_scope(&["alpha"]),
-                    },
-                    second: BindingOrigin::ImplicitImport {
-                        source: module_scope(&["beta"]),
-                    },
-                    span: Some(resolve_span()),
-                })),
-                "imported type 'Point' conflicts with a previously imported name",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::ReexportConflict {
-                    module: ModuleScope::Root,
-                    name: ident("Point"),
-                    namespace: BindingNamespace::Type,
-                    first: BindingOrigin::ImplicitImport {
-                        source: module_scope(&["alpha"]),
-                    },
-                    second: BindingOrigin::ImplicitImport {
-                        source: module_scope(&["beta"]),
-                    },
-                    span: Some(resolve_span()),
-                })),
-                "type 'Point' is re-exported by both 'alpha' and 'beta'",
-            ),
-            (
-                diagnose_type_error(&TypeError::Decl(DeclError::InvalidToStringMethod {
-                    message: "to_string method must return 'string'",
-                    span: Some(resolve_span()),
-                })),
-                "to_string method must return 'string'",
-            ),
-        ];
-
-        for (diagnostic, expected) in cases {
-            assert_msg(diagnostic, expected);
-        }
-    }
-
-    fn package_nominal(package: &str, name: &str) -> Type {
-        Type::nominal_with_origin(
-            ast::NominalKind::Struct,
-            ident(name),
-            vec![],
-            vec![],
-            Some(ModuleOrigin::Package {
-                package: package.to_string(),
-                path: None,
-            }),
-        )
-    }
-
-    #[test]
-    fn renders_type_errors() {
-        let cases = [
-            (
-                diagnose_type_error(&TypeError::TypeMismatch {
-                    expected: Type::Int,
-                    found: Type::Bool,
-                    span: Some(type_span()),
-                }),
-                "mismatched types",
-            ),
-            (
-                diagnose_type_error(&TypeError::TypeMismatch {
-                    expected: Type::Tuple(vec![Type::option_of(Type::Int)]),
-                    found: Type::Tuple(vec![Type::option_of(Type::String)]),
-                    span: Some(type_span()),
-                }),
-                "mismatched types",
-            ),
-            (
-                diagnose_type_error(&TypeError::TypeMismatch {
-                    expected: package_nominal("left", "Vec2"),
-                    found: package_nominal("right", "Vec2"),
-                    span: Some(type_span()),
-                }),
-                "mismatched types",
-            ),
-            (
-                diagnose_type_error(&TypeError::UndefinedVariable {
-                    name: ident("x"),
-                    span: Some(type_span()),
-                }),
-                "unknown variable",
-            ),
-            (
-                diagnose_type_error(&TypeError::InvalidOperand {
-                    op: "-".to_string(),
-                    operand_type: Type::Bool,
-                    span: Some(type_span()),
-                }),
-                "invalid operand type",
-            ),
-            (
-                diagnose_type_error(&TypeError::ConstAssignment {
-                    name: ident("LIMIT"),
-                    span: Some(type_span()),
-                }),
-                "Cannot assign to constant",
-            ),
-            (
-                diagnose_type_error(&TypeError::CannotInferEnum {
-                    span: Some(type_span()),
-                }),
-                "cannot infer enum type",
-            ),
-            (
-                diagnose_type_error(&TypeError::NamedFunctionCapture {
-                    name: ident("x"),
-                    span: Some(type_span()),
-                }),
-                "named functions cannot capture local value 'x'",
-            ),
-            (
-                diagnose_type_error(&TypeError::VarArgNonLvalue {
-                    span: Some(type_span()),
-                }),
-                "non-lvalue cannot be passed to var parameter",
-            ),
-            (
-                diagnose_type_error(&TypeError::VarArgImmutableBinding {
-                    name: ident("x"),
-                    span: Some(type_span()),
-                }),
-                "immutable binding 'x' cannot be passed to var parameter",
-            ),
-            (
-                diagnose_type_error(&TypeError::MutatingMethodImmutableReceiver {
-                    name: ident("self"),
-                    span: Some(type_span()),
-                }),
-                "mutating method requires mutable receiver 'self'",
-            ),
-            (
-                diagnose_type_error(&TypeError::MutableAlias {
-                    span: Some(type_span()),
-                }),
-                "var arguments must not alias the same variable",
-            ),
-            (
-                diagnose_type_error(&TypeError::InvalidFormatSpec {
-                    reason: "hex format requires int",
-                    span: Some(type_span()),
-                }),
-                "invalid format specifier: hex format requires int",
-            ),
-            (
-                diagnose_type_error(&TypeError::InfiniteSize {
-                    name: ident("Node"),
-                    span: Some(type_span()),
-                }),
-                "type 'Node' has infinite size",
-            ),
-            (
-                diagnose_type_error(&TypeError::NotEquatable {
-                    ty: Type::Slice {
-                        elem: Box::new(Type::Int),
-                    },
-                    span: Some(type_span()),
-                }),
-                "type 'slice[int]' is not equatable",
-            ),
-            (
-                diagnose_type_error(&TypeError::OrPatternBindingMismatch {
-                    span: Some(type_span()),
-                }),
-                "or-pattern alternatives must bind the same variables",
-            ),
-            (
-                diagnose_type_error(&TypeError::OrPatternBindingTypeMismatch {
-                    name: ident("x"),
-                    expected: Type::Int,
-                    found: Type::String,
-                    span: Some(type_span()),
-                }),
-                "or-pattern binding 'x' type mismatch: expected 'int', found 'string'",
-            ),
-            (
-                diagnose_type_error(&TypeError::UnknownMember {
-                    ty: Type::UnresolvedName(ident("Point")),
-                    member: ident("z"),
-                    kind: MemberAccessKind::Field,
-                    span: Some(type_span()),
-                }),
-                "Unknown field 'z' for type 'Point'",
-            ),
-            (
-                diagnose_type_error(&TypeError::UnknownMember {
-                    ty: Type::UnresolvedName(ident("Counter")),
-                    member: ident("reset"),
-                    kind: MemberAccessKind::Method,
-                    span: Some(type_span()),
-                }),
-                "Unknown method 'reset' for type 'Counter'",
-            ),
-            (
-                diagnose_type_error(&TypeError::MemberAccessOnNonAggregate {
-                    ty: Type::Int,
-                    member: ident("y"),
-                    kind: MemberAccessKind::Field,
-                    span: Some(type_span()),
-                }),
-                "Unknown field 'y' for type 'int'",
-            ),
-            (
-                diagnose_type_error(&TypeError::GenericArity(ArityError::TypeArgs {
-                    expected: 1,
-                    found: 2,
-                })),
-                "wrong number of type parameters: expected 1, found 2",
-            ),
-            (
-                diagnose_type_error(&TypeError::UnboundGenericParam {
-                    name: ident("T"),
-                    span: Some(type_span()),
-                }),
-                "Could not infer type parameter 'T'",
-            ),
-            (
-                diagnose_type_error(&TypeError::DuplicateGenericParam {
-                    name: ident("T"),
-                    span: Some(type_span()),
-                }),
-                "duplicate generic parameter 'T'",
-            ),
-            (
-                diagnose_type_error(&TypeError::UnknownStructLiteral {
-                    qualifier: None,
-                    name: ident("Point"),
-                    span: Some(type_span()),
-                }),
-                "Unknown struct 'Point'",
-            ),
-            (
-                diagnose_type_error(&TypeError::UnknownStructLiteral {
-                    qualifier: Some(ident("shapes")),
-                    name: ident("Point"),
-                    span: Some(type_span()),
-                }),
-                "Unknown struct 'shapes.Point'",
-            ),
-            (
-                diagnose_type_error(&TypeError::AnyOutsideExternBoundary {
-                    span: Some(type_span()),
-                }),
-                "any is only allowed in extern boundary signatures",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternAnyEscape {
-                    span: Some(type_span()),
-                }),
-                "extern 'any' value cannot escape an extern boundary",
-            ),
-        ];
-
-        for (diagnostic, expected) in cases {
-            assert_msg(diagnostic, expected);
-        }
-
-        let span = resolve_span();
-        let diagnostic = diagnose_type_error(&TypeError::UndefinedVariable {
-            name: ident("x"),
-            span: Some(span),
-        });
-        assert_eq!(diagnostic.labels()[0].span, span);
-        assert_eq!(
-            diagnostic.labels()[0].message.as_deref(),
-            Some("unknown variable `x`")
-        );
-
-        let diagnostic = diagnose_type_error(&TypeError::TypeMismatch {
-            expected: Type::Int,
-            found: Type::Bool,
-            span: Some(type_span()),
-        });
-        assert_eq!(diagnostic.message(), "mismatched types");
-        assert_eq!(
-            diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("expected `int`, found `bool`")
-        );
-
-        let diagnostic = diagnose_type_error(&TypeError::InvalidOperand {
-            op: "-".to_string(),
-            operand_type: Type::Bool,
-            span: Some(type_span()),
-        });
-        assert_eq!(
-            diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("operator `-` cannot be applied to `bool`")
-        );
-
-        let diagnostic = diagnose_type_error(&TypeError::WrongArgRange {
-            min: 1,
-            max: 3,
-            found: 4,
-            span: Some(type_span()),
-        });
-        assert_eq!(diagnostic.message(), "Wrong number of arguments");
-        assert_eq!(
-            diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("expected between 1 and 3, found 4")
-        );
-
-        let diagnostic = diagnose_type_error(&TypeError::IfConditionNotBool {
-            found: Type::Int,
-            span: Some(type_span()),
-        });
-        assert_eq!(diagnostic.message(), "if condition must be bool");
-        assert_eq!(
-            diagnostic.primary_label().unwrap().message.as_deref(),
-            Some("condition must be `bool`, found `int`")
-        );
     }
 
     #[test]
@@ -2913,154 +2498,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_extern_catalog_errors() {
-        let cases = [
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
-                    context: catalog_context(
-                        &["host"],
-                        ExternContextItem::Function {
-                            name: ident("tick"),
-                        },
-                    ),
-                    module: None,
-                    name: ident("Missing"),
-                    site: RawExternSite::default(),
-                })),
-                "Unknown extern type 'Missing' in extern function host.tick from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::InvalidType {
-                    context: catalog_context(
-                        &["host"],
-                        ExternContextItem::Type {
-                            name: ident("Handle"),
-                        },
-                    ),
-                    ty: Type::Infer,
-                    reason: InvalidExternTypeReason::Infer,
-                    site: RawExternSite::default(),
-                })),
-                "extern type '_' contains inference in extern type host.Handle from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(
-                    ExternCatalogError::UnknownInitField {
-                        context: catalog_context(
-                            &["host"],
-                            ExternContextItem::Init {
-                                ty: ident("Handle"),
-                            },
-                        ),
-                        field: ident("missing"),
-                        site: RawExternSite::default(),
-                    },
-                )),
-                "extern init host.Handle references unknown field 'missing' from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(
-                    ExternCatalogError::ComputedInitField {
-                        context: catalog_context(
-                            &["host"],
-                            ExternContextItem::Init {
-                                ty: ident("Handle"),
-                            },
-                        ),
-                        field: ident("x"),
-                        site: RawExternSite::default(),
-                    },
-                )),
-                "extern init host.Handle cannot initialize computed field 'x' from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(
-                    ExternCatalogError::UnsupportedInitParams {
-                        context: catalog_context(
-                            &["host"],
-                            ExternContextItem::Init {
-                                ty: ident("Handle"),
-                            },
-                        ),
-                        count: 2,
-                        site: RawExternSite::default(),
-                    },
-                )),
-                "extern init host.Handle does not support parameters: found 2 parameter(s) from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
-                    context: catalog_context(
-                        &["host"],
-                        ExternContextItem::Method {
-                            ty: ident("Handle"),
-                            method: ident("move_by"),
-                        },
-                    ),
-                    module: None,
-                    name: ident("Missing"),
-                    site: RawExternSite::default(),
-                })),
-                "Unknown extern type 'Missing' in extern method host.Handle.move_by from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
-                    context: catalog_context(
-                        &["host"],
-                        ExternContextItem::Static {
-                            ty: ident("Handle"),
-                            method: ident("make"),
-                        },
-                    ),
-                    module: None,
-                    name: ident("Missing"),
-                    site: RawExternSite::default(),
-                })),
-                "Unknown extern type 'Missing' in extern static host.Handle.make from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(
-                    ExternCatalogError::InvalidOperatorReturn {
-                        context: catalog_context(
-                            &["math"],
-                            ExternContextItem::Operator {
-                                ty: ident("Vec2"),
-                                op: ExternOperator::Binary {
-                                    op: BinaryOp::Eq,
-                                    self_on_right: false,
-                                },
-                            },
-                        ),
-                        found: Type::Int,
-                        expected: OperatorReturn::Bool,
-                        site: RawExternSite::default(),
-                    },
-                )),
-                "invalid extern operator math.Vec2.==: expected bool return type, found 'int' from source root",
-            ),
-            (
-                diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::InvalidType {
-                    context: catalog_context(
-                        &["host"],
-                        ExternContextItem::Field {
-                            ty: ident("Handle"),
-                            field: ident("id"),
-                        },
-                    ),
-                    ty: Type::Void,
-                    reason: InvalidExternTypeReason::Void,
-                    site: RawExternSite::default(),
-                })),
-                "void type is not allowed in extern type position 'void' in extern field host.Handle.id from source root",
-            ),
-        ];
-
-        for (diagnostic, expected) in cases {
-            assert_msg(diagnostic, expected);
-        }
-    }
-
-    #[test]
     fn renders_root_extern_catalog_context_without_fake_module() {
         let context = ExternCatalogContext {
             provenance: ExternProvenance::Source {
@@ -3098,83 +2535,6 @@ mod tests {
             }),
             "duplicate extern function 'tick' declared in source root and source root",
         );
-    }
-
-    #[test]
-    fn renders_source_raw_identities_without_source_module_prefix() {
-        let module = RawExternScope::Module(module_id(&["host"]));
-        let decl = source_decl(module.clone());
-        let op = ExternOperator::Binary {
-            op: BinaryOp::Add,
-            self_on_right: false,
-        };
-        let cases = vec![
-            (
-                RawExternIdentityKey::Function(RawExternFunctionKey {
-                    module: module.clone(),
-                    name: "ping".to_string(),
-                }),
-                "duplicate extern function 'ping' declared in source module 'host' and source module 'host'",
-            ),
-            (
-                RawExternIdentityKey::Type(RawExternTypeKey {
-                    module: module.clone(),
-                    name: "Handle".to_string(),
-                }),
-                "duplicate extern type 'Handle' declared in source module 'host' and source module 'host'",
-            ),
-            (
-                RawExternIdentityKey::Member(RawExternMemberKey {
-                    owner: RawExternTypeKey {
-                        module: module.clone(),
-                        name: "Handle".to_string(),
-                    },
-                    selector: ExternMemberSelector::Field("id".to_string()),
-                }),
-                "duplicate extern field 'Handle.id' declared in source module 'host' and source module 'host'",
-            ),
-            (
-                RawExternIdentityKey::Member(RawExternMemberKey {
-                    owner: RawExternTypeKey {
-                        module: module.clone(),
-                        name: "Handle".to_string(),
-                    },
-                    selector: ExternMemberSelector::Method("get".to_string()),
-                }),
-                "duplicate extern method 'Handle.get' declared in source module 'host' and source module 'host'",
-            ),
-            (
-                RawExternIdentityKey::Member(RawExternMemberKey {
-                    owner: RawExternTypeKey {
-                        module: module.clone(),
-                        name: "Handle".to_string(),
-                    },
-                    selector: ExternMemberSelector::Static("make".to_string()),
-                }),
-                "duplicate extern static method 'Handle.make' declared in source module 'host' and source module 'host'",
-            ),
-            (
-                RawExternIdentityKey::Member(RawExternMemberKey {
-                    owner: RawExternTypeKey {
-                        module,
-                        name: "Vec2".to_string(),
-                    },
-                    selector: ExternMemberSelector::Operator(op),
-                }),
-                "duplicate extern operator 'Vec2.+' declared in source module 'host' and source module 'host'",
-            ),
-        ];
-
-        for (key, expected) in cases {
-            assert_msg(
-                diagnose_extern_input_error(&ExternInputError::DuplicateRawIdentity {
-                    key,
-                    first: decl.clone(),
-                    duplicate: decl.clone(),
-                }),
-                expected,
-            );
-        }
     }
 
     #[test]
@@ -3440,7 +2800,7 @@ mod tests {
             Some("unexpected token")
         );
 
-        let source = test_source("fn");
+        let source = test_source_id();
         let stream = token_stream(vec![(
             Token::Keyword(Keyword::Fn),
             SourceSpan::new(source, 0, 2),

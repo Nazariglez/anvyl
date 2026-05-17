@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: conflicts with a locally defined type
+
+struct Option<T> { value: T }
+extern fn maybe() -> Option<int>;

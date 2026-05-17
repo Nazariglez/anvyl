@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ast::{Program, Stmt},
+    ast::{Ident, Program, Stmt},
     lexer, parser,
     resolve::{
         self, ModuleId, ModulePath, PackageId, ResolveResult, ResolvedImportTarget, ResolvedModule,
@@ -11,6 +11,10 @@ use crate::{
 
 pub(crate) fn test_source_id() -> SourceId {
     SourceTable::default().add(SourceKind::Virtual, "test", None, "")
+}
+
+pub(crate) fn ident(name: &str) -> Ident {
+    Ident::new(name)
 }
 
 pub(crate) fn parse_program(source: &str) -> Program {
@@ -26,6 +30,10 @@ pub(crate) fn root_id() -> ModuleId {
 
 pub(crate) fn module_path(path: &str) -> ModulePath {
     ModulePath::new(path.split('.').map(str::to_string).collect()).unwrap()
+}
+
+pub(crate) fn module_path_segments(path: &[&str]) -> ModulePath {
+    ModulePath::new(path.iter().map(ToString::to_string).collect()).unwrap()
 }
 
 pub(crate) fn empty_resolved() -> ResolveResult {

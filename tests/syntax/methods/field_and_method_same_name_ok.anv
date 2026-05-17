@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    value: int,
+
+    fn value(self) -> int { self.value + 1 }
+}
+
+fn main(c: Counter) {
+    let _: int = c.value;
+    let _: int = c.value();
+}

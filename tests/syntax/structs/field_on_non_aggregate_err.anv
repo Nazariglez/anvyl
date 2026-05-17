@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown field 'level' for type 'int'
+
+fn main() {
+    let x = 1.level;
+}

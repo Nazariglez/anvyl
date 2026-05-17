@@ -87,14 +87,13 @@ pub(crate) struct ResolvedExternSignature {
 
 impl ResolvedExternSignature {
     pub(crate) fn to_func_type(&self) -> Type {
-        Type::Func {
-            params: self
-                .params
+        Type::func(
+            self.params
                 .iter()
                 .map(ResolvedExternParam::to_func_param)
                 .collect(),
-            ret: Box::new(ReturnSpec::value(self.ret.ty.clone())),
-        }
+            ReturnSpec::value(self.ret.ty.clone()),
+        )
     }
 }
 
@@ -157,6 +156,29 @@ pub(crate) struct ExternCatalog {
     types_by_nominal: HashMap<NominalKey, ExternTypeId>,
 }
 
+enum ExternCatalogVisit<'a> {
+    Ty {
+        context: ExternCatalogContext,
+        ty: &'a ResolvedExternTy,
+        position: TypePosition,
+        site: RawExternSite,
+    },
+    Init {
+        ty: &'a ExternType,
+        init: &'a ExternInit,
+    },
+    OperatorReturn {
+        context: ExternCatalogContext,
+        operator: &'a ExternOperatorDecl,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExternCatalogVisitOrder {
+    FunctionsFirst,
+    TypesFirst,
+}
+
 impl ExternCatalog {
     pub(crate) fn functions(&self) -> impl Iterator<Item = &ExternFunction> {
         self.functions.iter()
@@ -175,21 +197,80 @@ impl ExternCatalog {
         &self,
         mut visit: impl FnMut(&ResolvedExternTy, RawExternSite),
     ) {
-        for function in &self.functions {
-            visit_extern_signature(&function.signature, function.site, &mut visit);
+        self.for_each_visit(ExternCatalogVisitOrder::FunctionsFirst, |item| {
+            if let ExternCatalogVisit::Ty { ty, site, .. } = item {
+                visit(ty, site);
+            }
+        });
+    }
+
+    fn for_each_visit(
+        &self,
+        order: ExternCatalogVisitOrder,
+        mut visit: impl FnMut(ExternCatalogVisit<'_>),
+    ) {
+        if order == ExternCatalogVisitOrder::FunctionsFirst {
+            self.visit_functions(&mut visit);
         }
+        self.visit_types(&mut visit);
+        if order == ExternCatalogVisitOrder::TypesFirst {
+            self.visit_functions(&mut visit);
+        }
+    }
+
+    fn visit_functions<'a>(&'a self, visit: &mut impl FnMut(ExternCatalogVisit<'a>)) {
+        for function in &self.functions {
+            visit_extern_signature_with_context(
+                ExternCatalogContext::function(
+                    &function.provenance,
+                    function.key.module.clone(),
+                    function.key.name,
+                ),
+                &function.signature,
+                function.site,
+                visit,
+            );
+        }
+    }
+
+    fn visit_types<'a>(&'a self, visit: &mut impl FnMut(ExternCatalogVisit<'a>)) {
         for ty in &self.types {
             for field in &ty.fields {
-                visit_extern_ty(&field.ty, field.site, &mut visit);
+                visit(ExternCatalogVisit::Ty {
+                    context: ty.context.field(field.name),
+                    ty: &field.ty,
+                    position: TypePosition::Param,
+                    site: field.site,
+                });
+            }
+            if let Some(init) = &ty.init {
+                visit(ExternCatalogVisit::Init { ty, init });
             }
             for method in &ty.methods {
-                visit_extern_signature(&method.signature, method.site, &mut visit);
+                visit_extern_signature_with_context(
+                    ty.context.method(method.name),
+                    &method.signature,
+                    method.site,
+                    visit,
+                );
             }
             for static_method in &ty.statics {
-                visit_extern_signature(&static_method.signature, static_method.site, &mut visit);
+                visit_extern_signature_with_context(
+                    ty.context.static_method(static_method.name),
+                    &static_method.signature,
+                    static_method.site,
+                    visit,
+                );
             }
             for operator in &ty.operators {
-                visit_extern_signature(&operator.signature, operator.site, &mut visit);
+                let context = ty.context.operator(operator.op);
+                visit_extern_signature_with_context(
+                    context.clone(),
+                    &operator.signature,
+                    operator.site,
+                    visit,
+                );
+                visit(ExternCatalogVisit::OperatorReturn { context, operator });
             }
         }
     }
@@ -560,23 +641,26 @@ pub(crate) enum InvalidExternTypeReason {
     UnresolvedConst,
 }
 
-fn visit_extern_signature(
-    signature: &ResolvedExternSignature,
+fn visit_extern_signature_with_context<'a>(
+    context: ExternCatalogContext,
+    signature: &'a ResolvedExternSignature,
     site: RawExternSite,
-    visit: &mut impl FnMut(&ResolvedExternTy, RawExternSite),
+    visit: &mut impl FnMut(ExternCatalogVisit<'a>),
 ) {
     for param in &signature.params {
-        visit_extern_ty(&param.ty, site, visit);
+        visit(ExternCatalogVisit::Ty {
+            context: context.clone(),
+            ty: &param.ty,
+            position: TypePosition::Param,
+            site,
+        });
     }
-    visit_extern_ty(&signature.ret, site, visit);
-}
-
-fn visit_extern_ty(
-    ty: &ResolvedExternTy,
-    site: RawExternSite,
-    visit: &mut impl FnMut(&ResolvedExternTy, RawExternSite),
-) {
-    visit(ty, site);
+    visit(ExternCatalogVisit::Ty {
+        context,
+        ty: &signature.ret,
+        position: TypePosition::Return,
+        site,
+    });
 }
 
 pub(crate) fn build_catalog(
@@ -1185,52 +1269,23 @@ fn provider_source_current_scope(scope: &ModuleScope) -> Option<ModuleScope> {
 
 fn validate_catalog(catalog: &ExternCatalog) -> Result<(), Vec<ExternCatalogError>> {
     let mut errors = vec![];
-    for ty in &catalog.types {
-        validate_extern_type(ty, &mut errors);
-    }
-    for function in &catalog.functions {
-        let context = ExternCatalogContext::function(
-            &function.provenance,
-            function.key.module.clone(),
-            function.key.name,
-        );
-        validate_signature(&context, &function.signature, function.site, &mut errors);
-    }
+    catalog.for_each_visit(ExternCatalogVisitOrder::TypesFirst, |item| match item {
+        ExternCatalogVisit::Ty {
+            context,
+            ty,
+            position,
+            site,
+        } => validate_ty(&context, ty, position, site, &mut errors),
+        ExternCatalogVisit::Init { ty, init } => validate_init(ty, init, &mut errors),
+        ExternCatalogVisit::OperatorReturn { context, operator } => {
+            validate_operator_return(&context, operator, &mut errors);
+        }
+    });
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
-    }
-}
-
-fn validate_extern_type(ty: &ExternType, errors: &mut Vec<ExternCatalogError>) {
-    for field in &ty.fields {
-        let context = ty.context.field(field.name);
-        validate_ty(&context, &field.ty, TypePosition::Param, field.site, errors);
-    }
-
-    if let Some(init) = &ty.init {
-        validate_init(ty, init, errors);
-    }
-
-    for method in &ty.methods {
-        let context = ty.context.method(method.name);
-        validate_signature(&context, &method.signature, method.site, errors);
-    }
-    for static_method in &ty.statics {
-        let context = ty.context.static_method(static_method.name);
-        validate_signature(
-            &context,
-            &static_method.signature,
-            static_method.site,
-            errors,
-        );
-    }
-    for operator in &ty.operators {
-        let context = ty.context.operator(operator.op);
-        validate_signature(&context, &operator.signature, operator.site, errors);
-        validate_operator_return(&context, operator, errors);
     }
 }
 
@@ -1253,18 +1308,6 @@ fn validate_init(ty: &ExternType, init: &ExternInit, errors: &mut Vec<ExternCata
             });
         }
     }
-}
-
-fn validate_signature(
-    context: &ExternCatalogContext,
-    signature: &ResolvedExternSignature,
-    site: RawExternSite,
-    errors: &mut Vec<ExternCatalogError>,
-) {
-    for param in &signature.params {
-        validate_ty(context, &param.ty, TypePosition::Param, site, errors);
-    }
-    validate_ty(context, &signature.ret, TypePosition::Return, site, errors);
 }
 
 fn validate_operator_return(
@@ -1437,10 +1480,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        ast::{Ident, ModuleOrigin, NominalKind, Program},
+        ast::{ModuleOrigin, NominalKind},
         externs::RawExternScope,
         resolve::PackageId,
-        test_support::{parse_program, resolved_modules, root_id, test_source_id},
+        test_support::{
+            ident, module_path_segments, parse_program, resolved_modules, root_id, test_source_id,
+        },
         typecheck::DeclarationIndex,
     };
 
@@ -1622,18 +1667,14 @@ mod tests {
         RawExternScope::Module(root_id())
     }
 
-    fn ident(name: &str) -> Ident {
-        Ident::new(name)
-    }
-
     fn scope(name: &str) -> ModuleScope {
-        ModuleScope::Named(ModulePath::new(vec![name.to_string()]).unwrap())
+        ModuleScope::Named(module_path_segments(&[name]))
     }
 
     fn provider_scope(name: &str) -> ModuleScope {
         ModuleScope::from_module_id(&ModuleId::provider(
             PackageId::synthetic_root(),
-            ModulePath::new(vec![name.to_string()]).unwrap(),
+            module_path_segments(&[name]),
         ))
     }
 
@@ -1672,24 +1713,17 @@ mod tests {
         )
     }
 
-    fn parse(source: &str) -> Program {
-        parse_program(source)
-    }
-
     fn decls(root: &str, modules: &[(&str, &str)], raw: &RawExterns) -> DeclarationIndex {
-        let root = parse(root);
+        let root = parse_program(root);
         let mut resolved = resolved_modules(&root, modules);
-        let option_module = ModuleId::named(
-            PackageId::core(),
-            ModulePath::new(vec!["option".to_string()]).unwrap(),
-        );
+        let option_module = ModuleId::named(PackageId::core(), module_path_segments(&["option"]));
         resolved.import_edges.insert(option_module.clone(), vec![]);
         resolved
             .module_groups
             .push(vec![crate::resolve::ResolvedModule {
                 key: option_module,
                 source: test_source_id(),
-                program: parse("pub enum Option<T> { None, Some(T) }"),
+                program: parse_program("pub enum Option<T> { None, Some(T) }"),
             }]);
         DeclarationIndex::from_root_and_modules(&root, &resolved, raw)
     }
@@ -1716,7 +1750,7 @@ mod tests {
     }
 
     fn source_raw(root: &str, modules: &[(&str, &str)]) -> RawExterns {
-        let root = parse(root);
+        let root = parse_program(root);
         let resolved = resolved_modules(&root, modules);
         crate::externs::collect_source_externs(&root, &resolved).unwrap()
     }
@@ -2063,7 +2097,7 @@ mod tests {
                     }],
                 }],
             };
-            let root = parse("");
+            let root = parse_program("");
             let resolved =
                 resolved_modules(&root, &[("geom.types", "pub struct Point { x: int }")]);
             let decls = DeclarationIndex::from_root_and_modules(&root, &resolved, &raw);
@@ -2077,36 +2111,6 @@ mod tests {
                     ..
                 }) if *name == ident("Point") && module.segments() == ["geom", "types"]
             ));
-        }
-
-        #[test]
-        fn source_type_uses_import_alias() {
-            let raw = source_raw(
-                "import geom as g; extern fn make() -> g.Point;",
-                &[("geom", "pub struct Point { x: int }")],
-            );
-            let decls = decls(
-                "import geom as g; extern fn make() -> g.Point;",
-                &[("geom", "pub struct Point { x: int }")],
-                &raw,
-            );
-            let catalog = build_catalog(raw, &decls).unwrap();
-            let function = catalog.function(
-                catalog
-                    .function_by_key(&function_key(ModuleScope::Root, "make"))
-                    .unwrap(),
-            );
-
-            assert_eq!(
-                function.signature.ret.ty,
-                Type::nominal(
-                    NominalKind::Struct,
-                    ident("Point"),
-                    vec![],
-                    vec![],
-                    Some(vec!["geom".to_string()].into())
-                )
-            );
         }
 
         #[test]
@@ -2393,26 +2397,6 @@ mod tests {
                 errors.first(),
                 Some(ExternCatalogError::GenericArgKindMismatch { name, expected: "const", .. })
                     if *name == ident("ArrayBox")
-            ));
-        }
-
-        #[test]
-        fn init_params_fail() {
-            let source = "extern type Handle { init(x: int); }";
-            let raw = source_raw(source, &[]);
-            let decls = decls(source, &[], &raw);
-            let errors = build_catalog(raw, &decls).unwrap_err();
-
-            assert!(matches!(
-                errors.first(),
-                Some(ExternCatalogError::UnsupportedInitParams {
-                    context: ExternCatalogContext {
-                        item: ExternContextItem::Init { ty, .. },
-                        ..
-                    },
-                    count: 1,
-                    ..
-                }) if *ty == ident("Handle")
             ));
         }
 

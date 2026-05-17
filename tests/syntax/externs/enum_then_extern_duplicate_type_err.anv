@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: type 'Handle' is already defined
+
+enum Handle { Empty }
+extern type Handle;

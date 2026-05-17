@@ -12,22 +12,17 @@ use super::support::{
     check_with_raw_externs,
 };
 use crate::{
-    ast::{ExprId, Ident, ModuleOrigin, NominalKind, Program, Type},
+    ast::{ExprId, Ident, ModuleOrigin, NominalKind, Type},
     externs::{
         self, ExternInputs, PackageExternInputs,
         catalog::{
-            ExternCatalogContext, ExternCatalogError, ExternContextItem, ExternFieldRef,
-            ExternMethodRef, ExternOperatorRef, ExternStaticRef, ExternTypeId,
+            ExternFieldRef, ExternMethodRef, ExternOperatorRef, ExternStaticRef, ExternTypeId,
         },
     },
     resolve::{ModuleId, ModulePath, PackageId},
     test_support::{parse_program, resolved_modules_with_external},
     typecheck::{self, DeprecatedUseKind, ExternUseTarget, MemberPathKind, ModuleScope, TypeError},
 };
-
-fn parse(source: &str) -> Program {
-    parse_program(source)
-}
 
 #[test]
 fn deprecated_source_extern_type_warns_on_type_reference() {
@@ -307,7 +302,7 @@ fn check_named_with_provider(
     modules: &[(&str, &str)],
     provider: ProviderDescriptor,
 ) -> Result<TypecheckTestResult, Vec<TypeError>> {
-    let root = parse(root_source);
+    let root = parse_program(root_source);
     let provider_raw = externs::ingest_providers(ExternInputs {
         packages: vec![PackageExternInputs {
             package: PackageId::synthetic_root(),
@@ -413,20 +408,6 @@ mod calls {
     }
 }
 
-fn expect_type_errors(result: Result<TypecheckTestResult, Vec<TypeError>>) -> Vec<TypeError> {
-    let Err(errors) = result else {
-        panic!("expected typecheck errors");
-    };
-    errors
-}
-
-fn assert_has_error(errors: &[TypeError], matches: impl Fn(&TypeError) -> bool) {
-    assert!(
-        errors.iter().any(matches),
-        "expected matching error in {errors:?}"
-    );
-}
-
 fn use_exprs(result: &TypecheckTestResult, expected: ExternUseTarget) -> Vec<ExprId> {
     result
         .extern_uses()
@@ -481,266 +462,6 @@ mod any {
     use super::*;
 
     #[test]
-    fn flows_to_boundary() {
-        check(
-            r"
-            extern fn get() -> any;
-            extern fn put(value: any);
-            fn main() { put(get()); }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_return() {
-        let Err(errors) = check(
-            r"
-            extern fn get() -> any;
-            fn main() -> int { get() }
-            ",
-        ) else {
-            panic!("extern any return should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ExternAnyEscape { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_builtin_arg() {
-        let Err(errors) = check(
-            r"
-            extern fn get() -> any;
-            fn main() { println(get()); }
-            ",
-        ) else {
-            panic!("extern any builtin argument should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ExternAnyEscape { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_container() {
-        let Err(errors) = check(
-            r"
-            extern fn get() -> any;
-            fn main() { let values = [get()]; }
-            ",
-        ) else {
-            panic!("extern any container escape should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ExternAnyEscape { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_block_join() {
-        let errors = expect_type_errors(check(
-            r"
-            extern fn get() -> any;
-            fn main(cond: bool) {
-                let block = { get() };
-                let joined = if cond { get() } else { get() };
-            }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ExternAnyEscape { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_tuple_shapes() {
-        let errors = expect_type_errors(check(
-            r"
-            extern fn get() -> any;
-            fn main() {
-                let tuple = (get(), get());
-            }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ExternAnyEscape { .. })
-        });
-    }
-
-    #[test]
-    fn allows_boundary_composite() {
-        check(
-            r"
-            extern fn get() -> any;
-            extern fn put(value: any);
-            fn main(cond: bool) { put(if cond { get() } else { get() }); }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_user_aggregate() {
-        let Err(errors) = check("struct Bag { value: any }") else {
-            panic!("user aggregate any field should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::AnyOutsideExternBoundary { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_user_enum() {
-        let Err(errors) = check("enum Bag { Value(any) }") else {
-            panic!("user enum any payload should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::AnyOutsideExternBoundary { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_ordinary_function_arg() {
-        let errors = expect_type_errors(check(
-            r"
-            extern fn get() -> any;
-            fn take<T>(value: T) {}
-            fn main() { take(get()); }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ExternAnyEscape { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_explicit_generic_lit() {
-        let errors = expect_type_errors(check(
-            r"
-            struct Box<T> { value: T }
-            extern fn get() -> any;
-            fn main() { let x = Box<any> { value: get() }; }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::AnyOutsideExternBoundary { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_generic_lit_hint() {
-        let errors = expect_type_errors(check(
-            r"
-            struct Box<T> { value: T }
-            extern fn get() -> any;
-            fn main() { let x: Box<any> = Box { value: get() }; }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::AnyOutsideExternBoundary { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_named_fn_type() {
-        let errors = expect_type_errors(check_named(
-            "import lib { keep }; fn main() { keep(1); }",
-            &[("lib", "pub fn keep(value: any) -> any { value }")],
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::AnyOutsideExternBoundary { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_named_aggregate() {
-        let errors = expect_type_errors(check_named(
-            "import lib { Bag }; fn main(bag: Bag) {}",
-            &[("lib", "pub struct Bag { value: any }")],
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::AnyOutsideExternBoundary { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_named_enum() {
-        let errors = expect_type_errors(check_named(
-            "import lib { Bag }; fn main(bag: Bag) {}",
-            &[("lib", "pub enum Bag { Value(any) }")],
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::AnyOutsideExternBoundary { .. })
-        });
-    }
-
-    #[test]
-    fn field_flows_to_boundary() {
-        check(
-            r"
-            extern type Box { value: any; }
-            extern fn put(value: any);
-            fn main(box: Box) { put(box.value); }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_field_bind() {
-        let Err(errors) = check(
-            r"
-            extern type Box { value: any; }
-            fn main(box: Box) { let value = box.value; }
-            ",
-        ) else {
-            panic!("extern any field binding should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ExternAnyEscape { .. }))
-        );
-    }
-
-    #[test]
-    fn allows_literal_field_boundary() {
-        check(
-            r"
-            extern fn get() -> any;
-            extern type Box { init; value: any; }
-            fn main() { Box { value: get() }; }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
     fn provider_flows_to_boundary() {
         check_with_provider(
             r"
@@ -766,97 +487,6 @@ mod any {
 
 mod callbacks {
     use super::*;
-
-    #[test]
-    fn named_function() {
-        let result = check(
-            r"
-            extern fn apply(value: int, cb: fn(int) -> int) -> int;
-            fn double(x: int) -> int { x * 2 }
-            fn main() { apply(5, double); }
-            ",
-        )
-        .expect("typecheck failed");
-        let id = result
-            .externs()
-            .function_by_key(&function_key(ModuleScope::Root, "apply"))
-            .expect("extern function");
-
-        assert_use(&result, ExternUseTarget::Function(id));
-        assert_typecheck_closed(&result);
-    }
-
-    #[test]
-    fn typed_local() {
-        check(
-            r"
-            extern fn apply(value: int, cb: fn(int) -> int) -> int;
-            fn double(x: int) -> int { x * 2 }
-            fn main() {
-                let cb: fn(int) -> int = double;
-                apply(5, cb);
-            }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
-    fn function_value_no_call_use() {
-        let result = check(
-            r"
-            extern fn transform(x: int) -> int;
-            extern fn apply(value: int, cb: fn(int) -> int) -> int;
-            fn main() { apply(5, transform); }
-            ",
-        )
-        .expect("typecheck failed");
-        let apply = result
-            .externs()
-            .function_by_key(&function_key(ModuleScope::Root, "apply"))
-            .expect("extern function");
-        let transform = result
-            .externs()
-            .function_by_key(&function_key(ModuleScope::Root, "transform"))
-            .expect("extern function");
-
-        assert_use(&result, ExternUseTarget::Function(apply));
-        assert_use_count(&result, ExternUseTarget::Function(transform), 0);
-        assert_use_total(&result, 1);
-        assert_typecheck_closed(&result);
-    }
-
-    #[test]
-    fn rejects_param_type() {
-        let Err(errors) = check(
-            r"
-            extern fn apply(value: int, cb: fn(int) -> int) -> int;
-            fn len(s: string) -> int { 1 }
-            fn main() { apply(5, len); }
-            ",
-        ) else {
-            panic!("wrong callback parameter type should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
-        );
-    }
-
-    #[test]
-    fn accepts_nominal_param() {
-        check(
-            r"
-            extern type Counter;
-            extern fn with_counter(cb: fn(Counter) -> int) -> int;
-            fn read(counter: Counter) -> int { 1 }
-            fn main() { with_counter(read); }
-            ",
-        )
-        .expect("typecheck failed");
-    }
 
     #[test]
     fn provider_metadata_checks_fn_value() {
@@ -943,16 +573,11 @@ mod fields {
             ",
         )
         .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Point"))
-            .expect("extern type");
-        let (field, _) = result
-            .externs()
-            .field(owner, Ident::new("x"))
-            .expect("extern field");
+        let owner = catalog_type(&result, ModuleScope::Root, "Point");
+        let field = catalog_field(&result, owner, "x");
 
-        assert_use(&result, ExternUseTarget::FieldRead(field));
+        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
+        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 0);
         assert_typecheck_closed(&result);
     }
 
@@ -1004,24 +629,6 @@ mod fields {
 
         assert_use(&result, ExternUseTarget::FieldRead(field));
         assert_typecheck_closed(&result);
-    }
-
-    #[test]
-    fn unknown_call_reports_once() {
-        let Err(errors) = check(
-            r"
-            extern type Point { x: float; }
-            fn read(p: Point) { p.missing(); }
-            ",
-        ) else {
-            panic!("unknown member should fail");
-        };
-
-        assert_eq!(errors.len(), 1, "unexpected errors: {errors:?}");
-        assert!(matches!(
-            errors.as_slice(),
-            [TypeError::UnknownMember { .. }]
-        ));
     }
 
     #[test]
@@ -1147,208 +754,6 @@ mod struct_literals {
         assert_use_total(&result, 1);
         assert_typecheck_closed(&result);
     }
-
-    #[test]
-    fn rejects_init_params() {
-        let errors = expect_type_errors(check(
-            r"
-            extern type Point { init(x: float); x: float; }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(
-                error,
-                TypeError::ExternCatalog(ExternCatalogError::UnsupportedInitParams {
-                    count: 1,
-                    ..
-                })
-            )
-        });
-    }
-
-    #[test]
-    fn rejects_no_init() {
-        let Err(errors) = check(
-            r"
-            extern type Point { x: float; }
-            fn make() -> Point { Point { x: 1.0 } }
-            ",
-        ) else {
-            panic!("no-init literal should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::InvalidStructLiteral { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_duplicate() {
-        let Err(errors) = check(
-            r"
-            extern type Point { init; x: float; }
-            fn make() -> Point { Point { x: 1.0, x: 2.0 } }
-            ",
-        ) else {
-            panic!("duplicate field should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::DuplicateField { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_unknown() {
-        let Err(errors) = check(
-            r"
-            extern type Point { init; x: float; }
-            fn make() -> Point { Point { x: 1.0, y: 2.0 } }
-            ",
-        ) else {
-            panic!("unknown field should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::UnknownMember { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_type_mismatch() {
-        let Err(errors) = check(
-            r#"
-            extern type Point { init; x: float; }
-            fn make() -> Point { Point { x: "bad" } }
-            "#,
-        ) else {
-            panic!("field type mismatch should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_computed() {
-        let Err(errors) = check(
-            r"
-            extern type Point { init; computed x: float; }
-            fn make() -> Point { Point { x: 1.0 } }
-            ",
-        ) else {
-            panic!("computed field init should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::ImmutableAssignment { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_missing() {
-        let Err(errors) = check(
-            r"
-            extern type Point { init; x: float; y: float; }
-            fn make() -> Point { Point { x: 1.0 } }
-            ",
-        ) else {
-            panic!("missing field should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::MissingField { .. }))
-        );
-    }
-}
-
-mod destructure {
-    use super::*;
-
-    #[test]
-    fn accepts_partial() {
-        let result = check(
-            r"
-            extern type Point { init; x: float; y: float; }
-            fn destructure(p: Point) { let Point { x } = p; }
-            ",
-        )
-        .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Point"))
-            .expect("extern type");
-        let (field, _) = result
-            .externs()
-            .field(owner, Ident::new("x"))
-            .expect("extern field");
-
-        assert_use(&result, ExternUseTarget::FieldRead(field));
-    }
-
-    #[test]
-    fn rejects_any_escape() {
-        let errors = expect_type_errors(check(
-            r"
-            extern type Box { value: any; }
-            fn destructure(box: Box) { let Box { value } = box; }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ExternAnyEscape { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_duplicate() {
-        let Err(errors) = check(
-            r"
-            extern type Point { init; x: float; }
-            fn destructure(p: Point) { let Point { x, x } = p; }
-            ",
-        ) else {
-            panic!("duplicate field should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::DuplicateField { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_unknown() {
-        let Err(errors) = check(
-            r"
-            extern type Point { init; x: float; }
-            fn destructure(p: Point) { let Point { y } = p; }
-            ",
-        ) else {
-            panic!("unknown field should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::UnknownMember { .. }))
-        );
-    }
 }
 
 mod methods {
@@ -1471,35 +876,6 @@ mod methods {
     }
 
     #[test]
-    fn checks_cross_type_param() {
-        check(
-            r"
-            extern type Point { fn distance_to(self, other: Point) -> float; }
-            fn distance(a: Point, b: Point) -> float { a.distance_to(b) }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_arg_count() {
-        let Err(errors) = check(
-            r"
-            extern type Point { fn move_by(self, dx: float, dy: float); }
-            fn move(p: Point) { p.move_by(1.0); }
-            ",
-        ) else {
-            panic!("wrong arity should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::WrongArgCount { .. }))
-        );
-    }
-
-    #[test]
     fn accepts_mut_receiver() {
         let result = check(
             r"
@@ -1604,21 +980,6 @@ mod methods {
     }
 
     #[test]
-    fn rejects_computed_receiver() {
-        let errors = expect_type_errors(check(
-            r"
-            extern type Point { fn move_by(var self, dx: float); }
-            extern type Holder { computed point: Point; }
-            fn move(var holder: Holder) { holder.point.move_by(1.0); }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::RequiresMutablePlace { .. })
-        });
-    }
-
-    #[test]
     fn provider_targets() {
         let result = check_with_provider(
             r"
@@ -1687,24 +1048,6 @@ mod operators {
     }
 
     #[test]
-    fn rejects_missing_unary() {
-        let Err(errors) = check(
-            r"
-            extern type Vec2;
-            fn neg(v: Vec2) -> Vec2 { -v }
-            ",
-        ) else {
-            panic!("undeclared unary operator should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::InvalidOperand { .. }))
-        );
-    }
-
-    #[test]
     fn records_left_self() {
         let result = check(
             r"
@@ -1747,172 +1090,6 @@ mod operators {
         assert_use(&result, ExternUseTarget::BinaryOperator(operator));
         assert_typecheck_closed(&result);
     }
-
-    #[test]
-    fn accepts_nested_any_left_self() {
-        let result = check(
-            r"
-            extern type Host { op Self + [any] -> Self; }
-            fn add(host: Host, values: [int]) -> Host { host + values }
-            ",
-        )
-        .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Host"))
-            .expect("extern type");
-        let (operator, _) = result
-            .externs()
-            .binary_operator(owner, ExternBinaryOp::Add, false)
-            .expect("extern operator");
-
-        assert_use(&result, ExternUseTarget::BinaryOperator(operator));
-        assert_typecheck_closed(&result);
-    }
-
-    #[test]
-    fn accepts_nested_any_right_self() {
-        let result = check(
-            r"
-            extern type Host { op [any] + Self -> Self; }
-            fn add(host: Host, values: [int]) -> Host { values + host }
-            ",
-        )
-        .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Host"))
-            .expect("extern type");
-        let (operator, _) = result
-            .externs()
-            .binary_operator(owner, ExternBinaryOp::Add, true)
-            .expect("extern operator");
-
-        assert_use(&result, ExternUseTarget::BinaryOperator(operator));
-        assert_typecheck_closed(&result);
-    }
-
-    #[test]
-    fn rejects_nested_any_result_escape() {
-        let errors = expect_type_errors(check(
-            r"
-            extern type Host { op Self + [int] -> [any]; }
-            fn add(host: Host, values: [int]) { let escaped = host + values; }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ExternAnyEscape { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_other_operand() {
-        let Err(errors) = check(
-            r#"
-            extern type Vec2 { op Self + float -> Self; }
-            fn add(v: Vec2) -> Vec2 { v + "bad" }
-            "#,
-        ) else {
-            panic!("wrong extern operator operand should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::InvalidOperand { .. }))
-        );
-    }
-
-    #[test]
-    fn rejects_left_operand() {
-        let errors = expect_type_errors(check(
-            r#"
-            extern type Vec2 { op float + Self -> Self; }
-            fn add(v: Vec2) -> Vec2 { "bad" + v }
-            "#,
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(
-                error,
-                TypeError::InvalidOperand {
-                    operand_type: Type::String,
-                    ..
-                }
-            )
-        });
-    }
-
-    #[test]
-    fn rejects_missing_equality() {
-        let Err(errors) = check(
-            r"
-            extern type Vec2;
-            fn eq(a: Vec2, b: Vec2) -> bool { a == b }
-            ",
-        ) else {
-            panic!("extern equality without operator should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::InvalidOperand { .. }))
-        );
-    }
-
-    #[test]
-    fn returns_bool() {
-        check(
-            r"
-            extern type Vec2 {
-                op Self == Self -> bool;
-                op Self < Self -> bool;
-            }
-            fn eq(a: Vec2, b: Vec2) -> bool { a == b }
-            fn lt(a: Vec2, b: Vec2) -> bool { a < b }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_ambiguous_cross_type() {
-        let Err(errors) = check(
-            r"
-            extern type A { op Self + B -> A; }
-            extern type B { op A + Self -> B; }
-            fn add(a: A, b: B) -> A { a + b }
-            ",
-        ) else {
-            panic!("ambiguous extern operator should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::InvalidOperand { .. }))
-        );
-    }
-
-    #[test]
-    fn unsupported_records_no_use() {
-        let Err(errors) = check(
-            r"
-            extern type Flags;
-            fn and(a: Flags, b: Flags) -> int { a & b }
-            ",
-        ) else {
-            panic!("unsupported extern operator should fail");
-        };
-
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error, TypeError::InvalidOperand { .. }))
-        );
-    }
 }
 
 mod compound {
@@ -1951,104 +1128,6 @@ mod compound {
     }
 
     #[test]
-    fn accepts_nested_any_operand() {
-        let result = check(
-            r"
-            extern type Vec2 { op Self + [any] -> Self; }
-            extern type Holder { value: Vec2; }
-            fn add(var holder: Holder, values: [int]) { holder.value += values; }
-            ",
-        )
-        .expect("typecheck failed");
-        let vec_owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Vec2"))
-            .expect("extern type");
-        let holder_owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Holder"))
-            .expect("extern type");
-        let (operator, _) = result
-            .externs()
-            .binary_operator(vec_owner, ExternBinaryOp::Add, false)
-            .expect("extern operator");
-        let (field, _) = result
-            .externs()
-            .field(holder_owner, Ident::new("value"))
-            .expect("extern field");
-
-        assert_use(&result, ExternUseTarget::BinaryOperator(operator));
-        assert_use(&result, ExternUseTarget::FieldWrite(field));
-        assert_typecheck_closed(&result);
-    }
-
-    #[test]
-    fn rejects_any_binary_operand() {
-        let errors = expect_type_errors(check(
-            r"
-            extern fn get() -> any;
-            extern type Vec2 { op Self + int -> Self; }
-            fn add(v: Vec2) -> Vec2 { v + get() }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(
-                error,
-                TypeError::ExternAnyEscape { .. }
-                    | TypeError::InvalidOperand { .. }
-                    | TypeError::TypeMismatch { .. }
-            )
-        });
-    }
-
-    #[test]
-    fn accepts_any_binary_operand() {
-        check(
-            r"
-            extern fn get() -> any;
-            extern type Vec2 { op Self + any -> Self; }
-            fn add(v: Vec2) -> Vec2 { v + get() }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
-    fn rejects_any_operand() {
-        let errors = expect_type_errors(check(
-            r"
-            extern fn get() -> any;
-            extern type Vec2 { op Self + int -> Self; }
-            extern type Holder { value: Vec2; }
-            fn add(var holder: Holder) { holder.value += get(); }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(
-                error,
-                TypeError::ExternAnyEscape { .. }
-                    | TypeError::InvalidOperand { .. }
-                    | TypeError::TypeMismatch { .. }
-            )
-        });
-    }
-
-    #[test]
-    fn accepts_any_operand() {
-        check(
-            r"
-            extern fn get() -> any;
-            extern type Vec2 { op Self + any -> Self; }
-            extern type Holder { value: Vec2; }
-            fn add(var holder: Holder) { holder.value += get(); }
-            ",
-        )
-        .expect("typecheck failed");
-    }
-
-    #[test]
     fn promoted_field_records_extern_read_and_member_path() {
         let result = check(
             r"
@@ -2071,28 +1150,6 @@ mod compound {
         assert_eq!(fact.kind, MemberPathKind::Field);
         assert_eq!(fact.path, vec![Ident::new("stats"), Ident::new("hp")]);
         assert_eq!(fact.origin_member, Ident::new("hp"));
-    }
-
-    #[test]
-    fn records_field_read() {
-        let result = check(
-            r"
-            extern type Point { x: float; }
-            fn read(p: Point) -> float { p.x }
-            ",
-        )
-        .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Point"))
-            .expect("extern type");
-        let (field, _) = result
-            .externs()
-            .field(owner, Ident::new("x"))
-            .expect("extern field");
-
-        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
-        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 0);
     }
 
     #[test]
@@ -2201,38 +1258,6 @@ mod compound {
 
         assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
         assert_use_count(&result, ExternUseTarget::FieldWrite(field), 1);
-    }
-
-    #[test]
-    fn rejects_computed_tuple_field_alias_write() {
-        let errors = expect_type_errors(check(
-            r"
-            struct Wrapper { pair: (int, int) }
-            extern type Holder { computed wrapper: Wrapper; }
-            fn write(var holder: Holder) {
-                var Holder { wrapper: Wrapper { pair: (x, _) } } = holder;
-                x = 3;
-            }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::VarPatternRequiresMutablePlace { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_computed_write_through_immutable_receiver() {
-        let errors = expect_type_errors(check(
-            r"
-            extern type Point { computed x: float; }
-            fn write(p: Point) { p.x = 1.0; }
-            ",
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ImmutableAssignment { .. })
-        });
     }
 
     #[test]
@@ -2754,39 +1779,6 @@ mod mut_borrow {
     }
 
     #[test]
-    fn rejects_immutable_local() {
-        let Err(errors) = check_with_provider(
-            r"
-            import ext:host { touch };
-            fn use_it() { let x = 1; touch(x); }
-            ",
-            touch_provider(vec![], ExternTypeExpr::Int),
-        ) else {
-            panic!("immutable argument should fail");
-        };
-
-        assert!(matches!(
-            errors.as_slice(),
-            [TypeError::ImmutableAssignment { .. }]
-        ));
-    }
-
-    #[test]
-    fn rejects_rvalue() {
-        let errors = expect_type_errors(check_with_provider(
-            r"
-            import ext:host { touch };
-            fn use_it() { touch(1); }
-            ",
-            touch_provider(vec![], ExternTypeExpr::Int),
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ImmutableAssignment { .. })
-        });
-    }
-
-    #[test]
     fn accepts_direct_field() {
         let result = check_with_provider(
             r"
@@ -2812,42 +1804,6 @@ mod mut_borrow {
             .expect("extern field");
 
         assert_use(&result, ExternUseTarget::FieldWrite(field));
-    }
-
-    #[test]
-    fn rejects_computed_field() {
-        let errors = expect_type_errors(check_with_provider(
-            r"
-            import ext:host { Point, touch };
-            fn use_it(var p: Point) { touch(p.x); }
-            ",
-            touch_provider(
-                vec![ExternTypeDescriptor {
-                    fields: vec![computed_field("x", ExternTypeExpr::Float)],
-                    ..extern_type("Point")
-                }],
-                ExternTypeExpr::Float,
-            ),
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::RequiresMutablePlace { .. })
-        });
-    }
-
-    #[test]
-    fn rejects_immutable_nested_field() {
-        let errors = expect_type_errors(check_with_provider(
-            r"
-            import ext:host { Parent, touch };
-            fn use_it(p: Parent) { touch(p.child.x); }
-            ",
-            touch_provider(nested_field_types(), ExternTypeExpr::Float),
-        ));
-
-        assert_has_error(&errors, |error| {
-            matches!(error, TypeError::ImmutableAssignment { .. })
-        });
     }
 
     #[test]
@@ -3012,72 +1968,6 @@ mod named_modules {
                 .any(|error| matches!(error, TypeError::TypeMismatch { .. })),
             "unexpected errors: {errors:?}"
         );
-    }
-
-    #[test]
-    fn invalid_member_catalog_types() {
-        let Err(errors) = check_with_provider(
-            "",
-            provider(ExternModuleDescriptor {
-                path: extern_path(&["host"]),
-                types: vec![ExternTypeDescriptor {
-                    methods: vec![ExternMethodDescriptor {
-                        name: "move_by".to_string(),
-                        doc: None,
-                        receiver: ReceiverMode::Shared,
-                        signature: ExternSignature {
-                            params: vec![param("missing", named("MissingMethod"))],
-                            ret: ExternTypeExpr::Void,
-                        },
-                        effects: ExternEffects::default(),
-                    }],
-                    statics: vec![ExternStaticDescriptor {
-                        name: "make".to_string(),
-                        doc: None,
-                        signature: ExternSignature {
-                            params: vec![],
-                            ret: named("MissingStatic"),
-                        },
-                        effects: ExternEffects::default(),
-                    }],
-                    operators: vec![ExternOperatorDescriptor {
-                        op: ExternOperator::Unary(UnaryOp::Neg),
-                        signature: ExternSignature {
-                            params: vec![],
-                            ret: named("MissingOperator"),
-                        },
-                        effects: ExternEffects::default(),
-                    }],
-                    ..extern_type("Handle")
-                }],
-                functions: vec![],
-            }),
-        ) else {
-            panic!("invalid catalog should fail");
-        };
-
-        for expected in ["MissingMethod", "MissingStatic", "MissingOperator"] {
-            assert!(
-                errors.iter().any(|error| matches!(
-                    error,
-                    TypeError::ExternCatalog(ExternCatalogError::UnknownType { name, .. })
-                        if name.as_str() == expected
-                )),
-                "missing {expected} in {errors:?}"
-            );
-        }
-
-        assert!(errors.iter().any(|error| matches!(
-            error,
-            TypeError::ExternCatalog(ExternCatalogError::UnknownType {
-                context: ExternCatalogContext {
-                    item: ExternContextItem::Operator { .. },
-                    ..
-                },
-                name,
-                ..
-            }) if name.as_str() == "MissingOperator"
-        )));
     }
 
     #[test]

@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: void type is not allowed in parameter position
+
+extern fn f(x: void) -> void;

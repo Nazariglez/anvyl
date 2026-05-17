@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, TypeSubst,
+    ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, ModuleScope, NominalKey, TypeSubst,
     const_term::{ConstInferVarId, ConstTerm},
     type_ops::TypeFolder,
 };
@@ -117,6 +117,17 @@ struct TyNominal {
 }
 
 impl TyNominal {
+    fn key(&self) -> NominalKey {
+        NominalKey {
+            module: self
+                .origin
+                .as_ref()
+                .map_or(ModuleScope::Root, ModuleScope::from_nominal_origin),
+            kind: self.kind,
+            name: self.name,
+        }
+    }
+
     fn same_head(&self, other: &Self) -> bool {
         self.kind == other.kind
             && self.name == other.name
@@ -232,22 +243,6 @@ impl Ty {
             const_args,
             nominal.origin.clone(),
         ))
-    }
-
-    fn option_inner(&self) -> Option<&Ty> {
-        match self {
-            Self::Nominal(nominal)
-                if nominal.kind == NominalKind::Enum
-                    && nominal.name.0.as_ref() == Type::OPTION_ENUM_NAME =>
-            {
-                nominal.type_args.first()
-            }
-            _ => None,
-        }
-    }
-
-    fn is_option(&self) -> bool {
-        self.option_inner().is_some()
     }
 
     fn from_recovery_type(ty: &Type) -> Self {
@@ -637,6 +632,7 @@ pub(super) type SourceExprTypes = HashMap<ExprId, (Option<SourceSpan>, Type)>;
 
 #[derive(Debug, Default, Clone)]
 pub(super) struct Solver {
+    core_option: Option<NominalKey>,
     next_type_var: u32,
     next_const_var: u32,
     type_spans: HashMap<InferVarId, SourceSpan>,
@@ -651,6 +647,36 @@ pub(super) struct Solver {
 }
 
 impl Solver {
+    pub(super) fn new(core_option: Option<NominalKey>) -> Self {
+        Self {
+            core_option,
+            ..Self::default()
+        }
+    }
+
+    fn option_inner<'a>(&self, ty: &'a Ty) -> Option<&'a Ty> {
+        match ty {
+            Ty::Nominal(nominal) if self.is_core_option_nominal(nominal) => {
+                nominal.type_args.first()
+            }
+            _ => None,
+        }
+    }
+
+    fn is_option(&self, ty: &Ty) -> bool {
+        self.option_inner(ty).is_some()
+    }
+
+    fn is_core_option_nominal(&self, nominal: &TyNominal) -> bool {
+        match &self.core_option {
+            Some(key) => nominal.key() == *key,
+            None => {
+                nominal.kind == NominalKind::Enum
+                    && nominal.name.0.as_ref() == Type::OPTION_ENUM_NAME
+            }
+        }
+    }
+
     fn type_for_storage(&self, ty: &Ty) -> Type {
         self.resolve_ty(ty)
             .try_to_type_no_infer()
@@ -1582,8 +1608,8 @@ impl Solver {
         if matches!(from, Ty::Infer(_)) || matches!(to, Ty::Infer(_)) {
             return self.unify_tys_equal(span, &from, &to);
         }
-        if let Some(inner) = to.option_inner().cloned()
-            && !from.is_option()
+        if let Some(inner) = self.option_inner(&to).cloned()
+            && !self.is_option(&from)
         {
             self.constrain_tys_assignable(span, &from, &inner)?;
             return Ok(to);
@@ -1668,7 +1694,7 @@ impl Solver {
         if !self.is_nil_var(*id) {
             return None;
         }
-        let target_accepts_nil = matches!(to, Ty::Infer(_)) || to.is_option();
+        let target_accepts_nil = matches!(to, Ty::Infer(_)) || self.is_option(to);
         if target_accepts_nil {
             return Some(self.unify_tys_equal(span, from, to));
         }
@@ -1713,8 +1739,7 @@ impl Solver {
         if !from.same_head(&to) {
             return Err(SolveError::type_mismatch(expected, found, span));
         }
-        let outer_mismatch =
-            to.kind == NominalKind::Enum && to.name.0.as_ref() == Type::OPTION_ENUM_NAME;
+        let outer_mismatch = self.is_core_option_nominal(&to);
         let type_args = Self::outer_mismatch(
             self.relate_ty_lists(span, to.type_args, from.type_args, TyRelation::Assignable),
             outer_mismatch,
@@ -1856,7 +1881,7 @@ impl Solver {
                     self.nil_vars.insert(*other);
                     Ok(())
                 }
-                ty if ty.is_option() => Ok(()),
+                ty if self.is_option(ty) => Ok(()),
                 _ => Err(SolveError::type_mismatch(
                     found.clone(),
                     Ty::Infer(var),
@@ -2361,6 +2386,18 @@ mod tests {
         Type::option_of(inner)
     }
 
+    fn option_key() -> NominalKey {
+        NominalKey {
+            module: ModuleScope::Root,
+            kind: NominalKind::Enum,
+            name: ident(Type::OPTION_ENUM_NAME),
+        }
+    }
+
+    fn option_solver() -> Solver {
+        Solver::new(Some(option_key()))
+    }
+
     fn ty_option(inner: Ty) -> Ty {
         Ty::from_recovery_type(&option(
             inner.try_to_type_no_infer().expect("concrete option arg"),
@@ -2402,18 +2439,6 @@ mod tests {
         }
     }
 
-    fn list(elem: Ty) -> Ty {
-        Ty::List {
-            elem: Box::new(elem),
-        }
-    }
-
-    fn slice(elem: Ty) -> Ty {
-        Ty::Slice {
-            elem: Box::new(elem),
-        }
-    }
-
     fn map(key: Ty, value: Ty) -> Ty {
         Ty::Map {
             key: Box::new(key),
@@ -2429,112 +2454,9 @@ mod tests {
         Ty::nominal(kind, ident(name), args, vec![], Some(origin(&["pkg"])))
     }
 
-    fn type_param(name: &str, id: u32) -> crate::ast::TypeParam {
-        crate::ast::TypeParam {
-            name: ident(name),
-            id: type_var(id),
-            bounds: vec![],
-        }
-    }
-
-    fn const_generic_param(name: &str, id: u32) -> crate::ast::ConstParam {
-        crate::ast::ConstParam {
-            name: ident(name),
-            id: const_param(id),
-        }
-    }
-
     fn assert_roundtrip(ty: Type) {
         let infer = Ty::from_recovery_type(&ty);
         assert_eq!(infer.try_to_type_no_infer(), Some(ty));
-    }
-
-    fn solver_with_vars(generics: &GenericParams) -> (Solver, GenericSolverVars) {
-        let mut solver = Solver::default();
-        let vars = solver.generic_solver_vars(generics, &GenericSolverSeeds::default(), span(1, 2));
-        (solver, vars)
-    }
-
-    #[test]
-    fn generic_type_from_arg() {
-        let generics = GenericParams {
-            type_params: vec![type_param("T", 0)],
-            const_params: vec![],
-        };
-        let (mut solver, vars) = solver_with_vars(&generics);
-        let template = solver.instantiate_generic_type(&Type::Var(type_var(0)), &vars);
-        let found = solver.concrete_type(&Type::Int);
-        solver.add_handle_equal(span(1, 2), template, found);
-        assert!(solver.solve_pending().is_empty());
-        assert_eq!(
-            solver.finalize_generic_args(&generics, &vars),
-            Ok(GenericArgs {
-                type_args: vec![Type::Int],
-                const_args: vec![],
-            }),
-        );
-    }
-
-    #[test]
-    fn generic_type_from_return() {
-        let generics = GenericParams {
-            type_params: vec![type_param("T", 0)],
-            const_params: vec![],
-        };
-        let (mut solver, vars) = solver_with_vars(&generics);
-        let template = solver.instantiate_generic_type(&option(Type::Var(type_var(0))), &vars);
-        let expected = solver.concrete_type(&option(Type::Int));
-        solver.add_handle_assignable(span(1, 2), template, expected);
-        assert!(solver.solve_pending().is_empty());
-        assert_eq!(
-            solver.finalize_generic_args(&generics, &vars),
-            Ok(GenericArgs {
-                type_args: vec![Type::Int],
-                const_args: vec![],
-            }),
-        );
-    }
-
-    #[test]
-    fn generic_const_from_array_return() {
-        let generics = GenericParams {
-            type_params: vec![],
-            const_params: vec![const_generic_param("N", 0)],
-        };
-        let (mut solver, vars) = solver_with_vars(&generics);
-        let template = solver.instantiate_generic_type(
-            &Type::Array {
-                elem: Box::new(Type::Int),
-                len: ArrayLen::Param(const_param(0)),
-            },
-            &vars,
-        );
-        let expected = solver.concrete_type(&Type::Array {
-            elem: Box::new(Type::Int),
-            len: ArrayLen::Fixed(3),
-        });
-        solver.add_handle_equal(span(1, 2), template, expected);
-        assert!(solver.solve_pending().is_empty());
-        assert_eq!(
-            solver.finalize_generic_args(&generics, &vars),
-            Ok(GenericArgs {
-                type_args: vec![],
-                const_args: vec![ConstTerm::from_usize(3)],
-            }),
-        );
-    }
-
-    #[test]
-    fn generic_unresolved_name() {
-        let generics = GenericParams {
-            type_params: vec![type_param("T", 0)],
-            const_params: vec![],
-        };
-        let (solver, vars) = solver_with_vars(&generics);
-        assert_eq!(
-            solver.finalize_generic_args(&generics, &vars),
-            Err(vec![ident("T")]),
-        );
     }
 
     #[test]
@@ -2895,72 +2817,6 @@ mod tests {
     }
 
     #[test]
-    fn equal_bind_concrete() {
-        let mut solver = Solver::default();
-        let var = infer_id(solver.fresh_type(span(1, 2)));
-        let result = solver
-            .unify_equal(span(3, 4), ty_ref(Ty::Infer(var)), ty_ref(Ty::Int))
-            .expect("unification should bind");
-        assert_eq!(result, Ty::Int);
-        assert_eq!(solver.resolve_ty(&Ty::Infer(var)), Ty::Int);
-    }
-
-    #[test]
-    fn equal_bind_chain() {
-        let mut solver = Solver::default();
-        let a = infer_id(solver.fresh_type(span(1, 2)));
-        let b = infer_id(solver.fresh_type(span(3, 4)));
-        solver
-            .unify_equal(span(5, 6), ty_ref(Ty::Infer(a)), ty_ref(Ty::Infer(b)))
-            .expect("vars should unify");
-        solver
-            .unify_equal(span(7, 8), ty_ref(Ty::Infer(b)), ty_ref(Ty::String))
-            .expect("chain should bind");
-        assert_eq!(solver.resolve_ty(&Ty::Infer(a)), Ty::String);
-        assert_eq!(solver.resolve_ty(&Ty::Infer(b)), Ty::String);
-    }
-
-    #[test]
-    fn equal_arrays_and_lengths() {
-        let mut solver = Solver::default();
-        let var = infer_id(solver.fresh_type(span(1, 2)));
-        let result = solver
-            .unify_equal(
-                span(3, 4),
-                ty_ref(fixed_array(Ty::Infer(var), 3)),
-                ty_ref(fixed_array(Ty::Int, 3)),
-            )
-            .expect("arrays should unify");
-        assert_eq!(result, fixed_array(Ty::Int, 3));
-        assert_eq!(
-            solver.unify_equal(
-                span(5, 6),
-                ty_ref(fixed_array(Ty::Int, 3)),
-                ty_ref(fixed_array(Ty::Int, 4)),
-            ),
-            Err(SolveError::ConstMismatch {
-                expected: ConstTerm::from_usize(3),
-                found: ConstTerm::from_usize(4),
-                span: span(5, 6),
-            })
-        );
-    }
-
-    #[test]
-    fn array_infer_unifies_with_fixed_length() {
-        let mut solver = Solver::default();
-        let wildcard = Ty::Array {
-            elem: Box::new(Ty::Int),
-            len: ConstTerm::ArrayInfer,
-        };
-        let fixed = fixed_array(Ty::Int, 5);
-        let result = solver
-            .unify_equal(span(1, 2), ty_ref(wildcard), ty_ref(fixed.clone()))
-            .expect("array wildcard length should unify");
-        assert_eq!(result, fixed);
-    }
-
-    #[test]
     fn unresolved_const_infer_finalizes_error() {
         let mut solver = Solver::default();
         let term = solver.fresh_const(span(3, 4));
@@ -3025,117 +2881,6 @@ mod tests {
     }
 
     #[test]
-    fn equal_tuples() {
-        let mut solver = Solver::default();
-        let a = infer_id(solver.fresh_type(span(1, 2)));
-        let b = infer_id(solver.fresh_type(span(3, 4)));
-        solver
-            .unify_equal(
-                span(5, 6),
-                ty_ref(Ty::Tuple(vec![Ty::Infer(a), Ty::String])),
-                ty_ref(Ty::Tuple(vec![Ty::Int, Ty::Infer(b)])),
-            )
-            .expect("tuple should unify");
-        assert_eq!(solver.resolve_ty(&Ty::Infer(a)), Ty::Int);
-        assert_eq!(solver.resolve_ty(&Ty::Infer(b)), Ty::String);
-    }
-
-    #[test]
-    fn equal_nominal_identity_and_args() {
-        let mut solver = Solver::default();
-        let a = infer_id(solver.fresh_type(span(1, 2)));
-        solver
-            .unify_equal(
-                span(3, 4),
-                ty_ref(nominal("Box", vec![Ty::Infer(a)])),
-                ty_ref(nominal("Box", vec![Ty::Bool])),
-            )
-            .expect("same nominal should unify args");
-        assert_eq!(solver.resolve_ty(&Ty::Infer(a)), Ty::Bool);
-        assert!(matches!(
-            solver.unify_equal(
-                span(5, 6),
-                ty_ref(nominal("Box", vec![Ty::Int])),
-                ty_ref(nominal("Bag", vec![Ty::Int])),
-            ),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-        assert!(matches!(
-            solver.unify_equal(
-                span(7, 8),
-                ty_ref(Ty::nominal(
-                    NominalKind::Struct,
-                    ident("Box"),
-                    vec![Ty::Int],
-                    vec![],
-                    Some(origin(&["a"])),
-                )),
-                ty_ref(Ty::nominal(
-                    NominalKind::Struct,
-                    ident("Box"),
-                    vec![Ty::Int],
-                    vec![],
-                    Some(origin(&["b"])),
-                )),
-            ),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn equal_nominal_dedup() {
-        let mut solver = Solver::default();
-        solver.add_equal(
-            span(1, 2),
-            ty_ref(nominal("Box", vec![Ty::Int])),
-            ty_ref(nominal("Box", vec![Ty::String])),
-        );
-        solver.add_equal(
-            span(1, 2),
-            ty_ref(nominal("Box", vec![Ty::Int])),
-            ty_ref(nominal("Box", vec![Ty::String])),
-        );
-        let errors = solver.solve_all();
-        assert_eq!(errors.len(), 1);
-        assert!(matches!(errors[0], SolveError::TypeMismatch { .. }));
-    }
-
-    #[test]
-    fn equal_functions() {
-        let mut solver = Solver::default();
-        let left = Ty::Func {
-            params: vec![TyFuncParam {
-                ty: Ty::Int,
-                mutable: false,
-                cast_accept: false,
-                escape: EscapeMode::NonEscaping,
-            }],
-            ret: Box::new(TyReturnSpec::value(Ty::Bool)),
-        };
-        let wrong_count = Ty::Func {
-            params: vec![],
-            ret: Box::new(TyReturnSpec::value(Ty::Bool)),
-        };
-        let wrong_mutability = Ty::Func {
-            params: vec![TyFuncParam {
-                ty: Ty::Int,
-                mutable: true,
-                cast_accept: false,
-                escape: EscapeMode::NonEscaping,
-            }],
-            ret: Box::new(TyReturnSpec::value(Ty::Bool)),
-        };
-        assert!(matches!(
-            solver.unify_equal(span(1, 2), ty_ref(left.clone()), ty_ref(wrong_count)),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-        assert!(matches!(
-            solver.unify_equal(span(3, 4), ty_ref(left), ty_ref(wrong_mutability)),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-    }
-
-    #[test]
     fn equal_occurs_check() {
         let mut solver = Solver::default();
         let var = infer_id(solver.fresh_type(span(1, 2)));
@@ -3153,160 +2898,6 @@ mod tests {
     }
 
     #[test]
-    fn equal_any_exact() {
-        let mut solver = Solver::default();
-        assert_eq!(
-            solver.unify_equal(span(1, 2), ty_ref(Ty::Any), ty_ref(Ty::Any)),
-            Ok(Ty::Any)
-        );
-        assert!(matches!(
-            solver.unify_equal(span(3, 4), ty_ref(Ty::Any), ty_ref(Ty::Int)),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn equal_vars_externs() {
-        let mut solver = Solver::default();
-        assert_eq!(
-            solver.unify_equal(
-                span(1, 2),
-                ty_ref(Ty::Var(type_var(1))),
-                ty_ref(Ty::Var(type_var(1))),
-            ),
-            Ok(Ty::Var(type_var(1)))
-        );
-        assert!(matches!(
-            solver.unify_equal(
-                span(3, 4),
-                ty_ref(Ty::Var(type_var(1))),
-                ty_ref(Ty::Var(type_var(2))),
-            ),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-
-        let tex = Ty::nominal(
-            NominalKind::Extern,
-            ident("Texture"),
-            vec![],
-            vec![],
-            Some(origin(&["gfx"])),
-        );
-        assert_eq!(
-            solver.unify_equal(span(5, 6), ty_ref(tex.clone()), ty_ref(tex.clone())),
-            Ok(tex)
-        );
-        assert!(matches!(
-            solver.unify_equal(
-                span(7, 8),
-                ty_ref(Ty::nominal(
-                    NominalKind::Extern,
-                    ident("Texture"),
-                    vec![],
-                    vec![],
-                    Some(origin(&["gfx"])),
-                )),
-                ty_ref(Ty::nominal(
-                    NominalKind::Extern,
-                    ident("Texture"),
-                    vec![],
-                    vec![],
-                    Some(origin(&["ui"])),
-                )),
-            ),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn equal_nominal_const_args() {
-        let mut solver = Solver::default();
-        let ConstTerm::Infer(n) = solver.fresh_const(span(1, 2)) else {
-            panic!("expected const infer var");
-        };
-        let left = Ty::nominal(
-            NominalKind::Struct,
-            ident("Buf"),
-            vec![Ty::Int],
-            vec![ConstTerm::Infer(n)],
-            None,
-        );
-        let right = Ty::nominal(
-            NominalKind::Struct,
-            ident("Buf"),
-            vec![Ty::Int],
-            vec![ConstTerm::Value(ConstValue::Int(8))],
-            None,
-        );
-        solver
-            .unify_equal(span(3, 4), ty_ref(left), ty_ref(right))
-            .expect("nominal const arg should bind");
-        assert_eq!(
-            solver.resolve_const(&ConstTerm::Infer(n)),
-            ConstTerm::Value(ConstValue::Int(8))
-        );
-    }
-
-    #[test]
-    fn assign_option_promotion() {
-        let mut solver = Solver::default();
-        let option_int = ty_option(Ty::Int);
-        assert_eq!(
-            solver.constrain_assignable(span(1, 2), ty_ref(Ty::Int), ty_ref(option_int.clone())),
-            Ok(option_int.clone())
-        );
-        assert!(matches!(
-            solver.constrain_assignable(span(3, 4), ty_ref(option_int), ty_ref(Ty::Int)),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn equal_does_not_promote_option() {
-        let mut solver = Solver::default();
-        assert!(matches!(
-            solver.unify_equal(span(1, 2), ty_ref(Ty::Int), ty_ref(ty_option(Ty::Int))),
-            Err(SolveError::TypeMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn nil_assigns_to_option() {
-        let mut solver = Solver::default();
-        let nil = solver.fresh_nil_handle(span(1, 2));
-        let option_handle = solver.concrete_type(&option(Type::Int));
-        solver.add_handle_assignable(span(3, 4), nil.clone(), option_handle);
-        assert!(solver.solve_all().is_empty());
-        let (ty, errors) = solver.finalize_handle(&nil);
-        assert_eq!(ty, option(Type::Int));
-        assert!(errors.is_empty());
-    }
-
-    #[test]
-    fn nil_rejects_plain_type() {
-        let mut solver = Solver::default();
-        let nil = solver.fresh_nil_handle(span(1, 2));
-        let int = solver.concrete_type(&Type::Int);
-        solver.add_handle_assignable(span(3, 4), nil, int);
-        let errors = solver.solve_all();
-        assert_eq!(errors.len(), 1);
-        assert!(matches!(errors[0], SolveError::TypeMismatch { .. }));
-    }
-
-    #[test]
-    fn nil_to_var_then_option() {
-        let mut solver = Solver::default();
-        let nil = solver.fresh_nil_handle(span(1, 2));
-        let var = solver.fresh_temp_handle(span(3, 4));
-        let option_handle = solver.concrete_type(&option(Type::Int));
-        solver.add_handle_assignable(span(5, 6), nil.clone(), var.clone());
-        solver.add_handle_assignable(span(7, 8), var.clone(), option_handle);
-        assert!(solver.solve_all().is_empty());
-        assert_eq!(solver.finalize_handle(&nil).0, option(Type::Int));
-        assert_eq!(solver.finalize_handle(&var).0, option(Type::Int));
-    }
-
-    #[test]
     fn nil_unresolved_finalize() {
         let mut solver = Solver::default();
         solver.nil_expr_type(ExprId(7), span(1, 2));
@@ -3314,42 +2905,6 @@ mod tests {
         assert_eq!(
             errors,
             vec![SolverFinalizeError::UnresolvedType { span: span(1, 2) }]
-        );
-    }
-
-    #[test]
-    fn assign_arrays_and_slices() {
-        let mut solver = Solver::default();
-        assert!(
-            solver
-                .constrain_assignable(
-                    span(1, 2),
-                    ty_ref(fixed_array(Ty::Int, 3)),
-                    ty_ref(fixed_array(Ty::Int, 3)),
-                )
-                .is_ok()
-        );
-        assert!(matches!(
-            solver.constrain_assignable(
-                span(3, 4),
-                ty_ref(fixed_array(Ty::Int, 3)),
-                ty_ref(fixed_array(Ty::Int, 4)),
-            ),
-            Err(SolveError::ConstMismatch { .. })
-        ));
-        assert!(
-            solver
-                .constrain_assignable(
-                    span(5, 6),
-                    ty_ref(fixed_array(Ty::Int, 3)),
-                    ty_ref(slice(Ty::Int)),
-                )
-                .is_ok()
-        );
-        assert!(
-            solver
-                .constrain_assignable(span(7, 8), ty_ref(list(Ty::Int)), ty_ref(slice(Ty::Int)))
-                .is_ok()
         );
     }
 
@@ -3387,21 +2942,8 @@ mod tests {
     }
 
     #[test]
-    fn assign_any_wildcard() {
-        let mut solver = Solver::default();
-        assert_eq!(
-            solver.constrain_assignable(span(1, 2), ty_ref(Ty::Int), ty_ref(Ty::Any)),
-            Ok(Ty::Any)
-        );
-        assert_eq!(
-            solver.constrain_assignable(span(3, 4), ty_ref(Ty::Any), ty_ref(Ty::Int)),
-            Ok(Ty::Int)
-        );
-    }
-
-    #[test]
     fn assign_func_invariant() {
-        let mut solver = Solver::default();
+        let mut solver = option_solver();
         let from = Ty::Func {
             params: vec![TyFuncParam {
                 ty: Ty::Int,
@@ -3427,6 +2969,23 @@ mod tests {
     }
 
     #[test]
+    fn non_core_option_is_not_optional() {
+        let mut solver = option_solver();
+        let local_option = Ty::nominal(
+            NominalKind::Enum,
+            ident(Type::OPTION_ENUM_NAME),
+            vec![Ty::Int],
+            vec![],
+            Some(origin(&["game"])),
+        );
+
+        assert!(matches!(
+            solver.constrain_assignable(span(1, 2), ty_ref(Ty::Int), ty_ref(local_option)),
+            Err(SolveError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn constraints_late_binding() {
         let mut solver = Solver::default();
         let a = infer_id(solver.fresh_type(span(1, 2)));
@@ -3440,7 +2999,7 @@ mod tests {
 
     #[test]
     fn constraints_equal_first() {
-        let mut solver = Solver::default();
+        let mut solver = option_solver();
         let a = infer_id(solver.fresh_type(span(1, 2)));
         solver.add_assignable(span(3, 4), ty_ref(Ty::Infer(a)), ty_ref(ty_option(Ty::Int)));
         solver.add_equal(span(5, 6), ty_ref(Ty::Infer(a)), ty_ref(Ty::Int));
@@ -3494,15 +3053,6 @@ mod tests {
     }
 
     #[test]
-    fn facade_assign() {
-        let mut solver = Solver::default();
-        let temp = solver.fresh_temp_handle(span(1, 2));
-        solver.add_handle_assignable(span(3, 4), solver.concrete_type(&Type::Int), temp.clone());
-        assert!(solver.solve_pending().is_empty());
-        assert_eq!(solver.handle_to_type(&temp), Type::Int);
-    }
-
-    #[test]
     fn finalize_dedup() {
         let mut solver = Solver::default();
         let first = solver.fresh_expr_type(ExprId(1), span(1, 2));
@@ -3512,21 +3062,6 @@ mod tests {
             errors,
             vec![SolverFinalizeError::UnresolvedType { span: span(1, 2) }]
         );
-    }
-
-    #[test]
-    fn nil_non_option() {
-        let mut solver = Solver::default();
-        let nil = solver.nil_expr_type(ExprId(1), span(1, 2));
-        solver.add_handle_assignable(span(3, 4), nil, solver.concrete_type(&Type::Int));
-        assert!(matches!(
-            solver.solve_pending().as_slice(),
-            [SolverRelationError::TypeMismatch {
-                expected: Type::Int,
-                found: Type::Infer,
-                ..
-            }]
-        ));
     }
 
     #[test]

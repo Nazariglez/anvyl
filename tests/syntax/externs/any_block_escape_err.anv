@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: extern 'any' value cannot escape an extern boundary
+
+extern fn get() -> any;
+
+fn main() {
+    let block = { get() };
+}

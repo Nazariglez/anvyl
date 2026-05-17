@@ -4,8 +4,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-LEXER=$(sed -n '/^fn map_ident_to_token/,/^}/p' "$REPO_ROOT/crates/frontend/src/lexer.rs" \
-  | grep -oE '"[a-z]+" =>' \
+LEXER=$(sed -n '/pub enum Keyword {/,/^    }/p' "$REPO_ROOT/crates/frontend/src/lexer.rs" \
   | grep -oE '"[a-z]+"' \
   | tr -d '"' \
   | sort -u)

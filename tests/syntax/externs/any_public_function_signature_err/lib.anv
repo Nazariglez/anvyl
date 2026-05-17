@@ -1,0 +1,3 @@
+// @helper
+
+pub fn keep(value: any) -> int { 0 }

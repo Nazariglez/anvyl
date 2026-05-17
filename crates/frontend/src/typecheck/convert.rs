@@ -158,7 +158,7 @@ fn try_expected_dyn(
     match to {
         Type::Dyn(contract) => try_to_dyn(tc, span, expr_id, from, contract),
         to => {
-            let Some(inner) = tc.decls.core_option_inner(to).cloned() else {
+            let Some(inner) = tc.decls.semantic_option_inner(to).cloned() else {
                 return false;
             };
             let Type::Dyn(contract) = &inner else {
@@ -167,7 +167,7 @@ fn try_expected_dyn(
             if from == &inner {
                 return true;
             }
-            if tc.decls.core_option_inner(from).is_some() {
+            if tc.decls.semantic_option_inner(from).is_some() {
                 return false;
             }
             try_to_dyn(tc, span, expr_id, from, contract)
@@ -226,7 +226,7 @@ fn try_to_dyn_hole(
             true
         }
         Type::Infer | Type::Var(_) => false,
-        _ if tc.decls.core_option_inner(from).is_some() => false,
+        _ if tc.decls.semantic_option_inner(from).is_some() => false,
         _ => {
             tc.dyn_infer.add_conversion(
                 tc.current_module.clone(),
@@ -281,7 +281,7 @@ fn try_concrete_to_dyn(
     contract: &ContractRef,
 ) -> bool {
     if matches!(from, Type::Infer | Type::Var(_) | Type::Dyn(_))
-        || tc.decls.core_option_inner(from).is_some()
+        || tc.decls.semantic_option_inner(from).is_some()
     {
         return false;
     }

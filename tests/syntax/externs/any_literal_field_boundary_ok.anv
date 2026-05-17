@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern fn get() -> any;
+extern type Box { init; value: any; }
+
+fn main() {
+    Box { value: get() };
+}

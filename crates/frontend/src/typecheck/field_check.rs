@@ -39,7 +39,29 @@ pub(super) enum MissingFields {
 #[derive(Default)]
 pub(super) struct FieldShape {
     pub(super) fields: Vec<CheckedField>,
+    pub(super) invalid_indices: Vec<usize>,
     pub(super) failed: bool,
+}
+
+pub(super) fn check_named<T>(
+    fields: &[(Ident, T)],
+    schema: &HashMap<Ident, FieldSchema>,
+    owner: &FieldOwner,
+    missing: MissingFields,
+    span: Option<Span>,
+    field_span: impl Fn(&T) -> Span,
+    tc: &mut TypeChecker,
+) -> FieldShape {
+    let uses = fields
+        .iter()
+        .enumerate()
+        .map(|(index, (name, field))| FieldUse {
+            name: *name,
+            span: field_span(field),
+            index,
+        })
+        .collect::<Vec<_>>();
+    check(&uses, schema, owner, missing, span, tc)
 }
 
 pub(super) fn check(
@@ -53,6 +75,7 @@ pub(super) fn check(
     let mut seen = HashSet::new();
     let mut failed = false;
     let mut fields = Vec::with_capacity(uses.len());
+    let mut invalid_indices = vec![];
 
     for field in uses {
         if !seen.insert(field.name) {
@@ -60,6 +83,7 @@ pub(super) fn check(
                 name: field.name,
                 span: tc.error_span(field.span),
             });
+            invalid_indices.push(field.index);
             failed = true;
             continue;
         }
@@ -71,6 +95,7 @@ pub(super) fn check(
                 policy: schema.policy.clone(),
             }),
             None => {
+                invalid_indices.push(field.index);
                 push_unknown(owner, field.name, field.span, tc);
                 failed = true;
             }
@@ -90,7 +115,11 @@ pub(super) fn check(
         }
     }
 
-    FieldShape { fields, failed }
+    FieldShape {
+        fields,
+        invalid_indices,
+        failed,
+    }
 }
 
 fn missing_fields_enabled(missing: MissingFields) -> bool {

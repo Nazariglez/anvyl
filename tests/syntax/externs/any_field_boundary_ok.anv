@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Box { value: any; }
+extern fn put(value: any);
+
+fn main(box: Box) {
+    put(box.value);
+}

@@ -38,15 +38,12 @@ use self::{
         PatternBindMode, PatternContext, PatternRoot, PatternRootInput, check_pattern_scrutinee,
         mode_for_head,
     },
-    place::{
-        AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts,
-        check_alias_scrutinee, check_place,
-    },
+    place::{AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts, check_place},
     postfix::{
         PostfixStep, check_index_expr, check_postfix_chain, check_tuple_index,
         collect_postfix_chain,
     },
-    type_ops::{type_contains_dyn_value, type_depends_on_generics},
+    type_ops::type_contains_dyn_value,
     type_refs::{LocalTypeScopes, TypeRefResolver},
 };
 use crate::{
@@ -1073,8 +1070,9 @@ struct TypeChecker {
 
 impl TypeChecker {
     fn new(decls: DeclarationIndex, externs: ExternCatalog, config: TypecheckConfig) -> Self {
+        let core_option = decls.core_option_key();
         Self {
-            solver: Solver::default(),
+            solver: Solver::new(core_option),
             calls: HashMap::new(),
             extern_uses: HashMap::new(),
             member_paths: HashMap::new(),
@@ -1761,7 +1759,7 @@ impl TypeChecker {
         } else {
             (
                 TryCarrierKind::Option,
-                self.decls.core_option_inner(ty)?,
+                self.decls.semantic_option_inner(ty)?,
                 None,
             )
         };
@@ -2038,10 +2036,7 @@ impl TypeChecker {
     ) -> Type {
         let resolved_params = self.resolve_callable_params(params, exported);
         let resolved_ret = ret.with_ty(self.resolve_type_for_tc_at(&ret.ty, span));
-        Type::Func {
-            params: resolved_params,
-            ret: Box::new(resolved_ret),
-        }
+        Type::func(resolved_params, resolved_ret)
     }
 
     fn resolve_callable_params(&mut self, params: &[Param], exported: bool) -> Vec<FuncParam> {
@@ -2229,7 +2224,7 @@ impl TypeChecker {
         if matches!(ty, Type::Infer) {
             return Type::Infer;
         }
-        if let Some(inner) = self.decls.core_option_inner(ty) {
+        if let Some(inner) = self.decls.semantic_option_inner(ty) {
             return inner.clone();
         }
         self.push_error(TypeError::OptionalChainingOnNonOptional {
@@ -2239,10 +2234,11 @@ impl TypeChecker {
     }
 
     pub(super) fn optional_chain_result_type(&self, ty: Type) -> Type {
-        if matches!(ty, Type::Infer | Type::Void) || self.decls.core_option_inner(&ty).is_some() {
+        if matches!(ty, Type::Infer | Type::Void) || self.decls.semantic_option_inner(&ty).is_some()
+        {
             return ty;
         }
-        self.decls.core_option_of(ty).unwrap_or(Type::Infer)
+        self.decls.semantic_option_of(ty)
     }
 }
 
@@ -2954,7 +2950,7 @@ fn try_operand_hint(
     let optional_context = matches!(enclosing.kind, TryCarrierKind::Option)
         && expected_success
             .as_ref()
-            .is_some_and(|ty| tc.decls.core_option_inner(ty).is_some());
+            .is_some_and(|ty| tc.decls.semantic_option_inner(ty).is_some());
     let success_matches_result_error = enclosing
         .error
         .as_ref()
@@ -3268,10 +3264,10 @@ fn check_coalesce(
     let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
     let left_expected = expected_ty
         .as_ref()
-        .and_then(|ty| tc.decls.core_option_of(ty.clone()))
+        .map(|ty| tc.decls.semantic_option_of(ty.clone()))
         .map(|ty| tc.type_handle(&ty));
     let left = check_value_expr_checked_with_hint(left_expr, left_expected, tc);
-    let Some(inner) = tc.decls.core_option_inner(&left.ty).cloned() else {
+    let Some(inner) = tc.decls.semantic_option_inner(&left.ty).cloned() else {
         if matches!(left.ty, Type::Infer) {
             let mut right = check_expr_checked(right_expr, tc);
             right.contains_extern_any |= left.contains_extern_any;
@@ -3288,7 +3284,7 @@ fn check_coalesce(
 
     let mut right = check_expr_checked(right_expr, tc);
     right.contains_extern_any |= left.contains_extern_any;
-    if tc.decls.core_option_inner(&right.ty) == Some(&inner) {
+    if tc.decls.semantic_option_inner(&right.ty) == Some(&inner) {
         return right;
     }
 
@@ -3718,7 +3714,7 @@ fn check_ternary_checked_with_hint(
 
 fn expected_assignable_type(expected: Option<&TypeHandle>, tc: &TypeChecker) -> Option<Type> {
     let ty = expected.map(|handle| tc.handle_type(handle))?;
-    Some(tc.decls.core_option_inner(&ty).unwrap_or(&ty).clone())
+    Some(tc.decls.semantic_option_inner(&ty).unwrap_or(&ty).clone())
 }
 
 fn check_exact_downcast_expr(

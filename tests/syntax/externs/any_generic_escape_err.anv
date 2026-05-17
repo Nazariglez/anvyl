@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: extern 'any' value cannot escape an extern boundary
+
+extern fn get() -> any;
+
+fn take<T>(value: T) {}
+
+fn main() {
+    take(get());
+}
