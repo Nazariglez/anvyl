@@ -1,0 +1,245 @@
+use super::{
+    ActiveMutDowncastRoot, PatternBindMode, PatternContext, PlaceAccess, TypeChecker, TypeError,
+    downcast,
+    pattern::{self, PatternOutcome, PatternPlace},
+};
+use crate::{
+    ast::{DynArmBinding, ExprId, Ident, Match, MatchArmHead, MatchArmNode, Type},
+    span::Span,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MatchKind {
+    Ordinary,
+    Dynamic,
+    Mixed,
+}
+
+pub(super) fn classify(arms: &[MatchArmNode]) -> MatchKind {
+    let has_pattern = arms
+        .iter()
+        .any(|arm| matches!(arm.node.head, MatchArmHead::Pattern(_)));
+    let has_dynamic = arms
+        .iter()
+        .any(|arm| !matches!(arm.node.head, MatchArmHead::Pattern(_)));
+    match (has_pattern, has_dynamic) {
+        (true, true) => MatchKind::Mixed,
+        (false, true) => MatchKind::Dynamic,
+        _ => MatchKind::Ordinary,
+    }
+}
+
+pub(super) fn check_arm_head(
+    head: &MatchArmHead,
+    scrutinee: PatternPlace,
+    mode: PatternBindMode,
+    scrutinee_id: ExprId,
+    tc: &mut TypeChecker,
+) -> PatternOutcome {
+    match head {
+        MatchArmHead::Pattern(pattern) => pattern::check_place_at(
+            pattern,
+            scrutinee,
+            mode,
+            scrutinee_id,
+            PatternContext::Match,
+            tc,
+        ),
+        MatchArmHead::DynDowncast(_) | MatchArmHead::DynElse(_) => PatternOutcome::error(),
+    }
+}
+
+pub(super) fn validate_dynamic_arms(arms: &[MatchArmNode], tc: &mut TypeChecker) -> bool {
+    let mut valid = true;
+    let Some(last) = arms.last() else {
+        return false;
+    };
+    if !matches!(last.node.head, MatchArmHead::DynElse(_)) {
+        tc.push_error(TypeError::CompileError {
+            message: "dynamic match requires a final else(...) arm".to_string(),
+            span: tc.error_span(last.span),
+        });
+        valid = false;
+    }
+    for arm in &arms[..arms.len() - 1] {
+        if matches!(arm.node.head, MatchArmHead::DynElse(_)) {
+            tc.push_error(TypeError::CompileError {
+                message: "dynamic match else(...) arm must be last".to_string(),
+                span: tc.error_span(arm.span),
+            });
+            valid = false;
+        }
+    }
+    valid
+}
+
+pub(super) fn check_dynamic_source(
+    node: &Match,
+    tc: &mut TypeChecker,
+) -> downcast::CheckedDowncastSource {
+    let policy = if matches!(node.head, crate::ast::PatternHead::Var) {
+        downcast::DowncastSourcePolicy::MutablePlace {
+            binding: first_dynamic_binding(&node.arms).unwrap_or(Ident::new("_")),
+        }
+    } else {
+        downcast::DowncastSourcePolicy::Value
+    };
+    downcast::check_source(
+        &node.scrutinee,
+        &policy,
+        downcast::DowncastSourceContext::DynamicMatch,
+        tc,
+    )
+}
+
+pub(super) fn with_dynamic_arm<R>(
+    arm: &MatchArmNode,
+    source: &downcast::CheckedDowncastSource,
+    scrutinee_id: ExprId,
+    targets: &mut Vec<Type>,
+    tc: &mut TypeChecker,
+    check_body: impl FnOnce(&mut TypeChecker) -> R,
+) -> R {
+    tc.push_scope();
+    let locked = match &arm.node.head {
+        MatchArmHead::DynDowncast(dyn_arm) => {
+            let target = downcast::check_target_ref(tc, &dyn_arm.node.target, dyn_arm.span);
+            if let Some(target) = &target {
+                let duplicate = targets.contains(target);
+                if duplicate {
+                    push_duplicate_target(target, dyn_arm.span, tc);
+                } else {
+                    targets.push(target.clone());
+                }
+                if let Some(contract) = source.valid_contract().filter(|_| !duplicate) {
+                    downcast::record_fact(
+                        &downcast::DowncastSite {
+                            id: dyn_arm.node.id,
+                            source_id: scrutinee_id,
+                            span: tc.source_span(dyn_arm.span),
+                        },
+                        contract,
+                        target.clone(),
+                        source.alias.is_some(),
+                        tc,
+                    );
+                }
+            }
+            match (binding_name(&dyn_arm.node.binding), target, source.valid) {
+                (Some(name), Some(target), true) => {
+                    define_downcast_binding(name, &target, source, tc)
+                }
+                (Some(name), _, _) => {
+                    define_recovery_binding(name, tc);
+                    false
+                }
+                (None, _, _) => false,
+            }
+        }
+        MatchArmHead::DynElse(dyn_arm) => {
+            if let Some(name) = binding_name(&dyn_arm.node.binding) {
+                define_else_binding(name, source, tc);
+            }
+            false
+        }
+        MatchArmHead::Pattern(_) => false,
+    };
+    let body = check_body(tc);
+    if locked {
+        tc.active_mut_downcast_roots.pop();
+    }
+    tc.pop_scope();
+    body
+}
+
+pub(super) fn with_dynamic_arm_recovery<R>(
+    arm: &MatchArmNode,
+    tc: &mut TypeChecker,
+    check_body: impl FnOnce(&mut TypeChecker) -> R,
+) -> R {
+    tc.push_scope();
+    if let Some(name) = head_binding(&arm.node.head) {
+        define_recovery_binding(name, tc);
+    }
+    let body = check_body(tc);
+    tc.pop_scope();
+    body
+}
+
+fn define_downcast_binding(
+    name: Ident,
+    target: &Type,
+    source: &downcast::CheckedDowncastSource,
+    tc: &mut TypeChecker,
+) -> bool {
+    let handle = tc.type_handle(target);
+    let Some(alias) = source.alias.as_ref() else {
+        tc.define_pattern_binding_from_handle(name, &handle, false);
+        return false;
+    };
+    tc.define_downcast_alias_from_handle(name, &handle, alias.target(PlaceAccess::Mutable));
+    tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
+        identity: alias.identity.clone(),
+        allowed: name,
+    });
+    true
+}
+
+fn define_else_binding(
+    name: Ident,
+    source: &downcast::CheckedDowncastSource,
+    tc: &mut TypeChecker,
+) {
+    if !source.valid {
+        define_recovery_binding(name, tc);
+        return;
+    }
+    if let Some(alias) = source.alias.as_ref() {
+        tc.define_alias_binding_from_handle(
+            name,
+            &source.handle,
+            alias.target(alias.access),
+            PatternContext::Match,
+        );
+    } else {
+        tc.define_pattern_binding_from_handle(name, &source.handle, false);
+    }
+}
+
+fn define_recovery_binding(name: Ident, tc: &mut TypeChecker) {
+    let handle = tc.type_handle(&Type::Infer);
+    tc.define_pattern_binding_from_handle(name, &handle, false);
+}
+
+pub(super) fn push_mixed_error(span: Span, tc: &mut TypeChecker) {
+    tc.push_error(TypeError::CompileError {
+        message: "dynamic type-match arms cannot be mixed with ordinary pattern arms".to_string(),
+        span: tc.error_span(span),
+    });
+}
+
+fn push_duplicate_target(target: &Type, span: Span, tc: &mut TypeChecker) {
+    tc.push_error(TypeError::CompileError {
+        message: format!("duplicate dynamic match target '{target}'"),
+        span: tc.error_span(span),
+    });
+}
+
+fn binding_name(binding: &DynArmBinding) -> Option<Ident> {
+    match binding {
+        DynArmBinding::Named(name) => Some(*name),
+        DynArmBinding::Wildcard => None,
+    }
+}
+
+fn head_binding(head: &MatchArmHead) -> Option<Ident> {
+    match head {
+        MatchArmHead::DynDowncast(arm) => binding_name(&arm.node.binding),
+        MatchArmHead::DynElse(arm) => binding_name(&arm.node.binding),
+        MatchArmHead::Pattern(_) => None,
+    }
+}
+
+fn first_dynamic_binding(arms: &[MatchArmNode]) -> Option<Ident> {
+    arms.iter().find_map(|arm| head_binding(&arm.node.head))
+}

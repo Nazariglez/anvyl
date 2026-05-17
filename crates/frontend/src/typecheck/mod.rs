@@ -72,6 +72,7 @@ mod control_flow;
 mod convert;
 mod decl_validate;
 mod decls;
+mod downcast;
 mod dyn_infer;
 mod enum_variant;
 mod extern_boundary;
@@ -82,6 +83,7 @@ mod generic_bind;
 mod globals;
 mod infer;
 mod literal;
+mod match_check;
 mod match_coverage;
 mod member;
 mod pattern;
@@ -2798,7 +2800,9 @@ fn check_expr_checked_with_hint(
         ExprKind::IntrinsicCall(call) => check_intrinsic_call(expr, call, tc),
         ExprKind::Range(range) => check_range_expr(expr, range, expected, tc),
         ExprKind::Cast(cast) => convert::check_cast_expr(expr, cast, tc),
-        ExprKind::ExactDowncast(downcast) => check_exact_downcast_expr(expr, downcast, tc),
+        ExprKind::ExactDowncast(downcast) => {
+            downcast::check_expr(expr, downcast, expected.as_ref(), tc)
+        }
         ExprKind::Lambda(lambda) => closure::check_lambda_expr(expr, lambda, expected.as_ref(), tc),
     }
 }
@@ -3757,20 +3761,6 @@ fn expected_assignable_type(expected: Option<&TypeHandle>, tc: &TypeChecker) -> 
     Some(tc.decls.semantic_option_inner(&ty).unwrap_or(&ty).clone())
 }
 
-fn check_exact_downcast_expr(
-    expr: &ExprNode,
-    downcast: &ExactDowncastNode,
-    tc: &mut TypeChecker,
-) -> CheckedType {
-    let _target = tc.resolve_downcast_target_type_at(&downcast.node.target, downcast.span);
-    check_value_expr_checked_with_hint(&downcast.node.expr, None, tc);
-    tc.push_error(TypeError::CompileError {
-        message: "exact downcast is only supported in conditional bindings".to_string(),
-        span: tc.error_span(downcast.span),
-    });
-    checked_from_type(expr, Type::Infer, tc)
-}
-
 fn sync_assigned_flow(
     target: &ExprNode,
     value: &ExprNode,
@@ -3890,54 +3880,126 @@ fn check_match_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &match_node.node;
-    let mode = mode_for_head(node.head);
-    let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
+    match match_check::classify(&node.arms) {
+        match_check::MatchKind::Dynamic => {
+            return check_dynamic_match_checked_with_hint(match_node, expected, tc);
+        }
+        match_check::MatchKind::Mixed => {
+            match_check::push_mixed_error(match_node.span, tc);
+            return checked_type(Type::Infer, tc);
+        }
+        match_check::MatchKind::Ordinary => {}
+    }
     if node.arms.is_empty() {
         tc.push_error(TypeError::EmptyMatch {
             span: tc.error_span(match_node.span),
         });
         return checked_void(tc);
     }
-    let mut arms = Vec::with_capacity(node.arms.len());
+
+    let mode = mode_for_head(node.head);
+    let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
     let mut outcomes = Vec::with_capacity(node.arms.len());
-    let flow = tc.closure.closure_flow_snapshot();
-    let mut arm_flows = Vec::with_capacity(node.arms.len());
-    for arm in &node.arms {
-        tc.closure.restore_closure_flow(&flow);
+    let arms = check_match_arm_bodies(&node.arms, expected, tc, |arm, expected, tc| {
         tc.push_scope();
-        let outcome = pattern::check_place_at(
-            &arm.node.pattern,
+        let outcome = match_check::check_arm_head(
+            &arm.node.head,
             scrutinee.pattern_place(
                 scrutinee.checked.handle.clone(),
                 scrutinee.checked.ty.clone(),
             ),
             mode,
             node.scrutinee.node.id,
-            PatternContext::Match,
             tc,
         );
-        let body = check_expr_checked_with_hint(&arm.node.body, expected.clone(), tc);
-        if let Some(expected) = expected.as_ref() {
-            let expected_ty = tc.handle_type(expected);
-            if !body.ty.is_void() && !matches!(body.ty, Type::Infer) && body.ty != expected_ty {
-                tc.push_error(TypeError::MatchArmTypeMismatch {
-                    expected: expected_ty,
-                    found: body.ty.clone(),
-                    span: tc.error_span(arm.node.body.span),
-                });
-            }
-        }
+        let body = check_expr_checked_with_hint(&arm.node.body, expected, tc);
         tc.pop_scope();
-        arm_flows.push(tc.closure.closure_flow_snapshot());
         outcomes.push(outcome);
-        arms.push((arm.node.body.span, body));
+        body
+    });
+    match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
+    finish_match_arms(arms, tc)
+}
+
+fn check_dynamic_match_checked_with_hint(
+    match_node: &MatchNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let node = &match_node.node;
+    if node.arms.is_empty() {
+        tc.push_error(TypeError::EmptyMatch {
+            span: tc.error_span(match_node.span),
+        });
+        return checked_void(tc);
+    }
+
+    let valid_arms = match_check::validate_dynamic_arms(&node.arms, tc);
+    let source = match_check::check_dynamic_source(node, tc);
+    let mut targets = vec![];
+    let arms = check_match_arm_bodies(&node.arms, expected, tc, |arm, expected, tc| {
+        if valid_arms {
+            match_check::with_dynamic_arm(
+                arm,
+                &source,
+                node.scrutinee.node.id,
+                &mut targets,
+                tc,
+                |tc| check_expr_checked_with_hint(&arm.node.body, expected, tc),
+            )
+        } else {
+            match_check::with_dynamic_arm_recovery(arm, tc, |tc| {
+                check_expr_checked_with_hint(&arm.node.body, expected, tc)
+            })
+        }
+    });
+    finish_match_arms(arms, tc)
+}
+
+fn check_match_arm_bodies(
+    arms: &[MatchArmNode],
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+    mut check_arm: impl FnMut(&MatchArmNode, Option<TypeHandle>, &mut TypeChecker) -> CheckedType,
+) -> Vec<(Span, CheckedType)> {
+    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let flow = tc.closure.closure_flow_snapshot();
+    let mut arm_flows = Vec::with_capacity(arms.len());
+    let mut checked = Vec::with_capacity(arms.len());
+    for arm in arms {
+        tc.closure.restore_closure_flow(&flow);
+        let body = check_arm(arm, expected.clone(), tc);
+        check_match_arm_expected(&body, expected_ty.as_ref(), arm.node.body.span, tc);
+        arm_flows.push(tc.closure.closure_flow_snapshot());
+        checked.push((arm.node.body.span, body));
     }
     tc.closure.restore_closure_flow(&flow);
     for flow in arm_flows {
         let current = tc.closure.closure_flow_snapshot();
         tc.closure.join_closure_flow_snapshots(&current, &flow);
     }
-    match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
+    checked
+}
+
+fn check_match_arm_expected(
+    body: &CheckedType,
+    expected: Option<&Type>,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    let Some(expected) = expected else {
+        return;
+    };
+    if !body.ty.is_void() && !matches!(body.ty, Type::Infer) && body.ty != *expected {
+        tc.push_error(TypeError::MatchArmTypeMismatch {
+            expected: expected.clone(),
+            found: body.ty.clone(),
+            span: tc.error_span(span),
+        });
+    }
+}
+
+fn finish_match_arms(arms: Vec<(Span, CheckedType)>, tc: &mut TypeChecker) -> CheckedType {
     if arms[0].1.ty.is_void() {
         return checked_void(tc);
     }

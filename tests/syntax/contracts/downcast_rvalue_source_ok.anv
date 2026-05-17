@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+    fn attack(self) {}
+}
+
+fn make_actor() -> dyn Drawable {
+    Enemy {}
+}
+
+fn main() {
+    if let enemy = make_actor() as? Enemy {
+        enemy.attack();
+    }
+}

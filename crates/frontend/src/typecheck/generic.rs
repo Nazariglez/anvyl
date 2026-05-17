@@ -6,6 +6,7 @@ use super::{
     GlobalAccessMap, MemberPathMap, TypeChecker, TypecheckFacts,
     const_term::ConstTerm,
     decls::CallableId,
+    dyn_infer::DynInferenceFacts,
     infer::{GenericSolverSeeds, Solver},
     semantic_use::map_delta,
     type_ops::TypeFolder,
@@ -147,6 +148,7 @@ pub(crate) struct SpecializedBodyFacts {
 #[derive(Clone)]
 pub(crate) struct SpecializedBody {
     pub(crate) facts: SpecializedBodyFacts,
+    pub(crate) dyn_infer: DynInferenceFacts,
     pub(crate) inferred_ret: Option<Type>,
 }
 
@@ -230,6 +232,7 @@ pub(super) fn check_with_specialization(
 ) -> Option<Type> {
     tc.solve_constraints();
     let old_facts = tc.specialization_facts();
+    let old_dyn_infer = tc.dyn_infer.specialization_snapshot();
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
     tc.push_type_subst(type_subst);
     tc.push_const_subst(const_subst);
@@ -245,6 +248,7 @@ pub(super) fn check_with_specialization(
         key,
         SpecializationState::Done(Box::new(SpecializedBody {
             facts: specialized_body_facts(&old_facts, &tc.specialization_facts()),
+            dyn_infer: tc.dyn_infer.specialization_delta_since(&old_dyn_infer),
             inferred_ret: inferred_ret.clone(),
         })),
     );

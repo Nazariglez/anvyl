@@ -154,6 +154,30 @@ impl TypeVisitor for DynTypeVisitor {
     }
 }
 
+pub(super) fn expected_optional_payload_dyn(
+    tc: &mut TypeChecker,
+    span: Span,
+    expr_id: ExprId,
+    payload: &Type,
+    expected: Option<&Type>,
+) -> Option<Type> {
+    let expected = expected?;
+    let (inner, contract) = optional_dyn_payload(tc, expected)?;
+    if payload == &inner {
+        return Some(expected.clone());
+    }
+    try_to_dyn(tc, span, Some(expr_id), payload, &contract)
+        .then(|| tc.decls.semantic_option_of(inner))
+}
+
+fn optional_dyn_payload(tc: &TypeChecker, ty: &Type) -> Option<(Type, ContractRef)> {
+    let inner = tc.decls.semantic_option_inner(ty)?.clone();
+    let Type::Dyn(contract) = &inner else {
+        return None;
+    };
+    Some((inner.clone(), contract.clone()))
+}
+
 fn try_expected_dyn(
     tc: &mut TypeChecker,
     span: Span,
@@ -164,10 +188,7 @@ fn try_expected_dyn(
     match to {
         Type::Dyn(contract) => try_to_dyn(tc, span, expr_id, from, contract),
         to => {
-            let Some(inner) = tc.decls.semantic_option_inner(to).cloned() else {
-                return false;
-            };
-            let Type::Dyn(contract) = &inner else {
+            let Some((inner, contract)) = optional_dyn_payload(tc, to) else {
                 return false;
             };
             if from == &inner {
@@ -176,7 +197,7 @@ fn try_expected_dyn(
             if tc.decls.semantic_option_inner(from).is_some() {
                 return false;
             }
-            try_to_dyn(tc, span, expr_id, from, contract)
+            try_to_dyn(tc, span, expr_id, from, &contract)
         }
     }
 }

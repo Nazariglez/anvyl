@@ -1,22 +1,19 @@
 use std::collections::HashMap;
 
 use super::{
-    ActiveMutDowncastRoot, CheckedType, DynDowncastFact, TypeChecker, TypeError, TypeHandle,
+    ActiveMutDowncastRoot, CheckedType, TypeChecker, TypeError, TypeHandle,
     annotation::AccessPolicy,
     check_block_checked, check_block_checked_with_hint, check_value_expr_checked_with_hint,
-    checked_from_type, checked_void, closure, contracts, control_flow,
+    checked_from_type, checked_void, closure, control_flow,
     decls::{FieldSchema, NominalKey, TypeBinding, nominal_type},
-    dyn_infer, enum_variant, field_check,
+    downcast::{self, DowncastSite, DowncastSourcePolicy},
+    enum_variant, field_check,
     generic::GenericArgs,
     join_checked,
     literal::type_from_lit,
     place,
-    place::{
-        MutableUseKind, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee,
-        check_place,
-    },
+    place::{MutableUseKind, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee},
     semantic_use::ExternUseTarget,
-    type_ops::{type_closure_facts, type_depends_on_generics},
 };
 use crate::{ast::*, span::Span};
 
@@ -246,7 +243,7 @@ impl PatternOutcome {
         }
     }
 
-    fn error() -> Self {
+    pub(super) fn error() -> Self {
         Self {
             cover: PatternCover::Unsupported,
             had_error: true,
@@ -1570,107 +1567,59 @@ pub(super) fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecke
 
 fn check_if_let_exact_downcast(
     if_let_node: &IfLetNode,
-    downcast: &ExactDowncastNode,
+    downcast_node: &ExactDowncastNode,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &if_let_node.node;
     let binding = exact_downcast_binding(node, tc);
-    let target = tc.resolve_downcast_target_type_at(&downcast.node.target, downcast.span);
-    let target = runtime_downcast_target(tc, target, downcast.span);
-    let source = check_place(&downcast.node.expr, tc);
-    let source_contract = match &source.checked().ty {
-        Type::Dyn(contract) => Some(contract.clone()),
-        Type::Infer => None,
-        _ => {
-            tc.push_error(TypeError::CompileError {
-                message: "exact downcast source must be a dynamic value".to_string(),
-                span: tc.error_span(downcast.node.expr.span),
-            });
-            None
-        }
+    let policy = match binding {
+        Some(binding) if binding.mutable => DowncastSourcePolicy::MutablePlace {
+            binding: binding.name,
+        },
+        _ => DowncastSourcePolicy::Value,
     };
-    let mut source_valid = source_contract.is_some();
+    let site = DowncastSite {
+        id: node.value.node.id,
+        source_id: downcast_node.node.expr.node.id,
+        span: tc.source_span(node.value.span),
+    };
+    let checked = downcast::check_conditional(downcast_node, &policy, binding.map(|_| &site), tc);
 
-    match binding {
-        Some(binding) if binding.mutable => {
-            if let Some(error) = source
-                .value
-                .access
-                .mut_borrow_error(binding.name, tc.error_span(downcast.node.expr.span))
-            {
-                tc.push_error(error);
-                source_valid = false;
-            }
-        }
-        Some(_) if matches!(source.value.access, PlaceAccess::NotPlace) => {
-            tc.push_error(TypeError::CompileError {
-                message: "exact downcast source must be a dynamic place".to_string(),
-                span: tc.error_span(downcast.node.expr.span),
-            });
-            source_valid = false;
-        }
-        _ => {}
-    }
-
-    let binding_ty = target.clone().unwrap_or(Type::Infer);
+    let binding_ty = checked.target.clone().unwrap_or(Type::Infer);
     checked_from_type(&node.value, binding_ty.clone(), tc);
     let Some(binding) = binding else {
         return check_downcast_branches(node, None, binding_ty, expected, tc);
     };
-    let Some(target) = target else {
+    let Some(target) = checked.target.clone() else {
         return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
     };
-    if !source_valid {
-        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
-    }
-    let source_contract = source_contract.expect("valid downcast source has contract");
 
-    if let Some(source) =
-        contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, &source_contract)
-    {
-        tc.record_dyn_downcast(DynDowncastFact {
-            expr_id: node.value.node.id,
-            source_id: downcast.node.expr.node.id,
-            source,
-            target: target.clone(),
-            mutable: binding.mutable,
-            span: tc.source_span(node.value.span),
-        });
-    } else if let Some(hole) = dyn_infer::hole_id(&source_contract) {
-        tc.dyn_infer.add_downcast(
-            tc.current_module.clone(),
-            node.value.node.id,
-            downcast.node.expr.node.id,
-            hole,
-            target.clone(),
-            binding.mutable,
-            tc.source_span(node.value.span),
-        );
+    if checked.source.valid_contract().is_none() {
+        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
     }
 
     let then_expected = expected.clone();
     check_if_let_branches(node, expected, tc, |tc| {
         tc.push_scope();
         let handle = tc.type_handle(&target);
-        if binding.mutable {
-            let alias = place::AliasTarget {
-                access: PlaceAccess::Mutable,
-                identity: source.value.identity.clone(),
-                facts: source.value.facts.clone(),
-                accepts_extern_any: source.accepts_extern_any(),
-            };
-            tc.define_downcast_alias_from_handle(binding.name, &handle, alias);
-            tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
-                identity: source.value.identity.clone(),
-                allowed: binding.name,
-            });
-        } else {
-            tc.define_pattern_binding_from_handle(binding.name, &handle, false);
+        match (binding.mutable, checked.source.valid_alias()) {
+            (true, Some(alias)) => {
+                tc.define_downcast_alias_from_handle(
+                    binding.name,
+                    &handle,
+                    alias.target(PlaceAccess::Mutable),
+                );
+                tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
+                    identity: alias.identity.clone(),
+                    allowed: binding.name,
+                });
+            }
+            _ => tc.define_pattern_binding_from_handle(binding.name, &handle, false),
         }
 
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
-        if binding.mutable {
+        if binding.mutable && checked.source.valid_alias().is_some() {
             tc.active_mut_downcast_roots.pop();
         }
         tc.pop_scope();
@@ -1697,43 +1646,6 @@ fn exact_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<ExactDow
             });
             None
         }
-    }
-}
-
-fn runtime_downcast_target(tc: &mut TypeChecker, target: Type, span: Span) -> Option<Type> {
-    match &target {
-        Type::Dyn(_) => {
-            tc.push_error(TypeError::CompileError {
-                message: "downcast tests the stored concrete type; use a wider dynamic type at the conversion site instead of downcasting to another contract".to_string(),
-                span: tc.error_span(span),
-            });
-            return None;
-        }
-        Type::Infer => return None,
-        _ => {}
-    }
-    let facts = type_closure_facts(&target);
-    if facts.first_unresolved.is_some()
-        || facts.infer.contains_type
-        || facts.infer.contains_return
-        || facts.contains_unresolved_const
-        || type_depends_on_generics(&target)
-    {
-        tc.push_error(TypeError::CompileError {
-            message: "exact downcast target must be a fully concrete runtime-identifiable type"
-                .to_string(),
-            span: tc.error_span(span),
-        });
-        return None;
-    }
-    if tc.decls.key_for_type(&target).is_some() {
-        Some(target)
-    } else {
-        tc.push_error(TypeError::CompileError {
-            message: "exact downcast target must be a concrete nominal type".to_string(),
-            span: tc.error_span(span),
-        });
-        None
     }
 }
 

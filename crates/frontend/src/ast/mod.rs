@@ -1375,8 +1375,33 @@ pub struct Match {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
-    pub pattern: PatternNode,
+    pub head: MatchArmHead,
     pub body: ExprNode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchArmHead {
+    Pattern(PatternNode),
+    DynDowncast(DynDowncastArmNode),
+    DynElse(DynElseArmNode),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynDowncastArm {
+    pub id: ExprId,
+    pub target: Type,
+    pub binding: DynArmBinding,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynElseArm {
+    pub binding: DynArmBinding,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DynArmBinding {
+    Named(Ident),
+    Wildcard,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1925,6 +1950,8 @@ pub type MapLiteralNode = Spanned<MapLiteral>;
 pub type IndexNode = Spanned<Index>;
 pub type MatchNode = Spanned<Match>;
 pub type MatchArmNode = Spanned<MatchArm>;
+pub type DynDowncastArmNode = Spanned<DynDowncastArm>;
+pub type DynElseArmNode = Spanned<DynElseArm>;
 pub type ExternFuncNode = Spanned<ExternFunc>;
 pub type ExternTypeNode = Spanned<ExternType>;
 pub type ImportNode = Spanned<Import>;

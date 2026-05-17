@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: exact downcast is only supported in conditional bindings
+// @contains: downcast tests the stored concrete type
 
 contract Drawable {
     fn draw(self);
@@ -13,5 +13,5 @@ struct Actor {
 
 fn main() {
     let actor: dyn Drawable = Actor {};
-    let enemy = actor as? Actor;
+    let enemy = actor as? dyn Drawable;
 }

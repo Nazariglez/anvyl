@@ -285,7 +285,7 @@ impl Printer<'_> {
         self.indent();
         for arm in &m.arms {
             self.write_indent();
-            self.format_pattern(&arm.node.pattern.node);
+            self.format_match_arm_head(&arm.node.head);
             self.write(" => ");
             self.format_expr(&arm.node.body.node);
             self.write(",");
@@ -294,6 +294,31 @@ impl Printer<'_> {
         self.dedent();
         self.write_indent();
         self.write("}");
+    }
+
+    fn format_match_arm_head(&mut self, head: &ast::MatchArmHead) {
+        match head {
+            ast::MatchArmHead::Pattern(pattern) => self.format_pattern(&pattern.node),
+            ast::MatchArmHead::DynDowncast(arm) => {
+                self.write("as ");
+                self.format_type(&arm.node.target);
+                self.write("(");
+                self.format_dyn_arm_binding(&arm.node.binding);
+                self.write(")");
+            }
+            ast::MatchArmHead::DynElse(arm) => {
+                self.write("else(");
+                self.format_dyn_arm_binding(&arm.node.binding);
+                self.write(")");
+            }
+        }
+    }
+
+    fn format_dyn_arm_binding(&mut self, binding: &ast::DynArmBinding) {
+        match binding {
+            ast::DynArmBinding::Named(name) => self.write_fmt(*name),
+            ast::DynArmBinding::Wildcard => self.write("_"),
+        }
     }
 
     fn format_lambda_param(&mut self, param: &ast::LambdaParam) {

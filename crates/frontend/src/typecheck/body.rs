@@ -1450,6 +1450,12 @@ pub(super) fn check_specialized_callable_body(
         Some(SpecializationState::InProgress) => return None,
         Some(SpecializationState::Done(body)) => {
             tc.restore_specialization(body.facts);
+            if let Err(message) = tc.dyn_infer.restore_specialization(body.dyn_infer) {
+                tc.push_error(TypeError::CompileError {
+                    message,
+                    span: None,
+                });
+            }
             return body.inferred_ret;
         }
         None => {}

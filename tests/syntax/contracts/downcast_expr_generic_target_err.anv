@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: exact downcast target must be a fully concrete runtime-identifiable type
+
+struct Enemy {}
+
+fn use_actor<T>(actor: dyn _) {
+    let value = actor as? T;
+}
+
+fn main() {
+    use_actor<Enemy>(Enemy {});
+}

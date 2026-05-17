@@ -28,6 +28,31 @@ pub(super) struct DynInference {
     solutions: HashMap<DynContractHoleId, ContractRef>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DynInferenceFacts {
+    next_id: u32,
+    holes: HashMap<DynContractHoleId, DynHole>,
+    conversions: Vec<PendingConversion>,
+    dyn_sources: Vec<PendingDynSource>,
+    hole_targets: Vec<PendingHoleTarget>,
+    calls: Vec<PendingCall>,
+    downcasts: Vec<PendingDowncast>,
+    solutions: HashMap<DynContractHoleId, ContractRef>,
+}
+
+#[derive(Clone)]
+pub(super) struct DynInferenceSnapshot {
+    next_id: u32,
+    holes: HashMap<DynContractHoleId, DynHole>,
+    conversions_len: usize,
+    dyn_sources_len: usize,
+    hole_targets_len: usize,
+    calls_len: usize,
+    downcasts_len: usize,
+    solutions: HashMap<DynContractHoleId, ContractRef>,
+}
+
+#[derive(Clone)]
 struct DynHole {
     module: ModuleScope,
     span: SourceSpan,
@@ -36,6 +61,7 @@ struct DynHole {
     expected: Vec<ContractRef>,
 }
 
+#[derive(Clone)]
 struct PendingConversion {
     module: ModuleScope,
     expr_id: Option<ExprId>,
@@ -44,6 +70,7 @@ struct PendingConversion {
     span: Span,
 }
 
+#[derive(Clone)]
 struct PendingDynSource {
     module: ModuleScope,
     expr_id: Option<ExprId>,
@@ -52,6 +79,7 @@ struct PendingDynSource {
     span: Span,
 }
 
+#[derive(Clone)]
 struct PendingHoleTarget {
     module: ModuleScope,
     expr_id: Option<ExprId>,
@@ -60,6 +88,7 @@ struct PendingHoleTarget {
     span: Span,
 }
 
+#[derive(Clone)]
 struct PendingCall {
     module: ModuleScope,
     call_id: ExprId,
@@ -71,6 +100,7 @@ struct PendingCall {
     span: SourceSpan,
 }
 
+#[derive(Clone)]
 struct PendingDowncast {
     module: ModuleScope,
     expr_id: ExprId,
@@ -82,6 +112,90 @@ struct PendingDowncast {
 }
 
 impl DynInference {
+    pub(super) fn specialization_snapshot(&self) -> DynInferenceSnapshot {
+        DynInferenceSnapshot {
+            next_id: self.next_id,
+            holes: self.holes.clone(),
+            conversions_len: self.conversions.len(),
+            dyn_sources_len: self.dyn_sources.len(),
+            hole_targets_len: self.hole_targets.len(),
+            calls_len: self.calls.len(),
+            downcasts_len: self.downcasts.len(),
+            solutions: self.solutions.clone(),
+        }
+    }
+
+    pub(super) fn specialization_delta_since(
+        &self,
+        old: &DynInferenceSnapshot,
+    ) -> DynInferenceFacts {
+        let solutions = self
+            .solutions
+            .iter()
+            .filter(|(id, contract)| old.solutions.get(id) != Some(contract))
+            .map(|(id, contract)| (*id, contract.clone()))
+            .collect();
+        DynInferenceFacts {
+            next_id: self.next_id.max(old.next_id),
+            holes: self
+                .holes
+                .iter()
+                .filter(|(id, hole)| {
+                    old.holes.get(id).is_none_or(|old| {
+                        old.requirements.len() != hole.requirements.len()
+                            || old.expected.len() != hole.expected.len()
+                    })
+                })
+                .map(|(id, hole)| (*id, hole.clone()))
+                .collect(),
+            conversions: self.conversions[old.conversions_len..].to_vec(),
+            dyn_sources: self.dyn_sources[old.dyn_sources_len..].to_vec(),
+            hole_targets: self.hole_targets[old.hole_targets_len..].to_vec(),
+            calls: self.calls[old.calls_len..].to_vec(),
+            downcasts: self.downcasts[old.downcasts_len..].to_vec(),
+            solutions,
+        }
+    }
+
+    pub(super) fn restore_specialization(
+        &mut self,
+        facts: DynInferenceFacts,
+    ) -> Result<(), String> {
+        self.next_id = self.next_id.max(facts.next_id);
+        for (id, hole) in facts.holes {
+            self.restore_hole(id, hole)?;
+        }
+        self.conversions.extend(facts.conversions);
+        self.dyn_sources.extend(facts.dyn_sources);
+        self.hole_targets.extend(facts.hole_targets);
+        self.calls.extend(facts.calls);
+        self.downcasts.extend(facts.downcasts);
+        self.solutions.extend(facts.solutions);
+        Ok(())
+    }
+
+    fn restore_hole(&mut self, id: DynContractHoleId, hole: DynHole) -> Result<(), String> {
+        let Some(current) = self.holes.get_mut(&id) else {
+            self.holes.insert(id, hole);
+            return Ok(());
+        };
+
+        if let Err(conflict) =
+            contracts::merge_effective_requirements(&mut current.requirements, &hole.requirements)
+        {
+            return Err(format!(
+                "conflicting inferred dynamic requirement '{}'",
+                conflict.name
+            ));
+        }
+        for expected in hole.expected {
+            if !current.expected.contains(&expected) {
+                current.expected.push(expected);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn has_raw_hole(ty: &Type) -> bool {
         let mut visitor = RawHoleVisitor;
         visitor.visit_type(ty)
@@ -573,5 +687,67 @@ impl TypeFolder for HoleAssigner<'_> {
             }
             contract => contract,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::{SourceKind, SourceTable};
+
+    fn test_span() -> SourceSpan {
+        let mut sources = SourceTable::default();
+        SourceSpan::empty(sources.add(SourceKind::Virtual, "test", None, ""), 0)
+    }
+
+    fn seed_infer() -> DynInference {
+        let mut infer = DynInference::default();
+        infer.holes.insert(
+            DynContractHoleId(0),
+            DynHole {
+                module: ModuleScope::Root,
+                span: test_span(),
+                exported: false,
+                requirements: vec![],
+                expected: vec![],
+            },
+        );
+        infer.next_id = 1;
+        infer
+    }
+
+    #[test]
+    fn specialization_restore_replays_pending_calls_and_downcasts() {
+        let mut checked = seed_infer();
+        let snapshot = checked.specialization_snapshot();
+        checked.add_call(
+            ModuleScope::Root,
+            ExprId(10),
+            ExprId(11),
+            DynContractHoleId(0),
+            Ident::new("draw"),
+            0,
+            false,
+            test_span(),
+        );
+        checked.add_downcast(
+            ModuleScope::Root,
+            ExprId(12),
+            ExprId(13),
+            DynContractHoleId(0),
+            Type::UnresolvedName(Ident::new("Enemy")),
+            false,
+            test_span(),
+        );
+        let facts = checked.specialization_delta_since(&snapshot);
+
+        let mut restored = seed_infer();
+        restored.restore_specialization(facts.clone()).unwrap();
+        restored.restore_specialization(facts).unwrap();
+
+        assert_eq!(restored.calls.len(), 2);
+        assert_eq!(restored.downcasts.len(), 2);
+        assert_eq!(restored.calls[0].method, Ident::new("draw"));
+        assert_eq!(restored.downcasts[0].expr_id, ExprId(12));
     }
 }

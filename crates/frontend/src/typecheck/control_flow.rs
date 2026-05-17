@@ -5,14 +5,14 @@ use super::{
     body::check_callable_body_place_return,
     check_block_checked, check_bool_condition, check_expr_checked, check_place,
     check_value_expr_checked_with_hint, checked_branch_against_expected, checked_from_checked,
-    checked_type, checked_void, join_branches_with_hint, match_coverage,
+    checked_type, checked_void, join_branches_with_hint, match_check, match_coverage,
     pattern::{self, check_pattern_scrutinee, mode_for_head},
     place,
 };
 use crate::{
     ast::{
-        BlockNode, DeferBody, DeferNode, ExprKind, ExprNode, For, ForBinding, ForNode, Return,
-        ReturnAccess, ReturnNode, Stmt, StmtNode, Type, WhileNode,
+        BlockNode, DeferBody, DeferNode, ExprKind, ExprNode, For, ForBinding, ForNode,
+        MatchArmNode, MatchNode, Return, ReturnAccess, ReturnNode, Stmt, StmtNode, Type, WhileNode,
     },
     span::Span,
 };
@@ -521,6 +521,18 @@ fn check_branch_place_return_expr(
         }
         ExprKind::Match(match_node) => {
             let node = &match_node.node;
+            match match_check::classify(&node.arms) {
+                match_check::MatchKind::Dynamic => {
+                    return Some(check_dynamic_match_return(
+                        match_node, ret, source, expected, tc,
+                    ));
+                }
+                match_check::MatchKind::Mixed => {
+                    match_check::push_mixed_error(match_node.span, tc);
+                    return Some(checked_type(Type::Infer, tc));
+                }
+                match_check::MatchKind::Ordinary => {}
+            }
             let mode = mode_for_head(node.head);
             let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
             if node.arms.is_empty() {
@@ -530,38 +542,27 @@ fn check_branch_place_return_expr(
                 return Some(checked_void(tc));
             }
 
-            let mut joined = None;
             let mut outcomes = Vec::with_capacity(node.arms.len());
-            for arm in &node.arms {
-                tc.push_scope();
-                let outcome = pattern::check_place_at(
-                    &arm.node.pattern,
-                    scrutinee.pattern_place(
-                        scrutinee.checked.handle.clone(),
-                        scrutinee.checked.ty.clone(),
-                    ),
-                    mode,
-                    node.scrutinee.node.id,
-                    PatternContext::Match,
-                    tc,
-                );
-                let checked = check_return_expr(&arm.node.body, ret, source, tc);
-                tc.pop_scope();
-                outcomes.push(outcome);
-                let branch =
-                    place_return_branch(checked, arm.node.body.span, expr_diverges(&arm.node.body));
-                joined = Some(match joined {
-                    Some(previous) => {
-                        join_place_return_branch(ret, expected.clone(), previous, branch, tc)
-                    }
-                    None => branch,
+            let joined =
+                check_match_return_branches(&node.arms, ret, expected.as_ref(), tc, |arm, tc| {
+                    tc.push_scope();
+                    let outcome = match_check::check_arm_head(
+                        &arm.node.head,
+                        scrutinee.pattern_place(
+                            scrutinee.checked.handle.clone(),
+                            scrutinee.checked.ty.clone(),
+                        ),
+                        mode,
+                        node.scrutinee.node.id,
+                        tc,
+                    );
+                    let checked = check_return_expr(&arm.node.body, ret, source, tc);
+                    tc.pop_scope();
+                    outcomes.push(outcome);
+                    checked
                 });
-            }
             match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
-            Some(match joined {
-                Some(branch) => finish_place_return_branch(ret, expected, branch, tc),
-                None => checked_void(tc),
-            })
+            Some(finish_match_return_branches(ret, expected, joined, tc))
         }
         _ => None,
     }
@@ -569,6 +570,76 @@ fn check_branch_place_return_expr(
 
 fn place_return_expected_handle(ret: &ReturnSpec, tc: &TypeChecker) -> Option<TypeHandle> {
     (!matches!(ret.ty, Type::InferReturn)).then(|| tc.type_handle(&ret.ty))
+}
+
+fn check_dynamic_match_return(
+    match_node: &MatchNode,
+    ret: &ReturnSpec,
+    source: Option<&PlaceIdentity>,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let node = &match_node.node;
+    if node.arms.is_empty() {
+        tc.push_error(TypeError::EmptyMatch {
+            span: tc.error_span(match_node.span),
+        });
+        return checked_void(tc);
+    }
+    let valid_arms = match_check::validate_dynamic_arms(&node.arms, tc);
+    let match_source = match_check::check_dynamic_source(node, tc);
+    let mut targets = vec![];
+    let joined = check_match_return_branches(&node.arms, ret, expected.as_ref(), tc, |arm, tc| {
+        if valid_arms {
+            match_check::with_dynamic_arm(
+                arm,
+                &match_source,
+                node.scrutinee.node.id,
+                &mut targets,
+                tc,
+                |tc| check_return_expr(&arm.node.body, ret, source, tc),
+            )
+        } else {
+            match_check::with_dynamic_arm_recovery(arm, tc, |tc| {
+                check_return_expr(&arm.node.body, ret, source, tc)
+            })
+        }
+    });
+    finish_match_return_branches(ret, expected, joined, tc)
+}
+
+fn check_match_return_branches(
+    arms: &[MatchArmNode],
+    ret: &ReturnSpec,
+    expected: Option<&TypeHandle>,
+    tc: &mut TypeChecker,
+    mut check_arm: impl FnMut(&MatchArmNode, &mut TypeChecker) -> CheckedType,
+) -> Option<CheckedBranch> {
+    let mut joined = None;
+    for arm in arms {
+        let checked = check_arm(arm, tc);
+        let branch =
+            place_return_branch(checked, arm.node.body.span, expr_diverges(&arm.node.body));
+        joined = Some(match joined {
+            Some(previous) => {
+                join_place_return_branch(ret, expected.cloned(), previous, branch, tc)
+            }
+            None => branch,
+        });
+    }
+    joined
+}
+
+fn finish_match_return_branches(
+    ret: &ReturnSpec,
+    expected: Option<TypeHandle>,
+    joined: Option<CheckedBranch>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match joined {
+        Some(branch) => finish_place_return_branch(ret, expected, branch, tc),
+        None => checked_void(tc),
+    }
 }
 
 fn place_return_branch(checked: CheckedType, span: Span, diverges: bool) -> CheckedBranch {

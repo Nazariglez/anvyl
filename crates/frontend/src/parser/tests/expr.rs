@@ -27,6 +27,32 @@ fn expect_if_let_downcast_head(source: &str, head: ast::PatternHead) {
     expect_exact_downcast(&if_let.node.value);
 }
 
+fn expect_match(source: &str) -> ast::MatchNode {
+    let expr = parse_expr(source);
+    match expr.node.kind {
+        ast::ExprKind::Match(node) => node,
+        other => panic!("expected match, found {other:?}"),
+    }
+}
+
+fn expect_dyn_downcast(head: &ast::MatchArmHead) -> &ast::DynDowncastArmNode {
+    match head {
+        ast::MatchArmHead::DynDowncast(arm) => arm,
+        other => panic!("expected dynamic downcast arm, found {other:?}"),
+    }
+}
+
+fn expect_dyn_else(head: &ast::MatchArmHead) -> &ast::DynElseArmNode {
+    match head {
+        ast::MatchArmHead::DynElse(arm) => arm,
+        other => panic!("expected dynamic else arm, found {other:?}"),
+    }
+}
+
+fn assert_dyn_binding(binding: &ast::DynArmBinding, expected: ast::DynArmBinding) {
+    assert_eq!(binding, &expected);
+}
+
 #[test]
 fn lambda_var_return() {
     let expr = parse_expr("|var x: int| -> var int { x }");
@@ -833,6 +859,53 @@ fn exact_downcast_if_let_scrutinee() {
 #[test]
 fn exact_downcast_if_let_var_rejected() {
     parse_program_err("fn main() { if let var enemy = actor as? Enemy {} }");
+}
+
+#[test]
+fn dynamic_match_arm_heads() {
+    let match_node = expect_match("match actor { as Enemy(enemy) => enemy, else(other) => other }");
+    assert_eq!(match_node.node.arms.len(), 2);
+
+    let downcast = expect_dyn_downcast(&match_node.node.arms[0].node.head);
+    expect_nominal(&downcast.node.target, "Enemy");
+    assert_dyn_binding(
+        &downcast.node.binding,
+        ast::DynArmBinding::Named(ast::Ident::new("enemy")),
+    );
+
+    let else_arm = expect_dyn_else(&match_node.node.arms[1].node.head);
+    assert_dyn_binding(
+        &else_arm.node.binding,
+        ast::DynArmBinding::Named(ast::Ident::new("other")),
+    );
+}
+
+#[test]
+fn dynamic_match_downcast_arm_ids_are_distinct() {
+    let match_node = expect_match(
+        "match actor { as Enemy(enemy) => enemy, as Bullet(bullet) => bullet, else(other) => other }",
+    );
+    let first = expect_dyn_downcast(&match_node.node.arms[0].node.head);
+    let second = expect_dyn_downcast(&match_node.node.arms[1].node.head);
+    assert_ne!(first.node.id, second.node.id);
+}
+
+#[test]
+fn dynamic_match_wildcard_arm_heads() {
+    let match_node = expect_match("match var actor { as Enemy(_) => actor, else(_) => actor }");
+    assert_eq!(match_node.node.head, ast::PatternHead::Var);
+    assert_dyn_binding(
+        &expect_dyn_downcast(&match_node.node.arms[0].node.head)
+            .node
+            .binding,
+        ast::DynArmBinding::Wildcard,
+    );
+    assert_dyn_binding(
+        &expect_dyn_else(&match_node.node.arms[1].node.head)
+            .node
+            .binding,
+        ast::DynArmBinding::Wildcard,
+    );
 }
 
 #[test]

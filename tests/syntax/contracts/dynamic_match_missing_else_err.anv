@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: dynamic match requires a final else
+
+contract Drawable { fn draw(self); }
+struct Enemy { fn draw(self) {} }
+
+fn main() {
+    let actor: dyn Drawable = Enemy {};
+    match actor {
+        as Enemy(enemy) => enemy.draw(),
+    };
+}

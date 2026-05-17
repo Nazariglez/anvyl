@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot assign to immutable value
+
+contract Updatable { fn update(var self); }
+struct Enemy { fn update(var self) {} }
+
+fn main() {
+    let actor: dyn Updatable = Enemy {};
+    match var actor {
+        as Enemy(enemy) => enemy.update(),
+        else(other) => other.update(),
+    };
+}

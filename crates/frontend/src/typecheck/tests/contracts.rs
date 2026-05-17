@@ -5,7 +5,7 @@ use crate::{
     span::Span,
     test_support::{empty_resolved, module_path, parse_program, resolved_modules},
     typecheck::{
-        DeprecatedUseKind, ModuleScope, TypeError, TypecheckConfig, contracts,
+        DeprecatedUseKind, GlobalAccessMode, ModuleScope, TypeError, TypecheckConfig, contracts,
         contracts::{ContractMatchError, ContractSlotTarget, RequirementError},
         typechecker_for_modules,
     },
@@ -311,6 +311,151 @@ fn inferred_dynamic_exact_downcast_records_fact_after_solving() {
     .expect("typecheck failed");
 
     assert_eq!(result.dyn_downcasts().len(), 1);
+}
+
+#[test]
+fn cached_generic_specialization_restores_dyn_conversion_facts() {
+    let result = check(
+        "contract Drawable { fn draw(self); }
+        struct Enemy { fn draw(self) {} }
+        struct Label { fn draw(self) {} }
+        fn use_actor(actor: dyn Drawable) {}
+        fn wrap<T>(actor: T) { use_actor(actor); }
+        fn main() {
+            wrap(Enemy {});
+            wrap(Label {});
+            wrap(Enemy {});
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_conversions().len(), 1);
+    let conversion = result.dyn_conversions().values().next().unwrap();
+    let witness = result
+        .contract_witnesses()
+        .get(&conversion.witness)
+        .unwrap();
+    assert_eq!(
+        witness.key.concrete_ty,
+        root_type(&mut checker("struct Enemy {}"), "Enemy")
+    );
+}
+
+#[test]
+fn cached_generic_specialization_restores_dyn_call_facts() {
+    let result = check(
+        "struct Enemy { fn draw(self) {} }
+        struct Label { fn draw(self) {} }
+        fn use_actor(actor: dyn _) { actor.draw(); }
+        fn wrap<T>(actor: T) { use_actor(actor); }
+        fn main() {
+            wrap(Enemy {});
+            wrap(Label {});
+            wrap(Enemy {});
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_calls().len(), 1);
+    assert!(
+        result
+            .dyn_calls()
+            .values()
+            .all(|fact| fact.method == Ident::new("draw") && !fact.requires_mutable)
+    );
+}
+
+#[test]
+fn cached_generic_specialization_restores_dyn_downcast_facts() {
+    let result = check(
+        "struct Enemy { fn draw(self) {} fn attack(self) {} }
+        struct Label { fn draw(self) {} }
+        fn use_actor(actor: dyn _) {
+            actor.draw();
+            if let enemy = actor as? Enemy {
+                enemy.attack();
+            }
+        }
+        fn wrap<T>(actor: T) { use_actor(actor); }
+        fn main() {
+            wrap(Enemy {});
+            wrap(Label {});
+            wrap(Enemy {});
+        }",
+    )
+    .expect("typecheck failed");
+
+    let enemy = root_type(&mut checker("struct Enemy {}"), "Enemy");
+    assert_eq!(result.dyn_downcasts().len(), 1);
+    assert!(
+        result.dyn_downcasts().values().all(|fact| {
+            fact.target == enemy && !fact.mutable && fact.expr_id != fact.source_id
+        })
+    );
+}
+
+#[test]
+fn exact_downcast_expr_records_fact_and_payload_conversion() {
+    let result = check(
+        "contract Drawable { fn draw(self); }
+        struct Enemy { fn draw(self) {} }
+        fn use_actor(actor: dyn Drawable) {
+            let drawable: dyn Drawable? = actor as? Enemy;
+        }
+        fn main() {}",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_downcasts().len(), 1);
+    assert_eq!(result.dyn_conversions().len(), 1);
+}
+
+#[test]
+fn dynamic_match_records_downcast_facts() {
+    let result = check(
+        "contract Drawable { fn draw(self); }
+        struct Enemy { fn draw(self) {} }
+        struct Bullet { fn draw(self) {} }
+        fn main() {
+            let actor: dyn Drawable = Enemy {};
+            match actor {
+                as Enemy(enemy) => enemy.draw(),
+                as Bullet(bullet) => bullet.draw(),
+                else(other) => other.draw(),
+            };
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_downcasts().len(), 2);
+    assert!(result.dyn_downcasts().values().all(|fact| !fact.mutable));
+}
+
+#[test]
+fn dynamic_match_var_records_mutable_downcast_facts() {
+    let result = check(
+        "contract Updatable { fn update(var self); }
+        struct Enemy { fn update(var self) {} }
+        struct Bullet { fn update(var self) {} }
+        lazy var Actor: dyn Updatable = Enemy {};
+        fn main() {
+            match var Actor {
+                as Enemy(enemy) => enemy.update(),
+                as Bullet(bullet) => bullet.update(),
+                else(other) => other.update(),
+            };
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.dyn_downcasts().len(), 2);
+    assert!(result.dyn_downcasts().values().all(|fact| fact.mutable));
+    assert!(
+        result
+            .global_accesses()
+            .values()
+            .any(|fact| fact.mode == GlobalAccessMode::MutableBorrow)
+    );
 }
 
 #[test]

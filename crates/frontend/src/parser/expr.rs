@@ -199,13 +199,52 @@ fn match_expr<'src>(
         expr.clone(),
     ));
 
-    let match_arm = pattern()
+    let dyn_binding = identifier().map(|ident| {
+        if ident.0.as_ref() == "_" {
+            ast::DynArmBinding::Wildcard
+        } else {
+            ast::DynArmBinding::Named(ident)
+        }
+    });
+    let dyn_downcast_head = select! { Token::Keyword(Keyword::As) => () }
+        .ignore_then(type_ident())
+        .then(
+            select! { Token::Open(Delimiter::Parent) => () }
+                .ignore_then(dyn_binding.clone())
+                .then_ignore(select! { Token::Close(Delimiter::Parent) => () }),
+        )
+        .map_with(|(target, binding), e| {
+            ast::MatchArmHead::DynDowncast(Spanned::new(
+                ast::DynDowncastArm {
+                    id: new_expr_id(),
+                    target,
+                    binding,
+                },
+                e.span().byte(),
+            ))
+        });
+    let dyn_else_head = select! { Token::Keyword(Keyword::Else) => () }
+        .ignore_then(
+            select! { Token::Open(Delimiter::Parent) => () }
+                .ignore_then(dyn_binding)
+                .then_ignore(select! { Token::Close(Delimiter::Parent) => () }),
+        )
+        .map_with(|binding, e| {
+            ast::MatchArmHead::DynElse(Spanned::new(ast::DynElseArm { binding }, e.span().byte()))
+        });
+    let match_arm_head = choice((
+        dyn_downcast_head,
+        dyn_else_head,
+        pattern().map(ast::MatchArmHead::Pattern),
+    ));
+
+    let match_arm = match_arm_head
         .then_ignore(fat_arrow)
         .then(arm_body)
-        .map_with(|(pat, body), e| {
+        .map_with(|(head, body), e| {
             let s = e.span();
             let span = s.byte();
-            Spanned::new(ast::MatchArm { pattern: pat, body }, span)
+            Spanned::new(ast::MatchArm { head, body }, span)
         });
 
     let cond_expr = cond_expression();

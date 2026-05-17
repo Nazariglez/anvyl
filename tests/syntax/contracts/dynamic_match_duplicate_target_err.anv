@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate dynamic match target
+
+contract Drawable { fn draw(self); }
+struct Enemy { fn draw(self) {} }
+
+fn main() {
+    let actor: dyn Drawable = Enemy {};
+    match actor {
+        as Enemy(first) => first.draw(),
+        as Enemy(second) => second.draw(),
+        else(other) => other.draw(),
+    };
+}

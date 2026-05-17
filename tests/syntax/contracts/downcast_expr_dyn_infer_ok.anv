@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn use_actor(actor: dyn _) {
+    actor.draw();
+    let enemy: Enemy? = actor as? Enemy;
+}
+
+fn main() {
+    use_actor(Enemy {});
+}

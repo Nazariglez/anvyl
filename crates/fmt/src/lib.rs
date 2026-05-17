@@ -1019,6 +1019,24 @@ mod tests {
     }
 
     #[test]
+    fn expr_dynamic_match() {
+        let source = "fn f(actor: dyn Drawable) { match actor { as Enemy(enemy) => enemy.attack(), else(other) => other.draw() } }";
+        let formatted = format_source(source).expect("format failed");
+        assert!(formatted.contains("match actor {"));
+        assert!(formatted.contains("as Enemy(enemy) => enemy.attack(),"));
+        assert!(formatted.contains("else(other) => other.draw(),"));
+    }
+
+    #[test]
+    fn expr_dynamic_match_var_wildcards() {
+        let source = "fn f(var actor: dyn Drawable) { match var actor { as Enemy(_) => actor.draw(), else(_) => actor.draw(), } }";
+        let formatted = format_source(source).expect("format failed");
+        assert!(formatted.contains("match var actor {"));
+        assert!(formatted.contains("as Enemy(_) => actor.draw(),"));
+        assert!(formatted.contains("else(_) => actor.draw(),"));
+    }
+
+    #[test]
     fn expr_tuple() {
         let source = "fn f() -> (int, int) { (1, 2) }";
         let formatted = format_source(source).expect("format failed");

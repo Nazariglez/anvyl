@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+    fn attack(self) {}
+}
+
+struct Bullet {
+    fn draw(self) {}
+    fn explode(self) {}
+}
+
+fn main() {
+    let actor: dyn Drawable = Enemy {};
+    match actor {
+        as Enemy(enemy) => enemy.attack(),
+        as Bullet(bullet) => bullet.explode(),
+        else(other) => other.draw(),
+    };
+}
