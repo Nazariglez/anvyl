@@ -23,7 +23,7 @@ use self::{
     const_term::ConstTerm,
     decl_validate::{
         check_decl_param_order, check_finite_size_cycles, check_infer_return_decls,
-        generic_param_type_error, validate_public_value_surfaces,
+        generic_param_type_error, validate_public_surfaces,
     },
     dyn_infer::DynInference,
     infer::{
@@ -1032,6 +1032,7 @@ struct TypeChecker {
     dyn_calls: DynCallMap,
     dyn_downcasts: DynDowncastMap,
     global_accesses: GlobalAccessMap,
+    for_step_runtime_checks: ForStepRuntimeCheckMap,
     closure: ClosureClassifier,
     global_types: HashMap<GlobalKey, LocalTypeId>,
     active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
@@ -1086,6 +1087,7 @@ impl TypeChecker {
             dyn_calls: HashMap::new(),
             dyn_downcasts: HashMap::new(),
             global_accesses: HashMap::new(),
+            for_step_runtime_checks: HashMap::new(),
             closure: ClosureClassifier::default(),
             global_types: HashMap::new(),
             active_mut_downcast_roots: vec![],
@@ -2095,6 +2097,9 @@ impl TypeChecker {
             return None;
         }
         let mut facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
+        facts
+            .for_step_runtime_checks
+            .clone_from(&self.for_step_runtime_checks);
         facts.import_records = self.decls.import_records().to_vec();
         facts.used_imports.clone_from(self.decls.used_imports());
         facts.used_imports.extend(self.used_imports.clone());
@@ -2341,7 +2346,7 @@ fn typechecker_for_modules(
         globals::check_global_initializers(module, program.as_ref(), &mut tc);
     }
     tc.sync_global_types();
-    validate_public_value_surfaces(&tc.decls, &mut tc.errors);
+    validate_public_surfaces(&tc.decls, &tc.externs, &mut tc.errors);
     if !tc.errors.is_empty() {
         return Ok(tc);
     }

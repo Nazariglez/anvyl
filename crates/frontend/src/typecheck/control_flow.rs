@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     ast::{
-        BlockNode, DeferBody, DeferNode, ExprKind, ExprNode, For, ForBinding, ForNode,
+        BlockNode, ConstValue, DeferBody, DeferNode, ExprKind, ExprNode, For, ForBinding, ForNode,
         MatchArmNode, MatchNode, Return, ReturnAccess, ReturnNode, Stmt, StmtNode, Type, WhileNode,
     },
     span::Span,
@@ -297,43 +297,92 @@ fn alias_for_root<'a>(
 
 fn check_for_modifiers(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
     let range_kind = tc.decls.core_range_kind(iterable_ty);
+    check_for_rev(node, iterable_ty, range_kind, tc);
+    check_for_step(node, iterable_ty, range_kind, tc);
+}
 
-    if node.reversed {
-        if matches!(iterable_ty, Type::Map { .. }) {
-            push_for_modifier_error(
-                tc,
-                "rev is not supported for map iteration",
-                node.iterable.span,
-            );
-        } else if matches!(
-            range_kind,
-            Some(CoreRangeKind::From | CoreRangeKind::To | CoreRangeKind::ToInclusive)
-        ) {
-            push_for_modifier_error(
-                tc,
-                "reverse is not supported for open-ended ranges",
-                node.iterable.span,
-            );
-        }
+fn check_for_rev(
+    node: &For,
+    iterable_ty: &Type,
+    range_kind: Option<CoreRangeKind>,
+    tc: &mut TypeChecker,
+) {
+    if !node.reversed {
+        return;
     }
 
-    if let Some(step) = &node.step {
-        if matches!(iterable_ty, Type::Map { .. }) {
-            push_for_modifier_error(tc, "step is not supported for map iteration", step.span);
-            check_expr_checked(step, tc);
-        } else {
-            let step_checked = check_expr_checked(step, tc);
-            let step_is_int = matches!(step_checked.ty, Type::Int | Type::Infer);
-            let range_is_int = matches!(
-                tc.decls.core_range_inner(iterable_ty),
-                Some(Type::Int | Type::Infer)
-            );
-            if range_kind.is_some() && (!range_is_int || !step_is_int) {
-                push_for_modifier_error(tc, "step is only supported for integer ranges", step.span);
-            }
-            let int = tc.type_handle(&Type::Int);
-            tc.expect_assignable(step.span, step_checked.handle, int);
+    if matches!(iterable_ty, Type::Map { .. }) {
+        push_for_modifier_error(
+            tc,
+            "rev is not supported for map iteration",
+            node.iterable.span,
+        );
+    } else if matches!(
+        range_kind,
+        Some(CoreRangeKind::From | CoreRangeKind::To | CoreRangeKind::ToInclusive)
+    ) {
+        push_for_modifier_error(
+            tc,
+            "reverse is not supported for open-ended ranges",
+            node.iterable.span,
+        );
+    }
+}
+
+fn check_for_step(
+    node: &For,
+    iterable_ty: &Type,
+    range_kind: Option<CoreRangeKind>,
+    tc: &mut TypeChecker,
+) {
+    let Some(step) = &node.step else {
+        return;
+    };
+
+    if matches!(iterable_ty, Type::Map { .. }) {
+        push_for_modifier_error(tc, "step is not supported for map iteration", step.span);
+        check_expr_checked(step, tc);
+        return;
+    }
+
+    let step_checked = check_expr_checked(step, tc);
+    let step_is_int = matches!(step_checked.ty, Type::Int | Type::Infer);
+    let range_is_int = matches!(
+        tc.decls.core_range_inner(iterable_ty),
+        Some(Type::Int | Type::Infer)
+    );
+    if range_kind.is_some() && (!range_is_int || !step_is_int) {
+        push_for_modifier_error(tc, "step is only supported for integer ranges", step.span);
+    }
+    let int = tc.type_handle(&Type::Int);
+    tc.expect_assignable(step.span, step_checked.handle, int);
+
+    if step_is_int {
+        check_positive_step(step, tc);
+    }
+}
+
+fn check_positive_step(step: &ExprNode, tc: &mut TypeChecker) {
+    match known_step_int(step, tc) {
+        Some(value) if value <= 0 => {
+            push_for_modifier_error(tc, "for-loop step must be positive", step.span);
         }
+        Some(_) => {}
+        None => record_for_step_runtime_check(step, tc),
+    }
+}
+
+fn record_for_step_runtime_check(step: &ExprNode, tc: &mut TypeChecker) {
+    let span = tc.source_span(step.span);
+    tc.for_step_runtime_checks
+        .entry(step.node.id)
+        .or_insert(span);
+}
+
+fn known_step_int(step: &ExprNode, tc: &mut TypeChecker) -> Option<i64> {
+    match tc.eval_const_expr(step, false) {
+        Ok(ConstValue::Int(value)) => Some(value),
+        Ok(_) | Err(_) => None,
     }
 }
 

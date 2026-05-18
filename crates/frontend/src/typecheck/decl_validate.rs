@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::{
     CallableKind, CastConversionSchema, ContractKey, DeclError, DeclarationIndex, DynInference,
     ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams,
-    MethodKey, MethodSurface, ModuleScope, NominalKey, TypeAliasDef, TypeBinding, TypeChecker,
+    MethodKey, MethodSurface, ModuleScope, NominalKey, PublicSurface, TypeAliasDef, TypeChecker,
     TypeError, TypeRefResolver, ValueDecl, VariantPayload, contracts, same_extend_target,
     type_ops::TypeVisitor, type_refs::GenericParamError,
 };
@@ -13,6 +13,7 @@ use crate::{
         FuncParam, Ident, MethodReceiver, MethodSig, Mutability, NominalKind, Param, Program,
         ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId, Visibility,
     },
+    externs::catalog::ExternCatalog,
     source::SourceId,
     span::{SourceSpan, Span},
 };
@@ -215,84 +216,373 @@ fn push_invalid_dyn_infer_decl(ty: &Type, span: Option<SourceSpan>, errors: &mut
 
 fn validate_type_alias_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
     for alias in decls.type_aliases() {
-        validate_type_alias_def(
-            decls,
-            &alias.def,
-            &alias.def.aliased,
-            matches!(alias.visibility, Visibility::Public),
-            errors,
-        );
+        validate_type_alias_def(&alias.def, &alias.def.aliased, errors);
     }
 }
 
-pub(super) fn validate_public_value_surfaces(
+pub(super) fn validate_public_surfaces(
     decls: &DeclarationIndex,
+    externs: &ExternCatalog,
     errors: &mut Vec<TypeError>,
 ) {
-    for value in decls.values() {
-        if !matches!(value.visibility, Visibility::Public) {
-            continue;
-        }
-        if let Some(ty) = private_exposed_type(decls, value.decl.ty()) {
-            errors.push(TypeError::Decl(DeclError::PublicValuePrivateType {
-                kind: value.decl.public_kind(),
-                name: value.name,
-                ty,
-                span: value.decl.diagnostic_span(),
-            }));
-        }
+    PublicSurfaceValidator {
+        decls,
+        externs,
+        errors,
     }
+    .validate();
 }
 
-fn validate_public_contract_types(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
-    for contract in decls.contracts() {
-        if !matches!(contract.visibility, Visibility::Public) {
-            continue;
+struct PublicSurfaceValidator<'a> {
+    decls: &'a DeclarationIndex,
+    externs: &'a ExternCatalog,
+    errors: &'a mut Vec<TypeError>,
+}
+
+impl PublicSurfaceValidator<'_> {
+    fn validate(&mut self) {
+        self.validate_values();
+        self.validate_aliases();
+        self.validate_contracts();
+        self.validate_aggregates();
+        self.validate_enums();
+        self.validate_extends();
+        self.validate_extern_types();
+    }
+
+    fn validate_values(&mut self) {
+        for value in self.decls.values() {
+            if !matches!(value.visibility, Visibility::Public) {
+                continue;
+            }
+            let kind = value.decl.public_kind();
+            if let ValueDecl::Func(sig) = &value.decl {
+                self.validate_generic_bounds(
+                    &PublicSurface::ValueBounds {
+                        kind,
+                        name: value.name,
+                    },
+                    &sig.generics,
+                    value.decl.diagnostic_span(),
+                );
+            }
+            self.validate_type_surface(
+                &PublicSurface::Value {
+                    kind,
+                    name: value.name,
+                },
+                value.decl.ty(),
+                value.decl.diagnostic_span(),
+            );
         }
-        for (include, span) in &contract.includes {
-            if private_included_contract(decls, &contract.key.module, include).is_some() {
-                errors.push(TypeError::Decl(DeclError::PublicContractPrivateType {
-                    name: contract.key.name,
-                    ty: Type::Dyn(include.clone()),
-                    span: Some(*span),
-                }));
+    }
+
+    fn validate_aliases(&mut self) {
+        for alias in self.decls.type_aliases() {
+            if !matches!(alias.visibility, Visibility::Public) {
+                continue;
+            }
+            self.validate_generic_bounds(
+                &PublicSurface::AliasBounds {
+                    name: alias.def.name,
+                },
+                &alias.def.generics,
+                Some(alias.def.span),
+            );
+            self.validate_type_surface(
+                &PublicSurface::Alias {
+                    name: alias.def.name,
+                },
+                &alias.def.aliased,
+                Some(alias.def.span),
+            );
+        }
+    }
+
+    fn validate_contracts(&mut self) {
+        for contract in self.decls.contracts() {
+            if !matches!(contract.visibility, Visibility::Public) {
+                continue;
+            }
+            let surface = PublicSurface::Contract {
+                name: contract.key.name,
+            };
+            for (include, span) in &contract.includes {
+                if private_included_contract(self.decls, &contract.key.module, include).is_some() {
+                    self.push_private_surface(&surface, Type::Dyn(include.clone()), Some(*span));
+                }
+            }
+
+            for req in &contract.requirements {
+                let exposed = req
+                    .params
+                    .iter()
+                    .find_map(|param| private_exposed_type(self.decls, self.externs, &param.ty))
+                    .or_else(|| private_exposed_type(self.decls, self.externs, &req.ret.ty));
+                if let Some(ty) = exposed {
+                    self.push_private_surface(&surface, ty, req.span);
+                }
             }
         }
-        for req in &contract.requirements {
-            let exposed = req
-                .params
-                .iter()
-                .find_map(|param| private_exposed_type(decls, &param.ty))
-                .or_else(|| private_exposed_type(decls, &req.ret.ty));
-            if let Some(ty) = exposed {
-                errors.push(TypeError::Decl(DeclError::PublicContractPrivateType {
-                    name: contract.key.name,
-                    ty,
-                    span: req.span,
-                }));
+    }
+
+    fn validate_aggregates(&mut self) {
+        for (_key, aggregate) in self.decls.aggregates() {
+            if !matches!(aggregate.visibility, Visibility::Public) {
+                continue;
+            }
+            self.validate_generic_bounds(
+                &PublicSurface::TypeBounds {
+                    name: aggregate.key.name,
+                },
+                &aggregate.generics,
+                Some(aggregate.span),
+            );
+            for (name, field) in &aggregate.fields {
+                self.validate_type_surface(
+                    &PublicSurface::Field {
+                        owner: aggregate.key.name,
+                        name: *name,
+                    },
+                    &field.ty,
+                    field.span,
+                );
+            }
+            for (key, method) in &aggregate.methods {
+                self.validate_callable_surface(
+                    &PublicSurface::Method {
+                        owner: aggregate.key.name,
+                        name: key.name,
+                        surface: key.surface,
+                    },
+                    &method.generics,
+                    &method.params,
+                    &method.param_spans,
+                    &method.ret,
+                    method.span,
+                );
             }
         }
+    }
+
+    fn validate_enums(&mut self) {
+        for (key, enm) in self.decls.enums() {
+            if !matches!(enm.visibility, Visibility::Public) {
+                continue;
+            }
+            self.validate_generic_bounds(
+                &PublicSurface::EnumBounds { name: key.name },
+                &enm.generics,
+                Some(enm.span),
+            );
+            for (name, variant) in &enm.variants {
+                match &variant.payload {
+                    VariantPayload::Unit => {}
+                    VariantPayload::Tuple(types) => {
+                        for ty in types {
+                            self.validate_type_surface(
+                                &PublicSurface::EnumVariant {
+                                    owner: key.name,
+                                    name: *name,
+                                },
+                                ty,
+                                Some(variant.span),
+                            );
+                        }
+                    }
+                    VariantPayload::Struct(fields) => {
+                        for (field_name, field) in fields {
+                            self.validate_type_surface(
+                                &PublicSurface::EnumVariantField {
+                                    owner: key.name,
+                                    variant: *name,
+                                    name: *field_name,
+                                },
+                                &field.ty,
+                                field.span,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_extends(&mut self) {
+        for extend in self.decls.extends() {
+            if !matches!(extend.visibility, Visibility::Public) {
+                continue;
+            }
+            self.validate_generic_bounds(
+                &PublicSurface::ExtendBounds,
+                &extend.generics,
+                Some(extend.span),
+            );
+            self.validate_type_surface(
+                &PublicSurface::ExtendTarget,
+                &extend.target,
+                Some(extend.span),
+            );
+            for (key, method) in &extend.methods {
+                self.validate_callable_surface(
+                    &PublicSurface::ExtendMethod {
+                        name: key.name,
+                        surface: key.surface,
+                    },
+                    &method.generics,
+                    &method.params,
+                    &method.param_spans,
+                    &method.ret,
+                    method.span,
+                );
+            }
+            for cast in &extend.cast_froms {
+                self.validate_cast_surface(cast);
+            }
+        }
+    }
+
+    fn validate_cast_surface(&mut self, cast: &CastConversionSchema) {
+        let span = SourceSpan {
+            source: cast.span.source,
+            span: cast.param_span,
+        };
+        self.validate_type_surface(&PublicSurface::CastSource, &cast.param.ty, Some(span));
+        if let Some(ret) = &cast.ret {
+            self.validate_type_surface(&PublicSurface::CastReturn, &ret.ty, Some(cast.span));
+        }
+    }
+
+    fn validate_extern_types(&mut self) {
+        for ty in self.externs.types() {
+            if !ty.exported {
+                continue;
+            }
+            for field in &ty.fields {
+                self.validate_type_surface(
+                    &PublicSurface::ExternField {
+                        owner: ty.key.name,
+                        name: field.name,
+                    },
+                    &field.ty.ty,
+                    field.site.span,
+                );
+            }
+            for method in &ty.methods {
+                self.validate_extern_signature(
+                    &PublicSurface::ExternMethod {
+                        owner: ty.key.name,
+                        name: method.name,
+                    },
+                    &method.signature,
+                    method.site.span,
+                );
+            }
+            for static_method in &ty.statics {
+                self.validate_extern_signature(
+                    &PublicSurface::ExternStatic {
+                        owner: ty.key.name,
+                        name: static_method.name,
+                    },
+                    &static_method.signature,
+                    static_method.site.span,
+                );
+            }
+            for operator in &ty.operators {
+                self.validate_extern_signature(
+                    &PublicSurface::ExternOperator {
+                        owner: ty.key.name,
+                        op: operator.op,
+                    },
+                    &operator.signature,
+                    operator.site.span,
+                );
+            }
+        }
+    }
+
+    fn validate_extern_signature(
+        &mut self,
+        surface: &PublicSurface,
+        signature: &crate::externs::catalog::ResolvedExternSignature,
+        span: Option<SourceSpan>,
+    ) {
+        for param in &signature.params {
+            self.validate_type_surface(surface, &param.ty.ty, span);
+        }
+        self.validate_type_surface(surface, &signature.ret.ty, span);
+    }
+
+    fn validate_callable_surface(
+        &mut self,
+        surface: &PublicSurface,
+        generics: &GenericParams,
+        params: &[FuncParam],
+        param_spans: &super::ParamTypeSpans,
+        ret: &ReturnSpec,
+        fallback_span: SourceSpan,
+    ) {
+        self.validate_generic_bounds(surface, generics, Some(fallback_span));
+        for (index, param) in params.iter().enumerate() {
+            let span = SourceSpan {
+                source: fallback_span.source,
+                span: param_spans.span_for(index, fallback_span.span),
+            };
+            self.validate_type_surface(surface, &param.ty, Some(span));
+        }
+        self.validate_type_surface(surface, &ret.ty, Some(fallback_span));
+    }
+
+    fn validate_generic_bounds(
+        &mut self,
+        surface: &PublicSurface,
+        generics: &GenericParams,
+        span: Option<SourceSpan>,
+    ) {
+        for param in &generics.type_params {
+            for bound in &param.bounds {
+                if let Some(ty) = private_contract_type(self.decls, self.externs, bound) {
+                    self.push_private_surface(surface, ty, span);
+                }
+            }
+        }
+    }
+
+    fn validate_type_surface(
+        &mut self,
+        surface: &PublicSurface,
+        ty: &Type,
+        span: Option<SourceSpan>,
+    ) {
+        if let Some(ty) = private_exposed_type(self.decls, self.externs, ty) {
+            self.push_private_surface(surface, ty, span);
+        }
+    }
+
+    fn push_private_surface(
+        &mut self,
+        surface: &PublicSurface,
+        ty: Type,
+        span: Option<SourceSpan>,
+    ) {
+        self.errors
+            .push(TypeError::Decl(DeclError::PublicSurfacePrivateType {
+                surface: surface.clone(),
+                ty,
+                span,
+            }));
     }
 }
 
 pub(super) fn validate_type_alias_def(
-    decls: &DeclarationIndex,
     alias: &TypeAliasDef,
     target: &Type,
-    public: bool,
     errors: &mut Vec<TypeError>,
 ) {
     if matches!(target, Type::Infer) {
         return;
     }
     push_unused_alias_params(&alias.generics, target, alias.span, errors);
-    if public && let Some(ty) = private_exposed_type(decls, target) {
-        errors.push(TypeError::Decl(DeclError::PublicAliasPrivateType {
-            name: alias.name,
-            ty,
-            span: Some(alias.span),
-        }));
-    }
 }
 
 fn push_unused_alias_params(
@@ -320,33 +610,43 @@ fn push_unused_alias_params(
     }
 }
 
-fn private_exposed_type(decls: &DeclarationIndex, ty: &Type) -> Option<Type> {
+fn private_exposed_type(
+    decls: &DeclarationIndex,
+    externs: &ExternCatalog,
+    ty: &Type,
+) -> Option<Type> {
     match ty {
         Type::Nominal(nominal) => {
             let key = decls.key_for_type(ty)?;
-            let exported = decls
-                .exported_nominal_type(&key.module, key.name)
-                .is_some_and(|exported| exported == key);
-            if !exported {
+            let public = match key.kind {
+                NominalKind::Extern => externs
+                    .type_by_nominal(&key)
+                    .is_none_or(|id| externs.ty(id).exported),
+                _ => decls
+                    .nominal_decl_visibility(&key)
+                    .is_none_or(|visibility| matches!(visibility, Visibility::Public)),
+            };
+            if !public {
                 return Some(ty.clone());
             }
             nominal
                 .type_args
                 .iter()
-                .find_map(|ty| private_exposed_type(decls, ty))
+                .find_map(|ty| private_exposed_type(decls, externs, ty))
         }
         Type::Func { params, ret } => params
             .iter()
-            .find_map(|param| private_exposed_type(decls, &param.ty))
-            .or_else(|| private_exposed_type(decls, &ret.ty)),
-        Type::Dyn(contract) => private_contract_type(decls, contract),
-        Type::Tuple(elems) => elems.iter().find_map(|ty| private_exposed_type(decls, ty)),
+            .find_map(|param| private_exposed_type(decls, externs, &param.ty))
+            .or_else(|| private_exposed_type(decls, externs, &ret.ty)),
+        Type::Dyn(contract) => private_contract_type(decls, externs, contract),
+        Type::Tuple(elems) => elems
+            .iter()
+            .find_map(|ty| private_exposed_type(decls, externs, ty)),
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
-            private_exposed_type(decls, elem)
+            private_exposed_type(decls, externs, elem)
         }
-        Type::Map { key, value } => {
-            private_exposed_type(decls, key).or_else(|| private_exposed_type(decls, value))
-        }
+        Type::Map { key, value } => private_exposed_type(decls, externs, key)
+            .or_else(|| private_exposed_type(decls, externs, value)),
         Type::Infer
         | Type::InferReturn
         | Type::Any
@@ -370,11 +670,10 @@ fn private_included_contract(
         ContractRef::Named { .. } => {
             let resolver = TypeRefResolver::module_only(decls);
             let key = resolver.resolve_contract_ref(module, contract).ok()?;
-            let exported = matches!(
-                decls.exported_type_binding(&key.module, key.name),
-                Some(TypeBinding::Contract(exported)) if exported == key
-            );
-            (!exported).then_some(key)
+            let public = decls
+                .contract_decl_visibility(&key)
+                .is_none_or(|visibility| matches!(visibility, Visibility::Public));
+            (!public).then_some(key)
         }
         ContractRef::Intersection(contracts) => contracts
             .iter()
@@ -383,7 +682,11 @@ fn private_included_contract(
     }
 }
 
-fn private_contract_type(decls: &DeclarationIndex, contract: &ContractRef) -> Option<Type> {
+fn private_contract_type(
+    decls: &DeclarationIndex,
+    externs: &ExternCatalog,
+    contract: &ContractRef,
+) -> Option<Type> {
     match contract {
         ContractRef::Named { name, origin, .. } => {
             let module = origin
@@ -393,21 +696,20 @@ fn private_contract_type(decls: &DeclarationIndex, contract: &ContractRef) -> Op
                 module,
                 name: *name,
             };
-            let exported = matches!(
-                decls.exported_type_binding(&key.module, key.name),
-                Some(TypeBinding::Contract(exported)) if exported == key
-            );
-            (!exported).then(|| Type::Dyn(contract.clone()))
+            let public = decls
+                .contract_decl_visibility(&key)
+                .is_none_or(|visibility| matches!(visibility, Visibility::Public));
+            (!public).then(|| Type::Dyn(contract.clone()))
         }
         ContractRef::Anonymous(surface) => surface.requirements.iter().find_map(|req| {
             req.params
                 .iter()
-                .find_map(|param| private_exposed_type(decls, &param.ty))
-                .or_else(|| private_exposed_type(decls, &req.ret.ty))
+                .find_map(|param| private_exposed_type(decls, externs, &param.ty))
+                .or_else(|| private_exposed_type(decls, externs, &req.ret.ty))
         }),
         ContractRef::Intersection(contracts) => contracts
             .iter()
-            .find_map(|contract| private_contract_type(decls, contract)),
+            .find_map(|contract| private_contract_type(decls, externs, contract)),
         ContractRef::Infer | ContractRef::Hole(_) => None,
     }
 }
@@ -1033,7 +1335,6 @@ impl TypeChecker {
         }
         validate_type_alias_decls(&decls, &mut self.errors);
         contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.lint_events);
-        validate_public_contract_types(&decls, &mut self.errors);
         validate_dyn_infer_decls(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
         for error in decls.build_projection_entries() {

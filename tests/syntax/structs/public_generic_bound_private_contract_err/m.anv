@@ -1,0 +1,3 @@
+// @helper
+contract Hidden { fn h(self); }
+pub struct Box<T: Hidden> { value: T }

@@ -1,6 +1,6 @@
 // @helper
 
-struct Health {
+pub struct Health {
     @internal
     hp: int,
 }

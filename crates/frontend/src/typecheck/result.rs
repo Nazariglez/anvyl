@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use super::{
-    BindingPromotionMap, CompileWarning, ImportId, ImportRecord, LambdaCaptureMap, LambdaEscapeMap,
-    ModuleScope, TypeError, semantic_use::map_delta,
+    BindingPromotionMap, CompileWarning, ForStepRuntimeCheckMap, ImportId, ImportRecord,
+    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, TypeError, semantic_use::map_delta,
 };
 use crate::{
     ast::Visibility,
@@ -64,6 +64,7 @@ pub struct TypecheckFacts {
     pub(super) lambda_escapes: LambdaEscapeMap,
     pub(super) lambda_captures: LambdaCaptureMap,
     pub(super) binding_promotions: BindingPromotionMap,
+    pub(super) for_step_runtime_checks: ForStepRuntimeCheckMap,
     pub(super) import_records: Vec<ImportRecord>,
     pub(super) used_imports: std::collections::HashSet<ImportId>,
 }
@@ -79,6 +80,10 @@ impl TypecheckFacts {
 
     pub fn binding_promotions(&self) -> &BindingPromotionMap {
         &self.binding_promotions
+    }
+
+    pub fn for_step_runtime_checks(&self) -> &ForStepRuntimeCheckMap {
+        &self.for_step_runtime_checks
     }
 
     pub(crate) fn unused_import_events(&self) -> Vec<LintEvent> {
@@ -100,6 +105,10 @@ impl TypecheckFacts {
             lambda_escapes: map_delta(&old.lambda_escapes, &self.lambda_escapes),
             lambda_captures: map_delta(&old.lambda_captures, &self.lambda_captures),
             binding_promotions: map_delta(&old.binding_promotions, &self.binding_promotions),
+            for_step_runtime_checks: map_delta(
+                old.for_step_runtime_checks(),
+                self.for_step_runtime_checks(),
+            ),
             import_records: self.import_records.clone(),
             used_imports: self.used_imports.clone(),
         }

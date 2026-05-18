@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn stride() -> int { 0 }
+
+fn main() {
+    for n in 0..10 step stride() {
+        let x: int = n;
+    }
+}

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use super::{
     ArgumentProjectionMap, CallMap, CallableRef, CallableTemplate, ContractWitnessMap, DynCallMap,
-    DynConversionMap, DynDowncastMap, DynWeakeningMap, ExternUseMap, GenericTypeContext,
-    GlobalAccessMap, MemberPathMap, TypeChecker, TypecheckFacts,
+    DynConversionMap, DynDowncastMap, DynWeakeningMap, ExternUseMap, ForStepRuntimeCheckMap,
+    GenericTypeContext, GlobalAccessMap, MemberPathMap, TypeChecker, TypecheckFacts,
     const_term::ConstTerm,
     decls::CallableId,
     dyn_infer::DynInferenceFacts,
@@ -142,6 +142,7 @@ pub(crate) struct SpecializedBodyFacts {
     pub(crate) dyn_calls: DynCallMap,
     pub(crate) dyn_downcasts: DynDowncastMap,
     pub(crate) global_accesses: GlobalAccessMap,
+    pub(crate) for_step_runtime_checks: ForStepRuntimeCheckMap,
     pub(crate) closure: TypecheckFacts,
 }
 
@@ -211,6 +212,10 @@ pub(super) fn specialized_body_facts(
         dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
         dyn_downcasts: map_delta(&old.dyn_downcasts, &current.dyn_downcasts),
         global_accesses: map_delta(&old.global_accesses, &current.global_accesses),
+        for_step_runtime_checks: map_delta(
+            &old.for_step_runtime_checks,
+            &current.for_step_runtime_checks,
+        ),
         closure: current.closure.delta_since(&old.closure),
     }
 }
@@ -346,6 +351,7 @@ impl TypeChecker {
             dyn_calls: self.dyn_calls.clone(),
             dyn_downcasts: self.dyn_downcasts.clone(),
             global_accesses: self.global_accesses.clone(),
+            for_step_runtime_checks: self.for_step_runtime_checks.clone(),
             closure: self.closure_fact_snapshot(),
         }
     }
@@ -372,6 +378,8 @@ impl TypeChecker {
         self.dyn_calls.extend(facts.dyn_calls);
         self.dyn_downcasts.extend(facts.dyn_downcasts);
         self.global_accesses.extend(facts.global_accesses);
+        self.for_step_runtime_checks
+            .extend(facts.for_step_runtime_checks);
         self.closure.extend_facts(facts.closure);
     }
 }

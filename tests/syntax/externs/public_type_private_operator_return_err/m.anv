@@ -1,0 +1,3 @@
+// @helper
+struct Hidden {}
+pub extern type Host { op Self + Self -> Hidden; }

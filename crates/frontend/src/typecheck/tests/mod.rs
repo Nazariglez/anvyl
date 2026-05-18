@@ -1,6 +1,7 @@
 mod basics;
 mod calls;
 mod contracts;
+mod control_flow;
 mod externs;
 mod globals;
 mod imports;

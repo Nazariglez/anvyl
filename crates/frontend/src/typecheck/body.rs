@@ -1110,7 +1110,7 @@ fn check_type_alias(alias_node: &TypeAliasDeclNode, tc: &mut TypeChecker) {
     tc.push_generic_context(local.def.generic_context.clone());
     let aliased = tc.resolve_type_for_tc_at(&local.def.aliased, alias_node.span);
     tc.pop_generic_context();
-    validate_type_alias_def(&tc.decls, &local.def, &aliased, false, &mut tc.errors);
+    validate_type_alias_def(&local.def, &aliased, &mut tc.errors);
 }
 
 fn check_callable_body_with_return(

@@ -25,8 +25,8 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, CaptureStorageOrigin, CompileWarning,
-        ConstDiagnostic, DeclError, DynContainerConversionKind, ModuleScope, TryCarrierKind,
-        TypeError, VariantShape,
+        ConstDiagnostic, DeclError, DynContainerConversionKind, ModuleScope, PublicSurface,
+        TryCarrierKind, TypeError, VariantShape,
     },
 };
 
@@ -1352,9 +1352,7 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::UnusedExtendConstParam { span, .. }
         | DeclError::UnusedAliasTypeParam { span, .. }
         | DeclError::UnusedAliasConstParam { span, .. }
-        | DeclError::PublicAliasPrivateType { span, .. }
-        | DeclError::PublicContractPrivateType { span, .. }
-        | DeclError::PublicValuePrivateType { span, .. }
+        | DeclError::PublicSurfacePrivateType { span, .. }
         | DeclError::ExtendMethodConflict { span, .. }
         | DeclError::ReexportConflict { span, .. }
         | DeclError::UnknownType { span, .. }
@@ -1816,6 +1814,47 @@ fn render_missing_projection(source: &Type, target: &Type, paths: &[Vec<Ident>])
     )
 }
 
+fn public_surface_label(surface: &PublicSurface) -> String {
+    match surface {
+        PublicSurface::Value { kind, name } => format!("{} '{name}'", kind.label()),
+        PublicSurface::ValueBounds { kind, name } => {
+            format!("{} '{name}' bounds", kind.label())
+        }
+        PublicSurface::Alias { name } => format!("type alias '{name}'"),
+        PublicSurface::AliasBounds { name } => format!("type alias '{name}' bounds"),
+        PublicSurface::Contract { name } => format!("contract '{name}'"),
+        PublicSurface::TypeBounds { name } => format!("type '{name}' bounds"),
+        PublicSurface::EnumBounds { name } => format!("enum '{name}' bounds"),
+        PublicSurface::Field { owner, name } => format!("field '{owner}.{name}'"),
+        PublicSurface::Method {
+            owner,
+            name,
+            surface,
+        } => {
+            format!("{} method '{owner}.{name}'", surface.label())
+        }
+        PublicSurface::EnumVariant { owner, name } => format!("enum variant '{owner}.{name}'"),
+        PublicSurface::EnumVariantField {
+            owner,
+            variant,
+            name,
+        } => format!("enum variant field '{owner}.{variant}.{name}'"),
+        PublicSurface::ExtendBounds => "extend bounds".to_string(),
+        PublicSurface::ExtendTarget => "extend target".to_string(),
+        PublicSurface::ExtendMethod { name, surface } => {
+            format!("{} extension method '{name}'", surface.label())
+        }
+        PublicSurface::CastSource => "cast source".to_string(),
+        PublicSurface::CastReturn => "cast return".to_string(),
+        PublicSurface::ExternField { owner, name } => format!("extern field '{owner}.{name}'"),
+        PublicSurface::ExternMethod { owner, name } => format!("extern method '{owner}.{name}'"),
+        PublicSurface::ExternStatic { owner, name } => format!("extern static '{owner}.{name}'"),
+        PublicSurface::ExternOperator { owner, op } => {
+            format!("extern operator '{owner}.{}'", render_extern_operator(*op))
+        }
+    }
+}
+
 fn render_decl_error(error: &DeclError) -> String {
     match error {
         DeclError::DuplicateValue { name, .. } => format!("value '{name}' is already declared"),
@@ -1897,15 +1936,9 @@ fn render_decl_error(error: &DeclError) -> String {
         DeclError::UnusedAliasConstParam { name, .. } => {
             format!("unused const parameter '{name}' in type alias")
         }
-        DeclError::PublicAliasPrivateType { name, ty, .. } => {
-            format!("public type alias '{name}' exposes private type '{ty}'")
-        }
-        DeclError::PublicContractPrivateType { name, ty, .. } => {
-            format!("public contract '{name}' exposes private type '{ty}'")
-        }
-        DeclError::PublicValuePrivateType { kind, name, ty, .. } => {
-            let kind = kind.label();
-            format!("public {kind} '{name}' exposes private type '{ty}'")
+        DeclError::PublicSurfacePrivateType { surface, ty, .. } => {
+            let surface = public_surface_label(surface);
+            format!("public {surface} exposes private type '{ty}'")
         }
         DeclError::ExtendMethodConflict {
             ty, name, surface, ..

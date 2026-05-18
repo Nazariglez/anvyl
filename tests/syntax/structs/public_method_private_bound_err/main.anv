@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: method 'Widget.take' exposes private type
+
+import m { Widget };

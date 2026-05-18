@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: value 'dup' is already declared
+// @contains: value 'DUP' is already declared
 
-import lib { dup };
+import lib { DUP };

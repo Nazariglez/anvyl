@@ -1,0 +1,4 @@
+// @helper
+struct Hidden {}
+pub struct Widget {}
+extern type Host { secret: Hidden; fn reveal(self) -> Hidden; }

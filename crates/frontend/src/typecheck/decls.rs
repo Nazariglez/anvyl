@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
+use anvyx_externs::ExternOperator;
+
 use super::{
     ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, TypeSubst, annotation,
     const_term::ConstTerm,
@@ -495,19 +497,8 @@ pub(crate) enum DeclError {
         name: Ident,
         span: Option<SourceSpan>,
     },
-    PublicAliasPrivateType {
-        name: Ident,
-        ty: Type,
-        span: Option<SourceSpan>,
-    },
-    PublicContractPrivateType {
-        name: Ident,
-        ty: Type,
-        span: Option<SourceSpan>,
-    },
-    PublicValuePrivateType {
-        kind: PublicValueKind,
-        name: Ident,
+    PublicSurfacePrivateType {
+        surface: PublicSurface,
         ty: Type,
         span: Option<SourceSpan>,
     },
@@ -1279,7 +1270,7 @@ impl ParamTypeSpans {
         Self(params.iter().map(|param| param.ty_span).collect())
     }
 
-    fn span_for(&self, index: usize, fallback: Span) -> Span {
+    pub(crate) fn span_for(&self, index: usize, fallback: Span) -> Span {
         self.0.get(index).copied().unwrap_or(fallback)
     }
 }
@@ -1335,6 +1326,8 @@ pub(crate) struct CallableRef {
 #[derive(Clone)]
 pub(crate) struct AggregateSchema {
     pub(crate) key: NominalKey,
+    pub(crate) visibility: Visibility,
+    pub(crate) span: SourceSpan,
     pub(crate) generics: GenericParams,
     pub(crate) fields: HashMap<Ident, FieldSchema>,
     pub(crate) methods: HashMap<MethodKey, MethodSchema>,
@@ -1432,6 +1425,7 @@ pub(crate) struct EmbedFieldSchema {
 
 #[derive(Clone)]
 pub(crate) struct MethodSchema {
+    pub(crate) span: SourceSpan,
     pub(crate) generics: GenericParams,
     pub(crate) mode: MethodMode,
     pub(crate) params: Vec<FuncParam>,
@@ -1443,6 +1437,8 @@ pub(crate) struct MethodSchema {
 
 #[derive(Clone)]
 pub(crate) struct EnumSchema {
+    pub(crate) visibility: Visibility,
+    pub(crate) span: SourceSpan,
     pub(crate) generics: GenericParams,
     pub(crate) variants: HashMap<Ident, VariantSchema>,
     pub(crate) policy: AccessPolicy,
@@ -1450,6 +1446,7 @@ pub(crate) struct EnumSchema {
 
 #[derive(Clone)]
 pub(crate) struct VariantSchema {
+    pub(crate) span: SourceSpan,
     pub(crate) policy: AccessPolicy,
     pub(crate) payload: VariantPayload,
 }
@@ -1465,6 +1462,7 @@ pub(crate) enum VariantPayload {
 pub(crate) struct ExtendSchema {
     pub(crate) id: ExtendId,
     pub(crate) origin: ModuleScope,
+    pub(crate) visibility: Visibility,
     pub(crate) exported: bool,
     pub(crate) target: Type,
     pub(crate) generics: GenericParams,
@@ -1483,6 +1481,7 @@ pub(crate) struct CastConversionSchema {
 
 #[derive(Clone)]
 pub(crate) struct ExtendMethodSchema {
+    pub(crate) span: SourceSpan,
     pub(crate) mode: MethodMode,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
@@ -1490,6 +1489,75 @@ pub(crate) struct ExtendMethodSchema {
     pub(crate) required_params: usize,
     pub(crate) ret: ReturnSpec,
     pub(crate) policy: AccessPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PublicSurface {
+    Value {
+        kind: PublicValueKind,
+        name: Ident,
+    },
+    ValueBounds {
+        kind: PublicValueKind,
+        name: Ident,
+    },
+    Alias {
+        name: Ident,
+    },
+    AliasBounds {
+        name: Ident,
+    },
+    Contract {
+        name: Ident,
+    },
+    TypeBounds {
+        name: Ident,
+    },
+    EnumBounds {
+        name: Ident,
+    },
+    Field {
+        owner: Ident,
+        name: Ident,
+    },
+    Method {
+        owner: Ident,
+        name: Ident,
+        surface: MethodSurface,
+    },
+    EnumVariant {
+        owner: Ident,
+        name: Ident,
+    },
+    EnumVariantField {
+        owner: Ident,
+        variant: Ident,
+        name: Ident,
+    },
+    ExtendBounds,
+    ExtendTarget,
+    ExtendMethod {
+        name: Ident,
+        surface: MethodSurface,
+    },
+    CastSource,
+    CastReturn,
+    ExternField {
+        owner: Ident,
+        name: Ident,
+    },
+    ExternMethod {
+        owner: Ident,
+        name: Ident,
+    },
+    ExternStatic {
+        owner: Ident,
+        name: Ident,
+    },
+    ExternOperator {
+        owner: Ident,
+        op: ExternOperator,
+    },
 }
 
 pub(crate) enum ExtendMethodMatch<'a> {
@@ -2219,6 +2287,7 @@ impl DeclarationIndex {
                         let mode = MethodMode::from_receiver(method.sig.receiver);
                         let method_key = MethodKey::new(method.sig.name, mode.surface());
                         let schema = MethodSchema {
+                            span: SourceSpan::from_byte_span(source, agg_node.span),
                             generics: generic_params(
                                 &method.sig.type_params,
                                 &method.sig.const_params,
@@ -2257,6 +2326,8 @@ impl DeclarationIndex {
                             key.clone(),
                             AggregateSchema {
                                 key,
+                                visibility: agg.visibility,
+                                span: SourceSpan::from_byte_span(source, agg_node.span),
                                 generics: generic_params(&agg.type_params, &agg.const_params),
                                 fields,
                                 methods,
@@ -2318,6 +2389,7 @@ impl DeclarationIndex {
                         variants.insert(
                             variant.name,
                             VariantSchema {
+                                span: SourceSpan::from_byte_span(source, enum_node.span),
                                 policy: variant_policy,
                                 payload,
                             },
@@ -2335,6 +2407,8 @@ impl DeclarationIndex {
                         self.enums.insert(
                             key.clone(),
                             EnumSchema {
+                                visibility: enm.visibility,
+                                span: SourceSpan::from_byte_span(source, enum_node.span),
                                 generics: generic_params(&enm.type_params, &enm.const_params),
                                 variants,
                                 policy,
@@ -2550,6 +2624,7 @@ impl DeclarationIndex {
                         let mode = MethodMode::from_receiver(m.sig.receiver);
                         let key = MethodKey::new(m.sig.name, mode.surface());
                         let schema = ExtendMethodSchema {
+                            span: SourceSpan::from_byte_span(source, method_node.span),
                             mode,
                             generics: generic_params(&m.sig.type_params, &m.sig.const_params),
                             params: resolve_func_params(&m.sig.params),
@@ -2597,6 +2672,7 @@ impl DeclarationIndex {
                     self.extends.push(ExtendSchema {
                         id,
                         origin: scope.clone(),
+                        visibility: ext.visibility,
                         exported,
                         target: ext.ty.clone(),
                         generics,
@@ -3358,6 +3434,20 @@ impl DeclarationIndex {
 
     pub(crate) fn enums(&self) -> impl Iterator<Item = (&NominalKey, &EnumSchema)> {
         self.enums.iter()
+    }
+
+    pub(crate) fn nominal_decl_visibility(&self, key: &NominalKey) -> Option<Visibility> {
+        match key.kind {
+            NominalKind::Struct | NominalKind::DataRef => {
+                self.aggregate(key).map(|schema| schema.visibility)
+            }
+            NominalKind::Enum => self.enum_schema(key).map(|schema| schema.visibility),
+            NominalKind::Extern => None,
+        }
+    }
+
+    pub(crate) fn contract_decl_visibility(&self, key: &ContractKey) -> Option<Visibility> {
+        self.contract(key).map(|schema| schema.visibility)
     }
 
     pub(crate) fn extern_type_policy(&self, key: &NominalKey) -> Option<&AccessPolicy> {

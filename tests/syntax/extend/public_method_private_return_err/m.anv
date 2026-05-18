@@ -1,0 +1,4 @@
+// @helper
+struct Hidden {}
+pub struct Widget {}
+pub extend Widget { fn reveal(self) -> Hidden { Hidden {} } }

@@ -1,6 +1,6 @@
 // @helper
 
-struct Health { hp: int }
+pub struct Health { hp: int }
 
 pub struct Enemy {
     embed health: Health,

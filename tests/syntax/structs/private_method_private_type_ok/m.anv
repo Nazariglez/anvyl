@@ -1,0 +1,4 @@
+// @helper
+struct Hidden {}
+pub struct Widget {}
+struct LocalOnly { fn reveal(self) -> Hidden { Hidden {} } }

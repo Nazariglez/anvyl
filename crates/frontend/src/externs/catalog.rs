@@ -184,6 +184,10 @@ impl ExternCatalog {
         self.functions.iter()
     }
 
+    pub(crate) fn types(&self) -> impl Iterator<Item = &ExternType> {
+        self.types.iter()
+    }
+
     pub(crate) fn functions_in_scope<'a>(
         &'a self,
         scope: &'a ModuleScope,
@@ -440,6 +444,7 @@ pub(crate) struct ExternType {
     pub(crate) key: TypeKey,
     pub(crate) nominal: NominalKey,
     pub(crate) context: ExternCatalogContext,
+    pub(crate) exported: bool,
     pub(crate) site: RawExternSite,
     pub(crate) doc: Option<String>,
     pub(crate) rep: ExternRep,
@@ -755,6 +760,7 @@ impl<'a> CatalogBuilder<'a> {
                 key,
                 nominal,
                 context: ExternCatalogContext::ty(provenance, scope.clone(), name),
+                exported: raw_ty.exported,
                 site: raw_ty.site,
                 doc: raw_ty.doc.clone(),
                 rep: raw_ty.rep,
@@ -1553,6 +1559,7 @@ mod tests {
                 key,
                 nominal,
                 context,
+                exported: true,
                 site: RawExternSite::default(),
                 doc: None,
                 rep: ExternRep::Shared,

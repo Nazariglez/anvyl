@@ -1,0 +1,3 @@
+// @helper
+contract Hidden { fn h(self); }
+pub fn take<T: Hidden>(value: T) {}

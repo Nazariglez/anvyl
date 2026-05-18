@@ -26,6 +26,7 @@ pub(crate) type GlobalAccessMap = HashMap<ExprId, GlobalAccessFact>;
 pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
 pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
 pub(crate) type BindingPromotionMap = HashMap<BindingId, BindingPromotionFact>;
+pub(crate) type ForStepRuntimeCheckMap = HashMap<ExprId, SourceSpan>;
 
 pub(super) fn map_delta<K, V>(old: &HashMap<K, V>, current: &HashMap<K, V>) -> HashMap<K, V>
 where

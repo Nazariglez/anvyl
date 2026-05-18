@@ -1,4 +1,4 @@
 // @helper
 
-pub fn dup() -> int { 1 }
-pub const dup: int = 2;
+pub fn DUP() -> int { 1 }
+pub const DUP: int = 2;

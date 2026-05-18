@@ -79,6 +79,10 @@ impl TypecheckTestResult {
         &self.global_accesses
     }
 
+    pub(crate) fn for_step_runtime_checks(&self) -> &typecheck::ForStepRuntimeCheckMap {
+        self.facts.for_step_runtime_checks()
+    }
+
     pub(crate) fn lambda_escapes(&self) -> &LambdaEscapeMap {
         self.facts.lambda_escapes()
     }
