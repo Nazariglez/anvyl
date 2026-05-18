@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @lint: internal_access=error
+
+import m { Widget, widget };
+
+fn main() {
+    let a = widget("a");
+    let hidden = a.hidden;
+    let b = Widget { name: "b", hidden };
+}

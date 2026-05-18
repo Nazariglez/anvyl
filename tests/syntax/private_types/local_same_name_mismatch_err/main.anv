@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mismatched types
+
+import m { Widget };
+
+struct Hidden { state: int }
+
+fn main() {
+    let w = Widget { hidden: Hidden { state: 0 } };
+}

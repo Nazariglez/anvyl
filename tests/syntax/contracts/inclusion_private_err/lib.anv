@@ -1,9 +1,0 @@
-// @helper
-
-contract Hidden {
-    fn f(self);
-}
-
-pub contract Public {
-    Hidden;
-}

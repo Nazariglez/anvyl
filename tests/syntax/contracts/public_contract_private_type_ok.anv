@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import public_contract_private_type_helper { thing, use_leaky };
+
+fn main() {
+    let h = use_leaky(thing());
+}

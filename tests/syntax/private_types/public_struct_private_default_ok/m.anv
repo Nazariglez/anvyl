@@ -1,0 +1,7 @@
+// @helper
+
+struct Hidden {}
+pub struct Widget {
+    name: string,
+    hidden: Hidden? = nil,
+}

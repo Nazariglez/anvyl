@@ -1,6 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: exposes private type
-
-import m { Leaked };

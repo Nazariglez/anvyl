@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { widget };
+
+fn main() {
+    let w = widget("ok");
+    let name: string = w.name;
+}

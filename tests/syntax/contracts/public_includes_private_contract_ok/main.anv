@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import lib { Public, use_public };
+
+struct Thing {}
+extend Thing { fn f(self) {} }
+
+fn main() {
+    let x = Thing {};
+    use_public(x);
+}

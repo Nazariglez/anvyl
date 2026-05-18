@@ -1,0 +1,11 @@
+// @helper
+
+extern type Hidden;
+pub extern type Host {
+    secret: Hidden;
+    fn take(self, h: Hidden);
+    fn reveal(self) -> Hidden;
+    fn static_reveal() -> Hidden;
+    op Self == Hidden -> bool;
+    op Self + Self -> Hidden;
+}

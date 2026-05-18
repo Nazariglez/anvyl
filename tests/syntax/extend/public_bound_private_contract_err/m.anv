@@ -1,3 +1,0 @@
-// @helper
-contract Hidden { fn h(self); }
-pub extend<T: Hidden> [T] { fn marker(self) {} }

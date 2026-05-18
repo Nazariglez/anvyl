@@ -1,0 +1,5 @@
+// @helper
+
+struct Hidden { value: int }
+pub type Leaked = Hidden;
+pub fn hidden() -> Leaked { Hidden { value: 1 } }

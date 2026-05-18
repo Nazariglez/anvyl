@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { Widget, hidden };
+
+fn main() {
+    let h = hidden();
+    let w = h as Widget;
+}

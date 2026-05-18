@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
-use anvyx_externs::ExternOperator;
-
 use super::{
     ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, TypeSubst, annotation,
     const_term::ConstTerm,
@@ -497,11 +495,6 @@ pub(crate) enum DeclError {
         name: Ident,
         span: Option<SourceSpan>,
     },
-    PublicSurfacePrivateType {
-        surface: PublicSurface,
-        ty: Type,
-        span: Option<SourceSpan>,
-    },
     ExtendMethodConflict {
         ty: Type,
         name: Ident,
@@ -674,7 +667,6 @@ struct SourceExternPolicies {
 pub(crate) struct ResolvedValue {
     pub(crate) module: ModuleScope,
     pub(crate) name: Ident,
-    pub(crate) visibility: Visibility,
     pub(crate) decl: ValueDecl,
 }
 
@@ -698,6 +690,12 @@ pub(crate) enum ModuleMemberLookup<T> {
     Found(T),
     Private,
     Missing,
+}
+
+pub(crate) struct TypeMemberLookup {
+    pub(crate) result: ModuleMemberLookup<TypeBinding>,
+    pub(crate) import: Option<ImportId>,
+    pub(crate) target: Option<ModuleScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -775,25 +773,6 @@ pub(crate) struct ModuleDecls {
     exported_active_modules: HashSet<ModuleScope>,
     private_reexports: HashSet<Ident>,
     imports: ImportScope,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicValueKind {
-    Function,
-    ExternFunction,
-    Const,
-    RuntimeGlobal,
-}
-
-impl PublicValueKind {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Function => "function",
-            Self::ExternFunction => "extern function",
-            Self::Const => "const",
-            Self::RuntimeGlobal => "runtime global",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1242,24 +1221,6 @@ impl ValueDecl {
             Self::Global(_) => Some(DeprecatedUseKind::Global),
         }
     }
-
-    pub(crate) fn public_kind(&self) -> PublicValueKind {
-        match self {
-            Self::Func(sig) if sig.kind == CallableKind::ExternFunction => {
-                PublicValueKind::ExternFunction
-            }
-            Self::Func(_) => PublicValueKind::Function,
-            Self::Const(_) => PublicValueKind::Const,
-            Self::Global(_) => PublicValueKind::RuntimeGlobal,
-        }
-    }
-
-    pub(crate) fn diagnostic_span(&self) -> Option<SourceSpan> {
-        match self {
-            Self::Global(sig) => Some(sig.span),
-            Self::Func(_) | Self::Const(_) => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1326,8 +1287,6 @@ pub(crate) struct CallableRef {
 #[derive(Clone)]
 pub(crate) struct AggregateSchema {
     pub(crate) key: NominalKey,
-    pub(crate) visibility: Visibility,
-    pub(crate) span: SourceSpan,
     pub(crate) generics: GenericParams,
     pub(crate) fields: HashMap<Ident, FieldSchema>,
     pub(crate) methods: HashMap<MethodKey, MethodSchema>,
@@ -1379,7 +1338,6 @@ pub(crate) struct TypeAliasDef {
 #[derive(Clone)]
 pub(crate) struct TypeAliasSchema {
     pub(crate) def: TypeAliasDef,
-    pub(crate) visibility: Visibility,
 }
 
 #[derive(Clone)]
@@ -1425,7 +1383,6 @@ pub(crate) struct EmbedFieldSchema {
 
 #[derive(Clone)]
 pub(crate) struct MethodSchema {
-    pub(crate) span: SourceSpan,
     pub(crate) generics: GenericParams,
     pub(crate) mode: MethodMode,
     pub(crate) params: Vec<FuncParam>,
@@ -1437,8 +1394,6 @@ pub(crate) struct MethodSchema {
 
 #[derive(Clone)]
 pub(crate) struct EnumSchema {
-    pub(crate) visibility: Visibility,
-    pub(crate) span: SourceSpan,
     pub(crate) generics: GenericParams,
     pub(crate) variants: HashMap<Ident, VariantSchema>,
     pub(crate) policy: AccessPolicy,
@@ -1446,7 +1401,6 @@ pub(crate) struct EnumSchema {
 
 #[derive(Clone)]
 pub(crate) struct VariantSchema {
-    pub(crate) span: SourceSpan,
     pub(crate) policy: AccessPolicy,
     pub(crate) payload: VariantPayload,
 }
@@ -1462,7 +1416,6 @@ pub(crate) enum VariantPayload {
 pub(crate) struct ExtendSchema {
     pub(crate) id: ExtendId,
     pub(crate) origin: ModuleScope,
-    pub(crate) visibility: Visibility,
     pub(crate) exported: bool,
     pub(crate) target: Type,
     pub(crate) generics: GenericParams,
@@ -1481,7 +1434,6 @@ pub(crate) struct CastConversionSchema {
 
 #[derive(Clone)]
 pub(crate) struct ExtendMethodSchema {
-    pub(crate) span: SourceSpan,
     pub(crate) mode: MethodMode,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
@@ -1489,75 +1441,6 @@ pub(crate) struct ExtendMethodSchema {
     pub(crate) required_params: usize,
     pub(crate) ret: ReturnSpec,
     pub(crate) policy: AccessPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PublicSurface {
-    Value {
-        kind: PublicValueKind,
-        name: Ident,
-    },
-    ValueBounds {
-        kind: PublicValueKind,
-        name: Ident,
-    },
-    Alias {
-        name: Ident,
-    },
-    AliasBounds {
-        name: Ident,
-    },
-    Contract {
-        name: Ident,
-    },
-    TypeBounds {
-        name: Ident,
-    },
-    EnumBounds {
-        name: Ident,
-    },
-    Field {
-        owner: Ident,
-        name: Ident,
-    },
-    Method {
-        owner: Ident,
-        name: Ident,
-        surface: MethodSurface,
-    },
-    EnumVariant {
-        owner: Ident,
-        name: Ident,
-    },
-    EnumVariantField {
-        owner: Ident,
-        variant: Ident,
-        name: Ident,
-    },
-    ExtendBounds,
-    ExtendTarget,
-    ExtendMethod {
-        name: Ident,
-        surface: MethodSurface,
-    },
-    CastSource,
-    CastReturn,
-    ExternField {
-        owner: Ident,
-        name: Ident,
-    },
-    ExternMethod {
-        owner: Ident,
-        name: Ident,
-    },
-    ExternStatic {
-        owner: Ident,
-        name: Ident,
-    },
-    ExternOperator {
-        owner: Ident,
-        op: ExternOperator,
-    },
 }
 
 pub(crate) enum ExtendMethodMatch<'a> {
@@ -2209,7 +2092,6 @@ impl DeclarationIndex {
                     let value = ResolvedValue {
                         module: scope.clone(),
                         name: func.name,
-                        visibility: func.visibility,
                         decl: ValueDecl::Func(FuncSig {
                             kind: CallableKind::Function,
                             generics: generic_params(&func.type_params, &func.const_params),
@@ -2287,7 +2169,6 @@ impl DeclarationIndex {
                         let mode = MethodMode::from_receiver(method.sig.receiver);
                         let method_key = MethodKey::new(method.sig.name, mode.surface());
                         let schema = MethodSchema {
-                            span: SourceSpan::from_byte_span(source, agg_node.span),
                             generics: generic_params(
                                 &method.sig.type_params,
                                 &method.sig.const_params,
@@ -2326,8 +2207,6 @@ impl DeclarationIndex {
                             key.clone(),
                             AggregateSchema {
                                 key,
-                                visibility: agg.visibility,
-                                span: SourceSpan::from_byte_span(source, agg_node.span),
                                 generics: generic_params(&agg.type_params, &agg.const_params),
                                 fields,
                                 methods,
@@ -2389,7 +2268,6 @@ impl DeclarationIndex {
                         variants.insert(
                             variant.name,
                             VariantSchema {
-                                span: SourceSpan::from_byte_span(source, enum_node.span),
                                 policy: variant_policy,
                                 payload,
                             },
@@ -2407,8 +2285,6 @@ impl DeclarationIndex {
                         self.enums.insert(
                             key.clone(),
                             EnumSchema {
-                                visibility: enm.visibility,
-                                span: SourceSpan::from_byte_span(source, enum_node.span),
                                 generics: generic_params(&enm.type_params, &enm.const_params),
                                 variants,
                                 policy,
@@ -2427,7 +2303,6 @@ impl DeclarationIndex {
                     let value = ResolvedValue {
                         module: scope.clone(),
                         name: c.name,
-                        visibility: c.visibility,
                         decl: ValueDecl::Const(ConstSig {
                             ty: c.ty.clone().unwrap_or(Type::Infer),
                             policy,
@@ -2459,7 +2334,6 @@ impl DeclarationIndex {
                     let value = ResolvedValue {
                         module: scope.clone(),
                         name: global.name,
-                        visibility: global.visibility,
                         decl: ValueDecl::Global(GlobalSig {
                             key,
                             ty: global.ty.clone().unwrap_or(Type::Infer),
@@ -2517,7 +2391,6 @@ impl DeclarationIndex {
                                     policy,
                                     span,
                                 },
-                                visibility: alias.visibility,
                             },
                         );
                     }
@@ -2624,7 +2497,6 @@ impl DeclarationIndex {
                         let mode = MethodMode::from_receiver(m.sig.receiver);
                         let key = MethodKey::new(m.sig.name, mode.surface());
                         let schema = ExtendMethodSchema {
-                            span: SourceSpan::from_byte_span(source, method_node.span),
                             mode,
                             generics: generic_params(&m.sig.type_params, &m.sig.const_params),
                             params: resolve_func_params(&m.sig.params),
@@ -2672,7 +2544,6 @@ impl DeclarationIndex {
                     self.extends.push(ExtendSchema {
                         id,
                         origin: scope.clone(),
-                        visibility: ext.visibility,
                         exported,
                         target: ext.ty.clone(),
                         generics,
@@ -2748,11 +2619,6 @@ impl DeclarationIndex {
             let value = ResolvedValue {
                 module: scope.clone(),
                 name,
-                visibility: if func.exported {
-                    Visibility::Public
-                } else {
-                    Visibility::Private
-                },
                 decl: ValueDecl::Func(FuncSig {
                     kind: CallableKind::ExternFunction,
                     generics: GenericParams::default(),
@@ -3228,39 +3094,41 @@ impl DeclarationIndex {
             .or_else(|| self.imported_type_binding_with_import(module, name))
     }
 
-    pub(crate) fn resolve_visible_type_binding(
+    pub(crate) fn resolve_type_member(
         &self,
         module: &ModuleScope,
         qualifier: Option<Ident>,
         name: Ident,
-    ) -> Option<TypeBinding> {
-        self.resolve_visible_type_binding_with_import(module, qualifier, name)
-            .map(|(binding, _)| binding)
-    }
-
-    pub(crate) fn resolve_visible_type_binding_with_import(
-        &self,
-        module: &ModuleScope,
-        qualifier: Option<Ident>,
-        name: Ident,
-    ) -> Option<(TypeBinding, Option<ImportId>)> {
+    ) -> TypeMemberLookup {
         match qualifier {
             Some(alias) => {
-                let (target, import) = self.imported_module_with_import(module, alias)?;
-                Some((self.exported_type_binding(&target, name)?, import))
+                let Some((target, import)) = self.imported_module_with_import(module, alias) else {
+                    return TypeMemberLookup {
+                        result: ModuleMemberLookup::Missing,
+                        import: None,
+                        target: None,
+                    };
+                };
+                let result = self.module_type(&target, name);
+                TypeMemberLookup {
+                    result,
+                    import,
+                    target: Some(target),
+                }
             }
-            None => self.visible_type_binding_with_import(module, name),
+            None => match self.visible_type_binding_with_import(module, name) {
+                Some((binding, import)) => TypeMemberLookup {
+                    result: ModuleMemberLookup::Found(binding),
+                    import,
+                    target: None,
+                },
+                None => TypeMemberLookup {
+                    result: ModuleMemberLookup::Missing,
+                    import: None,
+                    target: None,
+                },
+            },
         }
-    }
-
-    pub(crate) fn resolve_visible_nominal_key(
-        &self,
-        module: &ModuleScope,
-        qualifier: Option<Ident>,
-        name: Ident,
-    ) -> Option<NominalKey> {
-        self.resolve_visible_type_binding(module, qualifier, name)?
-            .into_nominal()
     }
 
     pub(crate) fn imports_module(&self, module: &ModuleScope, imported: &ModuleScope) -> bool {
@@ -3434,20 +3302,6 @@ impl DeclarationIndex {
 
     pub(crate) fn enums(&self) -> impl Iterator<Item = (&NominalKey, &EnumSchema)> {
         self.enums.iter()
-    }
-
-    pub(crate) fn nominal_decl_visibility(&self, key: &NominalKey) -> Option<Visibility> {
-        match key.kind {
-            NominalKind::Struct | NominalKind::DataRef => {
-                self.aggregate(key).map(|schema| schema.visibility)
-            }
-            NominalKind::Enum => self.enum_schema(key).map(|schema| schema.visibility),
-            NominalKind::Extern => None,
-        }
-    }
-
-    pub(crate) fn contract_decl_visibility(&self, key: &ContractKey) -> Option<Visibility> {
-        self.contract(key).map(|schema| schema.visibility)
     }
 
     pub(crate) fn extern_type_policy(&self, key: &NominalKey) -> Option<&AccessPolicy> {
@@ -3992,15 +3846,6 @@ pub(crate) fn owner_template(owner: &NominalKey, generics: &GenericParams) -> Ty
 }
 
 impl DeclarationIndex {
-    pub(crate) fn finalize_type_ref(
-        &self,
-        module: &ModuleScope,
-        generics: &GenericTypeContext,
-        ty: &Type,
-    ) -> Result<Type, TypeRefError> {
-        TypeRefResolver::module_only(self).finalize(module, generics, ty)
-    }
-
     pub(crate) fn finalize_nominal_type_args(
         &self,
         module: &ModuleScope,
@@ -4355,6 +4200,16 @@ mod tests {
         }
     }
 
+    fn finalize_type(
+        index: &DeclarationIndex,
+        module: &ModuleScope,
+        ty: &Type,
+    ) -> Result<Type, TypeRefError> {
+        TypeRefResolver::module_only(index)
+            .finalize_at(module, &GenericTypeContext::default(), ty, None)
+            .map(|finalized| finalized.ty)
+    }
+
     #[test]
     fn type_args_origin() {
         let name = ident("Box");
@@ -4365,9 +4220,7 @@ mod tests {
             generic_args: vec![GenericArg::Type(Type::Int)],
         };
         let index = index("", &[("tools", "pub struct Box<T> { value: T }")]);
-        let result = index
-            .finalize_type_ref(&scope, &GenericTypeContext::default(), &ty)
-            .unwrap();
+        let result = finalize_type(&index, &scope, &ty).unwrap();
 
         assert_eq!(
             result,
@@ -4395,9 +4248,7 @@ mod tests {
             "struct Wrapper<T> { value: T } struct Inner { value: int }",
             &[],
         );
-        let result = index
-            .finalize_type_ref(&scope, &GenericTypeContext::default(), &ty)
-            .unwrap();
+        let result = finalize_type(&index, &scope, &ty).unwrap();
 
         assert_eq!(
             result,
@@ -4425,8 +4276,7 @@ mod tests {
             generic_args: vec![GenericArg::Type(Type::Int)],
         };
         let index = index("", &[]);
-        let error = index
-            .finalize_type_ref(&ModuleScope::Root, &GenericTypeContext::default(), &ty)
+        let error = finalize_type(&index, &ModuleScope::Root, &ty)
             .expect_err("unknown qualified type should fail finalization");
 
         assert!(matches!(
@@ -4460,9 +4310,11 @@ mod tests {
             &[("shapes", "pub struct Point { x: int }")],
         );
 
-        let key = index
-            .resolve_visible_nominal_key(&ModuleScope::Root, Some(ident("shapes")), ident("Point"))
-            .expect("missing qualified type");
+        let lookup =
+            index.resolve_type_member(&ModuleScope::Root, Some(ident("shapes")), ident("Point"));
+        let ModuleMemberLookup::Found(TypeBinding::Nominal(key)) = lookup.result else {
+            panic!("missing qualified type");
+        };
 
         assert_eq!(key.module, scope("shapes"));
         assert_eq!(key.name, ident("Point"));
@@ -4473,15 +4325,10 @@ mod tests {
     fn qualified_visible_requires_binding() {
         let index = index("", &[("shapes", "pub struct Point { x: int }")]);
 
-        assert!(
-            index
-                .resolve_visible_nominal_key(
-                    &ModuleScope::Root,
-                    Some(ident("shapes")),
-                    ident("Point")
-                )
-                .is_none()
-        );
+        let lookup =
+            index.resolve_type_member(&ModuleScope::Root, Some(ident("shapes")), ident("Point"));
+
+        assert!(matches!(lookup.result, ModuleMemberLookup::Missing));
     }
 
     #[test]

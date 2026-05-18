@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { Host };
+
+fn main(host: Host) {
+    let field = host.secret;
+    host.take(field);
+    let revealed = host.reveal();
+    host.take(revealed);
+    let from_static = Host.static_reveal();
+    host.take(from_static);
+    let eq: bool = host == from_static;
+    let sum = host + host;
+    host.take(sum);
+}

@@ -1,4 +1,0 @@
-// @helper
-
-struct Hidden { value: int }
-pub type Leaked = Hidden;

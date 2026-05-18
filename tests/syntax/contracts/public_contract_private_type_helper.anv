@@ -5,3 +5,8 @@ struct Hidden {}
 pub contract Leaky {
     fn hidden(self) -> Hidden;
 }
+
+pub struct Thing {}
+pub extend Thing { fn hidden(self) -> Hidden { Hidden {} } }
+pub fn thing() -> Thing { Thing {} }
+pub fn use_leaky<T: Leaky>(value: T) -> Hidden { value.hidden() }

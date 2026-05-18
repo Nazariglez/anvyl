@@ -1,0 +1,10 @@
+// @helper
+struct Hidden {}
+pub struct Widget {}
+pub fn hidden() -> Hidden { Hidden {} }
+pub fn take(value: Hidden) {}
+pub extend Widget {
+    fn take(self, h: Hidden) {}
+    fn reveal(self) -> Hidden { Hidden {} }
+    fn static_reveal() -> Hidden { Hidden {} }
+}

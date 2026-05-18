@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { Leaked, hidden };
+
+fn main() {
+    let h: Leaked = hidden();
+}

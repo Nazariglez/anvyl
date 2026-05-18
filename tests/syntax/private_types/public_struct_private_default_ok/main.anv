@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @lint: internal_access=error
+
+import m { Widget };
+
+fn main() {
+    let w = Widget { name: "ok" };
+    let name: string = w.name;
+}

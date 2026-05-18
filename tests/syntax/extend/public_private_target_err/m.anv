@@ -1,4 +1,0 @@
-// @helper
-struct Hidden {}
-pub struct Widget {}
-pub extend Hidden { fn helper(self) {} }

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { take };
+
+struct Thing {}
+extend Thing { fn h(self) {} }
+
+fn main() {
+    take(Thing {});
+}

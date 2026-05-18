@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { Widget, take };
+
+fn main(w: Widget) {
+    let h = w.reveal();
+    take(h);
+}

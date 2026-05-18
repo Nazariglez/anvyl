@@ -18,7 +18,7 @@ use crate::{
     resolve::{ModuleId, ModulePath},
     typecheck::{
         DeclarationIndex, GenericTypeContext, ModuleScope, NominalKey, TypeRefError,
-        type_closure_facts,
+        TypeRefResolver, type_closure_facts,
     },
 };
 
@@ -182,10 +182,6 @@ enum ExternCatalogVisitOrder {
 impl ExternCatalog {
     pub(crate) fn functions(&self) -> impl Iterator<Item = &ExternFunction> {
         self.functions.iter()
-    }
-
-    pub(crate) fn types(&self) -> impl Iterator<Item = &ExternType> {
-        self.types.iter()
     }
 
     pub(crate) fn functions_in_scope<'a>(
@@ -596,6 +592,12 @@ pub(crate) enum ExternCatalogError {
         name: Ident,
         site: RawExternSite,
     },
+    PrivateType {
+        context: ExternCatalogContext,
+        module: ModuleScope,
+        name: Ident,
+        site: RawExternSite,
+    },
     GenericArity {
         context: ExternCatalogContext,
         name: Ident,
@@ -670,13 +672,13 @@ fn visit_extern_signature_with_context<'a>(
 
 pub(crate) fn build_catalog(
     raw: RawExterns,
-    decls: &DeclarationIndex,
+    decls: &mut DeclarationIndex,
 ) -> Result<ExternCatalog, Vec<ExternCatalogError>> {
     CatalogBuilder::new(decls).build(raw)
 }
 
 struct CatalogBuilder<'a> {
-    decls: &'a DeclarationIndex,
+    decls: &'a mut DeclarationIndex,
     catalog: ExternCatalog,
     errors: Vec<ExternCatalogError>,
 }
@@ -706,7 +708,7 @@ impl<'a> ResolveCtx<'a> {
 }
 
 impl<'a> CatalogBuilder<'a> {
-    fn new(decls: &'a DeclarationIndex) -> Self {
+    fn new(decls: &'a mut DeclarationIndex) -> Self {
         Self {
             decls,
             catalog: ExternCatalog::default(),
@@ -1114,12 +1116,26 @@ impl<'a> CatalogBuilder<'a> {
             name,
             generic_args,
         };
-        match self
-            .decls
-            .finalize_type_ref(&ctx.context.module, &GenericTypeContext::default(), &ty)
-        {
-            Ok(ty) => ty,
-            Err(error) => self.type_ref_error(ctx.context, name, error, ctx.site),
+        let result = {
+            let resolver = TypeRefResolver::module_only(self.decls);
+            resolver.finalize_at(
+                &ctx.context.module,
+                &GenericTypeContext::default(),
+                &ty,
+                None,
+            )
+        };
+        match result {
+            Ok(finalized) => {
+                for import in finalized.used_imports {
+                    self.decls.mark_import_used(Some(import));
+                }
+                finalized.ty
+            }
+            Err(error) => {
+                self.decls.mark_import_used(error.import().cloned());
+                self.type_ref_error(ctx.context, name, error, ctx.site)
+            }
         }
     }
 
@@ -1172,8 +1188,12 @@ impl<'a> CatalogBuilder<'a> {
                     });
                 Type::UnresolvedName(fallback)
             }
-            TypeRefError::Unknown { qualifier, name }
-            | TypeRefError::UnknownContract { qualifier, name } => {
+            TypeRefError::Unknown {
+                qualifier, name, ..
+            }
+            | TypeRefError::UnknownContract {
+                qualifier, name, ..
+            } => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: context.clone(),
                     module: qualifier.map(|qualifier| {
@@ -1182,6 +1202,15 @@ impl<'a> CatalogBuilder<'a> {
                                 .expect("single segment module path is valid"),
                         )
                     }),
+                    name,
+                    site,
+                });
+                Type::UnresolvedName(name)
+            }
+            TypeRefError::PrivateModuleMember { module, name, .. } => {
+                self.errors.push(ExternCatalogError::PrivateType {
+                    context: context.clone(),
+                    module,
                     name,
                     site,
                 });
@@ -1735,6 +1764,14 @@ mod tests {
         DeclarationIndex::from_root_and_modules(&root, &resolved, raw)
     }
 
+    fn build(
+        raw: RawExterns,
+        decls: &DeclarationIndex,
+    ) -> Result<ExternCatalog, Vec<ExternCatalogError>> {
+        let mut decls = decls.clone();
+        build_catalog(raw, &mut decls)
+    }
+
     fn extern_module(path: &[&str]) -> ExternModulePath {
         ExternModulePath {
             segments: path.iter().map(|segment| (*segment).to_string()).collect(),
@@ -1912,7 +1949,7 @@ mod tests {
                 &[],
                 &raw,
             );
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
 
             assert!(
                 catalog
@@ -1949,7 +1986,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
                     .function_by_key(&function_key(provider_scope("math"), "len"))
@@ -1976,7 +2013,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
                     .function_by_key(&function_key(provider_scope("math"), "make"))
@@ -1999,7 +2036,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[("geom", "pub struct Point { x: int }")], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
                     .function_by_key(&function_key(provider_scope("host"), "make"))
@@ -2038,7 +2075,7 @@ mod tests {
                 ],
                 &raw,
             );
-            let errors = build_catalog(raw, &decls).unwrap_err();
+            let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2059,7 +2096,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[("host", "pub struct Local { x: int }")], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
                     .function_by_key(&function_key(provider_scope("host"), "make"))
@@ -2108,7 +2145,7 @@ mod tests {
             let resolved =
                 resolved_modules(&root, &[("geom.types", "pub struct Point { x: int }")]);
             let decls = DeclarationIndex::from_root_and_modules(&root, &resolved, &raw);
-            let errors = build_catalog(raw, &decls).unwrap_err();
+            let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2125,7 +2162,7 @@ mod tests {
             let source = "struct Option<T> { value: T } extern fn maybe() -> Option<int>;";
             let raw = source_raw(source, &[]);
             let decls = decls(source, &[], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
                     .function_by_key(&function_key(ModuleScope::Root, "maybe"))
@@ -2149,7 +2186,7 @@ mod tests {
             let source = "extern type Handle { next: Self; init; fn same(self, other: Self) -> Self; fn make() -> Self; op Self + Self -> Self; op - Self -> Self; }";
             let raw = source_raw(source, &[]);
             let decls = decls(source, &[], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let owner = catalog
                 .type_by_key(&type_key(ModuleScope::Root, "Handle"))
                 .unwrap();
@@ -2248,7 +2285,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let signature = &catalog
                 .function(
                     catalog
@@ -2294,7 +2331,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let param = &catalog
                 .function(
                     catalog
@@ -2337,7 +2374,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[], &raw);
-            let errors = build_catalog(raw, &decls).unwrap_err();
+            let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2365,7 +2402,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[("host", "pub struct Box<T> { value: T }")], &raw);
-            let errors = build_catalog(raw, &decls).unwrap_err();
+            let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2398,7 +2435,7 @@ mod tests {
                 &[("host", "pub struct ArrayBox<N: int> { value: [int; N] }")],
                 &raw,
             );
-            let errors = build_catalog(raw, &decls).unwrap_err();
+            let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2421,7 +2458,7 @@ mod tests {
                 functions: vec![],
             });
             let decls = decls("", &[], &raw);
-            let errors = build_catalog(raw, &decls).unwrap_err();
+            let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2456,7 +2493,7 @@ mod tests {
                 functions: vec![],
             });
             let decls = decls("", &[], &raw);
-            let errors = build_catalog(raw, &decls).unwrap_err();
+            let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2492,7 +2529,7 @@ mod tests {
             });
             let decls = decls("", &[], &raw);
 
-            assert!(build_catalog(raw, &decls).is_ok());
+            assert!(build(raw, &decls).is_ok());
         }
 
         #[test]
@@ -2575,7 +2612,7 @@ mod tests {
             });
             let decls = decls("", &[], &raw);
 
-            assert!(build_catalog(raw, &decls).is_ok());
+            assert!(build(raw, &decls).is_ok());
         }
 
         #[test]
@@ -2635,7 +2672,7 @@ mod tests {
                 }],
             });
             let decls = decls("", &[], &raw);
-            let catalog = build_catalog(raw, &decls).unwrap();
+            let catalog = build(raw, &decls).unwrap();
             let function = catalog.function(
                 catalog
                     .function_by_key(&function_key(provider_scope("host"), "pass"))

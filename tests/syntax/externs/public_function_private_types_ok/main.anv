@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { native_make, native_take };
+
+fn main() {
+    let h = native_make();
+    native_take(h);
+}

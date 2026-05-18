@@ -10,7 +10,7 @@ use super::{
     member::{self, PromotedMethodTarget},
     semantic_use::{ContractWitnessKey, WitnessId, WitnessSlot, WitnessSlotTarget},
     type_ops::TypeVisitor,
-    type_refs::TypeRefResolver,
+    type_refs::{TypeRefResolver, type_ref_error},
 };
 use crate::{
     ast::{AnonymousContract, ContractRef, Ident, ReturnSpec, Type},
@@ -706,11 +706,9 @@ fn resolve_included_contracts(
                     }
                     vec![key]
                 }
-                Err(_) => {
-                    errors.push(TypeError::CompileError {
-                        message: format!("unknown contract '{include}'"),
-                        span: Some(span),
-                    });
+                Err(error) => {
+                    decls.mark_import_used(error.import().cloned());
+                    errors.push(type_ref_error(error, Some(span)));
                     vec![]
                 }
             }

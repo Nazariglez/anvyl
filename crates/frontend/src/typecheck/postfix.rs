@@ -25,7 +25,7 @@ use super::{
 use crate::{
     ast::{
         CallNode, EscapeMode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg,
-        Ident, IndexNode, MethodReceiver, ReturnSpec, TupleIndexNode, Type, Visibility,
+        Ident, IndexNode, MethodReceiver, ReturnSpec, TupleIndexNode, Type,
     },
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
@@ -543,7 +543,6 @@ fn named_value_subject(
     let resolved = ResolvedValue {
         module: module.clone(),
         name,
-        visibility: Visibility::Private,
         decl: value.clone(),
     };
     let local_dyn_infer_ty = (module == tc.current_module

@@ -1,4 +1,0 @@
-// @helper
-struct Hidden {}
-pub struct Widget {}
-pub extend Widget { cast from(value: Hidden) { Widget {} } }

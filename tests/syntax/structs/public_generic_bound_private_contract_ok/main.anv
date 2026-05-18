@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { Box };
+
+struct Thing {}
+extend Thing { fn h(self) {} }
+
+fn main() {
+    let b = Box { value: Thing {} };
+}

@@ -1,0 +1,5 @@
+// @helper
+struct Hidden {}
+pub struct Widget {}
+pub fn hidden() -> Hidden { Hidden {} }
+pub extend Widget { cast from(value: Hidden) { Widget {} } }

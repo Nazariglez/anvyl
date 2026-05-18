@@ -1,3 +1,0 @@
-// @helper
-struct Hidden {}
-pub struct Widget { fn reveal(self) -> Hidden { Hidden {} } }

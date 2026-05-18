@@ -1,0 +1,5 @@
+// @helper
+
+struct Hidden { state: int }
+pub struct Widget { name: string, hidden: Hidden }
+pub fn widget(name: string) -> Widget { Widget { name, hidden: Hidden { state: 0 } } }

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { Widget, hidden, take };
+
+fn main() {
+    let event = Widget.Reveal(hidden());
+    match event { Widget.Reveal(h) => take(h) }
+}

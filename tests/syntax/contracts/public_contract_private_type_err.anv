@@ -1,6 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: public contract 'Leaky' exposes private type 'Hidden'
-
-import public_contract_private_type_helper { Leaky };

@@ -1,3 +1,0 @@
-// @helper
-struct Hidden {}
-pub extern type Host { fn reveal(self) -> Hidden; }

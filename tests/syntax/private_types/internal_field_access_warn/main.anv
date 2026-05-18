@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: accessing internal field 'read_secret' of type 'Widget'
+// @warn-contains: accessing internal field 'write_secret' of type 'Widget'
+// @warn-contains: accessing internal field 'literal_secret' of type 'Widget'
+// @warn-contains: accessing internal field 'pattern_secret' of type 'Widget'
+
+import m { Widget, hidden, widget };
+
+fn main() {
+    var w = widget();
+    let read = w.read_secret;
+    w.write_secret = hidden();
+    let other = Widget { read_secret: hidden(), write_secret: hidden(), literal_secret: hidden(), pattern_secret: hidden() };
+    let Widget { pattern_secret } = other;
+}

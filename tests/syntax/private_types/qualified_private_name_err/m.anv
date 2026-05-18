@@ -1,0 +1,5 @@
+// @helper
+
+struct Hidden {}
+contract HiddenContract { fn h(self); }
+pub fn hidden() -> Hidden { Hidden {} }

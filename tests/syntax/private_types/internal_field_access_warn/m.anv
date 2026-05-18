@@ -1,0 +1,13 @@
+// @helper
+
+struct Hidden { state: int }
+pub struct Widget {
+    @internal read_secret: Hidden,
+    @internal write_secret: Hidden,
+    @internal literal_secret: Hidden,
+    @internal pattern_secret: Hidden,
+}
+pub fn hidden() -> Hidden { Hidden { state: 0 } }
+pub fn widget() -> Widget {
+    Widget { read_secret: hidden(), write_secret: hidden(), literal_secret: hidden(), pattern_secret: hidden() }
+}

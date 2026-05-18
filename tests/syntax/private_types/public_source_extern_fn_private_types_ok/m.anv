@@ -1,0 +1,6 @@
+// @helper
+
+struct Hidden {}
+extern fn native_make() -> Hidden;
+pub extern fn native_take(value: Hidden);
+pub fn make() -> Hidden { native_make() }

@@ -1,6 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: public type alias 'Leaked' exposes private type 'dyn Hidden'
-
-import public_alias_private_contract_helper { Leaked };

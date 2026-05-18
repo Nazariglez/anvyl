@@ -7,8 +7,8 @@ use super::{
     check_value_expr_checked_with_hint, checked_from_type, const_eval,
     const_term::ConstTerm,
     decls::{
-        CoreRangeKind, FieldSchema, NominalKey, TypeBinding, nominal_generic_args, nominal_type,
-        nominal_type_with_args,
+        CoreRangeKind, FieldSchema, ModuleMemberLookup, NominalKey, TypeBinding,
+        nominal_generic_args, nominal_type, nominal_type_with_args,
     },
     enum_variant, expected_assignable_type, extern_boundary, field_check,
     generic::{ArityError, GenericArgs, GenericParams},
@@ -798,19 +798,29 @@ fn resolve_struct_target(
         return struct_literal_target_from_expanded(lit, expanded, tc);
     }
 
-    let Some((binding, import)) = tc.decls.resolve_visible_type_binding_with_import(
-        &tc.current_module,
-        lit.node.qualifier,
-        lit.node.name,
-    ) else {
-        tc.push_error(TypeError::UnknownStructLiteral {
-            qualifier: lit.node.qualifier,
-            name: lit.node.name,
-            span: tc.error_span(lit.span),
-        });
-        return None;
+    let lookup =
+        tc.decls
+            .resolve_type_member(&tc.current_module, lit.node.qualifier, lit.node.name);
+    tc.mark_import_used(lookup.import);
+    let binding = match lookup.result {
+        ModuleMemberLookup::Found(binding) => binding,
+        ModuleMemberLookup::Private => {
+            tc.push_error(TypeError::PrivateModuleMember {
+                module: lookup.target.unwrap_or_else(|| tc.current_module.clone()),
+                name: lit.node.name,
+                span: tc.error_span(lit.span),
+            });
+            return None;
+        }
+        ModuleMemberLookup::Missing => {
+            tc.push_error(TypeError::UnknownStructLiteral {
+                qualifier: lit.node.qualifier,
+                name: lit.node.name,
+                span: tc.error_span(lit.span),
+            });
+            return None;
+        }
     };
-    tc.mark_import_used(import);
     match binding {
         TypeBinding::Nominal(key) => Some(StructLiteralTarget { key, seeds: None }),
         TypeBinding::Alias(key) => {

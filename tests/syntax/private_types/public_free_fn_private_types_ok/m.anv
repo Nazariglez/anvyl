@@ -1,0 +1,5 @@
+// @helper
+
+struct Hidden {}
+pub fn make_hidden() -> Hidden { Hidden {} }
+pub fn take_hidden(value: Hidden) {}

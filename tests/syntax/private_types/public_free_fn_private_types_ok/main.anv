@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { make_hidden, take_hidden };
+
+fn main() {
+    let h = make_hidden();
+    take_hidden(h);
+}

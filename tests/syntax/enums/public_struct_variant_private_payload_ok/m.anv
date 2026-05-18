@@ -1,0 +1,5 @@
+// @helper
+struct Hidden {}
+pub enum Widget { Reveal { secret: Hidden } }
+pub fn hidden() -> Hidden { Hidden {} }
+pub fn take(value: Hidden) {}

@@ -1,0 +1,11 @@
+// @helper
+
+contract Hidden {
+    fn f(self);
+}
+
+pub contract Public {
+    Hidden;
+}
+
+pub fn use_public<T: Public>(value: T) {}

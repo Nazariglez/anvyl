@@ -6,8 +6,9 @@ use super::{
     const_term::ConstTerm,
     contracts,
     decls::{
-        ContractKey, DeclTypeSite, DeclarationIndex, ImportId, ModuleScope, NominalKey,
-        TypeAliasDef, TypeAliasKey, TypeBinding, nominal_generic_args, nominal_type_with_args,
+        ContractKey, DeclTypeSite, DeclarationIndex, ImportId, ModuleMemberLookup, ModuleScope,
+        NominalKey, TypeAliasDef, TypeAliasKey, TypeBinding, nominal_generic_args,
+        nominal_type_with_args,
     },
     dyn_infer::DynInference,
     generic::{GenericArgs, GenericParams, substitute},
@@ -126,11 +127,17 @@ impl GenericTypeContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypeRefError {
     Unknown {
         qualifier: Option<Ident>,
         name: Ident,
+        import: Option<ImportId>,
+    },
+    PrivateModuleMember {
+        module: ModuleScope,
+        name: Ident,
+        import: Option<ImportId>,
     },
     GenericArity {
         expected: usize,
@@ -148,6 +155,7 @@ pub(crate) enum TypeRefError {
     UnknownContract {
         qualifier: Option<Ident>,
         name: Ident,
+        import: Option<ImportId>,
     },
     DuplicateContractRequirement {
         name: Ident,
@@ -179,13 +187,35 @@ pub(crate) struct FinalizedTypeRef {
     pub(crate) used_imports: Vec<ImportId>,
 }
 
+impl TypeRefError {
+    pub(crate) fn import(&self) -> Option<&ImportId> {
+        match self {
+            Self::Unknown { import, .. }
+            | Self::UnknownContract { import, .. }
+            | Self::PrivateModuleMember { import, .. } => import.as_ref(),
+            Self::GenericArity { .. }
+            | Self::GenericArgKindMismatch { .. }
+            | Self::AliasCycle { .. }
+            | Self::ContractAsType { .. }
+            | Self::DuplicateContractRequirement { .. }
+            | Self::ConflictingContractRequirement { .. }
+            | Self::UnsupportedContractComposition => None,
+        }
+    }
+}
+
 pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> TypeError {
     match error {
-        TypeRefError::Unknown { qualifier, name } => TypeError::UnknownType {
+        TypeRefError::Unknown {
+            qualifier, name, ..
+        } => TypeError::UnknownType {
             qualifier,
             name,
             span,
         },
+        TypeRefError::PrivateModuleMember { module, name, .. } => {
+            TypeError::PrivateModuleMember { module, name, span }
+        }
         TypeRefError::GenericArity { expected, found } => {
             TypeError::GenericArity(ArityError::TypeArgs { expected, found })
         }
@@ -202,7 +232,9 @@ pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> T
             ),
             span,
         },
-        TypeRefError::UnknownContract { qualifier, name } => TypeError::CompileError {
+        TypeRefError::UnknownContract {
+            qualifier, name, ..
+        } => TypeError::CompileError {
             message: match qualifier {
                 Some(qualifier) => format!("unknown contract '{qualifier}.{name}'"),
                 None => format!("unknown contract '{name}'"),
@@ -300,7 +332,12 @@ impl TypeChecker {
                 self.push_type_ref_warnings(finalized.warnings);
                 finalized.ty
             }
-            Err(TypeRefError::Unknown { qualifier, name }) => {
+            Err(TypeRefError::Unknown {
+                qualifier,
+                name,
+                import,
+            }) => {
+                self.mark_import_used(import);
                 self.push_error(TypeError::Decl(DeclError::UnknownType {
                     module: site.module,
                     qualifier,
@@ -310,6 +347,7 @@ impl TypeChecker {
                 Type::Infer
             }
             Err(error) => {
+                self.mark_import_used(error.import().cloned());
                 self.push_error(type_ref_error(error, self.error_span(site.span)));
                 Type::Infer
             }
@@ -565,6 +603,7 @@ impl TypeChecker {
                 self.finish_resolved_type(finalized.ty, span)
             }
             Err(error) => {
+                self.mark_import_used(error.import().cloned());
                 self.push_error_once(type_ref_error(error, self.error_span(span)));
                 Type::Infer
             }
@@ -689,6 +728,7 @@ pub(crate) struct TypeRefResolver<'a> {
     local_types: Option<&'a LocalTypeScopes>,
 }
 
+#[derive(Default)]
 struct FinalizeState {
     local_depth: Option<usize>,
     stack: Vec<AliasExpansionKey>,
@@ -700,11 +740,8 @@ struct FinalizeState {
 impl FinalizeState {
     fn new(site: Option<Span>) -> Self {
         Self {
-            local_depth: None,
-            stack: vec![],
             site,
-            warnings: vec![],
-            used_imports: vec![],
+            ..Self::default()
         }
     }
 
@@ -713,8 +750,7 @@ impl FinalizeState {
             local_depth: alias.local_depth,
             stack: vec![alias.key.clone()],
             site,
-            warnings: vec![],
-            used_imports: vec![],
+            ..Self::default()
         }
     }
 
@@ -777,15 +813,6 @@ impl<'a> TypeRefResolver<'a> {
             decls,
             local_types: Some(local_types),
         }
-    }
-
-    pub(crate) fn finalize(
-        &self,
-        module: &ModuleScope,
-        generics: &GenericTypeContext,
-        ty: &Type,
-    ) -> Result<Type, TypeRefError> {
-        Ok(self.finalize_at(module, generics, ty, None)?.ty)
     }
 
     pub(crate) fn finalize_at(
@@ -859,7 +886,8 @@ impl<'a> TypeRefResolver<'a> {
                 if nominal.origin.is_none()
                     && let Some(key) = self
                         .decls
-                        .resolve_visible_nominal_key(module, None, nominal.name)
+                        .visible_type_binding_with_import(module, nominal.name)
+                        .and_then(|(binding, _)| binding.into_nominal())
                         .filter(|key| key.kind == nominal.kind)
                 {
                     return Ok(nominal_type_with_args(&key, &type_args, &const_args));
@@ -912,19 +940,14 @@ impl<'a> TypeRefResolver<'a> {
             return Err(TypeRefError::Unknown {
                 qualifier: None,
                 name,
+                import: None,
             });
         }
         if let Some(alias) = self.local_alias(name, state.local_depth) {
             let alias_ref = Self::local_alias_ref(alias);
             return self.expand_alias_ref(module, generics, &alias_ref, &[], state, name);
         }
-        let (binding, import) = self
-            .decls
-            .resolve_visible_type_binding_with_import(module, None, name)
-            .ok_or(TypeRefError::Unknown {
-                qualifier: None,
-                name,
-            })?;
+        let (binding, import) = self.resolve_type_binding(module, None, name)?;
         state.mark_import_used(import);
         self.finalize_binding(module, generics, binding, &[], state, name)
     }
@@ -946,6 +969,7 @@ impl<'a> TypeRefResolver<'a> {
                 return Err(TypeRefError::Unknown {
                     qualifier: None,
                     name,
+                    import: None,
                 });
             }
         }
@@ -955,12 +979,31 @@ impl<'a> TypeRefResolver<'a> {
             let alias_ref = Self::local_alias_ref(alias);
             return self.expand_alias_ref(module, generics, &alias_ref, generic_args, state, name);
         }
-        let (binding, import) = self
-            .decls
-            .resolve_visible_type_binding_with_import(module, qualifier, name)
-            .ok_or(TypeRefError::Unknown { qualifier, name })?;
+        let (binding, import) = self.resolve_type_binding(module, qualifier, name)?;
         state.mark_import_used(import);
         self.finalize_binding(module, generics, binding, generic_args, state, name)
+    }
+
+    fn resolve_type_binding(
+        &self,
+        module: &ModuleScope,
+        qualifier: Option<Ident>,
+        name: Ident,
+    ) -> Result<(TypeBinding, Option<ImportId>), TypeRefError> {
+        let lookup = self.decls.resolve_type_member(module, qualifier, name);
+        match lookup.result {
+            ModuleMemberLookup::Found(binding) => Ok((binding, lookup.import)),
+            ModuleMemberLookup::Private => Err(TypeRefError::PrivateModuleMember {
+                module: lookup.target.unwrap_or_else(|| module.clone()),
+                name,
+                import: lookup.import,
+            }),
+            ModuleMemberLookup::Missing => Err(TypeRefError::Unknown {
+                qualifier,
+                name,
+                import: lookup.import,
+            }),
+        }
     }
 
     fn local_alias(&self, name: Ident, depth: Option<usize>) -> Option<&LocalTypeAlias> {
@@ -979,6 +1022,7 @@ impl<'a> TypeRefResolver<'a> {
         let schema = self.decls.type_alias(key).ok_or(TypeRefError::Unknown {
             qualifier: None,
             name: key.name,
+            import: None,
         })?;
         Ok(AliasRef {
             key: AliasExpansionKey::Module(key.clone()),
@@ -1234,19 +1278,26 @@ impl<'a> TypeRefResolver<'a> {
                 _ => Err(TypeRefError::UnknownContract {
                     qualifier: None,
                     name: *name,
+                    import: None,
                 }),
             };
         }
 
-        match self
-            .decls
-            .resolve_visible_type_binding_with_import(module, *qualifier, *name)
-        {
-            Some((TypeBinding::Contract(key), import)) => Ok((key, import)),
-            _ => Err(TypeRefError::UnknownContract {
-                qualifier: *qualifier,
+        let lookup = self.decls.resolve_type_member(module, *qualifier, *name);
+        match lookup.result {
+            ModuleMemberLookup::Found(TypeBinding::Contract(key)) => Ok((key, lookup.import)),
+            ModuleMemberLookup::Private => Err(TypeRefError::PrivateModuleMember {
+                module: lookup.target.unwrap_or_else(|| module.clone()),
                 name: *name,
+                import: lookup.import,
             }),
+            ModuleMemberLookup::Found(_) | ModuleMemberLookup::Missing => {
+                Err(TypeRefError::UnknownContract {
+                    qualifier: *qualifier,
+                    name: *name,
+                    import: lookup.import,
+                })
+            }
         }
     }
 
@@ -1336,6 +1387,7 @@ impl<'a> TypeRefResolver<'a> {
                             Err(TypeRefError::Unknown {
                                 qualifier: None,
                                 name,
+                                import: None,
                             })
                         }
                         _ => Err(TypeRefError::GenericArgKindMismatch { expected: "const" }),
@@ -1419,6 +1471,7 @@ fn finalize_const_name(
         return Err(TypeRefError::Unknown {
             qualifier: None,
             name,
+            import: None,
         });
     }
     Ok(generics.const_param(name))

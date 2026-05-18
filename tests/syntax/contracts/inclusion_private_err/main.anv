@@ -1,6 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: public contract 'Public' exposes private type 'dyn Hidden'
-
-import lib { Public };

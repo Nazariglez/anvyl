@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: member 'Hidden' in module 'm' is private
+
+import m;
+
+fn main() {
+    let h: m.Hidden = m.hidden();
+    let x = m.Hidden {};
+}

@@ -1,0 +1,5 @@
+// @helper
+
+extern type Hidden;
+pub extern fn native_make() -> Hidden;
+pub extern fn native_take(value: Hidden);

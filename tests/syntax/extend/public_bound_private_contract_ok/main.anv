@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import m { Thing };
+
+fn main() {
+    let values: [Thing] = [Thing {}];
+    values.marker();
+}

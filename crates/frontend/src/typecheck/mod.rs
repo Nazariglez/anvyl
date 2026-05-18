@@ -11,7 +11,7 @@ pub(crate) use self::{
     semantic_use::*,
     surface::*,
     type_ops::type_closure_facts,
-    type_refs::{GenericTypeContext, TypeRefError},
+    type_refs::{GenericTypeContext, TypeRefError, TypeRefResolver},
 };
 use self::{
     body::{
@@ -23,7 +23,7 @@ use self::{
     const_term::ConstTerm,
     decl_validate::{
         check_decl_param_order, check_finite_size_cycles, check_infer_return_decls,
-        generic_param_type_error, validate_public_surfaces,
+        generic_param_type_error,
     },
     dyn_infer::DynInference,
     infer::{
@@ -44,7 +44,7 @@ use self::{
         collect_postfix_chain,
     },
     type_ops::type_contains_dyn_value,
-    type_refs::{LocalTypeScopes, TypeRefResolver},
+    type_refs::LocalTypeScopes,
 };
 use crate::{
     ast::*,
@@ -2021,11 +2021,9 @@ impl TypeChecker {
             let ty = self.resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
             return (!matches!(ty, Type::Infer)).then_some(ty);
         }
-        let (binding, import) = self.decls.resolve_visible_type_binding_with_import(
-            &self.current_module,
-            None,
-            name,
-        )?;
+        let (binding, import) = self
+            .decls
+            .visible_type_binding_with_import(&self.current_module, name)?;
         self.mark_import_used(import);
         match binding {
             TypeBinding::Nominal(key) => {
@@ -2290,12 +2288,13 @@ fn typechecker_for_modules(
     if decls.has_errors() {
         return Err(decl_errors(decls.errors()));
     }
-    let catalog = crate::externs::catalog::build_catalog(externs, &decls).map_err(|errors| {
-        errors
-            .into_iter()
-            .map(TypeError::ExternCatalog)
-            .collect::<Vec<_>>()
-    })?;
+    let catalog =
+        crate::externs::catalog::build_catalog(externs, &mut decls).map_err(|errors| {
+            errors
+                .into_iter()
+                .map(TypeError::ExternCatalog)
+                .collect::<Vec<_>>()
+        })?;
     decls.sync_extern_headers(&catalog);
 
     let mut tc = TypeChecker::new(decls, catalog, config);
@@ -2346,7 +2345,6 @@ fn typechecker_for_modules(
         globals::check_global_initializers(module, program.as_ref(), &mut tc);
     }
     tc.sync_global_types();
-    validate_public_surfaces(&tc.decls, &tc.externs, &mut tc.errors);
     if !tc.errors.is_empty() {
         return Ok(tc);
     }
@@ -2689,7 +2687,6 @@ fn check_expr_checked_with_hint(
                     if let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
                         module: module.clone(),
                         name: value_name,
-                        visibility: Visibility::Private,
                         decl: value.clone(),
                     }) && callee.def.sig.ret.is_infer()
                     {
