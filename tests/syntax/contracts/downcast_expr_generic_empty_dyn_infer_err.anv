@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: exact downcast target must be a fully concrete runtime-identifiable type
+// @contains: cannot infer empty dynamic contract
 
 struct Enemy {}
 

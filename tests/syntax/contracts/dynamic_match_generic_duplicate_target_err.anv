@@ -1,15 +1,17 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: downcast tests the stored concrete type
+// @contains: duplicate dynamic match target
 
 contract Drawable { fn draw(self); }
 struct Enemy { fn draw(self) {} }
 
-fn main() {
-    let actor: dyn Drawable = Enemy {};
+fn route<T>(actor: dyn Drawable) {
     match actor as? {
-        dyn Drawable(value) => value.draw(),
+        Enemy(a) => {},
+        T(b) => {},
         other => other.draw(),
     };
 }
+
+fn main() { route<Enemy>(Enemy {}); }

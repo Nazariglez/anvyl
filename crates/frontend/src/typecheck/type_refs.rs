@@ -11,7 +11,7 @@ use super::{
     },
     dyn_infer::DynInference,
     generic::{GenericArgs, GenericParams, substitute},
-    type_ops::{TypeVisitor, bare_type_name, type_depends_on_generics},
+    type_ops::{TypeVisitor, bare_type_name},
 };
 use crate::{
     ast::{
@@ -329,39 +329,6 @@ impl TypeChecker {
             Some(span),
         );
         self.finish_source_type_ref(result, span)
-    }
-
-    pub(super) fn resolve_downcast_target_type_at(&mut self, ty: &Type, span: Span) -> Type {
-        let result = self.type_ref_resolver().finalize_at(
-            &self.current_module,
-            &self.current_generic_context(),
-            ty,
-            Some(span),
-        );
-        match result {
-            Ok(finalized) => {
-                self.used_imports.extend(finalized.used_imports);
-                self.push_type_ref_warnings(finalized.warnings);
-                let ty = self.reject_source_dyn_contracts(finalized.ty, span);
-                if matches!(ty, Type::Infer) {
-                    Type::Infer
-                } else if type_depends_on_generics(&ty) {
-                    self.push_error(TypeError::CompileError {
-                        message:
-                            "exact downcast target must be a fully concrete runtime-identifiable type"
-                                .to_string(),
-                        span: self.error_span(span),
-                    });
-                    Type::Infer
-                } else {
-                    self.finish_resolved_type(ty, span)
-                }
-            }
-            Err(error) => {
-                self.push_error_once(type_ref_error(error, self.error_span(span)));
-                Type::Infer
-            }
-        }
     }
 
     pub(super) fn resolve_callable_param_type(

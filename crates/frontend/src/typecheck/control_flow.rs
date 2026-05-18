@@ -570,17 +570,10 @@ fn check_branch_place_return_expr(
         }
         ExprKind::Match(match_node) => {
             let node = &match_node.node;
-            match match_check::classify(&node.arms) {
-                match_check::MatchKind::Dynamic => {
-                    return Some(check_dynamic_match_return(
-                        match_node, ret, source, expected, tc,
-                    ));
-                }
-                match_check::MatchKind::Mixed => {
-                    match_check::push_mixed_error(match_node.span, tc);
-                    return Some(checked_type(Type::Infer, tc));
-                }
-                match_check::MatchKind::Ordinary => {}
+            if matches!(node.mode, crate::ast::MatchMode::Dynamic) {
+                return Some(check_dynamic_match_return(
+                    match_node, ret, source, expected, tc,
+                ));
             }
             let mode = mode_for_head(node.head);
             let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);

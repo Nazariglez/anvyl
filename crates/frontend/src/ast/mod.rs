@@ -1366,9 +1366,16 @@ pub struct For {
     pub body: BlockNode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    Pattern,
+    Dynamic,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
     pub head: PatternHead,
+    pub mode: MatchMode,
     pub scrutinee: Box<ExprNode>,
     pub arms: Vec<MatchArmNode>,
 }
@@ -1383,7 +1390,7 @@ pub struct MatchArm {
 pub enum MatchArmHead {
     Pattern(PatternNode),
     DynDowncast(DynDowncastArmNode),
-    DynElse(DynElseArmNode),
+    DynFallback(DynArmBinding),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1393,16 +1400,7 @@ pub struct DynDowncastArm {
     pub binding: DynArmBinding,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DynElseArm {
-    pub binding: DynArmBinding,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DynArmBinding {
-    Named(Ident),
-    Wildcard,
-}
+pub type DynArmBinding = Option<Ident>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LambdaParam {
@@ -1951,7 +1949,6 @@ pub type IndexNode = Spanned<Index>;
 pub type MatchNode = Spanned<Match>;
 pub type MatchArmNode = Spanned<MatchArm>;
 pub type DynDowncastArmNode = Spanned<DynDowncastArm>;
-pub type DynElseArmNode = Spanned<DynElseArm>;
 pub type ExternFuncNode = Spanned<ExternFunc>;
 pub type ExternTypeNode = Spanned<ExternType>;
 pub type ImportNode = Spanned<Import>;

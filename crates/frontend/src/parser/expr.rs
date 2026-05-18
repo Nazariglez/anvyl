@@ -184,11 +184,6 @@ fn match_expr<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::ExprNode> {
-    let comma = select! { Token::Comma => () };
-    let open_brace = select! { Token::Open(Delimiter::Brace) => () };
-    let close_brace = select! { Token::Close(Delimiter::Brace) => () };
-    let fat_arrow = select! { Token::Op(Op::FatArrow) => () };
-
     let arm_body = choice((
         block_stmt(stmt.clone(), expr.clone()).map(|block_node| {
             let span = block_node.span;
@@ -199,15 +194,8 @@ fn match_expr<'src>(
         expr.clone(),
     ));
 
-    let dyn_binding = identifier().map(|ident| {
-        if ident.0.as_ref() == "_" {
-            ast::DynArmBinding::Wildcard
-        } else {
-            ast::DynArmBinding::Named(ident)
-        }
-    });
-    let dyn_downcast_head = select! { Token::Keyword(Keyword::As) => () }
-        .ignore_then(type_ident())
+    let dyn_binding = identifier().map(|ident| (ident.0.as_ref() != "_").then_some(ident));
+    let dynamic_arm_head = type_ident()
         .then(
             select! { Token::Open(Delimiter::Parent) => () }
                 .ignore_then(dyn_binding.clone())
@@ -222,30 +210,22 @@ fn match_expr<'src>(
                 },
                 e.span().byte(),
             ))
-        });
-    let dyn_else_head = select! { Token::Keyword(Keyword::Else) => () }
-        .ignore_then(
-            select! { Token::Open(Delimiter::Parent) => () }
-                .ignore_then(dyn_binding)
-                .then_ignore(select! { Token::Close(Delimiter::Parent) => () }),
-        )
-        .map_with(|binding, e| {
-            ast::MatchArmHead::DynElse(Spanned::new(ast::DynElseArm { binding }, e.span().byte()))
-        });
-    let match_arm_head = choice((
-        dyn_downcast_head,
-        dyn_else_head,
-        pattern().map(ast::MatchArmHead::Pattern),
-    ));
+        })
+        .or(dyn_binding.map(ast::MatchArmHead::DynFallback));
 
-    let match_arm = match_arm_head
-        .then_ignore(fat_arrow)
-        .then(arm_body)
-        .map_with(|(head, body), e| {
-            let s = e.span();
-            let span = s.byte();
-            Spanned::new(ast::MatchArm { head, body }, span)
-        });
+    let dynamic_marker = select! { Token::Keyword(Keyword::As) => () }
+        .then_ignore(select! { Token::Question => () })
+        .then_ignore(select! { Token::Open(Delimiter::Brace) => () }.rewind())
+        .to(ast::MatchMode::Dynamic);
+    let dynamic_arms = dynamic_marker.then(match_arm_list(match_arm(
+        dynamic_arm_head,
+        arm_body.clone(),
+    )));
+    let pattern_arms = match_arm_list(match_arm(
+        pattern().map(ast::MatchArmHead::Pattern),
+        arm_body,
+    ))
+    .map(|arms| (ast::MatchMode::Pattern, arms));
 
     let cond_expr = cond_expression();
     let match_head = select! { Token::Keyword(Keyword::Var) => ast::PatternHead::Var }
@@ -255,22 +235,13 @@ fn match_expr<'src>(
     select! { Token::Keyword(Keyword::Match) => () }
         .ignore_then(match_head)
         .then(cond_expr)
-        .then(
-            open_brace
-                .ignore_then(
-                    match_arm
-                        .separated_by(comma)
-                        .allow_trailing()
-                        .collect::<Vec<_>>(),
-                )
-                .then_ignore(close_brace),
-        )
-        .map_with(|((head, scrutinee), arms), e| {
-            let s = e.span();
-            let span = s.byte();
+        .then(dynamic_arms.or(pattern_arms))
+        .map_with(|((head, scrutinee), (mode, arms)), e| {
+            let span = e.span().byte();
             let match_node = Spanned::new(
                 ast::Match {
                     head,
+                    mode,
                     scrutinee: Box::new(scrutinee),
                     arms,
                 },
@@ -282,6 +253,29 @@ fn match_expr<'src>(
         })
         .labelled("match expression")
         .as_context()
+        .boxed()
+}
+
+fn match_arm<'src>(
+    head: impl AnvParser<'src, ast::MatchArmHead>,
+    body: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, ast::MatchArmNode> {
+    head.then_ignore(select! { Token::Op(Op::FatArrow) => () })
+        .then(body)
+        .map_with(|(head, body), e| Spanned::new(ast::MatchArm { head, body }, e.span().byte()))
+        .boxed()
+}
+
+fn match_arm_list<'src>(
+    arm: impl AnvParser<'src, ast::MatchArmNode>,
+) -> BoxedParser<'src, Vec<ast::MatchArmNode>> {
+    arm.separated_by(select! { Token::Comma => () })
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(
+            select! { Token::Open(Delimiter::Brace) => () },
+            select! { Token::Close(Delimiter::Brace) => () },
+        )
         .boxed()
 }
 

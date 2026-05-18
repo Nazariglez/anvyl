@@ -2,19 +2,21 @@
 // @expect: success
 // @frontend: new
 
-struct Enemy {
-    fn draw(self) {}
-    fn attack(self) {}
+contract Drawable {
+    fn draw(self);
 }
 
-fn use_actor(actor: dyn _) {
-    actor.draw();
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn route<T>(actor: dyn Drawable) {
     match actor as? {
-        Enemy(enemy) => enemy.attack(),
+        T(value) => value.draw(),
         other => other.draw(),
     };
 }
 
 fn main() {
-    use_actor(Enemy {});
+    route<Enemy>(Enemy {});
 }

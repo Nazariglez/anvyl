@@ -7,8 +7,8 @@ struct Enemy { fn draw(self) {} }
 
 fn main() {
     let actor = Enemy {};
-    match actor {
-        as Enemy(enemy) => enemy.draw(),
-        else(other) => other.draw(),
+    match actor as? {
+        Enemy(enemy) => enemy.draw(),
+        other => other.draw(),
     };
 }

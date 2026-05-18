@@ -8,8 +8,8 @@ struct Enemy { fn update(var self) {} }
 
 fn main() {
     let actor: dyn Updatable = Enemy {};
-    match var actor {
-        as Enemy(enemy) => enemy.update(),
-        else(other) => other.update(),
+    match var actor as? {
+        Enemy(enemy) => enemy.update(),
+        other => other.update(),
     };
 }

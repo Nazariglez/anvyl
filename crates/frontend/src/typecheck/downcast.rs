@@ -120,7 +120,7 @@ pub(super) fn check_target(tc: &mut TypeChecker, downcast: &ExactDowncastNode) -
 }
 
 pub(super) fn check_target_ref(tc: &mut TypeChecker, target: &Type, span: Span) -> Option<Type> {
-    let target = tc.resolve_downcast_target_type_at(target, span);
+    let target = tc.resolve_type_for_tc_at(target, span);
     runtime_target(tc, target, span)
 }
 

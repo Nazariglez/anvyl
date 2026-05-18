@@ -280,6 +280,9 @@ impl Printer<'_> {
             self.write("var ");
         }
         self.format_expr(&m.scrutinee.node);
+        if matches!(m.mode, ast::MatchMode::Dynamic) {
+            self.write(" as?");
+        }
         self.write(" {");
         self.writeln();
         self.indent();
@@ -300,24 +303,19 @@ impl Printer<'_> {
         match head {
             ast::MatchArmHead::Pattern(pattern) => self.format_pattern(&pattern.node),
             ast::MatchArmHead::DynDowncast(arm) => {
-                self.write("as ");
                 self.format_type(&arm.node.target);
                 self.write("(");
                 self.format_dyn_arm_binding(&arm.node.binding);
                 self.write(")");
             }
-            ast::MatchArmHead::DynElse(arm) => {
-                self.write("else(");
-                self.format_dyn_arm_binding(&arm.node.binding);
-                self.write(")");
-            }
+            ast::MatchArmHead::DynFallback(binding) => self.format_dyn_arm_binding(binding),
         }
     }
 
     fn format_dyn_arm_binding(&mut self, binding: &ast::DynArmBinding) {
         match binding {
-            ast::DynArmBinding::Named(name) => self.write_fmt(*name),
-            ast::DynArmBinding::Wildcard => self.write("_"),
+            Some(name) => self.write_fmt(*name),
+            None => self.write("_"),
         }
     }
 

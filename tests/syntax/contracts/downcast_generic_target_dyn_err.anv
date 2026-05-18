@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: downcast tests the stored concrete type
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn use_actor<T>(actor: dyn Drawable) {
+    let value = actor as? T;
+}
+
+fn main() {
+    use_actor<dyn Drawable>(Enemy {});
+}

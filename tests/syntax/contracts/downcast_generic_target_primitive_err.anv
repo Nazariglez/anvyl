@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: exact downcast target must be a concrete nominal type
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn use_actor<T>(actor: dyn Drawable) {
+    let value = actor as? T;
+}
+
+fn main() {
+    use_actor<int>(Enemy {});
+}

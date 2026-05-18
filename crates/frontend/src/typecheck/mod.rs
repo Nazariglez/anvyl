@@ -3885,15 +3885,8 @@ fn check_match_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &match_node.node;
-    match match_check::classify(&node.arms) {
-        match_check::MatchKind::Dynamic => {
-            return check_dynamic_match_checked_with_hint(match_node, expected, tc);
-        }
-        match_check::MatchKind::Mixed => {
-            match_check::push_mixed_error(match_node.span, tc);
-            return checked_type(Type::Infer, tc);
-        }
-        match_check::MatchKind::Ordinary => {}
+    if matches!(node.mode, MatchMode::Dynamic) {
+        return check_dynamic_match_checked_with_hint(match_node, expected, tc);
     }
     if node.arms.is_empty() {
         tc.push_error(TypeError::EmptyMatch {

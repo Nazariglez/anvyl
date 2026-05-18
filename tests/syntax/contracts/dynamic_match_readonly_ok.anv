@@ -18,9 +18,9 @@ struct Bullet {
 
 fn main() {
     let actor: dyn Drawable = Enemy {};
-    match actor {
-        as Enemy(enemy) => enemy.attack(),
-        as Bullet(bullet) => bullet.explode(),
-        else(other) => other.draw(),
+    match actor as? {
+        Enemy(enemy) => enemy.attack(),
+        Bullet(bullet) => bullet.explode(),
+        other => other.draw(),
     };
 }

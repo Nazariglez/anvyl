@@ -1020,20 +1020,20 @@ mod tests {
 
     #[test]
     fn expr_dynamic_match() {
-        let source = "fn f(actor: dyn Drawable) { match actor { as Enemy(enemy) => enemy.attack(), else(other) => other.draw() } }";
+        let source = "fn f(actor: dyn Drawable) { match actor as? { Enemy(enemy) => enemy.attack(), other => other.draw() } }";
         let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("match actor {"));
-        assert!(formatted.contains("as Enemy(enemy) => enemy.attack(),"));
-        assert!(formatted.contains("else(other) => other.draw(),"));
+        assert!(formatted.contains("match actor as? {"));
+        assert!(formatted.contains("Enemy(enemy) => enemy.attack(),"));
+        assert!(formatted.contains("other => other.draw(),"));
     }
 
     #[test]
     fn expr_dynamic_match_var_wildcards() {
-        let source = "fn f(var actor: dyn Drawable) { match var actor { as Enemy(_) => actor.draw(), else(_) => actor.draw(), } }";
+        let source = "fn f(var actor: dyn Drawable) { match var actor as? { Enemy(_) => actor.draw(), _ => actor.draw(), } }";
         let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("match var actor {"));
-        assert!(formatted.contains("as Enemy(_) => actor.draw(),"));
-        assert!(formatted.contains("else(_) => actor.draw(),"));
+        assert!(formatted.contains("match var actor as? {"));
+        assert!(formatted.contains("Enemy(_) => actor.draw(),"));
+        assert!(formatted.contains("_ => actor.draw(),"));
     }
 
     #[test]

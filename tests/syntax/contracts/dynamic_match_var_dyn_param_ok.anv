@@ -6,9 +6,9 @@ contract Updatable { fn update(var self); }
 struct Enemy { fn update(var self) {} }
 
 fn use_actor(var actor: dyn Updatable) {
-    match var actor {
-        as Enemy(enemy) => enemy.update(),
-        else(other) => other.update(),
+    match var actor as? {
+        Enemy(enemy) => enemy.update(),
+        other => other.update(),
     };
 }
 

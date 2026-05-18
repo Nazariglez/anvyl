@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+struct Box<T> {
+    value: T,
+    fn draw(self) {}
+}
+
+fn use_actor<T>(actor: dyn Drawable) {
+    let value = actor as? Box<T>;
+}
+
+fn main() {
+    use_actor<Enemy>(Box<Enemy> { value: Enemy {} });
+}

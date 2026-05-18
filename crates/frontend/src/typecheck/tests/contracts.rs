@@ -411,6 +411,24 @@ fn exact_downcast_expr_records_fact_and_payload_conversion() {
 }
 
 #[test]
+fn generic_downcast_records_closed_target_fact() {
+    let result = check(
+        "contract Drawable { fn draw(self); }
+        struct Enemy { fn draw(self) {} }
+        fn use_actor<T>(actor: dyn Drawable) {
+            let value = actor as? T;
+        }
+        fn main() { use_actor<Enemy>(Enemy {}); }",
+    )
+    .expect("typecheck failed");
+
+    let enemy = root_type(&mut checker("struct Enemy {}"), "Enemy");
+    let facts = result.dyn_downcasts();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts.values().next().unwrap().target, enemy);
+}
+
+#[test]
 fn dynamic_match_records_downcast_facts() {
     let result = check(
         "contract Drawable { fn draw(self); }
@@ -418,10 +436,10 @@ fn dynamic_match_records_downcast_facts() {
         struct Bullet { fn draw(self) {} }
         fn main() {
             let actor: dyn Drawable = Enemy {};
-            match actor {
-                as Enemy(enemy) => enemy.draw(),
-                as Bullet(bullet) => bullet.draw(),
-                else(other) => other.draw(),
+            match actor as? {
+                Enemy(enemy) => enemy.draw(),
+                Bullet(bullet) => bullet.draw(),
+                other => other.draw(),
             };
         }",
     )
@@ -439,10 +457,10 @@ fn dynamic_match_var_records_mutable_downcast_facts() {
         struct Bullet { fn update(var self) {} }
         lazy var Actor: dyn Updatable = Enemy {};
         fn main() {
-            match var Actor {
-                as Enemy(enemy) => enemy.update(),
-                as Bullet(bullet) => bullet.update(),
-                else(other) => other.update(),
+            match var Actor as? {
+                Enemy(enemy) => enemy.update(),
+                Bullet(bullet) => bullet.update(),
+                other => other.update(),
             };
         }",
     )

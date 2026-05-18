@@ -8,9 +8,9 @@ struct Enemy { fn draw(self) {} }
 
 fn main() {
     let actor: dyn Drawable = Enemy {};
-    match actor {
-        as Enemy(first) => first.draw(),
-        as Enemy(second) => second.draw(),
-        else(other) => other.draw(),
+    match actor as? {
+        Enemy(first) => first.draw(),
+        Enemy(second) => second.draw(),
+        other => other.draw(),
     };
 }

@@ -4,30 +4,9 @@ use super::{
     pattern::{self, PatternOutcome, PatternPlace},
 };
 use crate::{
-    ast::{DynArmBinding, ExprId, Ident, Match, MatchArmHead, MatchArmNode, Type},
+    ast::{ExprId, Ident, Match, MatchArmHead, MatchArmNode, Type},
     span::Span,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MatchKind {
-    Ordinary,
-    Dynamic,
-    Mixed,
-}
-
-pub(super) fn classify(arms: &[MatchArmNode]) -> MatchKind {
-    let has_pattern = arms
-        .iter()
-        .any(|arm| matches!(arm.node.head, MatchArmHead::Pattern(_)));
-    let has_dynamic = arms
-        .iter()
-        .any(|arm| !matches!(arm.node.head, MatchArmHead::Pattern(_)));
-    match (has_pattern, has_dynamic) {
-        (true, true) => MatchKind::Mixed,
-        (false, true) => MatchKind::Dynamic,
-        _ => MatchKind::Ordinary,
-    }
-}
 
 pub(super) fn check_arm_head(
     head: &MatchArmHead,
@@ -45,7 +24,7 @@ pub(super) fn check_arm_head(
             PatternContext::Match,
             tc,
         ),
-        MatchArmHead::DynDowncast(_) | MatchArmHead::DynElse(_) => PatternOutcome::error(),
+        MatchArmHead::DynDowncast(_) | MatchArmHead::DynFallback(_) => PatternOutcome::error(),
     }
 }
 
@@ -54,17 +33,17 @@ pub(super) fn validate_dynamic_arms(arms: &[MatchArmNode], tc: &mut TypeChecker)
     let Some(last) = arms.last() else {
         return false;
     };
-    if !matches!(last.node.head, MatchArmHead::DynElse(_)) {
+    if !matches!(last.node.head, MatchArmHead::DynFallback(_)) {
         tc.push_error(TypeError::CompileError {
-            message: "dynamic match requires a final else(...) arm".to_string(),
+            message: "dynamic match requires a final fallback arm".to_string(),
             span: tc.error_span(last.span),
         });
         valid = false;
     }
     for arm in &arms[..arms.len() - 1] {
-        if matches!(arm.node.head, MatchArmHead::DynElse(_)) {
+        if matches!(arm.node.head, MatchArmHead::DynFallback(_)) {
             tc.push_error(TypeError::CompileError {
-                message: "dynamic match else(...) arm must be last".to_string(),
+                message: "dynamic match fallback arm must be last".to_string(),
                 span: tc.error_span(arm.span),
             });
             valid = false;
@@ -125,7 +104,7 @@ pub(super) fn with_dynamic_arm<R>(
                     );
                 }
             }
-            match (binding_name(&dyn_arm.node.binding), target, source.valid) {
+            match (dyn_arm.node.binding, target, source.valid) {
                 (Some(name), Some(target), true) => {
                     define_downcast_binding(name, &target, source, tc)
                 }
@@ -136,9 +115,9 @@ pub(super) fn with_dynamic_arm<R>(
                 (None, _, _) => false,
             }
         }
-        MatchArmHead::DynElse(dyn_arm) => {
-            if let Some(name) = binding_name(&dyn_arm.node.binding) {
-                define_else_binding(name, source, tc);
+        MatchArmHead::DynFallback(binding) => {
+            if let Some(name) = binding {
+                define_fallback_binding(*name, source, tc);
             }
             false
         }
@@ -185,7 +164,7 @@ fn define_downcast_binding(
     true
 }
 
-fn define_else_binding(
+fn define_fallback_binding(
     name: Ident,
     source: &downcast::CheckedDowncastSource,
     tc: &mut TypeChecker,
@@ -211,13 +190,6 @@ fn define_recovery_binding(name: Ident, tc: &mut TypeChecker) {
     tc.define_pattern_binding_from_handle(name, &handle, false);
 }
 
-pub(super) fn push_mixed_error(span: Span, tc: &mut TypeChecker) {
-    tc.push_error(TypeError::CompileError {
-        message: "dynamic type-match arms cannot be mixed with ordinary pattern arms".to_string(),
-        span: tc.error_span(span),
-    });
-}
-
 fn push_duplicate_target(target: &Type, span: Span, tc: &mut TypeChecker) {
     tc.push_error(TypeError::CompileError {
         message: format!("duplicate dynamic match target '{target}'"),
@@ -225,17 +197,10 @@ fn push_duplicate_target(target: &Type, span: Span, tc: &mut TypeChecker) {
     });
 }
 
-fn binding_name(binding: &DynArmBinding) -> Option<Ident> {
-    match binding {
-        DynArmBinding::Named(name) => Some(*name),
-        DynArmBinding::Wildcard => None,
-    }
-}
-
 fn head_binding(head: &MatchArmHead) -> Option<Ident> {
     match head {
-        MatchArmHead::DynDowncast(arm) => binding_name(&arm.node.binding),
-        MatchArmHead::DynElse(arm) => binding_name(&arm.node.binding),
+        MatchArmHead::DynDowncast(arm) => arm.node.binding,
+        MatchArmHead::DynFallback(binding) => *binding,
         MatchArmHead::Pattern(_) => None,
     }
 }

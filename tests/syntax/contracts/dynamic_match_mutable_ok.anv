@@ -18,9 +18,9 @@ struct Bullet {
 
 fn main() {
     var actor: dyn Updatable = Enemy { hp: 1 };
-    match var actor {
-        as Enemy(enemy) => enemy.hp = 2,
-        as Bullet(bullet) => bullet.speed = 3,
-        else(other) => other.update(),
+    match var actor as? {
+        Enemy(enemy) => enemy.hp = 2,
+        Bullet(bullet) => bullet.speed = 3,
+        other => other.update(),
     };
 }

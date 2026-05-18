@@ -1,13 +1,14 @@
 // @mode: check
-// @expect: success
+// @expect: error
 // @frontend: new
+// @contains: dynamic match requires a final fallback arm
 
 contract Drawable { fn draw(self); }
 struct Enemy { fn draw(self) {} }
 
 fn main() {
     let actor: dyn Drawable = Enemy {};
-    match actor {
-        else(other) => other.draw(),
+    match actor as? {
+        Enemy(enemy) => enemy.draw(),
     };
 }

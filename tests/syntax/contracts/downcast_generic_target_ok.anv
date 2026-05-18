@@ -1,7 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: exact downcast target must be a fully concrete runtime-identifiable type
 
 contract Drawable {
     fn draw(self);
@@ -12,7 +11,9 @@ struct Enemy {
 }
 
 fn try_down<T>(actor: dyn Drawable) {
-    if let value = actor as? T {}
+    if let value = actor as? T {
+        value.draw();
+    }
 }
 
 fn main() {
