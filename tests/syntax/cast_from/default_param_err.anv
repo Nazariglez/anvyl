@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: cast from parameter cannot have a default value
+
+struct Vec2 { x: float, y: float }
+
+extend Vec2 {
+    cast from(v: int = 0) { Vec2 { x: v as float, y: v as float } }
+}

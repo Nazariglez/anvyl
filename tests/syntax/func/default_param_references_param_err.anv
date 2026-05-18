@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: default initializer cannot reference parameter 'a'
+
+fn bad(a: int, b: int = a) {}

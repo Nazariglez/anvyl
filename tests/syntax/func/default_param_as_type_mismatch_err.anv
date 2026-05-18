@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: mismatched types
+
+struct Target {}
+struct Source {}
+fn source_value() -> Source { Source {} }
+
+fn bad(x: as Target = source_value()) {}

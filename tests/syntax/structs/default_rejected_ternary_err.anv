@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: Ternary expressions cannot be used as default initializers
+
+struct Bad { x: int = true ? 1 : 2 }

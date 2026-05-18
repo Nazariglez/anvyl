@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: Lambda expressions cannot be used as default initializers
+
+struct Bad { f: fn() -> int = || 1 }

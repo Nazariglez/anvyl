@@ -1,0 +1,9 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+import m { make_widget };
+
+fn main() {
+    let w = make_widget();
+}

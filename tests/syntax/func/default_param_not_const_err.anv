@@ -1,4 +1,5 @@
 // @mode: check
+// @frontend: default
 // @expect: error
 // @contains: constant expression
 

@@ -5,14 +5,15 @@ use super::{
     ReturnMode, ScopeState, TypeChecker, TypeError, VarInfo, annotation, check_expr_checked,
     check_expr_checked_with_hint, checked_void, const_eval, control_flow,
     decl_validate::{
-        check_method_generic_shadows, check_param_order, has_generics, has_mutable_param,
-        is_generic, method_sig_is_generic, validate_return_spec, validate_type_alias_def,
+        check_method_generic_shadows, has_generics, has_mutable_param, is_generic,
+        method_sig_is_generic, validate_return_spec, validate_type_alias_def,
     },
     decls::{
         AggregateSchema, CallableDef, CallableId, CallableKind, CallableRef, CallableSig,
-        DeclError, ExtendId, FieldSchema, MethodKey, MethodMode, ModuleScope, NominalKey,
-        TypeAliasDef, generic_params, nominal_type, required_param_count, stmt_visibility,
+        DeclError, ExtendId, MethodKey, MethodMode, ModuleScope, NominalKey, TypeAliasDef,
+        generic_params, nominal_type, required_param_count, stmt_visibility,
     },
+    defaults,
     dyn_infer::DynInference,
     generic::{
         ConstSubst, GenericArgs, GenericOwnerFrame, GenericParams, SpecializationState, TypeSubst,
@@ -21,16 +22,14 @@ use super::{
     infer::TypeHandle,
     pattern::{self, check_binding},
     place::{PlaceIdentity, PlaceRoot},
-    type_ops::type_depends_on_generics,
     type_refs::{GenericTypeContext, LocalTypeAlias},
-    validate_const_expr_type,
 };
 use crate::{
     ast::{
         AggregateDeclNode, BlockNode, ConstValue, ExprId, ExprKind, ExprNode, ExtendDeclNode, Func,
-        FuncNode, FuncParam, Ident, Lit, MethodReceiver, Mutability, Param, Pattern, PatternHead,
-        PatternNode, Program, ReturnAccess, ReturnSpec, Stmt, StmtNode, StructDecl, StructField,
-        Type, TypeAliasDeclNode, Visibility,
+        FuncNode, FuncParam, Ident, MethodReceiver, Mutability, Param, Pattern, PatternHead,
+        PatternNode, Program, ReturnAccess, ReturnSpec, Stmt, StmtNode, StructDecl, Type,
+        TypeAliasDeclNode, Visibility,
     },
     span::Span,
 };
@@ -489,7 +488,7 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     let mut generics = generic_params(&func.type_params, &func.const_params);
     let generic_context =
         tc.extended_generic_context(&owner.generics, &func.type_params, &func.const_params, span);
-    check_param_order(&func.params, span, tc);
+    defaults::check_param_order(&func.params, span, tc);
     validate_return_spec(
         &func.ret,
         !generics.is_empty() || !owner.params.is_empty(),
@@ -632,6 +631,7 @@ pub(super) fn register_block_declarations(
         match &stmt.node {
             Stmt::Func(_) => {
                 let decl = funcs.next().expect("function declaration was collected");
+                check_local_func_defaults(&decl, env.clone(), tc);
                 store_local_callable_template(decl, env.clone(), tc);
             }
             Stmt::Const(const_node) => {
@@ -710,6 +710,34 @@ fn add_callable_decl_placeholders(
             env,
         );
     }
+}
+
+fn check_local_func_defaults(
+    decl: &LocalFuncDecl<'_>,
+    env: Vec<HashMap<Ident, LocalSymbol>>,
+    tc: &mut TypeChecker,
+) {
+    if !defaults::has_param_defaults(&decl.func.node.params) {
+        return;
+    }
+    let module = tc.current_module.clone();
+    let env = CallableTemplateEnv::Local(tc.scope_state_from(env));
+    with_callable_body_env(&module, &env, tc, |tc| {
+        defaults::check_param_defaults_in_decl_scope(
+            &decl.func.node.params,
+            &decl.sig.params,
+            false,
+            GenericOwnerFrame {
+                params: defaults::combine_params(
+                    decl.sig.owner_generics.clone(),
+                    decl.sig.generics.clone(),
+                ),
+                args: decl.sig.owner_args.clone(),
+                generics: decl.sig.generic_context.clone(),
+            },
+            tc,
+        );
+    });
 }
 
 fn store_local_callable_template(
@@ -812,58 +840,31 @@ fn check_aggregate_decl(agg_node: &AggregateDeclNode, tc: &mut TypeChecker) {
         return;
     };
 
-    check_aggregate_field_defaults(&agg.fields, &schema.fields, tc);
+    if agg.fields.iter().any(|field| field.default.is_some()) {
+        let generics = tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
+        defaults::check_aggregate_field_defaults(
+            &agg.fields,
+            &schema.fields,
+            GenericOwnerFrame {
+                params: schema.generics.clone(),
+                args: GenericArgs::default(),
+                generics,
+            },
+            tc,
+        );
+    }
     check_method_generic_shadows(agg, agg_node.span, tc);
     check_aggregate_method_bodies(agg, agg_node.span, &key, &schema, tc);
 }
 
-fn check_aggregate_field_defaults(
-    fields: &[StructField],
-    schema: &HashMap<Ident, FieldSchema>,
-    tc: &mut TypeChecker,
-) {
-    for field in fields {
-        let Some(default) = &field.default else {
-            continue;
-        };
-        let Some(schema) = schema.get(&field.name) else {
-            continue;
-        };
-        if type_depends_on_generics(&schema.ty) {
-            tc.push_error(TypeError::GenericFieldDefault {
-                span: tc.error_span(default.span),
-            });
-            continue;
-        }
-        let expected = tc.type_handle(&schema.ty);
-        if let Err(error) = validate_const_expr_type(default, Some(expected), tc) {
-            tc.push_error(error);
-            continue;
-        }
-        if matches!(default.node.kind, ExprKind::Lit(Lit::Nil))
-            && tc.decls.semantic_option_inner(&schema.ty).is_some()
-        {
-            continue;
-        }
-        if empty_heap_collection_default(default, &schema.ty) {
-            continue;
-        }
-        if let Err(error) = tc.eval_const_expr(default, false) {
-            tc.push_error(error);
-        }
-    }
-}
-
-fn empty_heap_collection_default(expr: &ExprNode, ty: &Type) -> bool {
-    match (&expr.node.kind, ty) {
-        (ExprKind::ArrayLiteral(lit), Type::List { .. }) => lit.node.elements.is_empty(),
-        (ExprKind::MapLiteral(lit), Type::Map { .. }) => lit.node.entries.is_empty(),
-        _ => false,
-    }
-}
-
 pub(super) fn check_module_bodies(module: &ModuleScope, program: &Program, tc: &mut TypeChecker) {
-    with_source_module_scope(module, tc, |tc| check_stmts(&program.stmts, tc));
+    with_source_module_scope(module, tc, |tc| {
+        let before = tc.errors.len();
+        defaults::check_decl_param_defaults(program, tc);
+        if tc.errors.len() == before {
+            check_stmts(&program.stmts, tc);
+        }
+    });
 }
 
 fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut TypeChecker) {
@@ -1319,7 +1320,6 @@ fn check_func_body(
     const_bindings: &[(Ident, ConstValue)],
     tc: &mut TypeChecker,
 ) -> Option<Type> {
-    check_param_default_values(params, param_types, tc);
     with_callable_body_scope(
         tc,
         TypeChecker::enter_named_function,
@@ -1380,23 +1380,6 @@ fn infer_return_type(frame: ReturnFrame, tc: &mut TypeChecker) -> Option<Type> {
         }
     }
     Some(inferred)
-}
-
-fn check_param_default_values(params: &[Param], param_types: &[FuncParam], tc: &mut TypeChecker) {
-    for (param, param_ty) in params.iter().zip(param_types) {
-        let Some(default) = &param.default else {
-            continue;
-        };
-        let expected = tc.type_handle(&param_ty.ty);
-        match validate_const_expr_type(default, Some(expected), tc) {
-            Ok(_) => {
-                if let Err(error) = tc.eval_const_expr(default, false) {
-                    tc.push_error(error);
-                }
-            }
-            Err(error) => tc.push_error(error),
-        }
-    }
 }
 
 pub(super) fn with_callable_body_env<R>(

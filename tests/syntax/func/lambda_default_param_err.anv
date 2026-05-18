@@ -1,0 +1,8 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: lambda parameters cannot have defaults
+
+fn main() {
+    let f = |x: int = 1| x;
+}

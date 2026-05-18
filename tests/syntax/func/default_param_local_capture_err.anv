@@ -1,0 +1,9 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: cannot capture local value 'runtime'
+
+fn outer() {
+    let runtime = 10;
+    fn bad(x: int = runtime) {}
+}

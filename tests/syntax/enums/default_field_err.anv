@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: enum variant fields cannot have defaults
+
+enum Event {
+    Move { dx: int = 0 },
+}
+
+fn main() {}

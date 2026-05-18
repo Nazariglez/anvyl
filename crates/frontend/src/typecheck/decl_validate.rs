@@ -772,39 +772,6 @@ fn validate_place_return_spec(
     }
 }
 
-pub(super) fn check_decl_param_order(program: &Program, tc: &mut TypeChecker) {
-    for stmt in &program.stmts {
-        match &stmt.node {
-            Stmt::Func(func) => check_param_order(&func.node.params, func.span, tc),
-            Stmt::Aggregate(agg) => {
-                for method in &agg.node.methods {
-                    check_param_order(&method.sig.params, agg.span, tc);
-                }
-            }
-            Stmt::Extend(extend) => {
-                for method in &extend.node.methods {
-                    check_param_order(&method.node.sig.params, method.span, tc);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-pub(super) fn check_param_order(params: &[Param], span: Span, tc: &mut TypeChecker) {
-    let mut saw_default = false;
-    for param in params {
-        if param.default.is_some() {
-            saw_default = true;
-        } else if saw_default {
-            tc.push_error(TypeError::RequiredParamAfterDefault {
-                name: param.name,
-                span: tc.error_span(span),
-            });
-        }
-    }
-}
-
 pub(super) fn check_method_generic_shadows(agg: &StructDecl, span: Span, tc: &mut TypeChecker) {
     let owner_params = agg
         .type_params

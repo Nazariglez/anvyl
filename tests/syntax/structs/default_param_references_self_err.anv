@@ -1,0 +1,9 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: default initializer cannot reference self
+
+struct S {
+    value: int,
+    fn bad(self, x: int = self.value) {}
+}

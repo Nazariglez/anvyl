@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: Match expressions cannot be used as default initializers
+
+struct Bad { x: int = match 1 { 1 => 1, _ => 0 } }

@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: Block expressions cannot be used as default initializers
+
+struct Bad { x: int = { 1 } }

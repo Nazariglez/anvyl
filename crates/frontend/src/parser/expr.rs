@@ -608,6 +608,7 @@ fn lambda_expr<'src>(
     let or_op = select! { Token::Op(Op::Or) => () };
     let comma = select! { Token::Comma => () };
     let colon = select! { Token::Colon => () };
+    let assign = select! { Token::Op(Op::Assign) => () };
 
     let var_kw = select! {
         Token::Keyword(Keyword::Var) => (),
@@ -626,13 +627,31 @@ fn lambda_expr<'src>(
                     None => (None, false, ast::EscapeMode::NonEscaping),
                 }),
         )
-        .map(
-            |((mutable, name), (ty, cast_accept, escape))| ast::LambdaParam {
-                name,
-                ty,
-                mutable,
-                cast_accept,
-                escape,
+        .then(
+            assign
+                .ignore_then(
+                    any()
+                        .filter(|token| !matches!(token, Token::Op(Op::BitOr) | Token::Comma))
+                        .repeated()
+                        .at_least(1),
+                )
+                .or_not(),
+        )
+        .validate(
+            |(((mutable, name), (ty, cast_accept, escape)), default), extra, emitter| {
+                if default.is_some() {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        "lambda parameters cannot have defaults",
+                    ));
+                }
+                ast::LambdaParam {
+                    name,
+                    ty,
+                    mutable,
+                    cast_accept,
+                    escape,
+                }
             },
         );
 

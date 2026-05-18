@@ -987,6 +987,7 @@ fn embed_selector<'src>() -> BoxedParser<'src, ast::EmbedSelector> {
 fn struct_field<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     allow_embed: bool,
+    allow_default: bool,
 ) -> BoxedParser<'src, ast::StructField> {
     annotations()
         .then(doc_comment_block())
@@ -1005,6 +1006,12 @@ fn struct_field<'src>(
             move |(((((annotations, doc), (first, second)), ty), selector), default),
                   extra,
                   emitter| {
+                if default.is_some() && !allow_default {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        "enum variant fields cannot have defaults",
+                    ));
+                }
                 let is_embed = allow_embed && first.as_str() == "embed" && second.is_some();
                 if second.is_some() && !is_embed {
                     emitter.emit(Rich::custom(extra.span(), "expected ':' after field name"));
@@ -1031,7 +1038,7 @@ fn struct_field<'src>(
                     span: extra.span().byte(),
                     name,
                     ty,
-                    default,
+                    default: allow_default.then_some(default).flatten(),
                     doc,
                 }
             },
@@ -1203,7 +1210,7 @@ fn aggregate_declaration<'src>(
                 Token::Open(Delimiter::Brace) => (),
             }
             .ignore_then(
-                struct_field(stmt.clone(), true)
+                struct_field(stmt.clone(), true, true)
                     .separated_by(select! { Token::Comma => () })
                     .allow_trailing()
                     .collect::<Vec<_>>(),
@@ -1360,7 +1367,7 @@ fn enum_variant_struct_payload<'src>(
 ) -> BoxedParser<'src, ast::VariantKind> {
     select! { Token::Open(Delimiter::Brace) => () }
         .ignore_then(
-            struct_field(stmt, false)
+            struct_field(stmt, false, false)
                 .separated_by(select! { Token::Comma => () })
                 .allow_trailing()
                 .collect::<Vec<_>>(),
@@ -1438,18 +1445,21 @@ pub(super) fn enum_declaration<'src>(
                         ast::VariantKind::Struct(fields) => {
                             let resolved = fields
                                 .iter()
-                                .map(|f| ast::StructField {
-                                    annotations: f.annotations.clone(),
-                                    embed: None,
-                                    span: f.span,
-                                    name: f.name,
-                                    ty: resolve_type_params(
-                                        &f.ty,
-                                        &type_param_map,
-                                        &const_param_map,
-                                    ),
-                                    default: None,
-                                    doc: f.doc.clone(),
+                                .map(|f| {
+                                    debug_assert!(f.default.is_none());
+                                    ast::StructField {
+                                        annotations: f.annotations.clone(),
+                                        embed: None,
+                                        span: f.span,
+                                        name: f.name,
+                                        ty: resolve_type_params(
+                                            &f.ty,
+                                            &type_param_map,
+                                            &const_param_map,
+                                        ),
+                                        default: None,
+                                        doc: f.doc.clone(),
+                                    }
                                 })
                                 .collect();
                             ast::VariantKind::Struct(resolved)

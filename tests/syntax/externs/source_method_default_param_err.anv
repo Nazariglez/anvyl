@@ -1,0 +1,8 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: default parameters are not supported in source extern declarations
+
+extern type Native {
+    fn make(x: int = 0) -> int;
+}

@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: mutable parameter 'x' cannot have a default initializer
+
+fn bad(var x: int = 0) {}

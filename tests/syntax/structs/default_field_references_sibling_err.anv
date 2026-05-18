@@ -1,0 +1,9 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: field default initializer cannot reference sibling field 'width'
+
+struct Bad {
+    width: int = 10,
+    area: int = width * width,
+}

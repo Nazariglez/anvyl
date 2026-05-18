@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: If expressions cannot be used as default initializers
+
+struct Bad { x: int = if true { 1 } else { 2 } }

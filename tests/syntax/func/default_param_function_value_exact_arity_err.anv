@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: Wrong number of arguments
+
+fn add(a: int, b: int = 1) -> int { a + b }
+
+fn main() {
+    let cb: fn(int, int) -> int = add;
+    let x = cb(1);
+}

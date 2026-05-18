@@ -32,6 +32,7 @@ pub(super) enum FieldOwner {
 #[derive(Clone, Copy)]
 pub(super) enum MissingFields {
     None,
+    RequireAll,
     AllowDefaults,
     AllowRest { has_rest: bool },
 }
@@ -125,7 +126,7 @@ pub(super) fn check(
 fn missing_fields_enabled(missing: MissingFields) -> bool {
     match missing {
         MissingFields::None => false,
-        MissingFields::AllowDefaults => true,
+        MissingFields::RequireAll | MissingFields::AllowDefaults => true,
         MissingFields::AllowRest { has_rest } => !has_rest,
     }
 }

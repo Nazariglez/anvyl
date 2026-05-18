@@ -1,0 +1,10 @@
+// @helper
+
+struct Hidden { state: int }
+fn make_hidden() -> Hidden { Hidden { state: 0 } }
+
+pub struct Widget { hidden: Hidden }
+
+pub fn make_widget(hidden: Hidden = make_hidden()) -> Widget {
+    Widget { hidden }
+}

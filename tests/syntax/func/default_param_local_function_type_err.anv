@@ -1,0 +1,9 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: mismatched types
+
+fn outer() {
+    fn text() -> string { "text" }
+    fn bad(x: int = text()) {}
+}

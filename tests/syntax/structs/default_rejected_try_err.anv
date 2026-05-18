@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: Try expressions cannot be used as default initializers
+
+fn read() -> Result<int, string> {
+    Result.Ok(1)
+}
+
+struct Bad { x: int = try read() }

@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: default parameters are not supported in source extern declarations
+
+extern fn native(x: int = 0) -> int;

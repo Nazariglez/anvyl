@@ -675,7 +675,7 @@ fn check_variant_literal_fields(
             key: key.clone(),
             variant,
         },
-        field_check::MissingFields::AllowDefaults,
+        field_check::MissingFields::RequireAll,
         span,
         inf,
         tc,

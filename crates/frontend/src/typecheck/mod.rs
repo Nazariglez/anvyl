@@ -21,10 +21,8 @@ use self::{
     },
     closure::{ClosureClassifier, ClosureScopeState},
     const_term::ConstTerm,
-    decl_validate::{
-        check_decl_param_order, check_finite_size_cycles, check_infer_return_decls,
-        generic_param_type_error,
-    },
+    decl_validate::{check_finite_size_cycles, check_infer_return_decls, generic_param_type_error},
+    defaults::{check_decl_param_defaults, check_decl_param_order},
     dyn_infer::DynInference,
     infer::{
         LocalTypeId, Solver, SolverFinalizeError, SolverRelationError, SourceExprTypes, TypeHandle,
@@ -72,6 +70,7 @@ mod control_flow;
 mod convert;
 mod decl_validate;
 mod decls;
+mod defaults;
 mod downcast;
 mod dyn_infer;
 mod enum_variant;
@@ -680,7 +679,23 @@ pub(crate) enum TypeError {
     NonConstExpression {
         span: Option<SourceSpan>,
     },
-    GenericFieldDefault {
+    InvalidDefaultExpression {
+        kind: &'static str,
+        span: Option<SourceSpan>,
+    },
+    DefaultReferencesParameter {
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
+    DefaultReferencesSelf {
+        span: Option<SourceSpan>,
+    },
+    DefaultReferencesField {
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
+    VarParamDefault {
+        name: Ident,
         span: Option<SourceSpan>,
     },
     ConstTypeMismatch {
@@ -2350,7 +2365,10 @@ fn typechecker_for_modules(
     }
     push_source_scope(&mut tc);
     register_declarations(program, &mut tc);
-    check_stmts(&program.stmts, &mut tc);
+    check_decl_param_defaults(program, &mut tc);
+    if tc.errors.is_empty() {
+        check_stmts(&program.stmts, &mut tc);
+    }
     tc.pop_scope();
 
     for (module, program) in module_bodies {

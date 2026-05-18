@@ -1,0 +1,13 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+const BASE: int = 10;
+lazy let global_size = 32;
+
+fn from_fn() -> int { 1 }
+fn f(a: int = from_fn(), b: int = BASE, c: int = global_size) -> int { a + b + c }
+
+fn main() {
+    let x = f();
+}

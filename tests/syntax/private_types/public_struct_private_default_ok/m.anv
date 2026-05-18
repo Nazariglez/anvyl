@@ -1,7 +1,9 @@
 // @helper
 
-struct Hidden {}
+struct Hidden { state: int }
+fn make_hidden() -> Hidden { Hidden { state: 0 } }
+
 pub struct Widget {
     name: string,
-    hidden: Hidden? = nil,
+    hidden: Hidden = make_hidden(),
 }

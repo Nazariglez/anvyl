@@ -977,8 +977,20 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         ),
         TypeError::ConstCycle { name, .. } => format!("constant '{name}' depends on itself"),
         TypeError::NonConstExpression { .. } => "not a constant expression".to_string(),
-        TypeError::GenericFieldDefault { .. } => {
-            "field default cannot depend on generic parameters".to_string()
+        TypeError::InvalidDefaultExpression { kind, .. } => {
+            format!("{kind} expressions cannot be used as default initializers")
+        }
+        TypeError::DefaultReferencesParameter { name, .. } => {
+            format!("default initializer cannot reference parameter '{name}'")
+        }
+        TypeError::DefaultReferencesSelf { .. } => {
+            "default initializer cannot reference self".to_string()
+        }
+        TypeError::DefaultReferencesField { name, .. } => {
+            format!("field default initializer cannot reference sibling field '{name}'")
+        }
+        TypeError::VarParamDefault { name, .. } => {
+            format!("mutable parameter '{name}' cannot have a default initializer")
         }
         TypeError::ConstTypeMismatch {
             expected, found, ..
@@ -1312,7 +1324,11 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::RuntimeGlobalInConstPosition { span, .. }
         | TypeError::ConstCycle { span, .. }
         | TypeError::NonConstExpression { span, .. }
-        | TypeError::GenericFieldDefault { span, .. }
+        | TypeError::InvalidDefaultExpression { span, .. }
+        | TypeError::DefaultReferencesParameter { span, .. }
+        | TypeError::DefaultReferencesSelf { span, .. }
+        | TypeError::DefaultReferencesField { span, .. }
+        | TypeError::VarParamDefault { span, .. }
         | TypeError::ConstTypeMismatch { span, .. }
         | TypeError::InvalidConstCast { span, .. }
         | TypeError::InvalidCast { span, .. }

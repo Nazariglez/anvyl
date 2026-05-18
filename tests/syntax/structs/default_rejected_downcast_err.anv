@@ -1,0 +1,18 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: ExactDowncast expressions cannot be used as default initializers
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn make_actor() -> dyn Drawable {
+    Enemy {}
+}
+
+struct Bad { enemy: Enemy? = make_actor() as? Enemy }
