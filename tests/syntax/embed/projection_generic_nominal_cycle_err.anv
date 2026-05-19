@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected `int`, found `Node<int>`
+
+dataref Node<T> {
+    @as embed next: Node<(T, int)>,
+}
+
+fn test(node: Node<int>) {
+    let x: int = node;
+}

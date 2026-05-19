@@ -815,27 +815,14 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
                 "promoted field '{field}' is not a stored field of '{ty}'; use stored path {paths}"
             )
         }
-        TypeError::DuplicateProjectionTarget {
+        TypeError::AmbiguousProjection {
             source,
             target,
             paths,
             ..
         } => {
             let paths = render_ident_paths(paths);
-            format!(
-                "projection from '{source}' to '{target}' is ambiguous; direct @as embed paths: {paths}"
-            )
-        }
-        TypeError::ChainedProjection {
-            source,
-            target,
-            via,
-            ..
-        } => {
-            let via = render_ident_path(via);
-            format!(
-                "projection from '{source}' to '{target}' would require chaining through '{via}'; declare a direct `@as embed` field"
-            )
+            format!("projection from '{source}' to '{target}' is ambiguous; @as embed paths: {paths}")
         }
         TypeError::MissingProjection {
             source,
@@ -1286,8 +1273,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::AmbiguousPromotedField { span, .. }
         | TypeError::AmbiguousPromotedMethod { span, .. }
         | TypeError::PromotedFieldNotStored { span, .. }
-        | TypeError::DuplicateProjectionTarget { span, .. }
-        | TypeError::ChainedProjection { span, .. }
+        | TypeError::AmbiguousProjection { span, .. }
         | TypeError::MissingProjection { span, .. }
         | TypeError::InstanceMethodOnType { span, .. }
         | TypeError::StaticMethodOnValue { span, .. }
@@ -1831,14 +1817,8 @@ fn render_ident_paths(paths: &[Vec<Ident>]) -> String {
 }
 
 fn render_missing_projection(source: &Type, target: &Type, paths: &[Vec<Ident>]) -> String {
-    if paths.is_empty() {
-        return format!(
-            "no direct `@as embed` projection from '{source}' to '{target}'; use the stored path explicitly or declare a direct `@as embed` field"
-        );
-    }
-
     format!(
-        "no direct `@as embed` projection from '{source}' to '{target}'; use stored path {} explicitly or mark it with `@as embed`",
+        "no `@as embed` projection path from '{source}' to '{target}'; use stored path {} explicitly or mark it with `@as embed`",
         render_ident_paths(paths)
     )
 }

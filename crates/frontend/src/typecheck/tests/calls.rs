@@ -294,16 +294,17 @@ fn projected_generic_return_records_call_target() {
     let result = check(
         r"
         struct Entity { x: int }
-        struct Enemy { @as embed entity: Entity }
+        struct Actor { @as embed entity: Entity }
+        struct Enemy { @as embed actor: Actor }
         fn id<T>(x: T) -> T { x }
         fn main() -> Entity {
-            let enemy = Enemy { entity: Entity { x: 1 } };
+            let enemy = Enemy { actor: Actor { entity: Entity { x: 1 } } };
             id(enemy)
         }
         ",
     )
     .unwrap();
-    assert_expected_projection(&result, &["entity"], nominal_struct("Entity"));
+    assert_expected_projection(&result, &["actor", "entity"], nominal_struct("Entity"));
     let target = result
         .calls()
         .values()

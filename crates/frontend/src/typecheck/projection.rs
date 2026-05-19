@@ -1,6 +1,6 @@
 use super::{
-    CheckedType, ExpectedProjectionFact, ProjectionEntry, TypeChecker, TypeError,
-    checked_from_type, checked_type, contracts, place,
+    CheckedType, ExpectedProjectionFact, ProjectionPath, TypeChecker, TypeError, checked_from_type,
+    checked_type, contracts, place,
 };
 use crate::{
     ast::{ContractRef, ExprNode, Ident, Type},
@@ -10,7 +10,7 @@ use crate::{
 pub(super) enum ExpectedProjectionDecision {
     SourceAccepted,
     NotNeeded,
-    Project(ProjectionEntry),
+    Project(ProjectionPath),
     Failed,
 }
 
@@ -35,11 +35,11 @@ pub(super) fn expected_projection(
         return ExpectedProjectionDecision::NotNeeded;
     }
 
-    let matches = direct_projection_matches(tc, span, source, target, mode);
+    let matches = projection_matches(tc, span, source, target, mode);
     match matches.as_slice() {
         [entry] => ExpectedProjectionDecision::Project(entry.clone()),
         [_, ..] => {
-            tc.push_error(TypeError::DuplicateProjectionTarget {
+            tc.push_error(TypeError::AmbiguousProjection {
                 source: source.clone(),
                 target: target.clone(),
                 paths: matches.into_iter().map(|entry| entry.field_path).collect(),
@@ -51,34 +51,34 @@ pub(super) fn expected_projection(
     }
 }
 
-fn direct_projection_matches(
+fn projection_matches(
     tc: &mut TypeChecker,
     span: Span,
     source: &Type,
     target: &Type,
     mode: ExpectedProjectionMode,
-) -> Vec<ProjectionEntry> {
+) -> Vec<ProjectionPath> {
     tc.decls
-        .direct_projections_from(source)
+        .projection_paths_from(source)
         .into_iter()
-        .filter(|entry| satisfies_without_effects(tc, span, &entry.target_ty, target, mode))
+        .filter(|path| satisfies_without_effects(tc, span, &path.target_ty, target, mode))
         .collect()
 }
 
-pub(super) fn unique_direct_projection_without_effects(
+pub(super) fn unique_projection_without_effects(
     tc: &mut TypeChecker,
     span: Span,
     source: &Type,
     target: &Type,
     mode: ExpectedProjectionMode,
-) -> Option<ProjectionEntry> {
+) -> Option<ProjectionPath> {
     if satisfies_without_effects(tc, span, source, target, mode)
         || projection_probe_deferred(source, target)
     {
         return None;
     }
 
-    let matches = direct_projection_matches(tc, span, source, target, mode);
+    let matches = projection_matches(tc, span, source, target, mode);
     match matches.as_slice() {
         [entry] => Some(entry.clone()),
         [] | [_, ..] => None,
@@ -90,7 +90,7 @@ pub(super) fn apply_value_projection(
     expr: &ExprNode,
     source_checked: &CheckedType,
     source_ty: &Type,
-    projection: ProjectionEntry,
+    projection: ProjectionPath,
 ) -> CheckedType {
     let path = projection.field_path;
     let target_ty = projection.target_ty;
@@ -117,7 +117,7 @@ pub(super) fn apply_place_projection(
     tc: &mut TypeChecker,
     expr: &ExprNode,
     source: &place::PlaceValue,
-    projection: ProjectionEntry,
+    projection: ProjectionPath,
 ) -> place::PlaceValue {
     let source_ty = source.checked.ty.clone();
     let path = projection.field_path;
@@ -263,17 +263,7 @@ fn projection_failure(
     source: &Type,
     target: &Type,
 ) -> ExpectedProjectionDecision {
-    if let Some(entry) = tc.decls.chained_projection_from(source, target) {
-        tc.push_error(TypeError::ChainedProjection {
-            source: source.clone(),
-            target: target.clone(),
-            via: entry.field_path,
-            span: tc.error_span(span),
-        });
-        return ExpectedProjectionDecision::Failed;
-    }
-
-    let paths = tc.decls.field_paths_to_type(source, target);
+    let paths = tc.decls.bare_embed_paths_to_type(source, target);
     if !paths.is_empty() {
         tc.push_error(TypeError::MissingProjection {
             source: source.clone(),

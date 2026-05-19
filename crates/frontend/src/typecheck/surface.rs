@@ -5,7 +5,7 @@ use super::{
     annotation::AccessPolicy,
     decls::{
         AggregateSchema, DeclError, DeclarationIndex, DependentEmbedTemplate, EmbedFieldSchema,
-        FieldSchema, MethodKey, MethodSurface, NominalKey, ProjectionEntry, nominal_key_sort_key,
+        FieldSchema, MethodKey, MethodSurface, NominalKey, ProjectionPath, nominal_key_sort_key,
     },
     substitute_aggregate_member,
     type_ops::type_depends_on_generics,
@@ -1059,10 +1059,8 @@ pub(super) fn dependent_embed_template_valid(template: &DependentEmbedTemplate) 
         && template.exposure == Exposure::from_selector(template.selector.is_some())
 }
 
-pub(super) fn projection_entry_valid(entry: &ProjectionEntry) -> bool {
-    entry.target.0 == entry.target_ty
-        && entry.field_path.len() == 1
-        && entry.field_span.span.start <= entry.field_span.span.end
+pub(super) fn projection_path_valid(path: &ProjectionPath) -> bool {
+    !path.field_path.is_empty()
 }
 
 fn concrete_surface_type(ty: &Type) -> bool {

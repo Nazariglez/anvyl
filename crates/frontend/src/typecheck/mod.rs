@@ -500,16 +500,10 @@ pub(crate) enum TypeError {
         paths: Vec<Vec<Ident>>,
         span: Option<SourceSpan>,
     },
-    DuplicateProjectionTarget {
+    AmbiguousProjection {
         source: Type,
         target: Type,
         paths: Vec<Vec<Ident>>,
-        span: Option<SourceSpan>,
-    },
-    ChainedProjection {
-        source: Type,
-        target: Type,
-        via: Vec<Ident>,
         span: Option<SourceSpan>,
     },
     MissingProjection {

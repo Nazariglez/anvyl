@@ -23,7 +23,7 @@ use super::{
     place::{self, MutableUseKind, PlaceUseFacts, PlaceValue},
     projection::{
         ExpectedProjectionDecision, ExpectedProjectionMode, apply_place_projection,
-        apply_value_projection, expected_projection, unique_direct_projection_without_effects,
+        apply_value_projection, expected_projection, unique_projection_without_effects,
     },
     type_ops::type_depends_on_generics,
 };
@@ -1912,7 +1912,7 @@ fn return_mismatch_can_project(
     if type_depends_on_generics(&source) || type_depends_on_generics(&target) {
         return false;
     }
-    unique_direct_projection_without_effects(
+    unique_projection_without_effects(
         tc,
         span,
         &source,

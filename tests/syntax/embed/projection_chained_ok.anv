@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Actor { @as embed entity: Entity }
+struct Enemy { @as embed actor: Actor }
+struct Boss { @as embed enemy: Enemy }
+
+fn take(entity: Entity) {}
+fn move_entity(var entity: Entity) { entity.x += 1; }
+fn take_as(entity: as Entity) {}
+
+fn make(boss: Boss) -> Entity { boss }
+
+fn test() {
+    var boss = Boss { enemy: Enemy { actor: Actor { entity: Entity { x: 1 } } } };
+    take(boss);
+    move_entity(boss);
+    let entity: Entity = boss;
+    take_as(boss);
+    let cast_entity: Entity = boss as Entity;
+    let returned: Entity = make(boss);
+}

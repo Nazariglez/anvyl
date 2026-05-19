@@ -850,7 +850,7 @@ impl TypeChecker {
         contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.lint_events);
         validate_dyn_infer_decls(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
-        for error in decls.build_projection_entries() {
+        for error in decls.build_projection_edges() {
             self.push_error(TypeError::Decl(error));
         }
         for error in decls.build_promoted_surfaces(&self.externs) {

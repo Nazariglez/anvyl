@@ -4,7 +4,7 @@ use super::{
     ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, TypeSubst, annotation,
     const_term::ConstTerm,
     generic_template_type, match_cast_conversion, same_extend_target, substitute,
-    surface::{dependent_embed_template_valid, projection_entry_valid},
+    surface::{dependent_embed_template_valid, projection_path_valid},
     type_ops::type_depends_on_generics,
     type_refs::{GenericParamError, GenericTypeContext, TypeRefError, TypeRefResolver},
 };
@@ -1292,7 +1292,7 @@ pub(crate) struct AggregateSchema {
     pub(crate) methods: HashMap<MethodKey, MethodSchema>,
     pub(crate) promoted: PromotedSurface,
     pub(crate) dependent_embeds: Vec<DependentEmbedTemplate>,
-    pub(crate) projections: Vec<ProjectionEntry>,
+    pub(crate) projection_edges: Vec<ProjectionPath>,
     pub(crate) policy: AccessPolicy,
 }
 
@@ -1306,11 +1306,9 @@ pub(crate) struct DependentEmbedTemplate {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProjectionEntry {
-    pub(crate) target: CanonicalTypeKey,
+pub(crate) struct ProjectionPath {
     pub(crate) target_ty: Type,
     pub(crate) field_path: Vec<Ident>,
-    pub(crate) field_span: SourceSpan,
 }
 
 #[derive(Clone)]
@@ -1923,7 +1921,7 @@ impl DeclarationIndex {
         errors
     }
 
-    pub(crate) fn build_projection_entries(&mut self) -> Vec<DeclError> {
+    pub(crate) fn build_projection_edges(&mut self) -> Vec<DeclError> {
         let mut errors = vec![];
         let mut keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
         keys.sort_by_key(nominal_key_sort_key);
@@ -1944,23 +1942,21 @@ impl DeclarationIndex {
                 }
                 let target_ty = field.ty.clone();
                 let target = CanonicalTypeKey(target_ty.clone());
-                if !type_depends_on_generics(&target_ty) && !seen.insert(target.clone()) {
+                if !type_depends_on_generics(&target_ty) && !seen.insert(target) {
                     errors.push(DeclError::DuplicateProjectionTarget {
                         owner: key.clone(),
                         target: target_ty,
-                        span: field.span,
+                        span: field.span.or(Some(embed.span)),
                     });
                     continue;
                 }
-                projections.push(ProjectionEntry {
-                    target,
+                projections.push(ProjectionPath {
                     target_ty,
                     field_path: vec![*name],
-                    field_span: field.span.unwrap_or(embed.span),
                 });
             }
             if let Some(schema) = self.aggregates.get_mut(&key) {
-                schema.projections = projections;
+                schema.projection_edges = projections;
             }
         }
         errors
@@ -2201,7 +2197,7 @@ impl DeclarationIndex {
                                 methods,
                                 promoted: PromotedSurface::default(),
                                 dependent_embeds: vec![],
-                                projections: vec![],
+                                projection_edges: vec![],
                                 policy,
                             },
                         );
@@ -3200,7 +3196,7 @@ impl DeclarationIndex {
                 .iter()
                 .all(dependent_embed_template_valid)
         );
-        debug_assert!(aggregate.projections.iter().all(projection_entry_valid));
+        debug_assert!(aggregate.projection_edges.iter().all(projection_path_valid));
         Some(aggregate)
     }
 
@@ -3208,28 +3204,46 @@ impl DeclarationIndex {
         self.aggregates.get_mut(key)
     }
 
-    pub(crate) fn direct_projections_from(&self, source: &Type) -> Vec<ProjectionEntry> {
-        self.projections_from(source)
+    pub(super) fn projection_paths_from(&self, source: &Type) -> Vec<ProjectionPath> {
+        let mut paths = vec![];
+        self.collect_projection_paths(source, &mut vec![], &mut HashSet::new(), &mut paths);
+        paths
     }
 
-    pub(crate) fn chained_projection_from(
+    fn collect_projection_paths(
         &self,
         source: &Type,
-        target: &Type,
-    ) -> Option<ProjectionEntry> {
-        self.direct_projections_from(source)
-            .into_iter()
-            .find(|entry| self.has_direct_projection_to(&entry.target_ty, target))
+        prefix: &mut Vec<Ident>,
+        seen: &mut HashSet<NominalKey>,
+        paths: &mut Vec<ProjectionPath>,
+    ) {
+        let Some(key) = self.key_for_type(source) else {
+            return;
+        };
+        let Some(aggregate) = self.aggregate(&key) else {
+            return;
+        };
+        if !seen.insert(key.clone()) {
+            return;
+        }
+
+        for edge in &aggregate.projection_edges {
+            let target_ty =
+                substitute_aggregate_member(source, &aggregate.generics, &edge.target_ty);
+            let start = prefix.len();
+            prefix.extend(edge.field_path.iter().copied());
+            paths.push(ProjectionPath {
+                target_ty: target_ty.clone(),
+                field_path: prefix.clone(),
+            });
+            self.collect_projection_paths(&target_ty, prefix, seen, paths);
+            prefix.truncate(start);
+        }
+
+        seen.remove(&key);
     }
 
-    fn has_direct_projection_to(&self, source: &Type, target: &Type) -> bool {
-        let target = CanonicalTypeKey(target.clone());
-        self.direct_projections_from(source)
-            .into_iter()
-            .any(|entry| entry.target == target)
-    }
-
-    pub(crate) fn field_paths_to_type(&self, source: &Type, target: &Type) -> Vec<Vec<Ident>> {
+    pub(super) fn bare_embed_paths_to_type(&self, source: &Type, target: &Type) -> Vec<Vec<Ident>> {
         let Some(key) = self.key_for_type(source) else {
             return vec![];
         };
@@ -3241,35 +3255,16 @@ impl DeclarationIndex {
             .fields
             .iter()
             .filter_map(|(name, field)| {
+                let embed = field.embed.as_ref()?;
+                if embed.as_projection {
+                    return None;
+                }
                 let field_ty = substitute_aggregate_member(source, &aggregate.generics, &field.ty);
                 (CanonicalTypeKey(field_ty) == target).then(|| vec![*name])
             })
             .collect::<Vec<_>>();
         paths.sort_by(|left, right| left[0].as_str().cmp(right[0].as_str()));
         paths
-    }
-
-    fn projections_from(&self, source: &Type) -> Vec<ProjectionEntry> {
-        let Some(key) = self.key_for_type(source) else {
-            return vec![];
-        };
-        let Some(aggregate) = self.aggregate(&key) else {
-            return vec![];
-        };
-        aggregate
-            .projections
-            .iter()
-            .map(|entry| {
-                let target_ty =
-                    substitute_aggregate_member(source, &aggregate.generics, &entry.target_ty);
-                ProjectionEntry {
-                    target: CanonicalTypeKey(target_ty.clone()),
-                    target_ty,
-                    field_path: entry.field_path.clone(),
-                    field_span: entry.field_span,
-                }
-            })
-            .collect()
     }
 
     pub(crate) fn aggregates(&self) -> impl Iterator<Item = (&NominalKey, &AggregateSchema)> {
