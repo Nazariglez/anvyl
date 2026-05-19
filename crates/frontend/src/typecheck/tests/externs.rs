@@ -9,7 +9,7 @@ use anvyx_externs::{
 
 use super::support::{
     TypecheckTestResult, assert_deprecated_warning, assert_typecheck_closed, check, check_named,
-    check_with_raw_externs,
+    check_with_raw_externs, single_expected_projection,
 };
 use crate::{
     ast::{ExprId, Ident, ModuleOrigin, NominalKind, Type},
@@ -482,6 +482,77 @@ mod any {
             }),
         )
         .expect("typecheck failed");
+    }
+}
+
+mod projection {
+    use super::*;
+
+    fn point_projection_provider(flow: ParamFlow) -> ProviderDescriptor {
+        provider(ExternModuleDescriptor {
+            path: extern_path(&["host"]),
+            types: vec![extern_type("Point")],
+            functions: vec![
+                function("make", vec![], named("Point")),
+                function(
+                    "touch",
+                    vec![flow_param("point", named("Point"), flow)],
+                    ExternTypeExpr::Void,
+                ),
+            ],
+        })
+    }
+
+    fn check_point_projection(flow: ParamFlow, binding: &str) -> TypecheckTestResult {
+        check_with_provider(
+            &format!(
+                r"
+                import ext:host {{ Point, make, touch }};
+                struct Holder {{ @as embed point: Point }}
+                fn main() {{
+                    {binding} holder = Holder {{ point: make() }};
+                    touch(holder);
+                }}
+                "
+            ),
+            point_projection_provider(flow),
+        )
+        .expect("typecheck failed")
+    }
+
+    fn assert_point_projection(result: &TypecheckTestResult) {
+        let (expr_id, fact) = single_expected_projection(result);
+        assert_eq!(fact.path, vec![Ident::new("point")]);
+        let (_, ty) = result
+            .types()
+            .find(|(id, _)| **id == expr_id)
+            .expect("missing projected expression type")
+            .1;
+        let nominal = ty.as_nominal().expect("projected extern type");
+
+        assert_eq!(nominal.kind, NominalKind::Extern);
+        assert_eq!(nominal.name, Ident::new("Point"));
+    }
+
+    #[test]
+    fn extern_value_arg_projects() {
+        let result = check_point_projection(ParamFlow::Value, "let");
+        assert_point_projection(&result);
+        assert_typecheck_closed(&result);
+    }
+
+    #[test]
+    fn extern_borrow_arg_projects() {
+        let result = check_point_projection(ParamFlow::Borrow, "let");
+        assert_point_projection(&result);
+        assert_typecheck_closed(&result);
+    }
+
+    #[test]
+    fn extern_mut_borrow_arg_projects() {
+        let result = check_point_projection(ParamFlow::MutBorrow, "var");
+        assert_point_projection(&result);
+        assert_typecheck_closed(&result);
     }
 }
 

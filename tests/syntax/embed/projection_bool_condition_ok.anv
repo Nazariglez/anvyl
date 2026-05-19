@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Flag {
+    @as embed active: bool,
+}
+
+fn test(flag: Flag) {
+    if flag {}
+    while flag {}
+    let x = flag ? 1 : 2;
+}

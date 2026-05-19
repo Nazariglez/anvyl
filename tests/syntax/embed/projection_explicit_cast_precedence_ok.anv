@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+extend Entity {
+    cast from(enemy: Enemy) { Entity { x: enemy.entity.x + 1 } }
+}
+
+fn test() {
+    let enemy = Enemy { entity: Entity { x: 1 } };
+    let entity: Entity = enemy as Entity;
+}

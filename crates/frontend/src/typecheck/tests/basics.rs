@@ -1,6 +1,7 @@
 use super::support::{
-    assert_err, assert_err_count, assert_single_error, assert_ty, assert_ty_mods, assert_ty_named,
-    assert_typecheck_closed, check, check_mods, check_named, errors,
+    assert_err, assert_err_count, assert_expected_projection, assert_single_error, assert_ty,
+    assert_ty_mods, assert_ty_named, assert_typecheck_closed, check, check_mods, check_named,
+    errors, nominal_struct,
 };
 use crate::{
     ast::{
@@ -10,6 +11,23 @@ use crate::{
     span::SourceSpan,
     typecheck::{ArityError, DeclError, TypeError, type_closure_facts},
 };
+
+#[test]
+fn assignment_records_expected_projection() {
+    let result = check(
+        r"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        fn main() {
+            let enemy = Enemy { entity: Entity { x: 1 } };
+            var entity = Entity { x: 0 };
+            entity = enemy;
+        }
+        ",
+    )
+    .unwrap();
+    assert_expected_projection(&result, &["entity"], nominal_struct("Entity"));
+}
 
 mod storage {
     use crate::{

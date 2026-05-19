@@ -4,11 +4,16 @@ use anvyx_externs::ParamFlow;
 
 use super::{
     ArityError, CheckedType, ExternUseTarget, MemberAccessKind, NominalKey, TypeChecker, TypeError,
-    check_arg_count, check_expr_checked, check_expr_checked_with_hint, check_place,
-    check_value_expr_checked_with_hint, checked_from_type,
+    check_arg_count, check_expected_value_expr_with_mode, check_expr_checked,
+    check_expr_checked_with_hint, check_place, checked_from_type,
     infer::TypeHandle,
     literal::check_unknown_nominal_fields,
-    nominal_type, solve_and_checked_from_handle,
+    nominal_type, place,
+    projection::{
+        ExpectedProjectionDecision, ExpectedProjectionMode, apply_place_projection,
+        expected_projection,
+    },
+    solve_and_checked_from_handle,
     type_ops::{type_closure_facts, type_contains_dyn_value},
 };
 use crate::{
@@ -91,21 +96,54 @@ pub(super) fn check_arg(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut Ty
 
 fn check_arg_borrow(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     let checked = check_place(arg, tc);
-    super::place::record_immutable_borrow(arg.node.id, &checked.value, tc);
-    let checked = checked.into_checked();
-    check_checked_value(arg, &checked, &param.ty, tc)
+    check_projected_place_arg(
+        arg,
+        param,
+        &checked.value,
+        place::record_immutable_borrow,
+        tc,
+    )
+}
+
+fn check_projected_place_arg(
+    arg: &ExprNode,
+    param: &ResolvedExternParam,
+    value: &place::PlaceValue,
+    record: fn(ExprId, &place::PlaceValue, &mut TypeChecker),
+    tc: &mut TypeChecker,
+) -> bool {
+    let source = value.checked.ty.clone();
+    match expected_projection(
+        tc,
+        arg.span,
+        &source,
+        &param.ty.ty,
+        ExpectedProjectionMode::Assignable,
+    ) {
+        ExpectedProjectionDecision::Project(projection) => {
+            let projected = apply_place_projection(tc, arg, value, projection);
+            record(arg.node.id, &projected, tc);
+            check_checked_value(arg, &projected.checked, &param.ty, tc)
+        }
+        ExpectedProjectionDecision::Failed => false,
+        ExpectedProjectionDecision::SourceAccepted | ExpectedProjectionDecision::NotNeeded => {
+            record(arg.node.id, value, tc);
+            check_checked_value(arg, &value.checked, &param.ty, tc)
+        }
+    }
 }
 
 fn check_arg_expr(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
+    let error_count = tc.errors.len();
     let expected = tc.type_handle(&param.ty.ty);
-    let checked = check_value_expr_checked_with_hint(arg, Some(expected), tc);
-    check_checked_value(arg, &checked, &param.ty, tc)
+    let checked =
+        check_expected_value_expr_with_mode(arg, expected, ExpectedProjectionMode::Assignable, tc);
+    check_boundary_value(arg, &checked, &param.ty, tc) && tc.errors.len() == error_count
 }
 
 fn check_arg_place(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     let checked = check_place(arg, tc);
-    let is_mutable = checked.value.access.can_mut_borrow();
-    if !is_mutable {
+    if !checked.value.access.can_mut_borrow() {
         let name = place_error_name(arg, param);
         if let Some(error) = checked
             .value
@@ -114,16 +152,26 @@ fn check_arg_place(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChe
         {
             tc.push_error(error);
         }
+        check_checked_value(arg, &checked.value.checked, &param.ty, tc);
+        return false;
     }
-    if is_mutable {
-        super::place::record_mut_borrow(arg.node.id, &checked.value, tc);
-    }
-    let checked = checked.into_checked();
-    let value_ok = check_checked_value(arg, &checked, &param.ty, tc);
-    is_mutable && value_ok
+
+    check_projected_place_arg(arg, param, &checked.value, place::record_mut_borrow, tc)
 }
 
 pub(super) fn check_checked_value(
+    expr: &ExprNode,
+    checked: &CheckedType,
+    boundary: &ResolvedExternTy,
+    tc: &mut TypeChecker,
+) -> bool {
+    let boundary_ok = check_boundary_value(expr, checked, boundary, tc);
+    let expected = tc.type_handle(&boundary.ty);
+    tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
+    boundary_ok && !tc.solve_constraints()
+}
+
+fn check_boundary_value(
     expr: &ExprNode,
     checked: &CheckedType,
     boundary: &ResolvedExternTy,
@@ -134,11 +182,7 @@ pub(super) fn check_checked_value(
     if !any_ok {
         tc.reject_extern_any_escape(checked, expr.span);
     }
-
-    let expected = tc.type_handle(&boundary.ty);
-    tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
-    let failed = tc.solve_constraints();
-    any_ok && !failed
+    any_ok && !tc.solve_constraints()
 }
 
 pub(super) fn type_fits_boundary(

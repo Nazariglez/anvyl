@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use super::{
-    ArgumentProjectionMap, CallMap, CallableRef, CallableTemplate, ContractWitnessMap, DynCallMap,
-    DynConversionMap, DynDowncastMap, DynWeakeningMap, ExternUseMap, ForStepRuntimeCheckMap,
+    CallMap, CallableRef, CallableTemplate, ContractWitnessMap, DynCallMap, DynConversionMap,
+    DynDowncastMap, DynWeakeningMap, ExpectedProjectionMap, ExternUseMap, ForStepRuntimeCheckMap,
     GenericTypeContext, GlobalAccessMap, MemberPathMap, TypeChecker, TypecheckFacts,
     const_term::ConstTerm,
     decls::CallableId,
@@ -135,7 +135,7 @@ pub(crate) struct SpecializedBodyFacts {
     pub(crate) calls: CallMap,
     pub(crate) extern_uses: ExternUseMap,
     pub(crate) member_paths: MemberPathMap,
-    pub(crate) argument_projections: ArgumentProjectionMap,
+    pub(crate) expected_projections: ExpectedProjectionMap,
     pub(crate) contract_witnesses: ContractWitnessMap,
     pub(crate) dyn_conversions: DynConversionMap,
     pub(crate) dyn_weakenings: DynWeakeningMap,
@@ -205,7 +205,7 @@ pub(super) fn specialized_body_facts(
         calls: map_delta(&old.calls, &current.calls),
         extern_uses: map_delta(&old.extern_uses, &current.extern_uses),
         member_paths: map_delta(&old.member_paths, &current.member_paths),
-        argument_projections: map_delta(&old.argument_projections, &current.argument_projections),
+        expected_projections: map_delta(&old.expected_projections, &current.expected_projections),
         contract_witnesses: map_delta(&old.contract_witnesses, &current.contract_witnesses),
         dyn_conversions: map_delta(&old.dyn_conversions, &current.dyn_conversions),
         dyn_weakenings: map_delta(&old.dyn_weakenings, &current.dyn_weakenings),
@@ -344,7 +344,7 @@ impl TypeChecker {
             calls: self.calls.clone(),
             extern_uses: self.extern_uses.clone(),
             member_paths: self.member_paths.clone(),
-            argument_projections: self.argument_projections.clone(),
+            expected_projections: self.expected_projections.clone(),
             contract_witnesses: self.contract_witnesses.clone(),
             dyn_conversions: self.dyn_conversions.clone(),
             dyn_weakenings: self.dyn_weakenings.clone(),
@@ -362,12 +362,8 @@ impl TypeChecker {
         }
         self.calls.extend(facts.calls);
         self.extern_uses.extend(facts.extern_uses);
-        for fact in facts.member_paths.into_values() {
-            self.record_member_path(fact);
-        }
-        for fact in facts.argument_projections.into_values() {
-            self.record_argument_projection(fact);
-        }
+        self.member_paths.extend(facts.member_paths);
+        self.expected_projections.extend(facts.expected_projections);
         for fact in facts.contract_witnesses.into_values() {
             self.next_witness_id = self.next_witness_id.max(fact.id.0 + 1);
             self.witness_keys.insert(fact.key.clone(), fact.id);

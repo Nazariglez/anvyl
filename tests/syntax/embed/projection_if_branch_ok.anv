@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+fn test(cond: bool, enemy: Enemy, other: Entity) {
+    let entity: Entity = if cond { enemy } else { other };
+}

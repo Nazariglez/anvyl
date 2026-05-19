@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: no direct `@as embed` projection from 'Enemy' to 'Entity'; pass stored path entity
+// @contains: no direct `@as embed` projection from 'Enemy' to 'Entity'; use stored path entity explicitly
 
 struct Entity {
     x: int,
@@ -11,7 +11,7 @@ struct Enemy {
     entity: Entity,
 }
 
-fn move_entity(var entity: as Entity) {}
+fn move_entity(var entity: Entity) {}
 
 fn test() {
     var enemy = Enemy { entity: Entity { x: 1 } };

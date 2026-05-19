@@ -3,6 +3,10 @@ use super::{
     DynWeakeningFact, EscapeMode, TypeChecker, TypeError, TypeHandle,
     check_value_expr_checked_with_hint, checked_from_type,
     contracts::{self, ContractMatchError, RequirementError},
+    projection::{
+        ExpectedProjectionDecision, ExpectedProjectionMode, apply_value_projection,
+        expected_projection,
+    },
     type_ops::TypeVisitor,
 };
 use crate::{
@@ -49,6 +53,13 @@ impl TypeChecker {
         }
         self.cast_from_conversion_escape(source, target)
             .map(|escape| ExplicitCast::CastFrom { escape })
+    }
+
+    pub(super) fn explicit_cast_without_effects(&mut self, source: &Type, target: &Type) -> bool {
+        let used_imports = self.used_imports.clone();
+        let ok = self.explicit_cast_conversion(source, target).is_some();
+        self.used_imports = used_imports;
+        ok
     }
 
     pub(super) fn cast_from_conversion_escape(
@@ -388,29 +399,64 @@ pub(super) fn check_cast_expr(
 ) -> CheckedType {
     let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
     let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
-    let from = checked.ty;
-    let conversion = tc.explicit_cast_conversion(&from, &target);
+    let from = checked.ty.clone();
+    if let Some(conversion) = tc.explicit_cast_conversion(&from, &target) {
+        apply_explicit_cast_effects(expr, cast, conversion, tc);
+        return cast_expr_checked(expr, target, checked.contains_extern_any, tc);
+    }
+    if matches!(from, Type::Infer) || matches!(target, Type::Infer) {
+        return cast_expr_checked(expr, target, checked.contains_extern_any, tc);
+    }
+    match expected_projection(
+        tc,
+        cast.node.expr.span,
+        &from,
+        &target,
+        ExpectedProjectionMode::ExplicitCast,
+    ) {
+        ExpectedProjectionDecision::Project(projection) => {
+            let projected =
+                apply_value_projection(tc, &cast.node.expr, &checked, &from, projection);
+            if let Some(conversion) = tc.explicit_cast_conversion(&projected.ty, &target) {
+                apply_explicit_cast_effects(expr, cast, conversion, tc);
+                return cast_expr_checked(expr, target, projected.contains_extern_any, tc);
+            }
+        }
+        ExpectedProjectionDecision::Failed => {
+            return cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc);
+        }
+        ExpectedProjectionDecision::SourceAccepted | ExpectedProjectionDecision::NotNeeded => {}
+    }
+    tc.push_error(TypeError::InvalidCast {
+        from,
+        to: target,
+        span: tc.error_span(cast.span),
+    });
+    cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
+}
+
+fn apply_explicit_cast_effects(
+    expr: &ExprNode,
+    cast: &CastNode,
+    conversion: ExplicitCast,
+    tc: &mut TypeChecker,
+) {
     match conversion {
-        Some(ExplicitCast::Identity) => tc
+        ExplicitCast::Identity => tc
             .closure
             .copy_expr_flow(cast.node.expr.node.id, expr.node.id),
-        Some(ExplicitCast::CastFrom { escape }) => {
-            tc.check_argument_escape(&cast.node.expr, escape);
-        }
-        Some(ExplicitCast::Builtin) | None => {}
+        ExplicitCast::CastFrom { escape } => tc.check_argument_escape(&cast.node.expr, escape),
+        ExplicitCast::Builtin => {}
     }
-    let ty = if conversion.is_some() || matches!(from, Type::Infer) || matches!(target, Type::Infer)
-    {
-        target
-    } else {
-        tc.push_error(TypeError::InvalidCast {
-            from,
-            to: target,
-            span: tc.error_span(cast.span),
-        });
-        Type::Infer
-    };
+}
+
+fn cast_expr_checked(
+    expr: &ExprNode,
+    ty: Type,
+    contains_extern_any: bool,
+    tc: &mut TypeChecker,
+) -> CheckedType {
     let mut casted = checked_from_type(expr, ty, tc);
-    casted.contains_extern_any = checked.contains_extern_any;
+    casted.contains_extern_any = contains_extern_any;
     casted
 }

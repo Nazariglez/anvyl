@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: accessing internal field 'entity' of type 'Enemy'
+
+import lib { Entity, enemy };
+
+fn move_entity(var entity: Entity) {
+    entity.x += 1;
+}
+
+fn test() {
+    var e = enemy();
+    move_entity(e);
+}

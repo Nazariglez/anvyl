@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected `int`
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+fn test() {
+    let enemy = Enemy { entity: Entity { x: 1 } };
+    let range: Range<int> = enemy..enemy;
+}

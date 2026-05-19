@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     ast::{
-        AggregateDeclNode, BlockNode, ConstValue, ExprId, ExprKind, ExprNode, ExtendDeclNode, Func,
+        AggregateDeclNode, BlockNode, ConstValue, ExprKind, ExprNode, ExtendDeclNode, Func,
         FuncNode, FuncParam, Ident, MethodReceiver, Mutability, Param, Pattern, PatternHead,
         PatternNode, Program, ReturnAccess, ReturnSpec, Stmt, StmtNode, StructDecl, Type,
         TypeAliasDeclNode, Visibility,
@@ -90,10 +90,6 @@ impl CallableBody<'_> {
         }
     }
 
-    fn value_expr_id(&self) -> Option<ExprId> {
-        self.value_expr().map(|expr| expr.node.id)
-    }
-
     fn value_expr(&self) -> Option<&ExprNode> {
         match self {
             Self::Block(block) => block.node.tail.as_deref(),
@@ -104,8 +100,22 @@ impl CallableBody<'_> {
     fn check_with_hint(&self, expected: Option<TypeHandle>, tc: &mut TypeChecker) -> CheckedType {
         match self {
             Self::Block(block) => check_block_checked_with_hint(block, expected, tc),
-            Self::Expr(expr) => check_expr_checked_with_hint(expr, expected, tc),
+            Self::Expr(expr) => check_tail_expr_with_hint(expr, expected, tc),
         }
+    }
+}
+
+fn check_tail_expr_with_hint(
+    expr: &ExprNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if control_flow::expr_diverges(expr) {
+        return check_expr_checked_with_hint(expr, None, tc);
+    }
+    match expected {
+        Some(expected) => super::check_expected_value_expr(expr, expected, tc),
+        None => check_expr_checked_with_hint(expr, None, tc),
     }
 }
 
@@ -1097,7 +1107,7 @@ pub(super) fn check_block_checked_with_hint(
         check_stmt(stmt, local_const, tc);
     }
     let checked = match &block.node.tail {
-        Some(expr) => check_expr_checked_with_hint(expr, expected, tc),
+        Some(expr) => check_tail_expr_with_hint(expr, expected, tc),
         None => checked_void(tc),
     };
     tc.pop_scope();
@@ -1237,20 +1247,8 @@ fn finish_callable_body_value_return(
         tc.record_escaping_use(expr);
     }
     tc.reject_extern_any_escape(checked, body.span());
-    match expected_ret {
-        Some(ret) => {
-            let ret_handle = tc.type_handle(&ret.ty);
-            match body.value_expr_id() {
-                Some(expr_id) => tc.expect_assignable_expr(
-                    body.span(),
-                    expr_id,
-                    checked.handle.clone(),
-                    ret_handle,
-                ),
-                None => tc.expect_assignable(body.span(), checked.handle.clone(), ret_handle),
-            }
-        }
-        None => tc.push_inferred_return(body.span(), checked.handle.clone()),
+    if expected_ret.is_none() {
+        tc.push_inferred_return(body.span(), checked.handle.clone());
     }
 }
 

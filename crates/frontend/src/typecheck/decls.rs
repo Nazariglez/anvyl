@@ -1313,17 +1313,6 @@ pub(crate) struct ProjectionEntry {
     pub(crate) field_span: SourceSpan,
 }
 
-pub(crate) enum ProjectionLookup {
-    Match(ProjectionEntry),
-    Missing,
-    Conflict(ProjectionConflict),
-}
-
-pub(crate) struct ProjectionConflict {
-    pub(crate) target: Type,
-    pub(crate) paths: Vec<Vec<Ident>>,
-}
-
 #[derive(Clone)]
 pub(crate) struct TypeAliasDef {
     pub(crate) module: ModuleScope,
@@ -3219,21 +3208,8 @@ impl DeclarationIndex {
         self.aggregates.get_mut(key)
     }
 
-    pub(crate) fn projection_from(&self, source: &Type, target: &Type) -> ProjectionLookup {
-        let entries = self.projections_from(source);
-        let target = CanonicalTypeKey(target.clone());
-        let matches = entries
-            .into_iter()
-            .filter(|entry| entry.target == target)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [] => ProjectionLookup::Missing,
-            [entry] => ProjectionLookup::Match(entry.clone()),
-            _ => ProjectionLookup::Conflict(ProjectionConflict {
-                target: target.0,
-                paths: matches.into_iter().map(|entry| entry.field_path).collect(),
-            }),
-        }
+    pub(crate) fn direct_projections_from(&self, source: &Type) -> Vec<ProjectionEntry> {
+        self.projections_from(source)
     }
 
     pub(crate) fn chained_projection_from(
@@ -3241,12 +3217,16 @@ impl DeclarationIndex {
         source: &Type,
         target: &Type,
     ) -> Option<ProjectionEntry> {
-        self.projections_from(source).into_iter().find(|entry| {
-            matches!(
-                self.projection_from(&entry.target_ty, target),
-                ProjectionLookup::Match(_)
-            )
-        })
+        self.direct_projections_from(source)
+            .into_iter()
+            .find(|entry| self.has_direct_projection_to(&entry.target_ty, target))
+    }
+
+    fn has_direct_projection_to(&self, source: &Type, target: &Type) -> bool {
+        let target = CanonicalTypeKey(target.clone());
+        self.direct_projections_from(source)
+            .into_iter()
+            .any(|entry| entry.target == target)
     }
 
     pub(crate) fn field_paths_to_type(&self, source: &Type, target: &Type) -> Vec<Vec<Ident>> {

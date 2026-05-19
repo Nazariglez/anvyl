@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: no direct `@as embed` projection from 'Enemy' to 'Entity'; use stored path entity explicitly
+
+struct Entity { x: int }
+struct Enemy { entity: Entity }
+
+fn test() {
+    let enemy = Enemy { entity: Entity { x: 1 } };
+    let entity: Entity = enemy;
+}

@@ -10,11 +10,12 @@ struct Enemy {
     @as embed entity: Entity,
 }
 
-fn move_entity(var entity: as Entity, dx: int) {
-    entity.x += dx;
+fn make_enemy() -> Enemy {
+    Enemy { entity: Entity { x: 1 } }
 }
 
+fn take(entity: Entity) {}
+
 fn test() {
-    var enemy = Enemy { entity: Entity { x: 1 } };
-    move_entity(enemy, 2);
+    take(make_enemy());
 }

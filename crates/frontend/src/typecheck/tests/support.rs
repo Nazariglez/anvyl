@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{ExprId, Ident, Type},
+    ast::{ExprId, Ident, NominalKind, Type},
     diagnostic::DiagnosticTag,
     externs::{self, RawExterns, catalog::ExternCatalog},
     lint::{LintEvent, LintId},
     span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
     typecheck::{
-        self, ArgumentProjectionMap, BindingPromotionMap, CallMap, CompileWarning,
-        ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap, DynDowncastMap,
-        DynWeakeningMap, ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap,
+        self, BindingPromotionMap, CallMap, CompileWarning, ContractWitnessMap, DeprecatedUseKind,
+        DynCallMap, DynConversionMap, DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact,
+        ExpectedProjectionMap, ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap,
         MemberPathMap, TypeError, TypecheckFacts, decls::DeclarationIndex,
     },
 };
@@ -20,7 +20,7 @@ pub(crate) struct TypecheckTestResult {
     calls: CallMap,
     extern_uses: ExternUseMap,
     member_paths: MemberPathMap,
-    argument_projections: ArgumentProjectionMap,
+    expected_projections: ExpectedProjectionMap,
     contract_witnesses: ContractWitnessMap,
     dyn_conversions: DynConversionMap,
     dyn_weakenings: DynWeakeningMap,
@@ -51,8 +51,8 @@ impl TypecheckTestResult {
         &self.member_paths
     }
 
-    pub(crate) fn argument_projections(&self) -> &ArgumentProjectionMap {
-        &self.argument_projections
+    pub(crate) fn expected_projections(&self) -> &ExpectedProjectionMap {
+        &self.expected_projections
     }
 
     pub(crate) fn contract_witnesses(&self) -> &ContractWitnessMap {
@@ -110,6 +110,47 @@ impl TypecheckTestResult {
     pub(crate) fn externs(&self) -> &ExternCatalog {
         &self.externs
     }
+}
+
+pub(crate) fn nominal_struct(name: &str) -> Type {
+    Type::nominal(NominalKind::Struct, Ident::new(name), vec![], vec![], None)
+}
+
+pub(crate) fn single_expected_projection(
+    result: &TypecheckTestResult,
+) -> (ExprId, &ExpectedProjectionFact) {
+    assert_eq!(result.expected_projections().len(), 1);
+    let (&expr_id, fact) = result
+        .expected_projections()
+        .iter()
+        .next()
+        .expect("missing projection fact");
+    assert_eq!(fact.expr_id, expr_id);
+    (expr_id, fact)
+}
+
+pub(crate) fn assert_expected_projection(
+    result: &TypecheckTestResult,
+    path: &[&str],
+    target_ty: Type,
+) -> ExprId {
+    let (expr_id, fact) = single_expected_projection(result);
+    let path = path
+        .iter()
+        .map(|name| Ident::new(*name))
+        .collect::<Vec<_>>();
+    assert_eq!(fact.path, path);
+    assert_eq!(fact.target_ty, target_ty);
+    expr_id
+}
+
+pub(crate) fn assert_expr_type(result: &TypecheckTestResult, expr_id: ExprId, expected: &Type) {
+    let (_, ty) = result
+        .types()
+        .find(|(id, _)| **id == expr_id)
+        .expect("missing expression type")
+        .1;
+    assert_eq!(ty, expected);
 }
 
 pub(crate) fn assert_deprecated_warning(
@@ -208,7 +249,7 @@ pub(crate) fn check_with_raw_externs(
         calls: tc.calls,
         extern_uses: tc.extern_uses,
         member_paths: tc.member_paths,
-        argument_projections: tc.argument_projections,
+        expected_projections: tc.expected_projections,
         contract_witnesses: tc.contract_witnesses,
         dyn_conversions: tc.dyn_conversions,
         dyn_weakenings: tc.dyn_weakenings,

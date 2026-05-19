@@ -88,6 +88,7 @@ mod member;
 mod pattern;
 mod place;
 mod postfix;
+mod projection;
 mod result;
 mod semantic_use;
 mod surface;
@@ -337,6 +338,11 @@ pub(crate) enum TypeError {
         expected: Type,
         span: Option<SourceSpan>,
     },
+    MatchArmTypeMismatch {
+        expected: Type,
+        found: Type,
+        span: Option<SourceSpan>,
+    },
     IfWithoutElseValue {
         span: Option<SourceSpan>,
     },
@@ -453,11 +459,6 @@ pub(crate) enum TypeError {
         span: Option<SourceSpan>,
     },
     NestedOptionalPattern {
-        span: Option<SourceSpan>,
-    },
-    MatchArmTypeMismatch {
-        expected: Type,
-        found: Type,
         span: Option<SourceSpan>,
     },
     RequiresUnwrappingPattern {
@@ -1039,7 +1040,8 @@ struct TypeChecker {
     calls: CallMap,
     extern_uses: ExternUseMap,
     member_paths: MemberPathMap,
-    argument_projections: ArgumentProjectionMap,
+    expected_projections: ExpectedProjectionMap,
+    expr_places: HashMap<ExprId, place::PlaceValue>,
     contract_witnesses: ContractWitnessMap,
     witness_keys: HashMap<ContractWitnessKey, WitnessId>,
     dyn_conversions: DynConversionMap,
@@ -1094,7 +1096,8 @@ impl TypeChecker {
             calls: HashMap::new(),
             extern_uses: HashMap::new(),
             member_paths: HashMap::new(),
-            argument_projections: HashMap::new(),
+            expected_projections: HashMap::new(),
+            expr_places: HashMap::new(),
             contract_witnesses: HashMap::new(),
             witness_keys: HashMap::new(),
             dyn_conversions: HashMap::new(),
@@ -1686,9 +1689,16 @@ impl TypeChecker {
         self.member_paths.insert(fact.expr_id, fact);
     }
 
-    pub(crate) fn record_argument_projection(&mut self, fact: ArgumentProjectionFact) {
-        self.argument_projections
-            .insert((fact.call_id, fact.arg_index), fact);
+    pub(crate) fn record_expected_projection(&mut self, fact: ExpectedProjectionFact) {
+        self.expected_projections.insert(fact.expr_id, fact);
+    }
+
+    fn record_expr_place(&mut self, expr_id: ExprId, value: &place::PlaceValue) {
+        self.expr_places.insert(expr_id, value.clone());
+    }
+
+    fn expr_place(&self, expr_id: ExprId) -> Option<place::PlaceValue> {
+        self.expr_places.get(&expr_id).cloned()
     }
 
     fn record_contract_witness(&mut self, key: ContractWitnessKey, span: Span) -> WitnessId {
@@ -2498,8 +2508,13 @@ pub(in crate::typecheck) fn check_value_expr_checked_with_hint(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
+    let expected_void = expected
+        .as_ref()
+        .is_some_and(|expected| tc.handle_type(expected).is_void());
     let checked = check_expr_checked_with_hint(expr, expected, tc);
-    reject_if_without_else_value(expr, tc);
+    if !expected_void {
+        reject_if_without_else_value(expr, tc);
+    }
     checked
 }
 
@@ -2557,7 +2572,151 @@ fn solve_and_checked_from_handle(
     checked_from_handle(expr, handle, tc)
 }
 
-fn check_expected(expr: &ExprNode, expected: TypeHandle, tc: &mut TypeChecker) -> CheckedType {
+pub(in crate::typecheck) fn check_expected_value_expr(
+    expr: &ExprNode,
+    expected: TypeHandle,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    check_expected_value_expr_with_mode(
+        expr,
+        expected,
+        projection::ExpectedProjectionMode::Assignable,
+        tc,
+    )
+}
+
+pub(in crate::typecheck) fn check_expected_value_expr_with_mode(
+    expr: &ExprNode,
+    expected: TypeHandle,
+    mode: projection::ExpectedProjectionMode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    check_expected_value_expr_inner(expr, expected, mode, true, tc)
+}
+
+fn check_expected_value_expr_deferred(
+    expr: &ExprNode,
+    expected: TypeHandle,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    check_expected_value_expr_inner(
+        expr,
+        expected,
+        projection::ExpectedProjectionMode::Assignable,
+        false,
+        tc,
+    )
+}
+
+fn check_expected_value_expr_inner(
+    expr: &ExprNode,
+    expected: TypeHandle,
+    mode: projection::ExpectedProjectionMode,
+    enforce: bool,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let error_count = tc.errors.len();
+    let hint = (!matches!(expr.node.kind, ExprKind::Ident(_))).then(|| expected.clone());
+    let mut checked = check_value_expr_checked_with_hint(expr, hint, tc);
+    let target = tc.handle_type(&expected);
+    let hint_span = tc.error_span(expr.span);
+    let projection_source = projection_hint_mismatch_found(error_count, &target, hint_span, tc)
+        .unwrap_or_else(|| checked.ty.clone());
+    let accepted =
+        match projection::expected_projection(tc, expr.span, &projection_source, &target, mode) {
+            projection::ExpectedProjectionDecision::SourceAccepted
+            | projection::ExpectedProjectionDecision::NotNeeded => {
+                if !enforce {
+                    drop_projection_hint_mismatches(error_count, &target, hint_span, tc);
+                }
+                true
+            }
+            projection::ExpectedProjectionDecision::Project(projection) => {
+                drop_projection_hint_mismatches(error_count, &target, hint_span, tc);
+                checked = projection::apply_value_projection(
+                    tc,
+                    expr,
+                    &checked,
+                    &projection_source,
+                    projection,
+                );
+                true
+            }
+            projection::ExpectedProjectionDecision::Failed => {
+                drop_projection_hint_mismatches(error_count, &target, hint_span, tc);
+                false
+            }
+        };
+    if accepted && enforce {
+        tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
+    }
+    checked
+}
+
+fn projection_hint_mismatch_found(
+    old_error_count: usize,
+    expected: &Type,
+    span: Option<SourceSpan>,
+    tc: &TypeChecker,
+) -> Option<Type> {
+    tc.errors[old_error_count..]
+        .iter()
+        .rev()
+        .find_map(|err| hint_error_found_type(err, expected, span, tc))
+}
+
+fn hint_error_found_type(
+    err: &TypeError,
+    expected: &Type,
+    span: Option<SourceSpan>,
+    tc: &TypeChecker,
+) -> Option<Type> {
+    match err {
+        TypeError::TypeMismatch {
+            expected: err_expected,
+            found,
+            span: err_span,
+        } if err_expected == expected && *err_span == span => Some(found.clone()),
+        TypeError::ContractUnsatisfied {
+            ty,
+            contract,
+            span: err_span,
+            ..
+        } if expected_dyn_contract(expected, tc).as_deref() == Some(contract.as_str())
+            && *err_span == span =>
+        {
+            Some(ty.clone())
+        }
+        _ => None,
+    }
+}
+
+fn expected_dyn_contract(expected: &Type, tc: &TypeChecker) -> Option<String> {
+    match expected {
+        Type::Dyn(contract) => Some(contract.to_string()),
+        expected => match tc.decls.semantic_option_inner(expected)? {
+            Type::Dyn(contract) => Some(contract.to_string()),
+            _ => None,
+        },
+    }
+}
+
+fn drop_projection_hint_mismatches(
+    old_error_count: usize,
+    expected: &Type,
+    span: Option<SourceSpan>,
+    tc: &mut TypeChecker,
+) {
+    let mut new_errors = tc.errors.split_off(old_error_count);
+    new_errors.retain(|err| hint_error_found_type(err, expected, span, tc).is_none());
+    tc.errors.extend(new_errors);
+}
+
+fn check_unprojected_expected(
+    expr: &ExprNode,
+    expected: TypeHandle,
+    tc: &mut TypeChecker,
+) -> CheckedType {
     let checked = check_value_expr_checked_with_hint(expr, Some(expected.clone()), tc);
     tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
     checked
@@ -2665,7 +2824,7 @@ fn check_expr_checked_with_hint(
                     tc.warn_named_value_deprecated(&value, value_name, expr.span);
                 }
                 let fallback = tc.solver.local_type_to_type(info.type_id);
-                if fallback != Type::Infer || info.const_value.is_some() {
+                let checked = if fallback != Type::Infer || info.const_value.is_some() {
                     checked_from_handle(expr, tc.local_handle(info.type_id), tc)
                 } else {
                     match tc.eval_visible_const(*name, expr.span) {
@@ -2678,7 +2837,13 @@ fn check_expr_checked_with_hint(
                         }
                         None => checked_from_handle(expr, tc.local_handle(info.type_id), tc),
                     }
-                }
+                };
+                let mut place =
+                    place::PlaceValue::new(checked.clone(), access.access, access.facts);
+                place.identity = access.identity;
+                place.root_name = Some(*name);
+                tc.record_expr_place(expr.node.id, &place);
+                checked
             }
             LocalSymbolLookup::Found(LocalSymbol::Callable(info), _) => {
                 match info.value_error(*name, tc.error_span(expr.span)) {
@@ -2699,6 +2864,7 @@ fn check_expr_checked_with_hint(
                     if let ValueDecl::Global(sig) = &value {
                         let checked = checked_from_handle(expr, tc.global_handle(&sig.key), tc);
                         let value = place::global_value(sig, checked);
+                        tc.record_expr_place(expr.node.id, &value);
                         place::record_value_read(expr.node.id, &value, tc);
                         return value.checked;
                     }
@@ -3633,15 +3799,37 @@ fn condition_not_bool(kind: ConditionKind, found: Type, span: Option<SourceSpan>
     }
 }
 
-fn check_bool_condition(kind: ConditionKind, cond: CheckedType, span: Span, tc: &mut TypeChecker) {
+fn check_bool_condition(
+    kind: ConditionKind,
+    expr: &ExprNode,
+    cond: CheckedType,
+    tc: &mut TypeChecker,
+) {
     if cond.ty.is_bool() {
         return;
     }
     if cond.ty == Type::Infer {
         let bool_handle = tc.type_handle(&Type::Bool);
-        tc.expect_assignable(span, cond.handle, bool_handle);
-    } else {
-        tc.push_error(condition_not_bool(kind, cond.ty, tc.error_span(span)));
+        tc.expect_assignable(expr.span, cond.handle, bool_handle);
+        return;
+    }
+    let target = Type::Bool;
+    match projection::expected_projection(
+        tc,
+        expr.span,
+        &cond.ty,
+        &target,
+        projection::ExpectedProjectionMode::Assignable,
+    ) {
+        projection::ExpectedProjectionDecision::Project(projection) => {
+            let source_ty = cond.ty.clone();
+            projection::apply_value_projection(tc, expr, &cond, &source_ty, projection);
+        }
+        projection::ExpectedProjectionDecision::Failed => {}
+        projection::ExpectedProjectionDecision::SourceAccepted
+        | projection::ExpectedProjectionDecision::NotNeeded => {
+            tc.push_error(condition_not_bool(kind, cond.ty, tc.error_span(expr.span)));
+        }
     }
 }
 
@@ -3659,8 +3847,6 @@ fn checked_branch_against_expected(
     let Some(expected) = expected else {
         return branch.checked;
     };
-    tc.expect_assignable(branch.span, branch.checked.handle, expected.clone());
-    tc.solve_constraints();
     CheckedType {
         ty: tc.handle_type(&expected),
         handle: expected,
@@ -3682,9 +3868,6 @@ fn join_branches_with_hint(
             if let Some(expected) = expected {
                 let contains_extern_any =
                     left.checked.contains_extern_any || right.checked.contains_extern_any;
-                tc.expect_assignable(left.span, left.checked.handle, expected.clone());
-                tc.expect_assignable(right.span, right.checked.handle, expected.clone());
-                tc.solve_constraints();
                 return CheckedType {
                     ty: tc.handle_type(&expected),
                     handle: expected,
@@ -3703,7 +3886,7 @@ fn check_if_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let cond = check_expr_checked(&if_node.node.cond, tc);
-    check_bool_condition(ConditionKind::If, cond, if_node.node.cond.span, tc);
+    check_bool_condition(ConditionKind::If, &if_node.node.cond, cond, tc);
     let known_cond = intrinsic_bool_value(&if_node.node.cond, tc);
     let Some(else_block) = &if_node.node.else_block else {
         if known_cond != Some(false) {
@@ -3747,18 +3930,18 @@ fn check_ternary_checked_with_hint(
 ) -> CheckedType {
     let node = &ternary_node.node;
     let cond = check_expr_checked(&node.cond, tc);
-    check_bool_condition(ConditionKind::Ternary, cond, node.cond.span, tc);
+    check_bool_condition(ConditionKind::Ternary, &node.cond, cond, tc);
     let known_cond = intrinsic_bool_value(&node.cond, tc);
     if known_cond == Some(true) {
-        return check_value_expr_checked_with_hint(&node.then_expr, expected, tc);
+        return check_value_branch_with_hint(&node.then_expr, expected, tc);
     }
     if known_cond == Some(false) {
-        return check_value_expr_checked_with_hint(&node.else_expr, expected, tc);
+        return check_value_branch_with_hint(&node.else_expr, expected, tc);
     }
     let (then, else_checked) = closure::check_closure_flow_branches(
         tc,
-        |tc| check_value_expr_checked_with_hint(&node.then_expr, expected.clone(), tc),
-        |tc| check_value_expr_checked_with_hint(&node.else_expr, expected.clone(), tc),
+        |tc| check_value_branch_with_hint(&node.then_expr, expected.clone(), tc),
+        |tc| check_value_branch_with_hint(&node.else_expr, expected.clone(), tc),
     );
     join_branches_with_hint(
         expected,
@@ -3774,6 +3957,28 @@ fn check_ternary_checked_with_hint(
         },
         tc,
     )
+}
+
+fn check_value_branch_with_hint(
+    expr: &ExprNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match expected {
+        Some(expected) => check_expected_value_expr(expr, expected, tc),
+        None => check_value_expr_checked_with_hint(expr, None, tc),
+    }
+}
+
+fn check_match_arm_body_with_hint(
+    expr: &ExprNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match expected {
+        Some(expected) => check_expected_value_expr_deferred(expr, expected, tc),
+        None => check_value_expr_checked_with_hint(expr, None, tc),
+    }
 }
 
 fn expected_assignable_type(expected: Option<&TypeHandle>, tc: &TypeChecker) -> Option<Type> {
@@ -3815,22 +4020,11 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
 
     match assign_op_to_binary_op(assign.node.op) {
         None => {
-            let value = check_expr_checked_with_hint(
-                &assign.node.value,
-                Some(target.checked().handle.clone()),
-                tc,
-            );
+            let value =
+                check_expected_value_expr(&assign.node.value, target.checked().handle.clone(), tc);
             let function_value = matches!(value.ty, Type::Func { .. });
             if !target.accepts_extern_any() {
                 tc.reject_extern_any_escape(&value, assign.node.value.span);
-            }
-            if !target.checked().ty.is_void() && !value.ty.is_void() {
-                tc.expect_assignable_expr(
-                    assign.node.value.span,
-                    assign.node.value.node.id,
-                    value.handle,
-                    target.checked().handle.clone(),
-                );
             }
             if target.value.access.can_assign() {
                 sync_assigned_flow(&assign.node.target, &assign.node.value, function_value, tc);
@@ -3913,7 +4107,7 @@ fn check_match_checked_with_hint(
     let mode = mode_for_head(node.head);
     let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
     let mut outcomes = Vec::with_capacity(node.arms.len());
-    let arms = check_match_arm_bodies(&node.arms, expected, tc, |arm, expected, tc| {
+    let arms = check_match_arm_bodies(&node.arms, expected.clone(), tc, |arm, expected, tc| {
         tc.push_scope();
         let outcome = match_check::check_arm_head(
             &arm.node.head,
@@ -3925,13 +4119,13 @@ fn check_match_checked_with_hint(
             node.scrutinee.node.id,
             tc,
         );
-        let body = check_expr_checked_with_hint(&arm.node.body, expected, tc);
+        let body = check_match_arm_body_with_hint(&arm.node.body, expected, tc);
         tc.pop_scope();
         outcomes.push(outcome);
         body
     });
     match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
-    finish_match_arms(arms, tc)
+    finish_match_arms_with_expected(arms, expected, tc)
 }
 
 fn check_dynamic_match_checked_with_hint(
@@ -3950,7 +4144,7 @@ fn check_dynamic_match_checked_with_hint(
     let valid_arms = match_check::validate_dynamic_arms(&node.arms, tc);
     let source = match_check::check_dynamic_source(node, tc);
     let mut targets = vec![];
-    let arms = check_match_arm_bodies(&node.arms, expected, tc, |arm, expected, tc| {
+    let arms = check_match_arm_bodies(&node.arms, expected.clone(), tc, |arm, expected, tc| {
         if valid_arms {
             match_check::with_dynamic_arm(
                 arm,
@@ -3958,15 +4152,15 @@ fn check_dynamic_match_checked_with_hint(
                 node.scrutinee.node.id,
                 &mut targets,
                 tc,
-                |tc| check_expr_checked_with_hint(&arm.node.body, expected, tc),
+                |tc| check_match_arm_body_with_hint(&arm.node.body, expected, tc),
             )
         } else {
             match_check::with_dynamic_arm_recovery(arm, tc, |tc| {
-                check_expr_checked_with_hint(&arm.node.body, expected, tc)
+                check_match_arm_body_with_hint(&arm.node.body, expected, tc)
             })
         }
     });
-    finish_match_arms(arms, tc)
+    finish_match_arms_with_expected(arms, expected, tc)
 }
 
 fn check_match_arm_bodies(
@@ -3975,14 +4169,22 @@ fn check_match_arm_bodies(
     tc: &mut TypeChecker,
     mut check_arm: impl FnMut(&MatchArmNode, Option<TypeHandle>, &mut TypeChecker) -> CheckedType,
 ) -> Vec<(Span, CheckedType)> {
-    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
     let flow = tc.closure.closure_flow_snapshot();
     let mut arm_flows = Vec::with_capacity(arms.len());
     let mut checked = Vec::with_capacity(arms.len());
     for arm in arms {
         tc.closure.restore_closure_flow(&flow);
+        let error_count = tc.errors.len();
         let body = check_arm(arm, expected.clone(), tc);
-        check_match_arm_expected(&body, expected_ty.as_ref(), arm.node.body.span, tc);
+        if tc.errors.len() == error_count {
+            check_match_arm_expected(
+                &body,
+                arm.node.body.node.id,
+                expected.as_ref(),
+                arm.node.body.span,
+                tc,
+            );
+        }
         arm_flows.push(tc.closure.closure_flow_snapshot());
         checked.push((arm.node.body.span, body));
     }
@@ -3996,20 +4198,49 @@ fn check_match_arm_bodies(
 
 fn check_match_arm_expected(
     body: &CheckedType,
-    expected: Option<&Type>,
+    expr_id: ExprId,
+    expected: Option<&TypeHandle>,
     span: Span,
     tc: &mut TypeChecker,
 ) {
     let Some(expected) = expected else {
         return;
     };
-    if !body.ty.is_void() && !matches!(body.ty, Type::Infer) && body.ty != *expected {
-        tc.push_error(TypeError::MatchArmTypeMismatch {
-            expected: expected.clone(),
-            found: body.ty.clone(),
-            span: tc.error_span(span),
-        });
+    let expected_ty = tc.handle_type(expected);
+    if body.ty.is_void() || matches!(body.ty, Type::Infer) {
+        return;
     }
+    if projection::satisfies_without_effects(
+        tc,
+        span,
+        &body.ty,
+        &expected_ty,
+        projection::ExpectedProjectionMode::Assignable,
+    ) {
+        tc.expect_assignable_expr(span, expr_id, body.handle.clone(), expected.clone());
+        return;
+    }
+    tc.push_error(TypeError::MatchArmTypeMismatch {
+        expected: expected_ty.clone(),
+        found: body.ty.clone(),
+        span: tc.error_span(span),
+    });
+}
+
+fn finish_match_arms_with_expected(
+    arms: Vec<(Span, CheckedType)>,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if let Some(expected) = expected {
+        let contains_extern_any = arms.iter().any(|(_, arm)| arm.contains_extern_any);
+        return CheckedType {
+            ty: tc.handle_type(&expected),
+            handle: expected,
+            contains_extern_any,
+        };
+    }
+    finish_match_arms(arms, tc)
 }
 
 fn finish_match_arms(arms: Vec<(Span, CheckedType)>, tc: &mut TypeChecker) -> CheckedType {

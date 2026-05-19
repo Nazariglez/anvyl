@@ -1248,6 +1248,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::ForMutableMapEntry { span, .. }
         | TypeError::InvalidOperand { span, .. }
         | TypeError::MissingReturn { span, .. }
+        | TypeError::MatchArmTypeMismatch { span, .. }
         | TypeError::IfWithoutElseValue { span, .. }
         | TypeError::IfConditionNotBool { span, .. }
         | TypeError::TernaryConditionNotBool { span, .. }
@@ -1277,7 +1278,6 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::OptionalPatternOnNonOptional { span, .. }
         | TypeError::OptionalChainingOnNonOptional { span, .. }
         | TypeError::NestedOptionalPattern { span, .. }
-        | TypeError::MatchArmTypeMismatch { span, .. }
         | TypeError::RequiresUnwrappingPattern { span, .. }
         | TypeError::IrrefutableLetElse { span, .. }
         | TypeError::LetElseMustDiverge { span, .. }
@@ -1833,12 +1833,12 @@ fn render_ident_paths(paths: &[Vec<Ident>]) -> String {
 fn render_missing_projection(source: &Type, target: &Type, paths: &[Vec<Ident>]) -> String {
     if paths.is_empty() {
         return format!(
-            "no direct `@as embed` projection from '{source}' to '{target}'; pass a mutable '{target}' place or declare a direct `@as embed` field"
+            "no direct `@as embed` projection from '{source}' to '{target}'; use the stored path explicitly or declare a direct `@as embed` field"
         );
     }
 
     format!(
-        "no direct `@as embed` projection from '{source}' to '{target}'; pass stored path {} or mark it with `@as embed`",
+        "no direct `@as embed` projection from '{source}' to '{target}'; use stored path {} explicitly or mark it with `@as embed`",
         render_ident_paths(paths)
     )
 }

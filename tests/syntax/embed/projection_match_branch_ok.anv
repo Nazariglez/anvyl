@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+fn test(n: int, enemy: Enemy, other: Entity) {
+    let entity: Entity = match n { 0 => enemy, _ => other };
+}

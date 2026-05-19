@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: no direct `@as embed` projection from 'float' to 'Vec2'
+// @contains: expected `Vec2`
 
 struct Vec2 { x: float, y: float }
 
@@ -9,7 +9,7 @@ extend Vec2 {
     cast from(v: float) { Vec2 { x: v, y: v } }
 }
 
-fn touch(var v: as Vec2) {}
+fn touch(var v: Vec2) {}
 
 fn main() {
     var x = 1.0;

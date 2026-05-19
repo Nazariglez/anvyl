@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::{
     CheckedType, TypeChecker, TypeError, VariantShape,
     annotation::DeprecatedUseKind,
-    check_expected, check_expr_checked, check_expr_checked_with_hint,
+    check_expected_value_expr, check_expr_checked, check_unprojected_expected,
     check_value_expr_checked_with_hint, checked_from_type, const_eval,
     const_term::ConstTerm,
     decls::{
@@ -145,9 +145,9 @@ pub(super) fn check_map_lit_hint(
     let mut contains_extern_any = false;
     let mut contains_poison = false;
     for (key_expr, value_expr) in &lit.node.entries {
-        let key_checked = check_expected(key_expr, key.clone(), tc);
+        let key_checked = check_expected_value_expr(key_expr, key.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, key_expr);
-        let value_checked = check_expected(value_expr, value.clone(), tc);
+        let value_checked = check_expected_value_expr(value_expr, value.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, value_expr);
         contains_extern_any |= key_checked.contains_extern_any || value_checked.contains_extern_any;
         contains_poison |=
@@ -206,7 +206,7 @@ pub(super) fn check_array_lit_hint(
     let mut contains_extern_any = false;
     let mut contains_poison = false;
     for value in &lit.node.elements {
-        let checked = check_expected(value, elem.clone(), tc);
+        let checked = check_expected_value_expr(value, elem.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, value);
         contains_extern_any |= checked.contains_extern_any;
         contains_poison |= tc.checked_is_poison(&checked);
@@ -252,7 +252,7 @@ pub(super) fn check_array_fill_hint(
             CollectionLiteralKind::Array,
         )
     });
-    let value = check_expected(&fill.node.value, elem.clone(), tc);
+    let value = check_expected_value_expr(&fill.node.value, elem.clone(), tc);
     tc.record_aggregate_elem_flow(expr.node.id, &fill.node.value);
     let array = collection_literal_handle(kind, elem, len, tc);
     let mut checked = solve_and_checked_from_handle(expr, array, tc);
@@ -286,7 +286,7 @@ pub(super) fn check_tuple_checked_with_hint(
     let mut contains_extern_any = false;
     let mut contains_poison = false;
     for (elem, hint) in elems.iter().zip(&hints) {
-        let checked = check_expected(elem, hint.clone(), tc);
+        let checked = check_expected_value_expr(elem, hint.clone(), tc);
         tc.record_aggregate_elem_flow(expr.node.id, elem);
         contains_extern_any |= checked.contains_extern_any;
         contains_poison |= tc.checked_is_poison(&checked);
@@ -585,7 +585,7 @@ pub(super) fn check_inferred_enum_hint(
             let mut failed = false;
             for (arg, param) in args.iter().zip(params) {
                 let hint = inf.instantiate(param, tc);
-                let checked = check_expected(arg, hint, tc);
+                let checked = check_expected_value_expr(arg, hint, tc);
                 tc.record_aggregate_elem_flow(expr.node.id, arg);
                 contains_extern_any |= checked.contains_extern_any;
                 failed |= tc.solve_constraints();
@@ -712,10 +712,9 @@ fn check_expr_fields(
         let value = &fields[field.index].1;
         tc.check_matched_field_access_policy(&owner, field.name, &field.policy, value.span);
         let hint = inf.instantiate(&field.ty, tc);
-        let checked = check_expr_checked_with_hint(value, Some(hint.clone()), tc);
+        let checked = check_expected_value_expr(value, hint.clone(), tc);
         tc.record_aggregate_elem_flow(aggregate, value);
         check.contains_extern_any |= checked.contains_extern_any;
-        tc.expect_assignable_expr(value.span, value.node.id, checked.handle, hint);
         check.failed |= tc.solve_constraints();
     }
     check
@@ -921,8 +920,8 @@ pub(super) fn check_range_expr(
             end,
             inclusive,
         } => {
-            let start = check_expected(start, bound.clone(), tc);
-            let end = check_expected(end, bound.clone(), tc);
+            let start = check_unprojected_expected(start, bound.clone(), tc);
+            let end = check_unprojected_expected(end, bound.clone(), tc);
             let kind = if *inclusive {
                 CoreRangeKind::Inclusive
             } else {
@@ -931,11 +930,11 @@ pub(super) fn check_range_expr(
             (kind, start.contains_extern_any || end.contains_extern_any)
         }
         Range::From { start } => {
-            let start = check_expected(start, bound.clone(), tc);
+            let start = check_unprojected_expected(start, bound.clone(), tc);
             (CoreRangeKind::From, start.contains_extern_any)
         }
         Range::To { end, inclusive } => {
-            let end = check_expected(end, bound.clone(), tc);
+            let end = check_unprojected_expected(end, bound.clone(), tc);
             let kind = if *inclusive {
                 CoreRangeKind::ToInclusive
             } else {

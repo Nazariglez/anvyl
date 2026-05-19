@@ -12,7 +12,7 @@ struct Enemy {
     @as embed entity: Body,
 }
 
-fn move_entity(var entity: as Entity) {
+fn move_entity(var entity: Entity) {
     entity.x += 1;
 }
 

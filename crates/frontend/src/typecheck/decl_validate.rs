@@ -323,6 +323,12 @@ pub(super) fn validate_param_escape(
     ty: &Type,
     span: Option<SourceSpan>,
 ) {
+    if mutable && cast_accept {
+        errors.push(TypeError::CompileError {
+            message: "`as` cannot be combined with `var`; use `var x: T`".to_string(),
+            span,
+        });
+    }
     if !escape.is_escaping() {
         return;
     }

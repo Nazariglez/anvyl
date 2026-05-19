@@ -1,0 +1,28 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Raw {
+    x: int,
+}
+
+struct Entity {
+    x: int,
+}
+
+struct Enemy {
+    @as embed raw: Raw,
+}
+
+extend Entity {
+    cast from(raw: Raw) {
+        Entity { x: raw.x }
+    }
+}
+
+fn take(entity: as Entity) {}
+
+fn test() {
+    let enemy = Enemy { raw: Raw { x: 1 } };
+    take(enemy);
+}

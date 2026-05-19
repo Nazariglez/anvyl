@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: accessing internal field 'entity' of type 'Enemy'
+
+import lib { Entity, enemy };
+
+fn take(entity: Entity) {}
+
+fn test() {
+    let e = enemy();
+    take(e);
+}

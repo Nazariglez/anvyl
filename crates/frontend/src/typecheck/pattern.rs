@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use super::{
     ActiveMutDowncastRoot, CheckedType, TypeChecker, TypeError, TypeHandle,
     annotation::AccessPolicy,
-    check_block_checked, check_block_checked_with_hint, check_value_expr_checked_with_hint,
-    checked_from_type, checked_void, closure, control_flow,
+    check_block_checked, check_block_checked_with_hint, check_expected_value_expr,
+    check_value_expr_checked_with_hint, checked_from_type, checked_void, closure, control_flow,
     decls::{FieldSchema, NominalKey, TypeBinding, nominal_type},
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
@@ -1457,24 +1457,14 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
             let value = match mode {
-                PatternBindMode::Owned { .. } => {
-                    PatternScrutinee::owned(check_value_expr_checked_with_hint(
-                        &binding.value,
-                        Some(annot_handle.clone()),
-                        tc,
-                    ))
-                }
+                PatternBindMode::Owned { .. } => PatternScrutinee::owned(
+                    check_expected_value_expr(&binding.value, annot_handle.clone(), tc),
+                ),
                 PatternBindMode::Alias => {
                     PatternScrutinee::alias(check_alias_scrutinee(&binding.value, tc))
                 }
             };
             tc.reject_extern_any_escape(&value.checked, binding.value.span);
-            tc.expect_assignable_expr(
-                binding.value.span,
-                binding.value.node.id,
-                value.checked.handle.clone(),
-                annot_handle,
-            );
             tc.solve_constraints();
             let value_ty = value.checked.ty.clone();
             let binding_ty = refined_binding_type(&annot_ty, &value.checked.ty, tc);

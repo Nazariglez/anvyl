@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: projection from 'Pair<int, int>' to 'int' is ambiguous
+
+struct Pair<T, U> {
+    @as embed left: T,
+    @as embed right: U,
+}
+
+fn test() {
+    let pair = Pair<int, int> { left: 1, right: 2 };
+    let x: int = pair;
+}

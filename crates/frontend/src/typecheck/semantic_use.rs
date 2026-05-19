@@ -16,7 +16,7 @@ use crate::{
 pub(crate) type CallMap = HashMap<ExprId, CallTarget>;
 pub(crate) type ExternUseMap = HashMap<ExprId, Vec<ExternUseTarget>>;
 pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
-pub(crate) type ArgumentProjectionMap = HashMap<(ExprId, usize), ArgumentProjectionFact>;
+pub(crate) type ExpectedProjectionMap = HashMap<ExprId, ExpectedProjectionFact>;
 pub(crate) type ContractWitnessMap = HashMap<WitnessId, ContractWitnessFact>;
 pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
 pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
@@ -160,9 +160,8 @@ pub(crate) struct MemberPathFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ArgumentProjectionFact {
-    pub(crate) call_id: ExprId,
-    pub(crate) arg_index: usize,
+pub(crate) struct ExpectedProjectionFact {
+    pub(crate) expr_id: ExprId,
     pub(crate) path: Vec<Ident>,
     pub(crate) target_ty: Type,
 }

@@ -1,6 +1,7 @@
 // @mode: check
-// @expect: success
+// @expect: error
 // @frontend: new
+// @contains: `as` cannot be combined with `var`; use `var x: T`
 
 fn touch(var x: as int) {
     x = x + 1;

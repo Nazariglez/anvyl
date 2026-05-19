@@ -967,6 +967,19 @@ impl CheckedPlace {
     }
 }
 
+pub(super) fn projected_value(
+    base: &PlaceValue,
+    checked: CheckedType,
+    path: &[Ident],
+) -> PlaceValue {
+    base.projected(
+        checked,
+        projected_field_access(base.access),
+        base.facts.clone(),
+        base.identity.clone().fields(path),
+    )
+}
+
 pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAccess {
     match receiver_access {
         PlaceAccess::Mutable => PlaceAccess::Mutable,

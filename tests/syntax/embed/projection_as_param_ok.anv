@@ -1,7 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: Invalid cast
 
 struct Entity {
     x: int,
@@ -11,7 +10,9 @@ struct Enemy {
     @as embed entity: Entity,
 }
 
+fn take(entity: as Entity) {}
+
 fn test() {
     let enemy = Enemy { entity: Entity { x: 1 } };
-    let entity: Entity = enemy as Entity;
+    take(enemy);
 }

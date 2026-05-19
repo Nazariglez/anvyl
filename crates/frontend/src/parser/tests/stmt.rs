@@ -560,7 +560,7 @@ fn non_as_keyword_annotation_fails() {
 }
 
 #[test]
-fn as_parameter_syntax_still_parses() {
+fn as_parameter_syntax_parses() {
     let prog = parse_program("fn f(x: as int) {}");
     let ast::Stmt::Func(func) = &prog.stmts[0].node else {
         panic!("expected Func");

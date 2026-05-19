@@ -1,0 +1,28 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Entity {
+    hp: int,
+
+    fn update(var self) {
+        self.hp += 1;
+    }
+}
+
+struct Enemy {
+    @as embed entity: Entity { hp as entity_hp },
+}
+
+fn update_actor(var actor: dyn Updatable) {
+    actor.update();
+}
+
+fn main() {
+    var enemy = Enemy { entity: Entity { hp: 1 } };
+    update_actor(enemy);
+}

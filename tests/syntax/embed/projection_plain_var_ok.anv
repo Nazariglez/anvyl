@@ -1,7 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: expected `Entity`
 
 struct Entity {
     x: int,

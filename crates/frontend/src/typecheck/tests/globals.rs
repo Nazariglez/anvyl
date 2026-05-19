@@ -59,7 +59,7 @@ fn records_projected_global_var_argument() {
     let result = check(
         "struct Health { @as embed hp: int }
          lazy var Player: Health = Health { hp: 1 };
-         fn bump(var hp: as int) { hp += 1; }
+         fn bump(var hp: int) { hp += 1; }
          fn main() { bump(Player); }",
     )
     .expect("typecheck");

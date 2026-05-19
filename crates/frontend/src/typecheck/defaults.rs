@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    TypeChecker, TypeError, check_value_expr_checked_with_hint,
+    TypeChecker, TypeError, check_expected_value_expr,
     decls::{ExtendId, FieldSchema, MethodKey, MethodMode, NominalKey, ValueDecl},
     generic::{GenericArgs, GenericOwnerFrame, GenericParams},
     type_refs::GenericTypeContext,
@@ -266,9 +266,8 @@ fn check_param_defaults(
 }
 
 fn check_default_type(default: &ExprNode, expected: super::TypeHandle, tc: &mut TypeChecker) {
-    let checked = check_value_expr_checked_with_hint(default, Some(expected.clone()), tc);
+    let checked = check_expected_value_expr(default, expected, tc);
     tc.reject_extern_any_escape(&checked, default.span);
-    tc.expect_assignable_expr(default.span, default.node.id, checked.handle, expected);
     tc.solve_constraints();
 }
 

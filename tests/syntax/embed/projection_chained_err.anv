@@ -15,7 +15,7 @@ struct Enemy {
     @as embed actor: Actor,
 }
 
-fn move_entity(var entity: as Entity) {}
+fn move_entity(var entity: Entity) {}
 
 fn test() {
     var enemy = Enemy { actor: Actor { entity: Entity { x: 1 } } };

@@ -1,0 +1,28 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @warn-contains: use tick
+
+contract Updatable {
+    fn update(var self);
+}
+
+struct Entity {
+    hp: int,
+
+    @deprecated("use tick")
+    fn update(var self) {
+        self.hp += 1;
+    }
+}
+
+struct Enemy {
+    @as embed entity: Entity { hp as entity_hp },
+}
+
+fn take_actor(actor: dyn Updatable) {}
+
+fn main() {
+    let enemy = Enemy { entity: Entity { hp: 1 } };
+    take_actor(enemy);
+}

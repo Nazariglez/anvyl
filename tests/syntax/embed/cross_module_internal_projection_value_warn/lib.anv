@@ -1,0 +1,15 @@
+// @helper
+
+pub struct Entity {
+    x: int,
+}
+
+pub struct Enemy {
+    @internal
+    @as
+    embed entity: Entity,
+}
+
+pub fn enemy() -> Enemy {
+    Enemy { entity: Entity { x: 1 } }
+}

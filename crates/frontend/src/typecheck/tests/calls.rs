@@ -1,6 +1,7 @@
 use super::support::{
     assert_calls, assert_calls_with_modules, assert_deprecated_warning, assert_err_count,
-    assert_single_error, assert_ty, assert_ty_mods, assert_typecheck_closed, check, check_mods,
+    assert_expected_projection, assert_expr_type, assert_single_error, assert_ty, assert_ty_mods,
+    assert_typecheck_closed, check, check_mods, nominal_struct,
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
@@ -114,12 +115,12 @@ fn cached_generic_specialization_restores_call_targets() {
 }
 
 #[test]
-fn projected_var_as_records_argument_projection() {
+fn projected_var_arg_records_expected_projection() {
     let result = check(
         r"
         struct Entity { x: int }
         struct Enemy { @as embed entity: Entity }
-        fn move_entity(var entity: as Entity) { entity.x += 1; }
+        fn move_entity(var entity: Entity) { entity.x += 1; }
         fn main() {
             var enemy = Enemy { entity: Entity { x: 1 } };
             move_entity(enemy);
@@ -127,33 +128,18 @@ fn projected_var_as_records_argument_projection() {
         ",
     )
     .unwrap();
-    let fact = result
-        .argument_projections()
-        .values()
-        .next()
-        .expect("missing projection fact");
-
-    assert_eq!(fact.arg_index, 0);
-    assert_eq!(fact.path, vec![Ident::new("entity")]);
-    assert_eq!(
-        fact.target_ty,
-        Type::nominal(
-            NominalKind::Struct,
-            Ident::new("Entity"),
-            vec![],
-            vec![],
-            None
-        )
-    );
+    let entity_ty = nominal_struct("Entity");
+    let expr_id = assert_expected_projection(&result, &["entity"], entity_ty.clone());
+    assert_expr_type(&result, expr_id, &entity_ty);
 }
 
 #[test]
-fn dependent_projected_var_as_records_specialized_argument_projection() {
+fn dependent_projected_var_arg_records_specialized_expected_projection() {
     let result = check(
         r"
         struct Entity { x: int }
         struct Box<T> { @as embed value: T }
-        fn move_entity(var entity: as Entity) { entity.x += 1; }
+        fn move_entity(var entity: Entity) { entity.x += 1; }
         fn move_box<T>(var box: Box<T>) { move_entity(box); }
         fn main() {
             var box = Box<Entity> { value: Entity { x: 1 } };
@@ -163,33 +149,18 @@ fn dependent_projected_var_as_records_specialized_argument_projection() {
         ",
     )
     .unwrap();
-    let fact = result
-        .argument_projections()
-        .values()
-        .next()
-        .expect("missing projection fact");
-
-    assert_eq!(fact.arg_index, 0);
-    assert_eq!(fact.path, vec![Ident::new("value")]);
-    assert_eq!(
-        fact.target_ty,
-        Type::nominal(
-            NominalKind::Struct,
-            Ident::new("Entity"),
-            vec![],
-            vec![],
-            None
-        )
-    );
+    let entity_ty = nominal_struct("Entity");
+    let expr_id = assert_expected_projection(&result, &["value"], entity_ty.clone());
+    assert_expr_type(&result, expr_id, &entity_ty);
 }
 
 #[test]
-fn exact_var_as_records_no_projection() {
+fn exact_var_arg_records_no_projection() {
     let result = check(
         r"
         struct Entity { x: int }
         struct Enemy { @as embed entity: Entity }
-        fn move_entity(var entity: as Entity) { entity.x += 1; }
+        fn move_entity(var entity: Entity) { entity.x += 1; }
         fn main() {
             var enemy = Enemy { entity: Entity { x: 1 } };
             move_entity(enemy.entity);
@@ -198,11 +169,67 @@ fn exact_var_as_records_no_projection() {
     )
     .unwrap();
 
-    assert!(result.argument_projections().is_empty());
+    assert!(result.expected_projections().is_empty());
 }
 
 #[test]
-fn by_value_as_records_no_projection() {
+fn value_arg_records_expected_projection() {
+    let result = check(
+        r"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        fn take(entity: Entity) {}
+        fn main() {
+            let enemy = Enemy { entity: Entity { x: 1 } };
+            take(enemy);
+        }
+        ",
+    )
+    .unwrap();
+    assert_expected_projection(&result, &["entity"], nominal_struct("Entity"));
+}
+
+#[test]
+fn unconstrained_generic_arg_records_no_projection() {
+    let result = check(
+        r"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        fn id<T>(x: T) -> T { x }
+        fn main() {
+            let enemy = Enemy { entity: Entity { x: 1 } };
+            id(enemy);
+        }
+        ",
+    )
+    .unwrap();
+
+    assert!(result.expected_projections().is_empty());
+}
+
+#[test]
+fn cast_accept_arg_projected_field_casts_to_target() {
+    let result = check(
+        r"
+        struct Raw { x: int }
+        struct Entity { x: int }
+        struct Enemy { @as embed raw: Raw }
+        extend Entity {
+            cast from(raw: Raw) { Entity { x: raw.x } }
+        }
+        fn take(entity: as Entity) {}
+        fn main() {
+            let enemy = Enemy { raw: Raw { x: 1 } };
+            take(enemy);
+        }
+        ",
+    )
+    .unwrap();
+    assert_expected_projection(&result, &["raw"], nominal_struct("Raw"));
+}
+
+#[test]
+fn cast_accept_arg_source_cast_precedes_projection() {
     let result = check(
         r"
         struct Entity { x: int }
@@ -219,7 +246,27 @@ fn by_value_as_records_no_projection() {
     )
     .unwrap();
 
-    assert!(result.argument_projections().is_empty());
+    assert!(result.expected_projections().is_empty());
+}
+
+#[test]
+fn explicit_cast_projection_records_operand_fact() {
+    let result = check(
+        r"
+        struct Raw { x: int }
+        struct Entity { x: int }
+        struct Enemy { @as embed raw: Raw }
+        extend Entity {
+            cast from(raw: Raw) { Entity { x: raw.x } }
+        }
+        fn main() {
+            let enemy = Enemy { raw: Raw { x: 1 } };
+            let entity: Entity = enemy as Entity;
+        }
+        ",
+    )
+    .unwrap();
+    assert_expected_projection(&result, &["raw"], nominal_struct("Raw"));
 }
 
 #[test]
@@ -239,7 +286,39 @@ fn explicit_cast_records_no_projection() {
     )
     .unwrap();
 
-    assert!(result.argument_projections().is_empty());
+    assert!(result.expected_projections().is_empty());
+}
+
+#[test]
+fn projected_generic_return_records_call_target() {
+    let result = check(
+        r"
+        struct Entity { x: int }
+        struct Enemy { @as embed entity: Entity }
+        fn id<T>(x: T) -> T { x }
+        fn main() -> Entity {
+            let enemy = Enemy { entity: Entity { x: 1 } };
+            id(enemy)
+        }
+        ",
+    )
+    .unwrap();
+    assert_expected_projection(&result, &["entity"], nominal_struct("Entity"));
+    let target = result
+        .calls()
+        .values()
+        .find(|target| target.id == CallableId::function(ModuleScope::Root, Ident::new("id")))
+        .expect("missing projected generic call target");
+    assert_eq!(
+        target,
+        &CallTarget::new(
+            CallableId::function(ModuleScope::Root, Ident::new("id")),
+            GenericArgs {
+                type_args: vec![nominal_struct("Enemy")],
+                const_args: vec![],
+            }
+        )
+    );
 }
 
 #[test]

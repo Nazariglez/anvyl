@@ -8,7 +8,7 @@ struct Pair<T, U> {
     @as embed right: U,
 }
 
-fn take_int(var x: as int) {}
+fn take_int(var x: int) {}
 
 fn test() {
     var pair = Pair<int, int> { left: 1, right: 2 };

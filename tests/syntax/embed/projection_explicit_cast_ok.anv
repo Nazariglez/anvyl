@@ -1,7 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: expected `Entity`
 
 struct Entity {
     x: int,
@@ -11,9 +10,7 @@ struct Enemy {
     @as embed entity: Entity,
 }
 
-fn take(entity: as Entity) {}
-
 fn test() {
     let enemy = Enemy { entity: Entity { x: 1 } };
-    take(enemy);
+    let entity: Entity = enemy as Entity;
 }

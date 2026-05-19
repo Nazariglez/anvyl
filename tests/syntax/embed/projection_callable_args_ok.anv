@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+struct Sink {
+    fn take(self, entity: Entity) {}
+}
+
+fn take(entity: Entity) {}
+
+fn test(sink: Sink, enemy: Enemy) {
+    let f: fn(Entity) = take;
+    let lambda: fn(Entity) = |entity: Entity| {};
+    f(enemy);
+    lambda(enemy);
+    sink.take(enemy);
+}

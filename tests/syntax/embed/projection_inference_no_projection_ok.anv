@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+fn take(enemy: Enemy) {}
+
+fn test() {
+    let enemy = Enemy { entity: Entity { x: 1 } };
+    let x = enemy;
+    take(x);
+}

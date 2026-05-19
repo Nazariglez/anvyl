@@ -3,9 +3,10 @@ use super::{
     PatternContext, PatternRoot, PatternRootInput, PlaceAccess, PlaceIdentity, ReturnMode,
     ReturnSpec, TypeChecker, TypeError, TypeHandle,
     body::check_callable_body_place_return,
-    check_block_checked, check_bool_condition, check_expr_checked, check_place,
-    check_value_expr_checked_with_hint, checked_branch_against_expected, checked_from_checked,
-    checked_type, checked_void, join_branches_with_hint, match_check, match_coverage,
+    check_block_checked, check_bool_condition, check_expected_value_expr, check_expr_checked,
+    check_place, check_value_expr_checked_with_hint, checked_branch_against_expected,
+    checked_from_checked, checked_type, checked_void, join_branches_with_hint, match_check,
+    match_coverage,
     pattern::{self, check_pattern_scrutinee, mode_for_head},
     place,
 };
@@ -137,7 +138,7 @@ pub(super) fn check_continue(span: Span, tc: &mut TypeChecker) {
 
 pub(super) fn check_while(while_node: &WhileNode, tc: &mut TypeChecker) {
     let cond = check_expr_checked(&while_node.node.cond, tc);
-    check_bool_condition(ConditionKind::While, cond, while_node.node.cond.span, tc);
+    check_bool_condition(ConditionKind::While, &while_node.node.cond, cond, tc);
     check_loop_body(&while_node.node.body, tc);
 }
 
@@ -483,12 +484,12 @@ pub(super) fn check_return_expr(
     }
 
     let expected = (!matches!(ret.ty, Type::InferReturn)).then(|| tc.type_handle(&ret.ty));
-    let actual = check_value_expr_checked_with_hint(expr, expected.clone(), tc);
+    let actual = match expected {
+        Some(expected) => check_expected_value_expr(expr, expected, tc),
+        None => check_value_expr_checked_with_hint(expr, None, tc),
+    };
     tc.record_escaping_use(expr);
     tc.reject_extern_any_escape(&actual, expr.span);
-    if let Some(expected) = expected {
-        tc.expect_assignable_expr(expr.span, expr.node.id, actual.handle.clone(), expected);
-    }
     actual
 }
 
@@ -509,7 +510,7 @@ fn check_branch_place_return_expr(
         )),
         ExprKind::If(if_node) => {
             let cond = check_expr_checked(&if_node.node.cond, tc);
-            check_bool_condition(ConditionKind::If, cond, if_node.node.cond.span, tc);
+            check_bool_condition(ConditionKind::If, &if_node.node.cond, cond, tc);
             let then_checked = check_callable_body_place_return(
                 CallableBody::Block(&if_node.node.then_block),
                 Some(ret),
@@ -549,7 +550,7 @@ fn check_branch_place_return_expr(
         }
         ExprKind::Ternary(ternary) => {
             let cond = check_expr_checked(&ternary.node.cond, tc);
-            check_bool_condition(ConditionKind::Ternary, cond, ternary.node.cond.span, tc);
+            check_bool_condition(ConditionKind::Ternary, &ternary.node.cond, cond, tc);
             let then_checked = check_return_expr(&ternary.node.then_expr, ret, source, tc);
             let else_checked = check_return_expr(&ternary.node.else_expr, ret, source, tc);
             Some(join_place_return_branches(
