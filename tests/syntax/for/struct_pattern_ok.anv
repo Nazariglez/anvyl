@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Point { x: int, y: int }
+
+fn main() {
+    let points = [Point { x: 1, y: 2 }];
+    for Point { x, y } in points {
+        let _: int = x;
+        let _: int = y;
+    }
+}

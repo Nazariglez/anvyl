@@ -454,24 +454,26 @@ impl<'tc> PatternChecker<'tc> {
         expected: &Type,
         outcome: &mut PatternOutcome,
     ) {
-        match self.context {
+        let span = self.tc.error_span(pattern.span);
+        let error = match self.context {
             PatternContext::IfLet | PatternContext::WhileLet | PatternContext::LetElse
                 if self.option_inner(expected).is_some()
                     && outcome.refutability == Refutability::Irrefutable =>
             {
-                self.tc.push_error(TypeError::RequiresUnwrappingPattern {
-                    span: self.tc.error_span(pattern.span),
-                });
-                outcome.had_error = true;
+                TypeError::RequiresUnwrappingPattern { span }
             }
             PatternContext::LetElse if outcome.refutability == Refutability::Irrefutable => {
-                self.tc.push_error(TypeError::IrrefutableLetElse {
-                    span: self.tc.error_span(pattern.span),
-                });
-                outcome.had_error = true;
+                TypeError::IrrefutableLetElse { span }
             }
-            _ => {}
-        }
+            PatternContext::For
+                if !outcome.had_error && outcome.refutability == Refutability::Refutable =>
+            {
+                TypeError::RefutableForPattern { span }
+            }
+            _ => return,
+        };
+        self.tc.push_error(error);
+        outcome.had_error = true;
     }
 
     fn check_ident(&mut self, name: Ident, input: PatternInput, span: Span) -> PatternCheckResult {

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: refutable pattern is not allowed in for binding
+
+enum State { A, B }
+
+fn main() {
+    let states = [State.A, State.B];
+    for State.A in states {}
+}

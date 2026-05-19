@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: refutable pattern is not allowed in for binding
+
+fn main() {
+    let pairs = [(1, "one"), (2, "two")];
+    for (1, name) in pairs {}
+}

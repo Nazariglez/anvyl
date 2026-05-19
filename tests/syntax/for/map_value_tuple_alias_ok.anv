@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var pairs: [string: (int, int)] = ["a": (1, 2)];
+    for k, var (a, b) in pairs {
+        let _: string = k;
+        a += 1;
+        b += 1;
+    }
+}

@@ -729,6 +729,9 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ForMutableMapEntry { .. } => {
             "mutable map entry iteration is not supported; use `for k, var v in map` to mutate values".to_string()
         }
+        TypeError::RefutableForPattern { .. } => {
+            "refutable pattern is not allowed in for binding".to_string()
+        }
         TypeError::InfiniteSize { name, .. } => {
             format!("type '{name}' has infinite size")
         }
@@ -1233,6 +1236,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::ForVarRequiresMutableIterable { span, .. }
         | TypeError::ForMutableMapKey { span, .. }
         | TypeError::ForMutableMapEntry { span, .. }
+        | TypeError::RefutableForPattern { span, .. }
         | TypeError::InvalidOperand { span, .. }
         | TypeError::MissingReturn { span, .. }
         | TypeError::MatchArmTypeMismatch { span, .. }

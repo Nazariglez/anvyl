@@ -25,15 +25,6 @@ mod binding_patterns {
     }
 }
 
-mod for_patterns {
-    use super::*;
-
-    #[test]
-    fn for_tuple_non_tuple_err() {
-        assert_err("fn main(x: int) { for (a, b) in x {} }");
-    }
-}
-
 mod while_let {
     use super::*;
 

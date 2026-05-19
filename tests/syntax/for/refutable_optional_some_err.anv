@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: refutable pattern is not allowed in for binding
+
+fn main() {
+    let xs: [int?; 2] = [1, nil];
+    for x? in xs {}
+}

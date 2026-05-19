@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let pairs = [(1, "one"), (2, "two")];
+    for i, (a, b) in pairs {
+        let _: int = i;
+        let _: int = a;
+        let _: string = b;
+    }
+}

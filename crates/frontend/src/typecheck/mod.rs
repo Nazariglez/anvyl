@@ -403,6 +403,9 @@ pub(crate) enum TypeError {
     ForMutableMapEntry {
         span: Option<SourceSpan>,
     },
+    RefutableForPattern {
+        span: Option<SourceSpan>,
+    },
     ForIterationModifier {
         message: &'static str,
         span: Option<SourceSpan>,

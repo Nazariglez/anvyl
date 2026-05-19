@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: refutable pattern is not allowed in for binding
+
+struct Point { x: int, y: int }
+
+fn main() {
+    let points = [Point { x: 1, y: 2 }];
+    for Point { x: 0, y } in points {}
+}
