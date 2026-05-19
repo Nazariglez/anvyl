@@ -1,0 +1,29 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity {
+    x: int,
+}
+
+struct Label {
+    name: string,
+}
+
+struct Box<T> {
+    @as embed value: T,
+}
+
+fn take<T>(var value: T) {}
+
+fn project<T>(var box: Box<T>) {
+    take<T>(box);
+}
+
+fn main() {
+    var entity_box = Box<Entity> { value: Entity { x: 1 } };
+    var label_box = Box<Label> { value: Label { name: "npc" } };
+    project<Entity>(entity_box);
+    project<Label>(label_box);
+    project<Entity>(entity_box);
+}

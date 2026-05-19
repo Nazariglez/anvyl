@@ -1,0 +1,27 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+struct Label {
+    fn draw(self) {}
+}
+
+fn use_actor(actor: dyn Drawable) {}
+
+fn wrap<T>(actor: T) {
+    use_actor(actor);
+}
+
+fn main() {
+    wrap<Enemy>(Enemy {});
+    wrap<Label>(Label {});
+    wrap<Enemy>(Enemy {});
+}

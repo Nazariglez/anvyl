@@ -375,9 +375,8 @@ fn check_positive_step(step: &ExprNode, tc: &mut TypeChecker) {
 
 fn record_for_step_runtime_check(step: &ExprNode, tc: &mut TypeChecker) {
     let span = tc.source_span(step.span);
-    tc.for_step_runtime_checks
-        .entry(step.node.id)
-        .or_insert(span);
+    let site = tc.current_expr_site(step.node.id);
+    tc.semantic_facts.record_for_step_runtime_check(site, span);
 }
 
 fn known_step_int(step: &ExprNode, tc: &mut TypeChecker) -> Option<i64> {

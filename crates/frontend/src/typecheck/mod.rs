@@ -1031,26 +1031,14 @@ struct ActiveMutDowncastRoot {
 
 struct TypeChecker {
     solver: Solver,
-    calls: CallMap,
-    extern_uses: ExternUseMap,
-    member_paths: MemberPathMap,
-    expected_projections: ExpectedProjectionMap,
+    semantic_facts: SemanticFactMaps,
     expr_places: HashMap<ExprId, place::PlaceValue>,
-    contract_witnesses: ContractWitnessMap,
-    witness_keys: HashMap<ContractWitnessKey, WitnessId>,
-    dyn_conversions: DynConversionMap,
-    dyn_weakenings: DynWeakeningMap,
-    dyn_calls: DynCallMap,
-    dyn_downcasts: DynDowncastMap,
-    global_accesses: GlobalAccessMap,
-    for_step_runtime_checks: ForStepRuntimeCheckMap,
     closure: ClosureClassifier,
     global_types: HashMap<GlobalKey, LocalTypeId>,
     active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
     dyn_infer_registered_modules: HashSet<ModuleScope>,
     dyn_infer: DynInference,
     used_imports: HashSet<ImportId>,
-    next_witness_id: u32,
     decls: DeclarationIndex,
     externs: ExternCatalog,
     promoted_surfaces: HashMap<CanonicalTypeKey, PromotedSurface>,
@@ -1073,9 +1061,10 @@ struct TypeChecker {
     const_substs: Vec<ConstSubst>,
     generic_contexts: Vec<GenericTypeContext>,
     generic_owner_frames: Vec<GenericOwnerFrame>,
+    active_bodies: Vec<BodyInstanceKey>,
     local_callables: HashMap<CallableId, LocalCallableInfo>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
-    specializations: HashMap<SpecializationKey, SpecializationState>,
+    specializations: HashMap<CallableInstanceKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
     local_consts: Vec<const_eval::LocalConstEntry>,
     next_alias_alt_group: u32,
@@ -1087,26 +1076,14 @@ impl TypeChecker {
         let core_option = decls.core_option_key();
         Self {
             solver: Solver::new(core_option),
-            calls: HashMap::new(),
-            extern_uses: HashMap::new(),
-            member_paths: HashMap::new(),
-            expected_projections: HashMap::new(),
+            semantic_facts: SemanticFactMaps::default(),
             expr_places: HashMap::new(),
-            contract_witnesses: HashMap::new(),
-            witness_keys: HashMap::new(),
-            dyn_conversions: HashMap::new(),
-            dyn_weakenings: HashMap::new(),
-            dyn_calls: HashMap::new(),
-            dyn_downcasts: HashMap::new(),
-            global_accesses: HashMap::new(),
-            for_step_runtime_checks: HashMap::new(),
             closure: ClosureClassifier::default(),
             global_types: HashMap::new(),
             active_mut_downcast_roots: vec![],
             dyn_infer_registered_modules: HashSet::new(),
             dyn_infer: DynInference::default(),
             used_imports: HashSet::new(),
-            next_witness_id: 0,
             decls,
             externs,
             promoted_surfaces: HashMap::new(),
@@ -1129,6 +1106,7 @@ impl TypeChecker {
             const_substs: vec![],
             generic_contexts: vec![],
             generic_owner_frames: vec![],
+            active_bodies: vec![],
             local_callables: HashMap::new(),
             callable_templates: HashMap::new(),
             specializations: HashMap::new(),
@@ -1169,6 +1147,30 @@ impl TypeChecker {
         let ret = f(self);
         self.current_module = previous;
         ret
+    }
+
+    fn current_body(&self) -> BodyInstanceKey {
+        self.active_bodies
+            .last()
+            .cloned()
+            .unwrap_or_else(|| BodyInstanceKey::Module(self.current_module.clone()))
+    }
+
+    fn with_body_instance<R>(&mut self, key: BodyInstanceKey, f: impl FnOnce(&mut Self) -> R) -> R {
+        let depth = self.active_bodies.len();
+        self.active_bodies.push(key);
+        let ret = f(self);
+        let popped = self.active_bodies.pop();
+        debug_assert!(popped.is_some());
+        debug_assert_eq!(self.active_bodies.len(), depth);
+        ret
+    }
+
+    fn current_expr_site(&self, expr: ExprId) -> SemanticExprSite {
+        SemanticExprSite {
+            body: self.current_body(),
+            expr,
+        }
     }
 
     fn push_scope(&mut self) {
@@ -1564,12 +1566,16 @@ impl TypeChecker {
             self.set_poison_type(id, span)
         } else {
             self.solver.set_expr_type_from_type(id, span, &ty);
-            self.solver.expr_handle(id)
+            let handle = self.solver.expr_handle(id);
+            self.record_expr_type(id, span, &handle);
+            handle
         }
     }
 
     fn set_poison_type(&mut self, id: ExprId, span: Option<SourceSpan>) -> TypeHandle {
-        self.solver.poison_expr_type(id, span)
+        let handle = self.solver.poison_expr_type(id, span);
+        self.record_expr_type(id, span, &handle);
+        handle
     }
 
     fn handle_is_poison(&self, handle: &TypeHandle) -> bool {
@@ -1581,7 +1587,10 @@ impl TypeChecker {
     }
 
     fn set_nil_type(&mut self, id: ExprId, span: Span) -> TypeHandle {
-        self.solver.nil_expr_type(id, self.error_span(span))
+        let span = self.error_span(span);
+        let handle = self.solver.nil_expr_type(id, span);
+        self.record_expr_type(id, span, &handle);
+        handle
     }
 
     fn fresh_nil_handle(&mut self, span: Span) -> TypeHandle {
@@ -1589,8 +1598,10 @@ impl TypeChecker {
     }
 
     fn set_type_from_handle(&mut self, id: ExprId, span: Span, handle: &TypeHandle) -> TypeHandle {
-        self.solver
-            .set_expr_type_from_handle(id, self.error_span(span), handle)
+        let span = self.error_span(span);
+        let handle = self.solver.set_expr_type_from_handle(id, span, handle);
+        self.record_expr_type(id, span, &handle);
+        handle
     }
 
     fn fresh_temp_handle(&mut self, span: Span) -> TypeHandle {
@@ -1667,24 +1678,30 @@ impl TypeChecker {
         has_errors
     }
 
-    fn expr_types(&self) -> HashMap<ExprId, (Span, Type)> {
-        self.solver.expr_types_to_types()
+    fn record_expr_type(&mut self, expr_id: ExprId, span: Option<SourceSpan>, handle: &TypeHandle) {
+        let site = self.current_expr_site(expr_id);
+        let handle = self.solver.snapshot_handle(handle);
+        self.semantic_facts.record_expr_type(site, span, handle);
     }
 
     fn record_call(&mut self, expr_id: ExprId, target: CallTarget) {
-        self.calls.insert(expr_id, target);
+        let site = self.current_expr_site(expr_id);
+        self.semantic_facts.record_call(site, target);
     }
 
     fn record_extern_use(&mut self, expr_id: ExprId, target: ExternUseTarget) {
-        self.extern_uses.entry(expr_id).or_default().push(target);
+        let site = self.current_expr_site(expr_id);
+        self.semantic_facts.record_extern_use(site, target);
     }
 
     pub(crate) fn record_member_path(&mut self, fact: MemberPathFact) {
-        self.member_paths.insert(fact.expr_id, fact);
+        self.semantic_facts
+            .record_member_path(self.current_body(), fact);
     }
 
     pub(crate) fn record_expected_projection(&mut self, fact: ExpectedProjectionFact) {
-        self.expected_projections.insert(fact.expr_id, fact);
+        self.semantic_facts
+            .record_expected_projection(self.current_body(), fact);
     }
 
     fn record_expr_place(&mut self, expr_id: ExprId, value: &place::PlaceValue) {
@@ -1712,35 +1729,102 @@ impl TypeChecker {
         for origin in origins {
             self.mark_activation_imports_used(&origin);
         }
-        if let Some(id) = self.witness_keys.get(&key) {
-            return *id;
-        }
-        let id = WitnessId(self.next_witness_id);
-        self.next_witness_id += 1;
-        let fact = ContractWitnessFact {
-            id,
-            key: key.clone(),
-            span: self.source_span(span),
-        };
-        self.witness_keys.insert(key, id);
-        self.contract_witnesses.insert(id, fact);
-        id
+        self.semantic_facts
+            .record_contract_witness(key, self.source_span(span))
     }
 
     fn record_dyn_conversion(&mut self, fact: DynConversionFact) {
-        self.dyn_conversions.insert(fact.expr_id, fact);
+        self.semantic_facts
+            .record_dyn_conversion(self.current_body(), fact);
+    }
+
+    fn record_dyn_conversion_at(
+        &mut self,
+        site: SemanticExprSite,
+        witness: WitnessId,
+        span: SourceSpan,
+    ) {
+        let expr_id = site.expr;
+        self.semantic_facts.record_dyn_conversion(
+            site.body,
+            DynConversionFact {
+                expr_id,
+                witness,
+                span,
+            },
+        );
     }
 
     fn record_dyn_weakening(&mut self, fact: DynWeakeningFact) {
-        self.dyn_weakenings.insert(fact.expr_id, fact);
+        self.semantic_facts
+            .record_dyn_weakening(self.current_body(), fact);
     }
 
-    fn record_dyn_call(&mut self, fact: DynCallFact) {
-        self.dyn_calls.insert(fact.call_id, fact);
+    fn record_dyn_weakening_at(
+        &mut self,
+        site: SemanticExprSite,
+        source: ContractSetKey,
+        target: ContractSetKey,
+        span: SourceSpan,
+    ) {
+        let expr_id = site.expr;
+        self.semantic_facts.record_dyn_weakening(
+            site.body,
+            DynWeakeningFact {
+                expr_id,
+                source,
+                target,
+                span,
+            },
+        );
     }
 
-    fn record_dyn_downcast(&mut self, fact: DynDowncastFact) {
-        self.dyn_downcasts.insert(fact.expr_id, fact);
+    fn record_resolved_dyn_call(
+        &mut self,
+        site: SemanticExprSite,
+        receiver: SemanticExprSite,
+        contract: ContractSetKey,
+        method: Ident,
+        arg_count: usize,
+        requires_mutable: bool,
+        span: SourceSpan,
+    ) {
+        let call_id = site.expr;
+        self.semantic_facts.record_dyn_call(
+            site.body,
+            DynCallFact {
+                call_id,
+                receiver_id: receiver.expr,
+                contract,
+                method,
+                arg_count,
+                requires_mutable,
+                span,
+            },
+        );
+    }
+
+    fn record_resolved_dyn_downcast(
+        &mut self,
+        site: SemanticExprSite,
+        source: SemanticExprSite,
+        source_contract: ContractSetKey,
+        target: Type,
+        mutable: bool,
+        span: SourceSpan,
+    ) {
+        let expr_id = site.expr;
+        self.semantic_facts.record_dyn_downcast(
+            site.body,
+            DynDowncastFact {
+                expr_id,
+                source_id: source.expr,
+                source: source_contract,
+                target,
+                mutable,
+                span,
+            },
+        );
     }
 
     fn should_register_dyn_infer_params(&mut self) -> bool {
@@ -2094,7 +2178,7 @@ impl TypeChecker {
             .collect()
     }
 
-    fn finish(&mut self) -> Option<(SourceExprTypes, TypecheckFacts)> {
+    fn finish(&mut self) -> Option<SemanticCheckOutput> {
         self.solve_constraints();
         self.solve_dyn_inference();
         let escape_events = self.closure.take_escape_events();
@@ -2105,7 +2189,7 @@ impl TypeChecker {
 
         let (types, finalize_errors) = self.solver.finalize_expr_types();
         let has_finalize_errors = self.push_finalize_errors(finalize_errors);
-        if !has_finalize_errors {
+        if !has_finalize_errors && !self.finish_semantic_expr_types() {
             for error in self.result_closure_errors(&types) {
                 self.push_error_once(error);
             }
@@ -2114,26 +2198,60 @@ impl TypeChecker {
             return None;
         }
         let mut facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
-        facts
-            .for_step_runtime_checks
-            .clone_from(&self.for_step_runtime_checks);
+        facts.for_step_runtime_checks = self
+            .semantic_facts
+            .flattened_body_facts()
+            .for_step_runtime_checks;
         facts.import_records = self.decls.import_records().to_vec();
         facts.used_imports.clone_from(self.decls.used_imports());
         facts.used_imports.extend(self.used_imports.clone());
-        Some((types, facts))
+        self.semantic_facts.validate_finished();
+        Some(SemanticCheckOutput {
+            warnings: std::mem::take(&mut self.warnings),
+            lint_events: std::mem::take(&mut self.lint_events),
+            public_facts: facts,
+            source_types: types,
+            program: SemanticProgram {
+                facts: self.semantic_facts.clone(),
+                declarations: self.decls.clone(),
+                externs: self.externs.clone(),
+            },
+        })
     }
 
-    fn into_output(mut self) -> TypecheckOutput {
-        let facts = self.finish().map(|(_, facts)| facts);
+    fn into_semantic_result(mut self) -> Result<SemanticCheckOutput, TypecheckFailure> {
+        let semantic = self.finish();
         let errors = std::mem::take(&mut self.errors);
         let warnings = std::mem::take(&mut self.warnings);
         let lint_events = std::mem::take(&mut self.lint_events);
-        match facts {
-            Some(facts) if errors.is_empty() => {
-                TypecheckOutput::success(warnings, lint_events, facts)
-            }
-            _ => TypecheckOutput::failed(errors, warnings, lint_events),
+        match semantic {
+            Some(semantic) if errors.is_empty() => Ok(semantic),
+            _ => Err(TypecheckFailure {
+                errors,
+                warnings,
+                lint_events,
+            }),
         }
+    }
+
+    fn finish_semantic_expr_types(&mut self) -> bool {
+        let records = self
+            .semantic_facts
+            .bodies
+            .iter()
+            .flat_map(|(body_key, body)| {
+                body.expr_types
+                    .iter()
+                    .map(|(expr, fact)| (body_key.clone(), *expr, fact.handle.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut has_errors = false;
+        for (body, expr, handle) in records {
+            let (ty, errors) = self.solver.finalize_handle_to_type(&handle);
+            has_errors |= self.push_finalize_errors(errors);
+            self.semantic_facts.finish_expr_type(&body, expr, ty);
+        }
+        has_errors
     }
 
     fn result_closure_errors(&self, types: &SourceExprTypes) -> Vec<TypeError> {
@@ -2141,9 +2259,11 @@ impl TypeChecker {
         for (span, ty) in types.values() {
             push_type_closure_error(&mut errors, ty, *span);
         }
-        for (id, target) in &self.calls {
-            let span = types.get(id).and_then(|(span, _)| *span);
-            push_call_target_closure_error(&mut errors, target, span);
+        for body in self.semantic_facts.bodies.values() {
+            for (id, target) in &body.calls {
+                let span = types.get(id).and_then(|(span, _)| *span);
+                push_call_target_closure_error(&mut errors, target, span);
+            }
         }
         self.externs.for_each_resolved_ty(|ty, site| {
             push_extern_ty_closure_error(&mut errors, ty, extern_site_span(site));
@@ -2291,9 +2411,31 @@ pub(crate) fn check_with_modules(
     externs: RawExterns,
     config: TypecheckConfig,
 ) -> TypecheckOutput {
+    match check_semantic_with_modules(program, resolved, externs, config) {
+        Ok(mut semantic) => {
+            let warnings = std::mem::take(&mut semantic.warnings);
+            let lint_events = std::mem::take(&mut semantic.lint_events);
+            TypecheckOutput::success(
+                warnings,
+                lint_events,
+                TypecheckFacts::from_semantic(semantic),
+            )
+        }
+        Err(failure) => {
+            TypecheckOutput::failed(failure.errors, failure.warnings, failure.lint_events)
+        }
+    }
+}
+
+pub(crate) fn check_semantic_with_modules(
+    program: &Program,
+    resolved: &ResolveResult,
+    externs: RawExterns,
+    config: TypecheckConfig,
+) -> Result<SemanticCheckOutput, TypecheckFailure> {
     match typechecker_for_modules(program, resolved, externs, config) {
-        Ok(tc) => tc.into_output(),
-        Err(errors) => TypecheckOutput::failed(errors, vec![], vec![]),
+        Ok(tc) => tc.into_semantic_result(),
+        Err(errors) => Err(TypecheckFailure::errors(errors)),
     }
 }
 

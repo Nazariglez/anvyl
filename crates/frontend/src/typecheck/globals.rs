@@ -47,8 +47,8 @@ impl TypeChecker {
         } else {
             GlobalInitEffect::InitializeFirst
         };
-        self.global_accesses.insert(
-            expr_id,
+        self.semantic_facts.record_global_access(
+            self.current_body(),
             GlobalAccessFact {
                 expr_id,
                 key: key.clone(),

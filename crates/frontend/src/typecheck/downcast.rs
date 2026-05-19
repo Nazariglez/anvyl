@@ -1,6 +1,6 @@
 use super::{
-    CheckedType, DynDowncastFact, TypeChecker, TypeError, TypeHandle,
-    check_value_expr_checked_with_hint, checked_from_type, contracts, convert, dyn_infer,
+    CheckedType, TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint,
+    checked_from_type, contracts, convert, dyn_infer,
     place::{self, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_place, record_mut_borrow},
     type_ops::{type_closure_facts, type_depends_on_generics},
 };
@@ -206,22 +206,17 @@ pub(super) fn record_fact(
     mutable: bool,
     tc: &mut TypeChecker,
 ) {
+    let expr_site = tc.current_expr_site(site.id);
+    let source_site = tc.current_expr_site(site.source_id);
     if let Some(source) =
         contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, source_contract)
     {
-        tc.record_dyn_downcast(DynDowncastFact {
-            expr_id: site.id,
-            source_id: site.source_id,
-            source,
-            target,
-            mutable,
-            span: site.span,
-        });
+        tc.record_resolved_dyn_downcast(expr_site, source_site, source, target, mutable, site.span);
     } else if let Some(hole) = dyn_infer::hole_id(source_contract) {
         tc.dyn_infer.add_downcast(
             tc.current_module.clone(),
-            site.id,
-            site.source_id,
+            expr_site,
+            source_site,
             hole,
             target,
             mutable,

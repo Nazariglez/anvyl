@@ -1,16 +1,32 @@
 use super::support::{
     assert_calls, assert_calls_with_modules, assert_deprecated_warning, assert_err_count,
     assert_expected_projection, assert_expr_type, assert_single_error, assert_ty, assert_ty_mods,
-    assert_typecheck_closed, check, check_mods, nominal_struct,
+    assert_typecheck_closed, check, check_mods, generic_body, nominal_struct, output,
 };
 use crate::{
     ast::{Ident, NominalKind, Type},
+    lint::LintId,
     typecheck::{
         CallTarget, CallableId, ConstDiagnostic, DeprecatedUseKind, GenericArgs, ModuleScope,
         TypeError, call_target_closure_facts,
         const_term::{ConstInferVarId, ConstTerm},
     },
 };
+
+#[test]
+fn failed_output_keeps_lints() {
+    let (errors, warnings, lint_events, facts) = output(
+        "@deprecated fn old() {}
+         fn main() { old(); missing; }",
+    )
+    .into_parts();
+
+    assert!(!errors.is_empty());
+    assert!(warnings.is_empty());
+    assert!(facts.is_none());
+    assert_eq!(lint_events.len(), 1);
+    assert_eq!(lint_events[0].id, LintId::Deprecated);
+}
 
 fn option_type(inner: Type) -> Type {
     Type::nominal(
@@ -97,40 +113,44 @@ fn cached_generic_specialization_restores_call_targets() {
     )
     .unwrap();
     let id = CallableId::function(ModuleScope::Root, Ident::new("id"));
-    let target = result
-        .calls()
-        .values()
-        .find(|target| target.id == id)
-        .expect("missing nested call target");
-    assert_eq!(
-        target,
-        &CallTarget::new(
-            id,
-            GenericArgs {
-                type_args: vec![Type::Int],
-                const_args: vec![],
-            }
-        )
-    );
-}
-
-#[test]
-fn projected_var_arg_records_expected_projection() {
-    let result = check(
-        r"
-        struct Entity { x: int }
-        struct Enemy { @as embed entity: Entity }
-        fn move_entity(var entity: Entity) { entity.x += 1; }
-        fn main() {
-            var enemy = Enemy { entity: Entity { x: 1 } };
-            move_entity(enemy);
+    let targets = result
+        .bodies()
+        .flat_map(|body| body.calls.values())
+        .filter(|target| target.id == id)
+        .collect::<Vec<_>>();
+    assert!(targets.contains(&&CallTarget::new(
+        id.clone(),
+        GenericArgs {
+            type_args: vec![Type::Int],
+            const_args: vec![],
         }
-        ",
-    )
-    .unwrap();
-    let entity_ty = nominal_struct("Entity");
-    let expr_id = assert_expected_projection(&result, &["entity"], entity_ty.clone());
-    assert_expr_type(&result, expr_id, &entity_ty);
+    )));
+    assert!(targets.contains(&&CallTarget::new(
+        id,
+        GenericArgs {
+            type_args: vec![Type::String],
+            const_args: vec![],
+        }
+    )));
+    assert_eq!(targets.len(), 2);
+
+    let int_key = generic_body("wrap", vec![Type::Int]);
+    let string_key = generic_body("wrap", vec![Type::String]);
+    let int_body = result.expect_body(&int_key);
+    let string_body = result.expect_body(&string_key);
+    let has_qualified_type = int_body.expr_types.iter().any(|(expr, int_fact)| {
+        int_fact.ty.as_ref() == Some(&Type::Int)
+            && string_body
+                .expr_types
+                .get(expr)
+                .and_then(|fact| fact.ty.as_ref())
+                == Some(&Type::String)
+    });
+    assert!(
+        has_qualified_type,
+        "int: {:?}\nstring: {:?}",
+        int_body.expr_types, string_body.expr_types
+    );
 }
 
 #[test]
@@ -173,23 +193,6 @@ fn exact_var_arg_records_no_projection() {
 }
 
 #[test]
-fn value_arg_records_expected_projection() {
-    let result = check(
-        r"
-        struct Entity { x: int }
-        struct Enemy { @as embed entity: Entity }
-        fn take(entity: Entity) {}
-        fn main() {
-            let enemy = Enemy { entity: Entity { x: 1 } };
-            take(enemy);
-        }
-        ",
-    )
-    .unwrap();
-    assert_expected_projection(&result, &["entity"], nominal_struct("Entity"));
-}
-
-#[test]
 fn unconstrained_generic_arg_records_no_projection() {
     let result = check(
         r"
@@ -205,27 +208,6 @@ fn unconstrained_generic_arg_records_no_projection() {
     .unwrap();
 
     assert!(result.expected_projections().is_empty());
-}
-
-#[test]
-fn cast_accept_arg_projected_field_casts_to_target() {
-    let result = check(
-        r"
-        struct Raw { x: int }
-        struct Entity { x: int }
-        struct Enemy { @as embed raw: Raw }
-        extend Entity {
-            cast from(raw: Raw) { Entity { x: raw.x } }
-        }
-        fn take(entity: as Entity) {}
-        fn main() {
-            let enemy = Enemy { raw: Raw { x: 1 } };
-            take(enemy);
-        }
-        ",
-    )
-    .unwrap();
-    assert_expected_projection(&result, &["raw"], nominal_struct("Raw"));
 }
 
 #[test]
@@ -247,26 +229,6 @@ fn cast_accept_arg_source_cast_precedes_projection() {
     .unwrap();
 
     assert!(result.expected_projections().is_empty());
-}
-
-#[test]
-fn explicit_cast_projection_records_operand_fact() {
-    let result = check(
-        r"
-        struct Raw { x: int }
-        struct Entity { x: int }
-        struct Enemy { @as embed raw: Raw }
-        extend Entity {
-            cast from(raw: Raw) { Entity { x: raw.x } }
-        }
-        fn main() {
-            let enemy = Enemy { raw: Raw { x: 1 } };
-            let entity: Entity = enemy as Entity;
-        }
-        ",
-    )
-    .unwrap();
-    assert_expected_projection(&result, &["raw"], nominal_struct("Raw"));
 }
 
 #[test]

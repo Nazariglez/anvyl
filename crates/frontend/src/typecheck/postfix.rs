@@ -1,9 +1,9 @@
 use anvyx_externs::ReceiverMode;
 
 use super::{
-    CallForm, CallTarget, CheckedType, ConstSubst, DynCallFact, Exposure, ExternUseTarget,
-    GenericArgs, GenericParams, MemberAccessKind, MemberPathFact, MemberPathKind, PlaceAccess,
-    TypeChecker, TypeError, TypeSubst,
+    CallForm, CallTarget, CheckedType, ConstSubst, Exposure, ExternUseTarget, GenericArgs,
+    GenericParams, MemberAccessKind, MemberPathFact, MemberPathKind, PlaceAccess, TypeChecker,
+    TypeError, TypeSubst,
     annotation::{AccessPolicyOutput, emit_access_policy},
     body::check_specialized_callable_body,
     check_arg_count, check_arg_range, check_expected_value_expr, check_expr_checked,
@@ -1413,8 +1413,8 @@ fn check_dyn_hole_method_call(
         ) {
             Ok(()) => tc.dyn_infer.add_call(
                 tc.current_module.clone(),
-                call_id,
-                receiver.id,
+                tc.current_expr_site(call_id),
+                tc.current_expr_site(receiver.id),
                 hole,
                 name,
                 call.node.args.len(),
@@ -1465,15 +1465,15 @@ fn check_dyn_method_call(
     let ret = tc.type_handle(&requirement.ret.ty);
     constrain_expected_return(call.span, ret.clone(), expected, tc);
     if !failed {
-        tc.record_dyn_call(DynCallFact {
-            call_id,
-            receiver_id: receiver.id,
-            contract: contract.clone(),
-            method: name,
-            arg_count: call.node.args.len(),
+        tc.record_resolved_dyn_call(
+            tc.current_expr_site(call_id),
+            tc.current_expr_site(receiver.id),
+            contract.clone(),
+            name,
+            call.node.args.len(),
             requires_mutable,
-            span: tc.source_span(call.span),
-        });
+            tc.source_span(call.span),
+        );
     }
     checked_type(requirement.ret.ty.clone(), tc)
 }

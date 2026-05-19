@@ -1,98 +1,119 @@
-use std::collections::HashMap;
+use std::collections::hash_map::Values;
 
 use crate::{
-    ast::{ExprId, Ident, NominalKind, Type},
+    ast::{ContractRef, ExprId, Ident, NominalKind, Type},
     diagnostic::DiagnosticTag,
     externs::{self, RawExterns, catalog::ExternCatalog},
     lint::{LintEvent, LintId},
     span::Span,
     test_support::{empty_resolved, parse_program, resolved_modules},
     typecheck::{
-        self, BindingPromotionMap, CallMap, CompileWarning, ContractWitnessMap, DeprecatedUseKind,
-        DynCallMap, DynConversionMap, DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact,
-        ExpectedProjectionMap, ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap,
-        MemberPathMap, TypeError, TypecheckFacts, decls::DeclarationIndex,
+        self, BindingPromotionMap, BodyInstanceKey, CallMap, CallableId, CallableInstanceKey,
+        CompileWarning, ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap,
+        DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact, ExpectedProjectionMap,
+        ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap,
+        SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
+        decls::DeclarationIndex, type_ops::TypeVisitor,
     },
 };
 
 pub(crate) struct TypecheckTestResult {
-    types: HashMap<ExprId, (Span, Type)>,
-    calls: CallMap,
-    extern_uses: ExternUseMap,
-    member_paths: MemberPathMap,
-    expected_projections: ExpectedProjectionMap,
-    contract_witnesses: ContractWitnessMap,
-    dyn_conversions: DynConversionMap,
-    dyn_weakenings: DynWeakeningMap,
-    dyn_calls: DynCallMap,
-    dyn_downcasts: DynDowncastMap,
-    global_accesses: GlobalAccessMap,
-    facts: TypecheckFacts,
+    program: SemanticProgram,
+    source_types: typecheck::infer::SourceExprTypes,
+    public_facts: typecheck::TypecheckFacts,
+    flat_facts: SemanticBodyFacts,
     warnings: Vec<CompileWarning>,
     lint_events: Vec<LintEvent>,
-    decls: DeclarationIndex,
-    externs: ExternCatalog,
 }
 
 impl TypecheckTestResult {
-    pub(crate) fn types(&self) -> impl Iterator<Item = (&ExprId, &(Span, Type))> {
-        self.types.iter()
+    fn from_semantic(semantic: SemanticCheckOutput) -> Self {
+        let flat_facts = semantic.program.facts.flattened_body_facts();
+        Self {
+            program: semantic.program,
+            source_types: semantic.source_types,
+            public_facts: semantic.public_facts,
+            flat_facts,
+            warnings: semantic.warnings,
+            lint_events: semantic.lint_events,
+        }
+    }
+
+    pub(crate) fn types(&self) -> impl Iterator<Item = (&ExprId, (Span, &Type))> {
+        self.source_types.iter().map(|(id, (span, ty))| {
+            let span = span
+                .expect("test expression type missing source span")
+                .byte();
+            (id, (span, ty))
+        })
+    }
+
+    pub(crate) fn body(&self, key: &BodyInstanceKey) -> Option<&SemanticBodyFacts> {
+        self.program.facts.body(key)
+    }
+
+    pub(crate) fn expect_body(&self, key: &BodyInstanceKey) -> &SemanticBodyFacts {
+        self.body(key).expect("missing semantic body facts")
+    }
+
+    pub(crate) fn bodies(&self) -> Values<'_, BodyInstanceKey, SemanticBodyFacts> {
+        self.program.facts.bodies.values()
     }
 
     pub(crate) fn calls(&self) -> &CallMap {
-        &self.calls
+        &self.flat_facts.calls
     }
 
     pub(crate) fn extern_uses(&self) -> &ExternUseMap {
-        &self.extern_uses
+        &self.flat_facts.extern_uses
     }
 
     pub(crate) fn member_paths(&self) -> &MemberPathMap {
-        &self.member_paths
+        &self.flat_facts.member_paths
     }
 
     pub(crate) fn expected_projections(&self) -> &ExpectedProjectionMap {
-        &self.expected_projections
+        &self.flat_facts.expected_projections
     }
 
     pub(crate) fn contract_witnesses(&self) -> &ContractWitnessMap {
-        &self.contract_witnesses
+        &self.program.facts.contract_witnesses
     }
 
     pub(crate) fn dyn_conversions(&self) -> &DynConversionMap {
-        &self.dyn_conversions
+        &self.flat_facts.dyn_conversions
     }
 
     pub(crate) fn dyn_weakenings(&self) -> &DynWeakeningMap {
-        &self.dyn_weakenings
+        &self.flat_facts.dyn_weakenings
     }
 
     pub(crate) fn dyn_calls(&self) -> &DynCallMap {
-        &self.dyn_calls
+        &self.flat_facts.dyn_calls
     }
 
     pub(crate) fn dyn_downcasts(&self) -> &DynDowncastMap {
-        &self.dyn_downcasts
+        &self.flat_facts.dyn_downcasts
     }
 
     pub(crate) fn global_accesses(&self) -> &GlobalAccessMap {
-        &self.global_accesses
+        &self.flat_facts.global_accesses
     }
 
     pub(crate) fn for_step_runtime_checks(&self) -> &typecheck::ForStepRuntimeCheckMap {
-        self.facts.for_step_runtime_checks()
+        self.public_facts.for_step_runtime_checks()
     }
 
     pub(crate) fn lambda_escapes(&self) -> &LambdaEscapeMap {
-        self.facts.lambda_escapes()
+        self.public_facts.lambda_escapes()
     }
 
     pub(crate) fn lambda_captures(&self) -> &LambdaCaptureMap {
-        self.facts.lambda_captures()
+        self.public_facts.lambda_captures()
     }
 
     pub(crate) fn binding_promotions(&self) -> &BindingPromotionMap {
-        self.facts.binding_promotions()
+        self.public_facts.binding_promotions()
     }
 
     pub(crate) fn warnings(&self) -> &[CompileWarning] {
@@ -104,16 +125,26 @@ impl TypecheckTestResult {
     }
 
     pub(crate) fn decls(&self) -> &DeclarationIndex {
-        &self.decls
+        &self.program.declarations
     }
 
     pub(crate) fn externs(&self) -> &ExternCatalog {
-        &self.externs
+        &self.program.externs
     }
 }
 
 pub(crate) fn nominal_struct(name: &str) -> Type {
     Type::nominal(NominalKind::Struct, Ident::new(name), vec![], vec![], None)
+}
+
+pub(crate) fn generic_body(name: &str, type_args: Vec<Type>) -> BodyInstanceKey {
+    BodyInstanceKey::Callable(CallableInstanceKey {
+        target: CallableId::function(typecheck::ModuleScope::Root, Ident::new(name)),
+        args: typecheck::GenericArgs {
+            type_args,
+            const_args: vec![],
+        },
+    })
 }
 
 pub(crate) fn single_expected_projection(
@@ -174,6 +205,15 @@ pub(crate) fn assert_typecheck_closed(result: &TypecheckTestResult) {
     for ty in result.types().map(|(_, (_, ty))| ty) {
         assert_closed_type(ty, "result");
     }
+    for body in result.bodies() {
+        for fact in body.expr_types.values() {
+            let ty = fact
+                .ty
+                .as_ref()
+                .expect("semantic expression type not finalized");
+            assert_closed_type(ty, "semantic expression");
+        }
+    }
     for target in result.calls().values() {
         let facts = typecheck::call_target_closure_facts(target);
         assert!(
@@ -212,6 +252,35 @@ fn assert_closed_type(ty: &Type, label: &str) {
         !facts.contains_unresolved_const,
         "{label} type contains unresolved const: {ty:?}"
     );
+    assert!(
+        !type_contains_dyn_hole(ty),
+        "{label} type contains inferred dynamic contract: {ty:?}"
+    );
+}
+
+fn type_contains_dyn_hole(ty: &Type) -> bool {
+    struct DynHoleVisitor;
+
+    impl TypeVisitor for DynHoleVisitor {
+        fn visit_contract_ref_leaf(&mut self, contract: &ContractRef) -> bool {
+            matches!(contract, ContractRef::Infer | ContractRef::Hole(_))
+        }
+    }
+
+    let mut visitor = DynHoleVisitor;
+    visitor.visit_type(ty)
+}
+
+pub(crate) fn output(source: &str) -> typecheck::TypecheckOutput {
+    let program = parse_program(source);
+    let resolved = empty_resolved();
+    let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
+    typecheck::check_with_modules(
+        &program,
+        &resolved,
+        raw_externs,
+        typecheck::TypecheckConfig::default(),
+    )
 }
 
 pub(crate) fn check(source: &str) -> Result<TypecheckTestResult, Vec<TypeError>> {
@@ -226,42 +295,14 @@ pub(crate) fn check_with_raw_externs(
     resolved: &crate::resolve::ResolveResult,
     raw_externs: RawExterns,
 ) -> Result<TypecheckTestResult, Vec<TypeError>> {
-    let mut tc = typecheck::typechecker_for_modules(
+    let semantic = typecheck::check_semantic_with_modules(
         program,
         resolved,
         raw_externs,
         typecheck::TypecheckConfig::default(),
-    )?;
-    let Some((source_types, facts)) = tc.finish() else {
-        return Err(tc.errors);
-    };
-    let types = source_types
-        .into_iter()
-        .map(|(id, (span, ty))| {
-            let span = span
-                .expect("test expression type missing source span")
-                .byte();
-            (id, (span, ty))
-        })
-        .collect();
-    Ok(TypecheckTestResult {
-        types,
-        calls: tc.calls,
-        extern_uses: tc.extern_uses,
-        member_paths: tc.member_paths,
-        expected_projections: tc.expected_projections,
-        contract_witnesses: tc.contract_witnesses,
-        dyn_conversions: tc.dyn_conversions,
-        dyn_weakenings: tc.dyn_weakenings,
-        dyn_calls: tc.dyn_calls,
-        dyn_downcasts: tc.dyn_downcasts,
-        global_accesses: tc.global_accesses,
-        facts,
-        warnings: tc.warnings,
-        lint_events: tc.lint_events,
-        decls: tc.decls,
-        externs: tc.externs,
-    })
+    )
+    .map_err(|failure| failure.errors)?;
+    Ok(TypecheckTestResult::from_semantic(semantic))
 }
 
 pub(crate) fn errors(source: &str) -> Vec<TypeError> {

@@ -1,0 +1,27 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+struct Label {
+    fn draw(self) {}
+}
+
+fn try_down<T>(actor: dyn Drawable) {
+    if let value = actor as? T {
+        value.draw();
+    }
+}
+
+fn main() {
+    try_down<Enemy>(Enemy {});
+    try_down<Label>(Label {});
+    try_down<Enemy>(Enemy {});
+}

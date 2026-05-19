@@ -2,14 +2,47 @@ use std::path::Path;
 
 use super::{
     BindingPromotionMap, CompileWarning, ForStepRuntimeCheckMap, ImportId, ImportRecord,
-    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, TypeError, semantic_use::map_delta,
+    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, SemanticFactMaps, TypeError,
+    decls::DeclarationIndex, infer::SourceExprTypes, semantic_use::map_delta,
 };
 use crate::{
     ast::Visibility,
     diagnostic::DiagnosticTag,
+    externs::catalog::ExternCatalog,
     lint::{LintEvent, LintId},
     resolve::PackageId,
 };
+
+#[derive(Clone)]
+pub(crate) struct SemanticProgram {
+    pub(crate) facts: SemanticFactMaps,
+    pub(crate) declarations: DeclarationIndex,
+    pub(crate) externs: ExternCatalog,
+}
+
+pub(crate) struct SemanticCheckOutput {
+    pub(crate) warnings: Vec<CompileWarning>,
+    pub(crate) lint_events: Vec<LintEvent>,
+    pub(crate) public_facts: TypecheckFacts,
+    pub(crate) source_types: SourceExprTypes,
+    pub(crate) program: SemanticProgram,
+}
+
+pub(crate) struct TypecheckFailure {
+    pub(crate) errors: Vec<TypeError>,
+    pub(crate) warnings: Vec<CompileWarning>,
+    pub(crate) lint_events: Vec<LintEvent>,
+}
+
+impl TypecheckFailure {
+    pub(crate) fn errors(errors: Vec<TypeError>) -> Self {
+        Self {
+            errors,
+            warnings: vec![],
+            lint_events: vec![],
+        }
+    }
+}
 
 pub struct TypecheckOutput {
     errors: Vec<TypeError>,
@@ -70,6 +103,23 @@ pub struct TypecheckFacts {
 }
 
 impl TypecheckFacts {
+    pub(crate) fn from_semantic(output: SemanticCheckOutput) -> Self {
+        output.program.facts.validate_finished();
+        debug_assert!(output.source_types.values().all(|(span, _)| span.is_some()));
+        debug_assert_eq!(
+            output.program.declarations.import_records().len(),
+            output.public_facts.import_records.len()
+        );
+        debug_assert!(
+            output.program.externs.functions().all(|function| output
+                .program
+                .externs
+                .function(function.id)
+                == function)
+        );
+        output.public_facts
+    }
+
     pub fn lambda_escapes(&self) -> &LambdaEscapeMap {
         &self.lambda_escapes
     }
@@ -106,21 +156,24 @@ impl TypecheckFacts {
             lambda_captures: map_delta(&old.lambda_captures, &self.lambda_captures),
             binding_promotions: map_delta(&old.binding_promotions, &self.binding_promotions),
             for_step_runtime_checks: map_delta(
-                old.for_step_runtime_checks(),
-                self.for_step_runtime_checks(),
+                &old.for_step_runtime_checks,
+                &self.for_step_runtime_checks,
             ),
             import_records: self.import_records.clone(),
             used_imports: self.used_imports.clone(),
         }
     }
 
-    fn validate(&self) {
+    pub(crate) fn validate(&self) {
         for (expr_id, fact) in self.lambda_escapes() {
             debug_assert_eq!(*expr_id, fact.expr_id);
         }
         for ((lambda_id, binding_id), fact) in self.lambda_captures() {
             debug_assert_eq!(*lambda_id, fact.lambda_id);
             debug_assert_eq!(*binding_id, fact.binding_id);
+        }
+        for span in self.for_step_runtime_checks().values() {
+            debug_assert!(span.span.start <= span.span.end);
         }
         for (binding_id, fact) in self.binding_promotions() {
             debug_assert_eq!(*binding_id, fact.binding_id);

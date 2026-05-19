@@ -1,9 +1,10 @@
 use std::{collections::HashMap, rc::Rc};
 
 use super::{
-    CheckedType, LocalBindingKind, LocalCallableInfo, LocalConstInfo, LocalSymbol, ReturnFrame,
-    ReturnMode, ScopeState, TypeChecker, TypeError, VarInfo, annotation, check_expr_checked,
-    check_expr_checked_with_hint, checked_void, const_eval, control_flow,
+    BodyInstanceKey, CallableInstanceKey, CastFromInstanceKey, CheckedType, LocalBindingKind,
+    LocalCallableInfo, LocalConstInfo, LocalSymbol, ReturnFrame, ReturnMode, ScopeState,
+    TypeChecker, TypeError, VarInfo, annotation, check_expr_checked, check_expr_checked_with_hint,
+    checked_void, const_eval, control_flow,
     decl_validate::{
         check_method_generic_shadows, has_generics, has_mutable_param, is_generic,
         method_sig_is_generic, validate_return_spec, validate_type_alias_def,
@@ -961,9 +962,17 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
     }
 }
 
+fn callable_body_key(target: CallableId, args: GenericArgs) -> BodyInstanceKey {
+    BodyInstanceKey::Callable(CallableInstanceKey { target, args })
+}
+
 fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
     let func = &func_node.node;
-    let id = CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+    let id = if tc.scopes.len() > 1 {
+        CallableId::local_function(tc.current_module.clone(), func.name, func_node.span)
+    } else {
+        CallableId::function(tc.current_module.clone(), func.name)
+    };
     let local = tc.local_callable(&id);
     let (param_types, ret) = match local.as_ref() {
         Some(info) => (&info.callee.def.sig.params, &info.callee.def.sig.ret),
@@ -975,29 +984,35 @@ fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
             let Type::Func { params, ret } = func_ty else {
                 return;
             };
-            check_func_body(
-                None,
-                &func.params,
-                &params,
-                ret.as_ref(),
-                &func.body,
-                func_node.span,
-                &[],
-                tc,
-            );
+            let body_key = callable_body_key(id.clone(), GenericArgs::default());
+            tc.with_body_instance(body_key, |tc| {
+                check_func_body(
+                    None,
+                    &func.params,
+                    &params,
+                    ret.as_ref(),
+                    &func.body,
+                    func_node.span,
+                    &[],
+                    tc,
+                );
+            });
             return;
         }
     };
-    check_func_body(
-        None,
-        &func.params,
-        param_types,
-        ret,
-        &func.body,
-        func_node.span,
-        &[],
-        tc,
-    );
+    let body_key = callable_body_key(id, GenericArgs::default());
+    tc.with_body_instance(body_key, |tc| {
+        check_func_body(
+            None,
+            &func.params,
+            param_types,
+            ret,
+            &func.body,
+            func_node.span,
+            &[],
+            tc,
+        );
+    });
 }
 
 fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
@@ -1028,28 +1043,40 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
         else {
             continue;
         };
-        check_func_body(
-            mode.receiver().map(|receiver| (receiver, self_ty.clone())),
-            &method.sig.params,
-            &method_schema.params,
-            &method_schema.ret,
-            &method.body,
-            extend_node.span,
-            &[],
-            tc,
-        );
+        let id = CallableId::extend_method(schema.id.clone(), method.sig.name, mode.surface());
+        let body_key = callable_body_key(id, GenericArgs::default());
+        tc.with_body_instance(body_key, |tc| {
+            check_func_body(
+                mode.receiver().map(|receiver| (receiver, self_ty.clone())),
+                &method.sig.params,
+                &method_schema.params,
+                &method_schema.ret,
+                &method.body,
+                extend_node.span,
+                &[],
+                tc,
+            );
+        });
     }
-    for (cast, schema) in extend.cast_froms.iter().zip(schema.cast_froms) {
-        check_func_body(
-            None,
-            std::slice::from_ref(&cast.node.param),
-            std::slice::from_ref(&schema.param),
-            &ReturnSpec::value(self_ty.clone()),
-            &cast.node.body,
-            cast.span,
-            &[],
-            tc,
-        );
+    for (index, (cast, cast_schema)) in extend.cast_froms.iter().zip(schema.cast_froms).enumerate()
+    {
+        let key = BodyInstanceKey::CastFrom(CastFromInstanceKey {
+            extend: schema.id.clone(),
+            index,
+            args: GenericArgs::default(),
+        });
+        tc.with_body_instance(key, |tc| {
+            check_func_body(
+                None,
+                std::slice::from_ref(&cast.node.param),
+                std::slice::from_ref(&cast_schema.param),
+                &ReturnSpec::value(self_ty.clone()),
+                &cast.node.body,
+                cast.span,
+                &[],
+                tc,
+            );
+        });
     }
 }
 
@@ -1076,19 +1103,23 @@ fn check_aggregate_method_bodies(
         else {
             continue;
         };
-        check_func_body(
-            method_schema
-                .mode
-                .receiver()
-                .map(|receiver| (receiver, self_ty.clone())),
-            &method.sig.params,
-            &method_schema.params,
-            &method_schema.ret,
-            &method.body,
-            span,
-            &[],
-            tc,
-        );
+        let id = CallableId::aggregate_method(key.clone(), method.sig.name, mode.surface());
+        let body_key = callable_body_key(id, GenericArgs::default());
+        tc.with_body_instance(body_key, |tc| {
+            check_func_body(
+                method_schema
+                    .mode
+                    .receiver()
+                    .map(|receiver| (receiver, self_ty.clone())),
+                &method.sig.params,
+                &method_schema.params,
+                &method_schema.ret,
+                &method.body,
+                span,
+                &[],
+                tc,
+            );
+        });
     }
 }
 
@@ -1430,7 +1461,8 @@ pub(super) fn check_specialized_callable_body(
         }
         Some(SpecializationState::InProgress) => return None,
         Some(SpecializationState::Done(body)) => {
-            tc.restore_specialization(body.facts);
+            let body = *body;
+            tc.restore_specialization(key, body.facts);
             if let Err(message) = tc.dyn_infer.restore_specialization(body.dyn_infer) {
                 tc.push_error(TypeError::CompileError {
                     message,

@@ -10,7 +10,7 @@ use crate::{
         ArrayLen, ConstArg, ConstParamId, ContractRef, EscapeMode, ExprId, FuncParam, GenericArg,
         Ident, ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type, TypeVarId,
     },
-    span::{SourceSpan, Span},
+    span::SourceSpan,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -702,6 +702,11 @@ impl Solver {
         TypeHandle(TypeRef::concrete(Ty::from_recovery_type(ty)))
     }
 
+    pub(super) fn snapshot_handle(&mut self, handle: &TypeHandle) -> TypeHandle {
+        let ty = self.resolve_ref(&handle.0);
+        self.temp_handle(ty)
+    }
+
     pub(super) fn generic_solver_vars(
         &mut self,
         generics: &GenericParams,
@@ -896,6 +901,22 @@ impl Solver {
         self.type_for_storage(&self.resolve_ref(&handle.0))
     }
 
+    pub(super) fn finalize_handle_to_type(
+        &self,
+        handle: &TypeHandle,
+    ) -> (Type, Vec<SolverFinalizeError>) {
+        let mut errors = Vec::new();
+        let mut seen_types = HashSet::new();
+        let mut seen_consts = HashSet::new();
+        let mut cx = FinalizeCx {
+            errors: &mut errors,
+            seen_types: &mut seen_types,
+            seen_consts: &mut seen_consts,
+        };
+        let ty = self.finalize_ty_inner(&self.resolve_ref(&handle.0), &mut cx);
+        (ty, errors.into_iter().map(Into::into).collect())
+    }
+
     pub(super) fn handle_is_poison(&self, handle: &TypeHandle) -> bool {
         self.resolve_ref(&handle.0).contains_error()
     }
@@ -990,16 +1011,6 @@ impl Solver {
         ty: &Type,
     ) {
         self.set_expr_type(id, span, Ty::from_recovery_type(ty));
-    }
-
-    pub(super) fn expr_types_to_types(&self) -> HashMap<ExprId, (Span, Type)> {
-        self.expr_types
-            .iter()
-            .map(|(id, (span, ty))| {
-                let span = span.expect("expression type missing source span").byte();
-                (*id, (span, self.type_for_storage(ty)))
-            })
-            .collect()
     }
 
     pub(super) fn rewrite_contract_refs(

@@ -1223,7 +1223,7 @@ impl ValueDecl {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ParamTypeSpans(Vec<Span>);
 
 impl ParamTypeSpans {
@@ -1339,7 +1339,7 @@ pub(crate) struct ContractSchema {
     pub(crate) span: SourceSpan,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ContractRequirementSchema {
     pub(crate) name: Ident,
     pub(crate) receiver: Option<MethodReceiver>,

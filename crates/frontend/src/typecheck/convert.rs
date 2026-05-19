@@ -225,10 +225,11 @@ fn try_to_dyn(
         (Type::Dyn(ContractRef::Hole(hole)), target) => {
             tc.dyn_infer.add_hole_target(
                 tc.current_module.clone(),
-                expr_id,
+                expr_id.map(|id| tc.current_expr_site(id)),
                 *hole,
                 target.clone(),
                 span,
+                tc.source_span(span),
             );
             true
         }
@@ -256,10 +257,11 @@ fn try_to_dyn_hole(
         Type::Dyn(source) => {
             tc.dyn_infer.add_dyn_source(
                 tc.current_module.clone(),
-                expr_id,
+                expr_id.map(|id| tc.current_expr_site(id)),
                 source.clone(),
                 hole,
                 span,
+                tc.source_span(span),
             );
             true
         }
@@ -268,10 +270,11 @@ fn try_to_dyn_hole(
         _ => {
             tc.dyn_infer.add_conversion(
                 tc.current_module.clone(),
-                expr_id,
+                expr_id.map(|id| tc.current_expr_site(id)),
                 from.clone(),
                 hole,
                 span,
+                tc.source_span(span),
             );
             true
         }

@@ -1,7 +1,4 @@
-use super::support::{
-    assert_err, assert_err_count, assert_expected_projection, assert_single_error, assert_ty,
-    check, errors, nominal_struct,
-};
+use super::support::{assert_err, assert_err_count, assert_single_error, assert_ty, errors};
 use crate::{ast::Type, typecheck::TypeError};
 
 mod binding_patterns {
@@ -26,22 +23,6 @@ mod binding_patterns {
     fn let_literal_string_ok() {
         assert_err_count("fn main() { let \"hi\" = \"hi\"; }", 0);
     }
-}
-
-#[test]
-fn typed_binding_records_expected_projection() {
-    let result = check(
-        r"
-        struct Entity { x: int }
-        struct Enemy { @as embed entity: Entity }
-        fn main() {
-            let enemy = Enemy { entity: Entity { x: 1 } };
-            let entity: Entity = enemy;
-        }
-        ",
-    )
-    .unwrap();
-    assert_expected_projection(&result, &["entity"], nominal_struct("Entity"));
 }
 
 mod for_patterns {

@@ -9,7 +9,7 @@ use anvyx_externs::{
 
 use super::support::{
     TypecheckTestResult, assert_deprecated_warning, assert_typecheck_closed, check, check_named,
-    check_with_raw_externs, single_expected_projection,
+    check_with_raw_externs, generic_body, single_expected_projection,
 };
 use crate::{
     ast::{ExprId, Ident, ModuleOrigin, NominalKind, Type},
@@ -21,7 +21,10 @@ use crate::{
     },
     resolve::{ModuleId, ModulePath, PackageId},
     test_support::{parse_program, resolved_modules_with_external},
-    typecheck::{self, DeprecatedUseKind, ExternUseTarget, MemberPathKind, ModuleScope, TypeError},
+    typecheck::{
+        self, CallableId, DeprecatedUseKind, ExternUseTarget, MemberPathKind, ModuleScope,
+        TypeError,
+    },
 };
 
 #[test]
@@ -404,6 +407,21 @@ mod calls {
 
         assert_use(&result, ExternUseTarget::Function(id));
         assert_use_total(&result, 1);
+
+        let body_use_count = [Type::Int, Type::String]
+            .into_iter()
+            .map(|ty| generic_body("wrap", vec![ty]))
+            .map(|key| {
+                result
+                    .expect_body(&key)
+                    .extern_uses
+                    .values()
+                    .flatten()
+                    .filter(|target| **target == ExternUseTarget::Function(id))
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(body_use_count, 2);
         assert_typecheck_closed(&result);
     }
 }
@@ -1594,7 +1612,7 @@ mod provider_imports {
             .expect("callable extern function");
         assert_eq!(
             callable.def.id,
-            typecheck::CallableId::extern_function(provider_scope(&["host"]), Ident::new("tick"))
+            CallableId::extern_function(provider_scope(&["host"]), Ident::new("tick"))
         );
         assert_eq!(
             result

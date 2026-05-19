@@ -1,20 +1,18 @@
 use std::collections::HashMap;
 
 use super::{
-    CallMap, CallableRef, CallableTemplate, ContractWitnessMap, DynCallMap, DynConversionMap,
-    DynDowncastMap, DynWeakeningMap, ExpectedProjectionMap, ExternUseMap, ForStepRuntimeCheckMap,
-    GenericTypeContext, GlobalAccessMap, MemberPathMap, TypeChecker, TypecheckFacts,
+    BodyInstanceKey, CallableInstanceKey, CallableRef, CallableTemplate, ContractWitnessMap,
+    GenericTypeContext, SemanticBodyFacts, TypeChecker, TypecheckFacts,
     const_term::ConstTerm,
     decls::CallableId,
     dyn_infer::DynInferenceFacts,
     infer::{GenericSolverSeeds, Solver},
-    semantic_use::map_delta,
     type_ops::TypeFolder,
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef, ExprId, GenericArg,
-        Ident, Type, TypeParam, TypeVarId,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef, GenericArg, Ident,
+        Type, TypeParam, TypeVarId,
     },
     span::Span,
 };
@@ -114,12 +112,6 @@ impl GenericArgs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct SpecializationKey {
-    pub(crate) target: CallableId,
-    pub(crate) args: GenericArgs,
-}
-
 #[derive(Clone, Default)]
 pub(super) struct GenericOwnerFrame {
     pub(super) params: GenericParams,
@@ -127,22 +119,10 @@ pub(super) struct GenericOwnerFrame {
     pub(super) generics: GenericTypeContext,
 }
 
-pub(crate) type SpecializedBodyTypes = HashMap<ExprId, (Span, Type)>;
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct SpecializedBodyFacts {
-    pub(crate) types: SpecializedBodyTypes,
-    pub(crate) calls: CallMap,
-    pub(crate) extern_uses: ExternUseMap,
-    pub(crate) member_paths: MemberPathMap,
-    pub(crate) expected_projections: ExpectedProjectionMap,
+    pub(crate) body: SemanticBodyFacts,
     pub(crate) contract_witnesses: ContractWitnessMap,
-    pub(crate) dyn_conversions: DynConversionMap,
-    pub(crate) dyn_weakenings: DynWeakeningMap,
-    pub(crate) dyn_calls: DynCallMap,
-    pub(crate) dyn_downcasts: DynDowncastMap,
-    pub(crate) global_accesses: GlobalAccessMap,
-    pub(crate) for_step_runtime_checks: ForStepRuntimeCheckMap,
     pub(crate) closure: TypecheckFacts,
 }
 
@@ -196,39 +176,15 @@ pub(super) fn callable_const_bindings(
     bindings
 }
 
-pub(super) fn specialized_body_facts(
-    old: &SpecializedBodyFacts,
-    current: &SpecializedBodyFacts,
-) -> SpecializedBodyFacts {
-    SpecializedBodyFacts {
-        types: map_delta(&old.types, &current.types),
-        calls: map_delta(&old.calls, &current.calls),
-        extern_uses: map_delta(&old.extern_uses, &current.extern_uses),
-        member_paths: map_delta(&old.member_paths, &current.member_paths),
-        expected_projections: map_delta(&old.expected_projections, &current.expected_projections),
-        contract_witnesses: map_delta(&old.contract_witnesses, &current.contract_witnesses),
-        dyn_conversions: map_delta(&old.dyn_conversions, &current.dyn_conversions),
-        dyn_weakenings: map_delta(&old.dyn_weakenings, &current.dyn_weakenings),
-        dyn_calls: map_delta(&old.dyn_calls, &current.dyn_calls),
-        dyn_downcasts: map_delta(&old.dyn_downcasts, &current.dyn_downcasts),
-        global_accesses: map_delta(&old.global_accesses, &current.global_accesses),
-        for_step_runtime_checks: map_delta(
-            &old.for_step_runtime_checks,
-            &current.for_step_runtime_checks,
-        ),
-        closure: current.closure.delta_since(&old.closure),
-    }
-}
-
-pub(super) fn specialization_key(id: CallableId, args: &GenericArgs) -> SpecializationKey {
-    SpecializationKey {
+pub(super) fn specialization_key(id: CallableId, args: &GenericArgs) -> CallableInstanceKey {
+    CallableInstanceKey {
         target: id,
         args: args.clone(),
     }
 }
 
 pub(super) fn check_with_specialization(
-    key: SpecializationKey,
+    key: CallableInstanceKey,
     type_subst: TypeSubst,
     const_subst: ConstSubst,
     owner_frame: GenericOwnerFrame,
@@ -236,23 +192,36 @@ pub(super) fn check_with_specialization(
     check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
 ) -> Option<Type> {
     tc.solve_constraints();
-    let old_facts = tc.specialization_facts();
+    let old_witnesses = tc.semantic_facts.contract_witnesses.clone();
+    let old_closure = tc.closure_fact_snapshot();
     let old_dyn_infer = tc.dyn_infer.specialization_snapshot();
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
     tc.push_type_subst(type_subst);
     tc.push_const_subst(const_subst);
     tc.push_generic_context(owner_frame.generics.clone());
     tc.push_generic_owner_frame(owner_frame);
-    let inferred_ret = check_body(tc);
+    let body_key = BodyInstanceKey::Callable(key.clone());
+    let inferred_ret = tc.with_body_instance(body_key.clone(), check_body);
     tc.solve_constraints();
     tc.pop_generic_owner_frame();
     tc.pop_generic_context();
     tc.pop_const_subst();
     tc.pop_type_subst();
+    let body = tc
+        .semantic_facts
+        .body(&body_key)
+        .cloned()
+        .unwrap_or_default();
+    let contract_witnesses =
+        super::semantic_use::map_delta(&old_witnesses, &tc.semantic_facts.contract_witnesses);
     tc.store_specialization(
         key,
         SpecializationState::Done(Box::new(SpecializedBody {
-            facts: specialized_body_facts(&old_facts, &tc.specialization_facts()),
+            facts: SpecializedBodyFacts {
+                body,
+                contract_witnesses,
+                closure: tc.closure_fact_snapshot().delta_since(&old_closure),
+            },
             dyn_infer: tc.dyn_infer.specialization_delta_since(&old_dyn_infer),
             inferred_ret: inferred_ret.clone(),
         })),
@@ -321,13 +290,13 @@ impl TypeChecker {
         self.callable_templates.get(id)
     }
 
-    pub(super) fn specialization(&self, key: &SpecializationKey) -> Option<&SpecializationState> {
+    pub(super) fn specialization(&self, key: &CallableInstanceKey) -> Option<&SpecializationState> {
         self.specializations.get(key)
     }
 
     pub(super) fn store_specialization(
         &mut self,
-        key: SpecializationKey,
+        key: CallableInstanceKey,
         state: SpecializationState,
     ) {
         self.specializations.insert(key, state);
@@ -338,44 +307,16 @@ impl TypeChecker {
             .fact_snapshot(|id| self.solver.local_type_to_type(id))
     }
 
-    pub(super) fn specialization_facts(&self) -> SpecializedBodyFacts {
-        SpecializedBodyFacts {
-            types: self.expr_types(),
-            calls: self.calls.clone(),
-            extern_uses: self.extern_uses.clone(),
-            member_paths: self.member_paths.clone(),
-            expected_projections: self.expected_projections.clone(),
-            contract_witnesses: self.contract_witnesses.clone(),
-            dyn_conversions: self.dyn_conversions.clone(),
-            dyn_weakenings: self.dyn_weakenings.clone(),
-            dyn_calls: self.dyn_calls.clone(),
-            dyn_downcasts: self.dyn_downcasts.clone(),
-            global_accesses: self.global_accesses.clone(),
-            for_step_runtime_checks: self.for_step_runtime_checks.clone(),
-            closure: self.closure_fact_snapshot(),
-        }
-    }
-
-    pub(super) fn restore_specialization(&mut self, facts: SpecializedBodyFacts) {
-        for (id, (span, ty)) in facts.types {
-            self.set_type(id, ty, span);
-        }
-        self.calls.extend(facts.calls);
-        self.extern_uses.extend(facts.extern_uses);
-        self.member_paths.extend(facts.member_paths);
-        self.expected_projections.extend(facts.expected_projections);
-        for fact in facts.contract_witnesses.into_values() {
-            self.next_witness_id = self.next_witness_id.max(fact.id.0 + 1);
-            self.witness_keys.insert(fact.key.clone(), fact.id);
-            self.contract_witnesses.insert(fact.id, fact);
-        }
-        self.dyn_conversions.extend(facts.dyn_conversions);
-        self.dyn_weakenings.extend(facts.dyn_weakenings);
-        self.dyn_calls.extend(facts.dyn_calls);
-        self.dyn_downcasts.extend(facts.dyn_downcasts);
-        self.global_accesses.extend(facts.global_accesses);
-        self.for_step_runtime_checks
-            .extend(facts.for_step_runtime_checks);
+    pub(super) fn restore_specialization(
+        &mut self,
+        key: CallableInstanceKey,
+        facts: SpecializedBodyFacts,
+    ) {
+        facts.body.validate();
+        self.semantic_facts
+            .merge_body(BodyInstanceKey::Callable(key), facts.body);
+        self.semantic_facts
+            .merge_witnesses(facts.contract_witnesses);
         self.closure.extend_facts(facts.closure);
     }
 }

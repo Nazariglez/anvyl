@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use super::{
-    DynCallFact, DynConversionFact, DynWeakeningFact, FuncParam, MethodReceiver, ParamTypeSpans,
-    TypeChecker, TypeError, contracts,
+    FuncParam, MethodReceiver, ParamTypeSpans, SemanticExprSite, TypeChecker, TypeError, contracts,
     convert::push_match_error,
     decls::{ContractRequirementSchema, ModuleScope},
     type_ops::{TypeFolder, TypeVisitor},
@@ -10,7 +9,7 @@ use super::{
 use crate::{
     ast::{
         AnonymousContract, AnonymousContractParam, AnonymousContractRequirement, ContractRef,
-        DynContractHoleId, ExprId, Ident, ReturnSpec, Type,
+        DynContractHoleId, Ident, ReturnSpec, Type,
     },
     lint::{LintEvent, LintId},
     span::{SourceSpan, Span},
@@ -52,7 +51,7 @@ pub(super) struct DynInferenceSnapshot {
     solutions: HashMap<DynContractHoleId, ContractRef>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct DynHole {
     module: ModuleScope,
     span: SourceSpan,
@@ -61,38 +60,41 @@ struct DynHole {
     expected: Vec<ContractRef>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct PendingConversion {
     module: ModuleScope,
-    expr_id: Option<ExprId>,
+    site: Option<SemanticExprSite>,
     concrete_ty: Type,
     hole: DynContractHoleId,
     span: Span,
+    source_span: SourceSpan,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct PendingDynSource {
     module: ModuleScope,
-    expr_id: Option<ExprId>,
+    site: Option<SemanticExprSite>,
     source: ContractRef,
     hole: DynContractHoleId,
     span: Span,
+    source_span: SourceSpan,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct PendingHoleTarget {
     module: ModuleScope,
-    expr_id: Option<ExprId>,
+    site: Option<SemanticExprSite>,
     hole: DynContractHoleId,
     target: ContractRef,
     span: Span,
+    source_span: SourceSpan,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct PendingCall {
     module: ModuleScope,
-    call_id: ExprId,
-    receiver_id: ExprId,
+    site: SemanticExprSite,
+    receiver_site: SemanticExprSite,
     hole: DynContractHoleId,
     method: Ident,
     arg_count: usize,
@@ -100,11 +102,11 @@ struct PendingCall {
     span: SourceSpan,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct PendingDowncast {
     module: ModuleScope,
-    expr_id: ExprId,
-    source_id: ExprId,
+    site: SemanticExprSite,
+    source_site: SemanticExprSite,
     hole: DynContractHoleId,
     target: Type,
     mutable: bool,
@@ -140,12 +142,7 @@ impl DynInference {
             holes: self
                 .holes
                 .iter()
-                .filter(|(id, hole)| {
-                    old.holes.get(id).is_none_or(|old| {
-                        old.requirements.len() != hole.requirements.len()
-                            || old.expected.len() != hole.expected.len()
-                    })
-                })
+                .filter(|(id, hole)| old.holes.get(id) != Some(hole))
                 .map(|(id, hole)| (*id, hole.clone()))
                 .collect(),
             conversions: self.conversions[old.conversions_len..].to_vec(),
@@ -165,12 +162,23 @@ impl DynInference {
         for (id, hole) in facts.holes {
             self.restore_hole(id, hole)?;
         }
-        self.conversions.extend(facts.conversions);
-        self.dyn_sources.extend(facts.dyn_sources);
-        self.hole_targets.extend(facts.hole_targets);
-        self.calls.extend(facts.calls);
-        self.downcasts.extend(facts.downcasts);
-        self.solutions.extend(facts.solutions);
+        push_unique(&mut self.conversions, facts.conversions);
+        push_unique(&mut self.dyn_sources, facts.dyn_sources);
+        push_unique(&mut self.hole_targets, facts.hole_targets);
+        push_unique(&mut self.calls, facts.calls);
+        push_unique(&mut self.downcasts, facts.downcasts);
+        for (id, solution) in facts.solutions {
+            if let Some(existing) = self.solutions.get(&id) {
+                if existing != &solution {
+                    return Err(format!(
+                        "conflicting inferred dynamic solution for hole {}",
+                        id.0
+                    ));
+                }
+                continue;
+            }
+            self.solutions.insert(id, solution);
+        }
         Ok(())
     }
 
@@ -220,44 +228,49 @@ impl DynInference {
     pub(super) fn add_conversion(
         &mut self,
         module: ModuleScope,
-        expr_id: Option<ExprId>,
+        site: Option<SemanticExprSite>,
         concrete_ty: Type,
         hole: DynContractHoleId,
         span: Span,
+        source_span: SourceSpan,
     ) {
         self.conversions.push(PendingConversion {
             module,
-            expr_id,
+            site,
             concrete_ty,
             hole,
             span,
+            source_span,
         });
     }
 
     pub(super) fn add_dyn_source(
         &mut self,
         module: ModuleScope,
-        expr_id: Option<ExprId>,
+        site: Option<SemanticExprSite>,
         source: ContractRef,
         hole: DynContractHoleId,
         span: Span,
+        source_span: SourceSpan,
     ) {
         self.dyn_sources.push(PendingDynSource {
             module,
-            expr_id,
+            site,
             source,
             hole,
             span,
+            source_span,
         });
     }
 
     pub(super) fn add_hole_target(
         &mut self,
         module: ModuleScope,
-        expr_id: Option<ExprId>,
+        site: Option<SemanticExprSite>,
         hole: DynContractHoleId,
         target: ContractRef,
         span: Span,
+        source_span: SourceSpan,
     ) {
         if let Some(hole) = self.holes.get_mut(&hole)
             && !hole.expected.contains(&target)
@@ -266,10 +279,11 @@ impl DynInference {
         }
         self.hole_targets.push(PendingHoleTarget {
             module,
-            expr_id,
+            site,
             hole,
             target,
             span,
+            source_span,
         });
     }
 
@@ -310,8 +324,8 @@ impl DynInference {
     pub(super) fn add_call(
         &mut self,
         module: ModuleScope,
-        call_id: ExprId,
-        receiver_id: ExprId,
+        site: SemanticExprSite,
+        receiver_site: SemanticExprSite,
         hole: DynContractHoleId,
         method: Ident,
         arg_count: usize,
@@ -320,8 +334,8 @@ impl DynInference {
     ) {
         self.calls.push(PendingCall {
             module,
-            call_id,
-            receiver_id,
+            site,
+            receiver_site,
             hole,
             method,
             arg_count,
@@ -333,8 +347,8 @@ impl DynInference {
     pub(super) fn add_downcast(
         &mut self,
         module: ModuleScope,
-        expr_id: ExprId,
-        source_id: ExprId,
+        site: SemanticExprSite,
+        source_site: SemanticExprSite,
         hole: DynContractHoleId,
         target: Type,
         mutable: bool,
@@ -342,8 +356,8 @@ impl DynInference {
     ) {
         self.downcasts.push(PendingDowncast {
             module,
-            expr_id,
-            source_id,
+            site,
+            source_site,
             hole,
             target,
             mutable,
@@ -450,12 +464,8 @@ impl DynInference {
             }) {
                 Ok(matched) => {
                     let witness = contracts::plan_witness(tc, &matched, pending.span);
-                    if let Some(expr_id) = pending.expr_id {
-                        tc.record_dyn_conversion(DynConversionFact {
-                            expr_id,
-                            witness,
-                            span: tc.source_span(pending.span),
-                        });
+                    if let Some(site) = pending.site {
+                        tc.record_dyn_conversion_at(site, witness, pending.source_span);
                     }
                 }
                 Err(error) => {
@@ -473,11 +483,12 @@ impl DynInference {
             };
             self.finish_dyn_flow(
                 tc,
-                pending.expr_id,
+                pending.site,
                 &pending.source,
                 &target,
                 &pending.module,
                 pending.span,
+                pending.source_span,
                 true,
             );
         }
@@ -491,11 +502,12 @@ impl DynInference {
             };
             self.finish_dyn_flow(
                 tc,
-                pending.expr_id,
+                pending.site,
                 &source,
                 &pending.target,
                 &pending.module,
                 pending.span,
+                pending.source_span,
                 false,
             );
         }
@@ -512,15 +524,15 @@ impl DynInference {
             else {
                 continue;
             };
-            tc.record_dyn_call(DynCallFact {
-                call_id: pending.call_id,
-                receiver_id: pending.receiver_id,
+            tc.record_resolved_dyn_call(
+                pending.site,
+                pending.receiver_site,
                 contract,
-                method: pending.method,
-                arg_count: pending.arg_count,
-                requires_mutable: pending.requires_mutable,
-                span: pending.span,
-            });
+                pending.method,
+                pending.arg_count,
+                pending.requires_mutable,
+                pending.span,
+            );
         }
     }
 
@@ -535,14 +547,14 @@ impl DynInference {
             else {
                 continue;
             };
-            tc.record_dyn_downcast(super::DynDowncastFact {
-                expr_id: pending.expr_id,
-                source_id: pending.source_id,
+            tc.record_resolved_dyn_downcast(
+                pending.site,
+                pending.source_site,
                 source,
-                target: pending.target,
-                mutable: pending.mutable,
-                span: pending.span,
-            });
+                pending.target,
+                pending.mutable,
+                pending.span,
+            );
         }
     }
 
@@ -565,11 +577,12 @@ impl DynInference {
     fn finish_dyn_flow(
         &self,
         tc: &mut TypeChecker,
-        expr_id: Option<ExprId>,
+        site: Option<SemanticExprSite>,
         source: &ContractRef,
         target: &ContractRef,
         module: &ModuleScope,
         span: Span,
+        source_span: SourceSpan,
         inferred_target: bool,
     ) {
         if !contracts::contract_ref_subset(&tc.decls, module, source, target) {
@@ -582,26 +595,26 @@ impl DynInference {
                 message: format!(
                     "dynamic value '{source}' cannot be used as {target}; implicit dynamic strengthening is not allowed"
                 ),
-                span: tc.error_span(span),
+                span: tc.module_error_span(module, span),
             });
             return;
         }
-        self.record_weakening(tc, expr_id, source, target, module, span);
+        self.record_weakening(tc, site, source, target, module, source_span);
     }
 
     fn record_weakening(
         &self,
         tc: &mut TypeChecker,
-        expr_id: Option<ExprId>,
+        site: Option<SemanticExprSite>,
         source: &ContractRef,
         target: &ContractRef,
         module: &ModuleScope,
-        span: Span,
+        span: SourceSpan,
     ) {
         if source == target {
             return;
         }
-        let Some(expr_id) = expr_id else {
+        let Some(site) = site else {
             return;
         };
         let (Some(source), Some(target)) = (
@@ -610,12 +623,15 @@ impl DynInference {
         ) else {
             return;
         };
-        tc.record_dyn_weakening(DynWeakeningFact {
-            expr_id,
-            source,
-            target,
-            span: tc.source_span(span),
-        });
+        tc.record_dyn_weakening_at(site, source, target, span);
+    }
+}
+
+fn push_unique<T: PartialEq>(target: &mut Vec<T>, facts: Vec<T>) {
+    for fact in facts {
+        if !target.contains(&fact) {
+            target.push(fact);
+        }
     }
 }
 
@@ -693,7 +709,11 @@ impl TypeFolder for HoleAssigner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{SourceKind, SourceTable};
+    use crate::{
+        ast::ExprId,
+        source::{SourceKind, SourceTable},
+        typecheck::BodyInstanceKey,
+    };
 
     fn test_span() -> SourceSpan {
         let mut sources = SourceTable::default();
@@ -717,13 +737,19 @@ mod tests {
     }
 
     #[test]
-    fn specialization_restore_replays_pending_calls_and_downcasts() {
+    fn specialization_restore_dedupes_pending_calls_and_downcasts() {
         let mut checked = seed_infer();
         let snapshot = checked.specialization_snapshot();
         checked.add_call(
             ModuleScope::Root,
-            ExprId(10),
-            ExprId(11),
+            SemanticExprSite {
+                body: BodyInstanceKey::Module(ModuleScope::Root),
+                expr: ExprId(10),
+            },
+            SemanticExprSite {
+                body: BodyInstanceKey::Module(ModuleScope::Root),
+                expr: ExprId(11),
+            },
             DynContractHoleId(0),
             Ident::new("draw"),
             0,
@@ -732,8 +758,14 @@ mod tests {
         );
         checked.add_downcast(
             ModuleScope::Root,
-            ExprId(12),
-            ExprId(13),
+            SemanticExprSite {
+                body: BodyInstanceKey::Module(ModuleScope::Root),
+                expr: ExprId(12),
+            },
+            SemanticExprSite {
+                body: BodyInstanceKey::Module(ModuleScope::Root),
+                expr: ExprId(13),
+            },
             DynContractHoleId(0),
             Type::UnresolvedName(Ident::new("Enemy")),
             false,
@@ -745,9 +777,9 @@ mod tests {
         restored.restore_specialization(facts.clone()).unwrap();
         restored.restore_specialization(facts).unwrap();
 
-        assert_eq!(restored.calls.len(), 2);
-        assert_eq!(restored.downcasts.len(), 2);
+        assert_eq!(restored.calls.len(), 1);
+        assert_eq!(restored.downcasts.len(), 1);
         assert_eq!(restored.calls[0].method, Ident::new("draw"));
-        assert_eq!(restored.downcasts[0].expr_id, ExprId(12));
+        assert_eq!(restored.downcasts[0].site.expr, ExprId(12));
     }
 }
