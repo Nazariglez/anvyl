@@ -172,28 +172,17 @@ fn dependent_projected_var_arg_records_specialized_expected_projection() {
     let entity_ty = nominal_struct("Entity");
     let expr_id = assert_expected_projection(&result, &["value"], entity_ty.clone());
     assert_expr_type(&result, expr_id, &entity_ty);
+
+    let body = result.expect_body(&generic_body("move_box", vec![entity_ty.clone()]));
+    let fact = body
+        .expected_projections
+        .get(&expr_id)
+        .expect("projection fact should stay in specialized body");
+    assert_eq!(fact.target_ty, entity_ty);
 }
 
 #[test]
-fn exact_var_arg_records_no_projection() {
-    let result = check(
-        r"
-        struct Entity { x: int }
-        struct Enemy { @as embed entity: Entity }
-        fn move_entity(var entity: Entity) { entity.x += 1; }
-        fn main() {
-            var enemy = Enemy { entity: Entity { x: 1 } };
-            move_entity(enemy.entity);
-        }
-        ",
-    )
-    .unwrap();
-
-    assert!(result.expected_projections().is_empty());
-}
-
-#[test]
-fn unconstrained_generic_arg_records_no_projection() {
+fn generic_arg_without_expected_target_records_no_projection() {
     let result = check(
         r"
         struct Entity { x: int }
@@ -249,6 +238,25 @@ fn explicit_cast_records_no_projection() {
     .unwrap();
 
     assert!(result.expected_projections().is_empty());
+}
+
+#[test]
+fn projection_dyn_arg_emits_one_deprecated_contract_warning() {
+    let result = check(
+        r#"
+        @deprecated("use New") contract Old { fn f(self); }
+        struct Entity { fn f(self) {} }
+        struct Enemy { @as embed entity: Entity }
+        fn take(value: dyn Old) {}
+        fn main() {
+            let enemy = Enemy { entity: Entity {} };
+            take(enemy);
+        }
+        "#,
+    )
+    .unwrap();
+
+    assert_deprecated_warning(&result, DeprecatedUseKind::Contract, "Old", Some("use New"));
 }
 
 #[test]

@@ -282,6 +282,12 @@ pub(super) fn resolve_dynamic_method(
     Ok((set.key, requirement.clone()))
 }
 
+pub(super) fn apply_match_access(tc: &mut TypeChecker, matched: &ContractMatch, span: Span) {
+    for slot in &matched.slots {
+        check_slot_access(tc, &matched.concrete_ty, &slot.target, span);
+    }
+}
+
 pub(super) fn plan_witness(tc: &mut TypeChecker, matched: &ContractMatch, span: Span) -> WitnessId {
     let key = ContractWitnessKey {
         concrete_ty: matched.concrete_ty.clone(),

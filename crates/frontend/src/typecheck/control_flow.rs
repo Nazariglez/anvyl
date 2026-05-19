@@ -23,6 +23,7 @@ pub(super) struct ControlFlowFrame {
     loops: usize,
     defers: usize,
     global_initializers: usize,
+    deferred_expected_returns: usize,
 }
 
 enum ReturnTarget {
@@ -72,10 +73,12 @@ impl TypeChecker {
             loops: self.loop_depth,
             defers: self.defer_depth,
             global_initializers: self.global_initializer_depth,
+            deferred_expected_returns: self.deferred_expected_return_depth,
         };
         self.loop_depth = 0;
         self.defer_depth = 0;
         self.global_initializer_depth = 0;
+        self.deferred_expected_return_depth = 0;
         frame
     }
 
@@ -83,6 +86,7 @@ impl TypeChecker {
         self.loop_depth = frame.loops;
         self.defer_depth = frame.defers;
         self.global_initializer_depth = frame.global_initializers;
+        self.deferred_expected_return_depth = frame.deferred_expected_returns;
     }
 }
 

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected `dyn Drawable`, found `Enemy?`
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn main() {
+    let actor: dyn Drawable = Enemy {};
+    let enemy: dyn Drawable = actor as? Enemy;
+}

@@ -9,7 +9,7 @@ use anvyx_externs::{
 
 use super::support::{
     TypecheckTestResult, assert_deprecated_warning, assert_typecheck_closed, check, check_named,
-    check_with_raw_externs, generic_body, single_expected_projection,
+    check_with_raw_externs, generic_body, nominal_struct, single_expected_projection,
 };
 use crate::{
     ast::{ExprId, Ident, ModuleOrigin, NominalKind, Type},
@@ -553,23 +553,39 @@ mod projection {
     }
 
     #[test]
-    fn extern_value_arg_projects() {
-        let result = check_point_projection(ParamFlow::Value, "let");
-        assert_point_projection(&result);
-        assert_typecheck_closed(&result);
+    fn extern_args_project_by_flow() {
+        for (flow, binding) in [
+            (ParamFlow::Value, "let"),
+            (ParamFlow::Borrow, "let"),
+            (ParamFlow::MutBorrow, "var"),
+        ] {
+            let result = check_point_projection(flow, binding);
+            assert_point_projection(&result);
+            assert_typecheck_closed(&result);
+        }
     }
 
     #[test]
-    fn extern_borrow_arg_projects() {
-        let result = check_point_projection(ParamFlow::Borrow, "let");
-        assert_point_projection(&result);
-        assert_typecheck_closed(&result);
-    }
+    fn source_extern_projected_return_records_use() {
+        let result = check(
+            r"
+            struct Entity { x: int }
+            struct Enemy { @as embed entity: Entity }
+            extern fn make_enemy() -> Enemy;
+            fn main() -> Entity { make_enemy() }
+            ",
+        )
+        .expect("typecheck failed");
 
-    #[test]
-    fn extern_mut_borrow_arg_projects() {
-        let result = check_point_projection(ParamFlow::MutBorrow, "var");
-        assert_point_projection(&result);
+        let (_, fact) = single_expected_projection(&result);
+        assert_eq!(fact.path, vec![Ident::new("entity")]);
+        assert_eq!(fact.target_ty, nominal_struct("Entity"));
+
+        let id = result
+            .externs()
+            .function_by_key(&function_key(ModuleScope::Root, "make_enemy"))
+            .expect("extern function");
+        assert_use(&result, ExternUseTarget::Function(id));
         assert_typecheck_closed(&result);
     }
 }

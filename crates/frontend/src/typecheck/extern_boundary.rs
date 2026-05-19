@@ -4,15 +4,12 @@ use anvyx_externs::ParamFlow;
 
 use super::{
     ArityError, CheckedType, ExternUseTarget, MemberAccessKind, NominalKey, TypeChecker, TypeError,
-    check_arg_count, check_expected_value_expr_with_mode, check_expr_checked,
-    check_expr_checked_with_hint, check_place, checked_from_type,
+    check_arg_count, check_expected_value_expr, check_expr_checked, check_expr_checked_with_hint,
+    check_place, checked_from_type,
     infer::TypeHandle,
     literal::check_unknown_nominal_fields,
     nominal_type, place,
-    projection::{
-        ExpectedProjectionDecision, ExpectedProjectionMode, apply_place_projection,
-        expected_projection,
-    },
+    projection::{ExpectedPlaceProjection, constrain_expected_return, expected_place_projection},
     solve_and_checked_from_handle,
     type_ops::{type_closure_facts, type_contains_dyn_value},
 };
@@ -75,11 +72,8 @@ pub(super) fn check_call(
         ok &= check_arg(arg, param, tc);
     }
 
-    if let Some(expected) = expected {
-        let ret = tc.type_handle(&signature.ret.ty);
-        tc.expect_assignable(call_span, ret, expected);
-        ok &= !tc.solve_constraints();
-    }
+    let ret = tc.type_handle(&signature.ret.ty);
+    ok &= !constrain_expected_return(call_span, ret, expected, tc).failed();
 
     ok
 }
@@ -112,21 +106,13 @@ fn check_projected_place_arg(
     record: fn(ExprId, &place::PlaceValue, &mut TypeChecker),
     tc: &mut TypeChecker,
 ) -> bool {
-    let source = value.checked.ty.clone();
-    match expected_projection(
-        tc,
-        arg.span,
-        &source,
-        &param.ty.ty,
-        ExpectedProjectionMode::Assignable,
-    ) {
-        ExpectedProjectionDecision::Project(projection) => {
-            let projected = apply_place_projection(tc, arg, value, projection);
+    match expected_place_projection(tc, arg, value, &param.ty.ty) {
+        ExpectedPlaceProjection::Projected(projected) => {
             record(arg.node.id, &projected, tc);
             check_checked_value(arg, &projected.checked, &param.ty, tc)
         }
-        ExpectedProjectionDecision::Failed => false,
-        ExpectedProjectionDecision::SourceAccepted | ExpectedProjectionDecision::NotNeeded => {
+        ExpectedPlaceProjection::Failed => false,
+        ExpectedPlaceProjection::SourceAccepted | ExpectedPlaceProjection::NotNeeded => {
             record(arg.node.id, value, tc);
             check_checked_value(arg, &value.checked, &param.ty, tc)
         }
@@ -136,8 +122,7 @@ fn check_projected_place_arg(
 fn check_arg_expr(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     let error_count = tc.errors.len();
     let expected = tc.type_handle(&param.ty.ty);
-    let checked =
-        check_expected_value_expr_with_mode(arg, expected, ExpectedProjectionMode::Assignable, tc);
+    let checked = check_expected_value_expr(arg, expected, tc);
     check_boundary_value(arg, &checked, &param.ty, tc) && tc.errors.len() == error_count
 }
 

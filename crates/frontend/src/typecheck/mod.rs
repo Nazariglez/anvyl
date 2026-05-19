@@ -1053,6 +1053,7 @@ struct TypeChecker {
     defer_depth: usize,
     global_initializer_depth: usize,
     discard_depth: usize,
+    deferred_expected_return_depth: usize,
     errors: Vec<TypeError>,
     warnings: Vec<CompileWarning>,
     lint_events: Vec<LintEvent>,
@@ -1098,6 +1099,7 @@ impl TypeChecker {
             defer_depth: 0,
             global_initializer_depth: 0,
             discard_depth: 0,
+            deferred_expected_return_depth: 0,
             errors: vec![],
             warnings: vec![],
             lint_events: vec![],
@@ -1157,6 +1159,37 @@ impl TypeChecker {
             .last()
             .cloned()
             .unwrap_or_else(|| BodyInstanceKey::Module(self.current_module.clone()))
+    }
+
+    fn with_deferred_expected_returns<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.deferred_expected_return_depth += 1;
+        let ret = f(self);
+        self.deferred_expected_return_depth = self
+            .deferred_expected_return_depth
+            .checked_sub(1)
+            .expect("deferred expected return depth underflow");
+        ret
+    }
+
+    fn expected_returns_deferred(&self) -> bool {
+        self.deferred_expected_return_depth > 0
+    }
+
+    fn probe_compatibility_without_effects<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let error_count = self.errors.len();
+        let warning_count = self.warnings.len();
+        let lint_count = self.lint_events.len();
+        let used_imports = self.used_imports.clone();
+        let promoted_surfaces = self.promoted_surfaces.clone();
+
+        let ret = f(self);
+
+        self.errors.truncate(error_count);
+        self.warnings.truncate(warning_count);
+        self.lint_events.truncate(lint_count);
+        self.used_imports = used_imports;
+        self.promoted_surfaces = promoted_surfaces;
+        ret
     }
 
     fn with_body_instance<R>(&mut self, key: BodyInstanceKey, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -1702,7 +1735,7 @@ impl TypeChecker {
             .record_member_path(self.current_body(), fact);
     }
 
-    pub(crate) fn record_expected_projection(&mut self, fact: ExpectedProjectionFact) {
+    fn record_expected_projection(&mut self, fact: ExpectedProjectionFact) {
         self.semantic_facts
             .record_expected_projection(self.current_body(), fact);
     }
@@ -1736,11 +1769,6 @@ impl TypeChecker {
             .record_contract_witness(key, self.source_span(span))
     }
 
-    fn record_dyn_conversion(&mut self, fact: DynConversionFact) {
-        self.semantic_facts
-            .record_dyn_conversion(self.current_body(), fact);
-    }
-
     fn record_dyn_conversion_at(
         &mut self,
         site: SemanticExprSite,
@@ -1756,11 +1784,6 @@ impl TypeChecker {
                 span,
             },
         );
-    }
-
-    fn record_dyn_weakening(&mut self, fact: DynWeakeningFact) {
-        self.semantic_facts
-            .record_dyn_weakening(self.current_body(), fact);
     }
 
     fn record_dyn_weakening_at(
@@ -2716,21 +2739,13 @@ pub(in crate::typecheck) fn check_expected_value_expr(
     expected: TypeHandle,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    check_expected_value_expr_with_mode(
+    check_expected_value_expr_inner(
         expr,
         expected,
         projection::ExpectedProjectionMode::Assignable,
+        true,
         tc,
     )
-}
-
-pub(in crate::typecheck) fn check_expected_value_expr_with_mode(
-    expr: &ExprNode,
-    expected: TypeHandle,
-    mode: projection::ExpectedProjectionMode,
-    tc: &mut TypeChecker,
-) -> CheckedType {
-    check_expected_value_expr_inner(expr, expected, mode, true, tc)
 }
 
 fn check_expected_value_expr_deferred(
@@ -2738,13 +2753,15 @@ fn check_expected_value_expr_deferred(
     expected: TypeHandle,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    check_expected_value_expr_inner(
-        expr,
-        expected,
-        projection::ExpectedProjectionMode::Assignable,
-        false,
-        tc,
-    )
+    tc.with_deferred_expected_returns(|tc| {
+        check_expected_value_expr_inner(
+            expr,
+            expected,
+            projection::ExpectedProjectionMode::Assignable,
+            false,
+            tc,
+        )
+    })
 }
 
 fn check_expected_value_expr_inner(
@@ -2754,101 +2771,23 @@ fn check_expected_value_expr_inner(
     enforce: bool,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let error_count = tc.errors.len();
     let hint = (!matches!(expr.node.kind, ExprKind::Ident(_))).then(|| expected.clone());
     let mut checked = check_value_expr_checked_with_hint(expr, hint, tc);
     let target = tc.handle_type(&expected);
-    let hint_span = tc.error_span(expr.span);
-    let projection_source = projection_hint_mismatch_found(error_count, &target, hint_span, tc)
-        .unwrap_or_else(|| checked.ty.clone());
-    let accepted =
-        match projection::expected_projection(tc, expr.span, &projection_source, &target, mode) {
-            projection::ExpectedProjectionDecision::SourceAccepted
-            | projection::ExpectedProjectionDecision::NotNeeded => {
-                if !enforce {
-                    drop_projection_hint_mismatches(error_count, &target, hint_span, tc);
-                }
-                true
-            }
-            projection::ExpectedProjectionDecision::Project(projection) => {
-                drop_projection_hint_mismatches(error_count, &target, hint_span, tc);
-                checked = projection::apply_value_projection(
-                    tc,
-                    expr,
-                    &checked,
-                    &projection_source,
-                    projection,
-                );
-                true
-            }
-            projection::ExpectedProjectionDecision::Failed => {
-                drop_projection_hint_mismatches(error_count, &target, hint_span, tc);
-                false
-            }
-        };
+    let source = checked.ty.clone();
+    let accepted = match projection::expected_projection(tc, expr.span, &source, &target, mode) {
+        projection::ExpectedProjectionDecision::SourceAccepted
+        | projection::ExpectedProjectionDecision::NotNeeded => true,
+        projection::ExpectedProjectionDecision::Project(projection) => {
+            checked = projection::apply_value_projection(tc, expr, &checked, &source, projection);
+            true
+        }
+        projection::ExpectedProjectionDecision::Failed => false,
+    };
     if accepted && enforce {
         tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
     }
     checked
-}
-
-fn projection_hint_mismatch_found(
-    old_error_count: usize,
-    expected: &Type,
-    span: Option<SourceSpan>,
-    tc: &TypeChecker,
-) -> Option<Type> {
-    tc.errors[old_error_count..]
-        .iter()
-        .rev()
-        .find_map(|err| hint_error_found_type(err, expected, span, tc))
-}
-
-fn hint_error_found_type(
-    err: &TypeError,
-    expected: &Type,
-    span: Option<SourceSpan>,
-    tc: &TypeChecker,
-) -> Option<Type> {
-    match err {
-        TypeError::TypeMismatch {
-            expected: err_expected,
-            found,
-            span: err_span,
-        } if err_expected == expected && *err_span == span => Some(found.clone()),
-        TypeError::ContractUnsatisfied {
-            ty,
-            contract,
-            span: err_span,
-            ..
-        } if expected_dyn_contract(expected, tc).as_deref() == Some(contract.as_str())
-            && *err_span == span =>
-        {
-            Some(ty.clone())
-        }
-        _ => None,
-    }
-}
-
-fn expected_dyn_contract(expected: &Type, tc: &TypeChecker) -> Option<String> {
-    match expected {
-        Type::Dyn(contract) => Some(contract.to_string()),
-        expected => match tc.decls.semantic_option_inner(expected)? {
-            Type::Dyn(contract) => Some(contract.to_string()),
-            _ => None,
-        },
-    }
-}
-
-fn drop_projection_hint_mismatches(
-    old_error_count: usize,
-    expected: &Type,
-    span: Option<SourceSpan>,
-    tc: &mut TypeChecker,
-) {
-    let mut new_errors = tc.errors.split_off(old_error_count);
-    new_errors.retain(|err| hint_error_found_type(err, expected, span, tc).is_none());
-    tc.errors.extend(new_errors);
 }
 
 fn check_unprojected_expected(

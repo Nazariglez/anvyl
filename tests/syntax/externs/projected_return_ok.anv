@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+extern fn make_enemy() -> Enemy;
+
+fn main() -> Entity {
+    make_enemy()
+}

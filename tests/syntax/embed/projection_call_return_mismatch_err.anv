@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected `Entity`, found `Rock`
+
+struct Entity { x: int }
+struct Rock { x: int }
+
+fn make_rock() -> Rock {
+    Rock { x: 1 }
+}
+
+fn make_entity() -> Entity {
+    make_rock()
+}

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot cast
+
+fn cast<T>(x: int) -> T {
+    x as T
+}
+
+fn main() {
+    let value: string = cast<string>(1);
+}

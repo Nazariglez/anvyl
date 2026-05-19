@@ -140,6 +140,18 @@ impl SemanticBodyFacts {
         for fact in self.expr_types.values() {
             debug_assert!(fact.ty.is_some());
         }
+        #[cfg(debug_assertions)]
+        for (expr_id, projection) in &self.expected_projections {
+            let Some(expr) = self.expr_types.get(expr_id) else {
+                debug_assert!(false, "expected projection missing expression type in body");
+                continue;
+            };
+            let Some(ty) = expr.ty.as_ref() else {
+                debug_assert!(false, "expected projection expression type not finalized");
+                continue;
+            };
+            debug_assert_eq!(ty, &projection.target_ty);
+        }
     }
 }
 

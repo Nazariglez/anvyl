@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: no `@as embed` projection path from 'Enemy' to 'Entity'
+// @contains: use stored path entity explicitly
+
+struct Entity { x: int }
+struct Enemy { embed entity: Entity }
+
+fn make_enemy() -> Enemy {
+    Enemy { entity: Entity { x: 1 } }
+}
+
+fn make_entity() -> Entity {
+    make_enemy()
+}

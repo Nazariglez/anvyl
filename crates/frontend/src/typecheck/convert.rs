@@ -1,24 +1,26 @@
 use super::{
-    CastConversionMatch, CheckedType, DynContainerConversionKind, DynConversionFact,
-    DynWeakeningFact, EscapeMode, TypeChecker, TypeError, TypeHandle,
-    check_value_expr_checked_with_hint, checked_from_type,
+    CastConversionMatch, CheckedType, DynContainerConversionKind, EscapeMode, ModuleScope,
+    TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint, checked_from_type,
     contracts::{self, ContractMatchError, RequirementError},
     projection::{
-        ExpectedProjectionDecision, ExpectedProjectionMode, apply_value_projection,
-        expected_projection,
+        ExpectedFit, ExpectedProjectionMode, SourceAcceptance, apply_value_projection,
+        classify_expected_fit,
     },
     type_ops::TypeVisitor,
 };
 use crate::{
-    ast::{CastNode, ContractRef, ExprId, ExprNode, Ident, Type},
+    ast::{CastNode, ContractRef, DynContractHoleId, ExprId, ExprNode, Ident, Type},
     span::Span,
 };
 
-#[derive(Clone, Copy)]
-enum ExplicitCast {
+#[derive(Clone)]
+pub(super) enum ExplicitCast {
     Identity,
     Builtin,
-    CastFrom { escape: EscapeMode },
+    CastFrom {
+        escape: EscapeMode,
+        origin: ModuleScope,
+    },
 }
 
 impl TypeChecker {
@@ -51,30 +53,28 @@ impl TypeChecker {
         if builtin_numeric_cast(source, target) {
             return Some(ExplicitCast::Builtin);
         }
-        self.cast_from_conversion_escape(source, target)
-            .map(|escape| ExplicitCast::CastFrom { escape })
+        self.cast_from_conversion(source, target)
+            .map(|(escape, origin)| ExplicitCast::CastFrom { escape, origin })
     }
 
-    pub(super) fn explicit_cast_without_effects(&mut self, source: &Type, target: &Type) -> bool {
-        let used_imports = self.used_imports.clone();
-        let ok = self.explicit_cast_conversion(source, target).is_some();
-        self.used_imports = used_imports;
-        ok
-    }
-
-    pub(super) fn cast_from_conversion_escape(
+    pub(super) fn explicit_cast_plan_without_effects(
         &mut self,
         source: &Type,
         target: &Type,
-    ) -> Option<EscapeMode> {
+    ) -> Option<ExplicitCast> {
+        self.probe_compatibility_without_effects(|tc| tc.explicit_cast_conversion(source, target))
+    }
+
+    pub(super) fn cast_from_conversion(
+        &mut self,
+        source: &Type,
+        target: &Type,
+    ) -> Option<(EscapeMode, ModuleScope)> {
         match self
             .decls
             .find_cast_conversion(source, target, |ext| self.extend_visible(ext))
         {
-            Some(CastConversionMatch::Match { escape, origin }) => {
-                self.mark_activation_imports_used(&origin);
-                Some(escape)
-            }
+            Some(CastConversionMatch::Match { escape, origin }) => Some((escape, origin)),
             Some(CastConversionMatch::Ambiguous) | None => None,
         }
     }
@@ -173,12 +173,8 @@ pub(super) fn expected_optional_payload_dyn(
     expected: Option<&Type>,
 ) -> Option<Type> {
     let expected = expected?;
-    let (inner, contract) = optional_dyn_payload(tc, expected)?;
-    if payload == &inner {
-        return Some(expected.clone());
-    }
-    try_to_dyn(tc, span, Some(expr_id), payload, &contract)
-        .then(|| tc.decls.semantic_option_of(inner))
+    optional_dyn_payload(tc, expected)?;
+    try_expected_dyn(tc, span, Some(expr_id), payload, expected).then(|| expected.clone())
 }
 
 fn optional_dyn_payload(tc: &TypeChecker, ty: &Type) -> Option<(Type, ContractRef)> {
@@ -189,6 +185,61 @@ fn optional_dyn_payload(tc: &TypeChecker, ty: &Type) -> Option<(Type, ContractRe
     Some((inner.clone(), contract.clone()))
 }
 
+enum ExpectedDynFit {
+    NoDyn,
+    Accepted(ExpectedDynPlan),
+    Rejected(ExpectedDynRejection),
+}
+
+#[derive(Clone)]
+pub(super) enum ExpectedDynPlan {
+    Noop,
+    ConcreteToHole {
+        hole: DynContractHoleId,
+        source: Type,
+    },
+    DynToHole {
+        hole: DynContractHoleId,
+        source: ContractRef,
+    },
+    DynHoleToTarget {
+        hole: DynContractHoleId,
+        target: ContractRef,
+    },
+    DynWeakening {
+        source: ContractRef,
+        target: ContractRef,
+    },
+    ConcreteToDyn {
+        matched: contracts::ContractMatch,
+    },
+}
+
+enum ExpectedDynRejection {
+    IndependentHoles,
+    DynStrengthening {
+        source: ContractRef,
+        target: ContractRef,
+    },
+    ContractUnsatisfied {
+        source: Type,
+        contract: ContractRef,
+        error: ContractMatchError,
+    },
+}
+
+pub(super) fn expected_dyn_plan_without_effects(
+    tc: &mut TypeChecker,
+    span: Span,
+    from: &Type,
+    to: &Type,
+) -> Option<ExpectedDynPlan> {
+    match tc.probe_compatibility_without_effects(|tc| expected_dyn_fit(tc, span, from, to)) {
+        ExpectedDynFit::Accepted(plan) => Some(plan),
+        ExpectedDynFit::NoDyn | ExpectedDynFit::Rejected(_) => None,
+    }
+}
+
 fn try_expected_dyn(
     tc: &mut TypeChecker,
     span: Span,
@@ -196,152 +247,198 @@ fn try_expected_dyn(
     from: &Type,
     to: &Type,
 ) -> bool {
-    match to {
-        Type::Dyn(contract) => try_to_dyn(tc, span, expr_id, from, contract),
-        to => {
-            let Some((inner, contract)) = optional_dyn_payload(tc, to) else {
-                return false;
-            };
-            if from == &inner {
-                return true;
-            }
-            if tc.decls.semantic_option_inner(from).is_some() {
-                return false;
-            }
-            try_to_dyn(tc, span, expr_id, from, &contract)
+    if let Some(plan) = expected_dyn_plan_without_effects(tc, span, from, to) {
+        apply_expected_dyn_plan(tc, span, expr_id, plan);
+        return true;
+    }
+
+    match expected_dyn_fit(tc, span, from, to) {
+        ExpectedDynFit::NoDyn => false,
+        ExpectedDynFit::Accepted(_) => unreachable!(),
+        ExpectedDynFit::Rejected(rejection) => {
+            push_expected_dyn_rejection(tc, span, rejection);
+            true
         }
     }
 }
 
-fn try_to_dyn(
+fn expected_dyn_fit(tc: &mut TypeChecker, span: Span, from: &Type, to: &Type) -> ExpectedDynFit {
+    match to {
+        Type::Dyn(contract) => to_dyn_fit(tc, span, from, contract),
+        to => {
+            let Some((inner, contract)) = optional_dyn_payload(tc, to) else {
+                return ExpectedDynFit::NoDyn;
+            };
+            if from == &inner {
+                return ExpectedDynFit::Accepted(ExpectedDynPlan::Noop);
+            }
+            if tc.decls.semantic_option_inner(from).is_some() {
+                return ExpectedDynFit::NoDyn;
+            }
+            to_dyn_fit(tc, span, from, &contract)
+        }
+    }
+}
+
+fn to_dyn_fit(
+    tc: &mut TypeChecker,
+    span: Span,
+    from: &Type,
+    contract: &ContractRef,
+) -> ExpectedDynFit {
+    match (from, contract) {
+        (_, ContractRef::Hole(hole)) => to_dyn_hole_fit(tc, from, *hole),
+        (Type::Dyn(ContractRef::Hole(hole)), target) => {
+            ExpectedDynFit::Accepted(ExpectedDynPlan::DynHoleToTarget {
+                hole: *hole,
+                target: target.clone(),
+            })
+        }
+        (Type::Dyn(source), target) => dyn_weakening_fit(tc, source, target),
+        (_, target) => concrete_to_dyn_fit(tc, span, from, target),
+    }
+}
+
+fn to_dyn_hole_fit(tc: &TypeChecker, from: &Type, target: DynContractHoleId) -> ExpectedDynFit {
+    match from {
+        Type::Dyn(ContractRef::Hole(source)) if *source != target => {
+            ExpectedDynFit::Rejected(ExpectedDynRejection::IndependentHoles)
+        }
+        Type::Dyn(ContractRef::Hole(_)) => ExpectedDynFit::Accepted(ExpectedDynPlan::Noop),
+        Type::Dyn(source) => ExpectedDynFit::Accepted(ExpectedDynPlan::DynToHole {
+            hole: target,
+            source: source.clone(),
+        }),
+        Type::Infer | Type::Var(_) => ExpectedDynFit::NoDyn,
+        _ if tc.decls.semantic_option_inner(from).is_some() => ExpectedDynFit::NoDyn,
+        _ => ExpectedDynFit::Accepted(ExpectedDynPlan::ConcreteToHole {
+            hole: target,
+            source: from.clone(),
+        }),
+    }
+}
+
+fn dyn_weakening_fit(
+    tc: &TypeChecker,
+    source: &ContractRef,
+    target: &ContractRef,
+) -> ExpectedDynFit {
+    if contracts::contract_ref_subset(&tc.decls, &tc.current_module, source, target) {
+        ExpectedDynFit::Accepted(ExpectedDynPlan::DynWeakening {
+            source: source.clone(),
+            target: target.clone(),
+        })
+    } else {
+        ExpectedDynFit::Rejected(ExpectedDynRejection::DynStrengthening {
+            source: source.clone(),
+            target: target.clone(),
+        })
+    }
+}
+
+fn concrete_to_dyn_fit(
+    tc: &mut TypeChecker,
+    span: Span,
+    from: &Type,
+    contract: &ContractRef,
+) -> ExpectedDynFit {
+    if matches!(from, Type::Infer | Type::Var(_) | Type::Dyn(_))
+        || tc.decls.semantic_option_inner(from).is_some()
+    {
+        return ExpectedDynFit::NoDyn;
+    }
+    match contracts::match_contract(tc, from, contract, span) {
+        Ok(matched) => ExpectedDynFit::Accepted(ExpectedDynPlan::ConcreteToDyn { matched }),
+        Err(error) => ExpectedDynFit::Rejected(ExpectedDynRejection::ContractUnsatisfied {
+            source: from.clone(),
+            contract: contract.clone(),
+            error,
+        }),
+    }
+}
+
+pub(super) fn apply_expected_dyn_plan(
     tc: &mut TypeChecker,
     span: Span,
     expr_id: Option<ExprId>,
-    from: &Type,
-    contract: &ContractRef,
-) -> bool {
-    match (from, contract) {
-        (_, ContractRef::Hole(hole)) => try_to_dyn_hole(tc, span, expr_id, from, *hole),
-        (Type::Dyn(ContractRef::Hole(hole)), target) => {
-            tc.dyn_infer.add_hole_target(
+    plan: ExpectedDynPlan,
+) {
+    match plan {
+        ExpectedDynPlan::Noop => {}
+        ExpectedDynPlan::ConcreteToHole { hole, source } => {
+            tc.dyn_infer.add_conversion(
                 tc.current_module.clone(),
                 expr_id.map(|id| tc.current_expr_site(id)),
-                *hole,
-                target.clone(),
+                source,
+                hole,
                 span,
                 tc.source_span(span),
             );
-            true
         }
-        (Type::Dyn(source), target) => try_dyn_weakening(tc, span, expr_id, source, target),
-        (_, target) => try_concrete_to_dyn(tc, span, expr_id, from, target),
+        ExpectedDynPlan::DynToHole { hole, source } => {
+            tc.dyn_infer.add_dyn_source(
+                tc.current_module.clone(),
+                expr_id.map(|id| tc.current_expr_site(id)),
+                source,
+                hole,
+                span,
+                tc.source_span(span),
+            );
+        }
+        ExpectedDynPlan::DynHoleToTarget { hole, target } => {
+            tc.dyn_infer.add_hole_target(
+                tc.current_module.clone(),
+                expr_id.map(|id| tc.current_expr_site(id)),
+                hole,
+                target,
+                span,
+                tc.source_span(span),
+            );
+        }
+        ExpectedDynPlan::DynWeakening { source, target } => {
+            if let Some(expr_id) = expr_id
+                && source != target
+                && let (Some(source), Some(target)) = (
+                    contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, &source),
+                    contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, &target),
+                )
+            {
+                let site = tc.current_expr_site(expr_id);
+                tc.record_dyn_weakening_at(site, source, target, tc.source_span(span));
+            }
+        }
+        ExpectedDynPlan::ConcreteToDyn { matched } => {
+            contracts::apply_match_access(tc, &matched, span);
+            let witness = contracts::plan_witness(tc, &matched, span);
+            if let Some(expr_id) = expr_id {
+                let site = tc.current_expr_site(expr_id);
+                tc.record_dyn_conversion_at(site, witness, tc.source_span(span));
+            }
+        }
     }
 }
 
-fn try_to_dyn_hole(
-    tc: &mut TypeChecker,
-    span: Span,
-    expr_id: Option<ExprId>,
-    from: &Type,
-    hole: crate::ast::DynContractHoleId,
-) -> bool {
-    match from {
-        Type::Dyn(ContractRef::Hole(source)) if *source != hole => {
+fn push_expected_dyn_rejection(tc: &mut TypeChecker, span: Span, rejection: ExpectedDynRejection) {
+    match rejection {
+        ExpectedDynRejection::IndependentHoles => {
             tc.push_error(TypeError::CompileError {
                 message: "cannot infer dynamic contract across independent holes".to_string(),
                 span: tc.error_span(span),
             });
-            true
         }
-        Type::Dyn(ContractRef::Hole(_)) => true,
-        Type::Dyn(source) => {
-            tc.dyn_infer.add_dyn_source(
-                tc.current_module.clone(),
-                expr_id.map(|id| tc.current_expr_site(id)),
-                source.clone(),
-                hole,
-                span,
-                tc.source_span(span),
-            );
-            true
+        ExpectedDynRejection::DynStrengthening { source, target } => {
+            tc.push_error(TypeError::CompileError {
+                message: format!(
+                    "dynamic value '{source}' cannot be used as '{target}'; implicit dynamic strengthening is not allowed"
+                ),
+                span: tc.error_span(span),
+            });
         }
-        Type::Infer | Type::Var(_) => false,
-        _ if tc.decls.semantic_option_inner(from).is_some() => false,
-        _ => {
-            tc.dyn_infer.add_conversion(
-                tc.current_module.clone(),
-                expr_id.map(|id| tc.current_expr_site(id)),
-                from.clone(),
-                hole,
-                span,
-                tc.source_span(span),
-            );
-            true
-        }
-    }
-}
-
-fn try_dyn_weakening(
-    tc: &mut TypeChecker,
-    span: Span,
-    expr_id: Option<ExprId>,
-    source: &ContractRef,
-    target: &ContractRef,
-) -> bool {
-    if !contracts::contract_ref_subset(&tc.decls, &tc.current_module, source, target) {
-        tc.push_error(TypeError::CompileError {
-            message: format!(
-                "dynamic value '{source}' cannot be used as '{target}'; implicit dynamic strengthening is not allowed"
-            ),
-            span: tc.error_span(span),
-        });
-        return true;
-    }
-    if let Some(expr_id) = expr_id
-        && source != target
-        && let (Some(source), Some(target)) = (
-            contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, source),
-            contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, target),
-        )
-    {
-        tc.record_dyn_weakening(DynWeakeningFact {
-            expr_id,
+        ExpectedDynRejection::ContractUnsatisfied {
             source,
-            target,
-            span: tc.source_span(span),
-        });
-    }
-    true
-}
-
-fn try_concrete_to_dyn(
-    tc: &mut TypeChecker,
-    span: Span,
-    expr_id: Option<ExprId>,
-    from: &Type,
-    contract: &ContractRef,
-) -> bool {
-    if matches!(from, Type::Infer | Type::Var(_) | Type::Dyn(_))
-        || tc.decls.semantic_option_inner(from).is_some()
-    {
-        return false;
-    }
-    match contracts::match_contract(tc, from, contract, span) {
-        Ok(matched) => {
-            let witness = contracts::plan_witness(tc, &matched, span);
-            if let Some(expr_id) = expr_id {
-                tc.record_dyn_conversion(DynConversionFact {
-                    expr_id,
-                    witness,
-                    span: tc.source_span(span),
-                });
-            }
-            true
-        }
-        Err(error) => {
-            push_match_error(tc, from, contract, error, span);
-            true
-        }
+            contract,
+            error,
+        } => push_match_error(tc, &source, &contract, error, span),
     }
 }
 
@@ -403,39 +500,54 @@ pub(super) fn check_cast_expr(
     let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
     let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
     let from = checked.ty.clone();
-    if let Some(conversion) = tc.explicit_cast_conversion(&from, &target) {
-        apply_explicit_cast_effects(expr, cast, conversion, tc);
-        return cast_expr_checked(expr, target, checked.contains_extern_any, tc);
-    }
-    if matches!(from, Type::Infer) || matches!(target, Type::Infer) {
-        return cast_expr_checked(expr, target, checked.contains_extern_any, tc);
-    }
-    match expected_projection(
+    match classify_expected_fit(
         tc,
         cast.node.expr.span,
         &from,
         &target,
         ExpectedProjectionMode::ExplicitCast,
     ) {
-        ExpectedProjectionDecision::Project(projection) => {
+        ExpectedFit::SourceAccepted(SourceAcceptance::ExplicitCast { conversion }) => {
+            apply_explicit_cast_effects(expr, cast, conversion, tc);
+            cast_expr_checked(expr, target, checked.contains_extern_any, tc)
+        }
+        ExpectedFit::Project {
+            projection,
+            acceptance: SourceAcceptance::ExplicitCast { conversion },
+        } => {
             let projected =
                 apply_value_projection(tc, &cast.node.expr, &checked, &from, projection);
-            if let Some(conversion) = tc.explicit_cast_conversion(&projected.ty, &target) {
-                apply_explicit_cast_effects(expr, cast, conversion, tc);
-                return cast_expr_checked(expr, target, projected.contains_extern_any, tc);
+            apply_explicit_cast_effects(expr, cast, conversion, tc);
+            cast_expr_checked(expr, target, projected.contains_extern_any, tc)
+        }
+        ExpectedFit::Deferred if matches!(from, Type::Infer) || matches!(target, Type::Infer) => {
+            cast_expr_checked(expr, target, checked.contains_extern_any, tc)
+        }
+        fit @ (ExpectedFit::Ambiguous(_) | ExpectedFit::MissingProjection { .. }) => {
+            match super::projection::expected_projection_decision(
+                tc,
+                cast.node.expr.span,
+                &from,
+                &target,
+                fit,
+            ) {
+                super::projection::ExpectedProjectionDecision::Failed => {}
+                super::projection::ExpectedProjectionDecision::SourceAccepted
+                | super::projection::ExpectedProjectionDecision::NotNeeded
+                | super::projection::ExpectedProjectionDecision::Project(_) => unreachable!(),
             }
+            cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
         }
-        ExpectedProjectionDecision::Failed => {
-            return cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc);
+        ExpectedFit::Deferred | ExpectedFit::Mismatch => {
+            tc.push_error(TypeError::InvalidCast {
+                from,
+                to: target,
+                span: tc.error_span(cast.span),
+            });
+            cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
         }
-        ExpectedProjectionDecision::SourceAccepted | ExpectedProjectionDecision::NotNeeded => {}
+        ExpectedFit::SourceAccepted(_) | ExpectedFit::Project { .. } => unreachable!(),
     }
-    tc.push_error(TypeError::InvalidCast {
-        from,
-        to: target,
-        span: tc.error_span(cast.span),
-    });
-    cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
 }
 
 fn apply_explicit_cast_effects(
@@ -448,7 +560,10 @@ fn apply_explicit_cast_effects(
         ExplicitCast::Identity => tc
             .closure
             .copy_expr_flow(cast.node.expr.node.id, expr.node.id),
-        ExplicitCast::CastFrom { escape } => tc.check_argument_escape(&cast.node.expr, escape),
+        ExplicitCast::CastFrom { escape, origin } => {
+            tc.mark_activation_imports_used(&origin);
+            tc.check_argument_escape(&cast.node.expr, escape);
+        }
         ExplicitCast::Builtin => {}
     }
 }

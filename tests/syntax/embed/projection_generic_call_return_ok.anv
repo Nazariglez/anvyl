@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+fn id<T>(value: T) -> T {
+    value
+}
+
+fn make_entity(enemy: Enemy) -> Entity {
+    id(enemy)
+}

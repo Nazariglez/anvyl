@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: projection from 'Enemy' to 'Entity' is ambiguous
+// @contains: @as embed paths: actor.entity, entity
+
+struct Entity { x: int }
+struct Actor { @as embed entity: Entity }
+
+struct Enemy {
+    @as embed entity: Entity,
+    @as embed actor: Actor,
+}
+
+fn make_enemy() -> Enemy {
+    Enemy { entity: Entity { x: 1 }, actor: Actor { entity: Entity { x: 2 } } }
+}
+
+fn make_entity() -> Entity {
+    make_enemy()
+}

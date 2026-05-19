@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: match arm type mismatch
+
+enum State { A, B }
+
+fn bad() -> string { "no" }
+
+fn main() {
+    let s = State.A;
+    let x: int = match s {
+        State.A => 1,
+        State.B => bad(),
+    };
+}
