@@ -6,6 +6,7 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+mod typing;
 mod verify;
 
 pub use body::*;

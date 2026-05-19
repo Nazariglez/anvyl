@@ -1,11 +1,14 @@
-use verify::{BadCall, BadFunction, BadPlace, BadReference, VerifyErrorKind as EK};
+use verify::{
+    BadCall, BadConst, BadFunction, BadModule, BadPlace, BadRValue, BadReference, BadStatement,
+    BadType, ModuleItem, PrimitiveKind, VerifyErrorKind as EK,
+};
 
 use super::*;
 use crate::ast::Ident;
 
 #[test]
 fn entry_function_out_of_range() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
@@ -19,7 +22,7 @@ fn entry_function_out_of_range() {
 
 #[test]
 fn fn_no_blocks() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
@@ -44,7 +47,7 @@ fn fn_no_blocks() {
 
 #[test]
 fn if_not_bool() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -54,8 +57,8 @@ fn if_not_bool() {
     let bb_then = fb.push_block(term_return_void());
     let bb_else = fb.push_block(term_return_void());
     fb.push_block(term_if(op_place(p_n, int_ty), bb_then, bb_else));
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -66,7 +69,7 @@ fn if_not_bool() {
 
 #[test]
 fn switch_not_enum() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -75,8 +78,8 @@ fn switch_not_enum() {
     let p_n = fb.push_param("n", int_ty, ParamRole::Normal);
     let bb_end = fb.push_block(term_return_void());
     fb.push_block(term_switch_enum(place(p_n, int_ty), vec![], Some(bb_end)));
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -87,7 +90,7 @@ fn switch_not_enum() {
 
 #[test]
 fn switch_bad_variant() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
@@ -109,8 +112,8 @@ fn switch_bad_variant() {
         vec![(VariantId::from_index(99), bb_end)],
         None,
     ));
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -121,8 +124,34 @@ fn switch_bad_variant() {
 }
 
 #[test]
+fn switch_invalid_enum_type_does_not_panic() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let enum_id = EnumId::from_index(99);
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+    let module = test_module(&mut builder);
+
+    let mut fb = FunctionBuilder::new("bad_switch_enum", module, FunctionKind::Normal, void_ty);
+    let value = fb.push_param("value", enum_ty, ParamRole::Normal);
+    let bb_end = fb.push_block(term_return_void());
+    fb.push_block(term_switch_enum(
+        place(value, enum_ty),
+        vec![(VariantId::from_index(0), bb_end)],
+        None,
+    ));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidEnum(id)) if id == enum_id
+    )));
+}
+
+#[test]
 fn return_type_mismatch() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let bool_ty = builder.alloc_type(TypeData::Bool);
     let module = test_module(&mut builder);
@@ -130,8 +159,8 @@ fn return_type_mismatch() {
     let mut fb = FunctionBuilder::new("bad_return", module, FunctionKind::Normal, int_ty);
     let local_b = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::Return);
     fb.push_block(term_return(op_place(local_b, bool_ty)));
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -143,7 +172,7 @@ fn return_type_mismatch() {
 
 #[test]
 fn void_fn_returns_value() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -151,8 +180,8 @@ fn void_fn_returns_value() {
     let mut fb = FunctionBuilder::new("void_bad", module, FunctionKind::Normal, void_ty);
     let local_i = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
     fb.push_block(term_return(op_place(local_i, int_ty)));
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -163,14 +192,14 @@ fn void_fn_returns_value() {
 
 #[test]
 fn nonvoid_fn_returns_none() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("non_void_bad", module, FunctionKind::Normal, int_ty);
     fb.push_block(term_return_void());
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -181,14 +210,14 @@ fn nonvoid_fn_returns_none() {
 
 #[test]
 fn goto_bad_block() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("bad_goto", module, FunctionKind::Normal, void_ty);
     fb.push_block(term_goto(BlockId::from_index(99)));
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -199,7 +228,7 @@ fn goto_bad_block() {
 
 #[test]
 fn fn_bad_type() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
@@ -214,8 +243,8 @@ fn fn_bad_type() {
             terminator: Terminator::Return(None),
         }],
     };
-    let _fid = builder.alloc_function(func);
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(func);
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -226,7 +255,7 @@ fn fn_bad_type() {
 
 #[test]
 fn aggregate_bad_field_type() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let module = test_module(&mut builder);
 
     builder.alloc_aggregate(AggregateDecl {
@@ -249,7 +278,7 @@ fn aggregate_bad_field_type() {
 
 #[test]
 fn enum_bad_variant_type() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let module = test_module(&mut builder);
 
     builder.alloc_enum(EnumDecl {
@@ -270,7 +299,7 @@ fn enum_bad_variant_type() {
 
 #[test]
 fn call_arity_mismatch() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -293,8 +322,8 @@ fn call_arity_mismatch() {
             args: vec![op_place(p_n, int_ty)],
         }),
     );
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -308,7 +337,7 @@ fn call_arity_mismatch() {
 
 #[test]
 fn call_arg_type_mismatch() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let bool_ty = builder.alloc_type(TypeData::Bool);
     let void_ty = builder.alloc_type(TypeData::Void);
@@ -333,8 +362,8 @@ fn call_arg_type_mismatch() {
             args: vec![op_place(p_n, int_ty), op_place(p_b, bool_ty)],
         }),
     );
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -346,7 +375,7 @@ fn call_arg_type_mismatch() {
 
 #[test]
 fn field_proj_non_aggregate() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -359,12 +388,9 @@ fn field_proj_non_aggregate() {
         ty: int_ty,
     };
     let bb0 = fb.push_block(term_return_void());
-    fb.add_statement(
-        bb0,
-        stmt_assign(bad_place, RValue::Use(op_place(local_int, int_ty))),
-    );
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    fb.add_statement(bb0, stmt_eval(RValue::Use(Operand::Place(bad_place))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -375,7 +401,7 @@ fn field_proj_non_aggregate() {
 
 #[test]
 fn tuple_field_out_of_range() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -390,12 +416,9 @@ fn tuple_field_out_of_range() {
         ty: int_ty,
     };
     let bb0 = fb.push_block(term_return_void());
-    fb.add_statement(
-        bb0,
-        stmt_assign(bad_place, RValue::Use(op_place(local_t, tuple_ty))),
-    );
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    fb.add_statement(bb0, stmt_eval(RValue::Use(Operand::Place(bad_place))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -406,7 +429,7 @@ fn tuple_field_out_of_range() {
 
 #[test]
 fn index_proj_non_indexable() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -420,12 +443,9 @@ fn index_proj_non_indexable() {
         ty: int_ty,
     };
     let bb0 = fb.push_block(term_return_void());
-    fb.add_statement(
-        bb0,
-        stmt_assign(bad_place, RValue::Use(op_place(local_int, int_ty))),
-    );
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    fb.add_statement(bb0, stmt_eval(RValue::Use(Operand::Place(bad_place))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -436,7 +456,7 @@ fn index_proj_non_indexable() {
 
 #[test]
 fn duplicate_switch_arm() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
@@ -467,8 +487,8 @@ fn duplicate_switch_arm() {
         ],
         None,
     ));
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -479,7 +499,7 @@ fn duplicate_switch_arm() {
 
 #[test]
 fn closure_bad_fn() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let module = test_module(&mut builder);
 
@@ -495,12 +515,451 @@ fn closure_bad_fn() {
             ty: sig_type,
         }),
     );
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadReference(BadReference::InvalidFunction(FunctionId(id))) if id == 999
+    )));
+}
+
+#[test]
+fn init_local_out_of_range() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let module = test_module(&mut builder);
+    let c = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("bad_init", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(c)));
+    fb.add_statement(
+        bb0,
+        stmt_init(LocalId::from_index(99), RValue::Use(op_const(c))),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidLocal(LocalId(99)))
+    )));
+}
+
+#[test]
+fn init_param_local_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_init_param", module, FunctionKind::Normal, int_ty);
+    let p = fb.push_param("p", int_ty, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return(op_place(p, int_ty)));
+    fb.add_statement(bb0, stmt_init(p, RValue::Use(op_place(p, int_ty))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(
+        |e| matches!(e.kind, EK::BadStatement(BadStatement::InitParamLocal(local)) if local == p)
+    ));
+}
+
+#[test]
+fn init_value_type_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_init_type", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
+    let b = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return(op_place(local, int_ty)));
+    fb.add_statement(bb0, stmt_init(local, RValue::Use(op_place(b, bool_ty))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadStatement(BadStatement::InitTypeMismatch { expected, found }) if expected == int_ty && found == bool_ty)));
+}
+
+#[test]
+fn assign_immutable_local_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_assign_imm", module, FunctionKind::Normal, int_ty);
+    let imm = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return(op_place(imm, int_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_assign(place(imm, int_ty), RValue::Use(op_place(imm, int_ty))),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadStatement(BadStatement::AssignImmutableLocal(local)) if local == imm)));
+}
+
+#[test]
+fn assign_type_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_assign_type", module, FunctionKind::Normal, int_ty);
+    let int = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::User);
+    let bool_ = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return(op_place(int, int_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_assign(place(int, int_ty), RValue::Use(op_place(bool_, bool_ty))),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadStatement(BadStatement::AssignTypeMismatch { expected, found }) if expected == int_ty && found == bool_ty)));
+}
+
+#[test]
+fn duplicate_primitive_type_is_invalid() {
+    let mut builder = ProgramBuilder::default();
+    let first = builder.alloc_type(TypeData::Int);
+    let duplicate = builder.alloc_type(TypeData::Int);
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadType(BadType::DuplicatePrimitive { kind: PrimitiveKind::Int, first: a, duplicate: b }) if a == first && b == duplicate)));
+}
+
+#[test]
+fn recursive_type_is_invalid() {
+    let mut program = Program::default();
+    let ty = program.alloc_type(TypeData::Optional(TypeId::from_index(999)));
+    *program.type_arena.data_mut(ty) = TypeData::Optional(ty);
+
+    let errors = verify(&program).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, EK::BadType(BadType::Recursive(id)) if id == ty))
+    );
+}
+
+#[test]
+fn constants_must_match_value_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Int(1),
+    });
+    builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Nil,
+    });
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadConst(BadConst::TypeMismatch { expected, found }) if expected == int_ty && found == bool_ty)));
+    assert!(
+        errors.iter().any(
+            |e| matches!(e.kind, EK::BadConst(BadConst::NilMustBeOptional(ty)) if ty == int_ty)
+        )
+    );
+}
+
+#[test]
+fn place_claimed_type_and_index_type_are_verified() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_place_ty", module, FunctionKind::Normal, int_ty);
+    let list = fb.push_local(None, list_ty, Mutability::Immutable, LocalKind::User);
+    let idx = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
+    let bad_place = Place {
+        root: list,
+        projection: vec![Projection::Index(idx)],
+        ty: list_ty,
+    };
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(bb0, stmt_eval(RValue::Use(Operand::Place(bad_place))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadPlace(BadPlace::IndexLocalTypeMismatch { expected, found }) if expected == int_ty && found == bool_ty)));
+}
+
+#[test]
+fn rvalue_binary_and_cast_invariants() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_rvalues", module, FunctionKind::Normal, int_ty);
+    let i = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
+    let b = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return(op_place(i, int_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Binary {
+            op: crate::ast::BinaryOp::And,
+            lhs: op_place(b, bool_ty),
+            rhs: op_place(b, bool_ty),
+            ty: bool_ty,
+        }),
+    );
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Cast {
+            value: op_place(i, int_ty),
+            target: int_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::UnsupportedBinaryOp(crate::ast::BinaryOp::And))
+    )));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target }) if value == int_ty && target == int_ty)));
+}
+
+#[test]
+fn function_param_local_must_match() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let module = test_module(&mut builder);
+    let local = LocalId::from_index(0);
+    let func = Function {
+        name: Ident::new("bad_param"),
+        module,
+        kind: FunctionKind::Normal,
+        signature: Signature::new(
+            vec![Param {
+                name: Some(Ident::new("p")),
+                ty: int_ty,
+                role: ParamRole::Normal,
+                local_id: local,
+            }],
+            int_ty,
+        ),
+        locals: vec![Local {
+            name: Some(Ident::new("p")),
+            ty: bool_ty,
+            mutability: Mutability::Immutable,
+            kind: LocalKind::User,
+        }],
+        body: vec![BasicBlock {
+            statements: vec![],
+            terminator: term_return(op_place(local, bool_ty)),
+        }],
+    };
+    let fid = builder.alloc_function(func);
+    builder.set_entry(fid);
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::ParamLocalMustBeArg { local: l, .. }) if l == local)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::ParamLocalTypeMismatch { expected, found, .. }) if expected == int_ty && found == bool_ty)));
+}
+
+#[test]
+fn module_missing_wrong_and_duplicate_items_are_invalid() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let m0 = test_module(&mut builder);
+    let m1 = builder.alloc_module(empty_module("other"));
+
+    let mut fb = FunctionBuilder::new("missing", m0, FunctionKind::Normal, void_ty);
+    fb.push_block(term_return_void());
+    let missing = builder.alloc_function_raw(fb.finish());
+    let missing_agg = builder.alloc_aggregate_raw(AggregateDecl {
+        name: Ident::new("MissingAgg"),
+        module: m0,
+        kind: AggregateKind::Struct,
+        fields: vec![],
+        cycle_capable: false,
+    });
+    let missing_enum = builder.alloc_enum_raw(EnumDecl {
+        name: Ident::new("MissingEnum"),
+        module: m0,
+        variants: vec![],
+    });
+    let missing_ext_ty = builder.alloc_extern_type_raw(ExternTypeDecl {
+        name: Ident::new("MissingExtType"),
+        module: m0,
+        rep: ExternRep::Shared,
+        has_init: false,
+        fields: vec![],
+        methods: vec![],
+        statics: vec![],
+        operators: vec![],
+    });
+    let missing_ext = builder.alloc_extern_raw(ExternDecl {
+        name: Ident::new("missing_ext"),
+        module: m0,
+        member: ExternMember::FreeFunction,
+        params: vec![],
+        return_type: void_ty,
+    });
+
+    let mut fb = FunctionBuilder::new("wrong", m1, FunctionKind::Normal, void_ty);
+    fb.push_block(term_return_void());
+    let wrong = builder.alloc_function_raw(fb.finish());
+    let module = builder.module_mut(m0);
+    module.functions.push(wrong);
+    module.functions.push(wrong);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Function(id))) if id == missing)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Aggregate(id))) if id == missing_agg)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Enum(id))) if id == missing_enum)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::ExternType(id))) if id == missing_ext_ty)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Extern(id))) if id == missing_ext)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::ItemWrongModule { item: ModuleItem::Function(id), expected, found }) if id == wrong && expected == m0 && found == m1)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::DuplicateItem(ModuleItem::Function(id))) if id == wrong)));
+}
+
+#[test]
+fn map_entry_and_slice_view_indices_must_exist_and_be_int() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let map_ty = builder.alloc_type(TypeData::Map {
+        key: int_ty,
+        value: bool_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_indices", module, FunctionKind::Normal, int_ty);
+    let list = fb.push_local(None, list_ty, Mutability::Immutable, LocalKind::User);
+    let map = fb.push_local(None, map_ty, Mutability::Immutable, LocalKind::User);
+    let bool_index = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MapEntryAt {
+            map: place(map, map_ty),
+            index: LocalId::from_index(99),
+            ty: bool_ty,
+        }),
+    );
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::SliceView {
+            source: place(list, list_ty),
+            start: bool_index,
+            end: LocalId::from_index(100),
+            inclusive: false,
+            ty: list_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidLocal(LocalId(99)))
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidLocal(LocalId(100)))
+    )));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::SliceIndexMustBeInt { which: "start", found }) if found == bool_ty)));
+}
+
+#[test]
+fn const_requires_matching_primitive_even_when_missing() {
+    let mut builder = ProgramBuilder::default();
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Int(1),
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadConst(BadConst::MissingPrimitive(PrimitiveKind::Int))
+    )));
+}
+
+#[test]
+fn builtin_call_requires_void_result_type() {
+    let mut builder = ProgramBuilder::default();
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new(
+        "missing_builtin_void",
+        module,
+        FunctionKind::Normal,
+        bool_ty,
+    );
+    let local = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return(op_place(local, bool_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_init(
+            local,
+            RValue::Call {
+                callee: Callee::Builtin(Builtin::Println),
+                args: vec![op_place(local, bool_ty)],
+            },
+        ),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::MissingPrimitive(PrimitiveKind::Void))
+    )));
+}
+
+#[test]
+fn implicit_primitive_rvalues_require_canonical_result_type() {
+    let mut builder = ProgramBuilder::default();
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let list_ty = builder.alloc_type(TypeData::List(bool_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new(
+        "missing_rvalue_prims",
+        module,
+        FunctionKind::Normal,
+        bool_ty,
+    );
+    let local_bool = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
+    let local_list = fb.push_local(None, list_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return(op_place(local_bool, bool_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_init(
+            local_bool,
+            RValue::Len {
+                source: place(local_list, list_ty),
+            },
+        ),
+    );
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::ToString {
+            value: op_place(local_bool, bool_ty),
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::MissingPrimitive(PrimitiveKind::Int))
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::MissingPrimitive(PrimitiveKind::String))
     )));
 }

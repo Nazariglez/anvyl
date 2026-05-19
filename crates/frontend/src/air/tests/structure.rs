@@ -76,7 +76,7 @@ fn const_arena() {
 
 #[test]
 fn aggregate_field_order() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let bool_ty = builder.alloc_type(TypeData::Bool);
 
@@ -111,7 +111,7 @@ fn aggregate_field_order() {
 
 #[test]
 fn enum_variant_order() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let bool_ty = builder.alloc_type(TypeData::Bool);
 
@@ -153,7 +153,7 @@ fn enum_variant_order() {
 
 #[test]
 fn function_stable_ids() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
 
     let module = test_module(&mut builder);
@@ -166,8 +166,8 @@ fn function_stable_ids() {
         Mutability::Mutable,
         LocalKind::User,
     );
-    let bb0 = fb.push_block(term_return_void());
-    let bb1 = fb.push_block(term_unreachable());
+    fb.push_block(term_return_void());
+    fb.push_block(term_unreachable());
     let func_id = builder.alloc_function(fb.finish());
 
     let program = builder.finish();
@@ -176,29 +176,14 @@ fn function_stable_ids() {
     assert_eq!(func.body.len(), 2);
     assert_eq!(param_a.index(), 0);
     assert_eq!(local_b.index(), 1);
-    let _ = (bb0, bb1);
 }
 
 #[test]
 fn module_refs_stable() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
 
-    let m0 = builder.alloc_module(Module {
-        path: vec![Ident::new("a")],
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
-    });
-    let m1 = builder.alloc_module(Module {
-        path: vec![Ident::new("b")],
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
-    });
+    let m0 = builder.alloc_module(empty_module("a"));
+    let m1 = builder.alloc_module(empty_module("b"));
 
     assert_eq!(m0.index(), 0);
     assert_eq!(m1.index(), 1);
@@ -210,7 +195,7 @@ fn module_refs_stable() {
 
 #[test]
 fn program_accessors() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
 
@@ -272,7 +257,7 @@ fn program_accessors() {
 
 #[test]
 fn id_roundtrip() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
 
     let module = test_module(&mut builder);
@@ -280,8 +265,6 @@ fn id_roundtrip() {
     let mut fb = FunctionBuilder::new("f", module, FunctionKind::Normal, void_ty);
     let bid = fb.push_block(term_return_void());
     let func_id = builder.alloc_function(fb.finish());
-    let _program = builder.finish();
-
     for i in 0..10 {
         assert_eq!(TypeId::from_index(i).index(), i);
         assert_eq!(ConstId::from_index(i).index(), i);
@@ -291,5 +274,4 @@ fn id_roundtrip() {
     assert_eq!(BlockId::from_index(0), bid);
     assert_eq!(FunctionId::from_index(0), func_id);
     assert_eq!(ModuleId::from_index(0), module);
-    let _ = void_ty;
 }

@@ -10,52 +10,132 @@ fn empty_program() {
 fn returns_verified_wrapper() {
     let program = Program::default();
     let verified = verify(&program).unwrap();
-    assert!(std::ptr::eq(verified.program(), &program));
+    assert_eq!(
+        std::ptr::from_ref(verified.program()),
+        std::ptr::from_ref(&program)
+    );
 }
 
 #[test]
 fn fn_return() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("ret42", module, FunctionKind::Normal, int_ty);
-    let local_ret = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Return);
     let c42 = builder.alloc_const(ConstData {
         ty: int_ty,
         value: ConstValue::Int(42),
     });
-    fb.push_block(term_return(op_place(local_ret, int_ty)));
+    fb.push_block(term_return(op_const(c42)));
     let func_id = builder.alloc_function(fb.finish());
     builder.set_entry(func_id);
 
     let program = builder.finish();
     expect_verified(&program);
     assert_eq!(program.entry(), Some(func_id));
-    let _ = c42;
+}
+
+#[test]
+fn init_and_assign_mutable_local() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let module = test_module(&mut builder);
+    let c1 = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let c2 = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(2),
+    });
+
+    let mut fb = FunctionBuilder::new("mutate", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::User);
+    let block = fb.push_block(term_return(op_place(local, int_ty)));
+    fb.add_statement(block, stmt_init(local, RValue::Use(op_const(c1))));
+    fb.add_statement(
+        block,
+        stmt_assign(place(local, int_ty), RValue::Use(op_const(c2))),
+    );
+    let func_id = builder.alloc_function(fb.finish());
+    builder.set_entry(func_id);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
+fn primitive_rvalues() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let float_ty = builder.alloc_type(TypeData::Float);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let module = test_module(&mut builder);
+
+    let mut fb = FunctionBuilder::new("primitive_rvalues", module, FunctionKind::Normal, int_ty);
+    let int = fb.push_param("i", int_ty, ParamRole::Normal);
+    let float = fb.push_param("f", float_ty, ParamRole::Normal);
+    let bool_ = fb.push_param("b", bool_ty, ParamRole::Normal);
+    let block = fb.push_block(term_return(op_place(int, int_ty)));
+    for value in [
+        RValue::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            value: op_place(int, int_ty),
+            ty: int_ty,
+        },
+        RValue::Unary {
+            op: crate::ast::UnaryOp::Not,
+            value: op_place(bool_, bool_ty),
+            ty: bool_ty,
+        },
+        RValue::Binary {
+            op: crate::ast::BinaryOp::Add,
+            lhs: op_place(int, int_ty),
+            rhs: op_place(int, int_ty),
+            ty: int_ty,
+        },
+        RValue::Binary {
+            op: crate::ast::BinaryOp::LessThan,
+            lhs: op_place(float, float_ty),
+            rhs: op_place(float, float_ty),
+            ty: bool_ty,
+        },
+        RValue::Cast {
+            value: op_place(int, int_ty),
+            target: float_ty,
+        },
+        RValue::Cast {
+            value: op_place(float, float_ty),
+            target: int_ty,
+        },
+    ] {
+        fb.add_statement(block, stmt_eval(value));
+    }
+    let func_id = builder.alloc_function(fb.finish());
+    builder.set_entry(func_id);
+
+    expect_verified(&builder.finish());
 }
 
 #[test]
 fn fn_params() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("add", module, FunctionKind::Normal, int_ty);
     let p_a = fb.push_param("a", int_ty, ParamRole::Normal);
-    let p_b = fb.push_param("b", int_ty, ParamRole::Normal);
-    let _ret = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Return);
+    fb.push_param("b", int_ty, ParamRole::Normal);
     fb.push_block(term_return(op_place(p_a, int_ty)));
     let func_id = builder.alloc_function(fb.finish());
     builder.set_entry(func_id);
 
     expect_verified(&builder.finish());
-    let _ = (p_a, p_b, func_id);
 }
 
 #[test]
 fn fn_aggregate() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -97,16 +177,8 @@ fn fn_aggregate() {
     let block0 = fb.push_block(term_return_void());
     fb.add_statement(
         block0,
-        stmt_assign(x_proj.clone(), RValue::Use(op_place(p_x, int_ty))),
-    );
-    fb.add_statement(
-        block0,
-        stmt_assign(y_proj.clone(), RValue::Use(op_place(p_y, int_ty))),
-    );
-    fb.add_statement(
-        block0,
-        stmt_assign(
-            place(local_agg, agg_ty),
+        stmt_init(
+            local_agg,
             RValue::Aggregate {
                 kind: AggregateCtor::Struct(agg_id),
                 fields: vec![op_place(p_x, int_ty), op_place(p_y, int_ty)],
@@ -114,23 +186,18 @@ fn fn_aggregate() {
             },
         ),
     );
+    fb.add_statement(block0, stmt_eval(RValue::Use(Operand::Place(x_proj))));
+    fb.add_statement(block0, stmt_eval(RValue::Use(Operand::Place(y_proj))));
     fb.add_statement(block0, stmt_eval(RValue::Use(op_place(local_agg, agg_ty))));
-    fb.add_statement(
-        block0,
-        stmt_assign(
-            place(local_agg, agg_ty),
-            RValue::Use(op_place(local_agg, agg_ty)),
-        ),
-    );
 
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
     expect_verified(&builder.finish());
 }
 
 #[test]
 fn enum_switch() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
@@ -167,19 +234,19 @@ fn enum_switch() {
         Some(bb_else),
     ));
 
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
     expect_verified(&builder.finish());
 }
 
 #[test]
 fn extern_call() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
-    let _ext_ty_id = builder.alloc_extern_type(ExternTypeDecl {
+    builder.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("Console"),
         module,
         rep: ExternRep::Shared,
@@ -209,14 +276,14 @@ fn extern_call() {
         }),
     );
 
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
     expect_verified(&builder.finish());
 }
 
 #[test]
 fn if_bool() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let bool_ty = builder.alloc_type(TypeData::Bool);
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
@@ -227,21 +294,21 @@ fn if_bool() {
     let bb_else = fb.push_block(term_return_void());
     fb.push_block(term_if(op_place(p_cond, bool_ty), bb_then, bb_else));
 
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
     expect_verified(&builder.finish());
 }
 
 #[test]
 fn multi_block_goto() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("multi_block", module, FunctionKind::Normal, void_ty);
     let bb_end = fb.push_block(term_return_void());
     let bb_mid = fb.push_block(term_goto(bb_end));
-    let _bb_start = fb.push_block(term_goto(bb_mid));
+    fb.push_block(term_goto(bb_mid));
 
     let func_id = builder.alloc_function(fb.finish());
     builder.set_entry(func_id);
@@ -253,66 +320,56 @@ fn multi_block_goto() {
 
 #[test]
 fn unreachable_fn() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("unreachable_fn", module, FunctionKind::Normal, void_ty);
     fb.push_block(term_unreachable());
 
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
     expect_verified(&builder.finish());
 }
 
 #[test]
 fn tuple_and_list() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let bool_ty = builder.alloc_type(TypeData::Bool);
     let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![int_ty, bool_ty]));
-    let _list_ty = builder.alloc_type(TypeData::List(int_ty));
-    let _map_ty = builder.alloc_type(TypeData::Map {
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    builder.alloc_type(TypeData::Map {
         key: int_ty,
         value: bool_ty,
     });
+    let module = test_module(&mut builder);
 
-    let mut fb = FunctionBuilder::new(
-        "types_ok",
-        ModuleId::from_index(0),
-        FunctionKind::Normal,
-        int_ty,
-    );
-    let _local_t = fb.push_local(None, tuple_ty, Mutability::Immutable, LocalKind::User);
-    let _local_l = fb.push_local(None, _list_ty, Mutability::Mutable, LocalKind::User);
+    let mut fb = FunctionBuilder::new("types_ok", module, FunctionKind::Normal, int_ty);
+    fb.push_local(None, tuple_ty, Mutability::Immutable, LocalKind::User);
+    fb.push_local(None, list_ty, Mutability::Mutable, LocalKind::User);
     let local_ret = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Return);
     fb.push_block(term_return(op_place(local_ret, int_ty)));
 
-    let _fid = builder.alloc_function(fb.finish());
-    builder.set_entry(_fid);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
     expect_verified(&builder.finish());
 }
 
 #[test]
 fn closure_make_call() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let module = test_module(&mut builder);
 
-    // inner closure body
     let mut inner_fb = FunctionBuilder::new("inner", module, FunctionKind::Closure, int_ty);
-    let _p_e = inner_fb.push_param("e", int_ty, ParamRole::CaptureEnv);
+    inner_fb.push_param("e", int_ty, ParamRole::CaptureEnv);
     let ret_local = inner_fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Return);
     inner_fb.push_block(term_return(op_place(ret_local, int_ty)));
     let inner_id = builder.alloc_function(inner_fb.finish());
 
     let sig_type = builder.alloc_type(TypeData::Function(SignatureType::new(vec![int_ty], int_ty)));
-    let _fn_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
-        vec![sig_type, int_ty],
-        int_ty,
-    )));
 
-    // outer function: calls closure, makes closure
     let mut outer_fb = FunctionBuilder::new("outer", module, FunctionKind::Normal, int_ty);
     let p_closure = outer_fb.push_param("f", sig_type, ParamRole::Normal);
     let p_arg = outer_fb.push_param("arg", int_ty, ParamRole::Normal);
@@ -321,8 +378,8 @@ fn closure_make_call() {
     let bb0 = outer_fb.push_block(Terminator::Return(Some(op_place(call_result, int_ty))));
     outer_fb.add_statement(
         bb0,
-        stmt_assign(
-            place(call_result, int_ty),
+        stmt_init(
+            call_result,
             RValue::Call {
                 callee: Callee::Closure(op_place(p_closure, sig_type)),
                 args: vec![op_place(p_arg, int_ty)],
@@ -342,30 +399,15 @@ fn closure_make_call() {
     builder.set_entry(outer_id);
 
     expect_verified(&builder.finish());
-    let _ = (inner_id, outer_id);
 }
 
 #[test]
 fn multi_module() {
-    let mut builder = ProgramBuilder::new();
+    let mut builder = ProgramBuilder::default();
     let void_ty = builder.alloc_type(TypeData::Void);
 
-    let m0 = builder.alloc_module(Module {
-        path: vec![Ident::new("a")],
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
-    });
-    let m1 = builder.alloc_module(Module {
-        path: vec![Ident::new("b")],
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
-    });
+    let m0 = builder.alloc_module(empty_module("a"));
+    let m1 = builder.alloc_module(empty_module("b"));
 
     let mut fb0 = FunctionBuilder::new("fn_a", m0, FunctionKind::Normal, void_ty);
     fb0.push_block(term_return_void());
@@ -381,5 +423,5 @@ fn multi_module() {
     expect_verified(&program);
     assert_eq!(program.module(m0).path[0].as_str(), "a");
     assert_eq!(program.module(m1).path[0].as_str(), "b");
-    let _ = f1;
+    assert_eq!(program.module(m1).functions[0], f1);
 }

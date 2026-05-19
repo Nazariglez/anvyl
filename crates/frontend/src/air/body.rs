@@ -34,6 +34,7 @@ pub enum Operand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    Init { local: LocalId, value: RValue },
     Assign { dst: Place, value: RValue },
     Eval(RValue),
 }

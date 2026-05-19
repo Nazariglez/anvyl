@@ -17,8 +17,16 @@ impl TypeArena {
         &self.data[id.index()]
     }
 
+    pub fn get(&self, id: TypeId) -> Option<&TypeData> {
+        self.data.get(id.index())
+    }
+
     pub fn data_mut(&mut self, id: TypeId) -> &mut TypeData {
         &mut self.data[id.index()]
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TypeData> {
+        self.data.iter()
     }
 
     pub fn len(&self) -> usize {
@@ -76,6 +84,14 @@ impl ConstArena {
 
     pub fn get(&self, id: ConstId) -> &ConstData {
         &self.data[id.index()]
+    }
+
+    pub fn get_checked(&self, id: ConstId) -> Option<&ConstData> {
+        self.data.get(id.index())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ConstData> {
+        self.data.iter()
     }
 
     pub fn get_mut(&mut self, id: ConstId) -> &mut ConstData {
