@@ -4,10 +4,10 @@ use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
     decls::{CallableId, ExtendId, GlobalKey},
     infer::{SemanticLocalId, TypeHandle},
-    type_ops::{type_closure_facts, type_depends_on_generics},
+    type_ops::{TypeVisitor, type_closure_facts, type_depends_on_generics},
 };
 use crate::{
-    ast::{ExprId, Ident},
+    ast::{ContractRef, ExprId, Ident},
     externs::catalog::{
         ExternFieldRef, ExternFunctionId, ExternMethodRef, ExternOperatorRef, ExternStaticRef,
         ExternTypeId,
@@ -17,6 +17,7 @@ use crate::{
 
 pub(crate) type SemanticExprTypeMap = HashMap<ExprId, SemanticExprType>;
 pub(crate) type CallMap = HashMap<ExprId, CallTarget>;
+pub(crate) type DefaultArgMap = HashMap<ExprId, Vec<DefaultArgFact>>;
 pub(crate) type ExternUseMap = HashMap<ExprId, Vec<ExternUseTarget>>;
 pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
 pub(crate) type ExpectedProjectionMap = HashMap<ExprId, ExpectedProjectionFact>;
@@ -106,7 +107,7 @@ impl LocalFacts {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SemanticDeclarations {
     pub(crate) modules: Vec<SemanticModuleFact>,
-    pub(crate) functions: Vec<SemanticFunctionFact>,
+    pub(crate) functions: Vec<SemanticFunctionInstanceFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,10 +117,24 @@ pub(crate) struct SemanticModuleFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SemanticFunctionFact {
+pub(crate) struct SemanticFunctionInstanceFact {
     pub(crate) id: CallableId,
+    pub(crate) args: GenericArgs,
     pub(crate) body: BodyInstanceKey,
+    pub(crate) module: ModuleScope,
+    pub(crate) name: Ident,
+    pub(crate) span: SourceSpan,
+    pub(crate) body_span: SourceSpan,
+    pub(crate) params: Vec<SemanticParamSigFact>,
     pub(crate) return_ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticParamSigFact {
+    pub(crate) name: Ident,
+    pub(crate) span: SourceSpan,
+    pub(crate) ty: Type,
+    pub(crate) mutable: bool,
 }
 
 impl SemanticDeclarations {
@@ -132,13 +147,71 @@ impl SemanticDeclarations {
         let mut functions = std::collections::HashSet::new();
         for fact in &self.functions {
             match &fact.body {
-                BodyInstanceKey::Callable(key) => debug_assert_eq!(key.target, fact.id),
+                BodyInstanceKey::Callable(key) => {
+                    debug_assert_eq!(key.target, fact.id);
+                    debug_assert_eq!(key.args, fact.args);
+                }
                 BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => {
                     debug_assert!(false, "semantic function fact has non-callable body");
                 }
             }
-            debug_assert!(functions.insert((fact.id.clone(), fact.body.clone())));
+            debug_assert_eq!(fact.module, fact.id.module);
+            debug_assert_eq!(fact.name, fact.id.name);
+            debug_assert!(functions.insert((fact.id.clone(), fact.args.clone())));
+            debug_assert!(fact.span.start() <= fact.span.end());
+            debug_assert!(fact.body_span.start() <= fact.body_span.end());
+            for param in &fact.params {
+                debug_assert!(param.span.start() <= param.span.end());
+                debug_assert!(!type_has_unfinished_facts(&param.ty));
+            }
             debug_assert!(!type_has_unfinished_facts(&fact.return_ty));
+        }
+    }
+
+    pub(crate) fn validate_bodies(&self, facts: &SemanticFactMaps) {
+        for body in facts.bodies.values() {
+            for defaults in body.default_args.values() {
+                for default in defaults {
+                    if let Some(function) = self.functions.iter().find(|function| {
+                        function.id == default.callee.target && function.args == default.callee.args
+                    }) {
+                        debug_assert!(default.param_index < function.params.len());
+                        debug_assert_eq!(function.params[default.param_index].ty, default.ty);
+                    } else if default.callee.args.is_empty() {
+                        debug_assert!(false, "default arg fact targets missing function instance");
+                    }
+                }
+            }
+        }
+        for function in &self.functions {
+            let Some(body) = facts.body(&function.body) else {
+                debug_assert!(
+                    function.params.is_empty(),
+                    "semantic function fact missing parameter body facts"
+                );
+                continue;
+            };
+            debug_assert_eq!(body.locals.param_defs.len(), function.params.len());
+            for (index, param) in function.params.iter().enumerate() {
+                let Some(local) = body.locals.param_defs.get(&index) else {
+                    debug_assert!(false, "semantic function param missing local fact");
+                    continue;
+                };
+                let Some(def) = body.locals.defs.get(local) else {
+                    debug_assert!(false, "semantic function param missing local definition");
+                    continue;
+                };
+                debug_assert_eq!(def.kind, LocalDefKind::Parameter);
+                debug_assert_eq!(def.name, param.name);
+                if !type_has_unfinished_facts(&def.ty)
+                    && !type_has_unfinished_facts(&param.ty)
+                    && !type_contains_dyn_hole(&def.ty)
+                    && !type_contains_dyn_hole(&param.ty)
+                {
+                    debug_assert_eq!(def.ty, param.ty);
+                }
+                debug_assert_eq!(def.mutable, param.mutable);
+            }
         }
     }
 }
@@ -150,6 +223,19 @@ fn type_has_unfinished_facts(ty: &Type) -> bool {
         || closure.infer.contains_return
         || closure.contains_unresolved_const
         || type_depends_on_generics(ty)
+}
+
+fn type_contains_dyn_hole(ty: &Type) -> bool {
+    struct DynHoleVisitor;
+
+    impl TypeVisitor for DynHoleVisitor {
+        fn visit_contract_ref_leaf(&mut self, contract: &ContractRef) -> bool {
+            matches!(contract, ContractRef::Infer | ContractRef::Hole(_))
+        }
+    }
+
+    let mut visitor = DynHoleVisitor;
+    visitor.visit_type(ty)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -178,6 +264,21 @@ pub(crate) struct SemanticExprSite {
     pub(crate) expr: ExprId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultArgFact {
+    pub(crate) call: ExprId,
+    pub(crate) callee: CallableInstanceKey,
+    pub(crate) param_index: usize,
+    pub(crate) default: DefaultExprSite,
+    pub(crate) ty: Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefaultExprSite {
+    pub(crate) expr: ExprId,
+    pub(crate) source: crate::source::SourceId,
+}
+
 pub(super) fn map_delta<K, V>(old: &HashMap<K, V>, current: &HashMap<K, V>) -> HashMap<K, V>
 where
     K: Copy + Eq + Hash,
@@ -203,6 +304,7 @@ pub(crate) struct SemanticExprType {
 pub(crate) struct SemanticBodyFacts {
     pub(crate) expr_types: SemanticExprTypeMap,
     pub(crate) calls: CallMap,
+    pub(crate) default_args: DefaultArgMap,
     pub(crate) extern_uses: ExternUseMap,
     pub(crate) member_paths: MemberPathMap,
     pub(crate) expected_projections: ExpectedProjectionMap,
@@ -219,6 +321,7 @@ impl SemanticBodyFacts {
     fn merge_from(&mut self, facts: Self) {
         self.expr_types.extend(facts.expr_types);
         self.calls.extend(facts.calls);
+        self.default_args.extend(facts.default_args);
         self.extern_uses.extend(facts.extern_uses);
         self.member_paths.extend(facts.member_paths);
         self.expected_projections.extend(facts.expected_projections);
@@ -234,6 +337,19 @@ impl SemanticBodyFacts {
     pub(crate) fn validate(&self) {
         for fact in self.expr_types.values() {
             debug_assert!(fact.span.is_some());
+        }
+        for (expr_id, facts) in &self.default_args {
+            let call = self.calls.get(expr_id);
+            for fact in facts {
+                debug_assert_eq!(*expr_id, fact.call);
+                if let Some(call) = call {
+                    debug_assert_eq!(fact.callee.target, call.id);
+                    debug_assert_eq!(fact.callee.args, call.args);
+                } else {
+                    debug_assert!(false, "default arg fact missing call target");
+                }
+                debug_assert!(!type_has_unfinished_facts(&fact.ty));
+            }
         }
         for (expr_id, fact) in &self.member_paths {
             debug_assert_eq!(*expr_id, fact.expr_id);
@@ -410,6 +526,14 @@ impl SemanticFactMaps {
 
     pub(crate) fn record_call(&mut self, site: SemanticExprSite, target: CallTarget) {
         self.body_mut(site.body).calls.insert(site.expr, target);
+    }
+
+    pub(crate) fn record_default_arg(&mut self, body: BodyInstanceKey, fact: DefaultArgFact) {
+        self.body_mut(body)
+            .default_args
+            .entry(fact.call)
+            .or_default()
+            .push(fact);
     }
 
     pub(crate) fn record_extern_use(&mut self, site: SemanticExprSite, target: ExternUseTarget) {

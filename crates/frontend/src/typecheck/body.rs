@@ -11,8 +11,8 @@ use super::{
     },
     decls::{
         AggregateSchema, CallableDef, CallableId, CallableKind, CallableRef, CallableSig,
-        DeclError, ExtendId, MethodKey, MethodMode, ModuleScope, NominalKey, TypeAliasDef,
-        generic_params, nominal_type, required_param_count, stmt_visibility,
+        DeclError, ExtendId, MethodKey, MethodMode, ModuleScope, NominalKey, ParamDefaultSite,
+        TypeAliasDef, generic_params, nominal_type, required_param_count, stmt_visibility,
     },
     defaults,
     dyn_infer::DynInference,
@@ -47,6 +47,7 @@ struct SourceFuncSig {
     generics: GenericParams,
     generic_context: GenericTypeContext,
     params: Vec<FuncParam>,
+    default_sites: Vec<Option<ParamDefaultSite>>,
     required_params: usize,
     ret: ReturnSpec,
     surface_ty: Type,
@@ -252,34 +253,6 @@ pub(super) fn collect_callable_templates(
     }
 }
 
-pub(super) fn push_source_scope(tc: &mut TypeChecker) {
-    tc.push_scope();
-    register_builtins(tc);
-}
-
-fn register_builtins(tc: &mut TypeChecker) {
-    let builtins = [
-        ("println", vec![FuncParam::immut(Type::Any)], Type::Void),
-        ("assert", vec![FuncParam::immut(Type::Bool)], Type::Void),
-        (
-            "assert_msg",
-            vec![FuncParam::immut(Type::Bool), FuncParam::immut(Type::String)],
-            Type::Void,
-        ),
-    ];
-
-    for (name, params, ret) in builtins {
-        tc.define(
-            Ident::new(name),
-            Type::Func {
-                params,
-                ret: Box::new(ReturnSpec::value(ret)),
-            },
-            false,
-        );
-    }
-}
-
 pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
     let extern_functions = tc
         .externs
@@ -325,7 +298,6 @@ pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                 };
                 tc.define(func.name, func_ty, false);
             }
-            Stmt::Aggregate(_) | Stmt::Enum(_) | Stmt::ExternFunc(_) | Stmt::ExternType(_) => {}
             Stmt::Const(const_node) => {
                 let c = &const_node.node;
                 let ty = match &c.ty {
@@ -522,6 +494,7 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
         owner_args: owner.args,
         generics,
         generic_context,
+        default_sites: ParamDefaultSite::from_params(tc.source_id(), &func.params),
         required_params: required_param_count(&func.params),
         surface_ty: Type::Func {
             params: params.clone(),
@@ -626,6 +599,7 @@ pub(super) fn register_block_declarations(
                     owner_generics: decl.sig.owner_generics.clone(),
                     generics: decl.sig.generics.clone(),
                     params: decl.sig.params.clone(),
+                    default_sites: decl.sig.default_sites.clone(),
                     required_params: decl.sig.required_params,
                     ret: decl.sig.ret.clone(),
                 },
@@ -702,6 +676,7 @@ fn add_callable_decl_placeholders(
                     owner_generics: GenericParams::default(),
                     generics: GenericParams::default(),
                     params: vec![],
+                    default_sites: vec![],
                     required_params: 0,
                     ret: ReturnSpec::value(Type::Infer),
                 },
@@ -927,7 +902,6 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
         Stmt::Aggregate(agg_node) => {
             check_aggregate_decl(agg_node, tc);
         }
-        Stmt::Enum(_) | Stmt::Contract(_) => {}
         Stmt::Const(const_node) => {
             if tc.scopes.len() > 1 {
                 match local_const {
@@ -948,7 +922,6 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
                 }
             }
         }
-        Stmt::Global(_) => {}
         Stmt::TypeAlias(alias_node) => {
             check_type_alias(alias_node, tc);
         }
@@ -958,7 +931,12 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
         Stmt::Defer(defer_node) => {
             control_flow::check_defer(defer_node, tc);
         }
-        Stmt::Import(_) | Stmt::ExternFunc(_) | Stmt::ExternType(_) => {}
+        Stmt::Enum(_)
+        | Stmt::Contract(_)
+        | Stmt::Global(_)
+        | Stmt::Import(_)
+        | Stmt::ExternFunc(_)
+        | Stmt::ExternType(_) => {}
     }
 }
 
@@ -1528,7 +1506,7 @@ fn with_source_module_scope<R>(
         ModuleScope::Named(_) | ModuleScope::Package(_) => {
             let state = tc.take_scope_state();
             tc.replace_scopes(vec![]);
-            push_source_scope(tc);
+            tc.push_scope();
             if let Some(program) = tc.module_programs.get(module).map(Rc::clone) {
                 register_declarations(program.as_ref(), tc);
                 tc.eval_module_consts(module);

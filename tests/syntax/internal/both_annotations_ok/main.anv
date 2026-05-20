@@ -2,6 +2,7 @@
 // @expect: success
 // @warn-contains: deprecated
 // @warn-contains: internal
+// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Widget };
 

@@ -18,7 +18,7 @@ use self::{
     body::{
         CallableBody, CallableTemplate, CallableTemplateEnv, check_block_checked,
         check_block_checked_with_hint, check_module_bodies, check_stmts,
-        collect_callable_templates, push_source_scope, register_declarations,
+        collect_callable_templates, register_declarations,
     },
     closure::{ClosureClassifier, ClosureScopeState},
     const_term::ConstTerm,
@@ -1849,6 +1849,42 @@ impl TypeChecker {
         self.semantic_facts.record_call(site, target);
     }
 
+    pub(super) fn record_default_args(
+        &mut self,
+        call: ExprId,
+        callee: &CallTarget,
+        provided: usize,
+        params: &[FuncParam],
+        default_sites: &[Option<ParamDefaultSite>],
+    ) {
+        if provided >= params.len() {
+            return;
+        }
+        let body = self.current_body();
+        let callee = CallableInstanceKey {
+            target: callee.id.clone(),
+            args: callee.args.clone(),
+        };
+        for (index, param) in params.iter().enumerate().skip(provided) {
+            let Some(site) = default_sites.get(index).copied().flatten() else {
+                continue;
+            };
+            self.semantic_facts.record_default_arg(
+                body.clone(),
+                DefaultArgFact {
+                    call,
+                    callee: callee.clone(),
+                    param_index: index,
+                    default: DefaultExprSite {
+                        expr: site.expr_id,
+                        source: site.source,
+                    },
+                    ty: param.ty.clone(),
+                },
+            );
+        }
+    }
+
     fn record_extern_use(&mut self, expr_id: ExprId, target: ExternUseTarget) {
         let site = self.current_expr_site(expr_id);
         self.semantic_facts.record_extern_use(site, target);
@@ -2341,10 +2377,7 @@ impl TypeChecker {
                     continue;
                 };
                 let func = &func_node.node;
-                if !func.type_params.is_empty()
-                    || !func.const_params.is_empty()
-                    || func.params.iter().any(|param| param.default.is_some())
-                {
+                if !func.type_params.is_empty() || !func.const_params.is_empty() {
                     continue;
                 }
                 let id = CallableId::function(module.scope.clone(), func.name);
@@ -2359,18 +2392,33 @@ impl TypeChecker {
                 assert_eq!(callable.def.id, id);
                 assert!(callable.def.sig.generics.is_empty());
                 assert!(callable.def.sig.owner_generics.is_empty());
-                assert_eq!(
-                    callable.def.sig.required_params,
-                    callable.def.sig.params.len()
-                );
+                assert!(callable.def.sig.required_params <= callable.def.sig.params.len());
                 assert_eq!(func.params.len(), callable.def.sig.params.len());
+                let args = GenericArgs::default();
                 let body = BodyInstanceKey::Callable(CallableInstanceKey {
                     target: id.clone(),
-                    args: GenericArgs::default(),
+                    args: args.clone(),
                 });
-                facts.functions.push(SemanticFunctionFact {
+                let params = func
+                    .params
+                    .iter()
+                    .zip(&callable.def.sig.params)
+                    .map(|(source, sig)| SemanticParamSigFact {
+                        name: source.name,
+                        span: SourceSpan::from_byte_span(module.source, source.ty_span),
+                        ty: sig.ty.clone(),
+                        mutable: sig.mutable,
+                    })
+                    .collect();
+                facts.functions.push(SemanticFunctionInstanceFact {
                     id,
+                    args,
                     body,
+                    module: module.scope.clone(),
+                    name: func.name,
+                    span: SourceSpan::from_byte_span(module.source, func_node.span),
+                    body_span: SourceSpan::from_byte_span(module.source, func.body.span),
+                    params,
                     return_ty: callable.def.sig.ret.ty,
                 });
             }
@@ -2751,7 +2799,7 @@ fn typechecker_for_modules(
     if !tc.errors.is_empty() {
         return Ok(tc);
     }
-    push_source_scope(&mut tc);
+    tc.push_scope();
     register_declarations(program, &mut tc);
     check_decl_param_defaults(program, &mut tc);
     if tc.errors.is_empty() {

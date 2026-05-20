@@ -44,27 +44,16 @@ fn deprecated_generic_call_warns_once() {
 }
 
 #[test]
-fn builtin_calls_typecheck() {
-    check(
-        r#"
-        fn main() {
-            println("ok");
-            println(1);
-            assert(true);
-            assert_msg(true, "ok");
-        }
-        "#,
-    )
-    .unwrap();
-}
-
-#[test]
-fn builtin_calls_in_named_modules() {
-    check_mods(
-        "import gamekit { run }; fn main() { run(); }",
-        "pub fn run() { println(1); }",
-    )
-    .unwrap();
+fn direct_typecheck_has_no_magic_builtins() {
+    assert_single_error("fn main() { println(\"ok\"); }", |err| {
+        matches!(err, TypeError::UndefinedVariable { .. })
+    });
+    assert_single_error("fn main() { assert(true); }", |err| {
+        matches!(err, TypeError::UndefinedVariable { .. })
+    });
+    assert_single_error("fn main() { assert_msg(true, \"ok\"); }", |err| {
+        matches!(err, TypeError::UndefinedVariable { .. })
+    });
 }
 
 #[test]

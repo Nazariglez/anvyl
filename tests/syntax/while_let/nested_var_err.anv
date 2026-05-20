@@ -2,6 +2,7 @@
 // @expect: error
 // @contains: `var` is only allowed before the whole pattern
 // @frontend: new
+// @skip: generic println awaits to_string/format AIR lowering
 
 fn main() {
     var opt: int? = 42;

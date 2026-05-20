@@ -317,6 +317,40 @@ fn enum_bad_variant_type() {
 }
 
 #[test]
+fn function_call_arg_type_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+
+    let mut callee = FunctionBuilder::new("takes_int", module, FunctionKind::Normal, void_ty);
+    callee.push_param("value", int_ty, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let callee_id = builder.alloc_function(callee.finish());
+
+    let mut caller = FunctionBuilder::new("bad_call", module, FunctionKind::Normal, void_ty);
+    let p_arg = caller.push_param("arg", bool_ty, ParamRole::Normal);
+    let bb0 = caller.push_block(term_return_void());
+    caller.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee_id),
+            args: vec![op_place(p_arg, bool_ty)],
+        }),
+    );
+    let caller_id = builder.alloc_function(caller.finish());
+    builder.set_entry(caller_id);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::ArgTypeMismatch { index: 0, expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
 fn call_arity_mismatch() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -903,39 +937,6 @@ fn const_requires_matching_primitive_even_when_missing() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadConst(BadConst::MissingPrimitive(PrimitiveKind::Int))
-    )));
-}
-
-#[test]
-fn builtin_call_requires_void_result_type() {
-    let mut builder = ProgramBuilder::default();
-    let bool_ty = builder.alloc_type(TypeData::Bool);
-    let module = test_module(&mut builder);
-    let mut fb = FunctionBuilder::new(
-        "missing_builtin_void",
-        module,
-        FunctionKind::Normal,
-        bool_ty,
-    );
-    let local = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
-    let bb0 = fb.push_block(term_return(op_place(local, bool_ty)));
-    fb.add_statement(
-        bb0,
-        stmt_init(
-            local,
-            RValue::Call {
-                callee: Callee::Builtin(Builtin::Println),
-                args: vec![op_place(local, bool_ty)],
-            },
-        ),
-    );
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-
-    let errors = verify(&builder.finish()).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(
-        e.kind,
-        EK::BadRValue(BadRValue::MissingPrimitive(PrimitiveKind::Void))
     )));
 }
 

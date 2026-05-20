@@ -387,6 +387,59 @@ mod calls {
     }
 
     #[test]
+    fn records_core_runtime_wrapper_shape() {
+        let result = check_named_with_provider(
+            r#"
+            import runtime { println, assert };
+            fn main() {
+                println("ready");
+                assert(true);
+                assert(true, "ok");
+            }
+            "#,
+            &[(
+                "runtime",
+                r#"
+                import ext:host { _println, _assert };
+                pub fn println(message: string) { _println(message); }
+                pub fn assert(condition: bool, message: string = "assertion failed") {
+                    _assert(condition, message);
+                }
+                "#,
+            )],
+            provider(ExternModuleDescriptor {
+                path: extern_path(&["host"]),
+                types: vec![],
+                functions: vec![
+                    function(
+                        "_println",
+                        vec![param("message", ExternTypeExpr::String)],
+                        ExternTypeExpr::Void,
+                    ),
+                    function(
+                        "_assert",
+                        vec![
+                            param("condition", ExternTypeExpr::Bool),
+                            param("message", ExternTypeExpr::String),
+                        ],
+                        ExternTypeExpr::Void,
+                    ),
+                ],
+            }),
+        )
+        .expect("typecheck failed");
+        let assert_id = result
+            .externs()
+            .function_by_key(&function_key(provider_scope(&["host"]), "_assert"))
+            .expect("runtime assert extern");
+
+        assert_eq!(result.calls().len(), 3);
+        assert_eq!(result.default_args().len(), 1);
+        assert_use(&result, ExternUseTarget::Function(assert_id));
+        assert_typecheck_closed(&result);
+    }
+
+    #[test]
     fn cached_generic_specialization_restores_extern_uses() {
         let result = check(
             r#"

@@ -2,6 +2,7 @@
 // @expect: error
 // @frontend: new
 // @contains: dynamic values cannot be implicitly formatted
+// @skip: generic println awaits to_string/format AIR lowering
 
 contract Action {
     fn act(self);

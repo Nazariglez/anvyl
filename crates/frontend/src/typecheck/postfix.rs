@@ -2061,6 +2061,7 @@ fn check_callable_call_with_args(
         return CheckedCall::value(checked_type(Type::Infer, tc));
     };
 
+    let provided_args = args.len();
     let (owner_args, callable_args) = split_generic_args(
         &inst.args,
         &callee.def.sig.owner_generics,
@@ -2098,7 +2099,14 @@ fn check_callable_call_with_args(
         CallForm::Normal => CallTarget::new(id, args),
         CallForm::QualifiedExtend { receiver } => CallTarget::qualified_extend(id, args, receiver),
     };
-    tc.record_call(call_id, target);
+    tc.record_call(call_id, target.clone());
+    tc.record_default_args(
+        call_id,
+        &target,
+        provided_args,
+        &concrete_params,
+        &callee.def.sig.default_sites,
+    );
     let returns_place = ret.is_place();
     CheckedCall {
         checked: checked_type(ret.ty, tc),

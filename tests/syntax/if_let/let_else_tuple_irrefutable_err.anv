@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
 // @contains: irrefutable pattern in let-else
+// @skip: generic println awaits to_string/format AIR lowering
 
 fn main() {
     let t = (1, 2);

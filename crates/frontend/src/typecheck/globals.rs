@@ -1,7 +1,7 @@
 use super::{
     CheckedType, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect, GlobalKey, GlobalSig, Type,
-    TypeChecker, TypeError, ValueDecl, check_value_expr_checked_with_hint, push_source_scope,
-    push_type_closure_error, register_declarations, type_closure_facts,
+    TypeChecker, TypeError, ValueDecl, check_value_expr_checked_with_hint, push_type_closure_error,
+    register_declarations, type_closure_facts,
 };
 use crate::{
     ast::{ExprId, GlobalDeclNode, Program, Stmt},
@@ -22,7 +22,7 @@ pub(super) fn check_global_initializers(
     }
 
     tc.with_current_module(module, |tc| {
-        push_source_scope(tc);
+        tc.push_scope();
         register_declarations(program, tc);
         for stmt in &program.stmts {
             let Stmt::Global(global) = &stmt.node else {

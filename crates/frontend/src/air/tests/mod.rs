@@ -7,7 +7,7 @@ pub(super) use support::{
 };
 
 pub(super) use super::{
-    AggregateCtor, AggregateDecl, AggregateKind, BasicBlock, BlockId, Builtin, Callee, ConstArena,
+    AggregateCtor, AggregateDecl, AggregateKind, BasicBlock, BlockId, Callee, ConstArena,
     ConstData, ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternRep,
     ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, Local, LocalId,
     LocalKind, ModuleId, Mutability, Operand, Param, ParamRole, Place, Program, Projection, RValue,

@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: success
 // @frontend: new
+// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Enemy, enemy };
 

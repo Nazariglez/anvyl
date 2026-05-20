@@ -151,7 +151,6 @@ pub enum RValue {
 pub enum Callee {
     Function(FunctionId),
     Extern(ExternId),
-    Builtin(Builtin),
     Closure(Operand),
 }
 
@@ -164,11 +163,4 @@ pub enum AggregateCtor {
     Array,
     Map,
     DataRef(AggregateId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Builtin {
-    Println,
-    Assert,
-    AssertMsg,
 }

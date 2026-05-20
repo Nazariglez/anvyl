@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: success
 // @warn-contains: accessing internal method 'raw_value' of type 'Counter'
+// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Counter };
 

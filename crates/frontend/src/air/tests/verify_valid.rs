@@ -240,6 +240,42 @@ fn enum_switch() {
 }
 
 #[test]
+fn function_call() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+
+    let mut callee = FunctionBuilder::new("id", module, FunctionKind::Normal, int_ty);
+    let p_value = callee.push_param("value", int_ty, ParamRole::Normal);
+    callee.push_block(term_return(op_place(p_value, int_ty)));
+    let callee_id = builder.alloc_function(callee.finish());
+
+    let mut caller = FunctionBuilder::new("call_id", module, FunctionKind::Normal, int_ty);
+    let p_arg = caller.push_param("arg", int_ty, ParamRole::Normal);
+    let result = caller.push_local(
+        Some("result"),
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::User,
+    );
+    let bb0 = caller.push_block(term_return(op_place(result, int_ty)));
+    caller.add_statement(
+        bb0,
+        stmt_init(
+            result,
+            RValue::Call {
+                callee: Callee::Function(callee_id),
+                args: vec![op_place(p_arg, int_ty)],
+            },
+        ),
+    );
+    let caller_id = builder.alloc_function(caller.finish());
+    builder.set_entry(caller_id);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
 fn extern_call() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();

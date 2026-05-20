@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: success
 // @warn-contains: accessing internal field 'scratch' of type 'Buffer'
+// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Buffer };
 

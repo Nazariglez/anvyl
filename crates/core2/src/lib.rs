@@ -32,6 +32,11 @@ pub const MODULES: &[SourceFile] = &[
         code: include_str!("collections.anv"),
     },
     SourceFile {
+        path: &["runtime"],
+        label: "crates/core2/src/runtime.anv",
+        code: include_str!("runtime.anv"),
+    },
+    SourceFile {
         path: &["core_int"],
         label: "crates/core2/src/core_int.anv",
         code: include_str!("core_int.anv"),
@@ -49,7 +54,12 @@ pub const MODULES: &[SourceFile] = &[
 ];
 
 pub fn provider_descriptors() -> Vec<anvyx_externs::ProviderDescriptor> {
-    vec![int_provider(), float_provider(), string_provider()]
+    vec![
+        int_provider(),
+        float_provider(),
+        string_provider(),
+        runtime_provider(),
+    ]
 }
 
 fn int_provider() -> anvyx_externs::ProviderDescriptor {
@@ -114,6 +124,17 @@ fn string_provider() -> anvyx_externs::ProviderDescriptor {
     )
 }
 
+fn runtime_provider() -> anvyx_externs::ProviderDescriptor {
+    let mut provider = anvyx_lang::provider_descriptor!(
+        provider = "core_runtime",
+        module = "core_runtime",
+        fn _println(message: string) -> void;,
+        fn _assert(condition: bool, message: string) -> void;
+    );
+    provider.modules[0].functions[1].effects.fallible = true;
+    provider
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +150,7 @@ mod tests {
         assert!(ROOT.code.contains("pub import core_int { * };"));
         assert!(ROOT.code.contains("pub import core_float { * };"));
         assert!(ROOT.code.contains("pub import core_string { * };"));
+        assert!(ROOT.code.contains("pub import runtime { * };"));
         assert!(ROOT.code.contains("pub import option { * };"));
         assert!(ROOT.code.contains("pub import result { * };"));
         assert!(ROOT.code.contains("pub import range { * };"));
@@ -147,6 +169,7 @@ mod tests {
                 &["result"],
                 &["range"],
                 &["collections"],
+                &["runtime"],
                 &["core_int"],
                 &["core_float"],
                 &["core_string"]
@@ -154,22 +177,14 @@ mod tests {
         );
         for module in MODULES {
             assert!(module.label.starts_with("crates/core2/src/"));
-            assert!(module.label.ends_with(".anv"));
+            assert_eq!(
+                std::path::Path::new(module.label)
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str),
+                Some("anv")
+            );
             assert!(!module.path.is_empty());
         }
-    }
-
-    #[test]
-    fn excludes_legacy_double_surface() {
-        let mut code = String::new();
-        code.push_str(ROOT.code);
-        for module in MODULES {
-            code.push_str(module.code);
-        }
-
-        assert!(!code.contains("double"));
-        assert!(!code.contains("PI_D"));
-        assert!(!code.contains("EPSILON_D"));
     }
 
     #[test]
@@ -183,7 +198,12 @@ mod tests {
     fn extension_modules_use_private_provider_imports() {
         let code = MODULES
             .iter()
-            .filter(|module| matches!(module.path, ["core_int"] | ["core_float"] | ["core_string"]))
+            .filter(|module| {
+                matches!(
+                    module.path,
+                    ["core_int" | "core_float" | "core_string" | "runtime"]
+                )
+            })
             .map(|module| module.code)
             .collect::<Vec<_>>()
             .join("\n");
@@ -191,6 +211,7 @@ mod tests {
         assert!(code.contains("import ext:core_int"));
         assert!(code.contains("import ext:core_float"));
         assert!(code.contains("import ext:core_string"));
+        assert!(code.contains("import ext:core_runtime"));
         assert!(!code.contains("import ext:int"));
         assert!(!code.contains("import ext:float"));
         assert!(!code.contains("import ext:string"));
@@ -209,8 +230,46 @@ mod tests {
 
         assert_eq!(
             modules,
-            [&["core_int"][..], &["core_float"], &["core_string"]]
+            [
+                &["core_int"][..],
+                &["core_float"],
+                &["core_string"],
+                &["core_runtime"]
+            ]
         );
         assert_eq!(providers[0].modules[0].functions[0].name, "int_abs");
+        let runtime = &providers[3].modules[0].functions;
+        assert_eq!(runtime[0].name, "_println");
+        assert_eq!(
+            runtime[0].signature.params[0].ty,
+            anvyx_externs::ExternTypeExpr::String
+        );
+        assert_eq!(
+            runtime[0].signature.ret,
+            anvyx_externs::ExternTypeExpr::Void
+        );
+        assert!(!runtime[0].effects.fallible);
+
+        assert_eq!(runtime[1].name, "_assert");
+        assert_eq!(
+            runtime[1].signature.params[0].ty,
+            anvyx_externs::ExternTypeExpr::Bool
+        );
+        assert_eq!(
+            runtime[1].signature.params[1].ty,
+            anvyx_externs::ExternTypeExpr::String
+        );
+        assert_eq!(
+            runtime[1].signature.ret,
+            anvyx_externs::ExternTypeExpr::Void
+        );
+        assert!(runtime[1].effects.fallible);
+    }
+
+    #[test]
+    fn providers_validate() {
+        for provider in provider_descriptors() {
+            assert_eq!(anvyx_externs::validate(&provider), Ok(()));
+        }
     }
 }

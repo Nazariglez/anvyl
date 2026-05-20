@@ -670,13 +670,12 @@ mod tests {
             );
         }
         let mut preloaded_modules = preloaded_modules;
-        if let Some(package) = core_package.clone() {
-            if let Some(root) = packages
+        if let Some(root) = core_package.clone().and_then(|package| {
+            packages
                 .get(&package)
                 .and_then(|package| package.root.clone())
-            {
-                preloaded_modules.push(root);
-            }
+        }) {
+            preloaded_modules.push(root);
         }
         PackageProgramInput {
             root_package: root_package.clone(),
@@ -1142,6 +1141,61 @@ mod tests {
         provider
     }
 
+    fn core_runtime_provider() -> anvyx_externs::ProviderDescriptor {
+        anvyx_externs::ProviderDescriptor {
+            provider: anvyx_externs::ProviderId {
+                name: "core_runtime".to_string(),
+            },
+            modules: vec![anvyx_externs::ExternModuleDescriptor {
+                path: extern_module_path(&["core_runtime"]),
+                types: vec![],
+                functions: vec![
+                    runtime_fn(
+                        "_println",
+                        vec![runtime_param(
+                            "message",
+                            anvyx_externs::ExternTypeExpr::String,
+                        )],
+                        anvyx_externs::ExternTypeExpr::Void,
+                        false,
+                    ),
+                    runtime_fn(
+                        "_assert",
+                        vec![
+                            runtime_param("condition", anvyx_externs::ExternTypeExpr::Bool),
+                            runtime_param("message", anvyx_externs::ExternTypeExpr::String),
+                        ],
+                        anvyx_externs::ExternTypeExpr::Void,
+                        true,
+                    ),
+                ],
+            }],
+        }
+    }
+
+    fn runtime_fn(
+        name: &str,
+        params: Vec<anvyx_externs::ExternParam>,
+        ret: anvyx_externs::ExternTypeExpr,
+        fallible: bool,
+    ) -> anvyx_externs::ExternFunctionDescriptor {
+        anvyx_externs::ExternFunctionDescriptor {
+            name: name.to_string(),
+            doc: None,
+            signature: anvyx_externs::ExternSignature { params, ret },
+            effects: anvyx_externs::ExternEffects { fallible },
+        }
+    }
+
+    fn runtime_param(name: &str, ty: anvyx_externs::ExternTypeExpr) -> anvyx_externs::ExternParam {
+        anvyx_externs::ExternParam {
+            name: Some(name.to_string()),
+            ty,
+            flow: anvyx_externs::ParamFlow::Value,
+            escape: anvyx_externs::CallbackEscape::NonEscaping,
+        }
+    }
+
     fn extern_module_path(path: &[&str]) -> anvyx_externs::ModulePath {
         anvyx_externs::ModulePath {
             segments: path.iter().map(|segment| (*segment).to_string()).collect(),
@@ -1189,7 +1243,7 @@ mod tests {
         let err = check_source("fn main() { \"unterminated }").unwrap();
         let report = assert_failed(&err, CheckPhase::Lex);
         assert_user_diagnostics(report.diagnostics());
-        assert_primary_label(&report);
+        assert_primary_label(report);
     }
 
     #[test]
@@ -1208,7 +1262,7 @@ mod tests {
         let err = check_source("fn main( {}").unwrap();
         let report = assert_failed(&err, CheckPhase::Parse);
         assert_user_diagnostics(report.diagnostics());
-        assert_primary_label(&report);
+        assert_primary_label(report);
     }
 
     #[test]
@@ -1247,7 +1301,7 @@ mod tests {
                 .contains("Cannot find module file")
         );
         assert_user_diagnostics(report.diagnostics());
-        assert_primary_label(&report);
+        assert_primary_label(report);
     }
 
     #[test]
@@ -1256,8 +1310,8 @@ mod tests {
         let report = assert_failed(&err, CheckPhase::Type);
         assert_eq!(report.diagnostics()[0].message(), "mismatched types");
         assert_user_diagnostics(report.diagnostics());
-        assert_primary_label(&report);
-        assert_primary_label_message(&report, "expected `int`, found `bool`");
+        assert_primary_label(report);
+        assert_primary_label_message(report, "expected `int`, found `bool`");
     }
 
     #[test]
@@ -1514,6 +1568,51 @@ mod tests {
             source_loader: &mut loader,
         })
         .unwrap();
+        assert_passed(&output);
+    }
+
+    #[test]
+    fn core_runtime_wrappers_are_preluded() {
+        let core = PackageId::core();
+        let mut loader = TestLoader::default();
+        loader.package_source(
+            &core,
+            &["runtime"],
+            r#"
+            import ext:core_runtime { _println, _assert };
+            pub fn println(message: string) { _println(message); }
+            pub fn assert(condition: bool, message: string = "assertion failed") {
+                _assert(condition, message);
+            }
+            "#,
+        );
+        loader.source(&["gamekit"], "pub fn run() { println(\"module\"); }");
+
+        let output = pipeline_check(
+            input(
+                &mut loader,
+                source(
+                    r#"
+                    import gamekit { run };
+                    fn main() {
+                        println("ready");
+                        assert(true);
+                        assert(true, "ok");
+                        run();
+                    }
+                    "#,
+                    "main.anv",
+                ),
+                Some(source("pub import runtime { * };", "<core>")),
+                vec![],
+            ),
+            FrontendConfig {
+                externs: package_extern_inputs(core, vec![core_runtime_provider()]),
+                ..FrontendConfig::default()
+            },
+        )
+        .unwrap();
+
         assert_passed(&output);
     }
 

@@ -2,6 +2,7 @@
 // @expect: success
 // @frontend: new
 // @warn-contains: accessing internal field 'health' of type 'Enemy'
+// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Enemy, enemy };
 

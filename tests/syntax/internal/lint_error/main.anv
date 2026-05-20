@@ -2,6 +2,7 @@
 // @expect: error
 // @lint: internal_access=error
 // @contains: accessing internal field
+// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Item };
 

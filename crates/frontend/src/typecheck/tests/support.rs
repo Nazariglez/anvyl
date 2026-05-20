@@ -67,6 +67,10 @@ impl TypecheckTestResult {
         &self.flat_facts.calls
     }
 
+    pub(crate) fn default_args(&self) -> &typecheck::DefaultArgMap {
+        &self.flat_facts.default_args
+    }
+
     pub(crate) fn extern_uses(&self) -> &ExternUseMap {
         &self.flat_facts.extern_uses
     }
@@ -129,6 +133,10 @@ impl TypecheckTestResult {
 
     pub(crate) fn decls(&self) -> &DeclarationIndex {
         &self.program.declarations
+    }
+
+    pub(crate) fn function_facts(&self) -> &[typecheck::SemanticFunctionInstanceFact] {
+        &self.program.declaration_facts.functions
     }
 
     pub(crate) fn externs(&self) -> &ExternCatalog {

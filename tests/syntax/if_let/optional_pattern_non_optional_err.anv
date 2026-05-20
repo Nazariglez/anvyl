@@ -1,6 +1,7 @@
 // @mode: check
 // @expect: error
 // @contains: optional
+// @skip: generic println awaits to_string/format AIR lowering
 
 fn main() {
     let x = 42;

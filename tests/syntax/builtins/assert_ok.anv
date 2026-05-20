@@ -3,5 +3,5 @@
 
 fn main() {
     assert(true);
-    assert_msg(true, "ok");
+    assert(true, "ok");
 }

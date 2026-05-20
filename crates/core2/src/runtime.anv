@@ -1,0 +1,9 @@
+import ext:core_runtime { _println, _assert };
+
+pub fn println(message: string) {
+    _println(message);
+}
+
+pub fn assert(condition: bool, message: string = "assertion failed") {
+    _assert(condition, message);
+}

@@ -1,6 +1,6 @@
 use super::{
     Program, TypeData,
-    body::{Builtin, Callee, Operand, RValue},
+    body::{Callee, Operand, RValue},
     ids::TypeId,
 };
 use crate::ast::{BinaryOp, UnaryOp};
@@ -224,7 +224,7 @@ pub(crate) fn rvalue_ty(
         | RValue::SliceView { ty, .. }
         | RValue::MakeClosure { ty, .. } => Some(*ty),
         RValue::Cast { target, .. } => Some(*target),
-        RValue::Call { callee, .. } => call_ty(program, primitives, callee),
+        RValue::Call { callee, .. } => call_ty(program, callee),
         RValue::SharedRefEq { .. } => primitives.bool(),
         RValue::ToString { .. } | RValue::Format { .. } => primitives.string(),
         RValue::Len { .. } => primitives.int(),
@@ -246,16 +246,13 @@ pub(crate) fn map_kv(program: &Program, ty: TypeId) -> Option<(TypeId, TypeId)> 
     }
 }
 
-fn call_ty(program: &Program, primitives: &PrimitiveTypes, callee: &Callee) -> Option<TypeId> {
+fn call_ty(program: &Program, callee: &Callee) -> Option<TypeId> {
     match callee {
         Callee::Function(id) => program
             .functions
             .get(id.index())
             .map(|func| func.signature.return_type),
         Callee::Extern(id) => program.externs.get(id.index()).map(|ext| ext.return_type),
-        Callee::Builtin(Builtin::Println | Builtin::Assert | Builtin::AssertMsg) => {
-            primitives.void()
-        }
         Callee::Closure(op) => {
             let ty = operand_ty(program, op)?;
             match program.type_arena.get(ty) {

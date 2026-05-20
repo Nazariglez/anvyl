@@ -4,5 +4,5 @@
 // @contains: expected `string`, found `int`
 
 fn main() {
-    assert_msg(true, 42)
+    assert(true, 42)
 }

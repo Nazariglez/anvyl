@@ -1,9 +1,7 @@
 pub use super::typing::PrimitiveKind;
 use super::{
     AggregateKind, BasicBlock, Function, LocalKind, Mutability, Program, TypeData, VariantShape,
-    body::{
-        AggregateCtor, Builtin, Callee, Operand, Place, Projection, RValue, Statement, Terminator,
-    },
+    body::{AggregateCtor, Callee, Operand, Place, Projection, RValue, Statement, Terminator},
     ids::*,
     typing::{self, PrimitiveTypes, supports_scalar_binary, supports_scalar_unary},
 };
@@ -1806,22 +1804,6 @@ fn verify_call(
             }
             let param_tys = cx.program.extern_decl(*id).params.clone();
             verify_call_args(cx, &site, args, &param_tys);
-        }
-        Callee::Builtin(builtin) => {
-            required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
-            let arity = match builtin {
-                Builtin::Println | Builtin::Assert => 1,
-                Builtin::AssertMsg => 2,
-            };
-            if args.len() != arity {
-                cx.push(
-                    site,
-                    VerifyErrorKind::BadCall(BadCall::ArityMismatch {
-                        expected: arity,
-                        found: args.len(),
-                    }),
-                );
-            }
         }
         Callee::Closure(op) => {
             if let Some(ty) = operand_ty(cx, op) {

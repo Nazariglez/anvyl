@@ -1258,8 +1258,29 @@ pub(crate) struct FuncSig {
     pub(crate) generics: GenericParams,
     pub(crate) ty: Type,
     pub(crate) param_spans: ParamTypeSpans,
+    pub(crate) default_sites: Vec<Option<ParamDefaultSite>>,
     pub(crate) required_params: usize,
     pub(crate) policy: AccessPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParamDefaultSite {
+    pub(crate) expr_id: ast::ExprId,
+    pub(crate) source: SourceId,
+}
+
+impl ParamDefaultSite {
+    pub(crate) fn from_params(source: SourceId, params: &[Param]) -> Vec<Option<Self>> {
+        params
+            .iter()
+            .map(|param| {
+                param.default.as_ref().map(|default| Self {
+                    expr_id: default.node.id,
+                    source,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1283,6 +1304,7 @@ pub(crate) struct CallableSig {
     pub(crate) owner_generics: GenericParams,
     pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
+    pub(crate) default_sites: Vec<Option<ParamDefaultSite>>,
     pub(crate) required_params: usize,
     pub(crate) ret: ReturnSpec,
 }
@@ -2226,6 +2248,7 @@ impl DeclarationIndex {
                             generics: generic_params(&func.type_params, &func.const_params),
                             ty,
                             param_spans: ParamTypeSpans::from_params(&func.params),
+                            default_sites: ParamDefaultSite::from_params(source, &func.params),
                             required_params: required_param_count(&func.params),
                             policy,
                         }),
@@ -2744,6 +2767,7 @@ impl DeclarationIndex {
                         ret: Box::new(ReturnSpec::void()),
                     },
                     param_spans: ParamTypeSpans::default(),
+                    default_sites: vec![],
                     required_params: 0,
                     policy,
                 }),
@@ -3799,6 +3823,7 @@ impl DeclarationIndex {
                     owner_generics: GenericParams::default(),
                     generics: sig.generics.clone(),
                     params: params.clone(),
+                    default_sites: sig.default_sites.clone(),
                     required_params: sig.required_params,
                     ret: ret.as_ref().clone(),
                 },
@@ -3871,6 +3896,7 @@ impl DeclarationIndex {
                     owner_generics: aggregate.generics.clone(),
                     generics: method.generics.clone(),
                     params,
+                    default_sites: vec![],
                     required_params: method.required_params,
                     ret,
                 },
@@ -3936,6 +3962,7 @@ impl DeclarationIndex {
                     owner_generics: extend.generics.clone(),
                     generics: method.generics.clone(),
                     params: substitute_func_params(&template_params, &type_subst, &const_subst),
+                    default_sites: vec![],
                     required_params: method.required_params,
                     ret: substitute_return_spec(&template_ret, &type_subst, &const_subst),
                 },

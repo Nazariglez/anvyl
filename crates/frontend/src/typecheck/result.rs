@@ -144,6 +144,10 @@ pub struct TypecheckFacts {
 impl TypecheckFacts {
     pub(crate) fn from_semantic(output: SemanticCheckOutput) -> Self {
         output.program.facts.validate_finished();
+        output
+            .program
+            .declaration_facts
+            .validate_bodies(&output.program.facts);
         output.program.declaration_facts.validate();
         debug_assert!(output.source_types.values().all(|(span, _)| span.is_some()));
         debug_assert_eq!(

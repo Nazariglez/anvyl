@@ -109,8 +109,9 @@ pub(super) fn tuple_callable_ref(
             sig: CallableSig {
                 owner_generics: resolved.generics.clone(),
                 generics: GenericParams::default(),
-                required_params: payload_types.len(),
                 params,
+                default_sites: vec![],
+                required_params: payload_types.len(),
                 ret: ReturnSpec::value(ret),
             },
         },

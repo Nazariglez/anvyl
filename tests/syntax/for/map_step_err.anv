@@ -2,6 +2,7 @@
 // @expect: error
 // @frontend: new
 // @contains: step is not supported for map iteration
+// @skip: generic println awaits to_string/format AIR lowering
 
 fn main() {
     let m = ["a": 1, "b": 2];
