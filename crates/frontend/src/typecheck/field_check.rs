@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::{
     MemberAccessKind, TypeChecker, TypeError,
     annotation::AccessPolicy,
-    decls::{FieldSchema, NominalKey},
+    decls::{FieldSchema, NamedSchemas, NominalKey},
     member,
 };
 use crate::{
@@ -46,7 +46,7 @@ pub(super) struct FieldShape {
 
 pub(super) fn check_named<T>(
     fields: &[(Ident, T)],
-    schema: &HashMap<Ident, FieldSchema>,
+    schema: &NamedSchemas<FieldSchema>,
     owner: &FieldOwner,
     missing: MissingFields,
     span: Option<Span>,
@@ -67,7 +67,7 @@ pub(super) fn check_named<T>(
 
 pub(super) fn check(
     uses: &[FieldUse],
-    schema: &HashMap<Ident, FieldSchema>,
+    schema: &NamedSchemas<FieldSchema>,
     owner: &FieldOwner,
     missing: MissingFields,
     span: Option<Span>,
@@ -88,7 +88,7 @@ pub(super) fn check(
             failed = true;
             continue;
         }
-        match schema.get(&field.name) {
+        match schema.get(field.name) {
             Some(schema) => fields.push(CheckedField {
                 name: field.name,
                 index: field.index,
@@ -104,14 +104,14 @@ pub(super) fn check(
     }
 
     if missing_fields_enabled(missing) {
-        for (name, field) in schema {
-            if seen.contains(name) || missing_default_ok(missing, field) {
+        for (name, field) in schema.iter() {
+            if seen.contains(&name) || missing_default_ok(missing, field) {
                 continue;
             }
             let Some(span) = span else {
                 continue;
             };
-            push_missing(owner, *name, span, tc);
+            push_missing(owner, name, span, tc);
             failed = true;
         }
     }
@@ -132,7 +132,7 @@ fn missing_fields_enabled(missing: MissingFields) -> bool {
 }
 
 fn missing_default_ok(missing: MissingFields, field: &FieldSchema) -> bool {
-    matches!(missing, MissingFields::AllowDefaults) && field.has_default
+    matches!(missing, MissingFields::AllowDefaults) && field.has_default()
 }
 
 fn push_unknown(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecker) {

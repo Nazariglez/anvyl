@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: use stored path z, a explicitly
+
+struct Target { x: int }
+struct Enemy {
+    embed z: Target,
+    embed a: Target,
+}
+
+fn take(target: Target) {}
+
+fn test(enemy: Enemy) {
+    take(enemy);
+}

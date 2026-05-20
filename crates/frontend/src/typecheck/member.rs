@@ -345,7 +345,7 @@ pub(super) fn resolve_field(
             ty: receiver.clone(),
         };
     };
-    let Some(field) = agg.fields.get(&name) else {
+    let Some(field) = agg.fields.get(name) else {
         let has_static = agg.methods.contains_key(&MethodKey::static_(name));
         if let Some(promoted) = resolve_promoted_field(receiver, name, receiver_access, tc) {
             return promoted;
@@ -399,7 +399,7 @@ fn resolve_promoted_field(
 
     let key = tc.decls.key_for_type(&origin_owner)?;
     let origin = tc.decls.aggregate(&key)?;
-    let field = origin.fields.get(&origin_field)?;
+    let field = origin.fields.get(origin_field)?;
     Some(FieldResolution::Promoted(PromotedFieldAccess {
         path: alias.path.clone(),
         origin_owner: origin_owner.clone(),

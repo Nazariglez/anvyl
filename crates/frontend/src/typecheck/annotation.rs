@@ -217,7 +217,7 @@ impl TypeChecker {
             let Some(aggregate) = self.decls.aggregate(&key) else {
                 return;
             };
-            let Some(field) = aggregate.fields.get(name) else {
+            let Some(field) = aggregate.fields.get(*name) else {
                 return;
             };
             let policy = field.policy.clone();

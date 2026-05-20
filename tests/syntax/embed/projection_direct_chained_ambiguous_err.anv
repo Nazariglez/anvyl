@@ -2,7 +2,7 @@
 // @expect: error
 // @frontend: new
 // @contains: projection from 'Enemy' to 'Entity' is ambiguous
-// @contains: @as embed paths: actor.entity, entity
+// @contains: @as embed paths: entity, actor.entity
 
 struct Entity { x: int }
 struct Actor { @as embed entity: Entity }

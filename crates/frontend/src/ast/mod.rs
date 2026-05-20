@@ -1056,6 +1056,7 @@ pub enum VariantKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumVariant {
     pub annotations: Vec<AnnotationNode>,
+    pub span: Span,
     pub name: Ident,
     pub kind: VariantKind,
     pub doc: Option<String>,

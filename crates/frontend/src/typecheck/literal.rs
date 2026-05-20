@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::{
     CheckedType, TypeChecker, TypeError, VariantShape,
@@ -7,7 +7,7 @@ use super::{
     check_value_expr_checked_with_hint, checked_from_type, const_eval,
     const_term::ConstTerm,
     decls::{
-        CoreRangeKind, FieldSchema, ModuleMemberLookup, NominalKey, TypeBinding,
+        CoreRangeKind, FieldSchema, ModuleMemberLookup, NamedSchemas, NominalKey, TypeBinding,
         nominal_generic_args, nominal_type, nominal_type_with_args,
     },
     enum_variant, expected_assignable_type, extern_boundary, field_check,
@@ -639,7 +639,7 @@ struct NominalFieldCheck {
 fn check_nominal_fields(
     aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
-    schema: &HashMap<Ident, FieldSchema>,
+    schema: &NamedSchemas<FieldSchema>,
     owner_ty: Type,
     span: Span,
     inf: &NominalLiteralSolver,
@@ -660,7 +660,7 @@ fn check_nominal_fields(
 fn check_variant_literal_fields(
     aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
-    schema: &HashMap<Ident, FieldSchema>,
+    schema: &NamedSchemas<FieldSchema>,
     key: &NominalKey,
     variant: Ident,
     span: Span,
@@ -685,7 +685,7 @@ fn check_variant_literal_fields(
 fn check_expr_fields(
     aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
-    schema: &HashMap<Ident, FieldSchema>,
+    schema: &NamedSchemas<FieldSchema>,
     owner: field_check::FieldOwner,
     missing: field_check::MissingFields,
     span: Span,

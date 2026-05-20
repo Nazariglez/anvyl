@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
 use super::{
     ActiveMutDowncastRoot, CheckedType, TypeChecker, TypeError, TypeHandle,
     annotation::AccessPolicy,
     check_block_checked, check_block_checked_with_hint, check_expected_value_expr,
     check_value_expr_checked_with_hint, checked_from_type, checked_void, closure, control_flow,
-    decls::{FieldSchema, NominalKey, TypeBinding, nominal_type},
+    decls::{FieldSchema, NamedSchemas, NominalKey, TypeBinding, nominal_type},
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
     generic::GenericArgs,
@@ -891,24 +889,21 @@ impl<'tc> PatternChecker<'tc> {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
                     return PatternCheckResult::empty(PatternOutcome::error());
                 };
-                let field_schema = self
-                    .tc
-                    .extern_type(owner)
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        (
+                let mut field_schema = NamedSchemas::default();
+                for field in &self.tc.extern_type(owner).fields {
+                    field_schema
+                        .insert(
                             field.name,
                             FieldSchema {
                                 ty: field.ty.ty.clone(),
-                                has_default: false,
+                                default: None,
                                 policy: AccessPolicy::default(),
                                 span: None,
                                 embed: None,
                             },
                         )
-                    })
-                    .collect();
+                        .expect("extern fields are unique");
+                }
                 self.check_struct_fields(fields, nominal_type(&key), &field_schema, input)
             }
             NominalKind::Enum => PatternCheckResult::empty(self.unsupported_named("Struct", span)),
@@ -919,7 +914,7 @@ impl<'tc> PatternChecker<'tc> {
         &mut self,
         fields: &[(Ident, PatternNode)],
         owner_ty: Type,
-        schema: &HashMap<Ident, FieldSchema>,
+        schema: &NamedSchemas<FieldSchema>,
         input: PatternInput,
     ) -> PatternCheckResult {
         let owner = field_check::FieldOwner::Nominal(owner_ty.clone());
@@ -1013,7 +1008,7 @@ impl<'tc> PatternChecker<'tc> {
     fn check_field_shape(
         &mut self,
         fields: &[(Ident, PatternNode)],
-        schema: &HashMap<Ident, FieldSchema>,
+        schema: &NamedSchemas<FieldSchema>,
         owner: &field_check::FieldOwner,
         missing: field_check::MissingFields,
         span: Option<Span>,

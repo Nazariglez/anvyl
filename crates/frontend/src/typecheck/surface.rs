@@ -129,10 +129,7 @@ impl PromotedSurface {
         insert_alias(&mut self.methods, name, alias);
     }
 
-    pub(crate) fn sort(&mut self) {
-        for slot in self.fields.values_mut() {
-            slot.aliases.sort_by_key(alias_sort_key);
-        }
+    pub(crate) fn sort_methods(&mut self) {
         for slot in self.methods.values_mut() {
             slot.aliases.sort_by_key(alias_sort_key);
         }
@@ -253,9 +250,7 @@ fn build_dependent_embed_templates(decls: &mut DeclarationIndex) {
             continue;
         };
         let mut templates = vec![];
-        let mut fields = schema.fields.iter().collect::<Vec<_>>();
-        fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-        for (name, field) in fields {
+        for (name, field) in schema.fields.iter() {
             let Some(embed) = &field.embed else {
                 continue;
             };
@@ -263,7 +258,7 @@ fn build_dependent_embed_templates(decls: &mut DeclarationIndex) {
                 continue;
             }
             templates.push(DependentEmbedTemplate {
-                field_path: vec![*name],
+                field_path: vec![name],
                 target_ty: field.ty.clone(),
                 selector: embed.selector.clone(),
                 exposure: embed.exposure,
@@ -303,7 +298,7 @@ impl SurfaceMemberKind {
 
     fn direct_names(self, schema: &AggregateSchema) -> HashSet<Ident> {
         match self {
-            Self::Field => schema.fields.keys().copied().collect(),
+            Self::Field => schema.fields.names().collect(),
             Self::Method => schema
                 .methods
                 .keys()
@@ -389,13 +384,10 @@ impl<'a> SurfaceBuilder<'a> {
             return surface;
         };
 
-        let mut fields = schema.fields.iter().collect::<Vec<_>>();
-        fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-        for (name, field) in fields {
-            self.add_embed_members(&mut surface, *name, field);
+        for (name, field) in schema.fields.iter() {
+            self.add_embed_members(&mut surface, name, field);
         }
         self.merge_surface(key, schema, &mut surface);
-        surface.sort();
         self.states.insert(key.clone(), SurfaceState::Done);
         self.surfaces.insert(key.clone(), surface.clone());
         surface
@@ -440,7 +432,6 @@ impl<'a> SurfaceBuilder<'a> {
             self.add_dependent_embed(&mut surface, ty, schema, template);
         }
         self.merge_surface(&key, schema, &mut surface);
-        surface.sort();
         self.type_states
             .insert(cache_key.clone(), SurfaceState::Done);
         self.type_surfaces.insert(cache_key, surface.clone());
@@ -464,7 +455,7 @@ impl<'a> SurfaceBuilder<'a> {
         }
         let field = FieldSchema {
             ty: target_ty,
-            has_default: false,
+            default: None,
             policy: AccessPolicy::default(),
             span: Some(template.span),
             embed: Some(EmbedFieldSchema {
@@ -543,7 +534,7 @@ impl<'a> SurfaceBuilder<'a> {
         schema: &AggregateSchema,
         surface: &mut PromotedSurface,
     ) {
-        surface.sort();
+        surface.sort_methods();
         for kind in SurfaceMemberKind::ALL {
             self.merge_member_surface(kind, owner, schema, surface);
         }
@@ -657,7 +648,7 @@ impl<'a> SurfaceBuilder<'a> {
             });
             return None;
         };
-        if target.fields.contains_key(&item.name) {
+        if target.fields.contains_key(item.name) {
             return Some(promoted_alias(
                 &field.ty,
                 vec![embed_name, item.name],
@@ -876,9 +867,7 @@ impl<'a> SurfaceBuilder<'a> {
             return;
         };
 
-        let mut direct_fields = target.fields.keys().copied().collect::<Vec<_>>();
-        direct_fields.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for name in direct_fields {
+        for name in target.fields.names() {
             let alias = promoted_alias(
                 &field.ty,
                 vec![embed_name, name],
@@ -943,9 +932,7 @@ impl<'a> SurfaceBuilder<'a> {
         let Some(owner) = self.externs.type_by_nominal(target_key) else {
             return;
         };
-        let mut fields = self.externs.ty(owner).fields.iter().collect::<Vec<_>>();
-        fields.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-        for extern_field in fields {
+        for extern_field in &self.externs.ty(owner).fields {
             let name = extern_field.name;
             let alias = promoted_alias(
                 &field.ty,
@@ -1037,7 +1024,7 @@ fn aggregate_has_field_name(
     surface: &PromotedSurface,
     name: Ident,
 ) -> bool {
-    aggregate.fields.contains_key(&name) || surface.fields.contains_key(&name)
+    aggregate.fields.contains_key(name) || surface.fields.contains_key(&name)
 }
 
 fn aggregate_has_method_name(

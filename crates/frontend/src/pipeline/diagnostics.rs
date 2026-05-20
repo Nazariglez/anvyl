@@ -1348,6 +1348,9 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::DuplicateModuleBinding { span, .. }
         | DeclError::DuplicateGenericParam { span, .. }
         | DeclError::DuplicateAggregateMethod { span, .. }
+        | DeclError::DuplicateAggregateField { span, .. }
+        | DeclError::DuplicateEnumVariant { span, .. }
+        | DeclError::DuplicateVariantField { span, .. }
         | DeclError::DuplicateContractRequirement { span, .. }
         | DeclError::DuplicateExtendMethod { span, .. }
         | DeclError::DuplicateCastFrom { span, .. }
@@ -1873,6 +1876,21 @@ fn render_decl_error(error: &DeclError) -> String {
         } => format!(
             "duplicate {} method '{name}' on type '{}'",
             surface.label(),
+            owner.name
+        ),
+        DeclError::DuplicateAggregateField { owner, name, .. } => {
+            format!("duplicate field '{name}' in '{}'", owner.name)
+        }
+        DeclError::DuplicateEnumVariant { owner, name, .. } => {
+            format!("duplicate variant '{name}' in enum '{}'", owner.name)
+        }
+        DeclError::DuplicateVariantField {
+            owner,
+            variant,
+            name,
+            ..
+        } => format!(
+            "duplicate field '{name}' in variant '{}.{variant}'",
             owner.name
         ),
         DeclError::DuplicateContractRequirement { contract, name, .. } => format!(

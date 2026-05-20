@@ -1388,8 +1388,9 @@ fn enum_variant<'src>(
             enum_variant_struct_payload(stmt),
             empty().to(ast::VariantKind::Unit),
         )))
-        .map(|(((annotations, doc), name), kind)| ast::EnumVariant {
+        .map_with(|(((annotations, doc), name), kind), e| ast::EnumVariant {
             annotations,
+            span: e.span().byte(),
             name,
             kind,
             doc,
@@ -1467,6 +1468,7 @@ pub(super) fn enum_declaration<'src>(
                     };
                     ast::EnumVariant {
                         annotations: v.annotations,
+                        span: v.span,
                         name: v.name,
                         kind: resolved_kind,
                         doc: v.doc,

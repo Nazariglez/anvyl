@@ -3295,7 +3295,7 @@ fn try_operand_field_carrier_ty(expr: &ExprNode, tc: &TypeChecker) -> Option<Typ
     let carrier_ty = tc.solver.handle_to_partial_type(&field);
     let key = tc.decls.key_for_type(&carrier_ty)?;
     let schema = tc.decls.enum_schema(&key)?;
-    schema.variants.get(&node.node.field)?;
+    schema.variants.get(node.node.field)?;
 
     let Type::Nominal(mut nominal) = carrier_ty else {
         return None;

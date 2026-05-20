@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate variant 'A' in enum 'E'
+
+enum E {
+    A,
+    A(int),
+}

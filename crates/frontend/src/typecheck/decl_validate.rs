@@ -471,7 +471,7 @@ fn validate_extend_method_conflicts(
     if let Some(enum_schema) = decls.enum_schema(&key) {
         for method_key in extend.methods.keys() {
             if method_key.surface == MethodSurface::Static
-                && enum_schema.variants.contains_key(&method_key.name)
+                && enum_schema.variants.contains_key(method_key.name)
             {
                 push_extend_method_conflict(errors, extend, *method_key);
             }

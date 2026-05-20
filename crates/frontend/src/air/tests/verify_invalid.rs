@@ -1,10 +1,32 @@
 use verify::{
     BadCall, BadConst, BadFunction, BadModule, BadPlace, BadRValue, BadReference, BadStatement,
-    BadType, ModuleItem, PrimitiveKind, VerifyErrorKind as EK,
+    BadType, ModuleItem, PrimitiveKind, VerifyError, VerifyErrorKind as EK,
 };
 
 use super::*;
 use crate::ast::Ident;
+
+fn field(name: &str, ty: TypeId) -> FieldDecl {
+    FieldDecl {
+        name: Ident::new(name),
+        ty,
+    }
+}
+
+fn verify_void_entry(
+    mut builder: ProgramBuilder,
+    name: &str,
+    module: ModuleId,
+    void_ty: TypeId,
+    build: impl FnOnce(&mut FunctionBuilder, BlockId),
+) -> Vec<VerifyError> {
+    let mut fb = FunctionBuilder::new(name, module, FunctionKind::Normal, void_ty);
+    let bb0 = fb.push_block(term_return_void());
+    build(&mut fb, bb0);
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+    verify(&builder.finish()).unwrap_err()
+}
 
 #[test]
 fn entry_function_out_of_range() {
@@ -262,10 +284,7 @@ fn aggregate_bad_field_type() {
         name: Ident::new("BadAgg"),
         module,
         kind: AggregateKind::Struct,
-        fields: vec![FieldDecl {
-            name: Ident::new("f"),
-            ty: TypeId::from_index(999),
-        }],
+        fields: vec![field("f", TypeId::from_index(999))],
         cycle_capable: false,
     });
 
@@ -961,5 +980,302 @@ fn implicit_primitive_rvalues_require_canonical_result_type() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadRValue(BadRValue::MissingPrimitive(PrimitiveKind::String))
+    )));
+}
+
+#[test]
+fn aggregate_ctor_slot_type_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Pair"),
+        module,
+        kind: AggregateKind::Struct,
+        fields: vec![field("z", int_ty), field("a", bool_ty)],
+        cycle_capable: false,
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+
+    let errors = verify_void_entry(builder, "bad_struct_ctor", module, void_ty, |fb, bb0| {
+        let p_i = fb.push_param("i", int_ty, ParamRole::Normal);
+        let p_b = fb.push_param("b", bool_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::Struct(aggregate),
+                fields: vec![op_place(p_b, bool_ty), op_place(p_i, int_ty)],
+                ty: aggregate_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::AggregateCtorFieldTypeMismatch { aggregate: id, field: 0, expected, found })
+            if id == aggregate && expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn enum_struct_ctor_slot_type_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let enum_id = builder.alloc_enum(EnumDecl {
+        name: Ident::new("Event"),
+        module,
+        variants: vec![VariantDecl {
+            name: Ident::new("Hit"),
+            shape: VariantShape::Struct(vec![field("z", int_ty), field("a", bool_ty)]),
+        }],
+    });
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+
+    let errors = verify_void_entry(builder, "bad_enum_ctor", module, void_ty, |fb, bb0| {
+        let p_i = fb.push_param("i", int_ty, ParamRole::Normal);
+        let p_b = fb.push_param("b", bool_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::EnumVariant {
+                    enum_id,
+                    variant: VariantId::from_index(0),
+                },
+                fields: vec![op_place(p_b, bool_ty), op_place(p_i, int_ty)],
+                ty: enum_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::EnumCtorFieldTypeMismatch { enum_id: id, variant, field: 0, expected, found })
+            if id == enum_id && variant == VariantId::from_index(0) && expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn dataref_field_projection_reaches_field_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let dataref = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: AggregateKind::DataRef,
+        fields: vec![field("value", int_ty)],
+        cycle_capable: true,
+    });
+    let dataref_ty = builder.alloc_type(TypeData::DataRef(dataref));
+
+    let errors = verify_void_entry(
+        builder,
+        "bad_dataref_projection",
+        module,
+        void_ty,
+        |fb, bb0| {
+            let local = fb.push_local(None, dataref_ty, Mutability::Immutable, LocalKind::User);
+            let bad_place = Place {
+                root: local,
+                projection: vec![Projection::Field(FieldId::from_index(0))],
+                ty: bool_ty,
+            };
+            fb.add_statement(bb0, stmt_eval(RValue::Use(Operand::Place(bad_place))));
+        },
+    );
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::PlaceTypeMismatch { expected, found }) if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn aggregate_ctor_field_count_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Pair"),
+        module,
+        kind: AggregateKind::Struct,
+        fields: vec![field("a", int_ty), field("b", int_ty)],
+        cycle_capable: false,
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+
+    let errors = verify_void_entry(builder, "bad_count", module, void_ty, |fb, bb0| {
+        let p = fb.push_param("p", int_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::Struct(aggregate),
+                fields: vec![op_place(p, int_ty)],
+                ty: aggregate_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::AggregateCtorFieldCountMismatch { aggregate: id, expected: 2, found: 1 }) if id == aggregate
+    )));
+}
+
+#[test]
+fn aggregate_ctor_result_and_kind_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: AggregateKind::DataRef,
+        fields: vec![field("value", int_ty)],
+        cycle_capable: true,
+    });
+
+    let errors = verify_void_entry(builder, "bad_result_kind", module, void_ty, |fb, bb0| {
+        let p = fb.push_param("p", int_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::Struct(aggregate),
+                fields: vec![op_place(p, int_ty)],
+                ty: int_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::AggregateCtorResultTypeMismatch { aggregate: id, expected: AggregateKind::Struct, found })
+            if id == aggregate && found == int_ty
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::AggregateCtorKindMismatch { aggregate: id, expected: AggregateKind::Struct, found: AggregateKind::DataRef })
+            if id == aggregate
+    )));
+}
+
+#[test]
+fn enum_ctor_unit_count_tuple_type_and_result_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let enum_id = builder.alloc_enum(EnumDecl {
+        name: Ident::new("E"),
+        module,
+        variants: vec![
+            VariantDecl {
+                name: Ident::new("Unit"),
+                shape: VariantShape::Unit,
+            },
+            VariantDecl {
+                name: Ident::new("Tuple"),
+                shape: VariantShape::Tuple(vec![int_ty]),
+            },
+        ],
+    });
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+
+    let errors = verify_void_entry(builder, "bad_enum", module, void_ty, |fb, bb0| {
+        let p = fb.push_param("p", bool_ty, ParamRole::Normal);
+        for (variant, ty) in [(0, int_ty), (1, enum_ty)] {
+            fb.add_statement(
+                bb0,
+                stmt_eval(RValue::Aggregate {
+                    kind: AggregateCtor::EnumVariant {
+                        enum_id,
+                        variant: VariantId::from_index(variant),
+                    },
+                    fields: vec![op_place(p, bool_ty)],
+                    ty,
+                }),
+            );
+        }
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::EnumCtorResultTypeMismatch { enum_id: id, found }) if id == enum_id && found == int_ty
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::EnumCtorFieldCountMismatch { enum_id: id, variant, expected: 0, found: 1 })
+            if id == enum_id && variant == VariantId::from_index(0)
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::EnumCtorFieldTypeMismatch { enum_id: id, variant, field: 0, expected, found })
+            if id == enum_id && variant == VariantId::from_index(1) && expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn dataref_field_projection_kind_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module,
+        kind: AggregateKind::Struct,
+        fields: vec![field("value", int_ty)],
+        cycle_capable: false,
+    });
+    let dataref_ty = builder.alloc_type(TypeData::DataRef(aggregate));
+
+    let errors = verify_void_entry(builder, "bad_dataref_field", module, void_ty, |fb, bb0| {
+        let local = fb.push_local(None, dataref_ty, Mutability::Immutable, LocalKind::User);
+        let bad_kind = Place {
+            root: local,
+            projection: vec![Projection::Field(FieldId::from_index(0))],
+            ty: int_ty,
+        };
+        fb.add_statement(bb0, stmt_eval(RValue::Use(Operand::Place(bad_kind))));
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::FieldProjectionKindMismatch { aggregate: id, expected: AggregateKind::DataRef, found: AggregateKind::Struct })
+            if id == aggregate
+    )));
+}
+
+#[test]
+fn dataref_field_projection_out_of_range() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let dataref = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: AggregateKind::DataRef,
+        fields: vec![field("value", int_ty)],
+        cycle_capable: true,
+    });
+    let dataref_ty = builder.alloc_type(TypeData::DataRef(dataref));
+
+    let errors = verify_void_entry(builder, "dataref_oob", module, void_ty, |fb, bb0| {
+        let local = fb.push_local(None, dataref_ty, Mutability::Immutable, LocalKind::User);
+        let bad_place = Place {
+            root: local,
+            projection: vec![Projection::Field(FieldId::from_index(9))],
+            ty: int_ty,
+        };
+        fb.add_statement(bb0, stmt_eval(RValue::Use(Operand::Place(bad_place))));
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidField { aggregate: id, field })
+            if id == dataref && field == FieldId::from_index(9)
     )));
 }

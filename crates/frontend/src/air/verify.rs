@@ -1,6 +1,6 @@
 pub use super::typing::PrimitiveKind;
 use super::{
-    BasicBlock, Function, LocalKind, Mutability, Program, TypeData, VariantShape,
+    AggregateKind, BasicBlock, Function, LocalKind, Mutability, Program, TypeData, VariantShape,
     body::{
         AggregateCtor, Builtin, Callee, Operand, Place, Projection, RValue, Statement, Terminator,
     },
@@ -111,6 +111,44 @@ pub enum BadRValue {
         value: TypeId,
         target: TypeId,
     },
+    AggregateCtorResultTypeMismatch {
+        aggregate: AggregateId,
+        expected: AggregateKind,
+        found: TypeId,
+    },
+    AggregateCtorKindMismatch {
+        aggregate: AggregateId,
+        expected: AggregateKind,
+        found: AggregateKind,
+    },
+    AggregateCtorFieldCountMismatch {
+        aggregate: AggregateId,
+        expected: usize,
+        found: usize,
+    },
+    AggregateCtorFieldTypeMismatch {
+        aggregate: AggregateId,
+        field: usize,
+        expected: TypeId,
+        found: TypeId,
+    },
+    EnumCtorResultTypeMismatch {
+        enum_id: EnumId,
+        found: TypeId,
+    },
+    EnumCtorFieldCountMismatch {
+        enum_id: EnumId,
+        variant: VariantId,
+        expected: usize,
+        found: usize,
+    },
+    EnumCtorFieldTypeMismatch {
+        enum_id: EnumId,
+        variant: VariantId,
+        field: usize,
+        expected: TypeId,
+        found: TypeId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,13 +249,32 @@ pub enum BadFunction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadPlace {
     FieldProjectionOnNonAggregate(TypeId),
-    TupleFieldOutOfRange { ty: TypeId, index: u16, len: usize },
+    FieldProjectionKindMismatch {
+        aggregate: AggregateId,
+        expected: AggregateKind,
+        found: AggregateKind,
+    },
+    TupleFieldOutOfRange {
+        ty: TypeId,
+        index: u16,
+        len: usize,
+    },
     TupleProjectionOnNonTuple(TypeId),
-    VariantFieldOutOfRange { ty: TypeId, index: u16, len: usize },
+    VariantFieldOutOfRange {
+        ty: TypeId,
+        index: u16,
+        len: usize,
+    },
     VariantProjectionOnNonEnum(TypeId),
     IndexProjectionOnNonIndexable(TypeId),
-    PlaceTypeMismatch { expected: TypeId, found: TypeId },
-    IndexLocalTypeMismatch { expected: TypeId, found: TypeId },
+    PlaceTypeMismatch {
+        expected: TypeId,
+        found: TypeId,
+    },
+    IndexLocalTypeMismatch {
+        expected: TypeId,
+        found: TypeId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1125,29 +1182,26 @@ fn verify_rvalue(
         RValue::Aggregate { kind, fields, ty } => {
             cx.verify_type_ref(site.clone(), *ty);
             match kind {
-                AggregateCtor::Struct(id) | AggregateCtor::DataRef(id) => {
-                    if !cx.has_aggregate(*id) {
-                        cx.push(
-                            site.clone(),
-                            VerifyErrorKind::BadReference(BadReference::InvalidAggregate(*id)),
-                        );
-                    }
+                AggregateCtor::Struct(id) => {
+                    verify_aggregate_ctor(
+                        cx,
+                        site.clone(),
+                        *id,
+                        AggregateKind::Struct,
+                        *ty,
+                        fields,
+                    );
                 }
+                AggregateCtor::DataRef(id) => verify_aggregate_ctor(
+                    cx,
+                    site.clone(),
+                    *id,
+                    AggregateKind::DataRef,
+                    *ty,
+                    fields,
+                ),
                 AggregateCtor::EnumVariant { enum_id, variant } => {
-                    if !cx.has_enum(*enum_id) {
-                        cx.push(
-                            site.clone(),
-                            VerifyErrorKind::BadReference(BadReference::InvalidEnum(*enum_id)),
-                        );
-                    } else if !cx.variant_belongs_to_enum(*enum_id, *variant) {
-                        cx.push(
-                            site.clone(),
-                            VerifyErrorKind::BadReference(BadReference::InvalidVariant {
-                                enum_id: *enum_id,
-                                variant: *variant,
-                            }),
-                        );
-                    }
+                    verify_enum_ctor(cx, site.clone(), *enum_id, *variant, *ty, fields);
                 }
                 AggregateCtor::Tuple
                 | AggregateCtor::List
@@ -1402,7 +1456,7 @@ fn verify_place(
         };
         match proj {
             Projection::Field(field_id) => match data {
-                TypeData::Aggregate(agg_id) => {
+                TypeData::Aggregate(agg_id) | TypeData::DataRef(agg_id) => {
                     let Some(agg) = cx.program.aggregates.get(agg_id.index()) else {
                         cx.push(
                             site.clone(),
@@ -1410,6 +1464,22 @@ fn verify_place(
                         );
                         return None;
                     };
+                    let expected = match data {
+                        TypeData::Aggregate(_) => AggregateKind::Struct,
+                        TypeData::DataRef(_) => AggregateKind::DataRef,
+                        _ => unreachable!(),
+                    };
+                    if agg.kind != expected {
+                        cx.push(
+                            site.clone(),
+                            VerifyErrorKind::BadPlace(BadPlace::FieldProjectionKindMismatch {
+                                aggregate: *agg_id,
+                                expected,
+                                found: agg.kind,
+                            }),
+                        );
+                        return None;
+                    }
                     let Some(field) = agg.fields.get(field_id.index()) else {
                         cx.push(
                             site.clone(),
@@ -1468,7 +1538,8 @@ fn verify_place(
                         );
                         return None;
                     };
-                    let Some(variant_decl) = enm.variants.get(variant.index()) else {
+                    let Some(shape) = enm.variants.get(variant.index()).map(|decl| &decl.shape)
+                    else {
                         cx.push(
                             site.clone(),
                             VerifyErrorKind::BadReference(BadReference::InvalidVariant {
@@ -1478,20 +1549,13 @@ fn verify_place(
                         );
                         return None;
                     };
-                    let (field_count, reached) = match &variant_decl.shape {
-                        VariantShape::Unit => (0, None),
-                        VariantShape::Tuple(ts) => (ts.len(), ts.get(*field as usize).copied()),
-                        VariantShape::Struct(fs) => {
-                            (fs.len(), fs.get(*field as usize).map(|field| field.ty))
-                        }
-                    };
-                    let Some(ty) = reached else {
+                    let Some(ty) = variant_field_ty(shape, *field as usize) else {
                         cx.push(
                             site.clone(),
                             VerifyErrorKind::BadPlace(BadPlace::VariantFieldOutOfRange {
                                 ty: current_ty,
                                 index: *field,
-                                len: field_count,
+                                len: variant_field_count(shape),
                             }),
                         );
                         return None;
@@ -1574,6 +1638,153 @@ fn verify_place(
     }
 
     Some(current_ty)
+}
+
+fn verify_aggregate_ctor(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    aggregate_id: AggregateId,
+    expected_kind: AggregateKind,
+    ty: TypeId,
+    fields: &[Operand],
+) {
+    let Some(aggregate) = cx.program.aggregates.get(aggregate_id.index()) else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidAggregate(aggregate_id)),
+        );
+        return;
+    };
+
+    let expected_ty = match expected_kind {
+        AggregateKind::Struct => TypeData::Aggregate(aggregate_id),
+        AggregateKind::DataRef => TypeData::DataRef(aggregate_id),
+    };
+    if cx.type_data(ty) != Some(&expected_ty) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::AggregateCtorResultTypeMismatch {
+                aggregate: aggregate_id,
+                expected: expected_kind,
+                found: ty,
+            }),
+        );
+    }
+    if aggregate.kind != expected_kind {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::AggregateCtorKindMismatch {
+                aggregate: aggregate_id,
+                expected: expected_kind,
+                found: aggregate.kind,
+            }),
+        );
+    }
+    if fields.len() != aggregate.fields.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::AggregateCtorFieldCountMismatch {
+                aggregate: aggregate_id,
+                expected: aggregate.fields.len(),
+                found: fields.len(),
+            }),
+        );
+    }
+    for (index, (operand, field)) in fields.iter().zip(&aggregate.fields).enumerate() {
+        if let Some(found) = operand_ty(cx, operand)
+            && found != field.ty
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadRValue(BadRValue::AggregateCtorFieldTypeMismatch {
+                    aggregate: aggregate_id,
+                    field: index,
+                    expected: field.ty,
+                    found,
+                }),
+            );
+        }
+    }
+}
+
+fn verify_enum_ctor(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    enum_id: EnumId,
+    variant: VariantId,
+    ty: TypeId,
+    fields: &[Operand],
+) {
+    let Some(enm) = cx.program.enums.get(enum_id.index()) else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidEnum(enum_id)),
+        );
+        return;
+    };
+    let Some(variant_decl) = enm.variants.get(variant.index()) else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidVariant { enum_id, variant }),
+        );
+        return;
+    };
+    if cx.type_data(ty) != Some(&TypeData::Enum(enum_id)) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::EnumCtorResultTypeMismatch {
+                enum_id,
+                found: ty,
+            }),
+        );
+    }
+    let expected_len = variant_field_count(&variant_decl.shape);
+    if fields.len() != expected_len {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::EnumCtorFieldCountMismatch {
+                enum_id,
+                variant,
+                expected: expected_len,
+                found: fields.len(),
+            }),
+        );
+    }
+    for (index, operand) in fields.iter().enumerate() {
+        let Some(expected_ty) = variant_field_ty(&variant_decl.shape, index) else {
+            break;
+        };
+        if let Some(found) = operand_ty(cx, operand)
+            && found != expected_ty
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadRValue(BadRValue::EnumCtorFieldTypeMismatch {
+                    enum_id,
+                    variant,
+                    field: index,
+                    expected: expected_ty,
+                    found,
+                }),
+            );
+        }
+    }
+}
+
+fn variant_field_count(shape: &VariantShape) -> usize {
+    match shape {
+        VariantShape::Unit => 0,
+        VariantShape::Tuple(fields) => fields.len(),
+        VariantShape::Struct(fields) => fields.len(),
+    }
+}
+
+fn variant_field_ty(shape: &VariantShape, index: usize) -> Option<TypeId> {
+    match shape {
+        VariantShape::Unit => None,
+        VariantShape::Tuple(fields) => fields.get(index).copied(),
+        VariantShape::Struct(fields) => fields.get(index).map(|field| field.ty),
+    }
 }
 
 fn verify_call(

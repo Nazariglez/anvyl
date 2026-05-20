@@ -451,6 +451,22 @@ pub(crate) enum DeclError {
         surface: MethodSurface,
         span: Option<SourceSpan>,
     },
+    DuplicateAggregateField {
+        owner: NominalKey,
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
+    DuplicateEnumVariant {
+        owner: NominalKey,
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
+    DuplicateVariantField {
+        owner: NominalKey,
+        variant: Ident,
+        name: Ident,
+        span: Option<SourceSpan>,
+    },
     DuplicateContractRequirement {
         contract: ContractKey,
         name: Ident,
@@ -1285,10 +1301,87 @@ pub(crate) struct CallableRef {
 }
 
 #[derive(Clone)]
+pub(crate) struct NamedSchemas<T> {
+    entries: Vec<NamedSchema<T>>,
+    by_name: HashMap<Ident, usize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NamedSchema<T> {
+    name: Ident,
+    schema: T,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DuplicateName;
+
+impl<T> Default for NamedSchemas<T> {
+    fn default() -> Self {
+        Self {
+            entries: vec![],
+            by_name: HashMap::new(),
+        }
+    }
+}
+
+impl<T> NamedSchemas<T> {
+    pub(crate) fn insert(&mut self, name: Ident, schema: T) -> Result<(), DuplicateName> {
+        match self.by_name.entry(name) {
+            Entry::Occupied(_) => Err(DuplicateName),
+            Entry::Vacant(entry) => {
+                let slot = self.entries.len();
+                self.entries.push(NamedSchema { name, schema });
+                entry.insert(slot);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn get(&self, name: Ident) -> Option<&T> {
+        self.by_name
+            .get(&name)
+            .map(|slot| &self.entries[*slot].schema)
+    }
+
+    pub(crate) fn contains_key(&self, name: Ident) -> bool {
+        self.by_name.contains_key(&name)
+    }
+
+    pub(crate) fn slot(&self, name: Ident) -> Option<usize> {
+        self.by_name.get(&name).copied()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Ident, &T)> {
+        self.entries.iter().map(|entry| (entry.name, &entry.schema))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|entry| &entry.schema)
+    }
+
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.entries.iter_mut().map(|entry| &mut entry.schema)
+    }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = Ident> + '_ {
+        self.entries.iter().map(|entry| entry.name)
+    }
+
+    fn invariants_hold(&self) -> bool {
+        self.entries.len() == self.by_name.len()
+            && self
+                .entries
+                .iter()
+                .enumerate()
+                .all(|(slot, entry)| self.by_name.get(&entry.name) == Some(&slot))
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct AggregateSchema {
     pub(crate) key: NominalKey,
     pub(crate) generics: GenericParams,
-    pub(crate) fields: HashMap<Ident, FieldSchema>,
+    pub(crate) fields: NamedSchemas<FieldSchema>,
     pub(crate) methods: HashMap<MethodKey, MethodSchema>,
     pub(crate) promoted: PromotedSurface,
     pub(crate) dependent_embeds: Vec<DependentEmbedTemplate>,
@@ -1351,13 +1444,25 @@ pub(crate) struct ContractRequirementSchema {
     pub(crate) span: Option<SourceSpan>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FieldDefault {
+    pub(crate) expr_id: ast::ExprId,
+    pub(crate) span: SourceSpan,
+}
+
 #[derive(Clone)]
 pub(crate) struct FieldSchema {
     pub(crate) ty: Type,
-    pub(crate) has_default: bool,
+    pub(crate) default: Option<FieldDefault>,
     pub(crate) policy: AccessPolicy,
     pub(crate) span: Option<SourceSpan>,
     pub(crate) embed: Option<EmbedFieldSchema>,
+}
+
+impl FieldSchema {
+    pub(crate) fn has_default(&self) -> bool {
+        self.default.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -1382,7 +1487,7 @@ pub(crate) struct MethodSchema {
 #[derive(Clone)]
 pub(crate) struct EnumSchema {
     pub(crate) generics: GenericParams,
-    pub(crate) variants: HashMap<Ident, VariantSchema>,
+    pub(crate) variants: NamedSchemas<VariantSchema>,
     pub(crate) policy: AccessPolicy,
 }
 
@@ -1396,7 +1501,7 @@ pub(crate) struct VariantSchema {
 pub(crate) enum VariantPayload {
     Unit,
     Tuple(Vec<Type>),
-    Struct(HashMap<Ident, FieldSchema>),
+    Struct(NamedSchemas<FieldSchema>),
 }
 
 #[derive(Clone)]
@@ -1931,9 +2036,7 @@ impl DeclarationIndex {
             };
             let mut projections = vec![];
             let mut seen = HashSet::new();
-            let mut fields = schema.fields.iter().collect::<Vec<_>>();
-            fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-            for (name, field) in fields {
+            for (name, field) in schema.fields.iter() {
                 let Some(embed) = &field.embed else {
                     continue;
                 };
@@ -1952,7 +2055,7 @@ impl DeclarationIndex {
                 }
                 projections.push(ProjectionPath {
                     target_ty,
-                    field_path: vec![*name],
+                    field_path: vec![name],
                 });
             }
             if let Some(schema) = self.aggregates.get_mut(&key) {
@@ -2051,6 +2154,47 @@ impl DeclarationIndex {
         }
     }
 
+    fn collect_field_schemas(
+        &mut self,
+        source: SourceId,
+        fields: &[ast::StructField],
+        defaults: bool,
+        embeds: bool,
+        mut duplicate: impl FnMut(Ident, SourceSpan) -> DeclError,
+    ) -> NamedSchemas<FieldSchema> {
+        let mut schemas = NamedSchemas::default();
+        for field in fields {
+            let annotations = annotation::normalize_field_annotations(
+                source,
+                &field.annotations,
+                embeds && field.embed.is_some(),
+                &mut self.errors,
+            );
+            let span = SourceSpan::from_byte_span(source, field.span);
+            let default = if defaults {
+                field.default.as_ref().map(|default| FieldDefault {
+                    expr_id: default.node.id,
+                    span: SourceSpan::from_byte_span(source, default.span),
+                })
+            } else {
+                None
+            };
+            let schema = FieldSchema {
+                ty: field.ty.clone(),
+                default,
+                policy: annotations.policy,
+                span: Some(span),
+                embed: embeds
+                    .then(|| embed_field_schema(field, annotations.as_projection, source))
+                    .flatten(),
+            };
+            if schemas.insert(field.name, schema).is_err() {
+                self.errors.push(duplicate(field.name, span));
+            }
+        }
+        schemas
+    }
+
     fn collect_module(
         &mut self,
         program: &Program,
@@ -2112,25 +2256,17 @@ impl DeclarationIndex {
                         target,
                         &mut self.errors,
                     );
-                    let mut fields = HashMap::new();
-                    for field in &agg.fields {
-                        let annotations = annotation::normalize_field_annotations(
-                            source,
-                            &field.annotations,
-                            field.embed.is_some(),
-                            &mut self.errors,
-                        );
-                        fields.insert(
-                            field.name,
-                            FieldSchema {
-                                ty: field.ty.clone(),
-                                has_default: field.default.is_some(),
-                                policy: annotations.policy,
-                                span: Some(SourceSpan::from_byte_span(source, field.span)),
-                                embed: embed_field_schema(field, annotations.as_projection, source),
-                            },
-                        );
-                    }
+                    let fields = self.collect_field_schemas(
+                        source,
+                        &agg.fields,
+                        true,
+                        true,
+                        |name, span| DeclError::DuplicateAggregateField {
+                            owner: key.clone(),
+                            name,
+                            span: Some(span),
+                        },
+                    );
                     validate_embed_field_schemas(&fields, &mut self.errors);
                     let mut methods = HashMap::new();
                     for method in &agg.methods {
@@ -2216,7 +2352,7 @@ impl DeclarationIndex {
                         annotation::AnnotationTarget::Enum,
                         &mut self.errors,
                     );
-                    let mut variants = HashMap::new();
+                    let mut variants = NamedSchemas::default();
                     for variant in &enm.variants {
                         let variant_policy = annotation::normalize_annotations(
                             source,
@@ -2228,35 +2364,31 @@ impl DeclarationIndex {
                             VariantKind::Unit => VariantPayload::Unit,
                             VariantKind::Tuple(types) => VariantPayload::Tuple(types.clone()),
                             VariantKind::Struct(fields) => {
-                                let mut field_map = HashMap::new();
-                                for f in fields {
-                                    let annotations = annotation::normalize_field_annotations(
-                                        source,
-                                        &f.annotations,
-                                        false,
-                                        &mut self.errors,
-                                    );
-                                    field_map.insert(
-                                        f.name,
-                                        FieldSchema {
-                                            ty: f.ty.clone(),
-                                            has_default: f.default.is_some(),
-                                            policy: annotations.policy,
-                                            span: Some(SourceSpan::from_byte_span(source, f.span)),
-                                            embed: None,
-                                        },
-                                    );
-                                }
-                                VariantPayload::Struct(field_map)
+                                VariantPayload::Struct(self.collect_field_schemas(
+                                    source,
+                                    fields,
+                                    false,
+                                    false,
+                                    |name, span| DeclError::DuplicateVariantField {
+                                        owner: key.clone(),
+                                        variant: variant.name,
+                                        name,
+                                        span: Some(span),
+                                    },
+                                ))
                             }
                         };
-                        variants.insert(
-                            variant.name,
-                            VariantSchema {
-                                policy: variant_policy,
-                                payload,
-                            },
-                        );
+                        let schema = VariantSchema {
+                            policy: variant_policy,
+                            payload,
+                        };
+                        if variants.insert(variant.name, schema).is_err() {
+                            self.errors.push(DeclError::DuplicateEnumVariant {
+                                owner: key.clone(),
+                                name: variant.name,
+                                span: Some(SourceSpan::from_byte_span(source, variant.span)),
+                            });
+                        }
                     }
                     if self.insert_local_type(
                         &mut decls,
@@ -3197,6 +3329,14 @@ impl DeclarationIndex {
                 .all(dependent_embed_template_valid)
         );
         debug_assert!(aggregate.projection_edges.iter().all(projection_path_valid));
+        debug_assert!(aggregate.fields.invariants_hold());
+        debug_assert!(
+            aggregate
+                .fields
+                .iter()
+                .enumerate()
+                .all(|(slot, (name, _))| { self.aggregate_field_index(key, name) == Some(slot) })
+        );
         Some(aggregate)
     }
 
@@ -3251,7 +3391,7 @@ impl DeclarationIndex {
             return vec![];
         };
         let target = CanonicalTypeKey(target.clone());
-        let mut paths = aggregate
+        aggregate
             .fields
             .iter()
             .filter_map(|(name, field)| {
@@ -3260,11 +3400,9 @@ impl DeclarationIndex {
                     return None;
                 }
                 let field_ty = substitute_aggregate_member(source, &aggregate.generics, &field.ty);
-                (CanonicalTypeKey(field_ty) == target).then(|| vec![*name])
+                (CanonicalTypeKey(field_ty) == target).then(|| vec![name])
             })
-            .collect::<Vec<_>>();
-        paths.sort_by(|left, right| left[0].as_str().cmp(right[0].as_str()));
-        paths
+            .collect()
     }
 
     pub(crate) fn aggregates(&self) -> impl Iterator<Item = (&NominalKey, &AggregateSchema)> {
@@ -3272,7 +3410,72 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn enum_schema(&self, key: &NominalKey) -> Option<&EnumSchema> {
-        self.enums.get(key)
+        let schema = self.enums.get(key)?;
+        debug_assert!(schema.variants.invariants_hold());
+        debug_assert!(
+            schema
+                .variants
+                .values()
+                .all(|variant| match &variant.payload {
+                    VariantPayload::Struct(fields) => fields.invariants_hold(),
+                    VariantPayload::Unit | VariantPayload::Tuple(_) => true,
+                })
+        );
+        debug_assert!(
+            schema
+                .variants
+                .iter()
+                .enumerate()
+                .all(|(slot, (name, variant))| {
+                    self.enum_variant_index(key, name) == Some(slot)
+                        && match &variant.payload {
+                            VariantPayload::Struct(fields) => {
+                                fields.iter().enumerate().all(|(slot, (field, _))| {
+                                    self.enum_struct_field_index(key, name, field) == Some(slot)
+                                })
+                            }
+                            VariantPayload::Unit | VariantPayload::Tuple(_) => true,
+                        }
+                })
+        );
+        Some(schema)
+    }
+
+    pub(crate) fn aggregate_fields(&self, key: &NominalKey) -> Option<&NamedSchemas<FieldSchema>> {
+        self.aggregates.get(key).map(|schema| &schema.fields)
+    }
+
+    pub(crate) fn enum_variants(&self, key: &NominalKey) -> Option<&NamedSchemas<VariantSchema>> {
+        self.enums.get(key).map(|schema| &schema.variants)
+    }
+
+    pub(crate) fn enum_struct_fields(
+        &self,
+        key: &NominalKey,
+        variant: Ident,
+    ) -> Option<&NamedSchemas<FieldSchema>> {
+        let variant = self.enums.get(key)?.variants.get(variant)?;
+        match &variant.payload {
+            VariantPayload::Struct(fields) => Some(fields),
+            VariantPayload::Unit | VariantPayload::Tuple(_) => None,
+        }
+    }
+
+    pub(crate) fn aggregate_field_index(&self, key: &NominalKey, field: Ident) -> Option<usize> {
+        self.aggregate_fields(key)?.slot(field)
+    }
+
+    pub(crate) fn enum_variant_index(&self, key: &NominalKey, variant: Ident) -> Option<usize> {
+        self.enum_variants(key)?.slot(variant)
+    }
+
+    pub(crate) fn enum_struct_field_index(
+        &self,
+        key: &NominalKey,
+        variant: Ident,
+        field: Ident,
+    ) -> Option<usize> {
+        self.enum_struct_fields(key, variant)?.slot(field)
     }
 
     pub(crate) fn enums(&self) -> impl Iterator<Item = (&NominalKey, &EnumSchema)> {
@@ -3453,15 +3656,13 @@ impl DeclarationIndex {
                     return None;
                 }
                 let agg = self.aggregate(&key)?;
-                let mut fields = agg.fields.iter().collect::<Vec<_>>();
-                fields.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-                for (name, field) in fields {
+                for (name, field) in agg.fields.iter() {
                     let field_ty = substitute_aggregate_member(ty, &agg.generics, &field.ty);
                     if let Some(err) = self.map_key_error_inner(&field_ty, seen) {
                         seen.remove(&key);
                         return Some(MapKeyError {
                             ty: err.ty,
-                            field: Some(*name),
+                            field: Some(name),
                         });
                     }
                 }
@@ -3490,7 +3691,7 @@ impl DeclarationIndex {
     pub(crate) fn aggregate_field_type(&self, receiver: &Type, name: Ident) -> Option<Type> {
         let key = self.key_for_type(receiver)?;
         let agg = self.aggregate(&key)?;
-        let field = agg.fields.get(&name)?;
+        let field = agg.fields.get(name)?;
         Some(substitute_aggregate_member(
             receiver,
             &agg.generics,
@@ -3980,7 +4181,7 @@ fn embed_field_schema(
     })
 }
 
-fn validate_embed_field_schemas(fields: &HashMap<Ident, FieldSchema>, errors: &mut Vec<DeclError>) {
+fn validate_embed_field_schemas(fields: &NamedSchemas<FieldSchema>, errors: &mut Vec<DeclError>) {
     for field in fields.values() {
         let Some(embed) = &field.embed else {
             continue;
@@ -4106,6 +4307,85 @@ mod tests {
         .expect("typecheck failed");
         tc.finish().expect("typecheck failed");
         tc.decls.clone()
+    }
+
+    fn root_key(kind: NominalKind, name: &str) -> NominalKey {
+        NominalKey {
+            module: ModuleScope::Root,
+            kind,
+            name: ident(name),
+        }
+    }
+
+    #[test]
+    fn aggregate_fields_keep_decl_order() {
+        let index = checked_index("struct Weird { z: int, a: int, m: int }", &[]);
+        let key = root_key(NominalKind::Struct, "Weird");
+        let fields = index.aggregate_fields(&key).expect("aggregate fields");
+        assert_eq!(
+            fields.names().collect::<Vec<_>>(),
+            vec![ident("z"), ident("a"), ident("m")]
+        );
+        assert_eq!(index.aggregate_field_index(&key, ident("z")), Some(0));
+        assert_eq!(index.aggregate_field_index(&key, ident("a")), Some(1));
+        assert_eq!(index.aggregate_field_index(&key, ident("m")), Some(2));
+    }
+
+    #[test]
+    fn enum_variants_and_struct_fields_keep_decl_order() {
+        let index = checked_index("enum Weird { Z, A { b: int, a: string }, M }", &[]);
+        let key = root_key(NominalKind::Enum, "Weird");
+        let variants = index.enum_variants(&key).expect("enum variants");
+        assert_eq!(
+            variants.names().collect::<Vec<_>>(),
+            vec![ident("Z"), ident("A"), ident("M")]
+        );
+        assert_eq!(index.enum_variant_index(&key, ident("A")), Some(1));
+        let fields = index
+            .enum_struct_fields(&key, ident("A"))
+            .expect("variant fields");
+        assert_eq!(
+            fields.names().collect::<Vec<_>>(),
+            vec![ident("b"), ident("a")]
+        );
+        assert_eq!(
+            index.enum_struct_field_index(&key, ident("A"), ident("b")),
+            Some(0)
+        );
+        assert_eq!(
+            index.enum_struct_field_index(&key, ident("A"), ident("a")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn aggregate_defaults_keep_expr_identity() {
+        let root = parse_program("struct Defaults { z: int = 1, a: int = 2 }");
+        let expected = match &root.stmts[0].node {
+            Stmt::Aggregate(aggregate) => {
+                aggregate.node.fields[1].default.as_ref().unwrap().node.id
+            }
+            _ => unreachable!(),
+        };
+        let resolved = resolved_modules(&root, &[]);
+        let externs = crate::externs::collect_source_externs(&root, &resolved).unwrap();
+        let mut tc = super::super::typechecker_for_modules(
+            &root,
+            &resolved,
+            externs,
+            super::super::TypecheckConfig::default(),
+        )
+        .expect("typecheck failed");
+        tc.finish().expect("typecheck failed");
+        let index = tc.decls.clone();
+        let key = root_key(NominalKind::Struct, "Defaults");
+        let fields = index.aggregate_fields(&key).expect("aggregate fields");
+        let default = fields
+            .iter()
+            .nth(1)
+            .and_then(|(_, field)| field.default.as_ref())
+            .expect("default");
+        assert_eq!(default.expr_id, expected);
     }
 
     fn provider_index(root: &str, provider: ProviderDescriptor) -> DeclarationIndex {

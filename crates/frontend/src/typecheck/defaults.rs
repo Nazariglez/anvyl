@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::{
     TypeChecker, TypeError, check_expected_value_expr,
-    decls::{ExtendId, FieldSchema, MethodKey, MethodMode, NominalKey, ValueDecl},
+    decls::{ExtendId, FieldSchema, MethodKey, MethodMode, NamedSchemas, NominalKey, ValueDecl},
     generic::{GenericArgs, GenericOwnerFrame, GenericParams},
     type_refs::GenericTypeContext,
 };
@@ -192,7 +192,7 @@ pub(super) fn combine_params(mut owner: GenericParams, callable: GenericParams) 
 
 pub(super) fn check_aggregate_field_defaults(
     fields: &[StructField],
-    schema: &HashMap<Ident, FieldSchema>,
+    schema: &NamedSchemas<FieldSchema>,
     generics: GenericOwnerFrame,
     tc: &mut TypeChecker,
 ) {
@@ -206,9 +206,12 @@ pub(super) fn check_aggregate_field_defaults(
         let Some(default) = &field.default else {
             continue;
         };
-        let Some(schema) = schema.get(&field.name) else {
+        let Some(schema) = schema.get(field.name) else {
             continue;
         };
+        if schema.default.as_ref().map(|default| default.expr_id) != Some(default.node.id) {
+            continue;
+        }
         if validate_default(default, DefaultKind::Field, &forbidden, tc) {
             check_default_type(default, tc.type_handle(&schema.ty), tc);
         }

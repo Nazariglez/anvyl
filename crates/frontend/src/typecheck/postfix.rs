@@ -1043,7 +1043,7 @@ fn apply_type_field(
 
     if let Some(key) = tc.decls.key_for_type(target) {
         if let Some(schema) = tc.decls.enum_schema(&key) {
-            let has_variant = schema.variants.contains_key(&name);
+            let has_variant = schema.variants.contains_key(name);
             if has_variant && has_static_extend {
                 return static_extend_conflict(target, name, span, tc);
             }

@@ -76,7 +76,7 @@ fn classify(scrutinee: &Type, tc: &TypeChecker) -> MatchSubject {
                 let variants = tc
                     .decls
                     .enum_schema(&key)
-                    .map(|schema| schema.variants.keys().copied().collect())
+                    .map(|schema| schema.variants.names().collect())
                     .unwrap_or_default();
                 MatchSubject::Enum { key, variants }
             }

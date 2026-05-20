@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate field 'x' in variant 'E.A'
+
+enum E {
+    A { x: int, x: string },
+}

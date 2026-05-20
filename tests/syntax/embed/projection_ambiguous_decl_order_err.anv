@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: @as embed paths: z, a.target
+
+struct Target { x: int }
+struct A { @as embed target: Target }
+struct Enemy {
+    @as embed z: Target,
+    @as embed a: A,
+}
+
+fn test(enemy: Enemy) {
+    let target: Target = enemy;
+}

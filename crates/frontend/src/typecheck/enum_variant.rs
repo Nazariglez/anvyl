@@ -1,13 +1,12 @@
-use std::collections::HashMap;
-
 use super::{
     DeprecatedUseKind, FieldSchema, GenericArgs, GenericParams, TypeChecker, TypeError,
     VariantShape,
     annotation::{AccessPolicy, deprecated_lint},
     const_term::ConstTerm,
     decls::{
-        CallableDef, CallableId, CallableRef, CallableSig, NominalKey, VariantPayload,
-        VariantSchema, nominal_generic_args, nominal_type, nominal_type_with_args, owner_template,
+        CallableDef, CallableId, CallableRef, CallableSig, NamedSchemas, NominalKey,
+        VariantPayload, VariantSchema, nominal_generic_args, nominal_type, nominal_type_with_args,
+        owner_template,
     },
     infer::GenericSolverSeeds,
 };
@@ -52,7 +51,7 @@ impl ResolvedEnumVariant {
 pub(super) enum VariantPayloadRef<'a> {
     Unit,
     Tuple(&'a [Type]),
-    Struct(&'a HashMap<Ident, FieldSchema>),
+    Struct(&'a NamedSchemas<FieldSchema>),
 }
 
 pub(super) fn expect_shape<'a>(
@@ -124,7 +123,7 @@ pub(super) fn expect_struct<'a>(
     tc: &mut TypeChecker,
     resolved: &'a ResolvedEnumVariant,
     span: Span,
-) -> Option<&'a HashMap<Ident, FieldSchema>> {
+) -> Option<&'a NamedSchemas<FieldSchema>> {
     match expect_shape(tc, resolved, VariantShape::Struct, span) {
         Some(VariantPayloadRef::Struct(fields)) => Some(fields),
         _ => None,
@@ -176,7 +175,7 @@ pub(super) fn resolve_use(
     span: Span,
 ) -> Option<ResolvedEnumVariant> {
     let schema = tc.decls.enum_schema(key)?;
-    let Some(variant_schema) = schema.variants.get(&variant).cloned() else {
+    let Some(variant_schema) = schema.variants.get(variant).cloned() else {
         tc.push_error(TypeError::UnknownEnumVariant {
             enum_name: key.name,
             variant,
