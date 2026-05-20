@@ -114,6 +114,7 @@ fn finite_size_edges(ty: &Type, decls: &DeclarationIndex, edges: &mut Vec<Nomina
             }
         }
         Type::Array { elem, .. } => finite_size_edges(elem, decls, edges),
+        Type::Optional { inner } => finite_size_edges(inner, decls, edges),
         Type::Tuple(types) => {
             for ty in types {
                 finite_size_edges(ty, decls, edges);

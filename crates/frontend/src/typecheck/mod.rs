@@ -2235,6 +2235,7 @@ impl TypeChecker {
         Some(SemanticCheckOutput {
             warnings: std::mem::take(&mut self.warnings),
             lint_events: std::mem::take(&mut self.lint_events),
+            diagnostic_context: TypeDiagnosticContext::from_decls(&self.decls),
             public_facts: facts,
             source_types: types,
             program: SemanticProgram {
@@ -2250,12 +2251,14 @@ impl TypeChecker {
         let errors = std::mem::take(&mut self.errors);
         let warnings = std::mem::take(&mut self.warnings);
         let lint_events = std::mem::take(&mut self.lint_events);
+        let diagnostic_context = TypeDiagnosticContext::from_decls(&self.decls);
         match semantic {
             Some(semantic) if errors.is_empty() => Ok(semantic),
             _ => Err(TypecheckFailure {
                 errors,
                 warnings,
                 lint_events,
+                diagnostic_context,
             }),
         }
     }
@@ -2409,6 +2412,19 @@ fn contract_ref_from_bounds(bounds: &[ContractRef]) -> ContractRef {
 }
 
 impl TypeChecker {
+    pub(super) fn core_option_or_infer(&mut self, inner: Type, span: Span) -> Type {
+        match self.decls.core_option_of(inner) {
+            Some(ty) => ty,
+            None => {
+                self.push_error(TypeError::CompileError {
+                    message: "optional features require the core Option type".to_string(),
+                    span: self.error_span(span),
+                });
+                Type::Infer
+            }
+        }
+    }
+
     pub(super) fn optional_chain_inner_type(&mut self, ty: &Type, span: Span) -> Type {
         if matches!(ty, Type::Infer) {
             return Type::Infer;
@@ -2422,12 +2438,12 @@ impl TypeChecker {
         ty.clone()
     }
 
-    pub(super) fn optional_chain_result_type(&self, ty: Type) -> Type {
+    pub(super) fn optional_chain_result_type(&mut self, ty: Type, span: Span) -> Type {
         if matches!(ty, Type::Infer | Type::Void) || self.decls.semantic_option_inner(&ty).is_some()
         {
             return ty;
         }
-        self.decls.semantic_option_of(ty)
+        self.core_option_or_infer(ty, span)
     }
 }
 
@@ -2441,15 +2457,20 @@ pub(crate) fn check_with_modules(
         Ok(mut semantic) => {
             let warnings = std::mem::take(&mut semantic.warnings);
             let lint_events = std::mem::take(&mut semantic.lint_events);
+            let diagnostic_context = semantic.diagnostic_context.clone();
             TypecheckOutput::success(
                 warnings,
                 lint_events,
+                diagnostic_context,
                 TypecheckFacts::from_semantic(semantic),
             )
         }
-        Err(failure) => {
-            TypecheckOutput::failed(failure.errors, failure.warnings, failure.lint_events)
-        }
+        Err(failure) => TypecheckOutput::failed(
+            failure.errors,
+            failure.warnings,
+            failure.lint_events,
+            failure.diagnostic_context,
+        ),
     }
 }
 
@@ -2459,10 +2480,7 @@ pub(crate) fn check_semantic_with_modules(
     externs: RawExterns,
     config: TypecheckConfig,
 ) -> Result<SemanticCheckOutput, TypecheckFailure> {
-    match typechecker_for_modules(program, resolved, externs, config) {
-        Ok(tc) => tc.into_semantic_result(),
-        Err(errors) => Err(TypecheckFailure::errors(errors)),
-    }
+    typechecker_for_modules(program, resolved, externs, config)?.into_semantic_result()
 }
 
 fn typechecker_for_modules(
@@ -2470,18 +2488,23 @@ fn typechecker_for_modules(
     resolved: &ResolveResult,
     externs: RawExterns,
     config: TypecheckConfig,
-) -> Result<TypeChecker, Vec<TypeError>> {
+) -> Result<TypeChecker, TypecheckFailure> {
     let mut decls = DeclarationIndex::from_root_and_modules(program, resolved, &externs);
     if decls.has_errors() {
-        return Err(decl_errors(decls.errors()));
+        return Err(TypecheckFailure::errors(decl_errors(decls.errors())));
     }
-    let catalog =
-        crate::externs::catalog::build_catalog(externs, &mut decls).map_err(|errors| {
-            errors
-                .into_iter()
-                .map(TypeError::ExternCatalog)
-                .collect::<Vec<_>>()
-        })?;
+    let catalog = match crate::externs::catalog::build_catalog(externs, &mut decls) {
+        Ok(catalog) => catalog,
+        Err(errors) => {
+            let diagnostic_context = TypeDiagnosticContext::from_decls(&decls);
+            return Err(TypecheckFailure {
+                errors: errors.into_iter().map(TypeError::ExternCatalog).collect(),
+                warnings: vec![],
+                lint_events: vec![],
+                diagnostic_context,
+            });
+        }
+    };
     decls.sync_extern_headers(&catalog);
 
     let mut tc = TypeChecker::new(decls, catalog, config);
@@ -3566,7 +3589,7 @@ fn check_coalesce(
     let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
     let left_expected = expected_ty
         .as_ref()
-        .map(|ty| tc.decls.semantic_option_of(ty.clone()))
+        .map(|ty| tc.core_option_or_infer(ty.clone(), span))
         .map(|ty| tc.type_handle(&ty));
     let left = check_value_expr_checked_with_hint(left_expr, left_expected, tc);
     let Some(inner) = tc.decls.semantic_option_inner(&left.ty).cloned() else {

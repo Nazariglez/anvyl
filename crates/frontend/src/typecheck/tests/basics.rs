@@ -1,6 +1,6 @@
 use super::support::{
     assert_err, assert_err_count, assert_single_error, assert_ty, assert_ty_mods, assert_ty_named,
-    assert_typecheck_closed, check, check_mods, check_named, errors,
+    assert_typecheck_closed, check, check_mods, check_named, core_option, errors,
 };
 use crate::{
     ast::{
@@ -187,7 +187,7 @@ mod constraints {
     fn ternary_nil_uses_binding_context() {
         assert_ty(
             "fn main(cond: bool) { let x: int? = cond ? nil : 1; x; }",
-            Type::option_of(Type::Int),
+            core_option(Type::Int),
         );
     }
 
@@ -212,7 +212,7 @@ mod constraints {
     fn nil_branch_uses_return_context() {
         assert_ty(
             "fn main(cond: bool) -> int? { if cond { nil } else { 1 } }",
-            Type::option_of(Type::Int),
+            core_option(Type::Int),
         );
     }
 
@@ -220,7 +220,7 @@ mod constraints {
     fn nil_branch_uses_binding_context() {
         assert_ty(
             "fn main(cond: bool) { let x: int? = if cond { nil } else { 1 }; x; }",
-            Type::option_of(Type::Int),
+            core_option(Type::Int),
         );
     }
 
@@ -682,7 +682,7 @@ mod nominals {
     fn literal_expected_optional() {
         assert_ty(
             "struct Box<T> { value: T } fn main() { let x: Box<int?> = Box { value: nil }; x; }",
-            box_struct(Type::option_of(Type::Int)),
+            box_struct(core_option(Type::Int)),
         );
     }
 
@@ -690,7 +690,7 @@ mod nominals {
     fn explicit_optional_arg() {
         assert_ty(
             "struct Box<T> { value: T } fn main() { let x = Box<int?> { value: nil }; x; }",
-            box_struct(Type::option_of(Type::Int)),
+            box_struct(core_option(Type::Int)),
         );
     }
 
@@ -700,7 +700,7 @@ mod nominals {
             "struct Inner<T> { value: T } struct Outer<T> { inner: T } fn main() { let x: Outer<Inner<int?>> = Outer { inner: Inner { value: nil } }; x; }",
             struct_ty(
                 "Outer",
-                vec![struct_ty("Inner", vec![Type::option_of(Type::Int)], vec![])],
+                vec![struct_ty("Inner", vec![core_option(Type::Int)], vec![])],
                 vec![],
             ),
         );
@@ -718,7 +718,7 @@ mod nominals {
     fn literal_optional_const_array_hint() {
         assert_ty(
             &buf("fn main() { let x: FixedBuf<int?, 2> = FixedBuf { data: [nil, 1] }; x; }"),
-            struct_ty("FixedBuf", vec![Type::option_of(Type::Int)], vec![arg(2)]),
+            struct_ty("FixedBuf", vec![core_option(Type::Int)], vec![arg(2)]),
         );
     }
 
@@ -726,7 +726,7 @@ mod nominals {
     fn dataref_expected_optional() {
         assert_ty(
             "dataref Box<T> { value: T } fn main() { let x: Box<int?> = Box { value: nil }; x; }",
-            dataref_ty("Box", vec![Type::option_of(Type::Int)]),
+            dataref_ty("Box", vec![core_option(Type::Int)]),
         );
     }
 
@@ -758,7 +758,7 @@ mod nominals {
     fn tuple_expected_optional() {
         assert_ty(
             "enum Maybe<T> { Some(T), None } fn main() { let x: Maybe<int?> = .Some(nil); x; }",
-            maybe(Type::option_of(Type::Int)),
+            maybe(core_option(Type::Int)),
         );
     }
 
@@ -766,7 +766,7 @@ mod nominals {
     fn struct_expected_optional() {
         assert_ty(
             "enum Maybe<T> { Pair { value: T }, None } fn main() { let x: Maybe<int?> = .Pair { value: nil }; x; }",
-            maybe(Type::option_of(Type::Int)),
+            maybe(core_option(Type::Int)),
         );
     }
 
@@ -782,7 +782,7 @@ mod nominals {
     fn return_expected_optional() {
         assert_ty(
             "enum Maybe<T> { Some(T) } fn main() -> Maybe<int?> { .Some(nil) }",
-            maybe(Type::option_of(Type::Int)),
+            maybe(core_option(Type::Int)),
         );
     }
 
@@ -790,7 +790,7 @@ mod nominals {
     fn array_element_expected_optional() {
         assert_ty(
             "enum Maybe<T> { Some(T) } fn main() { let xs: [Maybe<int?>; 1] = [.Some(nil)]; xs; }",
-            array(maybe(Type::option_of(Type::Int)), 1),
+            array(maybe(core_option(Type::Int)), 1),
         );
     }
 
@@ -895,7 +895,7 @@ mod arrays {
     fn nested_optional_context() {
         assert_ty(
             "fn main() { let xs: [[int?; 1]; 1] = [[nil]]; xs; }",
-            array(array(Type::option_of(Type::Int), 1), 1),
+            array(array(core_option(Type::Int), 1), 1),
         );
     }
 
@@ -938,7 +938,7 @@ mod tuples {
     fn optional_context() {
         assert_ty(
             "fn main() { let x: (int, string?) = (1, nil); x; }",
-            Type::Tuple(vec![Type::Int, Type::option_of(Type::String)]),
+            Type::Tuple(vec![Type::Int, core_option(Type::String)]),
         );
     }
 
@@ -947,8 +947,8 @@ mod tuples {
         assert_ty(
             "fn main() { let x: (int?, (string, bool?)) = (nil, (\"s\", nil)); x; }",
             Type::Tuple(vec![
-                Type::option_of(Type::Int),
-                Type::Tuple(vec![Type::String, Type::option_of(Type::Bool)]),
+                core_option(Type::Int),
+                Type::Tuple(vec![Type::String, core_option(Type::Bool)]),
             ]),
         );
     }
@@ -957,7 +957,7 @@ mod tuples {
     fn branch_context() {
         assert_ty(
             "fn main(cond: bool) { let x: (int, int?) = if cond { (1, nil) } else { (2, 3) }; x; }",
-            Type::Tuple(vec![Type::Int, Type::option_of(Type::Int)]),
+            Type::Tuple(vec![Type::Int, core_option(Type::Int)]),
         );
     }
 

@@ -1070,6 +1070,7 @@ fn concrete_surface_type(ty: &Type) -> bool {
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
             concrete_surface_type(elem)
         }
+        Type::Optional { inner } => concrete_surface_type(inner),
         Type::Map { key, value } => concrete_surface_type(key) && concrete_surface_type(value),
         Type::Any | Type::Int | Type::Float | Type::Bool | Type::String | Type::Void => true,
     }

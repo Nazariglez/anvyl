@@ -74,12 +74,12 @@ fn contains_nil(elements: &[ExprNode]) -> bool {
         .any(|element| matches!(element.node.kind, ExprKind::Lit(Lit::Nil)))
 }
 
-fn option_elem_handle(elem: TypeHandle, tc: &mut TypeChecker) -> TypeHandle {
+fn option_elem_handle(elem: TypeHandle, span: Span, tc: &mut TypeChecker) -> TypeHandle {
     let ty = tc.handle_type(&elem);
     if tc.decls.semantic_option_inner(&ty).is_some() {
         return elem;
     }
-    let option_ty = tc.decls.semantic_option_of(ty);
+    let option_ty = tc.core_option_or_infer(ty, span);
     tc.type_handle(&option_ty)
 }
 
@@ -193,7 +193,7 @@ pub(super) fn check_array_lit_hint(
     let (elem, kind) = expected_collection
         .unwrap_or_else(|| (tc.fresh_temp_handle(lit.span), CollectionLiteralKind::Array));
     let elem = if has_nil {
-        option_elem_handle(elem, tc)
+        option_elem_handle(elem, lit.span, tc)
     } else {
         elem
     };

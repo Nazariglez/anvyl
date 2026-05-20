@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: conflicts with a locally defined type
+
+enum Option<T> {
+    Value(T),
+}
+
+fn main() {}

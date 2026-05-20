@@ -347,12 +347,6 @@ fn callback_escape(escape: EscapeMode) -> CallbackEscape {
 }
 
 fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternTypeExpr> {
-    if let Some(inner) = ty.option_inner() {
-        return Ok(ExternTypeExpr::Option(Box::new(type_expr(
-            source, inner, span,
-        )?)));
-    }
-
     match ty {
         Type::InferReturn => Err(Box::new(ExternInputError::UnsupportedSource {
             span: SourceSpan::from_byte_span(source, span),
@@ -364,6 +358,9 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
         Type::Float => Ok(ExternTypeExpr::Float),
         Type::String => Ok(ExternTypeExpr::String),
         Type::Any => Ok(ExternTypeExpr::Any),
+        Type::Optional { inner } => Ok(ExternTypeExpr::Option(Box::new(type_expr(
+            source, inner, span,
+        )?))),
         Type::List { elem } => Ok(ExternTypeExpr::List(Box::new(type_expr(
             source, elem, span,
         )?))),

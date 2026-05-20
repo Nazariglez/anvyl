@@ -1,10 +1,10 @@
 use super::support::{
     assert_calls, assert_calls_with_modules, assert_deprecated_warning, assert_err_count,
     assert_expected_projection, assert_expr_type, assert_single_error, assert_ty, assert_ty_mods,
-    assert_typecheck_closed, check, check_mods, generic_body, nominal_struct, output,
+    assert_typecheck_closed, check, check_mods, core_option, generic_body, nominal_struct, output,
 };
 use crate::{
-    ast::{Ident, NominalKind, Type},
+    ast::{Ident, Type},
     lint::LintId,
     typecheck::{
         CallTarget, CallableId, ConstDiagnostic, DeprecatedUseKind, GenericArgs, ModuleScope,
@@ -15,7 +15,7 @@ use crate::{
 
 #[test]
 fn failed_output_keeps_lints() {
-    let (errors, warnings, lint_events, facts) = output(
+    let (errors, warnings, lint_events, _, facts) = output(
         "@deprecated fn old() {}
          fn main() { old(); missing; }",
     )
@@ -26,16 +26,6 @@ fn failed_output_keeps_lints() {
     assert!(facts.is_none());
     assert_eq!(lint_events.len(), 1);
     assert_eq!(lint_events[0].id, LintId::Deprecated);
-}
-
-fn option_type(inner: Type) -> Type {
-    Type::nominal(
-        NominalKind::Enum,
-        Ident::new("Option"),
-        vec![inner],
-        vec![],
-        None,
-    )
 }
 
 #[test]
@@ -294,10 +284,9 @@ fn projected_generic_return_records_call_target() {
 
 #[test]
 fn explicit_prefix_call_target() {
-    let result = check(
-        "enum Option<T> { Some(T), None } fn make<T, U>(x: T) -> Option<U> { nil } fn main() -> Option<string> { make<int>(1) }",
-    )
-    .unwrap();
+    let result =
+        check("fn make<T, U>(x: T) -> U? { nil } fn main() -> Option<string> { make<int>(1) }")
+            .unwrap();
     let target = result.calls().values().next().expect("missing call target");
     assert_eq!(
         target,
@@ -328,7 +317,7 @@ fn const_arg_in_type_slot_err() {
 fn explicit_optional_nil() {
     assert_ty(
         "fn id<T>(x: T) -> T { x } fn main() { let x = id<int?>(nil); x; }",
-        Type::option_of(Type::Int),
+        core_option(Type::Int),
     );
 }
 
@@ -341,38 +330,34 @@ fn explicit_plain_nil_err() {
 fn expected_nil_arg() {
     assert_ty(
         "fn id<T>(x: T) -> T { x } fn main() { let x: int? = id(nil); x; }",
-        Type::option_of(Type::Int),
+        core_option(Type::Int),
     );
 }
 
 #[test]
 fn expected_binding() {
     assert_ty(
-        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() { let x: Option<int> = none(); x; }",
-        option_type(Type::Int),
+        "fn none<T>() -> T? { nil } fn main() { let x: Option<int> = none(); x; }",
+        core_option(Type::Int),
     );
 }
 
 #[test]
 fn return_only_unbound() {
-    assert_err_count(
-        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() { none(); }",
-        1,
-    );
+    assert_err_count("fn none<T>() -> T? { nil } fn main() { none(); }", 1);
 }
 
 #[test]
 fn return_unbound_variant() {
-    assert_single_error(
-        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() { none(); }",
-        |err| matches!(err, TypeError::UnboundGenericParam { .. }),
-    );
+    assert_single_error("fn none<T>() -> T? { nil } fn main() { none(); }", |err| {
+        matches!(err, TypeError::UnboundGenericParam { .. })
+    });
 }
 
 #[test]
 fn expected_explicit_mismatch() {
     assert_err_count(
-        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() { let x: Option<int> = none<string>(); }",
+        "fn none<T>() -> T? { nil } fn main() { let x: Option<int> = none<string>(); }",
         1,
     );
 }
@@ -459,10 +444,8 @@ fn generic_method_named_const_arg() {
 
 #[test]
 fn expected_return_no_leak() {
-    let checked = check(
-        "enum Option<T> { Some(T), None } fn none<T>() -> Option<T> { nil } fn main() -> Option<int> { none() }",
-    )
-    .expect("typecheck failed");
+    let checked = check("fn none<T>() -> T? { nil } fn main() -> Option<int> { none() }")
+        .expect("typecheck failed");
     assert_typecheck_closed(&checked);
 }
 

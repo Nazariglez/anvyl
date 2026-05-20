@@ -26,7 +26,7 @@ use crate::{
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, CaptureStorageOrigin, CompileWarning,
         ConstDiagnostic, DeclError, DynContainerConversionKind, ModuleScope, TryCarrierKind,
-        TypeError, VariantShape,
+        TypeDiagnosticContext, TypeError, VariantShape, nominal_key_for_type,
     },
 };
 
@@ -533,9 +533,12 @@ pub(super) fn diagnose_compile_warning(warning: &CompileWarning) -> Diagnostic {
         .with_primary_message(warning.span, "compile warning emitted here")
 }
 
-pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
+pub(super) fn diagnose_type_error(
+    error: &TypeError,
+    type_ctx: &TypeDiagnosticContext,
+) -> Diagnostic {
     let span = type_error_span(error);
-    if let Some((message, label)) = type_error_rich_message(error) {
+    if let Some((message, label)) = type_error_rich_message(error, type_ctx) {
         let diagnostic = Diagnostic::error(message);
         return match span {
             Some(span) => diagnostic.with_primary_message(span, label),
@@ -544,15 +547,15 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
     }
 
     let diagnostic = Diagnostic::error(match error {
-        TypeError::Decl(error) => render_decl_error(error),
-        TypeError::ExternCatalog(error) => render_extern_catalog_error(error),
+        TypeError::Decl(error) => render_decl_error(error, type_ctx),
+        TypeError::ExternCatalog(error) => render_extern_catalog_error(error, type_ctx),
         TypeError::UndefinedVariable { name, .. } => format!("Unknown variable '{name}'"),
         TypeError::TypeUsedAsValue { ty, .. } => {
-            format!("type '{ty}' cannot be used as a value")
+            format!("type '{}' cannot be used as a value", render_surface_type(ty, type_ctx))
         }
         TypeError::TypeMismatch {
             expected, found, ..
-        } => render_type_mismatch(expected, found),
+        } => render_type_mismatch(expected, found, type_ctx),
         TypeError::ConstMismatch {
             expected, found, ..
         } => format!(
@@ -571,7 +574,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             contract,
             detail,
             ..
-        } => format!("{ty} does not satisfy {contract}: {detail}"),
+        } => format!("{} does not satisfy {contract}: {detail}", render_surface_type(ty, type_ctx)),
         TypeError::DynamicMethodMissing {
             contract, method, ..
         } => format!("dynamic contract '{contract}' has no method '{method}'"),
@@ -598,7 +601,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         }
         TypeError::InferReturnMismatch {
             expected, found, ..
-        } => format!("inferred return type mismatch: expected '{expected}', found '{found}'"),
+        } => format!("inferred return type mismatch: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx)),
         TypeError::InferReturnRecursive { .. } => {
             "recursive inferred return type requires an explicit return type".to_string()
         }
@@ -617,7 +620,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ArrayFillLengthNotConst { .. } => {
             "array fill length must be a compile-time constant".to_string()
         }
-        TypeError::NotCallable { ty, .. } => format!("type '{ty}' is not callable"),
+        TypeError::NotCallable { ty, .. } => format!("type '{}' is not callable", render_surface_type(ty, type_ctx)),
         TypeError::WrongArgCount {
             expected, found, ..
         } => {
@@ -675,21 +678,21 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         }
         TypeError::InvalidOperand {
             op, operand_type, ..
-        } => format!("Invalid operand type: operator '{op}' cannot be applied to '{operand_type}'"),
+        } => format!("Invalid operand type: operator '{op}' cannot be applied to '{}'", render_surface_type(operand_type, type_ctx)),
         TypeError::MissingReturn { expected, .. } => {
-            format!("Mismatched types: expected '{expected}', found 'void'")
+            format!("Mismatched types: expected '{}', found 'void'", render_surface_type(expected, type_ctx))
         }
         TypeError::IfWithoutElseValue { .. } => {
             "if expression used as value must have an else branch".to_string()
         }
         TypeError::IfConditionNotBool { found, .. } => {
-            format!("Condition of if expression must be bool: found '{found}'")
+            format!("Condition of if expression must be bool: found '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::TernaryConditionNotBool { found, .. } => {
-            format!("Condition of ternary expression must be bool: found '{found}'")
+            format!("Condition of ternary expression must be bool: found '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::WhileConditionNotBool { found, .. } => {
-            format!("Condition of while must be bool: found '{found}'")
+            format!("Condition of while must be bool: found '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::BreakOutsideLoop { .. } => "break outside of loop".to_string(),
         TypeError::ContinueOutsideLoop { .. } => "continue outside of loop".to_string(),
@@ -699,7 +702,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::TryOnInvalidCarrier {
             expected, found, ..
         } => {
-            format!("try requires {}, found '{found}'", expected.label())
+            format!("try requires {}, found '{}'", expected.label(), render_surface_type(found, type_ctx))
         }
         TypeError::TryOutsideCarrierFunction { found: None, .. } => {
             format!(
@@ -710,15 +713,16 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::TryOutsideCarrierFunction {
             found: Some(found), ..
         } => format!(
-            "try requires enclosing function to return {}, found '{found}'",
-            TryCarrierKind::any_label()
+            "try requires enclosing function to return {}, found '{}'",
+            TryCarrierKind::any_label(),
+            render_surface_type(found, type_ctx)
         ),
         TypeError::TryResultErrorMismatch {
             expected, found, ..
-        } => format!("try error type mismatch: expected '{expected}', found '{found}'"),
+        } => format!("try error type mismatch: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx)),
         TypeError::TryInsideDefer { .. } => "try inside defer".to_string(),
         TypeError::ForIterableNotSupported { found, .. } => {
-            format!("type '{found}' cannot be iterated")
+            format!("type '{}' cannot be iterated", render_surface_type(found, type_ctx))
         }
         TypeError::ForVarRequiresMutableIterable { .. } => {
             "mutable iteration requires a mutable iterable place".to_string()
@@ -735,7 +739,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::InfiniteSize { name, .. } => {
             format!("type '{name}' has infinite size")
         }
-        TypeError::NotEquatable { ty, .. } => format!("type '{ty}' is not equatable"),
+        TypeError::NotEquatable { ty, .. } => format!("type '{}' is not equatable", render_surface_type(ty, type_ctx)),
         TypeError::UnsupportedPattern { pattern, .. } => format!("Unsupported pattern: {pattern}"),
         TypeError::TuplePatternArityMismatch {
             expected, found, ..
@@ -743,7 +747,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             format!("tuple pattern arity mismatch: expected {expected}, found {found}")
         }
         TypeError::TuplePatternOnNonTuple { ty, .. } => {
-            format!("cannot destructure non-tuple type '{ty}'")
+            format!("cannot destructure non-tuple type '{}'", render_surface_type(ty, type_ctx))
         }
         TypeError::OrPatternBindingMismatch { .. } => {
             "or-pattern alternatives must bind the same variables".to_string()
@@ -754,16 +758,18 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             found,
             ..
         } => format!(
-            "or-pattern binding '{name}' type mismatch: expected '{expected}', found '{found}'"
+            "or-pattern binding '{name}' type mismatch: expected '{}', found '{}'",
+            render_surface_type(expected, type_ctx),
+            render_surface_type(found, type_ctx)
         ),
         TypeError::EmptyMatch { .. } => "match expression must have at least one arm".to_string(),
         TypeError::NonExhaustiveMatch { .. } => "non-exhaustive match".to_string(),
         TypeError::UnsupportedMatchScrutinee { found, .. } => {
-            format!("unsupported match scrutinee: '{found}'")
+            format!("unsupported match scrutinee: '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::InvalidLiteralPattern {
             expected, found, ..
-        } => format!("invalid literal pattern: mismatch expected '{expected}', found '{found}'"),
+        } => format!("invalid literal pattern: mismatch expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx)),
         TypeError::OptionalPatternOnNonOptional { .. } => {
             "optional pattern requires an optional scrutinee".to_string()
         }
@@ -775,7 +781,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         }
         TypeError::MatchArmTypeMismatch {
             expected, found, ..
-        } => format!("match arm type mismatch: expected '{expected}', found '{found}'"),
+        } => format!("match arm type mismatch: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx)),
         TypeError::RequiresUnwrappingPattern { .. } => {
             "optional value requires an unwrapping pattern".to_string()
         }
@@ -790,7 +796,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             ty, member, kind, ..
         } => {
             let kind = kind.diagnostic_name();
-            format!("Unknown {kind} '{member}' for type '{ty}'")
+            format!("Unknown {kind} '{member}' for type '{}'", render_surface_type(ty, type_ctx))
         }
         TypeError::AmbiguousPromotedField {
             ty,
@@ -799,7 +805,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             ..
         } => {
             let candidates = render_ident_paths(candidates);
-            format!("promoted field '{member}' for type '{ty}' is ambiguous: {candidates}")
+            format!("promoted field '{member}' for type '{}' is ambiguous: {candidates}", render_surface_type(ty, type_ctx))
         }
         TypeError::AmbiguousPromotedMethod {
             ty,
@@ -808,14 +814,15 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             ..
         } => {
             let candidates = render_ident_paths(candidates);
-            format!("promoted method '{member}' for type '{ty}' is ambiguous: {candidates}")
+            format!("promoted method '{member}' for type '{}' is ambiguous: {candidates}", render_surface_type(ty, type_ctx))
         }
         TypeError::PromotedFieldNotStored {
             ty, field, paths, ..
         } => {
             let paths = render_ident_paths(paths);
             format!(
-                "promoted field '{field}' is not a stored field of '{ty}'; use stored path {paths}"
+                "promoted field '{field}' is not a stored field of '{}'; use stored path {paths}",
+                render_surface_type(ty, type_ctx)
             )
         }
         TypeError::AmbiguousProjection {
@@ -825,19 +832,19 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             ..
         } => {
             let paths = render_ident_paths(paths);
-            format!("projection from '{source}' to '{target}' is ambiguous; @as embed paths: {paths}")
+            format!("projection from '{}' to '{}' is ambiguous; @as embed paths: {paths}", render_surface_type(source, type_ctx), render_surface_type(target, type_ctx))
         }
         TypeError::MissingProjection {
             source,
             target,
             paths,
             ..
-        } => render_missing_projection(source, target, paths),
+        } => render_missing_projection(source, target, paths, type_ctx),
         TypeError::InstanceMethodOnType { ty, method, .. } => {
-            format!("instance method '{method}' requires a value of type '{ty}'")
+            format!("instance method '{method}' requires a value of type '{}'", render_surface_type(ty, type_ctx))
         }
         TypeError::StaticMethodOnValue { ty, method, .. } => {
-            format!("static method '{method}' must be called on type '{ty}'")
+            format!("static method '{method}' must be called on type '{}'", render_surface_type(ty, type_ctx))
         }
         TypeError::ReadonlyMethodMutation { .. } => {
             "readonly method cannot mutate self".to_string()
@@ -872,31 +879,31 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             owner_param.keyword()
         ),
         TypeError::TupleIndexOnNonTuple { ty, index, .. } => {
-            format!("cannot index non-tuple type with .{index}: found '{ty}'")
+            format!("cannot index non-tuple type with .{index}: found '{}'", render_surface_type(ty, type_ctx))
         }
         TypeError::TupleIndexOutOfBounds { index, len, .. } => {
             format!("tuple index {index} is out of bounds for tuple of length {len}")
         }
         TypeError::IndexNotInt { found, .. } => {
-            format!("index must be an integer: found '{found}'")
+            format!("index must be an integer: found '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::IndexOnNonIndexable { found, .. } => {
-            format!("cannot index non-array type '{found}'")
+            format!("cannot index non-array type '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::RangeIndexNotInt { found, .. } => {
-            format!("range index bounds must be int, found '{found}'")
+            format!("range index bounds must be int, found '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::RangeIndexUnsupported { found, .. } => {
-            format!("range indexing is not supported for type '{found}'")
+            format!("range indexing is not supported for type '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::NonKeyableMapKey { ty, field, .. } => match field {
             Some(field) => {
-                format!("field '{field}' is not keyable: type '{ty}' cannot be used as map key")
+                format!("field '{field}' is not keyable: type '{}' cannot be used as map key", render_surface_type(ty, type_ctx))
             }
-            None if ty.is_option() => {
-                format!("optional type '{ty}' is not keyable and cannot be used as map key")
+            None if semantic_option_inner(ty, type_ctx).is_some() => {
+                format!("optional type '{}' is not keyable and cannot be used as map key", render_surface_type(ty, type_ctx))
             }
-            None => format!("type '{ty}' is not keyable and cannot be used as map key"),
+            None => format!("type '{}' is not keyable and cannot be used as map key", render_surface_type(ty, type_ctx)),
         },
         TypeError::DuplicateMapKey { .. } => "duplicate key in map literal".to_string(),
         TypeError::UndefinedModuleMember { module, name, .. } => {
@@ -912,7 +919,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
             )
         }
         TypeError::AmbiguousExtendMethod { receiver, name, .. } => {
-            format!("ambiguous method '{name}' for type '{receiver}'")
+            format!("ambiguous method '{name}' for type '{}'", render_surface_type(receiver, type_ctx))
         }
         TypeError::DuplicateField { name, .. } => format!("Duplicate field '{name}'"),
         TypeError::MissingField { name, .. } => format!("Missing field '{name}'"),
@@ -943,7 +950,7 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::EnumPatternTypeMismatch {
             expected, found, ..
         } => {
-            format!("pattern does not match scrutinee enum: expected '{expected}', found '{found}'")
+            format!("pattern does not match scrutinee enum: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx))
         }
         TypeError::EnumVariantShapeMismatch {
             enum_name,
@@ -985,20 +992,20 @@ pub(super) fn diagnose_type_error(error: &TypeError) -> Diagnostic {
         TypeError::ConstTypeMismatch {
             expected, found, ..
         } => {
-            format!("constant type mismatch: expected '{expected}', found '{found}'")
+            format!("constant type mismatch: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx))
         }
         TypeError::InvalidConstCast { from, to, .. } => {
-            format!("cannot cast constant from '{from}' to '{to}'")
+            format!("cannot cast constant from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
         }
         TypeError::InvalidCast { from, to, .. } => {
-            format!("Invalid cast: cannot cast from '{from}' to '{to}'")
+            format!("Invalid cast: cannot cast from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
         }
         TypeError::ConstDivisionByZero { .. } => {
             "division by zero in constant expression".to_string()
         }
         TypeError::ConstOverflow { .. } => "constant expression overflow".to_string(),
         TypeError::ExpectedIntConst { found, .. } => {
-            format!("expected integer constant, found '{found}'")
+            format!("expected integer constant, found '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::NegativeArrayLength { value, .. } => {
             format!("array length must not be negative: {value}")
@@ -1050,12 +1057,15 @@ fn borrowed_capture_escape_message(name: Ident, origin: CaptureStorageOrigin) ->
     }
 }
 
-fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> {
+fn type_error_rich_message(
+    error: &TypeError,
+    type_ctx: &TypeDiagnosticContext,
+) -> Option<(&'static str, String)> {
     let message = match error {
         TypeError::TypeMismatch {
             expected, found, ..
         } => {
-            let (expected, found) = render_type_mismatch_parts(expected, found);
+            let (expected, found) = render_type_mismatch_parts(expected, found, type_ctx);
             ("mismatched types", expected_found_label(&expected, &found))
         }
         TypeError::ConstMismatch {
@@ -1077,7 +1087,7 @@ fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> 
             "invalid operand type",
             format!(
                 "operator `{op}` cannot be applied to `{}`",
-                render_surface_type(operand_type)
+                render_surface_type(operand_type, type_ctx)
             ),
         ),
         TypeError::WrongArgCount {
@@ -1092,19 +1102,24 @@ fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> 
             "Wrong number of arguments",
             format!("expected between {min} and {max}, found {found}"),
         ),
-        TypeError::IfConditionNotBool { found, .. } => {
-            ("if condition must be bool", condition_type_label(found))
-        }
+        TypeError::IfConditionNotBool { found, .. } => (
+            "if condition must be bool",
+            condition_type_label(found, type_ctx),
+        ),
         TypeError::TernaryConditionNotBool { found, .. } => (
             "ternary condition must be bool",
-            condition_type_label(found),
+            condition_type_label(found, type_ctx),
         ),
-        TypeError::WhileConditionNotBool { found, .. } => {
-            ("while condition must be bool", condition_type_label(found))
-        }
+        TypeError::WhileConditionNotBool { found, .. } => (
+            "while condition must be bool",
+            condition_type_label(found, type_ctx),
+        ),
         TypeError::MissingReturn { expected, .. } => (
             "missing return value",
-            format!("expected `{}`, found `void`", render_surface_type(expected)),
+            format!(
+                "expected `{}`, found `void`",
+                render_surface_type(expected, type_ctx)
+            ),
         ),
         TypeError::BreakOutsideLoop { .. } => (
             "break outside of loop",
@@ -1136,13 +1151,16 @@ fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> 
         ),
         TypeError::NotCallable { ty, .. } => (
             "Not callable",
-            format!("type '{}' is not callable", render_surface_type(ty)),
+            format!(
+                "type '{}' is not callable",
+                render_surface_type(ty, type_ctx)
+            ),
         ),
         TypeError::TupleIndexOnNonTuple { ty, index, .. } => (
             "Invalid tuple index",
             format!(
                 "cannot index non-tuple type with .{index}; found '{}'",
-                render_surface_type(ty)
+                render_surface_type(ty, type_ctx)
             ),
         ),
         TypeError::TupleIndexOutOfBounds { index, len, .. } => (
@@ -1153,28 +1171,28 @@ fn type_error_rich_message(error: &TypeError) -> Option<(&'static str, String)> 
             "Invalid index type",
             format!(
                 "index must be an integer; found '{}'",
-                render_surface_type(found)
+                render_surface_type(found, type_ctx)
             ),
         ),
         TypeError::IndexOnNonIndexable { found, .. } => (
             "Not indexable",
             format!(
                 "cannot index non-array type '{}'",
-                render_surface_type(found)
+                render_surface_type(found, type_ctx)
             ),
         ),
         TypeError::RangeIndexNotInt { found, .. } => (
             "Invalid range index type",
             format!(
                 "range index bounds must be integers; found '{}'",
-                render_surface_type(found)
+                render_surface_type(found, type_ctx)
             ),
         ),
         TypeError::RangeIndexUnsupported { found, .. } => (
             "Range indexing unsupported",
             format!(
                 "range indexing is not supported for type '{}'",
-                render_surface_type(found)
+                render_surface_type(found, type_ctx)
             ),
         ),
         _ => return None,
@@ -1186,10 +1204,10 @@ fn expected_found_label(expected: &str, found: &str) -> String {
     format!("expected `{expected}`, found `{found}`")
 }
 
-fn condition_type_label(found: &Type) -> String {
+fn condition_type_label(found: &Type, type_ctx: &TypeDiagnosticContext) -> String {
     format!(
         "condition must be `bool`, found `{}`",
-        render_surface_type(found)
+        render_surface_type(found, type_ctx)
     )
 }
 
@@ -1413,8 +1431,8 @@ fn render_variant_shape(shape: VariantShape) -> &'static str {
     }
 }
 
-fn render_type_mismatch(expected: &Type, found: &Type) -> String {
-    let (expected, found) = render_type_mismatch_parts(expected, found);
+fn render_type_mismatch(expected: &Type, found: &Type, type_ctx: &TypeDiagnosticContext) -> String {
+    let (expected, found) = render_type_mismatch_parts(expected, found, type_ctx);
     format!(
         "Mismatched types: {}",
         expected_found_label(&expected, &found)
@@ -1442,40 +1460,80 @@ fn render_dyn_container_conversion(kind: DynContainerConversionKind) -> String {
     .to_string()
 }
 
-fn render_type_mismatch_parts(expected: &Type, found: &Type) -> (String, String) {
-    let ambiguous = expected != found && expected.to_string() == found.to_string();
-    (
-        render_mismatch_type(expected, ambiguous),
-        render_mismatch_type(found, ambiguous),
-    )
-}
-
-fn render_mismatch_type(ty: &Type, detailed: bool) -> String {
-    if !detailed {
-        return render_surface_type(ty);
+fn render_type_mismatch_parts(
+    expected: &Type,
+    found: &Type,
+    type_ctx: &TypeDiagnosticContext,
+) -> (String, String) {
+    let expected_surface = render_surface_type(expected, type_ctx);
+    let found_surface = render_surface_type(found, type_ctx);
+    if expected != found && expected_surface == found_surface {
+        return (render_detailed_type(expected), render_detailed_type(found));
     }
-    render_detailed_type(ty)
+    (expected_surface, found_surface)
 }
 
-fn render_surface_type(ty: &Type) -> String {
-    if let Some(inner) = ty.option_inner() {
-        return format!("{}?", render_surface_type(inner));
+fn render_surface_type(ty: &Type, type_ctx: &TypeDiagnosticContext) -> String {
+    surface_type(ty, type_ctx).to_string()
+}
+
+fn surface_type(ty: &Type, type_ctx: &TypeDiagnosticContext) -> Type {
+    if let Some(inner) = semantic_option_inner(ty, type_ctx) {
+        return Type::optional_syntax(surface_type(inner, type_ctx));
     }
     match ty {
-        Type::List { elem } => format!("[{}]", render_surface_type(elem)),
-        Type::Array { elem, len } => format!("[{}; {len}]", render_surface_type(elem)),
-        Type::Map { key, value } => {
-            format!(
-                "[{}: {}]",
-                render_surface_type(key),
-                render_surface_type(value)
-            )
-        }
-        Type::Slice { elem } => format!("slice[{}]", render_surface_type(elem)),
-        Type::Tuple(elems) => render_wrapped_types("(", ")", elems, render_surface_type),
-        Type::Func { .. }
-        | Type::Dyn(_)
-        | Type::Infer
+        Type::Func { params, ret } => Type::func(
+            params
+                .iter()
+                .map(|param| FuncParam {
+                    ty: surface_type(&param.ty, type_ctx),
+                    mutable: param.mutable,
+                    cast_accept: param.cast_accept,
+                    escape: param.escape,
+                })
+                .collect(),
+            ret.with_ty(surface_type(&ret.ty, type_ctx)),
+        ),
+        Type::Dyn(contract) => Type::Dyn(surface_contract(contract, type_ctx)),
+        Type::UnresolvedNominal {
+            qualifier,
+            name,
+            generic_args,
+        } => Type::UnresolvedNominal {
+            qualifier: *qualifier,
+            name: *name,
+            generic_args: generic_args
+                .iter()
+                .map(|arg| match arg {
+                    ast::GenericArg::Type(ty) => ast::GenericArg::Type(surface_type(ty, type_ctx)),
+                    ast::GenericArg::Const(arg) => ast::GenericArg::Const(arg.clone()),
+                })
+                .collect(),
+        },
+        Type::Tuple(elems) => Type::Tuple(surface_types(elems, type_ctx)),
+        Type::Nominal(nominal) => Type::nominal_with_origin(
+            nominal.kind,
+            nominal.name,
+            surface_types(&nominal.type_args, type_ctx),
+            nominal.const_args.clone(),
+            nominal.origin.clone(),
+        ),
+        Type::List { elem } => Type::List {
+            elem: Box::new(surface_type(elem, type_ctx)),
+        },
+        Type::Array { elem, len } => Type::Array {
+            elem: Box::new(surface_type(elem, type_ctx)),
+            len: *len,
+        },
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(surface_type(key, type_ctx)),
+            value: Box::new(surface_type(value, type_ctx)),
+        },
+        Type::Slice { elem } => Type::Slice {
+            elem: Box::new(surface_type(elem, type_ctx)),
+        },
+        Type::Optional { inner } => Type::optional_syntax(surface_type(inner, type_ctx)),
+        Type::Infer
         | Type::InferReturn
         | Type::Any
         | Type::Int
@@ -1484,10 +1542,67 @@ fn render_surface_type(ty: &Type) -> String {
         | Type::String
         | Type::Void
         | Type::Var(_)
-        | Type::UnresolvedName(_)
-        | Type::UnresolvedNominal { .. }
-        | Type::Nominal(_) => ty.to_string(),
+        | Type::UnresolvedName(_) => ty.clone(),
     }
+}
+
+fn surface_types(types: &[Type], type_ctx: &TypeDiagnosticContext) -> Vec<Type> {
+    types.iter().map(|ty| surface_type(ty, type_ctx)).collect()
+}
+
+fn surface_contract(
+    contract: &ast::ContractRef,
+    type_ctx: &TypeDiagnosticContext,
+) -> ast::ContractRef {
+    match contract {
+        ast::ContractRef::Anonymous(surface) => {
+            ast::ContractRef::Anonymous(ast::AnonymousContract {
+                requirements: surface
+                    .requirements
+                    .iter()
+                    .map(|requirement| ast::AnonymousContractRequirement {
+                        receiver: requirement.receiver,
+                        name: requirement.name,
+                        params: requirement
+                            .params
+                            .iter()
+                            .map(|param| ast::AnonymousContractParam {
+                                mutable: param.mutable,
+                                escape: param.escape,
+                                name: param.name,
+                                ty: surface_type(&param.ty, type_ctx),
+                            })
+                            .collect(),
+                        ret: requirement
+                            .ret
+                            .with_ty(surface_type(&requirement.ret.ty, type_ctx)),
+                    })
+                    .collect(),
+            })
+        }
+        ast::ContractRef::Intersection(contracts) => ast::ContractRef::Intersection(
+            contracts
+                .iter()
+                .map(|contract| surface_contract(contract, type_ctx))
+                .collect(),
+        ),
+        ast::ContractRef::Named { .. } | ast::ContractRef::Infer | ast::ContractRef::Hole(_) => {
+            contract.clone()
+        }
+    }
+}
+
+fn semantic_option_inner<'a>(ty: &'a Type, type_ctx: &TypeDiagnosticContext) -> Option<&'a Type> {
+    let Type::Nominal(nominal) = ty else {
+        return None;
+    };
+    if &nominal_key_for_type(ty)? != type_ctx.core_option()? {
+        return None;
+    }
+    let [inner] = nominal.type_args.as_slice() else {
+        return None;
+    };
+    nominal.const_args.is_empty().then_some(inner)
 }
 
 fn render_detailed_type(ty: &Type) -> String {
@@ -1571,7 +1686,7 @@ fn render_wrapped_types(
     open: &str,
     close: &str,
     elems: &[Type],
-    render: fn(&Type) -> String,
+    render: impl Fn(&Type) -> String,
 ) -> String {
     let elems = elems.iter().map(render).collect::<Vec<_>>().join(", ");
     format!("{open}{elems}{close}")
@@ -1609,7 +1724,10 @@ fn render_nominal_origin(origin: &ModuleOrigin) -> String {
     }
 }
 
-fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
+fn render_extern_catalog_error(
+    error: &ExternCatalogError,
+    type_ctx: &TypeDiagnosticContext,
+) -> String {
     let (context, message) = match error {
         ExternCatalogError::UnknownType {
             context,
@@ -1675,18 +1793,26 @@ fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
         } => {
             let item = render_extern_item(context);
             let message = match reason {
-                InvalidExternTypeReason::Unresolved => {
-                    format!("unresolved extern type '{ty}' in {item}")
-                }
-                InvalidExternTypeReason::Infer => {
-                    format!("extern type '{ty}' contains inference in {item}")
-                }
-                InvalidExternTypeReason::Void => {
-                    format!("void type is not allowed in extern type position '{ty}' in {item}")
-                }
-                InvalidExternTypeReason::UnresolvedConst => {
-                    format!("extern type '{ty}' contains an unresolved const argument in {item}")
-                }
+                InvalidExternTypeReason::Unresolved => format!(
+                    "unresolved extern type '{}' in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
+                InvalidExternTypeReason::Infer => format!(
+                    "extern type '{}' contains inference in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
+                InvalidExternTypeReason::Void => format!(
+                    "void type is not allowed in extern type position '{}' in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
+                InvalidExternTypeReason::UnresolvedConst => format!(
+                    "extern type '{}' contains an unresolved const argument in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
+                InvalidExternTypeReason::MissingCoreOption => format!(
+                    "extern type '{}' requires the core Option type in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
             };
             (context, message)
         }
@@ -1719,9 +1845,10 @@ fn render_extern_catalog_error(error: &ExternCatalogError) -> String {
         } => (
             context,
             format!(
-                "invalid {}: expected {} return type, found '{found}'",
+                "invalid {}: expected {} return type, found '{}'",
                 render_extern_item(context),
-                render_operator_return(*expected)
+                render_operator_return(*expected),
+                render_surface_type(found, type_ctx)
             ),
         ),
     };
@@ -1823,14 +1950,21 @@ fn render_ident_paths(paths: &[Vec<Ident>]) -> String {
         .join(", ")
 }
 
-fn render_missing_projection(source: &Type, target: &Type, paths: &[Vec<Ident>]) -> String {
+fn render_missing_projection(
+    source: &Type,
+    target: &Type,
+    paths: &[Vec<Ident>],
+    type_ctx: &TypeDiagnosticContext,
+) -> String {
     format!(
-        "no `@as embed` projection path from '{source}' to '{target}'; use stored path {} explicitly or mark it with `@as embed`",
+        "no `@as embed` projection path from '{}' to '{}'; use stored path {} explicitly or mark it with `@as embed`",
+        render_surface_type(source, type_ctx),
+        render_surface_type(target, type_ctx),
         render_ident_paths(paths)
     )
 }
 
-fn render_decl_error(error: &DeclError) -> String {
+fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> String {
     match error {
         DeclError::DuplicateValue { name, .. } => format!("value '{name}' is already declared"),
         DeclError::DuplicateType { name, .. } => format!("type '{name}' is already defined"),
@@ -1900,19 +2034,26 @@ fn render_decl_error(error: &DeclError) -> String {
         DeclError::DuplicateExtendMethod { name, surface, .. } => {
             format!("duplicate extend {} method '{name}'", surface.label())
         }
-        DeclError::DuplicateCastFrom { source, target, .. } => {
-            format!("duplicate cast from '{source}' to '{target}'")
-        }
+        DeclError::DuplicateCastFrom { source, target, .. } => format!(
+            "duplicate cast from '{}' to '{}'",
+            render_surface_type(source, type_ctx),
+            render_surface_type(target, type_ctx)
+        ),
         DeclError::PointlessCastFrom { ty, .. } => {
-            format!("pointless cast from '{ty}' to itself")
+            format!(
+                "pointless cast from '{}' to itself",
+                render_surface_type(ty, type_ctx)
+            )
         }
         DeclError::CastFromReturnMismatch {
             expected, found, ..
-        } => {
-            format!("cast from return type mismatch: expected '{expected}', found '{found}'")
-        }
+        } => format!(
+            "cast from return type mismatch: expected '{}', found '{}'",
+            render_surface_type(expected, type_ctx),
+            render_surface_type(found, type_ctx)
+        ),
         DeclError::UnsupportedExtendTarget { ty, .. } => {
-            format!("cannot extend type '{ty}'")
+            format!("cannot extend type '{}'", render_surface_type(ty, type_ctx))
         }
         DeclError::UnusedExtendTypeParam { name, .. } => {
             format!("unused type parameter '{name}' in extend target")
@@ -1929,8 +2070,9 @@ fn render_decl_error(error: &DeclError) -> String {
         DeclError::ExtendMethodConflict {
             ty, name, surface, ..
         } => format!(
-            "{} method '{name}' already exists for type '{ty}'",
-            surface.label()
+            "{} method '{name}' already exists for type '{}'",
+            surface.label(),
+            render_surface_type(ty, type_ctx)
         ),
         DeclError::UnknownType {
             qualifier, name, ..
@@ -2308,7 +2450,9 @@ mod tests {
         lexer::{Keyword, Token, TokenStream},
         parser,
         span::SourceSpan,
-        test_support::{ident, module_path_segments, test_source_id},
+        test_support::{
+            core_option_key, core_option_type, ident, module_path_segments, test_source_id,
+        },
     };
 
     fn module_id(path: &[&str]) -> ModuleId {
@@ -2385,6 +2529,37 @@ mod tests {
             eoi: SourceSpan::empty(source, len),
             tokens,
         }
+    }
+
+    fn core_option(inner: Type) -> Type {
+        core_option_type(inner)
+    }
+
+    fn local_option(inner: Type) -> Type {
+        Type::nominal(
+            ast::NominalKind::Enum,
+            ident("Option"),
+            vec![inner],
+            vec![],
+            None,
+        )
+    }
+
+    fn module_option(module: &[&str], inner: Type) -> Type {
+        Type::nominal_with_origin(
+            ast::NominalKind::Enum,
+            ident("Option"),
+            vec![inner],
+            vec![],
+            Some(ModuleOrigin::Module(
+                module_path_segments(module).to_ast_path(),
+            )),
+        )
+    }
+
+    fn diagnose_test_type_error(error: &TypeError) -> Diagnostic {
+        let type_ctx = TypeDiagnosticContext::from_core_option(Some(core_option_key()));
+        diagnose_type_error(error, &type_ctx)
     }
 
     fn assert_msg(diagnostic: impl std::fmt::Display, expected: &str) {
@@ -2479,11 +2654,98 @@ mod tests {
     }
 
     #[test]
+    fn option_rendering_uses_core_identity() {
+        let cases = [
+            (
+                core_option(Type::Int),
+                Type::Bool,
+                "mismatched types: expected `int?`, found `bool`",
+            ),
+            (
+                local_option(Type::Int),
+                Type::Bool,
+                "mismatched types: expected `Option<int>`, found `bool`",
+            ),
+            (
+                core_option(Type::Int),
+                local_option(Type::Int),
+                "mismatched types: expected `int?`, found `Option<int>`",
+            ),
+            (
+                local_option(Type::Int),
+                module_option(&["game"], Type::Int),
+                "mismatched types: expected `Option<int>`, found `game.Option<int>`",
+            ),
+        ];
+
+        for (expected, found, message) in cases {
+            let diagnostic = diagnose_test_type_error(&TypeError::TypeMismatch {
+                expected,
+                found,
+                span: None,
+            });
+            assert_msg(&diagnostic, message);
+        }
+    }
+
+    #[test]
+    fn dyn_contract_rendering_uses_context() {
+        let diagnostic = diagnose_test_type_error(&TypeError::TypeMismatch {
+            expected: Type::Dyn(ast::ContractRef::Anonymous(ast::AnonymousContract {
+                requirements: vec![ast::AnonymousContractRequirement {
+                    receiver: ast::MethodReceiver::Value,
+                    name: ident("get"),
+                    params: vec![],
+                    ret: ReturnSpec::value(core_option(Type::Int)),
+                }],
+            })),
+            found: Type::Bool,
+            span: None,
+        });
+        assert_msg(
+            &diagnostic,
+            "mismatched types: expected `dyn { fn get(self) -> int?; }`, found `bool`",
+        );
+    }
+
+    #[test]
+    fn map_key_optional_message_uses_core_identity() {
+        let cases = [
+            (
+                core_option(Type::Int),
+                "optional type 'int?' is not keyable and cannot be used as map key",
+            ),
+            (
+                local_option(Type::Int),
+                "type 'Option<int>' is not keyable and cannot be used as map key",
+            ),
+        ];
+
+        for (ty, message) in cases {
+            let diagnostic = diagnose_test_type_error(&TypeError::NonKeyableMapKey {
+                ty,
+                field: None,
+                span: None,
+            });
+            assert_msg(&diagnostic, message);
+        }
+    }
+
+    #[test]
+    fn decl_type_errors_use_context_rendering() {
+        let diagnostic = diagnose_test_type_error(&TypeError::Decl(DeclError::PointlessCastFrom {
+            ty: core_option(Type::Int),
+            span: None,
+        }));
+        assert_msg(&diagnostic, "pointless cast from 'int?' to itself");
+    }
+
+    #[test]
     fn omits_labels_without_source_span() {
-        let diagnostic = diagnose_type_error(&TypeError::CannotInferType { span: None });
+        let diagnostic = diagnose_test_type_error(&TypeError::CannotInferType { span: None });
         assert!(diagnostic.labels().is_empty());
 
-        let diagnostic = diagnose_type_error(&TypeError::TypeMismatch {
+        let diagnostic = diagnose_test_type_error(&TypeError::TypeMismatch {
             expected: Type::Int,
             found: Type::Bool,
             span: None,
@@ -2494,15 +2756,18 @@ mod tests {
         );
         assert!(diagnostic.labels().is_empty());
 
-        let diagnostic = diagnose_type_error(&TypeError::Decl(DeclError::DuplicateType {
-            module: ModuleScope::Root,
-            name: ident("Point"),
-            span: None,
-        }));
+        let diagnostic = diagnose_type_error(
+            &TypeError::Decl(DeclError::DuplicateType {
+                module: ModuleScope::Root,
+                name: ident("Point"),
+                span: None,
+            }),
+            &TypeDiagnosticContext::default(),
+        );
         assert!(diagnostic.labels().is_empty());
 
         let diagnostic =
-            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+            diagnose_test_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
                 context: catalog_context(
                     &["host"],
                     ExternContextItem::Function {
@@ -2529,7 +2794,7 @@ mod tests {
         };
 
         assert_msg(
-            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+            diagnose_test_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
                 context,
                 module: Some(ModuleScope::Root),
                 name: ident("Missing"),
@@ -2659,7 +2924,7 @@ mod tests {
         };
 
         assert_msg(
-            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+            diagnose_test_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
                 context,
                 module: None,
                 name: ident("Missing"),
@@ -2686,7 +2951,7 @@ mod tests {
         };
 
         assert_msg(
-            diagnose_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
+            diagnose_test_type_error(&TypeError::ExternCatalog(ExternCatalogError::UnknownType {
                 context,
                 module: None,
                 name: ident("Missing"),
@@ -2720,7 +2985,7 @@ mod tests {
                     actual: ExternTypeExpr::Int,
                 },
             });
-        let catalog = diagnose_type_error(&TypeError::ExternCatalog(
+        let catalog = diagnose_test_type_error(&TypeError::ExternCatalog(
             ExternCatalogError::InvalidOperatorReturn {
                 context: catalog_context(
                     &["math"],

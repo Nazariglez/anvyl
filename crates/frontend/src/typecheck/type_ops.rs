@@ -160,6 +160,9 @@ pub(crate) trait TypeFolder {
             Type::Slice { elem } => Type::Slice {
                 elem: Box::new(self.fold_type(elem)),
             },
+            Type::Optional { inner } => Type::Optional {
+                inner: Box::new(self.fold_type(inner)),
+            },
         }
     }
 
@@ -290,6 +293,7 @@ pub(crate) trait TypeVisitor {
                         .any(|arg| self.visit_const_arg(arg))
             }
             Type::List { elem } | Type::Slice { elem } => self.visit_type(elem),
+            Type::Optional { inner } => self.visit_type(inner),
             Type::Array { elem, len } => self.visit_type(elem) || self.visit_array_len(*len),
             Type::Map { key, value } => self.visit_type(key) || self.visit_type(value),
             Type::UnresolvedNominal { generic_args, .. } => {
@@ -363,6 +367,7 @@ pub(super) fn type_contains_dyn_value(
         Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
             type_contains_dyn_value(elem, decls, seen)
         }
+        Type::Optional { inner } => type_contains_dyn_value(inner, decls, seen),
         Type::Map { key, value } => {
             type_contains_dyn_value(key, decls, seen) || type_contains_dyn_value(value, decls, seen)
         }

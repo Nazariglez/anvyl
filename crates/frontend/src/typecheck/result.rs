@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::{
     BindingPromotionMap, CompileWarning, ForStepRuntimeCheckMap, ImportId, ImportRecord,
-    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, SemanticFactMaps, TypeError,
+    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, NominalKey, SemanticFactMaps, TypeError,
     decls::DeclarationIndex, infer::SourceExprTypes, semantic_use::map_delta,
 };
 use crate::{
@@ -20,18 +20,42 @@ pub(crate) struct SemanticProgram {
     pub(crate) externs: ExternCatalog,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TypeDiagnosticContext {
+    core_option: Option<NominalKey>,
+}
+
+impl TypeDiagnosticContext {
+    pub(crate) fn core_option(&self) -> Option<&NominalKey> {
+        self.core_option.as_ref()
+    }
+
+    pub(crate) fn from_core_option(core_option: Option<NominalKey>) -> Self {
+        Self { core_option }
+    }
+
+    pub(crate) fn from_decls(decls: &DeclarationIndex) -> Self {
+        Self {
+            core_option: decls.core_option_key(),
+        }
+    }
+}
+
 pub(crate) struct SemanticCheckOutput {
     pub(crate) warnings: Vec<CompileWarning>,
     pub(crate) lint_events: Vec<LintEvent>,
+    pub(crate) diagnostic_context: TypeDiagnosticContext,
     pub(crate) public_facts: TypecheckFacts,
     pub(crate) source_types: SourceExprTypes,
     pub(crate) program: SemanticProgram,
 }
 
+#[derive(Debug)]
 pub(crate) struct TypecheckFailure {
     pub(crate) errors: Vec<TypeError>,
     pub(crate) warnings: Vec<CompileWarning>,
     pub(crate) lint_events: Vec<LintEvent>,
+    pub(crate) diagnostic_context: TypeDiagnosticContext,
 }
 
 impl TypecheckFailure {
@@ -40,6 +64,7 @@ impl TypecheckFailure {
             errors,
             warnings: vec![],
             lint_events: vec![],
+            diagnostic_context: TypeDiagnosticContext::from_core_option(None),
         }
     }
 }
@@ -48,6 +73,7 @@ pub struct TypecheckOutput {
     errors: Vec<TypeError>,
     warnings: Vec<CompileWarning>,
     lint_events: Vec<LintEvent>,
+    diagnostic_context: TypeDiagnosticContext,
     facts: Option<TypecheckFacts>,
 }
 
@@ -55,6 +81,7 @@ impl TypecheckOutput {
     pub(crate) fn success(
         warnings: Vec<CompileWarning>,
         lint_events: Vec<LintEvent>,
+        diagnostic_context: TypeDiagnosticContext,
         facts: TypecheckFacts,
     ) -> Self {
         facts.validate();
@@ -62,6 +89,7 @@ impl TypecheckOutput {
             errors: vec![],
             warnings,
             lint_events,
+            diagnostic_context,
             facts: Some(facts),
         }
     }
@@ -70,12 +98,14 @@ impl TypecheckOutput {
         errors: Vec<TypeError>,
         warnings: Vec<CompileWarning>,
         lint_events: Vec<LintEvent>,
+        diagnostic_context: TypeDiagnosticContext,
     ) -> Self {
         debug_assert!(!errors.is_empty());
         Self {
             errors,
             warnings,
             lint_events,
+            diagnostic_context,
             facts: None,
         }
     }
@@ -86,9 +116,16 @@ impl TypecheckOutput {
         Vec<TypeError>,
         Vec<CompileWarning>,
         Vec<LintEvent>,
+        TypeDiagnosticContext,
         Option<TypecheckFacts>,
     ) {
-        (self.errors, self.warnings, self.lint_events, self.facts)
+        (
+            self.errors,
+            self.warnings,
+            self.lint_events,
+            self.diagnostic_context,
+            self.facts,
+        )
     }
 }
 

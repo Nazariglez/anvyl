@@ -383,6 +383,9 @@ pub enum Type {
     Slice {
         elem: Box<Type>,
     },
+    Optional {
+        inner: Box<Type>,
+    },
 }
 
 impl PartialEq for Type {
@@ -431,6 +434,7 @@ impl PartialEq for Type {
             (Self::Map { key: ka, value: va }, Self::Map { key: kb, value: vb }) => {
                 ka == kb && va == vb
             }
+            (Self::Optional { inner: a }, Self::Optional { inner: b }) => a == b,
             _ => false,
         }
     }
@@ -469,6 +473,7 @@ impl std::hash::Hash for Type {
                 key.hash(state);
                 value.hash(state);
             }
+            Type::Optional { inner } => inner.hash(state),
             _ => {}
         }
     }
@@ -532,31 +537,9 @@ impl Type {
         }
     }
 
-    pub fn option_of(inner: Type) -> Type {
-        Type::nominal(
-            NominalKind::Enum,
-            Ident(Intern::new(Type::OPTION_ENUM_NAME.to_string())),
-            vec![inner],
-            vec![],
-            None,
-        )
-    }
-
-    #[inline]
-    pub fn is_option(&self) -> bool {
-        self.option_inner().is_some()
-    }
-
-    #[inline]
-    pub fn option_inner(&self) -> Option<&Type> {
-        match self {
-            Type::Nominal(nominal)
-                if nominal.kind == NominalKind::Enum
-                    && nominal.name.0.as_ref() == Type::OPTION_ENUM_NAME =>
-            {
-                nominal.type_args.first()
-            }
-            _ => None,
+    pub fn optional_syntax(inner: Type) -> Type {
+        Type::Optional {
+            inner: Box::new(inner),
         }
     }
 
@@ -780,6 +763,13 @@ impl Display for Type {
             Self::Array { elem, len } => write!(f, "[{elem}; {len}]"),
             Self::Map { key, value } => write!(f, "[{key}: {value}]"),
             Self::Slice { elem } => write!(f, "slice[{elem}]"),
+            Self::Optional { inner } => {
+                if matches!(inner.as_ref(), Type::Func { .. }) {
+                    write!(f, "({inner})?")
+                } else {
+                    write!(f, "{inner}?")
+                }
+            }
         }
     }
 }

@@ -6,7 +6,10 @@ use crate::{
     externs::{self, RawExterns, catalog::ExternCatalog},
     lint::{LintEvent, LintId},
     span::Span,
-    test_support::{empty_resolved, parse_program, resolved_modules},
+    test_support::{
+        core_option_type, parse_program, resolved_modules_with_core_option,
+        resolved_with_core_option,
+    },
     typecheck::{
         self, BindingPromotionMap, BodyInstanceKey, CallMap, CallableId, CallableInstanceKey,
         CompileWarning, ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap,
@@ -135,6 +138,10 @@ impl TypecheckTestResult {
 
 pub(crate) fn nominal_struct(name: &str) -> Type {
     Type::nominal(NominalKind::Struct, Ident::new(name), vec![], vec![], None)
+}
+
+pub(crate) fn core_option(inner: Type) -> Type {
+    core_option_type(inner)
 }
 
 pub(crate) fn generic_body(name: &str, type_args: Vec<Type>) -> BodyInstanceKey {
@@ -273,7 +280,7 @@ fn type_contains_dyn_hole(ty: &Type) -> bool {
 
 pub(crate) fn output(source: &str) -> typecheck::TypecheckOutput {
     let program = parse_program(source);
-    let resolved = empty_resolved();
+    let resolved = resolved_with_core_option(&program);
     let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
     typecheck::check_with_modules(
         &program,
@@ -285,7 +292,7 @@ pub(crate) fn output(source: &str) -> typecheck::TypecheckOutput {
 
 pub(crate) fn check(source: &str) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let program = parse_program(source);
-    let resolved = empty_resolved();
+    let resolved = resolved_with_core_option(&program);
     let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
     check_with_raw_externs(&program, &resolved, raw_externs)
 }
@@ -330,7 +337,7 @@ pub(crate) fn check_named(
     modules: &[(&str, &str)],
 ) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let root = parse_program(root_source);
-    let resolved = resolved_modules(&root, modules);
+    let resolved = resolved_modules_with_core_option(&root, modules);
     let raw_externs = externs::collect_source_externs(&root, &resolved).unwrap();
     check_with_raw_externs(&root, &resolved, raw_externs)
 }

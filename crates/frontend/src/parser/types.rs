@@ -54,6 +54,7 @@ fn type_contains_slice(ty: &Type) -> bool {
         Type::Tuple(elems) => elems.iter().any(type_contains_slice),
         Type::Nominal(nominal) => nominal.type_args.iter().any(type_contains_slice),
         Type::List { elem } | Type::Array { elem, .. } => type_contains_slice(elem),
+        Type::Optional { inner } => type_contains_slice(inner),
         Type::Map { key, value } => type_contains_slice(key) || type_contains_slice(value),
         Type::UnresolvedNominal { generic_args, .. } => {
             generic_args.iter().any(generic_arg_contains_slice)
@@ -380,7 +381,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
             .then(type_suffix.repeated().collect::<Vec<_>>())
             .map(|(base, suffixes)| {
                 suffixes.into_iter().fold(base, |ty, sfx| match sfx {
-                    TypeSuffix::Optional => Type::option_of(ty),
+                    TypeSuffix::Optional => Type::optional_syntax(ty),
                 })
             })
     })

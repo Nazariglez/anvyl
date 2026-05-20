@@ -646,6 +646,7 @@ pub(crate) enum InvalidExternTypeReason {
     Infer,
     Void,
     UnresolvedConst,
+    MissingCoreOption,
 }
 
 fn visit_extern_signature_with_context<'a>(
@@ -1023,9 +1024,19 @@ impl<'a> CatalogBuilder<'a> {
             },
             ExternTypeExpr::Option(inner) => {
                 let inner = self.resolve_ty(ctx, inner).ty;
-                self.decls
-                    .core_option_of(inner)
-                    .expect("core Option declaration is available")
+                match self.decls.core_option_of(inner.clone()) {
+                    Some(ty) => ty,
+                    None => {
+                        let ty = Type::optional_syntax(inner);
+                        self.errors.push(invalid_type(
+                            ctx.context,
+                            &ty,
+                            InvalidExternTypeReason::MissingCoreOption,
+                            ctx.site,
+                        ));
+                        ty
+                    }
+                }
             }
             ExternTypeExpr::Callback(callback) => {
                 let params = callback
@@ -1228,7 +1239,7 @@ impl<'a> CatalogBuilder<'a> {
                 });
                 Type::UnresolvedName(name)
             }
-            TypeRefError::UnsupportedContractComposition => {
+            TypeRefError::UnsupportedContractComposition | TypeRefError::MissingCoreOption => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: context.clone(),
                     module: None,
@@ -1459,6 +1470,9 @@ fn validate_void_positions(
         }
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
             validate_void_positions(context, elem, TypePosition::Nested, site, errors);
+        }
+        Type::Optional { inner } => {
+            validate_void_positions(context, inner, TypePosition::Nested, site, errors);
         }
         Type::Map { key, value } => {
             validate_void_positions(context, key, TypePosition::Nested, site, errors);
@@ -2179,6 +2193,35 @@ mod tests {
                     None,
                 )
             );
+        }
+
+        #[test]
+        fn descriptor_option_reports_missing_core_option() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                functions: vec![ExternFunctionDescriptor {
+                    name: "maybe".to_string(),
+                    doc: None,
+                    signature: ext_signature(
+                        vec![],
+                        ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int)),
+                    ),
+                    effects: ExternEffects::default(),
+                }],
+                types: vec![],
+            });
+            let root = parse_program("");
+            let resolved = resolved_modules(&root, &[]);
+            let decls = DeclarationIndex::from_root_and_modules(&root, &resolved, &raw);
+            let errors = build(raw, &decls).unwrap_err();
+
+            assert!(matches!(
+                errors.as_slice(),
+                [ExternCatalogError::InvalidType {
+                    reason: InvalidExternTypeReason::MissingCoreOption,
+                    ..
+                }]
+            ));
         }
 
         #[test]

@@ -20,7 +20,7 @@ use crate::{
         },
     },
     resolve::{ModuleId, ModulePath, PackageId},
-    test_support::{parse_program, resolved_modules_with_external},
+    test_support::{parse_program, resolved_modules_with_core_option_external},
     typecheck::{
         self, CallableId, DeprecatedUseKind, ExternUseTarget, MemberPathKind, ModuleScope,
         TypeError,
@@ -314,7 +314,7 @@ fn check_named_with_provider(
     })
     .expect("valid provider");
     let external_modules = externs::raw_extern_module_ids(&provider_raw);
-    let resolved = resolved_modules_with_external(&root, modules, &external_modules);
+    let resolved = resolved_modules_with_core_option_external(&root, modules, &external_modules);
     let mut raw = externs::collect_source_externs(&root, &resolved).expect("valid source externs");
     raw.append(provider_raw);
     check_with_raw_externs(&root, &resolved, raw)

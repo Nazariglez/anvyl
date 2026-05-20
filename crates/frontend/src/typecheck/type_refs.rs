@@ -164,6 +164,7 @@ pub(crate) enum TypeRefError {
         name: Ident,
     },
     UnsupportedContractComposition,
+    MissingCoreOption,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,7 +200,8 @@ impl TypeRefError {
             | Self::ContractAsType { .. }
             | Self::DuplicateContractRequirement { .. }
             | Self::ConflictingContractRequirement { .. }
-            | Self::UnsupportedContractComposition => None,
+            | Self::UnsupportedContractComposition
+            | Self::MissingCoreOption => None,
         }
     }
 }
@@ -251,6 +253,10 @@ pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> T
         },
         TypeRefError::UnsupportedContractComposition => TypeError::CompileError {
             message: "inferred dynamic contracts are not supported yet".to_string(),
+            span,
+        },
+        TypeRefError::MissingCoreOption => TypeError::CompileError {
+            message: "optional type syntax requires the core Option type".to_string(),
             span,
         },
     }
@@ -530,6 +536,7 @@ impl TypeChecker {
             Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
                 self.validate_type_uses(decls, elem, span, policy);
             }
+            Type::Optional { inner } => self.validate_type_uses(decls, inner, span, policy),
             Type::Map { key, value } => {
                 self.validate_type_uses(decls, key, span, policy);
                 if let Some(err) = map_key_type_error(decls, key, self.error_span(span)) {
@@ -914,6 +921,12 @@ impl<'a> TypeRefResolver<'a> {
                 key: Box::new(self.finalize_inner(module, generics, key, state)?),
                 value: Box::new(self.finalize_inner(module, generics, value, state)?),
             }),
+            Type::Optional { inner } => {
+                let inner = self.finalize_inner(module, generics, inner, state)?;
+                self.decls
+                    .core_option_of(inner)
+                    .ok_or(TypeRefError::MissingCoreOption)
+            }
             Type::Infer
             | Type::InferReturn
             | Type::Any

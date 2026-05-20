@@ -147,9 +147,8 @@ mod match_stmt {
 
     #[test]
     fn let_else_return_isolated() {
-        let errors = errors(
-            "enum Option<T> { Some(T), None } fn f(opt: int?) -> int { let Option.Some(x) = opt else { return 0; } }",
-        );
+        let errors =
+            errors("fn f(opt: int?) -> int { let Option.Some(x) = opt else { return 0; } }");
         assert!(
             errors
                 .iter()

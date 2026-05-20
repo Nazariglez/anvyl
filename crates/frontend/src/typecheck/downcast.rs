@@ -111,7 +111,7 @@ pub(super) fn check_expr(
         &target,
         expected_ty.as_ref(),
     )
-    .unwrap_or_else(|| tc.decls.semantic_option_of(target));
+    .unwrap_or_else(|| tc.core_option_or_infer(target, expr.span));
     checked_from_type(expr, ty, tc)
 }
 

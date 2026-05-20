@@ -3524,15 +3524,9 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn key_for_type(&self, ty: &Type) -> Option<NominalKey> {
-        let Type::Nominal(nominal) = ty else {
-            return None;
-        };
-        let scope = match &nominal.origin {
-            Some(origin) => ModuleScope::from_nominal_origin(origin),
-            None => ModuleScope::Root,
-        };
-        self.local_nominal_type(&scope, nominal.name)
-            .filter(|key| key.kind == nominal.kind)
+        let key = nominal_key_for_type(ty)?;
+        self.local_nominal_type(&key.module, key.name)
+            .filter(|found| found.kind == key.kind)
     }
 
     pub(crate) fn core_result_key(&self) -> Option<NominalKey> {
@@ -3544,8 +3538,9 @@ impl DeclarationIndex {
         Some(nominal_type_with_args(&key, &[inner], &[]))
     }
 
-    pub(crate) fn core_option_inner<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
-        if self.key_for_type(ty)? != self.core_option_key()? {
+    pub(crate) fn semantic_option_parts<'a>(&self, ty: &'a Type) -> Option<(NominalKey, &'a Type)> {
+        let key = nominal_key_for_type(ty)?;
+        if key != self.core_option_key()? {
             return None;
         }
         let Type::Nominal(nominal) = ty else {
@@ -3554,21 +3549,23 @@ impl DeclarationIndex {
         let [inner] = nominal.type_args.as_slice() else {
             return None;
         };
-        Some(inner)
+        if !nominal.const_args.is_empty() {
+            return None;
+        }
+        Some((key, inner))
+    }
+
+    pub(crate) fn semantic_option_key(&self, ty: &Type) -> Option<NominalKey> {
+        self.semantic_option_parts(ty).map(|(key, _)| key)
     }
 
     pub(crate) fn semantic_option_inner<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
-        self.core_option_inner(ty).or_else(|| {
-            self.core_option_key()
-                .is_none()
-                .then(|| ty.option_inner())
-                .flatten()
-        })
+        self.semantic_option_parts(ty).map(|(_, inner)| inner)
     }
 
-    pub(crate) fn semantic_option_of(&self, inner: Type) -> Type {
-        self.core_option_of(inner.clone())
-            .unwrap_or_else(|| Type::option_of(inner))
+    pub(crate) fn expect_core_option_of(&self, inner: Type) -> Type {
+        self.core_option_of(inner)
+            .expect("core option declaration must be loaded")
     }
 
     pub(crate) fn core_range_of(&self, kind: CoreRangeKind, inner: Type) -> Option<Type> {
@@ -3632,7 +3629,8 @@ impl DeclarationIndex {
             | Type::List { .. }
             | Type::Array { .. }
             | Type::Map { .. }
-            | Type::Slice { .. } => Some(MapKeyError {
+            | Type::Slice { .. }
+            | Type::Optional { .. } => Some(MapKeyError {
                 ty: ty.clone(),
                 field: None,
             }),
@@ -4242,6 +4240,20 @@ pub(crate) fn stmt_visibility(stmt: &StmtNode) -> Visibility {
         Stmt::Contract(n) => n.node.visibility,
         _ => Visibility::Private,
     }
+}
+
+pub(crate) fn nominal_key_for_type(ty: &Type) -> Option<NominalKey> {
+    let Type::Nominal(nominal) = ty else {
+        return None;
+    };
+    Some(NominalKey {
+        module: nominal
+            .origin
+            .as_ref()
+            .map_or(ModuleScope::Root, ModuleScope::from_nominal_origin),
+        kind: nominal.kind,
+        name: nominal.name,
+    })
 }
 
 pub(crate) fn nominal_type(key: &NominalKey) -> Type {

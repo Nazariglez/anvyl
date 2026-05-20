@@ -116,6 +116,7 @@ impl Printer<'_> {
                 self.format_type(elem);
                 self.write("]");
             }
+            ast::Type::Optional { inner } => self.format_optional_type(inner),
         }
     }
 
@@ -144,16 +145,6 @@ impl Printer<'_> {
     }
 
     fn format_nominal_type(&mut self, nominal: &ast::NominalType) {
-        let is_option = matches!(nominal.kind, ast::NominalKind::Enum)
-            && nominal.name.0.as_ref() == "Option"
-            && nominal.type_args.len() == 1
-            && nominal.const_args.is_empty();
-        if is_option {
-            self.format_type(&nominal.type_args[0]);
-            self.write("?");
-            return;
-        }
-
         self.write_fmt(nominal.name);
         let args = nominal
             .type_args
@@ -171,6 +162,17 @@ impl Printer<'_> {
         if !args.is_empty() {
             self.format_generic_args(&args);
         }
+    }
+
+    fn format_optional_type(&mut self, inner: &ast::Type) {
+        if matches!(inner, ast::Type::Func { .. }) {
+            self.write("(");
+            self.format_type(inner);
+            self.write(")");
+        } else {
+            self.format_type(inner);
+        }
+        self.write("?");
     }
 
     fn format_array_len(&mut self, len: &ast::ArrayLen) {

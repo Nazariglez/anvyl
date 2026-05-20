@@ -95,11 +95,8 @@ fn extension_call_target_records_specialization() {
 
 #[test]
 fn enum_tuple_nil_inference_does_not_leak() {
-    let checked = check(
-        "enum Option<T> { Some(T), None }
-        fn main() { let x: Option<int?> = Option.Some(nil); x; }",
-    )
-    .expect("typecheck failed");
+    let checked = check("fn main() { let x: Option<int?> = Option.Some(nil); x; }")
+        .expect("typecheck failed");
     assert_typecheck_closed(&checked);
 }
 

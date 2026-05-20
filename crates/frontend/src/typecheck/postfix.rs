@@ -294,7 +294,8 @@ pub(super) fn check_postfix_chain_place(
                     field_expected.as_ref(),
                     tc,
                 );
-                tc.set_type(*id, chain_type(&subject, optional_chain, tc), node.span);
+                let ty = chain_type(&subject, optional_chain, node.span, tc);
+                tc.set_type(*id, ty, node.span);
                 subject
             }
             PostfixStep::Call { node, id } => {
@@ -306,11 +307,8 @@ pub(super) fn check_postfix_chain_place(
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
                 let value = apply_call(&subject, node, *id, call_expected, tc);
-                tc.set_type(
-                    *id,
-                    wrap_optional(value.checked.ty.clone(), optional_chain, tc),
-                    node.span,
-                );
+                let ty = wrap_optional(value.checked.ty.clone(), optional_chain, node.span, tc);
+                tc.set_type(*id, ty, node.span);
                 if matches!(subject, Subject::Error) {
                     Subject::Error
                 } else {
@@ -341,7 +339,7 @@ pub(super) fn check_postfix_chain_place(
             } else {
                 Type::Infer
             };
-            let ty = wrap_optional(ty, optional_chain, tc);
+            let ty = wrap_optional(ty, optional_chain, expr.span, tc);
             let checked = checked_from_type(expr, ty, tc);
             return PlaceValue::not_place(checked);
         }
@@ -366,7 +364,7 @@ pub(super) fn check_postfix_chain_place(
         _ => {}
     }
 
-    let ty = chain_type(&subject, optional_chain, tc);
+    let ty = chain_type(&subject, optional_chain, expr.span, tc);
     let checked = CheckedType {
         handle: tc.set_type(expr.node.id, ty.clone(), expr.span),
         ty,
@@ -422,13 +420,13 @@ fn subject_type(subject: &Subject) -> Type {
     }
 }
 
-fn chain_type(subject: &Subject, optional: bool, tc: &TypeChecker) -> Type {
-    wrap_optional(subject_type(subject), optional, tc)
+fn chain_type(subject: &Subject, optional: bool, span: Span, tc: &mut TypeChecker) -> Type {
+    wrap_optional(subject_type(subject), optional, span, tc)
 }
 
-fn wrap_optional(ty: Type, optional: bool, tc: &TypeChecker) -> Type {
+fn wrap_optional(ty: Type, optional: bool, span: Span, tc: &mut TypeChecker) -> Type {
     if optional {
-        tc.optional_chain_result_type(ty)
+        tc.optional_chain_result_type(ty, span)
     } else {
         ty
     }
@@ -2587,7 +2585,7 @@ pub(super) fn check_index_access(
         };
         let indexed = check_index_access_inner(node, &inner_target, tc);
         return CheckedIndex {
-            read_ty: tc.optional_chain_result_type(indexed.read_ty),
+            read_ty: tc.optional_chain_result_type(indexed.read_ty, node.span),
             write_ty: Type::Infer,
             contains_extern_any: indexed.contains_extern_any,
         };
@@ -2637,7 +2635,7 @@ fn check_index_access_inner(
             tc.solve_constraints();
             let value = (**value).clone();
             CheckedIndex::new(
-                tc.decls.semantic_option_of(value.clone()),
+                tc.core_option_or_infer(value.clone(), node.span),
                 value,
                 target,
                 &index,

@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn takes_suffix(x: int?) -> int? { x }
+fn takes_named(x: Option<int>) -> Option<int> { x }
+
+fn main() {
+    let a: int? = Option.Some(1);
+    let b: Option<int> = a;
+    let c: int? = b;
+    let d: Option<int> = nil;
+    let e: int? = Option.None;
+
+    let f: Option<int> = takes_suffix(b);
+    let g: int? = takes_named(c);
+    let h: int = (d ?? 2) + (e ?? 3) + (f ?? 4) + (g ?? 5);
+}

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let x: Option<int> = Option.Some(1);
+    let a: int = match x { v? => v, nil => 0 };
+
+    if let v? = x {
+        let b: int = v;
+    }
+}

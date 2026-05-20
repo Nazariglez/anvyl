@@ -286,14 +286,14 @@ fn typecheck_report(
     lint: &LintConfig,
     output: typecheck::TypecheckOutput,
 ) -> DiagnosticReport {
-    let (errors, warnings, mut lint_events, facts) = output.into_parts();
+    let (errors, warnings, mut lint_events, type_ctx, facts) = output.into_parts();
     if let Some(facts) = facts {
         // TypecheckFacts are complete only on successful typechecking; skip fact-derived lints otherwise.
         lint_events.extend(facts.unused_import_events());
     }
     let diagnostics = errors
         .iter()
-        .map(diagnose_type_error)
+        .map(|error| diagnose_type_error(error, &type_ctx))
         .chain(warnings.iter().map(diagnose_compile_warning))
         .chain(apply_lints(lint, lint_events));
     diagnostic_report(sources, diagnostics)
@@ -573,7 +573,7 @@ mod tests {
     }
 
     impl PackageSourceLoader for TestLoader {
-        type FatalError = std::convert::Infallible;
+        type FatalError = Infallible;
 
         fn load(
             &mut self,
@@ -1520,10 +1520,15 @@ mod tests {
     #[test]
     fn private_core_root_declarations_are_preluded() {
         let mut loader = TestLoader::default();
+        loader.package_source(
+            &PackageId::core(),
+            &["option"],
+            "pub enum Option<T> { Some(T), None }",
+        );
         let output = check(input(
             &mut loader,
             source("fn main() { let x: Option<int> = nil; }", "main.anv"),
-            Some(source("enum Option<T> { Some(T), None }", "<core>")),
+            Some(source("pub import option { Option };", "<core>")),
             vec![],
         ))
         .unwrap();

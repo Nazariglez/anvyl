@@ -770,11 +770,8 @@ impl<'tc> PatternChecker<'tc> {
     }
 
     fn option_cover(&self, expected: &Type, variant: &str) -> Option<PatternCover> {
-        let key = self.tc.decls.key_for_type(expected).filter(|key| {
-            key.kind == NominalKind::Enum && key.name.0.as_ref() == Type::OPTION_ENUM_NAME
-        })?;
         Some(PatternCover::EnumVariant {
-            key,
+            key: self.tc.decls.semantic_option_key(expected)?,
             variant: Ident::new(variant),
         })
     }
@@ -1400,7 +1397,7 @@ fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
     if let Some(annot_inner) = tc.decls.semantic_option_inner(annot) {
         let value_inner = tc.decls.semantic_option_inner(value).unwrap_or(value);
         let inner = refined_binding_type(annot_inner, value_inner, tc);
-        return tc.decls.semantic_option_of(inner);
+        return tc.decls.expect_core_option_of(inner);
     }
     match (annot, value) {
         (
