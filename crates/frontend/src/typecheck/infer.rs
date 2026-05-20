@@ -352,11 +352,11 @@ impl Ty {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub(super) struct LocalTypeId(u32);
+pub(crate) struct SemanticLocalId(u32);
 
 #[cfg(test)]
-impl LocalTypeId {
-    pub(super) fn new(id: u32) -> Self {
+impl SemanticLocalId {
+    pub(crate) fn new(id: u32) -> Self {
         Self(id)
     }
 }
@@ -367,7 +367,7 @@ struct TempTypeId(u32);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeRef {
     Concrete(Ty),
-    Local(LocalTypeId),
+    Local(SemanticLocalId),
     Temp(TempTypeId),
     Expr(ExprId),
 }
@@ -436,7 +436,7 @@ impl TypeRef {
         Self::Concrete(ty)
     }
 
-    fn local(id: LocalTypeId) -> Self {
+    fn local(id: SemanticLocalId) -> Self {
         Self::Local(id)
     }
 
@@ -769,7 +769,7 @@ impl Solver {
         self.finalized_generic_const_arg(arg)
     }
 
-    pub(super) fn local_handle(&self, id: LocalTypeId) -> TypeHandle {
+    pub(super) fn local_handle(&self, id: SemanticLocalId) -> TypeHandle {
         TypeHandle(TypeRef::local(id))
     }
 
@@ -954,25 +954,25 @@ impl Solver {
         (types, errors.into_iter().map(Into::into).collect())
     }
 
-    pub(super) fn alloc_local_type(&mut self, ty: &Type) -> LocalTypeId {
+    pub(super) fn alloc_local_type(&mut self, ty: &Type) -> SemanticLocalId {
         self.alloc_local(Ty::from_recovery_type(ty))
     }
 
-    pub(super) fn alloc_fresh_local_type(&mut self, span: Option<SourceSpan>) -> LocalTypeId {
+    pub(super) fn alloc_fresh_local_type(&mut self, span: Option<SourceSpan>) -> SemanticLocalId {
         let ty = self.fresh_type(span);
         self.alloc_local(ty)
     }
 
-    pub(super) fn alloc_local_type_from_handle(&mut self, handle: &TypeHandle) -> LocalTypeId {
+    pub(super) fn alloc_local_type_from_handle(&mut self, handle: &TypeHandle) -> SemanticLocalId {
         let ty = self.resolve_ref(&handle.0);
         self.alloc_local(ty)
     }
 
-    pub(super) fn local_type_to_type(&self, id: LocalTypeId) -> Type {
+    pub(super) fn local_type_to_type(&self, id: SemanticLocalId) -> Type {
         self.type_for_storage(self.local_type(id))
     }
 
-    pub(super) fn set_local_type_from_type(&mut self, id: LocalTypeId, ty: &Type) {
+    pub(super) fn set_local_type_from_type(&mut self, id: SemanticLocalId, ty: &Type) {
         self.set_local_type(id, Ty::from_recovery_type(ty));
     }
 
@@ -1302,17 +1302,17 @@ impl Solver {
         self.nil_vars.contains(&id)
     }
 
-    fn alloc_local(&mut self, ty: Ty) -> LocalTypeId {
-        let id = LocalTypeId(self.local_types.len() as u32);
+    fn alloc_local(&mut self, ty: Ty) -> SemanticLocalId {
+        let id = SemanticLocalId(self.local_types.len() as u32);
         self.local_types.push(ty);
         id
     }
 
-    fn local_type(&self, id: LocalTypeId) -> &Ty {
+    fn local_type(&self, id: SemanticLocalId) -> &Ty {
         &self.local_types[id.0 as usize]
     }
 
-    fn set_local_type(&mut self, id: LocalTypeId, ty: Ty) {
+    fn set_local_type(&mut self, id: SemanticLocalId, ty: Ty) {
         self.local_types[id.0 as usize] = ty;
     }
 

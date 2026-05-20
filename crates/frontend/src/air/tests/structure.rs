@@ -16,6 +16,13 @@ fn empty_program() {
 }
 
 #[test]
+fn primitive_builder_helpers_cache() {
+    let mut builder = ProgramBuilder::default();
+    assert_eq!(builder.string_ty(), builder.string_ty());
+    assert_eq!(builder.any_ty(), builder.any_ty());
+}
+
+#[test]
 fn type_arena_all_variants() {
     let mut arena = TypeArena::default();
     let int_ty = arena.alloc(TypeData::Int);
@@ -77,7 +84,7 @@ fn const_arena() {
 #[test]
 fn function_stable_ids() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let void_ty = builder.void_ty();
 
     let module = test_module(&mut builder);
 
@@ -119,8 +126,8 @@ fn module_refs_stable() {
 #[test]
 fn program_accessors() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
 
     let module = test_module(&mut builder);
 
@@ -181,7 +188,7 @@ fn program_accessors() {
 #[test]
 fn id_roundtrip() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let void_ty = builder.void_ty();
 
     let module = test_module(&mut builder);
 

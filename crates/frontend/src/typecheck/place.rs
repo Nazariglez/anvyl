@@ -1,7 +1,7 @@
 use super::{
-    CheckedType, Exposure, ExternUseTarget, GlobalAccessMode, GlobalKey, GlobalSig, LocalTypeId,
-    MemberAccessKind, MemberPathFact, MemberPathKind, TypeChecker, TypeError, ValueDecl,
-    check_expr_checked, member,
+    CheckedType, Exposure, ExternUseTarget, GlobalAccessMode, GlobalKey, GlobalSig, LocalUseMode,
+    MemberAccessKind, MemberPathFact, MemberPathKind, SemanticLocalId, TypeChecker, TypeError,
+    ValueDecl, check_expr_checked, member,
     postfix::{check_index_access, check_tuple_index_access},
 };
 use crate::{
@@ -83,7 +83,7 @@ pub(super) struct PlacePath {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum PlaceRoot {
-    Local(LocalTypeId),
+    Local(SemanticLocalId),
     Global(GlobalKey),
     Temporary(ExprId),
 }
@@ -260,6 +260,13 @@ fn alternatives_conflict(
 }
 
 impl PlacePath {
+    fn direct_local(&self) -> Option<SemanticLocalId> {
+        let PlaceRoot::Local(local) = self.root else {
+            return None;
+        };
+        self.segments.is_empty().then_some(local)
+    }
+
     pub(super) fn root(root: PlaceRoot) -> Self {
         Self {
             root,
@@ -848,6 +855,23 @@ fn check_module_qualified_place(expr: &ExprNode, tc: &mut TypeChecker) -> Option
     })
 }
 
+fn record_direct_use(
+    expr_id: ExprId,
+    value: &PlaceValue,
+    mode: LocalUseMode,
+    tc: &mut TypeChecker,
+) {
+    let PlaceIdentity::Single(path) = &value.identity else {
+        return;
+    };
+    let Some(local) = path.direct_local() else {
+        return;
+    };
+    if tc.has_recordable_semantic_local(local) {
+        tc.record_local_use(expr_id, local, mode);
+    }
+}
+
 pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
     let mode = if place
         .value
@@ -860,12 +884,14 @@ pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeC
         GlobalAccessMode::ProjectedAssign
     };
     record_place_global_access(expr_id, &place.value, mode, tc);
+    record_direct_use(expr_id, &place.value, LocalUseMode::Assign, tc);
     record_value_write(expr_id, &place.value, tc);
 }
 
 pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
     tc.closure.mutably_use_place(expr_id);
     record_place_global_access(expr_id, &place.value, GlobalAccessMode::CompoundAssign, tc);
+    record_direct_use(expr_id, &place.value, LocalUseMode::CompoundAssign, tc);
     record_prefix_reads(expr_id, &place.value.facts, tc);
     record_target_reads(expr_id, &place.value.facts, tc);
     record_target_writes(expr_id, &place.value.facts, tc);
@@ -874,6 +900,7 @@ pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &
 pub(super) fn record_value_read(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.read_place(expr_id);
     record_place_global_access(expr_id, value, GlobalAccessMode::Read, tc);
+    record_direct_use(expr_id, value, LocalUseMode::Read, tc);
     record_facts_read(expr_id, &value.facts, tc);
 }
 
@@ -1008,7 +1035,7 @@ mod tests {
     }
 
     fn root(id: u32) -> PlaceRoot {
-        PlaceRoot::Local(LocalTypeId::new(id))
+        PlaceRoot::Local(SemanticLocalId::new(id))
     }
 
     fn path(id: u32) -> PlacePath {

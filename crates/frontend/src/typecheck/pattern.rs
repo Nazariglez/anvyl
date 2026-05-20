@@ -616,8 +616,12 @@ impl<'tc> PatternChecker<'tc> {
         for (name, binding) in first.iter() {
             match &binding.kind {
                 PatternBindingKind::Owned { mutable } => {
-                    self.tc
-                        .define_pattern_binding_from_handle(name, &binding.ty, *mutable);
+                    self.tc.define_pattern_binding_from_handle(
+                        name,
+                        &binding.ty,
+                        *mutable,
+                        Some(binding.span),
+                    );
                 }
                 PatternBindingKind::Alias(_) => {
                     let targets = bindings
@@ -1599,7 +1603,14 @@ fn check_if_let_exact_downcast(
                     allowed: binding.name,
                 });
             }
-            _ => tc.define_pattern_binding_from_handle(binding.name, &handle, false),
+            _ => {
+                tc.define_pattern_binding_from_handle(
+                    binding.name,
+                    &handle,
+                    false,
+                    Some(node.pattern.span),
+                );
+            }
         }
 
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
@@ -1645,7 +1656,12 @@ fn check_downcast_branches(
         tc.push_scope();
         if let Some(binding) = binding {
             let handle = tc.type_handle(&binding_ty);
-            tc.define_pattern_binding_from_handle(binding.name, &handle, binding.mutable);
+            tc.define_pattern_binding_from_handle(
+                binding.name,
+                &handle,
+                binding.mutable,
+                Some(node.pattern.span),
+            );
         }
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
         tc.pop_scope();

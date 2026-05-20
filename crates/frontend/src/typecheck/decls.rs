@@ -1604,10 +1604,10 @@ pub(crate) struct GenericContextError {
     pub(crate) span: Span,
 }
 
-struct ModuleProgram<'a> {
-    scope: ModuleScope,
-    source: SourceId,
-    program: &'a Program,
+pub(crate) struct SourceModule<'a> {
+    pub(crate) scope: ModuleScope,
+    pub(crate) source: SourceId,
+    pub(crate) program: &'a Program,
 }
 
 impl DeclarationIndex {
@@ -1617,7 +1617,7 @@ impl DeclarationIndex {
         externs: &RawExterns,
     ) -> Self {
         let mut index = Self::default();
-        let modules = Self::module_programs(root, resolved);
+        let modules = Self::source_modules(root, resolved);
         let mut source_extern_policies = SourceExternPolicies::default();
         for module in &modules {
             index.collect_module(
@@ -1649,11 +1649,11 @@ impl DeclarationIndex {
         }
     }
 
-    fn module_programs<'a>(
+    pub(crate) fn source_modules<'a>(
         root: &'a Program,
         resolved: &'a ResolveResult,
-    ) -> Vec<ModuleProgram<'a>> {
-        let mut modules = vec![ModuleProgram {
+    ) -> Vec<SourceModule<'a>> {
+        let mut modules = vec![SourceModule {
             scope: ModuleScope::from_module_id(&resolved.root),
             source: resolved.root_source,
             program: root,
@@ -1663,7 +1663,7 @@ impl DeclarationIndex {
                 if module.key == resolved.root {
                     continue;
                 }
-                modules.push(ModuleProgram {
+                modules.push(SourceModule {
                     scope: ModuleScope::from_module_id(&module.key),
                     source: module.source,
                     program: &module.program,
@@ -2817,7 +2817,7 @@ impl DeclarationIndex {
 
     fn apply_public_import_reexports(
         &mut self,
-        modules: &[ModuleProgram<'_>],
+        modules: &[SourceModule<'_>],
         resolved: &ResolveResult,
     ) {
         for module in modules.iter().skip(1).chain(modules.first()) {
@@ -2915,7 +2915,7 @@ impl DeclarationIndex {
         }
     }
 
-    fn build_import_scopes(&mut self, modules: &[ModuleProgram<'_>], resolved: &ResolveResult) {
+    fn build_import_scopes(&mut self, modules: &[SourceModule<'_>], resolved: &ResolveResult) {
         for module in modules.iter().skip(1).chain(modules.first()) {
             let mut builder = ImportScopeBuilder::new(module.scope.clone(), ImportMode::Import);
             if let Some(decls) = self.modules.get(&module.scope) {

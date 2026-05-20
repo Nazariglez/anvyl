@@ -15,11 +15,45 @@ use crate::{
 #[derive(Default)]
 pub struct ProgramBuilder {
     program: Program,
+    primitive_tys: [Option<TypeId>; 6],
 }
 
 impl ProgramBuilder {
     pub fn alloc_type(&mut self, data: TypeData) -> TypeId {
         self.program.alloc_type(data)
+    }
+
+    pub fn int_ty(&mut self) -> TypeId {
+        self.primitive_ty(0, TypeData::Int)
+    }
+
+    pub fn float_ty(&mut self) -> TypeId {
+        self.primitive_ty(1, TypeData::Float)
+    }
+
+    pub fn bool_ty(&mut self) -> TypeId {
+        self.primitive_ty(2, TypeData::Bool)
+    }
+
+    pub fn string_ty(&mut self) -> TypeId {
+        self.primitive_ty(3, TypeData::String)
+    }
+
+    pub fn void_ty(&mut self) -> TypeId {
+        self.primitive_ty(4, TypeData::Void)
+    }
+
+    pub fn any_ty(&mut self) -> TypeId {
+        self.primitive_ty(5, TypeData::Any)
+    }
+
+    fn primitive_ty(&mut self, index: usize, data: TypeData) -> TypeId {
+        if let Some(id) = self.primitive_tys[index] {
+            return id;
+        }
+        let id = self.program.alloc_type(data);
+        self.primitive_tys[index] = Some(id);
+        id
     }
 
     pub fn alloc_const(&mut self, data: ConstData) -> ConstId {

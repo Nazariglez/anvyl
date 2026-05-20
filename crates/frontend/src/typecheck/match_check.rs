@@ -153,7 +153,7 @@ fn define_downcast_binding(
 ) -> bool {
     let handle = tc.type_handle(target);
     let Some(alias) = source.alias.as_ref() else {
-        tc.define_pattern_binding_from_handle(name, &handle, false);
+        tc.define_pattern_binding_from_handle(name, &handle, false, None);
         return false;
     };
     tc.define_downcast_alias_from_handle(name, &handle, alias.target(PlaceAccess::Mutable));
@@ -181,13 +181,13 @@ fn define_fallback_binding(
             PatternContext::Match,
         );
     } else {
-        tc.define_pattern_binding_from_handle(name, &source.handle, false);
+        tc.define_pattern_binding_from_handle(name, &source.handle, false, None);
     }
 }
 
 fn define_recovery_binding(name: Ident, tc: &mut TypeChecker) {
     let handle = tc.type_handle(&Type::Infer);
-    tc.define_pattern_binding_from_handle(name, &handle, false);
+    tc.define_pattern_binding_from_handle(name, &handle, false, None);
 }
 
 fn push_duplicate_target(target: &Type, span: Span, tc: &mut TypeChecker) {

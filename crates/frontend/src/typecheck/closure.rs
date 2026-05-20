@@ -14,7 +14,7 @@ use super::{
     checked_from_type,
     decl_validate::{has_mutable_func_param, validate_return_spec},
     expected_assignable_type,
-    infer::{LocalTypeId, TypeHandle},
+    infer::{SemanticLocalId, TypeHandle},
 };
 use crate::{
     ast::{EscapeMode, ExprId, ExprNode, FuncParam, Ident, LambdaNode, Type},
@@ -34,7 +34,7 @@ pub(super) struct ClosureClassifier {
     bindings: HashMap<BindingId, BindingInfo>,
     local_flows: HashMap<BindingId, EscapeFlow>,
     active_loops: Vec<LoopFlow>,
-    reported_non_escaping_callback_escapes: HashSet<LocalTypeId>,
+    reported_non_escaping_callback_escapes: HashSet<SemanticLocalId>,
     reported_borrowed_escaping_captures: HashSet<BindingId>,
     active_lambdas: Vec<ActiveLambda>,
 }
@@ -78,7 +78,7 @@ impl TypeChecker {
     pub(super) fn mark_non_escaping_callback_param(
         &mut self,
         name: Ident,
-        type_id: LocalTypeId,
+        type_id: SemanticLocalId,
         param: &FuncParam,
         source_ty: Option<&Type>,
     ) {
@@ -162,7 +162,7 @@ impl ClosureClassifier {
         &mut self,
         binding_id: BindingId,
         name: Ident,
-        type_id: LocalTypeId,
+        type_id: SemanticLocalId,
         kind: LocalBindingKind,
         scope_depth: usize,
     ) {
@@ -181,7 +181,7 @@ impl ClosureClassifier {
 
     pub(super) fn scope_state_for_bindings(
         &self,
-        bindings: impl IntoIterator<Item = (BindingId, Ident, LocalTypeId, LocalBindingKind, usize)>,
+        bindings: impl IntoIterator<Item = (BindingId, Ident, SemanticLocalId, LocalBindingKind, usize)>,
     ) -> ClosureScopeState {
         let mut state = ClosureScopeState::default();
         for (binding_id, name, type_id, kind, scope_depth) in bindings {
@@ -499,7 +499,7 @@ impl ClosureClassifier {
             .insert_callback(origin);
     }
 
-    pub(super) fn record_non_escaping_callback_escape(&mut self, id: LocalTypeId) -> bool {
+    pub(super) fn record_non_escaping_callback_escape(&mut self, id: SemanticLocalId) -> bool {
         self.reported_non_escaping_callback_escapes.insert(id)
     }
 
@@ -667,7 +667,10 @@ impl ClosureClassifier {
             .is_some_and(|fact| matches!(fact.escape, LambdaEscapeKind::Escaping))
     }
 
-    pub(super) fn finish(&self, mut type_of: impl FnMut(LocalTypeId) -> Type) -> TypecheckFacts {
+    pub(super) fn finish(
+        &self,
+        mut type_of: impl FnMut(SemanticLocalId) -> Type,
+    ) -> TypecheckFacts {
         debug_assert!(
             self.escape_queue.is_empty(),
             "closure escape queue must be drained before finalization"
@@ -677,12 +680,15 @@ impl ClosureClassifier {
 
     pub(super) fn fact_snapshot(
         &self,
-        mut type_of: impl FnMut(LocalTypeId) -> Type,
+        mut type_of: impl FnMut(SemanticLocalId) -> Type,
     ) -> TypecheckFacts {
         self.build_final_facts(&mut type_of)
     }
 
-    fn build_final_facts(&self, type_of: &mut impl FnMut(LocalTypeId) -> Type) -> TypecheckFacts {
+    fn build_final_facts(
+        &self,
+        type_of: &mut impl FnMut(SemanticLocalId) -> Type,
+    ) -> TypecheckFacts {
         let mut facts = self.replayed_facts.clone();
         facts.lambda_escapes.extend(self.lambda_escapes.clone());
         for lambda in &self.sealed_lambdas {
@@ -695,7 +701,7 @@ impl ClosureClassifier {
         &self,
         lambda: &SealedLambda,
         facts: &mut TypecheckFacts,
-        type_of: &mut impl FnMut(LocalTypeId) -> Type,
+        type_of: &mut impl FnMut(SemanticLocalId) -> Type,
     ) {
         let escaping = self.lambda_escapes(lambda.expr_id);
         for capture in &lambda.captures {
@@ -900,7 +906,7 @@ pub(super) struct ClosureScopeState {
 #[derive(Clone, Copy)]
 struct BindingInfo {
     name: Ident,
-    type_id: LocalTypeId,
+    type_id: SemanticLocalId,
     mutability: BindingMutability,
     storage: CaptureStorageOrigin,
     scope_depth: usize,
@@ -985,7 +991,7 @@ impl Hash for FlowOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct NonEscapingCallback {
-    pub(super) id: LocalTypeId,
+    pub(super) id: SemanticLocalId,
     pub(super) name: Ident,
     pub(super) help: Option<String>,
 }
@@ -1001,7 +1007,7 @@ pub(super) struct BorrowedCapture {
 struct CaptureUse {
     binding_id: BindingId,
     name: Ident,
-    type_id: LocalTypeId,
+    type_id: SemanticLocalId,
     kind: LocalBindingKind,
     access: CaptureAccess,
 }
@@ -1228,15 +1234,17 @@ pub(super) fn check_lambda_expr(
                     ty,
                 })
                 .collect::<Vec<_>>();
-            check_callable_body_frame(
-                &bindings,
-                expected_ret.as_ref(),
-                ReturnAccess::Value,
-                None,
-                CallableBody::Expr(&lambda.node.body),
-                lambda.span,
-                tc,
-            )
+            tc.with_suppressed_local_facts(|tc| {
+                check_callable_body_frame(
+                    &bindings,
+                    expected_ret.as_ref(),
+                    ReturnAccess::Value,
+                    None,
+                    CallableBody::Expr(&lambda.node.body),
+                    lambda.span,
+                    tc,
+                )
+            })
         },
         |tc| {
             tc.closure.exit_lambda();

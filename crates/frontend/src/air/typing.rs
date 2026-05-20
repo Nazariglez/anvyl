@@ -3,6 +3,7 @@ use super::{
     body::{Builtin, Callee, Operand, RValue},
     ids::TypeId,
 };
+use crate::ast::{BinaryOp, UnaryOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimitiveKind {
@@ -19,6 +20,68 @@ pub(crate) struct DuplicatePrimitive {
     pub kind: PrimitiveKind,
     pub first: TypeId,
     pub duplicate: TypeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarType {
+    Int,
+    Float,
+    Bool,
+    String,
+}
+
+pub(crate) fn supports_scalar_unary(op: UnaryOp, value: ScalarType, result: ScalarType) -> bool {
+    match op {
+        UnaryOp::Neg => matches!(
+            (value, result),
+            (ScalarType::Int, ScalarType::Int) | (ScalarType::Float, ScalarType::Float)
+        ),
+        UnaryOp::Not => matches!((value, result), (ScalarType::Bool, ScalarType::Bool)),
+        UnaryOp::BitNot => matches!((value, result), (ScalarType::Int, ScalarType::Int)),
+    }
+}
+
+pub(crate) fn supports_scalar_binary(
+    op: BinaryOp,
+    lhs: ScalarType,
+    rhs: ScalarType,
+    result: ScalarType,
+) -> bool {
+    match op {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+            matches!(
+                (lhs, rhs, result),
+                (ScalarType::Int, ScalarType::Int, ScalarType::Int)
+                    | (ScalarType::Float, ScalarType::Float, ScalarType::Float)
+            )
+        }
+        BinaryOp::LessThan
+        | BinaryOp::GreaterThan
+        | BinaryOp::LessThanEq
+        | BinaryOp::GreaterThanEq => {
+            matches!(
+                (lhs, rhs, result),
+                (ScalarType::Int, ScalarType::Int, ScalarType::Bool)
+                    | (ScalarType::Float, ScalarType::Float, ScalarType::Bool)
+            )
+        }
+        BinaryOp::Eq | BinaryOp::NotEq => {
+            matches!(
+                (lhs, rhs, result),
+                (ScalarType::Int, ScalarType::Int, ScalarType::Bool)
+                    | (ScalarType::Float, ScalarType::Float, ScalarType::Bool)
+                    | (ScalarType::Bool, ScalarType::Bool, ScalarType::Bool)
+                    | (ScalarType::String, ScalarType::String, ScalarType::Bool)
+            )
+        }
+        BinaryOp::Xor | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Shl | BinaryOp::Shr => {
+            matches!(
+                (lhs, rhs, result),
+                (ScalarType::Int, ScalarType::Int, ScalarType::Int)
+            )
+        }
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce => false,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -100,12 +163,19 @@ impl PrimitiveTypes {
         self.string() == Some(ty)
     }
 
-    pub(crate) fn is_numeric(&self, ty: TypeId) -> bool {
-        self.is_int(ty) || self.is_float(ty)
-    }
-
-    pub(crate) fn is_scalar_eq(&self, ty: TypeId) -> bool {
-        self.is_int(ty) || self.is_float(ty) || self.is_bool(ty) || self.is_string(ty)
+    pub(crate) fn scalar(&self, ty: TypeId) -> Option<ScalarType> {
+        // FIXME: this is better and more readable with a match statement
+        if self.is_int(ty) {
+            Some(ScalarType::Int)
+        } else if self.is_float(ty) {
+            Some(ScalarType::Float)
+        } else if self.is_bool(ty) {
+            Some(ScalarType::Bool)
+        } else if self.is_string(ty) {
+            Some(ScalarType::String)
+        } else {
+            None
+        }
     }
 }
 

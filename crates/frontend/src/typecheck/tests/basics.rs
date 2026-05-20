@@ -15,15 +15,15 @@ mod storage {
     use crate::{
         ast::{Ident, Program, Type},
         test_support::empty_resolved,
-        typecheck::{DeclarationIndex, LocalTypeId, TypeChecker, TypecheckConfig},
+        typecheck::{DeclarationIndex, SemanticLocalId, TypeChecker, TypecheckConfig},
     };
 
     trait TypeCheckerTestExt {
-        fn set_local_type(&mut self, id: LocalTypeId, ty: Type);
+        fn set_local_type(&mut self, id: SemanticLocalId, ty: Type);
     }
 
     impl TypeCheckerTestExt for TypeChecker {
-        fn set_local_type(&mut self, id: LocalTypeId, ty: Type) {
+        fn set_local_type(&mut self, id: SemanticLocalId, ty: Type) {
             self.solver.set_local_type_from_type(id, &ty);
         }
     }

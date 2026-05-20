@@ -2,9 +2,9 @@ use std::{collections::HashMap, rc::Rc};
 
 use super::{
     BodyInstanceKey, CallableInstanceKey, CastFromInstanceKey, CheckedType, LocalBindingKind,
-    LocalCallableInfo, LocalConstInfo, LocalSymbol, ReturnFrame, ReturnMode, ScopeState,
-    TypeChecker, TypeError, VarInfo, annotation, check_expr_checked, check_expr_checked_with_hint,
-    checked_void, const_eval, control_flow,
+    LocalCallableInfo, LocalConstInfo, LocalDefKind, LocalSymbol, ReturnFrame, ReturnMode,
+    ScopeState, TypeChecker, TypeError, VarInfo, annotation, check_expr_checked,
+    check_expr_checked_with_hint, checked_void, const_eval, control_flow,
     decl_validate::{
         check_method_generic_shadows, has_generics, has_mutable_param, is_generic,
         method_sig_is_generic, validate_return_spec, validate_type_alias_def,
@@ -1314,9 +1314,19 @@ pub(super) fn check_callable_body_frame(
     span: Span,
     tc: &mut TypeChecker,
 ) -> Option<Type> {
-    for param in params {
+    for (index, param) in params.iter().enumerate() {
         let kind = LocalBindingKind::from_param(param.ty.mutable, &param.ty.ty);
-        let type_id = tc.define_value(param.name, param.ty.ty.clone(), kind, None);
+        let Some(type_id) = tc.define_value(param.name, param.ty.ty.clone(), kind, None) else {
+            continue;
+        };
+        tc.record_local_def(
+            type_id,
+            param.name,
+            None,
+            param.ty.mutable,
+            LocalDefKind::Parameter,
+        );
+        tc.record_param_def(index, type_id);
         tc.mark_non_escaping_callback_param(param.name, type_id, param.ty, param.source_ty);
         if source.is_none() && param.ty.mutable {
             source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
@@ -1363,7 +1373,9 @@ fn check_func_body(
                     MethodReceiver::Value => LocalBindingKind::readonly_self(),
                 };
                 let type_id = tc.define_value(Ident::new("self"), self_ty, kind, None);
-                if matches!(receiver, MethodReceiver::Var) {
+                if matches!(receiver, MethodReceiver::Var)
+                    && let Some(type_id) = type_id
+                {
                     source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
                 }
             }

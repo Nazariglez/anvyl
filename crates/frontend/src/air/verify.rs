@@ -5,7 +5,7 @@ use super::{
         AggregateCtor, Builtin, Callee, Operand, Place, Projection, RValue, Statement, Terminator,
     },
     ids::*,
-    typing::{self, PrimitiveTypes},
+    typing::{self, PrimitiveTypes, supports_scalar_binary, supports_scalar_unary},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1077,14 +1077,9 @@ fn verify_rvalue(
             verify_operand(cx, function_id, block_id, stmt_index, op);
             cx.verify_type_ref(site.clone(), *ty);
             if let Some(value_ty) = operand_ty(cx, op) {
-                let valid = match unary {
-                    crate::ast::UnaryOp::Neg => {
-                        cx.primitives.is_numeric(value_ty) && value_ty == *ty
-                    }
-                    crate::ast::UnaryOp::Not => cx.primitives.is_bool(value_ty) && value_ty == *ty,
-                    crate::ast::UnaryOp::BitNot => {
-                        cx.primitives.is_int(value_ty) && value_ty == *ty
-                    }
+                let valid = match (cx.primitives.scalar(value_ty), cx.primitives.scalar(*ty)) {
+                    (Some(value), Some(result)) => supports_scalar_unary(*unary, value, result),
+                    _ => false,
                 };
                 if !valid {
                     cx.push(
@@ -1113,37 +1108,15 @@ fn verify_rvalue(
                 );
             } else if let (Some(lhs_ty), Some(rhs_ty)) = (operand_ty(cx, lhs), operand_ty(cx, rhs))
             {
-                let valid = match op {
-                    crate::ast::BinaryOp::Add
-                    | crate::ast::BinaryOp::Sub
-                    | crate::ast::BinaryOp::Mul
-                    | crate::ast::BinaryOp::Div
-                    | crate::ast::BinaryOp::Rem => {
-                        lhs_ty == rhs_ty && lhs_ty == *ty && cx.primitives.is_numeric(lhs_ty)
+                let valid = match (
+                    cx.primitives.scalar(lhs_ty),
+                    cx.primitives.scalar(rhs_ty),
+                    cx.primitives.scalar(*ty),
+                ) {
+                    (Some(lhs), Some(rhs), Some(result)) => {
+                        supports_scalar_binary(*op, lhs, rhs, result)
                     }
-                    crate::ast::BinaryOp::LessThan
-                    | crate::ast::BinaryOp::GreaterThan
-                    | crate::ast::BinaryOp::LessThanEq
-                    | crate::ast::BinaryOp::GreaterThanEq => {
-                        lhs_ty == rhs_ty
-                            && cx.primitives.is_numeric(lhs_ty)
-                            && cx.primitives.is_bool(*ty)
-                    }
-                    crate::ast::BinaryOp::Eq | crate::ast::BinaryOp::NotEq => {
-                        lhs_ty == rhs_ty
-                            && cx.primitives.is_scalar_eq(lhs_ty)
-                            && cx.primitives.is_bool(*ty)
-                    }
-                    crate::ast::BinaryOp::BitAnd
-                    | crate::ast::BinaryOp::BitOr
-                    | crate::ast::BinaryOp::Xor
-                    | crate::ast::BinaryOp::Shl
-                    | crate::ast::BinaryOp::Shr => {
-                        cx.primitives.is_int(lhs_ty) && lhs_ty == rhs_ty && lhs_ty == *ty
-                    }
-                    crate::ast::BinaryOp::And
-                    | crate::ast::BinaryOp::Or
-                    | crate::ast::BinaryOp::Coalesce => true,
+                    _ => false,
                 };
                 if !valid {
                     cx.push(

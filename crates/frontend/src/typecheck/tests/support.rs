@@ -134,6 +134,17 @@ impl TypecheckTestResult {
     pub(crate) fn externs(&self) -> &ExternCatalog {
         &self.program.externs
     }
+
+    pub(crate) fn function_body(&self, name: &str) -> BodyInstanceKey {
+        self.program
+            .declaration_facts
+            .functions
+            .iter()
+            .find(|function| function.id.name == Ident::new(name))
+            .expect("missing semantic function fact")
+            .body
+            .clone()
+    }
 }
 
 pub(crate) fn nominal_struct(name: &str) -> Type {

@@ -7,6 +7,7 @@ pub(crate) use self::{
     annotation::DeprecatedUseKind,
     decls::*,
     generic::*,
+    infer::SemanticLocalId,
     result::*,
     semantic_use::*,
     surface::*,
@@ -24,9 +25,7 @@ use self::{
     decl_validate::{check_finite_size_cycles, check_infer_return_decls, generic_param_type_error},
     defaults::{check_decl_param_defaults, check_decl_param_order},
     dyn_infer::DynInference,
-    infer::{
-        LocalTypeId, Solver, SolverFinalizeError, SolverRelationError, SourceExprTypes, TypeHandle,
-    },
+    infer::{Solver, SolverFinalizeError, SolverRelationError, SourceExprTypes, TypeHandle},
     literal::{
         check_array_fill_hint, check_array_lit_hint, check_inferred_enum_hint, check_map_lit_hint,
         check_range_expr, check_string_interp, check_struct_lit_hint,
@@ -868,6 +867,13 @@ impl LocalBindingKind {
         !matches!(self.storage, CaptureStorageOrigin::Const)
     }
 
+    fn is_air_local(self) -> bool {
+        matches!(
+            self.storage,
+            CaptureStorageOrigin::Owned | CaptureStorageOrigin::BorrowedParam
+        )
+    }
+
     fn place_access(self) -> PlaceAccess {
         match self.storage {
             CaptureStorageOrigin::Owned
@@ -886,7 +892,7 @@ impl LocalBindingKind {
 #[derive(Clone)]
 struct VarInfo {
     binding_id: BindingId,
-    type_id: LocalTypeId,
+    type_id: SemanticLocalId,
     kind: LocalBindingKind,
     const_value: Option<ConstValue>,
     local_const: Option<LocalConstId>,
@@ -896,7 +902,7 @@ struct VarInfo {
 #[derive(Clone)]
 struct LocalCallableInfo {
     binding_id: BindingId,
-    type_id: LocalTypeId,
+    type_id: SemanticLocalId,
     callee: CallableRef,
 }
 
@@ -918,7 +924,7 @@ struct LocalConstId(u32);
 #[derive(Clone, Copy)]
 struct LocalConstInfo {
     binding_id: BindingId,
-    type_id: LocalTypeId,
+    type_id: SemanticLocalId,
     id: LocalConstId,
 }
 
@@ -938,6 +944,13 @@ impl LocalConstInfo {
 struct LocalValue {
     info: VarInfo,
     source_depth: usize,
+}
+
+#[derive(Clone)]
+struct SourceModuleFactsInput {
+    scope: ModuleScope,
+    source: SourceId,
+    program: Rc<Program>,
 }
 
 struct LocalPlaceAccess {
@@ -1037,7 +1050,7 @@ struct TypeChecker {
     semantic_facts: SemanticFactMaps,
     expr_places: HashMap<ExprId, place::PlaceValue>,
     closure: ClosureClassifier,
-    global_types: HashMap<GlobalKey, LocalTypeId>,
+    global_types: HashMap<GlobalKey, SemanticLocalId>,
     active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
     dyn_infer_registered_modules: HashSet<ModuleScope>,
     dyn_infer: DynInference,
@@ -1061,11 +1074,14 @@ struct TypeChecker {
     current_module: ModuleScope,
     module_sources: HashMap<ModuleScope, SourceId>,
     module_programs: HashMap<ModuleScope, Rc<Program>>,
+    source_modules: Vec<SourceModuleFactsInput>,
     type_substs: Vec<TypeSubst>,
     const_substs: Vec<ConstSubst>,
     generic_contexts: Vec<GenericTypeContext>,
     generic_owner_frames: Vec<GenericOwnerFrame>,
     active_bodies: Vec<BodyInstanceKey>,
+    local_def_bodies: HashMap<SemanticLocalId, BodyInstanceKey>,
+    local_fact_suppression: usize,
     local_callables: HashMap<CallableId, LocalCallableInfo>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
     specializations: HashMap<CallableInstanceKey, SpecializationState>,
@@ -1107,11 +1123,14 @@ impl TypeChecker {
             current_module: ModuleScope::Root,
             module_sources: HashMap::new(),
             module_programs: HashMap::new(),
+            source_modules: vec![],
             type_substs: vec![],
             const_substs: vec![],
             generic_contexts: vec![],
             generic_owner_frames: vec![],
             active_bodies: vec![],
+            local_def_bodies: HashMap::new(),
+            local_fact_suppression: 0,
             local_callables: HashMap::new(),
             callable_templates: HashMap::new(),
             specializations: HashMap::new(),
@@ -1209,6 +1228,103 @@ impl TypeChecker {
         }
     }
 
+    fn with_suppressed_local_facts<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.local_fact_suppression += 1;
+        let ret = f(self);
+        self.local_fact_suppression = self
+            .local_fact_suppression
+            .checked_sub(1)
+            .expect("local fact suppression underflow");
+        ret
+    }
+
+    fn can_record_local_facts(&self) -> bool {
+        if self.local_fact_suppression > 0 {
+            return false;
+        }
+        let BodyInstanceKey::Callable(key) = self.current_body() else {
+            return false;
+        };
+        key.args.is_empty()
+            && key.target.parent.is_none()
+            && matches!(key.target.kind, CallableKind::Function)
+    }
+
+    fn record_local_def(
+        &mut self,
+        id: SemanticLocalId,
+        name: Ident,
+        span: Option<Span>,
+        mutable: bool,
+        kind: LocalDefKind,
+    ) {
+        if !self.can_record_local_facts() {
+            return;
+        }
+        let body = self.current_body();
+        let span = span.map(|span| self.source_span(span));
+        self.semantic_facts.record_local_def(
+            body.clone(),
+            LocalDefFact {
+                id,
+                name,
+                span,
+                ty: Type::Infer,
+                mutable,
+                kind,
+            },
+        );
+        self.local_def_bodies.insert(id, body);
+    }
+
+    fn record_binding_def(&mut self, span: Span, local: SemanticLocalId) {
+        if !self.can_record_local_facts() {
+            return;
+        }
+        let body = self.current_body();
+        self.semantic_facts
+            .record_binding_def(body, self.source_span(span), local);
+    }
+
+    fn record_param_def(&mut self, index: usize, local: SemanticLocalId) {
+        if !self.can_record_local_facts() {
+            return;
+        }
+        self.semantic_facts
+            .record_param_def(self.current_body(), index, local);
+    }
+
+    fn has_recordable_semantic_local(&self, local: SemanticLocalId) -> bool {
+        self.can_record_local_facts()
+            && self
+                .local_def_bodies
+                .get(&local)
+                .is_some_and(|body| *body == self.current_body())
+    }
+
+    fn record_local_use(&mut self, expr_id: ExprId, local: SemanticLocalId, mode: LocalUseMode) {
+        if !self.can_record_local_facts() {
+            return;
+        }
+        let body = self.current_body();
+        let has_def = self
+            .semantic_facts
+            .body(&body)
+            .is_some_and(|facts| facts.locals.defs.contains_key(&local));
+        debug_assert!(has_def, "semantic local use missing local definition");
+        if !has_def {
+            return;
+        }
+        self.semantic_facts.record_local_use(
+            body,
+            LocalUseFact {
+                expr_id,
+                local,
+                mode,
+            },
+        );
+    }
+
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
         self.local_type_scopes.push_scope();
@@ -1299,7 +1415,7 @@ impl TypeChecker {
         &mut self,
         binding_id: BindingId,
         name: Ident,
-        type_id: LocalTypeId,
+        type_id: SemanticLocalId,
         kind: LocalBindingKind,
     ) {
         let Some(scope_depth) = self.scopes.len().checked_sub(1) else {
@@ -1318,14 +1434,22 @@ impl TypeChecker {
         name: Ident,
         handle: &TypeHandle,
         mutable: bool,
-    ) {
-        self.define_shadowing_value_from_handle(
-            name,
-            handle,
-            LocalBindingKind::from_mutable(mutable),
-            None,
-            None,
-        );
+        span: Option<Span>,
+    ) -> SemanticLocalId {
+        let id = self
+            .define_shadowing_value_from_handle(
+                name,
+                handle,
+                LocalBindingKind::from_mutable(mutable),
+                None,
+                None,
+            )
+            .expect("pattern binding requires an active local scope");
+        if let Some(span) = span {
+            self.record_local_def(id, name, Some(span), mutable, LocalDefKind::Binding);
+            self.record_binding_def(span, id);
+        }
+        id
     }
 
     fn define_alias_binding_from_handle(
@@ -1369,7 +1493,7 @@ impl TypeChecker {
         ty: Type,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
-    ) -> LocalTypeId {
+    ) -> Option<SemanticLocalId> {
         self.define_value_with_alias(name, ty, kind, const_value, None)
     }
 
@@ -1380,7 +1504,7 @@ impl TypeChecker {
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
-    ) -> LocalTypeId {
+    ) -> Option<SemanticLocalId> {
         let binding_id = self.fresh_binding_id();
         let type_id = self.solver.alloc_local_type(&ty);
         let inserted = self.define_local_symbol(
@@ -1394,10 +1518,11 @@ impl TypeChecker {
                 alias: alias.map(Box::new),
             }),
         );
-        if inserted {
-            self.define_closure_binding(binding_id, name, type_id, kind);
+        if !inserted {
+            return None;
         }
-        type_id
+        self.define_closure_binding(binding_id, name, type_id, kind);
+        Some(type_id)
     }
 
     fn define_local_symbol(&mut self, name: Ident, symbol: LocalSymbol) -> bool {
@@ -1423,23 +1548,21 @@ impl TypeChecker {
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
-    ) {
+    ) -> Option<SemanticLocalId> {
         let type_id = self.solver.alloc_local_type_from_handle(handle);
-        self.define_shadowing_local(name, type_id, kind, const_value, alias);
+        self.define_shadowing_local(name, type_id, kind, const_value, alias)
     }
 
     fn define_shadowing_local(
         &mut self,
         name: Ident,
-        type_id: LocalTypeId,
+        type_id: SemanticLocalId,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
-    ) {
+    ) -> Option<SemanticLocalId> {
         let binding_id = self.fresh_binding_id();
-        let Some(scope) = self.scopes.last_mut() else {
-            return;
-        };
+        let scope = self.scopes.last_mut()?;
         scope.insert(
             name,
             LocalSymbol::Value(VarInfo {
@@ -1452,6 +1575,7 @@ impl TypeChecker {
             }),
         );
         self.define_closure_binding(binding_id, name, type_id, kind);
+        Some(type_id)
     }
 
     fn local_binding_id(&self, name: Ident) -> Option<BindingId> {
@@ -1592,7 +1716,7 @@ impl TypeChecker {
         self.solver.concrete_type(ty)
     }
 
-    fn local_handle(&self, id: LocalTypeId) -> TypeHandle {
+    fn local_handle(&self, id: SemanticLocalId) -> TypeHandle {
         self.solver.local_handle(id)
     }
 
@@ -2204,6 +2328,57 @@ impl TypeChecker {
             .collect()
     }
 
+    fn build_semantic_declarations(&self) -> SemanticDeclarations {
+        let mut facts = SemanticDeclarations::default();
+        for module in &self.source_modules {
+            facts.modules.push(SemanticModuleFact {
+                module: module.scope.clone(),
+                source: module.source,
+            });
+
+            for stmt in &module.program.stmts {
+                let Stmt::Func(func_node) = &stmt.node else {
+                    continue;
+                };
+                let func = &func_node.node;
+                if !func.type_params.is_empty()
+                    || !func.const_params.is_empty()
+                    || func.params.iter().any(|param| param.default.is_some())
+                {
+                    continue;
+                }
+                let id = CallableId::function(module.scope.clone(), func.name);
+                let value = self
+                    .decls
+                    .local_value(&module.scope, func.name)
+                    .expect("concrete source function missing declaration");
+                let callable = self
+                    .decls
+                    .callable_for_value(&value)
+                    .expect("concrete source function declaration is not callable");
+                assert_eq!(callable.def.id, id);
+                assert!(callable.def.sig.generics.is_empty());
+                assert!(callable.def.sig.owner_generics.is_empty());
+                assert_eq!(
+                    callable.def.sig.required_params,
+                    callable.def.sig.params.len()
+                );
+                assert_eq!(func.params.len(), callable.def.sig.params.len());
+                let body = BodyInstanceKey::Callable(CallableInstanceKey {
+                    target: id.clone(),
+                    args: GenericArgs::default(),
+                });
+                facts.functions.push(SemanticFunctionFact {
+                    id,
+                    body,
+                    return_ty: callable.def.sig.ret.ty,
+                });
+            }
+        }
+        facts.validate();
+        facts
+    }
+
     fn finish(&mut self) -> Option<SemanticCheckOutput> {
         self.solve_constraints();
         self.solve_dyn_inference();
@@ -2215,7 +2390,9 @@ impl TypeChecker {
 
         let (types, finalize_errors) = self.solver.finalize_expr_types();
         let has_finalize_errors = self.push_finalize_errors(finalize_errors);
-        if !has_finalize_errors && !self.finish_semantic_expr_types() {
+        let has_local_finalize_errors = self.finish_semantic_local_defs();
+        if !has_finalize_errors && !has_local_finalize_errors && !self.finish_semantic_expr_types()
+        {
             for error in self.result_closure_errors(&types) {
                 self.push_error_once(error);
             }
@@ -2232,6 +2409,7 @@ impl TypeChecker {
         facts.used_imports.clone_from(self.decls.used_imports());
         facts.used_imports.extend(self.used_imports.clone());
         self.semantic_facts.validate_finished();
+        let declaration_facts = self.build_semantic_declarations();
         Some(SemanticCheckOutput {
             warnings: std::mem::take(&mut self.warnings),
             lint_events: std::mem::take(&mut self.lint_events),
@@ -2240,6 +2418,7 @@ impl TypeChecker {
             source_types: types,
             program: SemanticProgram {
                 facts: self.semantic_facts.clone(),
+                declaration_facts,
                 declarations: self.decls.clone(),
                 externs: self.externs.clone(),
             },
@@ -2261,6 +2440,23 @@ impl TypeChecker {
                 diagnostic_context,
             }),
         }
+    }
+
+    fn finish_semantic_local_defs(&mut self) -> bool {
+        let records = self
+            .local_def_bodies
+            .iter()
+            .map(|(local, body)| (*local, body.clone()))
+            .collect::<Vec<_>>();
+        let mut has_errors = false;
+        for (local, body) in records {
+            let (ty, errors) = self
+                .solver
+                .finalize_handle_to_type(&self.solver.local_handle(local));
+            has_errors |= self.push_finalize_errors(errors);
+            self.semantic_facts.finish_local_def(&body, local, ty);
+        }
+        has_errors
     }
 
     fn finish_semantic_expr_types(&mut self) -> bool {
@@ -2509,31 +2705,28 @@ fn typechecker_for_modules(
 
     let mut tc = TypeChecker::new(decls, catalog, config);
     let root_scope = ModuleScope::from_module_id(&resolved.root);
-    let root_source = resolved.root_source;
     tc.current_module = root_scope.clone();
-    tc.module_sources.insert(root_scope.clone(), root_source);
-    tc.with_current_module(&root_scope, |tc| {
-        tc.collect_const_decls(&root_scope, program);
-        collect_callable_templates(&root_scope, program, tc);
-    });
 
     let mut module_bodies = vec![];
-    for group in &resolved.module_groups {
-        for module in group {
-            if module.key == resolved.root {
-                continue;
-            }
-            let scope = ModuleScope::from_module_id(&module.key);
-            let program = Rc::new(module.program.clone());
-            tc.module_sources.insert(scope.clone(), module.source);
+    for source_module in DeclarationIndex::source_modules(program, resolved) {
+        let scope = source_module.scope;
+        let source = source_module.source;
+        let program = Rc::new(source_module.program.clone());
+        tc.module_sources.insert(scope.clone(), source);
+        tc.source_modules.push(SourceModuleFactsInput {
+            scope: scope.clone(),
+            source,
+            program: Rc::clone(&program),
+        });
+        if scope != root_scope {
             tc.module_programs
                 .insert(scope.clone(), Rc::clone(&program));
-            tc.with_current_module(&scope, |tc| {
-                tc.collect_const_decls(&scope, program.as_ref());
-                collect_callable_templates(&scope, program.as_ref(), tc);
-            });
-            module_bodies.push((scope, program));
+            module_bodies.push((scope.clone(), Rc::clone(&program)));
         }
+        tc.with_current_module(&scope, |tc| {
+            tc.collect_const_decls(&scope, program.as_ref());
+            collect_callable_templates(&scope, program.as_ref(), tc);
+        });
     }
 
     tc.with_current_module(&root_scope, |tc| tc.eval_module_consts(&root_scope));
@@ -2917,6 +3110,9 @@ fn check_expr_checked_with_hint(
             LocalSymbolLookup::Found(LocalSymbol::Value(ref info), depth) => {
                 let value = tc.local_value_from_info(info.clone(), depth);
                 tc.record_local_read(expr.node.id, &value);
+                if info.kind.is_air_local() && tc.has_recordable_semantic_local(info.type_id) {
+                    tc.record_local_use(expr.node.id, info.type_id, LocalUseMode::Read);
+                }
                 let access = tc.local_value_access(&value);
                 tc.check_mut_downcast_root_use(Some(*name), &access.identity, expr.span);
                 if let Some((_, value_name, value)) = tc.lookup_named_value(*name)

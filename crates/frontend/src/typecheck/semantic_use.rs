@@ -3,7 +3,8 @@ use std::{collections::HashMap, hash::Hash};
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
     decls::{CallableId, ExtendId, GlobalKey},
-    infer::TypeHandle,
+    infer::{SemanticLocalId, TypeHandle},
+    type_ops::{type_closure_facts, type_depends_on_generics},
 };
 use crate::{
     ast::{ExprId, Ident},
@@ -29,6 +30,127 @@ pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
 pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
 pub(crate) type BindingPromotionMap = HashMap<BindingId, BindingPromotionFact>;
 pub(crate) type ForStepRuntimeCheckMap = HashMap<ExprId, SourceSpan>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LocalFacts {
+    pub(crate) defs: HashMap<SemanticLocalId, LocalDefFact>,
+    pub(crate) binding_defs: HashMap<SourceSpan, SemanticLocalId>,
+    pub(crate) param_defs: HashMap<usize, SemanticLocalId>,
+    pub(crate) uses: HashMap<ExprId, LocalUseFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalDefFact {
+    pub(crate) id: SemanticLocalId,
+    pub(crate) name: Ident,
+    pub(crate) span: Option<SourceSpan>,
+    pub(crate) ty: Type,
+    pub(crate) mutable: bool,
+    pub(crate) kind: LocalDefKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalDefKind {
+    Binding,
+    Parameter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalUseFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) local: SemanticLocalId,
+    pub(crate) mode: LocalUseMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalUseMode {
+    Read,
+    Assign,
+    CompoundAssign,
+}
+
+impl LocalFacts {
+    fn validate(&self) {
+        for (id, fact) in &self.defs {
+            debug_assert_eq!(*id, fact.id);
+        }
+        for (span, id) in &self.binding_defs {
+            let Some(fact) = self.defs.get(id) else {
+                debug_assert!(false, "binding local fact missing definition");
+                continue;
+            };
+            debug_assert_eq!(fact.kind, LocalDefKind::Binding);
+            debug_assert_eq!(fact.span, Some(*span));
+        }
+        for id in self.param_defs.values() {
+            let Some(fact) = self.defs.get(id) else {
+                debug_assert!(false, "parameter local fact missing definition");
+                continue;
+            };
+            debug_assert_eq!(fact.kind, LocalDefKind::Parameter);
+        }
+        for (expr_id, fact) in &self.uses {
+            debug_assert_eq!(*expr_id, fact.expr_id);
+            debug_assert!(self.defs.contains_key(&fact.local));
+        }
+    }
+
+    fn validate_finished(&self) {
+        self.validate();
+        for fact in self.defs.values() {
+            debug_assert!(!type_has_unfinished_facts(&fact.ty));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SemanticDeclarations {
+    pub(crate) modules: Vec<SemanticModuleFact>,
+    pub(crate) functions: Vec<SemanticFunctionFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticModuleFact {
+    pub(crate) module: ModuleScope,
+    pub(crate) source: crate::source::SourceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticFunctionFact {
+    pub(crate) id: CallableId,
+    pub(crate) body: BodyInstanceKey,
+    pub(crate) return_ty: Type,
+}
+
+impl SemanticDeclarations {
+    pub(crate) fn validate(&self) {
+        let mut modules = std::collections::HashSet::new();
+        for fact in &self.modules {
+            debug_assert!(modules.insert(fact.module.clone()));
+        }
+
+        let mut functions = std::collections::HashSet::new();
+        for fact in &self.functions {
+            match &fact.body {
+                BodyInstanceKey::Callable(key) => debug_assert_eq!(key.target, fact.id),
+                BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => {
+                    debug_assert!(false, "semantic function fact has non-callable body");
+                }
+            }
+            debug_assert!(functions.insert((fact.id.clone(), fact.body.clone())));
+            debug_assert!(!type_has_unfinished_facts(&fact.return_ty));
+        }
+    }
+}
+
+fn type_has_unfinished_facts(ty: &Type) -> bool {
+    let closure = type_closure_facts(ty);
+    closure.first_unresolved.is_some()
+        || closure.infer.contains_type
+        || closure.infer.contains_return
+        || closure.contains_unresolved_const
+        || type_depends_on_generics(ty)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallableInstanceKey {
@@ -90,6 +212,7 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) dyn_downcasts: DynDowncastMap,
     pub(crate) global_accesses: GlobalAccessMap,
     pub(crate) for_step_runtime_checks: ForStepRuntimeCheckMap,
+    pub(crate) locals: LocalFacts,
 }
 
 impl SemanticBodyFacts {
@@ -133,6 +256,7 @@ impl SemanticBodyFacts {
         for (expr_id, fact) in &self.global_accesses {
             debug_assert_eq!(*expr_id, fact.expr_id);
         }
+        self.locals.validate();
     }
 
     pub(crate) fn validate_finished(&self) {
@@ -140,6 +264,7 @@ impl SemanticBodyFacts {
         for fact in self.expr_types.values() {
             debug_assert!(fact.ty.is_some());
         }
+        self.locals.validate_finished();
         #[cfg(debug_assertions)]
         for (expr_id, projection) in &self.expected_projections {
             let Some(expr) = self.expr_types.get(expr_id) else {
@@ -208,6 +333,54 @@ impl SemanticFactMaps {
             self.witness_keys.insert(fact.key.clone(), fact.id);
             self.contract_witnesses.insert(fact.id, fact);
         }
+    }
+
+    pub(super) fn record_local_def(&mut self, body: BodyInstanceKey, fact: LocalDefFact) {
+        let local = fact.id;
+        self.body_mut(body).locals.defs.insert(local, fact);
+    }
+
+    pub(super) fn record_binding_def(
+        &mut self,
+        body: BodyInstanceKey,
+        span: SourceSpan,
+        local: SemanticLocalId,
+    ) {
+        self.body_mut(body).locals.binding_defs.insert(span, local);
+    }
+
+    pub(super) fn record_param_def(
+        &mut self,
+        body: BodyInstanceKey,
+        index: usize,
+        local: SemanticLocalId,
+    ) {
+        self.body_mut(body).locals.param_defs.insert(index, local);
+    }
+
+    pub(super) fn record_local_use(&mut self, body: BodyInstanceKey, fact: LocalUseFact) {
+        let existing = self
+            .body_mut(body)
+            .locals
+            .uses
+            .insert(fact.expr_id, fact.clone());
+        if let Some(existing) = existing {
+            debug_assert_eq!(existing, fact, "conflicting semantic local use fact");
+        }
+    }
+
+    pub(crate) fn finish_local_def(
+        &mut self,
+        body: &BodyInstanceKey,
+        local: SemanticLocalId,
+        ty: Type,
+    ) {
+        let fact = self
+            .bodies
+            .get_mut(body)
+            .and_then(|body| body.locals.defs.get_mut(&local))
+            .expect("semantic local definition missing during finish");
+        fact.ty = ty;
     }
 
     pub(super) fn record_expr_type(

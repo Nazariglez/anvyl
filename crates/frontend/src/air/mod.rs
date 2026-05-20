@@ -6,6 +6,7 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod lower;
 mod typing;
 mod verify;
 

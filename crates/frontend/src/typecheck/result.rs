@@ -2,8 +2,9 @@ use std::path::Path;
 
 use super::{
     BindingPromotionMap, CompileWarning, ForStepRuntimeCheckMap, ImportId, ImportRecord,
-    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, NominalKey, SemanticFactMaps, TypeError,
-    decls::DeclarationIndex, infer::SourceExprTypes, semantic_use::map_delta,
+    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, NominalKey, SemanticDeclarations,
+    SemanticFactMaps, TypeError, decls::DeclarationIndex, infer::SourceExprTypes,
+    semantic_use::map_delta,
 };
 use crate::{
     ast::Visibility,
@@ -16,6 +17,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct SemanticProgram {
     pub(crate) facts: SemanticFactMaps,
+    pub(crate) declaration_facts: SemanticDeclarations,
     pub(crate) declarations: DeclarationIndex,
     pub(crate) externs: ExternCatalog,
 }
@@ -142,6 +144,7 @@ pub struct TypecheckFacts {
 impl TypecheckFacts {
     pub(crate) fn from_semantic(output: SemanticCheckOutput) -> Self {
         output.program.facts.validate_finished();
+        output.program.declaration_facts.validate();
         debug_assert!(output.source_types.values().all(|(span, _)| span.is_some()));
         debug_assert_eq!(
             output.program.declarations.import_records().len(),

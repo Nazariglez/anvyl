@@ -19,7 +19,7 @@ fn returns_verified_wrapper() {
 #[test]
 fn fn_return() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
+    let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("ret42", module, FunctionKind::Normal, int_ty);
@@ -39,7 +39,7 @@ fn fn_return() {
 #[test]
 fn init_and_assign_mutable_local() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
+    let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
     let c1 = builder.alloc_const(ConstData {
         ty: int_ty,
@@ -67,9 +67,9 @@ fn init_and_assign_mutable_local() {
 #[test]
 fn primitive_rvalues() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
-    let float_ty = builder.alloc_type(TypeData::Float);
-    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let int_ty = builder.int_ty();
+    let float_ty = builder.float_ty();
+    let bool_ty = builder.bool_ty();
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("primitive_rvalues", module, FunctionKind::Normal, int_ty);
@@ -120,7 +120,7 @@ fn primitive_rvalues() {
 #[test]
 fn fn_params() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
+    let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("add", module, FunctionKind::Normal, int_ty);
@@ -136,8 +136,8 @@ fn fn_params() {
 #[test]
 fn fn_aggregate() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
     let module = test_module(&mut builder);
 
     let agg_id = builder.alloc_aggregate(AggregateDecl {
@@ -198,7 +198,7 @@ fn fn_aggregate() {
 #[test]
 fn enum_switch() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let void_ty = builder.void_ty();
     let module = test_module(&mut builder);
 
     let enum_id = builder.alloc_enum(EnumDecl {
@@ -242,8 +242,8 @@ fn enum_switch() {
 #[test]
 fn extern_call() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
     let module = test_module(&mut builder);
 
     builder.alloc_extern_type(ExternTypeDecl {
@@ -284,8 +284,8 @@ fn extern_call() {
 #[test]
 fn if_bool() {
     let mut builder = ProgramBuilder::default();
-    let bool_ty = builder.alloc_type(TypeData::Bool);
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let bool_ty = builder.bool_ty();
+    let void_ty = builder.void_ty();
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("branch", module, FunctionKind::Normal, void_ty);
@@ -302,7 +302,7 @@ fn if_bool() {
 #[test]
 fn multi_block_goto() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let void_ty = builder.void_ty();
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("multi_block", module, FunctionKind::Normal, void_ty);
@@ -321,7 +321,7 @@ fn multi_block_goto() {
 #[test]
 fn unreachable_fn() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let void_ty = builder.void_ty();
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("unreachable_fn", module, FunctionKind::Normal, void_ty);
@@ -335,8 +335,8 @@ fn unreachable_fn() {
 #[test]
 fn tuple_and_list() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
-    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
     let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![int_ty, bool_ty]));
     let list_ty = builder.alloc_type(TypeData::List(int_ty));
     builder.alloc_type(TypeData::Map {
@@ -359,7 +359,7 @@ fn tuple_and_list() {
 #[test]
 fn closure_make_call() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
+    let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
 
     let mut inner_fb = FunctionBuilder::new("inner", module, FunctionKind::Closure, int_ty);
@@ -404,7 +404,7 @@ fn closure_make_call() {
 #[test]
 fn multi_module() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let void_ty = builder.void_ty();
 
     let m0 = builder.alloc_module(empty_module("a"));
     let m1 = builder.alloc_module(empty_module("b"));
