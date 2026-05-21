@@ -4,7 +4,7 @@ use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
     decls::{CallableId, ExtendId, GlobalKey},
     infer::{SemanticLocalId, TypeHandle},
-    type_ops::{TypeVisitor, type_closure_facts, type_depends_on_generics},
+    type_ops::{TypeVisitor, type_has_unfinished_facts},
 };
 use crate::{
     ast::{ContractRef, ExprId, Ident},
@@ -215,15 +215,6 @@ impl SemanticDeclarations {
             }
         }
     }
-}
-
-fn type_has_unfinished_facts(ty: &Type) -> bool {
-    let closure = type_closure_facts(ty);
-    closure.first_unresolved.is_some()
-        || closure.infer.contains_type
-        || closure.infer.contains_return
-        || closure.contains_unresolved_const
-        || type_depends_on_generics(ty)
 }
 
 fn type_contains_dyn_hole(ty: &Type) -> bool {

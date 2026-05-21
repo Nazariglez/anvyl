@@ -5,13 +5,14 @@ use std::{
 
 pub(crate) use self::{
     annotation::DeprecatedUseKind,
+    const_term::ConstTerm,
     decls::*,
     generic::*,
     infer::SemanticLocalId,
     result::*,
     semantic_use::*,
     surface::*,
-    type_ops::type_closure_facts,
+    type_ops::{type_closure_facts, type_has_unfinished_facts},
     type_refs::{GenericTypeContext, TypeRefError, TypeRefResolver},
 };
 use self::{
@@ -21,7 +22,6 @@ use self::{
         collect_callable_templates, register_declarations,
     },
     closure::{ClosureClassifier, ClosureScopeState},
-    const_term::ConstTerm,
     decl_validate::{check_finite_size_cycles, check_infer_return_decls, generic_param_type_error},
     defaults::{check_decl_param_defaults, check_decl_param_order},
     dyn_infer::DynInference,

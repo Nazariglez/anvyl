@@ -46,6 +46,15 @@ pub(crate) fn type_depends_on_generics(ty: &Type) -> bool {
     visitor.visit_type(ty)
 }
 
+pub(crate) fn type_has_unfinished_facts(ty: &Type) -> bool {
+    let closure = type_closure_facts(ty);
+    closure.first_unresolved.is_some()
+        || closure.infer.contains_type
+        || closure.infer.contains_return
+        || closure.contains_unresolved_const
+        || type_depends_on_generics(ty)
+}
+
 struct GenericDependencyVisitor;
 
 impl TypeVisitor for GenericDependencyVisitor {

@@ -19,18 +19,15 @@ use crate::{
     source::SourceId,
     span::SourceSpan,
     typecheck::{
-        BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, DeclarationIndex,
+        BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, ConstTerm, DeclarationIndex,
         DefaultArgFact, ExternUseTarget, GenericArgs, LocalDefFact, LocalDefKind, LocalUseFact,
         LocalUseMode, ModuleScope, SemanticBodyFacts, SemanticFunctionInstanceFact,
-        SemanticLocalId, SemanticProgram,
+        SemanticLocalId, SemanticProgram, type_has_unfinished_facts,
     },
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LowerError {
-    MissingBodyFacts {
-        body: Box<BodyInstanceKey>,
-    },
     MissingExprType {
         body: Box<BodyInstanceKey>,
         expr_id: ExprId,
@@ -63,9 +60,13 @@ pub(crate) enum LowerError {
         param_index: usize,
         expr_id: ExprId,
     },
-    UnsupportedDecl {
-        kind: &'static str,
-        span: Option<SourceSpan>,
+    NonConcreteRoot {
+        id: Box<CallableId>,
+        args: Box<GenericArgs>,
+    },
+    UnsupportedRootCallable {
+        id: Box<CallableId>,
+        args: Box<GenericArgs>,
     },
     MissingFunctionFact {
         id: Box<CallableId>,
@@ -87,6 +88,9 @@ pub(crate) enum LowerError {
     MissingLoweredCallee {
         body: Box<BodyInstanceKey>,
     },
+    MissingEntryRoot {
+        root: Box<CallableInstanceKey>,
+    },
     UnsupportedStmt {
         kind: &'static str,
         span: Option<SourceSpan>,
@@ -102,6 +106,63 @@ pub(crate) enum LowerError {
     UnterminatedBlock,
     Verify(Box<[VerifyError]>),
     AnyTypeEmitted(TypeId),
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AirLowerConfig {
+    pub(crate) roots: AirRoots,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AirRoots {
+    pub(crate) entry: Option<CallableInstanceKey>,
+    pub(crate) callables: Vec<CallableInstanceKey>,
+}
+
+impl AirRoots {
+    fn normalized(&self) -> Vec<CallableInstanceKey> {
+        let mut roots = vec![];
+        if let Some(entry) = &self.entry {
+            roots.push(entry.clone());
+        }
+        roots.extend(self.callables.iter().cloned());
+
+        let mut unique = vec![];
+        for root in roots {
+            if !unique.contains(&root) {
+                unique.push(root);
+            }
+        }
+        unique
+    }
+}
+
+struct SemanticCallableFacts<'a> {
+    functions: HashMap<CallableInstanceKey, &'a SemanticFunctionInstanceFact>,
+}
+
+impl<'a> SemanticCallableFacts<'a> {
+    fn new(semantic: &'a SemanticProgram) -> Self {
+        let functions = semantic
+            .declaration_facts
+            .functions
+            .iter()
+            .map(|fact| {
+                (
+                    CallableInstanceKey {
+                        target: fact.id.clone(),
+                        args: fact.args.clone(),
+                    },
+                    fact,
+                )
+            })
+            .collect();
+        Self { functions }
+    }
+
+    fn get(&self, key: &CallableInstanceKey) -> Option<&'a SemanticFunctionInstanceFact> {
+        self.functions.get(key).copied()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -151,39 +212,96 @@ impl LowerCx {
         self.types.lower(&mut self.program, ty)
     }
 
-    fn lower_modules(&mut self, modules: &SourceModules<'_>) {
-        for module in &modules.items {
-            let id = self.program.alloc_module(Module {
-                path: module.path.clone(),
-                functions: vec![],
-                aggregates: vec![],
-                enums: vec![],
-                extern_types: vec![],
-                externs: vec![],
+    fn set_entry(&mut self, root: &CallableInstanceKey) -> Result<(), LowerError> {
+        let body = BodyInstanceKey::Callable(root.clone());
+        let Some(function) = self.maps.bodies.get(&body).copied() else {
+            return Err(LowerError::MissingEntryRoot {
+                root: Box::new(root.clone()),
             });
-            let old = self.maps.modules.insert(module.scope.clone(), id);
-            debug_assert!(old.is_none(), "duplicate source module in AIR lowering");
+        };
+        self.program.set_entry(function);
+        Ok(())
+    }
+
+    fn ensure_module(&mut self, scope: &ModuleScope) -> ModuleId {
+        if let Some(id) = self.maps.modules.get(scope).copied() {
+            return id;
         }
+        let id = self.program.alloc_module(Module {
+            path: module_path(scope),
+            functions: vec![],
+            aggregates: vec![],
+            enums: vec![],
+            extern_types: vec![],
+            externs: vec![],
+        });
+        let old = self.maps.modules.insert(scope.clone(), id);
+        debug_assert!(old.is_none(), "duplicate source module in AIR lowering");
+        id
+    }
+
+    fn alloc_function_in_module(
+        &mut self,
+        scope: &ModuleScope,
+        body: BodyInstanceKey,
+        locals: HashMap<SemanticLocalId, LocalId>,
+        build: impl FnOnce(ModuleId) -> Function,
+    ) -> FunctionId {
+        let module = self.ensure_module(scope);
+        let id = self.program.alloc_function(build(module));
+        self.program.module_mut(module).functions.push(id);
+        let old = self.maps.bodies.insert(body.clone(), id);
+        debug_assert!(old.is_none(), "duplicate lowered function body");
+        let old = self.maps.locals.insert(body, locals);
+        debug_assert!(old.is_none(), "duplicate lowered function local map");
+        id
+    }
+
+    fn alloc_extern_in_module(
+        &mut self,
+        scope: &ModuleScope,
+        source_id: crate::externs::catalog::ExternFunctionId,
+        name: Ident,
+        member: ExternMember,
+        params: Vec<TypeId>,
+        return_type: TypeId,
+    ) -> ExternId {
+        let module = self.ensure_module(scope);
+        let id = self.program.alloc_extern(ExternDecl {
+            name,
+            module,
+            member,
+            params,
+            return_type,
+        });
+        self.program.module_mut(module).externs.push(id);
+        let old = self.maps.externs.insert(source_id, id);
+        debug_assert!(old.is_none(), "duplicate lowered extern");
+        id
     }
 
     fn lower_extern_declarations(
         &mut self,
-        functions: &SourceFunctions<'_>,
+        functions: &ReachableCallables<'_>,
         semantic: &SemanticProgram,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
-            let Some(facts) = semantic.facts.body(&source.body) else {
-                continue;
-            };
-            let mut externs = facts
+            let mut externs = vec![];
+            let mut uses = source
+                .body_facts
+                .as_facts()
                 .extern_uses
-                .values()
-                .flatten()
-                .filter_map(|target| match target {
-                    ExternUseTarget::Function(id) => Some(*id),
-                    _ => None,
-                })
+                .iter()
                 .collect::<Vec<_>>();
+            uses.sort_by_key(|(expr_id, _)| expr_id.0);
+            for (expr_id, targets) in uses {
+                for target in targets {
+                    match target {
+                        ExternUseTarget::Function(id) => externs.push(*id),
+                        _ => return Err(LowerError::UnsupportedExternUse { expr_id: *expr_id }),
+                    }
+                }
+            }
             externs.sort_by_key(|id| {
                 let function = semantic.externs.function(*id);
                 format!("{:?}::{}", function.key.module, function.key.name.as_str())
@@ -195,22 +313,6 @@ impl LowerCx {
                 }
                 let function = semantic.externs.function(id);
                 let module_scope = &function.key.module;
-                let module = match self.maps.modules.get(module_scope).copied() {
-                    Some(module) => module,
-                    None => {
-                        let path = module_path(module_scope);
-                        let module = self.program.alloc_module(Module {
-                            path,
-                            functions: vec![],
-                            aggregates: vec![],
-                            enums: vec![],
-                            extern_types: vec![],
-                            externs: vec![],
-                        });
-                        self.maps.modules.insert(module_scope.clone(), module);
-                        module
-                    }
-                };
                 let params = function
                     .signature
                     .params
@@ -225,15 +327,14 @@ impl LowerCx {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let return_type = self.lower_ty(&function.signature.ret.ty)?;
-                let air_id = self.program.alloc_extern(ExternDecl {
-                    name: function.key.name,
-                    module,
-                    member: ExternMember::FreeFunction,
+                self.alloc_extern_in_module(
+                    module_scope,
+                    id,
+                    function.key.name,
+                    ExternMember::FreeFunction,
                     params,
                     return_type,
-                });
-                self.program.module_mut(module).externs.push(air_id);
-                self.maps.externs.insert(id, air_id);
+                );
             }
         }
         Ok(())
@@ -242,25 +343,11 @@ impl LowerCx {
     fn lower_function_shells(
         &mut self,
         modules: &SourceModules<'_>,
-        functions: &SourceFunctions<'_>,
-        semantic: &SemanticProgram,
+        functions: &ReachableCallables<'_>,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
             let module_scope = &modules.items[source.module].scope;
-            let module = self.maps.modules[module_scope];
-            let empty_facts;
-            let body_facts = match semantic.facts.body(&source.body) {
-                Some(facts) => facts,
-                None if source.can_omit_body_facts() => {
-                    empty_facts = SemanticBodyFacts::default();
-                    &empty_facts
-                }
-                None => {
-                    return Err(LowerError::MissingBodyFacts {
-                        body: Box::new(source.body.clone()),
-                    });
-                }
-            };
+            let body_facts = source.body_facts.as_facts();
             reject_unsupported_stringifies(body_facts)?;
             let return_type = self.lower_ty(&source.fact.return_ty)?;
             let mut params = vec![];
@@ -307,46 +394,29 @@ impl LowerCx {
                     local_id,
                 });
             }
-            let function = Function {
-                name: source.func.node.name,
-                module,
-                kind: FunctionKind::Normal,
-                signature: Signature::new(params, return_type),
-                locals,
-                body: vec![BasicBlock {
-                    statements: vec![],
-                    terminator: Terminator::Unreachable,
-                }],
-            };
-            let id = self.program.alloc_function(function);
-            self.program.module_mut(module).functions.push(id);
-            let old = self.maps.bodies.insert(source.body.clone(), id);
-            debug_assert!(old.is_none(), "duplicate lowered function body");
-            let old = self.maps.locals.insert(source.body.clone(), local_map);
-            debug_assert!(old.is_none(), "duplicate lowered function local map");
+            self.alloc_function_in_module(module_scope, source.body.clone(), local_map, |module| {
+                Function {
+                    name: source.func.node.name,
+                    module,
+                    kind: FunctionKind::Normal,
+                    signature: Signature::new(params, return_type),
+                    locals,
+                    body: vec![BasicBlock {
+                        statements: vec![],
+                        terminator: Terminator::Unreachable,
+                    }],
+                }
+            });
         }
         Ok(())
     }
 
     fn lower_function_bodies(
         &mut self,
-        functions: &SourceFunctions<'_>,
-        semantic: &SemanticProgram,
+        functions: &ReachableCallables<'_>,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
-            let empty_facts;
-            let facts = match semantic.facts.body(&source.body) {
-                Some(facts) => facts,
-                None if source.can_omit_body_facts() => {
-                    empty_facts = SemanticBodyFacts::default();
-                    &empty_facts
-                }
-                None => {
-                    return Err(LowerError::MissingBodyFacts {
-                        body: Box::new(source.body.clone()),
-                    });
-                }
-            };
+            let facts = source.body_facts.as_facts();
             let function = self.maps.bodies[&source.body];
             let locals = self
                 .maps
@@ -365,7 +435,7 @@ struct FunctionLowerer<'cx, 'facts> {
     cx: &'cx mut LowerCx,
     body: BodyInstanceKey,
     facts: &'facts SemanticBodyFacts,
-    default_exprs: &'facts HashMap<(CallableId, SourceId, ExprId), &'facts ExprNode>,
+    index: &'facts SourceProgramIndex<'facts>,
     function_id: FunctionId,
     source: SourceId,
     function: Function,
@@ -377,8 +447,8 @@ struct FunctionLowerer<'cx, 'facts> {
 impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn new(
         cx: &'cx mut LowerCx,
-        functions: &'facts SourceFunctions<'facts>,
-        source: &SourceFunction<'_>,
+        functions: &'facts ReachableCallables<'facts>,
+        source: &ReachableCallable<'_>,
         facts: &'facts SemanticBodyFacts,
         function_id: FunctionId,
         locals: HashMap<SemanticLocalId, LocalId>,
@@ -392,7 +462,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             cx,
             body: source.body.clone(),
             facts,
-            default_exprs: &functions.default_exprs,
+            index: functions.index,
             function_id,
             source: source.source,
             function,
@@ -743,7 +813,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             param_index: fact.param_index,
             expr_id: fact.default.expr,
         };
-        let Some(expr) = self.default_exprs.get(&(
+        let Some(expr) = self.index.default_exprs.get(&(
             fact.callee.target.clone(),
             fact.default.source,
             fact.default.expr,
@@ -1146,17 +1216,69 @@ pub(crate) fn lower_with_modules(
     root: &ast::Program,
     resolved: &ResolveResult,
     semantic: &SemanticProgram,
+    config: AirLowerConfig,
 ) -> Result<Program, LowerError> {
-    let modules = SourceModules::new(root, resolved);
-    let functions = SourceFunctions::new(&modules, semantic)?;
+    let index = SourceProgramIndex::new(root, resolved);
+    let facts = SemanticCallableFacts::new(semantic);
+    let AirLowerConfig { roots } = config;
+    let entry = roots.entry.clone();
+    let roots = roots.normalized();
+    validate_roots(&roots, &facts)?;
+    let functions = ReachableCallables::new(&index, semantic, &facts, roots)?;
     let mut cx = LowerCx::default();
-    cx.lower_modules(&modules);
+    cx.lower_function_shells(&index.modules, &functions)?;
+    if let Some(entry) = &entry {
+        cx.set_entry(entry)?;
+    }
     cx.lower_extern_declarations(&functions, semantic)?;
-    cx.lower_function_shells(&modules, &functions, semantic)?;
-    cx.lower_function_bodies(&functions, semantic)?;
+    cx.lower_function_bodies(&functions)?;
     verify(&cx.program).map_err(|errors| LowerError::Verify(errors.into_boxed_slice()))?;
     reject_any_types(&cx.program)?;
     Ok(cx.program)
+}
+
+fn validate_roots(
+    roots: &[CallableInstanceKey],
+    facts: &SemanticCallableFacts<'_>,
+) -> Result<(), LowerError> {
+    for root in roots {
+        if !generic_args_are_concrete(&root.args) {
+            return Err(LowerError::NonConcreteRoot {
+                id: Box::new(root.target.clone()),
+                args: Box::new(root.args.clone()),
+            });
+        }
+        if !callable_is_top_level_function(&root.target) {
+            return Err(LowerError::UnsupportedRootCallable {
+                id: Box::new(root.target.clone()),
+                args: Box::new(root.args.clone()),
+            });
+        }
+        if facts.get(root).is_none() {
+            return Err(LowerError::MissingFunctionFact {
+                id: Box::new(root.target.clone()),
+                args: Box::new(root.args.clone()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn callable_is_top_level_function(id: &CallableId) -> bool {
+    id.parent.is_none() && id.kind == crate::typecheck::CallableKind::Function
+}
+
+fn generic_args_are_concrete(args: &GenericArgs) -> bool {
+    args.type_args.iter().all(type_is_concrete)
+        && args.const_args.iter().all(const_term_is_concrete)
+}
+
+fn type_is_concrete(ty: &Type) -> bool {
+    !type_has_unfinished_facts(ty)
+}
+
+fn const_term_is_concrete(term: &ConstTerm) -> bool {
+    matches!(term, ConstTerm::Value(_))
 }
 
 fn reject_any_types(program: &Program) -> Result<(), LowerError> {
@@ -1168,16 +1290,16 @@ fn reject_any_types(program: &Program) -> Result<(), LowerError> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct SourceModules<'a> {
     items: Vec<SourceModule<'a>>,
 }
 
+#[derive(Debug)]
 struct SourceModule<'a> {
     scope: ModuleScope,
     source: SourceId,
     program: &'a ast::Program,
-    path: Vec<Ident>,
-    system: bool,
 }
 
 impl<'a> SourceModules<'a> {
@@ -1185,8 +1307,6 @@ impl<'a> SourceModules<'a> {
         let items = DeclarationIndex::source_modules(root, resolved)
             .into_iter()
             .map(|module| SourceModule {
-                path: module_path(&module.scope),
-                system: module_is_system(&module.scope, resolved),
                 scope: module.scope,
                 source: module.source,
                 program: module.program,
@@ -1197,23 +1317,47 @@ impl<'a> SourceModules<'a> {
 }
 
 #[derive(Debug)]
-struct SourceFunctions<'a> {
-    items: Vec<SourceFunction<'a>>,
+struct SourceProgramIndex<'a> {
+    modules: SourceModules<'a>,
+    callables: HashMap<CallableId, SourceCallable<'a>>,
     default_exprs: HashMap<(CallableId, SourceId, ExprId), &'a ExprNode>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SourceCallable<'a> {
+    module: usize,
+    func: &'a ast::FuncNode,
+    source: SourceId,
+}
+
 #[derive(Debug)]
-struct SourceFunction<'a> {
+struct ReachableCallables<'a> {
+    index: &'a SourceProgramIndex<'a>,
+    items: Vec<ReachableCallable<'a>>,
+}
+
+#[derive(Debug)]
+struct ReachableCallable<'a> {
     module: usize,
     func: &'a ast::FuncNode,
     body: BodyInstanceKey,
     fact: &'a SemanticFunctionInstanceFact,
+    body_facts: ReachableBodyFacts<'a>,
     source: SourceId,
 }
 
-impl SourceFunction<'_> {
-    fn can_omit_body_facts(&self) -> bool {
-        can_omit_body_facts(self.fact, self.func)
+#[derive(Debug)]
+enum ReachableBodyFacts<'a> {
+    Facts(&'a SemanticBodyFacts),
+    Empty(SemanticBodyFacts),
+}
+
+impl ReachableBodyFacts<'_> {
+    fn as_facts(&self) -> &SemanticBodyFacts {
+        match self {
+            Self::Facts(facts) => facts,
+            Self::Empty(facts) => facts,
+        }
     }
 }
 
@@ -1224,27 +1368,15 @@ fn can_omit_body_facts(fact: &SemanticFunctionInstanceFact, func: &ast::FuncNode
         && func.node.body.node.tail.is_none()
 }
 
-impl<'a> SourceFunctions<'a> {
-    fn new(
-        modules: &'a SourceModules<'a>,
-        semantic: &'a SemanticProgram,
-    ) -> Result<Self, LowerError> {
-        let mut function_index = HashMap::new();
+impl<'a> SourceProgramIndex<'a> {
+    fn new(root: &'a ast::Program, resolved: &'a ResolveResult) -> Self {
+        let modules = SourceModules::new(root, resolved);
+        let mut callables = HashMap::new();
         let mut default_exprs = HashMap::new();
-        let mut worklist = vec![];
-        let mut queued = std::collections::HashSet::new();
 
         for (module_index, module) in modules.items.iter().enumerate() {
             for stmt in &module.program.stmts {
                 let Stmt::Func(func_node) = &stmt.node else {
-                    if !module.system
-                        && !matches!(&stmt.node, Stmt::Import(_) | Stmt::ExternFunc(_))
-                    {
-                        return Err(LowerError::UnsupportedDecl {
-                            kind: stmt_kind(&stmt.node),
-                            span: Some(SourceSpan::from_byte_span(module.source, stmt.span)),
-                        });
-                    }
                     continue;
                 };
                 let id = CallableId::function(module.scope.clone(), func_node.node.name);
@@ -1253,32 +1385,57 @@ impl<'a> SourceFunctions<'a> {
                         default_exprs.insert((id.clone(), module.source, default.node.id), default);
                     }
                 }
-                function_index.insert(id.clone(), (module_index, func_node));
-                if !module.system
-                    && func_node.node.type_params.is_empty()
-                    && func_node.node.const_params.is_empty()
-                {
-                    let key = CallableInstanceKey {
-                        target: id,
-                        args: GenericArgs::default(),
-                    };
-                    queued.insert(key.clone());
-                    worklist.push(key);
-                }
+                callables.insert(
+                    id,
+                    SourceCallable {
+                        module: module_index,
+                        func: func_node,
+                        source: module.source,
+                    },
+                );
+            }
+        }
+
+        Self {
+            modules,
+            callables,
+            default_exprs,
+        }
+    }
+}
+
+impl<'a> ReachableCallables<'a> {
+    fn new(
+        index: &'a SourceProgramIndex<'a>,
+        semantic: &'a SemanticProgram,
+        semantic_functions: &SemanticCallableFacts<'a>,
+        roots: Vec<CallableInstanceKey>,
+    ) -> Result<Self, LowerError> {
+        let mut queued = std::collections::HashSet::new();
+        let mut worklist = vec![];
+        for root in roots {
+            if queued.insert(root.clone()) {
+                worklist.push(root);
             }
         }
 
         let mut items = vec![];
-        let mut index = 0;
-        while let Some(key) = worklist.get(index).cloned() {
-            index += 1;
-            let Some((module_index, func_node)) = function_index.get(&key.target).copied() else {
+        let mut worklist_index = 0;
+        while let Some(key) = worklist.get(worklist_index).cloned() {
+            worklist_index += 1;
+            if !callable_is_top_level_function(&key.target) {
+                return Err(LowerError::UnsupportedCallableInstance {
+                    id: Box::new(key.target.clone()),
+                    args: Box::new(key.args.clone()),
+                });
+            }
+            let Some(source) = index.callables.get(&key.target).copied() else {
                 return Err(LowerError::UnsupportedCallableInstance {
                     id: Box::new(key.target.clone()),
                     args: Box::new(key.args.clone()),
                 });
             };
-            let module = &modules.items[module_index];
+            let func_node = source.func;
             let func = &func_node.node;
             if (!func.type_params.is_empty() || !func.const_params.is_empty())
                 && key.args.is_empty()
@@ -1288,62 +1445,55 @@ impl<'a> SourceFunctions<'a> {
                 });
             }
             let body = BodyInstanceKey::Callable(key.clone());
-            let Some(fact) = semantic
-                .declaration_facts
-                .functions
-                .iter()
-                .find(|fact| fact.id == key.target && fact.args == key.args)
-            else {
+            let Some(fact) = semantic_functions.get(&key) else {
                 return Err(LowerError::MissingFunctionFact {
                     id: Box::new(key.target.clone()),
                     args: Box::new(key.args.clone()),
                 });
             };
-            let facts = match semantic.facts.body(&body) {
-                Some(facts) => Some(facts),
-                None if can_omit_body_facts(fact, func_node) => None,
+            let body_facts = match semantic.facts.body(&body) {
+                Some(facts) => ReachableBodyFacts::Facts(facts),
+                None if can_omit_body_facts(fact, func_node) => {
+                    ReachableBodyFacts::Empty(SemanticBodyFacts::default())
+                }
                 None => {
                     return Err(LowerError::MissingSpecializedBodyFacts {
                         body: Box::new(body.clone()),
                     });
                 }
             };
-            if let Some(facts) = facts {
-                let mut calls = facts.calls.iter().collect::<Vec<_>>();
-                calls.sort_by_key(|(expr, _)| expr.0);
-                for (expr, target) in calls {
-                    if target.form != CallForm::Normal {
-                        return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
-                    }
-                    let called = CallableInstanceKey {
-                        target: target.id.clone(),
-                        args: target.args.clone(),
-                    };
-                    if queued.insert(called.clone()) {
-                        worklist.push(called);
-                    }
+            let mut calls = body_facts.as_facts().calls.iter().collect::<Vec<_>>();
+            calls.sort_by_key(|(expr, _)| expr.0);
+            for (expr, target) in calls {
+                if target.form != CallForm::Normal {
+                    return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
+                }
+                if !callable_is_top_level_function(&target.id) {
+                    return Err(LowerError::UnsupportedCallableInstance {
+                        id: Box::new(target.id.clone()),
+                        args: Box::new(target.args.clone()),
+                    });
+                }
+                let called = CallableInstanceKey {
+                    target: target.id.clone(),
+                    args: target.args.clone(),
+                };
+                if queued.insert(called.clone()) {
+                    worklist.push(called);
                 }
             }
-            items.push(SourceFunction {
-                module: module_index,
+            items.push(ReachableCallable {
+                module: source.module,
                 func: func_node,
                 body,
                 fact,
-                source: module.source,
+                body_facts,
+                source: source.source,
             });
         }
 
-        Ok(Self {
-            items,
-            default_exprs,
-        })
+        Ok(Self { index, items })
     }
-}
-
-fn module_is_system(scope: &ModuleScope, resolved: &ResolveResult) -> bool {
-    resolved.system.core.as_ref().is_some_and(|package| {
-        matches!(scope, ModuleScope::Package(module) if module.package_context() == Some(package))
-    })
 }
 
 fn module_path(scope: &ModuleScope) -> Vec<Ident> {
@@ -1375,16 +1525,329 @@ mod tests {
         externs,
         externs::{ExternInputs, PackageExternInputs},
         test_support::{
-            parse_program, resolved_modules_with_core_option,
-            resolved_modules_with_core_option_external, resolved_with_core_option,
+            checked_with_full_core_shape, parse_program, resolved_modules_with_core_option,
+            resolved_modules_with_core_option_external,
         },
         typecheck::{self, TypecheckConfig},
     };
 
     #[test]
     fn empty_program_lowers_to_verified_air() {
-        let (root, resolved, semantic) = checked("");
-        lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        lower_empty("").expect("lower failed");
+    }
+
+    #[test]
+    fn full_core_shape_replaces_option_only_core_for_containment() {
+        let (root, resolved, semantic) = checked_with_full_core_shape("");
+        let air = lower_with_modules(
+            &root,
+            &resolved,
+            &semantic.program,
+            AirLowerConfig::default(),
+        )
+        .expect("lower failed");
+
+        assert!(air.modules.is_empty());
+        assert_eq!(
+            resolved.system.core,
+            Some(crate::resolve::PackageId::core())
+        );
+        assert_eq!(
+            core_fixture_module_paths(&resolved),
+            vec![
+                vec![],
+                vec!["option"],
+                vec!["result"],
+                vec!["range"],
+                vec!["collections"],
+                vec!["runtime"],
+                vec!["core_int"],
+                vec!["core_float"],
+                vec!["core_string"],
+            ]
+        );
+        let core_root = crate::resolve::ModuleId::root(crate::resolve::PackageId::core());
+        let root_imports = resolved
+            .import_edges
+            .get(&core_root)
+            .expect("core root imports");
+        assert_eq!(
+            root_imports
+                .iter()
+                .map(|target| target.default_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "core_int",
+                "core_float",
+                "core_string",
+                "runtime",
+                "option",
+                "result",
+                "range",
+                "collections",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_full_core_shape_lowers_to_empty_air() {
+        let air = lower_full_core("").expect("lower failed");
+
+        assert!(air.modules.is_empty());
+        assert!(air.functions.is_empty());
+        assert!(air.externs.is_empty());
+        assert!(air.aggregates.is_empty());
+        assert!(air.enums.is_empty());
+        assert!(air.extern_types.is_empty());
+        assert!(air.type_arena.is_empty());
+        assert!(air.entry.is_none());
+    }
+
+    #[test]
+    fn root_full_core_shape_lowers_only_root_function() {
+        let air = lower_full_core_root("fn main() {}", "main").expect("lower failed");
+
+        assert_eq!(air.modules.len(), 1);
+        assert!(air.modules[0].path.is_empty());
+        assert_eq!(air.functions.len(), 1);
+        assert_eq!(air.functions[0].name.as_str(), "main");
+        assert!(air.externs.is_empty());
+        assert!(air.aggregates.is_empty());
+        assert!(air.enums.is_empty());
+        assert!(air.extern_types.is_empty());
+        assert!(air.entry.is_none());
+    }
+
+    #[test]
+    fn primitive_root_with_full_core_shape_emits_no_core() {
+        let air = lower_full_core_root(
+            "
+            fn main() -> int {
+                let a = 1;
+                var b = a + 2;
+                b += 3;
+                b
+            }
+            ",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(air.modules.len(), 1);
+        assert!(air.modules[0].path.is_empty());
+        assert_eq!(air.functions.len(), 1);
+        assert_eq!(air.functions[0].name.as_str(), "main");
+        assert!(air.externs.is_empty());
+        assert!(air.aggregates.is_empty());
+        assert!(air.enums.is_empty());
+        assert!(air.extern_types.is_empty());
+        assert!(air.type_arena.iter().all(|ty| matches!(ty, TypeData::Int)));
+    }
+
+    #[test]
+    fn helper_call_full_core_shape_emits_only_reachable_user_functions() {
+        let air = lower_full_core_entry(
+            "fn unused() {} fn helper() {} fn main() { helper(); }",
+            "main",
+            &[],
+        )
+        .expect("lower failed");
+
+        assert_eq!(function_names(&air), vec!["main", "helper"]);
+        assert!(air.externs.is_empty());
+    }
+
+    #[test]
+    fn println_int_full_core_shape_emits_runtime_slice_only() {
+        let air =
+            lower_full_core_entry("fn main() { println(1); }", "main", &[]).expect("lower failed");
+
+        assert_eq!(air.entry, Some(FunctionId::from_index(0)));
+        assert_eq!(function_names(&air), vec!["main", "println"]);
+        assert_eq!(extern_names(&air), vec!["_println"]);
+        assert_eq!(
+            module_paths(&air),
+            vec![vec![], vec!["runtime"], vec!["core_runtime"]]
+        );
+        assert_no_deferred_core_decls(&air);
+
+        let println = &air.functions[1];
+        assert_eq!(println.signature.params.len(), 1);
+        assert!(matches!(
+            air.type_arena.data(println.signature.params[0].ty),
+            TypeData::Int
+        ));
+        assert_eq!(stringify_source_types(&air), vec![TypeData::Int]);
+        assert_extern_signature(&air, "_println", &[TypeData::String], &TypeData::Void);
+    }
+
+    #[test]
+    fn println_string_full_core_shape_emits_one_println_instance() {
+        let air = lower_full_core_entry("fn main() { println(\"ready\"); }", "main", &[])
+            .expect("lower failed");
+
+        assert_eq!(function_names(&air), vec!["main", "println"]);
+        assert_eq!(extern_names(&air), vec!["_println"]);
+        assert_eq!(stringify_source_types(&air), vec![TypeData::String]);
+        assert_no_deferred_core_decls(&air);
+    }
+
+    #[test]
+    fn assert_full_core_shape_emits_assert_runtime_slice_only() {
+        let air = lower_full_core_entry("fn main() { assert(true); }", "main", &[])
+            .expect("lower failed");
+
+        assert_eq!(function_names(&air), vec!["main", "assert"]);
+        assert_eq!(extern_names(&air), vec!["_assert"]);
+        assert_eq!(
+            module_paths(&air),
+            vec![vec![], vec!["runtime"], vec!["core_runtime"]]
+        );
+        assert!(air.const_arena.iter().any(|data| {
+            matches!(&data.value, ConstValue::String(value) if value.as_ref() == "assertion failed")
+        }));
+        assert_extern_signature(
+            &air,
+            "_assert",
+            &[TypeData::Bool, TypeData::String],
+            &TypeData::Void,
+        );
+        assert_no_deferred_core_decls(&air);
+    }
+
+    #[test]
+    fn assert_explicit_message_full_core_shape_uses_runtime_assert_only() {
+        let air = lower_full_core_entry("fn main() { assert(false, \"msg\"); }", "main", &[])
+            .expect("lower failed");
+
+        assert_eq!(function_names(&air), vec!["main", "assert"]);
+        assert_eq!(extern_names(&air), vec!["_assert"]);
+        assert!(air.const_arena.iter().any(|data| {
+            matches!(&data.value, ConstValue::String(value) if value.as_ref() == "msg")
+        }));
+    }
+
+    #[test]
+    fn unused_extension_block_does_not_affect_air() {
+        let air = lower_full_core_root(
+            "
+            extend int {
+                fn plus_one(self) -> int { self + 1 }
+                fn print_it(self) { println(self); }
+            }
+            fn main() {}
+            ",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(function_names(&air), vec!["main"]);
+        assert!(air.externs.is_empty());
+        assert_no_deferred_core_decls(&air);
+    }
+
+    #[test]
+    fn reachable_extension_method_is_explicitly_unsupported() {
+        let err = lower_root(
+            "
+            extend int { fn plus_one(self) -> int { self + 1 } }
+            fn main() -> int { 1.plus_one() }
+            ",
+            "main",
+        )
+        .expect_err("expected unsupported extension method");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedCallableInstance { .. }
+        ));
+    }
+
+    #[test]
+    fn reachable_core_extension_method_is_explicitly_unsupported() {
+        let err = lower_full_core_entry("fn main() { let x = (-1).abs(); }", "main", &[])
+            .expect_err("expected unsupported extension method");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedCallableInstance { id, .. }
+                if id.name.as_str() == "abs" && id.parent.is_some()
+        ));
+    }
+
+    #[test]
+    fn reachable_qualified_core_extension_call_is_explicitly_unsupported() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import facade; fn main() -> int { facade.a.pick(1) }",
+            &[
+                ("facade", "pub import a;"),
+                ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+            ],
+        );
+        let err = lower_checked_entry(&root, &resolved, &semantic.program, "main", &[])
+            .expect_err("expected unsupported qualified extension call");
+
+        assert!(matches!(err, LowerError::UnsupportedCallForm { .. }));
+    }
+
+    #[test]
+    fn reachable_string_extension_optional_return_is_explicitly_unsupported() {
+        let err = lower_full_core_entry(
+            "fn main() { let x = \"abc\".substring(0, 1); }",
+            "main",
+            &[],
+        )
+        .expect_err("expected unsupported string extension");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedCallableInstance { .. } | LowerError::UnsupportedType { .. }
+        ));
+    }
+
+    #[test]
+    fn reachable_core_option_constructor_is_explicitly_unsupported() {
+        let err = lower_full_core_entry(
+            "fn main() { let x: Option<int> = Option.Some(1); }",
+            "main",
+            &[],
+        )
+        .expect_err("expected unsupported option constructor");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedCallableInstance { .. } | LowerError::UnsupportedType { .. }
+        ));
+    }
+
+    #[test]
+    fn unused_const_and_lazy_globals_do_not_affect_air() {
+        let air = lower_root(
+            "
+            const ANSWER: int = 42;
+            lazy let Value: int = 1;
+            lazy var Counter: int = 0;
+            fn main() {}
+            ",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(function_names(&air), vec!["main"]);
+        assert!(air.externs.is_empty());
+        assert!(air.aggregates.is_empty());
+        assert!(air.enums.is_empty());
+    }
+
+    #[test]
+    fn reached_lazy_global_access_is_explicitly_unsupported() {
+        let err = lower_root(
+            "lazy let Value: int = 1; fn main() -> int { Value }",
+            "main",
+        )
+        .expect_err("expected unsupported global access");
+
+        assert!(matches!(err, LowerError::UnsupportedExpr { .. }));
     }
 
     #[test]
@@ -1401,46 +1864,121 @@ mod tests {
             ModuleScope::from_module_id(&resolved.root)
         );
         assert_eq!(modules.items[0].source, resolved.root_source);
-        assert!(
-            modules
-                .items
-                .iter()
-                .all(|module| !module.path.is_empty() || matches!(module.scope, ModuleScope::Root))
-        );
+        assert!(modules.items.iter().all(|module| {
+            !module_path(&module.scope).is_empty() || matches!(module.scope, ModuleScope::Root)
+        }));
     }
 
     #[test]
     fn source_functions_pair_with_semantic_facts() {
-        let (root, resolved, semantic) = checked("fn f(a: int) -> int { a }");
-        let modules = SourceModules::new(&root, &resolved);
-        let functions =
-            SourceFunctions::new(&modules, &semantic.program).expect("inventory failed");
-        assert_eq!(functions.items.len(), 1);
-        let function = &functions.items[0];
-        assert_eq!(function.module, 0);
-        assert_eq!(function.func.node.name, Ident::new("f"));
-        assert_eq!(function.body, function.fact.body);
+        with_source_functions("fn f(a: int) -> int { a }", &["f"], |_, functions, _| {
+            assert_eq!(functions.items.len(), 1);
+            let function = &functions.items[0];
+            assert_eq!(function.module, 0);
+            assert_eq!(function.func.node.name, Ident::new("f"));
+            assert_eq!(function.body, function.fact.body);
+        });
+    }
+
+    #[test]
+    fn air_roots_normalize_entry_first_and_deduplicate() {
+        let entry = root_function("main");
+        let helper = root_function("helper");
+        let roots = AirRoots {
+            entry: Some(entry.clone()),
+            callables: vec![helper.clone(), entry.clone(), helper.clone()],
+        };
+
+        assert_eq!(roots.normalized(), vec![entry, helper]);
+    }
+
+    #[test]
+    fn missing_root_fact_is_rejected_before_traversal() {
+        let (root, resolved, semantic) = checked("fn main() {}");
+        let missing = root_function("missing");
+        let err = lower_with_modules(
+            &root,
+            &resolved,
+            &semantic.program,
+            AirLowerConfig {
+                roots: AirRoots {
+                    entry: None,
+                    callables: vec![missing],
+                },
+            },
+        )
+        .expect_err("expected missing root fact");
+
+        assert!(matches!(err, LowerError::MissingFunctionFact { .. }));
+    }
+
+    #[test]
+    fn unsupported_root_callable_kind_is_rejected() {
+        let (root, resolved, semantic) = checked("extern fn host();");
+        let root_key = CallableInstanceKey {
+            target: CallableId::extern_function(ModuleScope::Root, Ident::new("host")),
+            args: GenericArgs::default(),
+        };
+        let err = lower_with_modules(
+            &root,
+            &resolved,
+            &semantic.program,
+            AirLowerConfig {
+                roots: AirRoots {
+                    entry: None,
+                    callables: vec![root_key],
+                },
+            },
+        )
+        .expect_err("expected unsupported root");
+
+        assert!(matches!(err, LowerError::UnsupportedRootCallable { .. }));
+    }
+
+    #[test]
+    fn non_concrete_root_args_are_rejected() {
+        let (root, resolved, semantic) = checked("fn main() {}");
+        let root_key = CallableInstanceKey {
+            target: CallableId::function(ModuleScope::Root, Ident::new("main")),
+            args: GenericArgs {
+                type_args: vec![Type::Infer],
+                const_args: vec![],
+            },
+        };
+        let err = lower_with_modules(
+            &root,
+            &resolved,
+            &semantic.program,
+            AirLowerConfig {
+                roots: AirRoots {
+                    entry: None,
+                    callables: vec![root_key],
+                },
+            },
+        )
+        .expect_err("expected non-concrete root");
+
+        assert!(matches!(err, LowerError::NonConcreteRoot { .. }));
     }
 
     #[test]
     fn source_functions_include_called_generic_instance() {
-        let (root, resolved, semantic) =
-            checked("fn f<T>(x: T) -> T { x } fn main() -> int { f(1) }");
-        let modules = SourceModules::new(&root, &resolved);
-        let functions =
-            SourceFunctions::new(&modules, &semantic.program).expect("inventory failed");
-
-        assert!(functions.items.iter().any(|function| {
-            function.func.node.name == Ident::new("f")
-                && function.fact.args.type_args == vec![Type::Int]
-        }));
+        with_source_functions(
+            "fn f<T>(x: T) -> T { x } fn main() -> int { f(1) }",
+            &["main"],
+            |_, functions, _| {
+                assert!(functions.items.iter().any(|function| {
+                    function.func.node.name == Ident::new("f")
+                        && function.fact.args.type_args == vec![Type::Int]
+                }));
+            },
+        );
     }
 
     #[test]
     fn generic_function_call_lowers_once() {
         let source = "fn id<T>(x: T) -> T { x } fn f() -> int { id(1) + id(2) }";
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
 
         let id_functions = air
             .functions
@@ -1459,8 +1997,7 @@ mod tests {
     fn generic_identity_lowers_independent_instances() {
         let source =
             r#"fn id<T>(x: T) -> T { x } fn f() -> int { id(1) } fn g() -> string { id("x") }"#;
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_roots(source, &["f", "g"]).expect("lower failed");
 
         let id_functions = air
             .functions
@@ -1482,8 +2019,7 @@ mod tests {
     fn generic_wrapper_calls_generic_helper() {
         let source =
             "fn id<T>(x: T) -> T { x } fn wrap<T>(x: T) -> T { id(x) } fn f() -> int { wrap(1) }";
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
 
         let wrap = air
             .functions
@@ -1497,8 +2033,8 @@ mod tests {
 
     #[test]
     fn uncalled_generic_function_is_not_lowered() {
-        let (root, resolved, semantic) = checked("fn id<T>(x: T) -> T { x } fn main() {}");
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air =
+            lower_root("fn id<T>(x: T) -> T { x } fn main() {}", "main").expect("lower failed");
 
         assert!(
             air.functions
@@ -1510,8 +2046,7 @@ mod tests {
     #[test]
     fn generic_call_order_drives_function_order() {
         let source = r#"fn id<T>(x: T) -> T { x } fn f() { let a = id("x"); let b = id(1); }"#;
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
         let id_returns = air
             .functions
             .iter()
@@ -1528,7 +2063,7 @@ mod tests {
     fn local_function_call_is_unsupported_callable_instance() {
         let source = "fn f() -> int { fn inner() -> int { 1 } inner() }";
         let (root, resolved, semantic) = checked(source);
-        let err = lower_with_modules(&root, &resolved, &semantic.program)
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
             .expect_err("expected unsupported local function");
 
         assert!(matches!(
@@ -1549,7 +2084,7 @@ mod tests {
             },
         });
         semantic.program.facts.bodies.remove(&body);
-        let err = lower_with_modules(&root, &resolved, &semantic.program)
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
             .expect_err("expected missing body facts");
 
         assert!(matches!(
@@ -1566,7 +2101,7 @@ mod tests {
             args: GenericArgs::default(),
         });
         semantic.program.facts.bodies.remove(&body);
-        let err = lower_with_modules(&root, &resolved, &semantic.program)
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
             .expect_err("expected missing body facts");
 
         assert!(matches!(
@@ -1580,7 +2115,7 @@ mod tests {
         let source = "fn noop<T>() {} fn main() { noop<int>(); }";
         let (root, resolved, semantic) = checked(source);
 
-        lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        lower_checked_roots(&root, &resolved, &semantic.program, &["main"]).expect("lower failed");
     }
 
     #[test]
@@ -1619,7 +2154,7 @@ mod tests {
                 params: vec![],
                 return_ty: Type::Infer,
             });
-        let err = lower_with_modules(&root, &resolved, &semantic.program)
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["main"])
             .expect_err("expected missing generic args");
 
         assert!(matches!(err, LowerError::MissingGenericInstanceArgs { .. }));
@@ -1628,8 +2163,7 @@ mod tests {
     #[test]
     fn stringify_int_lowers_to_string_typed_air() {
         let source = "fn f() -> string { #stringify(1) }";
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
         let string_ty = PrimitiveTypes::scan(&air).string().expect("string type");
 
         assert!(air.functions.iter().any(|function| {
@@ -1650,9 +2184,7 @@ mod tests {
     #[test]
     fn non_stringify_intrinsic_is_unsupported() {
         let source = "fn f() -> string { #file() }";
-        let (root, resolved, semantic) = checked(source);
-        let err = lower_with_modules(&root, &resolved, &semantic.program)
-            .expect_err("expected unsupported intrinsic");
+        let err = lower_root(source, "f").expect_err("expected unsupported intrinsic");
 
         assert!(matches!(
             err,
@@ -1666,8 +2198,7 @@ mod tests {
     #[test]
     fn generic_stringify_lowers_specialized_source_type() {
         let source = "fn f<T>(x: T) -> string { #stringify(x) } fn main() -> string { f(1) }";
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "main").expect("lower failed");
         let int_ty = PrimitiveTypes::scan(&air).int().expect("int type");
 
         assert!(air.functions.iter().any(|function| {
@@ -1689,9 +2220,7 @@ mod tests {
     #[test]
     fn unsupported_stringify_type_is_explicit_error() {
         let source = "fn g() {} fn f() -> string { #stringify(g) }";
-        let (root, resolved, semantic) = checked(source);
-        let err = lower_with_modules(&root, &resolved, &semantic.program)
-            .expect_err("expected unsupported stringify type");
+        let err = lower_root(source, "f").expect_err("expected unsupported stringify type");
 
         assert!(matches!(err, LowerError::UnsupportedStringifyType { .. }));
     }
@@ -1700,70 +2229,156 @@ mod tests {
     fn generic_unsupported_stringify_type_is_reported_before_shell_type_lowering() {
         let source =
             "fn g() {} fn f<T>(x: T) -> string { #stringify(x) } fn main() -> string { f(g) }";
-        let (root, resolved, semantic) = checked(source);
-        let err = lower_with_modules(&root, &resolved, &semantic.program)
-            .expect_err("expected unsupported stringify type");
+        let err = lower_root(source, "main").expect_err("expected unsupported stringify type");
 
         assert!(matches!(err, LowerError::UnsupportedStringifyType { .. }));
     }
 
     #[test]
     fn source_functions_keep_default_param_instances() {
-        let (root, resolved, semantic) = checked("fn f(a: int = 1) -> int { a }");
-        let modules = SourceModules::new(&root, &resolved);
-        let functions =
-            SourceFunctions::new(&modules, &semantic.program).expect("inventory failed");
-        assert_eq!(functions.items.len(), 1);
-        assert_eq!(functions.items[0].func.node.params.len(), 1);
-        assert_eq!(functions.items[0].fact.params.len(), 1);
+        with_source_functions(
+            "fn f(a: int = 1) -> int { a }",
+            &["f"],
+            |_, functions, _| {
+                assert_eq!(functions.items.len(), 1);
+                assert_eq!(functions.items[0].func.node.params.len(), 1);
+                assert_eq!(functions.items[0].fact.params.len(), 1);
+            },
+        );
     }
 
     #[test]
-    fn lower_modules_allocates_air_modules() {
-        let root = parse_program("");
-        let resolved = resolved_with_core_option(&root);
-        let modules = SourceModules::new(&root, &resolved);
-        let mut cx = LowerCx::default();
-        cx.lower_modules(&modules);
-        assert_eq!(cx.program.modules.len(), modules.items.len());
-        assert_eq!(
-            cx.maps.modules[&modules.items[0].scope],
-            ModuleId::from_index(0)
+    fn empty_roots_allocate_no_modules() {
+        let air = lower_empty("").expect("lower failed");
+
+        assert!(air.modules.is_empty());
+    }
+
+    #[test]
+    fn single_root_allocates_only_reached_module() {
+        let (root, resolved, semantic) =
+            checked_with_modules("import util; fn main() {}", &[("util", "fn helper() {}")]);
+        let air = lower_checked_roots(&root, &resolved, &semantic.program, &["main"])
+            .expect("lower failed");
+
+        assert_eq!(air.modules.len(), 1);
+        assert_eq!(air.functions.len(), 1);
+        assert_eq!(air.functions[0].name, Ident::new("main"));
+    }
+
+    #[test]
+    fn executable_root_sets_entry() {
+        let air = lower_entry("fn main() {}", "main", &[]).expect("lower failed");
+
+        assert_eq!(air.functions.len(), 1);
+        assert_eq!(air.entry, Some(FunctionId::from_index(0)));
+        assert_eq!(air.function(air.entry.unwrap()).name, Ident::new("main"));
+    }
+
+    #[test]
+    fn entry_root_preserved_when_already_in_callables() {
+        let air = lower_entry("fn helper() {} fn main() {}", "main", &["helper", "main"])
+            .expect("lower failed");
+
+        assert_eq!(air.functions.len(), 2);
+        assert_eq!(air.entry, Some(FunctionId::from_index(0)));
+        assert_eq!(air.functions[0].name, Ident::new("main"));
+        assert_eq!(air.functions[1].name, Ident::new("helper"));
+    }
+
+    #[test]
+    fn multi_root_without_entry_leaves_entry_unset() {
+        let air = lower_roots("fn a() {} fn b() {}", &["a", "b"]).expect("lower failed");
+
+        assert_eq!(air.entry, None);
+        assert_eq!(air.functions.len(), 2);
+    }
+
+    #[test]
+    fn invalid_entry_root_is_rejected() {
+        let err = lower_entry("fn main() {}", "missing", &[]).expect_err("expected error");
+
+        assert!(matches!(err, LowerError::MissingFunctionFact { .. }));
+    }
+
+    #[test]
+    fn reachable_extern_allocates_function_module_first() {
+        let provider = ProviderDescriptor {
+            provider: ProviderId {
+                name: "host".to_string(),
+            },
+            modules: vec![ExternModuleDescriptor {
+                path: anvyx_externs::ModulePath {
+                    segments: vec!["host".to_string()],
+                },
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "host_log".to_string(),
+                    doc: None,
+                    signature: ExternSignature {
+                        params: vec![ExternParam {
+                            name: Some("message".to_string()),
+                            ty: ExternTypeExpr::String,
+                            flow: ParamFlow::Value,
+                            escape: CallbackEscape::NonEscaping,
+                        }],
+                        ret: ExternTypeExpr::Void,
+                    },
+                    effects: ExternEffects::default(),
+                }],
+            }],
+        };
+        let (root, resolved, semantic) = checked_with_provider(
+            "import ext:host { host_log }; fn f() { host_log(\"ok\"); }",
+            provider,
         );
-        verify(&cx.program).expect("module-only AIR should verify");
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic.program, &["f"]).expect("lower failed");
+
+        assert!(
+            air.modules[0]
+                .functions
+                .iter()
+                .any(|id| air.function(*id).name == Ident::new("f"))
+        );
+        assert!(
+            air.modules[1]
+                .externs
+                .iter()
+                .any(|id| air.extern_decl(*id).name == Ident::new("host_log"))
+        );
     }
 
     #[test]
     fn extern_function_use_lowers_declaration() {
-        let (root, resolved, semantic) =
-            checked("extern fn host_log(message: string); fn f() { host_log(\"ok\"); }");
-        let modules = SourceModules::new(&root, &resolved);
-        let functions =
-            SourceFunctions::new(&modules, &semantic.program).expect("inventory failed");
-        let mut cx = LowerCx::default();
-        cx.lower_modules(&modules);
-        cx.lower_extern_declarations(&functions, &semantic.program)
-            .expect("extern lowering failed");
+        with_source_functions(
+            "extern fn host_log(message: string); fn f() { host_log(\"ok\"); }",
+            &["f"],
+            |_modules, functions, semantic| {
+                let mut cx = LowerCx::default();
+                cx.lower_extern_declarations(functions, semantic)
+                    .expect("extern lowering failed");
 
-        assert_eq!(cx.program.externs.len(), 1);
-        let ext = &cx.program.externs[0];
-        assert_eq!(ext.name, Ident::new("host_log"));
-        assert_eq!(ext.params.len(), 1);
-        assert!(matches!(
-            cx.program.type_arena.get(ext.params[0]),
-            Some(TypeData::String)
-        ));
-        assert!(matches!(
-            cx.program.type_arena.get(ext.return_type),
-            Some(TypeData::Void)
-        ));
+                assert_eq!(cx.program.externs.len(), 1);
+                let ext = &cx.program.externs[0];
+                assert_eq!(ext.name, Ident::new("host_log"));
+                assert_eq!(ext.params.len(), 1);
+                assert!(matches!(
+                    cx.program.type_arena.get(ext.params[0]),
+                    Some(TypeData::String)
+                ));
+                assert!(matches!(
+                    cx.program.type_arena.get(ext.return_type),
+                    Some(TypeData::Void)
+                ));
+            },
+        );
     }
 
     #[test]
     fn source_function_call_lowers() {
         let source = "fn add(a: int, b: int) -> int { a + b } fn f() -> int { add(1, 2) }";
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
 
         assert!(air.functions.iter().any(|function| {
             function.body.iter().any(|block| {
@@ -1784,26 +2399,47 @@ mod tests {
     }
 
     #[test]
+    fn reachable_struct_return_type_is_unsupported() {
+        let source =
+            "struct S { x: int } fn make() -> S { S { x: 1 } } fn main() { let s = make(); }";
+        let err = lower_root(source, "main").expect_err("expected error");
+
+        assert!(matches!(err, LowerError::UnsupportedType { .. }));
+    }
+
+    #[test]
     fn method_call_is_unsupported() {
         let source = "struct S { fn value(self) -> int { 1 } } fn f(s: S) -> int { s.value() }";
         let (root, resolved, semantic) = checked(source);
-        let err =
-            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+            .expect_err("expected error");
         assert!(matches!(
             err,
-            LowerError::UnsupportedDecl {
-                kind: "Aggregate",
-                ..
-            } | LowerError::UnsupportedExpr { kind: "Call", .. }
+            LowerError::UnsupportedCallableInstance { .. }
         ));
+    }
+
+    #[test]
+    fn qualified_extend_call_is_unsupported_call_form() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import facade; fn use_it() -> int { facade.pick(1) }",
+            &[
+                ("facade", "pub import a { * } ;"),
+                ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
+            ],
+        );
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["use_it"])
+            .expect_err("expected error");
+
+        assert!(matches!(err, LowerError::UnsupportedCallForm { .. }));
     }
 
     #[test]
     fn runtime_default_arg_is_unsupported() {
         let source = r#"fn fallback() -> string { "ok" } fn ok(message: string = fallback()) -> string { message } fn f() -> string { ok() }"#;
         let (root, resolved, semantic) = checked(source);
-        let err =
-            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+            .expect_err("expected error");
         assert!(matches!(err, LowerError::UnsupportedDefaultArg { .. }));
     }
 
@@ -1811,8 +2447,7 @@ mod tests {
     fn default_arg_lowers_to_literal_operand() {
         let source =
             r#"fn ok(message: string = "ok") -> string { message } fn f() -> string { ok() }"#;
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
 
         assert!(air.functions.iter().any(|function| {
             function.body.iter().any(|block| {
@@ -1841,7 +2476,8 @@ mod tests {
                 ",
             )],
         );
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_checked_roots(&root, &resolved, &semantic.program, &["main"])
+            .expect("lower failed");
 
         assert_eq!(air.externs.len(), 1);
         assert!(air.functions.iter().any(|function| {
@@ -1890,15 +2526,14 @@ mod tests {
             "import ext:host { touch }; fn f(var x: int) { touch(x); }",
             provider,
         );
-        let err =
-            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+            .expect_err("expected error");
         assert!(matches!(err, LowerError::UnsupportedExternSignature));
     }
 
     #[test]
     fn concrete_function_lowers_to_verified_body() {
-        let (root, resolved, semantic) = checked("fn f(var a: int) -> int { a }");
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root("fn f(var a: int) -> int { a }", "f").expect("lower failed");
         assert_eq!(air.functions.len(), 1);
         let (module_id, module) = air
             .modules
@@ -1922,8 +2557,7 @@ mod tests {
 
     #[test]
     fn empty_void_function_lowers_to_fallthrough_return() {
-        let (root, resolved, semantic) = checked("fn f() {}");
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root("fn f() {}", "f").expect("lower failed");
         assert!(matches!(
             air.functions[0].body[0].terminator,
             Terminator::Return(None)
@@ -1942,8 +2576,7 @@ fn f(a: int) -> int {
     b
 }
 ";
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
         assert_eq!(air.functions.len(), 1);
         let function = &air.functions[0];
         assert!(
@@ -1967,8 +2600,7 @@ fn f() -> int {
     x + 1
 }
 ";
-        let (root, resolved, semantic) = checked(source);
-        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let air = lower_root(source, "f").expect("lower failed");
         let function = &air.functions[0];
         assert!(matches!(
             function.body[0].terminator,
@@ -1980,8 +2612,8 @@ fn f() -> int {
     fn rejects_deferred_string_concat() {
         let source = r#"fn f() -> string { "a" + "b" }"#;
         let (root, resolved, semantic) = checked(source);
-        let err =
-            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+            .expect_err("expected error");
         assert!(matches!(
             err,
             LowerError::UnsupportedExpr { kind: "Binary", .. }
@@ -1989,40 +2621,60 @@ fn f() -> int {
     }
 
     #[test]
-    fn rejects_unsupported_top_level_declarations() {
-        let (root, resolved, semantic) = checked("struct S { x: int }");
-        let err =
-            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedDecl {
-                kind: "Aggregate",
-                ..
-            }
-        ));
+    fn unused_unsupported_top_level_declarations_are_ignored() {
+        lower_empty("struct S { x: int }").expect("lower failed");
     }
 
     #[test]
-    fn rejects_extern_type_declarations() {
-        let (root, resolved, semantic) = checked("extern type Handle; fn f() {}");
-        let err =
-            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
+    fn unused_extern_type_declarations_are_ignored() {
+        lower_root("extern type Handle; fn f() {}", "f").expect("lower failed");
+    }
 
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedDecl {
-                kind: "ExternType",
-                ..
-            }
-        ));
+    #[test]
+    fn unused_function_body_is_not_traversed() {
+        let air = lower_root(
+            "extern fn host(); fn unused() { host(); } fn main() {}",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(air.functions.len(), 1);
+        assert_eq!(air.functions[0].name, Ident::new("main"));
+        assert!(air.externs.is_empty());
+    }
+
+    #[test]
+    fn unused_declarations_do_not_block_root_lowering() {
+        let source = "
+struct S { x: int }
+dataref D { x: int }
+enum E { A, B }
+type Alias = int;
+contract Drawable { fn draw(self); }
+extend int { fn unused(self) -> int { self + 1 } }
+extern fn host();
+const ANSWER: int = 42;
+lazy let Value: int = 1;
+lazy var Count: int = 1;
+fn unused() { host(); }
+fn main() {}
+";
+        let air = lower_root(source, "main").expect("lower failed");
+
+        assert_eq!(air.functions.len(), 1);
+        assert_eq!(air.functions[0].name, Ident::new("main"));
+        assert!(air.externs.is_empty());
+        assert!(air.aggregates.is_empty());
+        assert!(air.enums.is_empty());
+        assert!(air.extern_types.is_empty());
     }
 
     #[test]
     fn rejects_function_value_read_as_unsupported() {
         let source = "fn g() -> int { 1 } fn f() -> void { g; }";
         let (root, resolved, semantic) = checked(source);
-        let err =
-            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
+        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+            .expect_err("expected error");
         assert!(matches!(
             err,
             LowerError::UnsupportedExpr { kind: "Ident", .. }
@@ -2057,6 +2709,212 @@ fn f() -> int {
         assert!(matches!(err, LowerError::AnyTypeEmitted(id) if id == any));
     }
 
+    fn root_function(name: &str) -> CallableInstanceKey {
+        CallableInstanceKey {
+            target: CallableId::function(ModuleScope::Root, Ident::new(name)),
+            args: GenericArgs::default(),
+        }
+    }
+
+    fn lower_empty(source: &str) -> Result<Program, LowerError> {
+        let (root, resolved, semantic) = checked(source);
+        lower_with_modules(
+            &root,
+            &resolved,
+            &semantic.program,
+            AirLowerConfig::default(),
+        )
+    }
+
+    fn lower_full_core(source: &str) -> Result<Program, LowerError> {
+        let (root, resolved, semantic) = checked_with_full_core_shape(source);
+        lower_with_modules(
+            &root,
+            &resolved,
+            &semantic.program,
+            AirLowerConfig::default(),
+        )
+    }
+
+    fn lower_full_core_root(source: &str, name: &str) -> Result<Program, LowerError> {
+        let (root, resolved, semantic) = checked_with_full_core_shape(source);
+        lower_checked_roots(&root, &resolved, &semantic.program, &[name])
+    }
+
+    fn lower_full_core_entry(
+        source: &str,
+        entry: &str,
+        callables: &[&str],
+    ) -> Result<Program, LowerError> {
+        let (root, resolved, semantic) = checked_with_full_core_shape(source);
+        lower_checked_entry(&root, &resolved, &semantic.program, entry, callables)
+    }
+
+    fn lower_checked_entry(
+        root: &ast::Program,
+        resolved: &ResolveResult,
+        semantic: &SemanticProgram,
+        entry: &str,
+        callables: &[&str],
+    ) -> Result<Program, LowerError> {
+        lower_with_modules(
+            root,
+            resolved,
+            semantic,
+            AirLowerConfig {
+                roots: AirRoots {
+                    entry: Some(root_function(entry)),
+                    callables: callables.iter().map(|name| root_function(name)).collect(),
+                },
+            },
+        )
+    }
+
+    fn lower_root(source: &str, name: &str) -> Result<Program, LowerError> {
+        lower_roots(source, &[name])
+    }
+
+    fn lower_roots(source: &str, names: &[&str]) -> Result<Program, LowerError> {
+        let (root, resolved, semantic) = checked(source);
+        lower_checked_roots(&root, &resolved, &semantic.program, names)
+    }
+
+    fn lower_checked_roots(
+        root: &ast::Program,
+        resolved: &ResolveResult,
+        semantic: &SemanticProgram,
+        names: &[&str],
+    ) -> Result<Program, LowerError> {
+        let callables = names.iter().map(|name| root_function(name)).collect();
+        lower_with_modules(
+            root,
+            resolved,
+            semantic,
+            AirLowerConfig {
+                roots: AirRoots {
+                    entry: None,
+                    callables,
+                },
+            },
+        )
+    }
+
+    fn lower_entry(source: &str, name: &str, callables: &[&str]) -> Result<Program, LowerError> {
+        let (root, resolved, semantic) = checked(source);
+        lower_checked_entry(&root, &resolved, &semantic.program, name, callables)
+    }
+
+    fn function_names(program: &Program) -> Vec<&str> {
+        program
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect()
+    }
+
+    fn extern_names(program: &Program) -> Vec<&str> {
+        program
+            .externs
+            .iter()
+            .map(|decl| decl.name.as_str())
+            .collect()
+    }
+
+    fn module_paths(program: &Program) -> Vec<Vec<&str>> {
+        program
+            .modules
+            .iter()
+            .map(|module| module.path.iter().map(Ident::as_str).collect())
+            .collect()
+    }
+
+    fn core_fixture_module_paths(resolved: &ResolveResult) -> Vec<Vec<&str>> {
+        resolved
+            .module_groups
+            .iter()
+            .flatten()
+            .map(|module| match module.key.path() {
+                PackageModulePath::Root => vec![],
+                PackageModulePath::Named(path) | PackageModulePath::Provider(path) => {
+                    path.segments().iter().map(String::as_str).collect()
+                }
+                PackageModulePath::Source(_) => panic!("unexpected source module in core fixture"),
+            })
+            .collect()
+    }
+
+    fn stringify_source_types(program: &Program) -> Vec<TypeData> {
+        program
+            .functions
+            .iter()
+            .flat_map(|function| &function.body)
+            .flat_map(|block| &block.statements)
+            .filter_map(|statement| match statement {
+                Statement::Init {
+                    value: RValue::Stringify { source_ty, .. },
+                    ..
+                }
+                | Statement::Assign {
+                    value: RValue::Stringify { source_ty, .. },
+                    ..
+                }
+                | Statement::Eval(RValue::Stringify { source_ty, .. }) => {
+                    Some(program.type_arena.data(*source_ty).clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_extern_signature(program: &Program, name: &str, params: &[TypeData], ret: &TypeData) {
+        let decl = program
+            .externs
+            .iter()
+            .find(|decl| decl.name.as_str() == name)
+            .expect("extern not found");
+        let actual_params = decl
+            .params
+            .iter()
+            .map(|ty| program.type_arena.data(*ty).clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_params, params);
+        assert_eq!(program.type_arena.data(decl.return_type), ret);
+    }
+
+    fn assert_no_deferred_core_decls(program: &Program) {
+        assert!(program.aggregates.is_empty());
+        assert!(program.enums.is_empty());
+        assert!(program.extern_types.is_empty());
+        assert!(program.modules.iter().all(|module| {
+            !matches!(
+                module.path.first().map(Ident::as_str),
+                Some(
+                    "option"
+                        | "result"
+                        | "range"
+                        | "collections"
+                        | "core_int"
+                        | "core_float"
+                        | "core_string"
+                )
+            )
+        }));
+    }
+
+    fn with_source_functions<R>(
+        source: &str,
+        names: &[&str],
+        f: impl FnOnce(&SourceModules<'_>, &ReachableCallables<'_>, &SemanticProgram) -> R,
+    ) -> R {
+        let (root, resolved, semantic) = checked(source);
+        let index = SourceProgramIndex::new(&root, &resolved);
+        let facts = SemanticCallableFacts::new(&semantic.program);
+        let roots = names.iter().map(|name| root_function(name)).collect();
+        let functions = ReachableCallables::new(&index, &semantic.program, &facts, roots)
+            .expect("source functions failed");
+        f(&index.modules, &functions, &semantic.program)
+    }
+
     fn checked(source: &str) -> (ast::Program, ResolveResult, typecheck::SemanticCheckOutput) {
         checked_with_modules(source, &[])
     }
@@ -2082,11 +2940,18 @@ fn f() -> int {
         source: &str,
         provider: ProviderDescriptor,
     ) -> (ast::Program, ResolveResult, typecheck::SemanticCheckOutput) {
+        checked_with_providers(source, vec![provider])
+    }
+
+    fn checked_with_providers(
+        source: &str,
+        providers: Vec<ProviderDescriptor>,
+    ) -> (ast::Program, ResolveResult, typecheck::SemanticCheckOutput) {
         let root = parse_program(source);
         let provider_raw = externs::ingest_providers(ExternInputs {
             packages: vec![PackageExternInputs {
                 package: crate::resolve::PackageId::synthetic_root(),
-                providers: vec![provider],
+                providers,
             }],
         })
         .expect("valid provider");

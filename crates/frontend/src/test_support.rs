@@ -1,13 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
+use anvyx_externs::{
+    CallbackEscape, ExternEffects, ExternFunctionDescriptor, ExternModuleDescriptor, ExternParam,
+    ExternSignature, ExternTypeExpr, ParamFlow, ProviderDescriptor, ProviderId,
+};
+
 use crate::{
-    ast::{Ident, ModuleOrigin, NominalKind, Program, Stmt, Type},
+    ast::{Ident, ImportItemKind, ImportKind, ModuleOrigin, NominalKind, Program, Stmt, Type},
+    externs,
+    externs::{ExternInputs, PackageExternInputs},
     lexer, parser,
     resolve::{
         self, ModuleId, ModulePath, PackageId, ResolveResult, ResolvedImportTarget, ResolvedModule,
     },
     source::{SourceId, SourceKind, SourceTable},
-    typecheck::{ModuleScope, NominalKey},
+    typecheck::{self, ModuleScope, NominalKey, TypecheckConfig},
 };
 
 pub(crate) fn test_source_id() -> SourceId {
@@ -60,6 +67,307 @@ pub(crate) fn core_option_type(inner: Type) -> Type {
         vec![],
         Some(core_option_origin()),
     )
+}
+
+const CORE_ROOT_SOURCE: &str = include_str!("../../core2/src/lib.anv");
+const CORE_MODULE_SOURCES: &[(&[&str], &str)] = &[
+    (&["option"], include_str!("../../core2/src/option.anv")),
+    (&["result"], include_str!("../../core2/src/result.anv")),
+    (&["range"], include_str!("../../core2/src/range.anv")),
+    (
+        &["collections"],
+        include_str!("../../core2/src/collections.anv"),
+    ),
+    (&["runtime"], include_str!("../../core2/src/runtime.anv")),
+    (&["core_int"], include_str!("../../core2/src/core_int.anv")),
+    (
+        &["core_float"],
+        include_str!("../../core2/src/core_float.anv"),
+    ),
+    (
+        &["core_string"],
+        include_str!("../../core2/src/core_string.anv"),
+    ),
+];
+
+fn provider_module(path: &[&str]) -> anvyx_externs::ModulePath {
+    anvyx_externs::ModulePath {
+        segments: path.iter().map(|segment| (*segment).to_string()).collect(),
+    }
+}
+
+fn provider_param(name: &str, ty: ExternTypeExpr) -> ExternParam {
+    ExternParam {
+        name: Some(name.to_string()),
+        ty,
+        flow: ParamFlow::Value,
+        escape: CallbackEscape::NonEscaping,
+    }
+}
+
+fn provider_fn(
+    name: &str,
+    params: &[(&str, ExternTypeExpr)],
+    ret: ExternTypeExpr,
+) -> ExternFunctionDescriptor {
+    provider_fn_with_effects(name, params, ret, ExternEffects::default())
+}
+
+fn provider_fn_with_effects(
+    name: &str,
+    params: &[(&str, ExternTypeExpr)],
+    ret: ExternTypeExpr,
+    effects: ExternEffects,
+) -> ExternFunctionDescriptor {
+    ExternFunctionDescriptor {
+        name: name.to_string(),
+        doc: None,
+        signature: ExternSignature {
+            params: params
+                .iter()
+                .map(|(name, ty)| provider_param(name, ty.clone()))
+                .collect(),
+            ret,
+        },
+        effects,
+    }
+}
+
+fn primitive_provider(name: &str, functions: Vec<ExternFunctionDescriptor>) -> ProviderDescriptor {
+    ProviderDescriptor {
+        provider: ProviderId {
+            name: name.to_string(),
+        },
+        modules: vec![ExternModuleDescriptor {
+            path: provider_module(&[name]),
+            types: vec![],
+            functions,
+        }],
+    }
+}
+
+fn full_core_providers() -> Vec<ProviderDescriptor> {
+    use ExternTypeExpr::{Bool, Float, Int, List, Option as Optional, String as Str, Void};
+
+    vec![
+        ProviderDescriptor {
+            provider: ProviderId {
+                name: "core_runtime".to_string(),
+            },
+            modules: vec![ExternModuleDescriptor {
+                path: provider_module(&["core_runtime"]),
+                types: vec![],
+                functions: vec![
+                    provider_fn("_println", &[("message", Str)], Void),
+                    provider_fn_with_effects(
+                        "_assert",
+                        &[("condition", Bool), ("message", Str)],
+                        Void,
+                        ExternEffects { fallible: true },
+                    ),
+                ],
+            }],
+        },
+        primitive_provider(
+            "core_int",
+            vec![
+                provider_fn("int_abs", &[("x", Int)], Int),
+                provider_fn("int_min", &[("a", Int), ("b", Int)], Int),
+                provider_fn("int_max", &[("a", Int), ("b", Int)], Int),
+                provider_fn("int_clamp", &[("x", Int), ("lo", Int), ("hi", Int)], Int),
+            ],
+        ),
+        primitive_provider(
+            "core_float",
+            vec![
+                provider_fn("float_sin", &[("x", Float)], Float),
+                provider_fn("float_cos", &[("x", Float)], Float),
+                provider_fn("float_tan", &[("x", Float)], Float),
+                provider_fn("float_asin", &[("x", Float)], Float),
+                provider_fn("float_acos", &[("x", Float)], Float),
+                provider_fn("float_atan", &[("x", Float)], Float),
+                provider_fn("float_atan2", &[("y", Float), ("x", Float)], Float),
+                provider_fn("float_floor", &[("x", Float)], Float),
+                provider_fn("float_ceil", &[("x", Float)], Float),
+                provider_fn("float_round", &[("x", Float)], Float),
+                provider_fn("float_trunc", &[("x", Float)], Float),
+                provider_fn("float_sqrt", &[("x", Float)], Float),
+                provider_fn("float_cbrt", &[("x", Float)], Float),
+                provider_fn("float_pow", &[("x", Float), ("exp", Float)], Float),
+                provider_fn("float_exp", &[("x", Float)], Float),
+                provider_fn("float_ln", &[("x", Float)], Float),
+                provider_fn("float_abs", &[("x", Float)], Float),
+                provider_fn("float_min", &[("a", Float), ("b", Float)], Float),
+                provider_fn("float_max", &[("a", Float), ("b", Float)], Float),
+                provider_fn(
+                    "float_clamp",
+                    &[("x", Float), ("lo", Float), ("hi", Float)],
+                    Float,
+                ),
+                provider_fn(
+                    "float_lerp",
+                    &[("x", Float), ("target", Float), ("t", Float)],
+                    Float,
+                ),
+                provider_fn("float_to_radians", &[("x", Float)], Float),
+                provider_fn("float_to_degrees", &[("x", Float)], Float),
+            ],
+        ),
+        primitive_provider(
+            "core_string",
+            vec![
+                provider_fn("str_len", &[("s", Str)], Int),
+                provider_fn("str_contains", &[("s", Str), ("sub", Str)], Bool),
+                provider_fn("str_starts_with", &[("s", Str), ("prefix", Str)], Bool),
+                provider_fn("str_ends_with", &[("s", Str), ("suffix", Str)], Bool),
+                provider_fn("str_find", &[("s", Str), ("sub", Str)], Int),
+                provider_fn("str_to_upper", &[("s", Str)], Str),
+                provider_fn("str_to_lower", &[("s", Str)], Str),
+                provider_fn("str_trim", &[("s", Str)], Str),
+                provider_fn("str_trim_start", &[("s", Str)], Str),
+                provider_fn("str_trim_end", &[("s", Str)], Str),
+                provider_fn(
+                    "str_substring",
+                    &[("s", Str), ("start", Int), ("len", Int)],
+                    Optional(Box::new(Str)),
+                ),
+                provider_fn(
+                    "str_char_at",
+                    &[("s", Str), ("index", Int)],
+                    Optional(Box::new(Str)),
+                ),
+                provider_fn(
+                    "str_split",
+                    &[("s", Str), ("sep", Str)],
+                    List(Box::new(Str)),
+                ),
+                provider_fn(
+                    "str_replace",
+                    &[("s", Str), ("from", Str), ("to", Str)],
+                    Str,
+                ),
+            ],
+        ),
+    ]
+}
+
+fn assert_core_provider_names_match_source_imports(
+    modules: &[ResolvedModule],
+    providers: &[ProviderDescriptor],
+) {
+    let mut provider_names = HashMap::<Vec<String>, HashSet<String>>::new();
+    for provider in providers {
+        for module in &provider.modules {
+            provider_names.insert(
+                module.path.segments.clone(),
+                module
+                    .functions
+                    .iter()
+                    .map(|function| function.name.clone())
+                    .collect(),
+            );
+        }
+    }
+
+    for module in modules {
+        for stmt in &module.program.stmts {
+            let Stmt::Import(import) = &stmt.node else {
+                continue;
+            };
+            if import.node.target.root != crate::ast::ImportRoot::NativeProvider {
+                continue;
+            }
+            let crate::ast::PackageModulePath::Named(path) = &import.node.target.path else {
+                panic!("core extern imports must name provider modules");
+            };
+            let provider_path = path
+                .iter()
+                .map(|segment| segment.to_string())
+                .collect::<Vec<_>>();
+            let ImportKind::Selective(items) = &import.node.kind else {
+                panic!("core extern imports must list provider functions explicitly");
+            };
+            let imported = items
+                .iter()
+                .map(|item| match &item.kind {
+                    ImportItemKind::Name(name) => name.to_string(),
+                    ImportItemKind::SelfModule => panic!("core extern imports cannot import self"),
+                })
+                .collect::<HashSet<_>>();
+            let declared = provider_names
+                .get(&provider_path)
+                .unwrap_or_else(|| panic!("missing provider descriptor for {provider_path:?}"));
+            assert_eq!(declared, &imported, "provider/source extern import drift");
+        }
+    }
+}
+
+pub(crate) fn checked_with_full_core_shape(
+    source: &str,
+) -> (Program, ResolveResult, typecheck::SemanticCheckOutput) {
+    let root = parse_program(source);
+    let core_root = parse_program(CORE_ROOT_SOURCE);
+    let mut modules = CORE_MODULE_SOURCES
+        .iter()
+        .map(|(path, code)| ResolvedModule {
+            key: ModuleId::named(
+                PackageId::core(),
+                ModulePath::new(path.iter().map(|segment| (*segment).to_string()).collect())
+                    .expect("valid core module path"),
+            ),
+            source: test_source_id(),
+            program: parse_program(code),
+        })
+        .collect::<Vec<_>>();
+    modules.insert(
+        0,
+        ResolvedModule {
+            key: ModuleId::root(PackageId::core()),
+            source: test_source_id(),
+            program: core_root,
+        },
+    );
+    let providers = full_core_providers();
+    assert_core_provider_names_match_source_imports(&modules, &providers);
+    checked_with_core_modules(root, modules, providers)
+}
+
+fn checked_with_core_modules(
+    root: Program,
+    core_modules: Vec<ResolvedModule>,
+    providers: Vec<ProviderDescriptor>,
+) -> (Program, ResolveResult, typecheck::SemanticCheckOutput) {
+    let provider_raw = externs::ingest_providers(ExternInputs {
+        packages: vec![PackageExternInputs {
+            package: PackageId::core(),
+            providers,
+        }],
+    })
+    .expect("valid providers");
+    let external_modules = externs::raw_extern_module_ids(&provider_raw);
+    let mut resolved = resolved_modules_with_external(&root, &[], &external_modules);
+    for module in &external_modules {
+        resolved.import_edges.entry(module.clone()).or_default();
+    }
+    for module in &core_modules {
+        resolved.import_edges.insert(
+            module.key.clone(),
+            import_targets(
+                &module.key,
+                &module.program,
+                module.source,
+                &external_modules,
+            ),
+        );
+    }
+    resolved.module_groups.push(core_modules);
+    resolved.system.core = Some(PackageId::core());
+    let mut raw = externs::collect_source_externs(&root, &resolved).unwrap();
+    raw.append(provider_raw);
+    let semantic =
+        typecheck::check_semantic_with_modules(&root, &resolved, raw, TypecheckConfig::default())
+            .expect("typecheck failed");
+    (root, resolved, semantic)
 }
 
 pub(crate) fn empty_resolved() -> ResolveResult {
