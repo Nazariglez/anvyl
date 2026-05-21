@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: cannot be stringified
+
+fn main() {
+    let x = nil;
+    let text: string = #stringify(x);
+    let value: int? = x;
+}

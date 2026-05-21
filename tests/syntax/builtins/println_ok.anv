@@ -1,8 +1,8 @@
 // @mode: check
 // @expect: success
-// @skip: generic println awaits to_string/format AIR lowering
 
 fn main() {
     println("hello");
     println(42);
+    println(true);
 }

@@ -1,0 +1,24 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+contract Drawable { fn draw(self); }
+
+struct Sprite {
+    fn draw(self) {}
+}
+
+fn callback() {}
+
+fn main() {
+    let int_text: string = #stringify(1);
+    let float_text: string = #stringify(1.5);
+    let bool_text: string = #stringify(true);
+    let string_text: string = #stringify("hello");
+    let void_text: string = #stringify({});
+    let function_text: string = #stringify(callback);
+
+    let sprite = Sprite {};
+    let drawable: dyn Drawable = sprite;
+    let dyn_text: string = #stringify(drawable);
+}

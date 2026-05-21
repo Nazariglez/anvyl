@@ -2,7 +2,6 @@
 // @mode: check
 // @expect: success
 // @lint: internal_access=allow
-// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Item };
 

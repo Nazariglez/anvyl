@@ -88,8 +88,9 @@ pub enum RValue {
         callee: Callee,
         args: Vec<Operand>,
     },
-    ToString {
+    Stringify {
         value: Operand,
+        source_ty: TypeId,
     },
     Format {
         value: Operand,

@@ -1580,7 +1580,7 @@ mod tests {
             &["runtime"],
             r#"
             import ext:core_runtime { _println, _assert };
-            pub fn println(message: string) { _println(message); }
+            pub fn println<T>(value: T) { _println(#stringify(value)); }
             pub fn assert(condition: bool, message: string = "assertion failed") {
                 _assert(condition, message);
             }

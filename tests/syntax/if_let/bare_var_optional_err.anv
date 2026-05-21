@@ -2,7 +2,7 @@
 // @expect: error
 // @contains: optional value requires an unwrapping pattern
 // @frontend: new
-// @skip: generic println awaits to_string/format AIR lowering
+// @skip: stringify not support for optional yet
 
 fn main() {
     var opt: int? = 42;

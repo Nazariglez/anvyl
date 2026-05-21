@@ -966,8 +966,9 @@ fn implicit_primitive_rvalues_require_canonical_result_type() {
     );
     fb.add_statement(
         bb0,
-        stmt_eval(RValue::ToString {
+        stmt_eval(RValue::Stringify {
             value: op_place(local_bool, bool_ty),
+            source_ty: bool_ty,
         }),
     );
     let fid = builder.alloc_function(fb.finish());
@@ -981,6 +982,70 @@ fn implicit_primitive_rvalues_require_canonical_result_type() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadRValue(BadRValue::MissingPrimitive(PrimitiveKind::String))
+    )));
+}
+
+#[test]
+fn stringify_operand_must_match_source_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let errors = verify_void_entry(builder, "bad_stringify", module, void_ty, |fb, bb0| {
+        let local = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Stringify {
+                value: op_place(local, int_ty),
+                source_ty: bool_ty,
+            }),
+        );
+    });
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::StringifyOperandTypeMismatch { operand, source })
+            if operand == int_ty && source == bool_ty
+    )));
+}
+
+#[test]
+fn stringify_rejects_invalid_and_any_source_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let any_ty = builder.any_ty();
+    builder.string_ty();
+    let void_ty = builder.void_ty();
+    let invalid_ty = TypeId::from_index(999);
+    let module = test_module(&mut builder);
+    let errors = verify_void_entry(builder, "bad_stringify", module, void_ty, |fb, bb0| {
+        let int_local = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
+        let any_local = fb.push_local(None, any_ty, Mutability::Immutable, LocalKind::User);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Stringify {
+                value: op_place(int_local, int_ty),
+                source_ty: invalid_ty,
+            }),
+        );
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Stringify {
+                value: op_place(any_local, any_ty),
+                source_ty: any_ty,
+            }),
+        );
+    });
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidType(ty)) if ty == invalid_ty
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::StringifyAnySource { source }) if source == any_ty
     )));
 }
 

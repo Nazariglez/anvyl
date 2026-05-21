@@ -226,7 +226,7 @@ pub(crate) fn rvalue_ty(
         RValue::Cast { target, .. } => Some(*target),
         RValue::Call { callee, .. } => call_ty(program, callee),
         RValue::SharedRefEq { .. } => primitives.bool(),
-        RValue::ToString { .. } | RValue::Format { .. } => primitives.string(),
+        RValue::Stringify { .. } | RValue::Format { .. } => primitives.string(),
         RValue::Len { .. } => primitives.int(),
         RValue::ListPush { .. } | RValue::MapInsert { .. } => primitives.void(),
     }

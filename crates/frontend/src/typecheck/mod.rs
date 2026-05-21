@@ -728,6 +728,10 @@ pub(crate) enum TypeError {
         expected: &'static str,
         span: Option<SourceSpan>,
     },
+    UnsupportedStringifyType {
+        ty: Type,
+        span: Option<SourceSpan>,
+    },
     ExternAnyEscape {
         span: Option<SourceSpan>,
     },
@@ -1081,7 +1085,7 @@ struct TypeChecker {
     generic_owner_frames: Vec<GenericOwnerFrame>,
     active_bodies: Vec<BodyInstanceKey>,
     local_def_bodies: HashMap<SemanticLocalId, BodyInstanceKey>,
-    local_fact_suppression: usize,
+    suppressed_local_fact_bodies: Vec<BodyInstanceKey>,
     local_callables: HashMap<CallableId, LocalCallableInfo>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
     specializations: HashMap<CallableInstanceKey, SpecializationState>,
@@ -1130,7 +1134,7 @@ impl TypeChecker {
             generic_owner_frames: vec![],
             active_bodies: vec![],
             local_def_bodies: HashMap::new(),
-            local_fact_suppression: 0,
+            suppressed_local_fact_bodies: vec![],
             local_callables: HashMap::new(),
             callable_templates: HashMap::new(),
             specializations: HashMap::new(),
@@ -1229,25 +1233,26 @@ impl TypeChecker {
     }
 
     fn with_suppressed_local_facts<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.local_fact_suppression += 1;
+        let body = self.current_body();
+        self.suppressed_local_fact_bodies.push(body.clone());
         let ret = f(self);
-        self.local_fact_suppression = self
-            .local_fact_suppression
-            .checked_sub(1)
+        let popped = self
+            .suppressed_local_fact_bodies
+            .pop()
             .expect("local fact suppression underflow");
+        debug_assert_eq!(popped, body);
         ret
     }
 
     fn can_record_local_facts(&self) -> bool {
-        if self.local_fact_suppression > 0 {
+        let body = self.current_body();
+        if self.suppressed_local_fact_bodies.contains(&body) {
             return false;
         }
-        let BodyInstanceKey::Callable(key) = self.current_body() else {
+        let BodyInstanceKey::Callable(key) = body else {
             return false;
         };
-        key.args.is_empty()
-            && key.target.parent.is_none()
-            && matches!(key.target.kind, CallableKind::Function)
+        key.target.parent.is_none() && matches!(key.target.kind, CallableKind::Function)
     }
 
     fn record_local_def(
@@ -1890,6 +1895,11 @@ impl TypeChecker {
         self.semantic_facts.record_extern_use(site, target);
     }
 
+    fn record_stringify(&mut self, expr_id: ExprId, arg: ExprId) {
+        self.semantic_facts
+            .record_stringify(self.current_expr_site(expr_id), arg);
+    }
+
     pub(crate) fn record_member_path(&mut self, fact: MemberPathFact) {
         self.semantic_facts
             .record_member_path(self.current_body(), fact);
@@ -2377,54 +2387,91 @@ impl TypeChecker {
                     continue;
                 };
                 let func = &func_node.node;
-                if !func.type_params.is_empty() || !func.const_params.is_empty() {
-                    continue;
-                }
                 let id = CallableId::function(module.scope.clone(), func.name);
                 let value = self
                     .decls
                     .local_value(&module.scope, func.name)
-                    .expect("concrete source function missing declaration");
+                    .expect("source function missing declaration");
                 let callable = self
                     .decls
                     .callable_for_value(&value)
-                    .expect("concrete source function declaration is not callable");
+                    .expect("source function declaration is not callable");
                 assert_eq!(callable.def.id, id);
-                assert!(callable.def.sig.generics.is_empty());
                 assert!(callable.def.sig.owner_generics.is_empty());
                 assert!(callable.def.sig.required_params <= callable.def.sig.params.len());
                 assert_eq!(func.params.len(), callable.def.sig.params.len());
-                let args = GenericArgs::default();
-                let body = BodyInstanceKey::Callable(CallableInstanceKey {
-                    target: id.clone(),
-                    args: args.clone(),
-                });
-                let params = func
-                    .params
+                if callable.def.sig.generics.is_empty() {
+                    facts.functions.push(self.semantic_function_fact(
+                        module,
+                        func_node,
+                        &callable,
+                        GenericArgs::default(),
+                        callable.def.sig.params.clone(),
+                        callable.def.sig.ret.ty.clone(),
+                    ));
+                    continue;
+                }
+
+                let mut instances = self
+                    .specializations
                     .iter()
-                    .zip(&callable.def.sig.params)
-                    .map(|(source, sig)| SemanticParamSigFact {
-                        name: source.name,
-                        span: SourceSpan::from_byte_span(module.source, source.ty_span),
-                        ty: sig.ty.clone(),
-                        mutable: sig.mutable,
+                    .filter_map(|(key, state)| match state {
+                        SpecializationState::Done(body) if key.target == id => Some((
+                            key.args.clone(),
+                            body.params.clone(),
+                            body.return_ty.clone(),
+                        )),
+                        SpecializationState::InProgress | SpecializationState::Done(_) => None,
                     })
-                    .collect();
-                facts.functions.push(SemanticFunctionInstanceFact {
-                    id,
-                    args,
-                    body,
-                    module: module.scope.clone(),
-                    name: func.name,
-                    span: SourceSpan::from_byte_span(module.source, func_node.span),
-                    body_span: SourceSpan::from_byte_span(module.source, func.body.span),
-                    params,
-                    return_ty: callable.def.sig.ret.ty,
-                });
+                    .collect::<Vec<_>>();
+                instances.sort_by_key(|(args, ..)| format!("{args:?}"));
+                for (args, params, return_ty) in instances {
+                    facts.functions.push(self.semantic_function_fact(
+                        module, func_node, &callable, args, params, return_ty,
+                    ));
+                }
             }
         }
         facts.validate();
         facts
+    }
+
+    fn semantic_function_fact(
+        &self,
+        module: &SourceModuleFactsInput,
+        func_node: &FuncNode,
+        callable: &CallableRef,
+        args: GenericArgs,
+        param_types: Vec<FuncParam>,
+        return_ty: Type,
+    ) -> SemanticFunctionInstanceFact {
+        let func = &func_node.node;
+        let body = BodyInstanceKey::Callable(CallableInstanceKey {
+            target: callable.def.id.clone(),
+            args: args.clone(),
+        });
+        let params = func
+            .params
+            .iter()
+            .zip(param_types)
+            .map(|(source, sig)| SemanticParamSigFact {
+                name: source.name,
+                span: SourceSpan::from_byte_span(module.source, source.ty_span),
+                ty: sig.ty,
+                mutable: sig.mutable,
+            })
+            .collect();
+        SemanticFunctionInstanceFact {
+            id: callable.def.id.clone(),
+            args,
+            body,
+            module: module.scope.clone(),
+            name: func.name,
+            span: SourceSpan::from_byte_span(module.source, func_node.span),
+            body_span: SourceSpan::from_byte_span(module.source, func.body.span),
+            params,
+            return_ty,
+        }
     }
 
     fn finish(&mut self) -> Option<SemanticCheckOutput> {
@@ -2439,8 +2486,16 @@ impl TypeChecker {
         let (types, finalize_errors) = self.solver.finalize_expr_types();
         let has_finalize_errors = self.push_finalize_errors(finalize_errors);
         let has_local_finalize_errors = self.finish_semantic_local_defs();
-        if !has_finalize_errors && !has_local_finalize_errors && !self.finish_semantic_expr_types()
-        {
+        let has_expr_finalize_errors = self.finish_semantic_expr_types();
+        let has_type_errors =
+            has_finalize_errors || has_local_finalize_errors || has_expr_finalize_errors;
+        let has_stringify_errors = if has_type_errors {
+            false
+        } else {
+            self.semantic_facts.finish_stringifies();
+            self.finish_stringify_types()
+        };
+        if !has_type_errors && !has_stringify_errors {
             for error in self.result_closure_errors(&types) {
                 self.push_error_once(error);
             }
@@ -2523,6 +2578,29 @@ impl TypeChecker {
             let (ty, errors) = self.solver.finalize_handle_to_type(&handle);
             has_errors |= self.push_finalize_errors(errors);
             self.semantic_facts.finish_expr_type(&body, expr, ty);
+        }
+        has_errors
+    }
+
+    fn finish_stringify_types(&mut self) -> bool {
+        let records = self
+            .semantic_facts
+            .bodies
+            .values()
+            .flat_map(|body| {
+                body.stringifies.values().map(|fact| {
+                    let span = body.expr_types.get(&fact.arg).and_then(|arg| arg.span);
+                    (fact.source_ty.clone(), span)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut has_errors = false;
+        for (ty, span) in records {
+            let Some(error) = stringify_type_error(&ty, false, span) else {
+                continue;
+            };
+            self.push_error_once(error);
+            has_errors = true;
         }
         has_errors
     }
@@ -3347,6 +3425,7 @@ enum IntrinsicKind {
     File,
     Line,
     Function,
+    Stringify,
 }
 
 fn intrinsic_kind(name: Ident) -> Option<IntrinsicKind> {
@@ -3358,6 +3437,7 @@ fn intrinsic_kind(name: Ident) -> Option<IntrinsicKind> {
         "file" => IntrinsicKind::File,
         "line" => IntrinsicKind::Line,
         "function" => IntrinsicKind::Function,
+        "stringify" => IntrinsicKind::Stringify,
         _ => return None,
     })
 }
@@ -3408,7 +3488,64 @@ fn check_intrinsic_call(
             check_intrinsic_arg_count(name, &call.node.args, 0, call.span, tc);
             checked_from_type(expr, Type::Int, tc)
         }
+        IntrinsicKind::Stringify => check_stringify_intrinsic(expr, call, tc),
     }
+}
+
+fn check_stringify_intrinsic(
+    expr: &ExprNode,
+    call: &IntrinsicCallNode,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    if !check_intrinsic_arg_count(call.node.name, &call.node.args, 1, call.span, tc) {
+        return checked_from_type(expr, Type::String, tc);
+    }
+    let arg = &call.node.args[0];
+    let checked = check_value_expr_checked_with_hint(arg, None, tc);
+    if let Some(error) = stringify_type_error(
+        &checked.ty,
+        checked.contains_extern_any,
+        tc.error_span(arg.span),
+    ) {
+        tc.push_error(error);
+    }
+    tc.record_stringify(expr.node.id, arg.node.id);
+    checked_from_type(expr, Type::String, tc)
+}
+
+fn stringify_type_error(
+    ty: &Type,
+    contains_extern_any: bool,
+    span: Option<SourceSpan>,
+) -> Option<TypeError> {
+    let facts = type_closure_facts(ty);
+    if matches!(ty, Type::Infer | Type::InferReturn)
+        || facts.first_unresolved.is_some()
+        || facts.infer.contains_type
+        || facts.infer.contains_return
+    {
+        return None;
+    }
+    if stringify_type_supported(ty) && !contains_extern_any && !facts.contains_any {
+        return None;
+    }
+    Some(TypeError::UnsupportedStringifyType {
+        ty: ty.clone(),
+        span,
+    })
+}
+
+fn stringify_type_supported(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Func { .. }
+            | Type::Dyn(_)
+    ) || matches!(ty, Type::Nominal(nominal) if nominal.kind == NominalKind::Extern)
 }
 
 fn intrinsic_ident_arg(

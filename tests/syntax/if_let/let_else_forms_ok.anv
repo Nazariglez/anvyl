@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @skip: generic println awaits to_string/format AIR lowering
 
 fn process(opt: int?) -> int {
     let Option.Some(x) = opt else { return 0; }

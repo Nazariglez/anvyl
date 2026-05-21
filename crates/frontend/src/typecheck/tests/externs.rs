@@ -401,7 +401,7 @@ mod calls {
                 "runtime",
                 r#"
                 import ext:host { _println, _assert };
-                pub fn println(message: string) { _println(message); }
+                pub fn println<T>(value: T) { _println(#stringify(value)); }
                 pub fn assert(condition: bool, message: string = "assertion failed") {
                     _assert(condition, message);
                 }
@@ -550,6 +550,45 @@ mod any {
                         ExternTypeExpr::Void,
                     ),
                 ],
+            }),
+        )
+        .expect("typecheck failed");
+    }
+
+    #[test]
+    fn stringify_rejects_provider_any() {
+        let Err(errors) = check_with_provider(
+            r"
+            import ext:host { get };
+            fn main() { #stringify(get()); }
+            ",
+            provider(ExternModuleDescriptor {
+                path: extern_path(&["host"]),
+                types: vec![],
+                functions: vec![function("get", vec![], ExternTypeExpr::Any)],
+            }),
+        ) else {
+            panic!("typecheck should fail");
+        };
+
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0],
+            TypeError::UnsupportedStringifyType { ty: Type::Any, .. }
+        ));
+    }
+
+    #[test]
+    fn stringify_accepts_provider_nominal() {
+        check_with_provider(
+            r"
+            import ext:host { Handle, get };
+            fn main() { let text: string = #stringify(get()); }
+            ",
+            provider(ExternModuleDescriptor {
+                path: extern_path(&["host"]),
+                types: vec![extern_type("Handle")],
+                functions: vec![function("get", vec![], named("Handle"))],
             }),
         )
         .expect("typecheck failed");

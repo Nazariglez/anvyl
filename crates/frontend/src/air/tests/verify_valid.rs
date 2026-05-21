@@ -70,6 +70,7 @@ fn primitive_rvalues() {
     let int_ty = builder.int_ty();
     let float_ty = builder.float_ty();
     let bool_ty = builder.bool_ty();
+    builder.string_ty();
     let module = test_module(&mut builder);
 
     let mut fb = FunctionBuilder::new("primitive_rvalues", module, FunctionKind::Normal, int_ty);
@@ -107,6 +108,10 @@ fn primitive_rvalues() {
         RValue::Cast {
             value: op_place(float, float_ty),
             target: int_ty,
+        },
+        RValue::Stringify {
+            value: op_place(bool_, bool_ty),
+            source_ty: bool_ty,
         },
     ] {
         fb.add_statement(block, stmt_eval(value));

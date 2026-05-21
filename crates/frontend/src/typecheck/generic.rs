@@ -11,8 +11,8 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef, GenericArg, Ident,
-        Type, TypeParam, TypeVarId,
+        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef, FuncParam,
+        GenericArg, Ident, Type, TypeParam, TypeVarId,
     },
     span::Span,
 };
@@ -130,6 +130,8 @@ pub(crate) struct SpecializedBodyFacts {
 pub(crate) struct SpecializedBody {
     pub(crate) facts: SpecializedBodyFacts,
     pub(crate) dyn_infer: DynInferenceFacts,
+    pub(crate) params: Vec<FuncParam>,
+    pub(crate) return_ty: Type,
     pub(crate) inferred_ret: Option<Type>,
 }
 
@@ -188,6 +190,8 @@ pub(super) fn check_with_specialization(
     type_subst: TypeSubst,
     const_subst: ConstSubst,
     owner_frame: GenericOwnerFrame,
+    params: Vec<FuncParam>,
+    declared_ret: Type,
     tc: &mut TypeChecker,
     check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
 ) -> Option<Type> {
@@ -214,6 +218,7 @@ pub(super) fn check_with_specialization(
         .unwrap_or_default();
     let contract_witnesses =
         super::semantic_use::map_delta(&old_witnesses, &tc.semantic_facts.contract_witnesses);
+    let return_ty = inferred_ret.clone().unwrap_or(declared_ret);
     tc.store_specialization(
         key,
         SpecializationState::Done(Box::new(SpecializedBody {
@@ -223,6 +228,8 @@ pub(super) fn check_with_specialization(
                 closure: tc.closure_fact_snapshot().delta_since(&old_closure),
             },
             dyn_infer: tc.dyn_infer.specialization_delta_since(&old_dyn_infer),
+            params,
+            return_ty,
             inferred_ret: inferred_ret.clone(),
         })),
     );

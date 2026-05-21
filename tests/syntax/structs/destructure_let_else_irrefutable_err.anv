@@ -2,7 +2,6 @@
 // @frontend: new
 // @expect: error
 // @contains: irrefutable pattern in let-else
-// @skip: generic println awaits to_string/format AIR lowering
 
 struct Point { x: int, y: int }
 

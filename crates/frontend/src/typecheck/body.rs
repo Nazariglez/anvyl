@@ -1471,20 +1471,29 @@ pub(super) fn check_specialized_callable_body(
         args: args.clone(),
         generics: template.generics.clone(),
     };
-    check_with_specialization(key, type_subst, const_subst, owner_frame, tc, |tc| {
-        with_callable_body_env(&callee.def.id.module, &template.env, tc, |tc| {
-            check_func_body(
-                receiver,
-                &template.params,
-                param_types,
-                ret,
-                &template.body,
-                template.span,
-                const_bindings,
-                tc,
-            )
-        })
-    })
+    check_with_specialization(
+        key,
+        type_subst,
+        const_subst,
+        owner_frame,
+        param_types.to_vec(),
+        ret.ty.clone(),
+        tc,
+        |tc| {
+            with_callable_body_env(&callee.def.id.module, &template.env, tc, |tc| {
+                check_func_body(
+                    receiver,
+                    &template.params,
+                    param_types,
+                    ret,
+                    &template.body,
+                    template.span,
+                    const_bindings,
+                    tc,
+                )
+            })
+        },
+    )
 }
 
 fn with_global_scope<R>(tc: &mut TypeChecker, f: impl FnOnce(&mut TypeChecker) -> R) -> R {

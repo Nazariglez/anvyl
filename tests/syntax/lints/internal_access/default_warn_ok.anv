@@ -2,7 +2,6 @@
 // @mode: check
 // @expect: success
 // @warn-contains: Warning: accessing internal field 'cache' of type 'Item'
-// @skip: generic println awaits to_string/format AIR lowering
 
 import lib { Item };
 

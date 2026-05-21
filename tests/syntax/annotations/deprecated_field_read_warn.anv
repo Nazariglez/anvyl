@@ -2,7 +2,6 @@
 // @frontend: new
 // @expect: success
 // @warn-contains: use label
-// @skip: generic println awaits to_string/format AIR lowering
 
 struct Item {
     name: string,

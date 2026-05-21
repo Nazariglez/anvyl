@@ -2,7 +2,6 @@
 // @expect: error
 // @frontend: new
 // @contains: map keys cannot be mutable
-// @skip: generic println awaits to_string/format AIR lowering
 
 fn main() {
     var xs = ["a": 1];

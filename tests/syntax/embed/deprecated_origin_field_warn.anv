@@ -2,7 +2,6 @@
 // @expect: success
 // @frontend: new
 // @warn-contains: use current_hp
-// @skip: generic println awaits to_string/format AIR lowering
 
 struct Health {
     @deprecated("use current_hp")

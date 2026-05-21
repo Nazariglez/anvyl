@@ -27,6 +27,7 @@ pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
 pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
 pub(crate) type DynDowncastMap = HashMap<ExprId, DynDowncastFact>;
 pub(crate) type GlobalAccessMap = HashMap<ExprId, GlobalAccessFact>;
+pub(crate) type StringifyMap = HashMap<ExprId, StringifyFact>;
 pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
 pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
 pub(crate) type BindingPromotionMap = HashMap<BindingId, BindingPromotionFact>;
@@ -186,8 +187,8 @@ impl SemanticDeclarations {
         for function in &self.functions {
             let Some(body) = facts.body(&function.body) else {
                 debug_assert!(
-                    function.params.is_empty(),
-                    "semantic function fact missing parameter body facts"
+                    function.params.is_empty() && function.return_ty == Type::Void,
+                    "semantic function fact missing body facts"
                 );
                 continue;
             };
@@ -313,6 +314,7 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) dyn_calls: DynCallMap,
     pub(crate) dyn_downcasts: DynDowncastMap,
     pub(crate) global_accesses: GlobalAccessMap,
+    pub(crate) stringifies: StringifyMap,
     pub(crate) for_step_runtime_checks: ForStepRuntimeCheckMap,
     pub(crate) locals: LocalFacts,
 }
@@ -330,6 +332,7 @@ impl SemanticBodyFacts {
         self.dyn_calls.extend(facts.dyn_calls);
         self.dyn_downcasts.extend(facts.dyn_downcasts);
         self.global_accesses.extend(facts.global_accesses);
+        self.stringifies.extend(facts.stringifies);
         self.for_step_runtime_checks
             .extend(facts.for_step_runtime_checks);
     }
@@ -372,6 +375,10 @@ impl SemanticBodyFacts {
         for (expr_id, fact) in &self.global_accesses {
             debug_assert_eq!(*expr_id, fact.expr_id);
         }
+        for (expr_id, fact) in &self.stringifies {
+            debug_assert!(self.expr_types.contains_key(expr_id));
+            debug_assert!(self.expr_types.contains_key(&fact.arg));
+        }
         self.locals.validate();
     }
 
@@ -381,6 +388,18 @@ impl SemanticBodyFacts {
             debug_assert!(fact.ty.is_some());
         }
         self.locals.validate_finished();
+        for fact in self.stringifies.values() {
+            debug_assert!(!type_has_unfinished_facts(&fact.source_ty));
+            let Some(arg) = self.expr_types.get(&fact.arg) else {
+                debug_assert!(false, "stringify argument missing expression type in body");
+                continue;
+            };
+            let Some(arg_ty) = arg.ty.as_ref() else {
+                debug_assert!(false, "stringify argument expression type not finalized");
+                continue;
+            };
+            debug_assert_eq!(arg_ty, &fact.source_ty);
+        }
         #[cfg(debug_assertions)]
         for (expr_id, projection) in &self.expected_projections {
             let Some(expr) = self.expr_types.get(expr_id) else {
@@ -607,6 +626,42 @@ impl SemanticFactMaps {
             .insert(fact.expr_id, fact);
     }
 
+    pub(crate) fn record_stringify(&mut self, site: SemanticExprSite, arg: ExprId) {
+        self.body_mut(site.body).stringifies.insert(
+            site.expr,
+            StringifyFact {
+                arg,
+                source_ty: Type::Infer,
+            },
+        );
+    }
+
+    pub(crate) fn finish_stringifies(&mut self) {
+        let records = self
+            .bodies
+            .iter()
+            .flat_map(|(body_key, body)| {
+                body.stringifies
+                    .iter()
+                    .map(|(call, fact)| (body_key.clone(), *call, fact.arg))
+            })
+            .collect::<Vec<_>>();
+        for (body_key, call, arg) in records {
+            let source_ty = self
+                .bodies
+                .get(&body_key)
+                .and_then(|body| body.expr_types.get(&arg))
+                .and_then(|fact| fact.ty.clone())
+                .expect("stringify argument type missing during finish");
+            let fact = self
+                .bodies
+                .get_mut(&body_key)
+                .and_then(|body| body.stringifies.get_mut(&call))
+                .expect("stringify fact missing during finish");
+            fact.source_ty = source_ty;
+        }
+    }
+
     pub(crate) fn record_for_step_runtime_check(
         &mut self,
         site: SemanticExprSite,
@@ -727,6 +782,12 @@ pub(crate) struct GlobalAccessFact {
     pub(crate) key: GlobalKey,
     pub(crate) mode: GlobalAccessMode,
     pub(crate) init_effect: GlobalInitEffect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StringifyFact {
+    pub(crate) arg: ExprId,
+    pub(crate) source_ty: Type,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

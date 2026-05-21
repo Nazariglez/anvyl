@@ -109,6 +109,13 @@ pub enum BadRValue {
         value: TypeId,
         target: TypeId,
     },
+    StringifyOperandTypeMismatch {
+        operand: TypeId,
+        source: TypeId,
+    },
+    StringifyAnySource {
+        source: TypeId,
+    },
     AggregateCtorResultTypeMismatch {
         aggregate: AggregateId,
         expected: AggregateKind,
@@ -1049,6 +1056,37 @@ fn verify_return(
     }
 }
 
+fn verify_stringify(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    stmt_index: Option<usize>,
+    site: VerifySite,
+    value: &Operand,
+    source_ty: TypeId,
+) {
+    required_rvalue_primitive(cx, site.clone(), PrimitiveKind::String);
+    cx.verify_type_ref(site.clone(), source_ty);
+    if matches!(cx.type_data(source_ty), Some(TypeData::Any)) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::StringifyAnySource { source: source_ty }),
+        );
+    }
+    verify_operand(cx, function_id, block_id, stmt_index, value);
+    if let Some(operand) = operand_ty(cx, value)
+        && operand != source_ty
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadRValue(BadRValue::StringifyOperandTypeMismatch {
+                operand,
+                source: source_ty,
+            }),
+        );
+    }
+}
+
 fn verify_rvalue(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -1063,9 +1101,16 @@ fn verify_rvalue(
         RValue::Use(op) => {
             verify_operand(cx, function_id, block_id, stmt_index, op);
         }
-        RValue::ToString { value: op } => {
-            verify_operand(cx, function_id, block_id, stmt_index, op);
-            required_rvalue_primitive(cx, site, PrimitiveKind::String);
+        RValue::Stringify { value, source_ty } => {
+            verify_stringify(
+                cx,
+                function_id,
+                block_id,
+                stmt_index,
+                site,
+                value,
+                *source_ty,
+            );
         }
         RValue::Unary {
             op: unary,

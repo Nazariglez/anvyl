@@ -2,7 +2,6 @@
 // @expect: error
 // @contains: irrefutable pattern in let-else
 // @frontend: new
-// @skip: generic println awaits to_string/format AIR lowering
 
 fn main() {
     var n = 99;

@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @contains: requires an unwrapping pattern
-// @skip: generic println awaits to_string/format AIR lowering
+// @skip: stringify not support for optional yet
 
 fn next() -> int? {
     nil

@@ -67,6 +67,26 @@ pub(crate) enum LowerError {
         kind: &'static str,
         span: Option<SourceSpan>,
     },
+    MissingFunctionFact {
+        id: Box<CallableId>,
+        args: Box<GenericArgs>,
+    },
+    MissingSpecializedBodyFacts {
+        body: Box<BodyInstanceKey>,
+    },
+    MissingGenericInstanceArgs {
+        id: Box<CallableId>,
+    },
+    UnsupportedCallableInstance {
+        id: Box<CallableId>,
+        args: Box<GenericArgs>,
+    },
+    UnsupportedCallForm {
+        expr_id: ExprId,
+    },
+    MissingLoweredCallee {
+        body: Box<BodyInstanceKey>,
+    },
     UnsupportedStmt {
         kind: &'static str,
         span: Option<SourceSpan>,
@@ -74,6 +94,10 @@ pub(crate) enum LowerError {
     UnsupportedExpr {
         expr_id: ExprId,
         kind: &'static str,
+    },
+    UnsupportedStringifyType {
+        expr_id: ExprId,
+        ty: Box<Type>,
     },
     UnterminatedBlock,
     Verify(Box<[VerifyError]>),
@@ -227,7 +251,7 @@ impl LowerCx {
             let empty_facts;
             let body_facts = match semantic.facts.body(&source.body) {
                 Some(facts) => facts,
-                None if source.func.node.params.is_empty() => {
+                None if source.can_omit_body_facts() => {
                     empty_facts = SemanticBodyFacts::default();
                     &empty_facts
                 }
@@ -237,11 +261,12 @@ impl LowerCx {
                     });
                 }
             };
+            reject_unsupported_stringifies(body_facts)?;
             let return_type = self.lower_ty(&source.fact.return_ty)?;
             let mut params = vec![];
             let mut locals = vec![];
             let mut local_map = HashMap::new();
-            for index in 0..source.func.node.params.len() {
+            for (index, param_fact) in source.fact.params.iter().enumerate() {
                 let semantic_local = body_facts
                     .locals
                     .param_defs
@@ -258,12 +283,15 @@ impl LowerCx {
                     }
                 })?;
                 debug_assert_eq!(def.kind, LocalDefKind::Parameter);
-                let ty = self.lower_ty(&def.ty)?;
+                debug_assert_eq!(def.name, param_fact.name);
+                debug_assert_eq!(def.ty, param_fact.ty);
+                debug_assert_eq!(def.mutable, param_fact.mutable);
+                let ty = self.lower_ty(&param_fact.ty)?;
                 let local_id = LocalId::from_index(locals.len());
                 locals.push(Local {
-                    name: Some(def.name),
+                    name: Some(param_fact.name),
                     ty,
-                    mutability: if def.mutable {
+                    mutability: if param_fact.mutable {
                         AirMutability::Mutable
                     } else {
                         AirMutability::Immutable
@@ -273,7 +301,7 @@ impl LowerCx {
                 let old = local_map.insert(semantic_local, local_id);
                 debug_assert!(old.is_none(), "duplicate semantic param local");
                 params.push(Param {
-                    name: Some(def.name),
+                    name: Some(param_fact.name),
                     ty,
                     role: ParamRole::Normal,
                     local_id,
@@ -309,7 +337,7 @@ impl LowerCx {
             let empty_facts;
             let facts = match semantic.facts.body(&source.body) {
                 Some(facts) => facts,
-                None if source.func.node.params.is_empty() => {
+                None if source.can_omit_body_facts() => {
                     empty_facts = SemanticBodyFacts::default();
                     &empty_facts
                 }
@@ -545,6 +573,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 })
             }
             ExprKind::Call(call) => self.lower_call_value(expr, &call.node.args),
+            ExprKind::IntrinsicCall(call) => self.lower_intrinsic_value(expr, call),
             ExprKind::Cast(cast) => {
                 self.require_builtin_scalar(expr)?;
                 let source_ty = self.lower_expr_ty(cast.node.expr.node.id)?;
@@ -564,6 +593,26 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             }
             _ => Err(unsupported_expr(expr)),
         }
+    }
+
+    fn lower_intrinsic_value(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::IntrinsicCallNode,
+    ) -> Result<Operand, LowerError> {
+        let Some(fact) = self.facts.stringifies.get(&expr.node.id) else {
+            return Err(unsupported_expr(expr));
+        };
+        let [arg] = call.node.args.as_slice() else {
+            return Err(unsupported_expr(expr));
+        };
+        if fact.arg != arg.node.id {
+            return Err(unsupported_expr(expr));
+        }
+        let result_ty = self.cx.lower_ty(&Type::String)?;
+        let source_ty = self.cx.lower_ty(&fact.source_ty)?;
+        let value = self.lower_value(arg)?;
+        self.emit_typed_temp(result_ty, RValue::Stringify { value, source_ty })
     }
 
     fn lower_call_value(
@@ -611,14 +660,18 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             .get(&expr.node.id)
             .ok_or_else(|| unsupported_expr(expr))?;
         if target.form != CallForm::Normal {
-            return Err(unsupported_expr(expr));
+            return Err(LowerError::UnsupportedCallForm {
+                expr_id: expr.node.id,
+            });
         }
         let body = BodyInstanceKey::Callable(CallableInstanceKey {
             target: target.id.clone(),
             args: target.args.clone(),
         });
         let Some(callee) = self.cx.maps.bodies.get(&body).copied() else {
-            return Err(unsupported_expr(expr));
+            return Err(LowerError::MissingLoweredCallee {
+                body: Box::new(body),
+            });
         };
         let mut operands = args
             .iter()
@@ -965,6 +1018,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 ty: Box::new(Type::Infer),
             }
         })?;
+        self.emit_typed_temp(ty, value)
+    }
+
+    fn emit_typed_temp(&mut self, ty: TypeId, value: RValue) -> Result<Operand, LowerError> {
         let local = self.temp(ty);
         self.emit_init(local, value)?;
         Ok(self.operand_place(local))
@@ -995,6 +1052,24 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn source_span(&self, span: crate::span::Span) -> SourceSpan {
         SourceSpan::from_byte_span(self.source, span)
     }
+}
+
+fn reject_unsupported_stringifies(facts: &SemanticBodyFacts) -> Result<(), LowerError> {
+    facts
+        .stringifies
+        .iter()
+        .filter(|(_, fact)| !stringify_source_ty_supported(&fact.source_ty))
+        .min_by_key(|(call, _)| call.0)
+        .map_or(Ok(()), |(call, fact)| {
+            Err(LowerError::UnsupportedStringifyType {
+                expr_id: *call,
+                ty: Box::new(fact.source_ty.clone()),
+            })
+        })
+}
+
+fn stringify_source_ty_supported(ty: &Type) -> bool {
+    matches!(ty, Type::Int | Type::Float | Type::Bool | Type::String)
 }
 
 fn unsupported_expr(expr: &ExprNode) -> LowerError {
@@ -1136,6 +1211,19 @@ struct SourceFunction<'a> {
     source: SourceId,
 }
 
+impl SourceFunction<'_> {
+    fn can_omit_body_facts(&self) -> bool {
+        can_omit_body_facts(self.fact, self.func)
+    }
+}
+
+fn can_omit_body_facts(fact: &SemanticFunctionInstanceFact, func: &ast::FuncNode) -> bool {
+    fact.params.is_empty()
+        && fact.return_ty == Type::Void
+        && func.node.body.node.stmts.is_empty()
+        && func.node.body.node.tail.is_none()
+}
+
 impl<'a> SourceFunctions<'a> {
     fn new(
         modules: &'a SourceModules<'a>,
@@ -1185,16 +1273,18 @@ impl<'a> SourceFunctions<'a> {
         while let Some(key) = worklist.get(index).cloned() {
             index += 1;
             let Some((module_index, func_node)) = function_index.get(&key.target).copied() else {
-                continue;
+                return Err(LowerError::UnsupportedCallableInstance {
+                    id: Box::new(key.target.clone()),
+                    args: Box::new(key.args.clone()),
+                });
             };
             let module = &modules.items[module_index];
-            let span = Some(SourceSpan::from_byte_span(module.source, func_node.span));
             let func = &func_node.node;
-            if !func.type_params.is_empty() || !func.const_params.is_empty() || !key.args.is_empty()
+            if (!func.type_params.is_empty() || !func.const_params.is_empty())
+                && key.args.is_empty()
             {
-                return Err(LowerError::UnsupportedDecl {
-                    kind: "generic function",
-                    span,
+                return Err(LowerError::MissingGenericInstanceArgs {
+                    id: Box::new(key.target.clone()),
                 });
             }
             let body = BodyInstanceKey::Callable(key.clone());
@@ -1204,14 +1294,27 @@ impl<'a> SourceFunctions<'a> {
                 .iter()
                 .find(|fact| fact.id == key.target && fact.args == key.args)
             else {
-                return Err(LowerError::MissingBodyFacts {
-                    body: Box::new(body),
+                return Err(LowerError::MissingFunctionFact {
+                    id: Box::new(key.target.clone()),
+                    args: Box::new(key.args.clone()),
                 });
             };
-            if let Some(facts) = semantic.facts.body(&body) {
+            let facts = match semantic.facts.body(&body) {
+                Some(facts) => Some(facts),
+                None if can_omit_body_facts(fact, func_node) => None,
+                None => {
+                    return Err(LowerError::MissingSpecializedBodyFacts {
+                        body: Box::new(body.clone()),
+                    });
+                }
+            };
+            if let Some(facts) = facts {
                 let mut calls = facts.calls.iter().collect::<Vec<_>>();
                 calls.sort_by_key(|(expr, _)| expr.0);
-                for (_, target) in calls {
+                for (expr, target) in calls {
+                    if target.form != CallForm::Normal {
+                        return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
+                    }
                     let called = CallableInstanceKey {
                         target: target.id.clone(),
                         args: target.args.clone(),
@@ -1320,18 +1423,288 @@ mod tests {
     }
 
     #[test]
-    fn generic_function_is_unsupported() {
+    fn source_functions_include_called_generic_instance() {
         let (root, resolved, semantic) =
             checked("fn f<T>(x: T) -> T { x } fn main() -> int { f(1) }");
         let modules = SourceModules::new(&root, &resolved);
-        let err = SourceFunctions::new(&modules, &semantic.program).expect_err("expected error");
+        let functions =
+            SourceFunctions::new(&modules, &semantic.program).expect("inventory failed");
+
+        assert!(functions.items.iter().any(|function| {
+            function.func.node.name == Ident::new("f")
+                && function.fact.args.type_args == vec![Type::Int]
+        }));
+    }
+
+    #[test]
+    fn generic_function_call_lowers_once() {
+        let source = "fn id<T>(x: T) -> T { x } fn f() -> int { id(1) + id(2) }";
+        let (root, resolved, semantic) = checked(source);
+        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+
+        let id_functions = air
+            .functions
+            .iter()
+            .filter(|function| function.name == Ident::new("id"))
+            .collect::<Vec<_>>();
+        assert_eq!(id_functions.len(), 1);
+        assert_eq!(id_functions[0].signature.params.len(), 1);
+        assert!(matches!(
+            air.type_arena.get(id_functions[0].signature.return_type),
+            Some(TypeData::Int)
+        ));
+    }
+
+    #[test]
+    fn generic_identity_lowers_independent_instances() {
+        let source =
+            r#"fn id<T>(x: T) -> T { x } fn f() -> int { id(1) } fn g() -> string { id("x") }"#;
+        let (root, resolved, semantic) = checked(source);
+        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+
+        let id_functions = air
+            .functions
+            .iter()
+            .filter(|function| function.name == Ident::new("id"))
+            .collect::<Vec<_>>();
+        assert_eq!(id_functions.len(), 2);
+        assert!(id_functions.iter().any(|function| matches!(
+            air.type_arena.get(function.signature.return_type),
+            Some(TypeData::Int)
+        )));
+        assert!(id_functions.iter().any(|function| matches!(
+            air.type_arena.get(function.signature.return_type),
+            Some(TypeData::String)
+        )));
+    }
+
+    #[test]
+    fn generic_wrapper_calls_generic_helper() {
+        let source =
+            "fn id<T>(x: T) -> T { x } fn wrap<T>(x: T) -> T { id(x) } fn f() -> int { wrap(1) }";
+        let (root, resolved, semantic) = checked(source);
+        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+
+        let wrap = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("wrap"))
+            .expect("missing wrap");
+        assert!(wrap.body.iter().any(|block| block.statements.iter().any(|statement| {
+            matches!(statement, Statement::Init { value: RValue::Call { callee: Callee::Function(_), args }, .. } if args.len() == 1)
+        })));
+    }
+
+    #[test]
+    fn uncalled_generic_function_is_not_lowered() {
+        let (root, resolved, semantic) = checked("fn id<T>(x: T) -> T { x } fn main() {}");
+        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+
+        assert!(
+            air.functions
+                .iter()
+                .all(|function| function.name != Ident::new("id"))
+        );
+    }
+
+    #[test]
+    fn generic_call_order_drives_function_order() {
+        let source = r#"fn id<T>(x: T) -> T { x } fn f() { let a = id("x"); let b = id(1); }"#;
+        let (root, resolved, semantic) = checked(source);
+        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let id_returns = air
+            .functions
+            .iter()
+            .filter(|function| function.name == Ident::new("id"))
+            .map(|function| air.type_arena.get(function.signature.return_type))
+            .collect::<Vec<_>>();
+
+        assert_eq!(id_returns.len(), 2);
+        assert!(matches!(id_returns[0], Some(TypeData::String)));
+        assert!(matches!(id_returns[1], Some(TypeData::Int)));
+    }
+
+    #[test]
+    fn local_function_call_is_unsupported_callable_instance() {
+        let source = "fn f() -> int { fn inner() -> int { 1 } inner() }";
+        let (root, resolved, semantic) = checked(source);
+        let err = lower_with_modules(&root, &resolved, &semantic.program)
+            .expect_err("expected unsupported local function");
+
         assert!(matches!(
             err,
-            LowerError::UnsupportedDecl {
-                kind: "generic function",
+            LowerError::UnsupportedCallableInstance { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_generic_body_facts_are_reported() {
+        let (root, resolved, mut semantic) =
+            checked("fn id<T>(x: T) -> T { x } fn f() -> int { id(1) }");
+        let body = BodyInstanceKey::Callable(CallableInstanceKey {
+            target: CallableId::function(ModuleScope::Root, Ident::new("id")),
+            args: GenericArgs {
+                type_args: vec![Type::Int],
+                const_args: vec![],
+            },
+        });
+        semantic.program.facts.bodies.remove(&body);
+        let err = lower_with_modules(&root, &resolved, &semantic.program)
+            .expect_err("expected missing body facts");
+
+        assert!(matches!(
+            err,
+            LowerError::MissingSpecializedBodyFacts { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_non_empty_zero_param_body_facts_are_reported() {
+        let (root, resolved, mut semantic) = checked("fn f() -> int { 1 }");
+        let body = BodyInstanceKey::Callable(CallableInstanceKey {
+            target: CallableId::function(ModuleScope::Root, Ident::new("f")),
+            args: GenericArgs::default(),
+        });
+        semantic.program.facts.bodies.remove(&body);
+        let err = lower_with_modules(&root, &resolved, &semantic.program)
+            .expect_err("expected missing body facts");
+
+        assert!(matches!(
+            err,
+            LowerError::MissingSpecializedBodyFacts { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_no_param_generic_void_specialization_can_omit_body_facts() {
+        let source = "fn noop<T>() {} fn main() { noop<int>(); }";
+        let (root, resolved, semantic) = checked(source);
+
+        lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+    }
+
+    #[test]
+    fn queued_generic_template_without_instance_args_is_explicit_error() {
+        let (root, resolved, mut semantic) =
+            checked("fn id<T>(x: T) -> T { x } fn main() { let x = 1; }");
+        let id = CallableId::function(ModuleScope::Root, Ident::new("id"));
+        let args = GenericArgs::default();
+        let main_body = BodyInstanceKey::Callable(CallableInstanceKey {
+            target: CallableId::function(ModuleScope::Root, Ident::new("main")),
+            args: GenericArgs::default(),
+        });
+        semantic
+            .program
+            .facts
+            .bodies
+            .get_mut(&main_body)
+            .expect("main body facts")
+            .calls
+            .insert(
+                ExprId(u64::MAX),
+                typecheck::CallTarget::new(id.clone(), args.clone()),
+            );
+        semantic
+            .program
+            .declaration_facts
+            .functions
+            .push(SemanticFunctionInstanceFact {
+                id: id.clone(),
+                args: args.clone(),
+                body: BodyInstanceKey::Callable(CallableInstanceKey { target: id, args }),
+                module: ModuleScope::Root,
+                name: Ident::new("id"),
+                span: semantic.program.declaration_facts.functions[0].span,
+                body_span: semantic.program.declaration_facts.functions[0].body_span,
+                params: vec![],
+                return_ty: Type::Infer,
+            });
+        let err = lower_with_modules(&root, &resolved, &semantic.program)
+            .expect_err("expected missing generic args");
+
+        assert!(matches!(err, LowerError::MissingGenericInstanceArgs { .. }));
+    }
+
+    #[test]
+    fn stringify_int_lowers_to_string_typed_air() {
+        let source = "fn f() -> string { #stringify(1) }";
+        let (root, resolved, semantic) = checked(source);
+        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let string_ty = PrimitiveTypes::scan(&air).string().expect("string type");
+
+        assert!(air.functions.iter().any(|function| {
+            function.body.iter().any(|block| {
+                block.statements.iter().any(|statement| {
+                    matches!(
+                        statement,
+                        Statement::Init {
+                            value: RValue::Stringify { value: _, source_ty },
+                            ..
+                        } if *source_ty != string_ty
+                    )
+                })
+            })
+        }));
+    }
+
+    #[test]
+    fn non_stringify_intrinsic_is_unsupported() {
+        let source = "fn f() -> string { #file() }";
+        let (root, resolved, semantic) = checked(source);
+        let err = lower_with_modules(&root, &resolved, &semantic.program)
+            .expect_err("expected unsupported intrinsic");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedExpr {
+                kind: "IntrinsicCall",
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn generic_stringify_lowers_specialized_source_type() {
+        let source = "fn f<T>(x: T) -> string { #stringify(x) } fn main() -> string { f(1) }";
+        let (root, resolved, semantic) = checked(source);
+        let air = lower_with_modules(&root, &resolved, &semantic.program).expect("lower failed");
+        let int_ty = PrimitiveTypes::scan(&air).int().expect("int type");
+
+        assert!(air.functions.iter().any(|function| {
+            function.name == Ident::new("f")
+                && function.body.iter().any(|block| {
+                    block.statements.iter().any(|statement| {
+                        matches!(
+                            statement,
+                            Statement::Init {
+                                value: RValue::Stringify { value: _, source_ty },
+                                ..
+                            } if *source_ty == int_ty
+                        )
+                    })
+                })
+        }));
+    }
+
+    #[test]
+    fn unsupported_stringify_type_is_explicit_error() {
+        let source = "fn g() {} fn f() -> string { #stringify(g) }";
+        let (root, resolved, semantic) = checked(source);
+        let err = lower_with_modules(&root, &resolved, &semantic.program)
+            .expect_err("expected unsupported stringify type");
+
+        assert!(matches!(err, LowerError::UnsupportedStringifyType { .. }));
+    }
+
+    #[test]
+    fn generic_unsupported_stringify_type_is_reported_before_shell_type_lowering() {
+        let source =
+            "fn g() {} fn f<T>(x: T) -> string { #stringify(x) } fn main() -> string { f(g) }";
+        let (root, resolved, semantic) = checked(source);
+        let err = lower_with_modules(&root, &resolved, &semantic.program)
+            .expect_err("expected unsupported stringify type");
+
+        assert!(matches!(err, LowerError::UnsupportedStringifyType { .. }));
     }
 
     #[test]
@@ -1459,12 +1832,12 @@ mod tests {
     #[test]
     fn core_runtime_wrapper_lowers_extern_call() {
         let (root, resolved, semantic) = checked_with_modules(
-            "import runtime { println };",
+            "import runtime { println }; fn main() { println(1); }",
             &[(
                 "runtime",
                 "
                 extern fn _println(message: string);
-                pub fn println(message: string) { _println(message); }
+                pub fn println<T>(value: T) { _println(#stringify(value)); }
                 ",
             )],
         );
@@ -1624,6 +1997,21 @@ fn f() -> int {
             err,
             LowerError::UnsupportedDecl {
                 kind: "Aggregate",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_extern_type_declarations() {
+        let (root, resolved, semantic) = checked("extern type Handle; fn f() {}");
+        let err =
+            lower_with_modules(&root, &resolved, &semantic.program).expect_err("expected error");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedDecl {
+                kind: "ExternType",
                 ..
             }
         ));

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @skip: generic println awaits to_string/format AIR lowering
 
 fn bump(var x: int) {
     x += 1;
