@@ -2,7 +2,7 @@ use std::{collections::HashMap, hash::Hash};
 
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
-    decls::{CallableId, ExtendId, GlobalKey},
+    decls::{CallableId, CallableKind, ExtendId, GlobalKey},
     infer::{SemanticLocalId, TypeHandle},
     type_ops::{TypeVisitor, type_has_unfinished_facts},
 };
@@ -176,8 +176,10 @@ impl SemanticDeclarations {
                     if let Some(function) = self.functions.iter().find(|function| {
                         function.id == default.callee.target && function.args == default.callee.args
                     }) {
-                        debug_assert!(default.param_index < function.params.len());
-                        debug_assert_eq!(function.params[default.param_index].ty, default.ty);
+                        let param_index = default.param_index
+                            + usize::from(function.id.kind == CallableKind::InstanceMethod);
+                        debug_assert!(param_index < function.params.len());
+                        debug_assert_eq!(function.params[param_index].ty, default.ty);
                     } else if default.callee.args.is_empty() {
                         debug_assert!(false, "default arg fact targets missing function instance");
                     }

@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: optional
-// @skip: stringify not support for optional yet
 
 fn main() {
     let x = 42;

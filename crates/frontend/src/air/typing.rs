@@ -226,7 +226,9 @@ pub(crate) fn rvalue_ty(
         RValue::Cast { target, .. } => Some(*target),
         RValue::Call { callee, .. } => call_ty(program, callee),
         RValue::SharedRefEq { .. } => primitives.bool(),
-        RValue::Stringify { .. } | RValue::Format { .. } => primitives.string(),
+        RValue::Stringify { .. } | RValue::StringConcat { .. } | RValue::Format { .. } => {
+            primitives.string()
+        }
         RValue::Len { .. } => primitives.int(),
         RValue::ListPush { .. } | RValue::MapInsert { .. } => primitives.void(),
     }
@@ -241,7 +243,7 @@ pub(crate) fn list_elem_ty(program: &Program, ty: TypeId) -> Option<TypeId> {
 
 pub(crate) fn map_kv(program: &Program, ty: TypeId) -> Option<(TypeId, TypeId)> {
     match program.type_arena.get(ty) {
-        Some(TypeData::Map { key, value }) => Some((*key, *value)),
+        Some(TypeData::Map { key, value, .. }) => Some((*key, *value)),
         _ => None,
     }
 }

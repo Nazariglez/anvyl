@@ -49,13 +49,34 @@ pub enum TypeData {
     Optional(TypeId),
     Tuple(Vec<TypeId>),
     List(TypeId),
-    Array { elem: TypeId, len: usize },
-    Map { key: TypeId, value: TypeId },
+    Array {
+        elem: TypeId,
+        len: usize,
+    },
+    Map {
+        key: TypeId,
+        value: TypeId,
+        order: MapOrder,
+    },
+    Slice(TypeId),
     Function(SignatureType),
+    Dyn(DynContractData),
     Aggregate(AggregateId),
     Enum(EnumId),
     DataRef(AggregateId),
     Extern(ExternTypeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapOrder {
+    Insertion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynContractData {
+    pub display_name: String,
+    pub method_table_key: String,
+    pub concrete_printer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

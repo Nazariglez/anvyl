@@ -572,10 +572,7 @@ mod any {
         };
 
         assert_eq!(errors.len(), 1);
-        assert!(matches!(
-            errors[0],
-            TypeError::UnsupportedStringifyType { ty: Type::Any, .. }
-        ));
+        assert!(matches!(errors[0], TypeError::ExternAnyEscape { .. }));
     }
 
     #[test]

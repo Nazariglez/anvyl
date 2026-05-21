@@ -413,36 +413,6 @@ fn profile_rejects_collection_rvalues() {
 }
 
 #[test]
-fn profile_rejects_void_stringify_source() {
-    let mut program = Program::default();
-    let void = program.alloc_type(TypeData::Void);
-    let string = program.alloc_type(TypeData::String);
-    let module = program.alloc_module(root_module());
-    let value = air::LocalId::from_index(0);
-    let tmp = air::LocalId::from_index(1);
-    let func = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        signature: Signature::new(vec![], void),
-        locals: vec![local(void, LocalKind::User), local(string, LocalKind::Temp)],
-        body: vec![BasicBlock {
-            statements: vec![Statement::Init {
-                local: tmp,
-                value: RValue::Stringify {
-                    value: Operand::Place(place(value, void)),
-                    source_ty: void,
-                },
-            }],
-            terminator: Terminator::Return(None),
-        }],
-    });
-    program.module_mut(module).functions.push(func);
-
-    expect_reject(program, ProfileErrorKind::UnsupportedRValue);
-}
-
-#[test]
 fn profile_rejects_core_runtime_extern_with_wrong_signature() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -477,6 +447,8 @@ fn profile_rejects_non_free_extern_members() {
     let owner = program.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("Host"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
         fields: vec![],

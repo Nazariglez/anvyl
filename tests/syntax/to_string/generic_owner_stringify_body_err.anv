@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @contains: unknown variable `missing`
+
+struct Box<T> {
+    value: T,
+
+    fn to_string(self) -> string {
+        missing
+    }
+}
+
+fn main() {
+    let b = Box<int> { value: 1 };
+    #stringify(b);
+}

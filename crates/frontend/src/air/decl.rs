@@ -94,8 +94,11 @@ pub struct AggregateDecl {
     pub name: Ident,
     pub module: ModuleId,
     pub kind: AggregateKind,
+    pub type_args: Vec<TypeId>,
+    pub const_args: Vec<String>,
     pub fields: Vec<FieldDecl>,
     pub cycle_capable: bool,
+    pub stringify_override: Option<FunctionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,8 @@ pub enum AggregateKind {
 pub struct EnumDecl {
     pub name: Ident,
     pub module: ModuleId,
+    pub type_args: Vec<TypeId>,
+    pub const_args: Vec<String>,
     pub variants: Vec<VariantDecl>,
 }
 
@@ -174,6 +179,8 @@ pub enum ExternMember {
 pub struct ExternTypeDecl {
     pub name: Ident,
     pub module: ModuleId,
+    pub type_args: Vec<TypeId>,
+    pub const_args: Vec<String>,
     pub rep: ExternRep,
     pub has_init: bool,
     pub fields: Vec<ExternFieldDecl>,
@@ -219,12 +226,13 @@ pub struct ExternOpDecl {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternOp {
-    Binary(BinaryOp),
+    Binary { op: BinaryOp, self_on_right: bool },
     Unary(UnaryOp),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodReceiver {
     Value,
+    Shared,
     Mut,
 }

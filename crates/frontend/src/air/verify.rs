@@ -1,6 +1,7 @@
 pub use super::typing::PrimitiveKind;
 use super::{
-    AggregateKind, BasicBlock, Function, LocalKind, Mutability, Program, TypeData, VariantShape,
+    AggregateKind, BasicBlock, Function, LocalKind, Mutability, ParamRole, Program, TypeData,
+    VariantShape,
     body::{AggregateCtor, Callee, Operand, Place, Projection, RValue, Statement, Terminator},
     ids::*,
     typing::{self, PrimitiveTypes, supports_scalar_binary, supports_scalar_unary},
@@ -62,6 +63,7 @@ pub enum BadType {
         first: TypeId,
         duplicate: TypeId,
     },
+    EmptyDynContract,
     Recursive(TypeId),
 }
 
@@ -109,11 +111,15 @@ pub enum BadRValue {
         value: TypeId,
         target: TypeId,
     },
+    StringConcatPartMustBeString(TypeId),
     StringifyOperandTypeMismatch {
         operand: TypeId,
         source: TypeId,
     },
     StringifyAnySource {
+        source: TypeId,
+    },
+    StringifyVoidSource {
         source: TypeId,
     },
     AggregateCtorResultTypeMismatch {
@@ -211,6 +217,16 @@ pub enum BadFunction {
         expected: TypeId,
         found: TypeId,
     },
+    StringifyOverrideModuleMismatch {
+        expected: ModuleId,
+        found: ModuleId,
+    },
+    StringifyOverrideMissingReceiver,
+    StringifyOverrideReceiverTypeMismatch {
+        expected: AggregateId,
+        found: TypeId,
+    },
+    StringifyOverrideReturnMustBeString(TypeId),
     LenSourceMustBeCountable(TypeId),
     ListElementTypeMismatch {
         expected: TypeId,
@@ -697,6 +713,70 @@ fn verify_aggregate(cx: &mut VerifyCx<'_>, id: AggregateId) {
     for field in &agg.fields {
         cx.verify_type_ref(site.clone(), field.ty);
     }
+    if let Some(function_id) = agg.stringify_override {
+        if function_id.index() >= cx.program.functions.len() {
+            cx.push(
+                site,
+                VerifyErrorKind::BadReference(BadReference::InvalidFunction(function_id)),
+            );
+            return;
+        }
+        let function = cx.program.function(function_id);
+        if function.module != agg.module {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::StringifyOverrideModuleMismatch {
+                    expected: agg.module,
+                    found: function.module,
+                }),
+            );
+        }
+        match function.signature.params.first() {
+            Some(param) if param.role == ParamRole::Receiver => {
+                let matches_owner = cx.has_type(param.ty)
+                    && match (agg.kind, cx.program.type_data(param.ty)) {
+                        (AggregateKind::Struct, TypeData::Aggregate(owner))
+                        | (AggregateKind::DataRef, TypeData::DataRef(owner)) => *owner == id,
+                        _ => false,
+                    };
+                if !matches_owner {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(
+                            BadFunction::StringifyOverrideReceiverTypeMismatch {
+                                expected: id,
+                                found: param.ty,
+                            },
+                        ),
+                    );
+                }
+            }
+            _ => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::StringifyOverrideMissingReceiver),
+            ),
+        }
+        if !cx.has_type(function.signature.return_type) {
+            cx.push(
+                site,
+                VerifyErrorKind::BadReference(BadReference::InvalidType(
+                    function.signature.return_type,
+                )),
+            );
+            return;
+        }
+        if !matches!(
+            cx.program.type_data(function.signature.return_type),
+            TypeData::String
+        ) {
+            cx.push(
+                site,
+                VerifyErrorKind::BadFunction(BadFunction::StringifyOverrideReturnMustBeString(
+                    function.signature.return_type,
+                )),
+            );
+        }
+    }
 }
 
 fn verify_enum(cx: &mut VerifyCx<'_>, id: EnumId) {
@@ -1067,11 +1147,16 @@ fn verify_stringify(
 ) {
     required_rvalue_primitive(cx, site.clone(), PrimitiveKind::String);
     cx.verify_type_ref(site.clone(), source_ty);
-    if matches!(cx.type_data(source_ty), Some(TypeData::Any)) {
-        cx.push(
+    match cx.type_data(source_ty) {
+        Some(TypeData::Any) => cx.push(
             site.clone(),
             VerifyErrorKind::BadRValue(BadRValue::StringifyAnySource { source: source_ty }),
-        );
+        ),
+        Some(TypeData::Void) => cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::StringifyVoidSource { source: source_ty }),
+        ),
+        _ => {}
     }
     verify_operand(cx, function_id, block_id, stmt_index, value);
     if let Some(operand) = operand_ty(cx, value)
@@ -1230,6 +1315,20 @@ fn verify_rvalue(
         }
         RValue::Call { callee, args } => {
             verify_call(cx, function_id, block_id, stmt_index, callee, args);
+        }
+        RValue::StringConcat { parts } => {
+            required_rvalue_primitive(cx, site.clone(), PrimitiveKind::String);
+            for part in parts {
+                verify_operand(cx, function_id, block_id, stmt_index, part);
+                if let Some(ty) = operand_ty(cx, part)
+                    && !matches!(cx.type_data(ty), Some(TypeData::String))
+                {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadRValue(BadRValue::StringConcatPartMustBeString(ty)),
+                    );
+                }
+            }
         }
         RValue::Format { value, .. } => {
             verify_operand(cx, function_id, block_id, stmt_index, value);
@@ -1615,7 +1714,7 @@ fn verify_place(
                         }
                         current_ty = *elem;
                     }
-                    TypeData::Map { key, value } => {
+                    TypeData::Map { key, value, .. } => {
                         if index_local.ty != *key {
                             cx.push(
                                 site.clone(),
@@ -1934,7 +2033,7 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
         | TypeData::String
         | TypeData::Void
         | TypeData::Any => {}
-        TypeData::Optional(inner) | TypeData::List(inner) => {
+        TypeData::Optional(inner) | TypeData::List(inner) | TypeData::Slice(inner) => {
             cx.verify_type_ref(site, inner);
         }
         TypeData::Tuple(items) => {
@@ -1945,7 +2044,7 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
         TypeData::Array { elem, .. } => {
             cx.verify_type_ref(site, elem);
         }
-        TypeData::Map { key, value } => {
+        TypeData::Map { key, value, .. } => {
             cx.verify_type_ref(site.clone(), key);
             cx.verify_type_ref(site, value);
         }
@@ -1954,6 +2053,11 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
                 cx.verify_type_ref(site.clone(), *param);
             }
             cx.verify_type_ref(site, sig.ret);
+        }
+        TypeData::Dyn(contract) => {
+            if contract.display_name.is_empty() || contract.method_table_key.is_empty() {
+                cx.push(site, VerifyErrorKind::BadType(BadType::EmptyDynContract));
+            }
         }
         TypeData::Aggregate(agg_id) | TypeData::DataRef(agg_id) => {
             if !cx.has_aggregate(agg_id) {

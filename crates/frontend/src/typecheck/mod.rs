@@ -3,6 +3,8 @@ use std::{
     rc::Rc,
 };
 
+#[cfg(test)]
+pub(crate) use self::type_ops::type_has_unfinished_facts;
 pub(crate) use self::{
     annotation::DeprecatedUseKind,
     const_term::ConstTerm,
@@ -12,17 +14,20 @@ pub(crate) use self::{
     result::*,
     semantic_use::*,
     surface::*,
-    type_ops::{type_closure_facts, type_has_unfinished_facts},
+    type_ops::type_closure_facts,
     type_refs::{GenericTypeContext, TypeRefError, TypeRefResolver},
 };
 use self::{
     body::{
         CallableBody, CallableTemplate, CallableTemplateEnv, check_block_checked,
-        check_block_checked_with_hint, check_module_bodies, check_stmts,
-        collect_callable_templates, register_declarations,
+        check_block_checked_with_hint, check_module_bodies, check_specialized_callable_body,
+        check_stmts, collect_callable_templates, register_declarations,
     },
     closure::{ClosureClassifier, ClosureScopeState},
-    decl_validate::{check_finite_size_cycles, check_infer_return_decls, generic_param_type_error},
+    decl_validate::{
+        check_finite_size_cycles, check_infer_return_decls, generic_param_type_error,
+        method_sig_is_generic,
+    },
     defaults::{check_decl_param_defaults, check_decl_param_order},
     dyn_infer::DynInference,
     infer::{Solver, SolverFinalizeError, SolverRelationError, SourceExprTypes, TypeHandle},
@@ -728,10 +733,6 @@ pub(crate) enum TypeError {
         expected: &'static str,
         span: Option<SourceSpan>,
     },
-    UnsupportedStringifyType {
-        ty: Type,
-        span: Option<SourceSpan>,
-    },
     ExternAnyEscape {
         span: Option<SourceSpan>,
     },
@@ -1253,6 +1254,13 @@ impl TypeChecker {
             return false;
         };
         key.target.parent.is_none() && matches!(key.target.kind, CallableKind::Function)
+            || matches!(
+                (&key.target.parent, key.target.kind),
+                (
+                    Some(CallableParent::Nominal(_)),
+                    CallableKind::InstanceMethod | CallableKind::StaticMethod,
+                )
+            )
     }
 
     fn record_local_def(
@@ -2383,52 +2391,142 @@ impl TypeChecker {
             });
 
             for stmt in &module.program.stmts {
-                let Stmt::Func(func_node) = &stmt.node else {
-                    continue;
-                };
-                let func = &func_node.node;
-                let id = CallableId::function(module.scope.clone(), func.name);
-                let value = self
-                    .decls
-                    .local_value(&module.scope, func.name)
-                    .expect("source function missing declaration");
-                let callable = self
-                    .decls
-                    .callable_for_value(&value)
-                    .expect("source function declaration is not callable");
-                assert_eq!(callable.def.id, id);
-                assert!(callable.def.sig.owner_generics.is_empty());
-                assert!(callable.def.sig.required_params <= callable.def.sig.params.len());
-                assert_eq!(func.params.len(), callable.def.sig.params.len());
-                if callable.def.sig.generics.is_empty() {
-                    facts.functions.push(self.semantic_function_fact(
-                        module,
-                        func_node,
-                        &callable,
-                        GenericArgs::default(),
-                        callable.def.sig.params.clone(),
-                        callable.def.sig.ret.ty.clone(),
-                    ));
-                    continue;
-                }
+                match &stmt.node {
+                    Stmt::Func(func_node) => {
+                        let func = &func_node.node;
+                        let id = CallableId::function(module.scope.clone(), func.name);
+                        let value = self
+                            .decls
+                            .local_value(&module.scope, func.name)
+                            .expect("source function missing declaration");
+                        let callable = self
+                            .decls
+                            .callable_for_value(&value)
+                            .expect("source function declaration is not callable");
+                        assert_eq!(callable.def.id, id);
+                        assert!(callable.def.sig.owner_generics.is_empty());
+                        assert!(callable.def.sig.required_params <= callable.def.sig.params.len());
+                        assert_eq!(func.params.len(), callable.def.sig.params.len());
+                        if callable.def.sig.generics.is_empty() {
+                            facts.functions.push(self.semantic_function_fact(
+                                module,
+                                func_node,
+                                &callable,
+                                GenericArgs::default(),
+                                callable.def.sig.params.clone(),
+                                callable.def.sig.ret.ty.clone(),
+                            ));
+                            continue;
+                        }
 
-                let mut instances = self
-                    .specializations
-                    .iter()
-                    .filter_map(|(key, state)| match state {
-                        SpecializationState::Done(body) if key.target == id => Some((
-                            key.args.clone(),
-                            body.params.clone(),
-                            body.return_ty.clone(),
-                        )),
-                        SpecializationState::InProgress | SpecializationState::Done(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                instances.sort_by_key(|(args, ..)| format!("{args:?}"));
-                for (args, params, return_ty) in instances {
-                    facts.functions.push(self.semantic_function_fact(
-                        module, func_node, &callable, args, params, return_ty,
-                    ));
+                        let mut instances =
+                            self.specializations
+                                .iter()
+                                .filter_map(|(key, state)| match state {
+                                    SpecializationState::Done(body) if key.target == id => Some((
+                                        key.args.clone(),
+                                        body.params.clone(),
+                                        body.return_ty.clone(),
+                                    )),
+                                    SpecializationState::InProgress
+                                    | SpecializationState::Done(_) => None,
+                                })
+                                .collect::<Vec<_>>();
+                        instances.sort_by_key(|(args, ..)| format!("{args:?}"));
+                        for (args, params, return_ty) in instances {
+                            facts.functions.push(self.semantic_function_fact(
+                                module, func_node, &callable, args, params, return_ty,
+                            ));
+                        }
+                    }
+                    Stmt::Aggregate(agg_node) => {
+                        let agg = &agg_node.node;
+                        let owner = NominalKey {
+                            module: module.scope.clone(),
+                            kind: agg.kind.into(),
+                            name: agg.name,
+                        };
+                        let Some(schema) = self.decls.aggregate(&owner) else {
+                            continue;
+                        };
+                        for method in &agg.methods {
+                            let mode = MethodMode::from_receiver(method.sig.receiver);
+                            let Some(method_schema) = schema
+                                .methods
+                                .get(&MethodKey::new(method.sig.name, mode.surface()))
+                            else {
+                                continue;
+                            };
+                            let id = CallableId::aggregate_method(
+                                owner.clone(),
+                                method.sig.name,
+                                mode.surface(),
+                            );
+                            let mut instances = vec![];
+                            if schema.generics.is_empty() && !method_sig_is_generic(&method.sig) {
+                                instances.push((
+                                    GenericArgs::default(),
+                                    method_schema.params.clone(),
+                                    method_schema.ret.ty.clone(),
+                                ));
+                            } else {
+                                instances.extend(self.specializations.iter().filter_map(
+                                    |(key, state)| match state {
+                                        SpecializationState::Done(body) if key.target == id => {
+                                            Some((
+                                                key.args.clone(),
+                                                body.params.clone(),
+                                                body.return_ty.clone(),
+                                            ))
+                                        }
+                                        SpecializationState::InProgress
+                                        | SpecializationState::Done(_) => None,
+                                    },
+                                ));
+                                instances.sort_by_key(|(args, ..)| format!("{args:?}"));
+                            }
+                            for (args, params, return_ty) in instances {
+                                let owner_const_args = ConstTerm::to_args_no_infer(
+                                    &args.const_args[..schema.generics.const_params.len()],
+                                )
+                                .expect("generic method instance has unresolved owner const args");
+                                let self_ty = nominal_type_with_args(
+                                    &owner,
+                                    &args.type_args[..schema.generics.type_params.len()],
+                                    &owner_const_args,
+                                );
+                                let callable = match mode {
+                                    MethodMode::Instance { .. } => {
+                                        self.decls.callable_for_aggregate_method(
+                                            schema,
+                                            method.sig.name,
+                                            method_schema,
+                                            self_ty.clone(),
+                                        )
+                                    }
+                                    MethodMode::Static => {
+                                        self.decls.callable_for_aggregate_static_method(
+                                            schema,
+                                            method.sig.name,
+                                            method_schema,
+                                            Some(&self_ty),
+                                        )
+                                    }
+                                };
+                                debug_assert_eq!(callable.def.id, id);
+                                facts.functions.push(self.semantic_method_fact(
+                                    module,
+                                    method,
+                                    agg_node.span,
+                                    &callable,
+                                    args,
+                                    params,
+                                    return_ty,
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2446,10 +2544,6 @@ impl TypeChecker {
         return_ty: Type,
     ) -> SemanticFunctionInstanceFact {
         let func = &func_node.node;
-        let body = BodyInstanceKey::Callable(CallableInstanceKey {
-            target: callable.def.id.clone(),
-            args: args.clone(),
-        });
         let params = func
             .params
             .iter()
@@ -2461,14 +2555,85 @@ impl TypeChecker {
                 mutable: sig.mutable,
             })
             .collect();
+        self.semantic_callable_fact(
+            module,
+            callable,
+            args,
+            func.name,
+            func_node.span,
+            func.body.span,
+            params,
+            return_ty,
+        )
+    }
+
+    fn semantic_method_fact(
+        &self,
+        module: &SourceModuleFactsInput,
+        method: &Method,
+        span: Span,
+        callable: &CallableRef,
+        args: GenericArgs,
+        param_types: Vec<FuncParam>,
+        return_ty: Type,
+    ) -> SemanticFunctionInstanceFact {
+        let mut params = vec![];
+        if let Some(receiver_ty) = &callable.receiver_ty {
+            params.push(SemanticParamSigFact {
+                name: Ident::new("self"),
+                span: SourceSpan::from_byte_span(module.source, span),
+                ty: receiver_ty.clone(),
+                mutable: matches!(method.sig.receiver, Some(MethodReceiver::Var)),
+            });
+        }
+        params.extend(
+            method
+                .sig
+                .params
+                .iter()
+                .zip(param_types)
+                .map(|(source, sig)| SemanticParamSigFact {
+                    name: source.name,
+                    span: SourceSpan::from_byte_span(module.source, source.ty_span),
+                    ty: sig.ty,
+                    mutable: sig.mutable,
+                }),
+        );
+        self.semantic_callable_fact(
+            module,
+            callable,
+            args,
+            method.sig.name,
+            span,
+            method.body.span,
+            params,
+            return_ty,
+        )
+    }
+
+    fn semantic_callable_fact(
+        &self,
+        module: &SourceModuleFactsInput,
+        callable: &CallableRef,
+        args: GenericArgs,
+        name: Ident,
+        span: Span,
+        body_span: Span,
+        params: Vec<SemanticParamSigFact>,
+        return_ty: Type,
+    ) -> SemanticFunctionInstanceFact {
+        let body = BodyInstanceKey::Callable(CallableInstanceKey {
+            target: callable.def.id.clone(),
+            args: args.clone(),
+        });
         SemanticFunctionInstanceFact {
             id: callable.def.id.clone(),
             args,
             body,
             module: module.scope.clone(),
-            name: func.name,
-            span: SourceSpan::from_byte_span(module.source, func_node.span),
-            body_span: SourceSpan::from_byte_span(module.source, func.body.span),
+            name,
+            span: SourceSpan::from_byte_span(module.source, span),
+            body_span: SourceSpan::from_byte_span(module.source, body_span),
             params,
             return_ty,
         }
@@ -2483,18 +2648,36 @@ impl TypeChecker {
             return None;
         }
 
-        let (types, finalize_errors) = self.solver.finalize_expr_types();
-        let has_finalize_errors = self.push_finalize_errors(finalize_errors);
-        let has_local_finalize_errors = self.finish_semantic_local_defs();
-        let has_expr_finalize_errors = self.finish_semantic_expr_types();
-        let has_type_errors =
-            has_finalize_errors || has_local_finalize_errors || has_expr_finalize_errors;
-        let has_stringify_errors = if has_type_errors {
-            false
-        } else {
-            self.semantic_facts.finish_stringifies();
-            self.finish_stringify_types()
-        };
+        let mut types;
+        let mut has_type_errors;
+        let mut has_stringify_errors;
+        loop {
+            let (current_types, finalize_errors) = self.solver.finalize_expr_types();
+            types = current_types;
+            let has_finalize_errors = self.push_finalize_errors(finalize_errors);
+            let has_local_finalize_errors = self.finish_semantic_local_defs();
+            let has_expr_finalize_errors = self.finish_semantic_expr_types();
+            has_type_errors =
+                has_finalize_errors || has_local_finalize_errors || has_expr_finalize_errors;
+            has_stringify_errors = false;
+            if !has_type_errors {
+                self.semantic_facts.finish_stringifies();
+                has_stringify_errors = self.finish_stringify_types();
+            }
+            if has_type_errors || has_stringify_errors {
+                break;
+            }
+            if !self.ensure_stringify_override_specializations() {
+                break;
+            }
+            self.solve_constraints();
+            self.solve_dyn_inference();
+            let escape_events = self.closure.take_escape_events();
+            self.push_escape_events(escape_events);
+            if !self.errors.is_empty() {
+                return None;
+            }
+        }
         if !has_type_errors && !has_stringify_errors {
             for error in self.result_closure_errors(&types) {
                 self.push_error_once(error);
@@ -2596,13 +2779,156 @@ impl TypeChecker {
             .collect::<Vec<_>>();
         let mut has_errors = false;
         for (ty, span) in records {
-            let Some(error) = stringify_type_error(&ty, false, span) else {
+            if !type_closure_facts(&ty).contains_any {
                 continue;
-            };
-            self.push_error_once(error);
+            }
+            self.push_error_once(TypeError::AnyOutsideExternBoundary { span });
             has_errors = true;
         }
         has_errors
+    }
+
+    fn ensure_stringify_override_specializations(&mut self) -> bool {
+        let types = self
+            .semantic_facts
+            .bodies
+            .values()
+            .flat_map(|body| body.stringifies.values().map(|fact| fact.source_ty.clone()))
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        let mut added = false;
+        for ty in types {
+            added |= self.ensure_type_stringify_override_specializations(&ty, &mut seen);
+        }
+        added
+    }
+
+    fn ensure_type_stringify_override_specializations(
+        &mut self,
+        ty: &Type,
+        seen: &mut HashSet<Type>,
+    ) -> bool {
+        if !seen.insert(ty.clone()) {
+            return false;
+        }
+        let mut added = false;
+        match ty {
+            Type::Optional { inner } | Type::List { elem: inner } | Type::Slice { elem: inner } => {
+                added |= self.ensure_type_stringify_override_specializations(inner, seen);
+            }
+            Type::Array { elem, .. } => {
+                added |= self.ensure_type_stringify_override_specializations(elem, seen);
+            }
+            Type::Map { key, value } => {
+                added |= self.ensure_type_stringify_override_specializations(key, seen);
+                added |= self.ensure_type_stringify_override_specializations(value, seen);
+            }
+            Type::Tuple(items) => {
+                for item in items {
+                    added |= self.ensure_type_stringify_override_specializations(item, seen);
+                }
+            }
+            Type::Nominal(_) => {
+                added |= self.ensure_nominal_stringify_override_specialization(ty, seen);
+            }
+            Type::Func { .. }
+            | Type::Infer
+            | Type::InferReturn
+            | Type::Any
+            | Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Dyn(_)
+            | Type::Var(_)
+            | Type::UnresolvedName(_)
+            | Type::UnresolvedNominal { .. } => {}
+        }
+        added
+    }
+
+    fn ensure_nominal_stringify_override_specialization(
+        &mut self,
+        ty: &Type,
+        seen: &mut HashSet<Type>,
+    ) -> bool {
+        let Some(owner) = self.decls.key_for_type(ty) else {
+            return false;
+        };
+        if let Some(aggregate) = self.decls.aggregate(&owner).cloned() {
+            if let Some(method) = aggregate.stringify_override().cloned() {
+                return self.ensure_stringify_override_specialization(ty, &aggregate, &method);
+            }
+
+            let mut added = false;
+            for field in aggregate.fields.values() {
+                let field_ty = substitute_aggregate_member(ty, &aggregate.generics, &field.ty);
+                added |= self.ensure_type_stringify_override_specializations(&field_ty, seen);
+            }
+            return added;
+        }
+
+        let Some(schema) = self.decls.enum_schema(&owner).cloned() else {
+            return false;
+        };
+        let mut added = false;
+        for variant in schema.variants.values() {
+            variant.payload.for_each_type(|payload_ty| {
+                let payload_ty = substitute_aggregate_member(ty, &schema.generics, payload_ty);
+                added |= self.ensure_type_stringify_override_specializations(&payload_ty, seen);
+            });
+        }
+        added
+    }
+
+    fn ensure_stringify_override_specialization(
+        &mut self,
+        ty: &Type,
+        aggregate: &AggregateSchema,
+        method: &MethodSchema,
+    ) -> bool {
+        let Some(args) = nominal_generic_args(ty) else {
+            return false;
+        };
+        if args.is_empty() {
+            return false;
+        }
+        let callable = self.decls.callable_for_aggregate_method(
+            aggregate,
+            Ident::new("to_string"),
+            method,
+            ty.clone(),
+        );
+        let key = CallableInstanceKey {
+            target: callable.def.id.clone(),
+            args: args.clone(),
+        };
+        if self.specializations.contains_key(&key) {
+            return false;
+        }
+        debug_assert!(method.generics.is_empty());
+        debug_assert_eq!(args.type_args.len(), aggregate.generics.type_params.len());
+        debug_assert_eq!(args.const_args.len(), aggregate.generics.const_params.len());
+        let generics = combined_callable_params(&callable);
+        let (type_subst, const_subst) = generics.substitutions(&args);
+        let const_bindings = callable_const_bindings(
+            &callable.def.sig.owner_generics,
+            &args,
+            &callable.def.sig.generics,
+            &GenericArgs::default(),
+        );
+        check_specialized_callable_body(
+            &callable,
+            &[],
+            &method.ret,
+            &args,
+            type_subst,
+            const_subst,
+            &const_bindings,
+            self,
+        );
+        true
     }
 
     fn result_closure_errors(&self, types: &SourceExprTypes) -> Vec<TypeError> {
@@ -3502,50 +3828,17 @@ fn check_stringify_intrinsic(
     }
     let arg = &call.node.args[0];
     let checked = check_value_expr_checked_with_hint(arg, None, tc);
-    if let Some(error) = stringify_type_error(
-        &checked.ty,
-        checked.contains_extern_any,
-        tc.error_span(arg.span),
-    ) {
-        tc.push_error(error);
-    }
+    check_default_stringify_conversion(&checked, arg.span, tc);
     tc.record_stringify(expr.node.id, arg.node.id);
     checked_from_type(expr, Type::String, tc)
 }
 
-fn stringify_type_error(
-    ty: &Type,
-    contains_extern_any: bool,
-    span: Option<SourceSpan>,
-) -> Option<TypeError> {
-    let facts = type_closure_facts(ty);
-    if matches!(ty, Type::Infer | Type::InferReturn)
-        || facts.first_unresolved.is_some()
-        || facts.infer.contains_type
-        || facts.infer.contains_return
-    {
-        return None;
+fn check_default_stringify_conversion(checked: &CheckedType, span: Span, tc: &mut TypeChecker) {
+    if checked.contains_extern_any {
+        tc.reject_extern_any_escape(checked, span);
+        return;
     }
-    if stringify_type_supported(ty) && !contains_extern_any && !facts.contains_any {
-        return None;
-    }
-    Some(TypeError::UnsupportedStringifyType {
-        ty: ty.clone(),
-        span,
-    })
-}
-
-fn stringify_type_supported(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Void
-            | Type::Func { .. }
-            | Type::Dyn(_)
-    ) || matches!(ty, Type::Nominal(nominal) if nominal.kind == NominalKind::Extern)
+    tc.reject_user_any_type(&checked.ty, span);
 }
 
 fn intrinsic_ident_arg(
@@ -4023,11 +4316,38 @@ fn check_binary_checked(
         return checked_type(Type::Infer, tc);
     }
     match builtin_binary_type(op, &left.ty, &right.ty, tc) {
-        Ok(ty) => checked_type(ty, tc),
+        Ok(ty) => {
+            record_binary_stringify_conversions(op, left_expr, &left, right_expr, &right, tc);
+            checked_type(ty, tc)
+        }
         Err(failure) => {
             extern_ops::check_binary(expr_id, op, left_expr, &left, right_expr, &right, span, tc)
                 .unwrap_or_else(|| checked_type(emit_binary_failure(failure, span, tc), tc))
         }
+    }
+}
+
+fn record_binary_stringify_conversions(
+    op: BinaryOp,
+    left_expr: &ExprNode,
+    left: &CheckedType,
+    right_expr: &ExprNode,
+    right: &CheckedType,
+    tc: &mut TypeChecker,
+) {
+    if op != BinaryOp::Add {
+        return;
+    }
+    match (left.ty.is_str(), right.ty.is_str()) {
+        (true, false) => {
+            check_default_stringify_conversion(right, right_expr.span, tc);
+            tc.record_stringify(right_expr.node.id, right_expr.node.id);
+        }
+        (false, true) => {
+            check_default_stringify_conversion(left, left_expr.span, tc);
+            tc.record_stringify(left_expr.node.id, left_expr.node.id);
+        }
+        _ => {}
     }
 }
 
@@ -4063,10 +4383,7 @@ fn builtin_binary_type(
     let same = left_ty == right_ty;
     match op {
         BinaryOp::Add => {
-            let string_pair = left_ty.is_str() && right_ty.is_str();
-            let string_lhs = left_ty.is_str() && right_ty.is_stringable();
-            let string_rhs = right_ty.is_str() && left_ty.is_stringable();
-            if string_pair || string_lhs || string_rhs {
+            if left_ty.is_str() || right_ty.is_str() {
                 return Ok(Type::String);
             }
             if left_ty.is_num() && same {

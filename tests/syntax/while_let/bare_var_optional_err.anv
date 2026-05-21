@@ -2,7 +2,6 @@
 // @expect: error
 // @contains: optional value requires an unwrapping pattern
 // @frontend: new
-// @skip: stringify not support for optional yet
 
 fn main() {
     var opt: int? = nil;

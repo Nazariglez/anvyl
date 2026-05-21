@@ -1908,7 +1908,7 @@ fn finish_value_arg(
 ) -> SourceArgCheck {
     tc.reject_extern_any_escape(&checked, arg.span);
     let dyn_format = matches!(tc.handle_type(&param.ty), Type::Any)
-        && tc.reject_dyn_implicit_format(&checked.ty, arg.span);
+        && tc.reject_dyn_format(&checked.ty, arg.span);
     SourceArgCheck {
         failed: tc.solve_constraints() || dyn_format,
         mutable_arg: None,

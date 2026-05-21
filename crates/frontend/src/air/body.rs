@@ -92,6 +92,9 @@ pub enum RValue {
         value: Operand,
         source_ty: TypeId,
     },
+    StringConcat {
+        parts: Vec<Operand>,
+    },
     Format {
         value: Operand,
         spec: FormatSpec,

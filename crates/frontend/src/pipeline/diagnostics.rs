@@ -569,9 +569,6 @@ pub(super) fn diagnose_type_error(
         TypeError::AnyOutsideExternBoundary { .. } => {
             "any is only allowed in extern boundary signatures".to_string()
         }
-        TypeError::UnsupportedStringifyType { ty, .. } => {
-            format!("type '{}' cannot be stringified", render_surface_type(ty, type_ctx))
-        }
         TypeError::ContractUnsatisfied {
             ty,
             contract,
@@ -1348,7 +1345,6 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::ExpectedIntConst { span, .. }
         | TypeError::NegativeArrayLength { span, .. }
         | TypeError::GenericArgKindMismatch { span, .. }
-        | TypeError::UnsupportedStringifyType { span, .. }
         | TypeError::ExternAnyEscape { span, .. }
         | TypeError::AnyOutsideExternBoundary { span, .. }
         | TypeError::ContractUnsatisfied { span, .. }

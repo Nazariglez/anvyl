@@ -119,6 +119,8 @@ fn switch_bad_variant() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Color"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         variants: vec![VariantDecl {
             name: Ident::new("Red"),
             shape: VariantShape::Unit,
@@ -284,8 +286,11 @@ fn aggregate_bad_field_type() {
         name: Ident::new("BadAgg"),
         module,
         kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![field("f", TypeId::from_index(999))],
         cycle_capable: false,
+        stringify_override: None,
     });
 
     let errors = verify(&builder.finish()).unwrap_err();
@@ -303,6 +308,8 @@ fn enum_bad_variant_type() {
     builder.alloc_enum(EnumDecl {
         name: Ident::new("BadEnum"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         variants: vec![VariantDecl {
             name: Ident::new("V"),
             shape: VariantShape::Tuple(vec![TypeId::from_index(888)]),
@@ -516,6 +523,8 @@ fn duplicate_switch_arm() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Dup"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         variants: vec![
             VariantDecl {
                 name: Ident::new("A"),
@@ -832,17 +841,24 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         name: Ident::new("MissingAgg"),
         module: m0,
         kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![],
         cycle_capable: false,
+        stringify_override: None,
     });
     let missing_enum = builder.alloc_enum_raw(EnumDecl {
         name: Ident::new("MissingEnum"),
         module: m0,
+        type_args: vec![],
+        const_args: vec![],
         variants: vec![],
     });
     let missing_ext_ty = builder.alloc_extern_type_raw(ExternTypeDecl {
         name: Ident::new("MissingExtType"),
         module: m0,
+        type_args: vec![],
+        const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
         fields: vec![],
@@ -884,6 +900,7 @@ fn map_entry_and_slice_view_indices_must_exist_and_be_int() {
     let map_ty = builder.alloc_type(TypeData::Map {
         key: int_ty,
         value: bool_ty,
+        order: MapOrder::Insertion,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("bad_indices", module, FunctionKind::Normal, int_ty);
@@ -1012,6 +1029,71 @@ fn stringify_operand_must_match_source_type() {
 }
 
 #[test]
+fn stringify_operand_must_match_non_scalar_source_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let errors = verify_void_entry(builder, "bad_stringify", module, void_ty, |fb, bb0| {
+        let local = fb.push_local(None, aggregate_ty, Mutability::Immutable, LocalKind::User);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Stringify {
+                value: op_place(local, aggregate_ty),
+                source_ty: list_ty,
+            }),
+        );
+    });
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::StringifyOperandTypeMismatch { operand, source })
+            if operand == aggregate_ty && source == list_ty
+    )));
+}
+
+#[test]
+fn stringify_rejects_void_source_type() {
+    let mut builder = ProgramBuilder::default();
+    let string_ty = builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_void_stringify", module, FunctionKind::Normal, void_ty);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Stringify {
+            value: op_const(builder.alloc_const(ConstData {
+                ty: string_ty,
+                value: ConstValue::String("bad".into()),
+            })),
+            source_ty: void_ty,
+        }),
+    );
+    builder.alloc_function(fb.finish());
+    let program = builder.finish();
+    let errors = verify(&program).expect_err("expected void stringify rejection");
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::StringifyVoidSource { source }) if source == void_ty
+    )));
+}
+
+#[test]
 fn stringify_rejects_invalid_and_any_source_type() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -1050,6 +1132,202 @@ fn stringify_rejects_invalid_and_any_source_type() {
 }
 
 #[test]
+fn aggregate_stringify_override_invalid_function() {
+    let mut builder = ProgramBuilder::default();
+    let module = test_module(&mut builder);
+    builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: Some(FunctionId::from_index(999)),
+    });
+    let program = builder.finish();
+    let errors = verify(&program).expect_err("expected invalid override");
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidFunction(id)) if id == FunctionId::from_index(999)
+    )));
+}
+
+#[test]
+fn aggregate_stringify_override_module_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let string_ty = builder.string_ty();
+    let aggregate_module = test_module(&mut builder);
+    let function_module = builder.alloc_module(empty_module("other"));
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module: aggregate_module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+    let mut fb = FunctionBuilder::new(
+        "to_string",
+        function_module,
+        FunctionKind::Method,
+        string_ty,
+    );
+    fb.push_param("self", aggregate_ty, ParamRole::Receiver);
+    let string_const = builder.alloc_const(ConstData {
+        ty: string_ty,
+        value: ConstValue::String("S".into()),
+    });
+    fb.push_block(term_return(op_const(string_const)));
+    let override_id = builder.alloc_function(fb.finish());
+    let mut program = builder.finish();
+    program.aggregate_mut(aggregate).stringify_override = Some(override_id);
+    let errors = verify(&program).expect_err("expected module mismatch");
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::StringifyOverrideModuleMismatch { expected, found })
+            if expected == aggregate_module && found == function_module
+    )));
+}
+
+#[test]
+fn aggregate_stringify_override_invalid_return_type_ref() {
+    let mut builder = ProgramBuilder::default();
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+    let mut fb = FunctionBuilder::new(
+        "to_string",
+        module,
+        FunctionKind::Method,
+        TypeId::from_index(999),
+    );
+    fb.push_param("self", aggregate_ty, ParamRole::Receiver);
+    fb.push_block(term_unreachable());
+    let override_id = builder.alloc_function(fb.finish());
+    let mut program = builder.finish();
+    program.aggregate_mut(aggregate).stringify_override = Some(override_id);
+    let errors = verify(&program).expect_err("expected invalid return type");
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidType(ty)) if ty == TypeId::from_index(999)
+    )));
+}
+
+#[test]
+fn aggregate_stringify_override_wrong_shape() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let string_ty = builder.string_ty();
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+    let other = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Other"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let other_ty = builder.alloc_type(TypeData::Aggregate(other));
+    let wrong_kind_ty = builder.alloc_type(TypeData::DataRef(aggregate));
+
+    let mut wrong_ret = FunctionBuilder::new("bad_ret", module, FunctionKind::Method, int_ty);
+    wrong_ret.push_param("self", aggregate_ty, ParamRole::Receiver);
+    wrong_ret.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    }))));
+    let wrong_ret = builder.alloc_function(wrong_ret.finish());
+
+    let mut wrong_receiver =
+        FunctionBuilder::new("bad_receiver", module, FunctionKind::Method, string_ty);
+    wrong_receiver.push_param("self", other_ty, ParamRole::Receiver);
+    wrong_receiver.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: string_ty,
+        value: ConstValue::String("bad".into()),
+    }))));
+    let wrong_receiver = builder.alloc_function(wrong_receiver.finish());
+
+    let mut wrong_kind = FunctionBuilder::new("bad_kind", module, FunctionKind::Method, string_ty);
+    wrong_kind.push_param("self", wrong_kind_ty, ParamRole::Receiver);
+    wrong_kind.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: string_ty,
+        value: ConstValue::String("bad".into()),
+    }))));
+    let wrong_kind = builder.alloc_function(wrong_kind.finish());
+
+    let mut no_receiver =
+        FunctionBuilder::new("no_receiver", module, FunctionKind::Method, string_ty);
+    no_receiver.push_param("self", aggregate_ty, ParamRole::Normal);
+    no_receiver.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: string_ty,
+        value: ConstValue::String("bad".into()),
+    }))));
+    let no_receiver = builder.alloc_function(no_receiver.finish());
+
+    let mut program = builder.finish();
+    for (function, expected) in [
+        (wrong_ret, "ret"),
+        (wrong_receiver, "receiver_ty"),
+        (wrong_kind, "receiver_kind"),
+        (no_receiver, "receiver_role"),
+    ] {
+        program.aggregate_mut(aggregate).stringify_override = Some(function);
+        let errors = verify(&program).expect_err("expected invalid override");
+        match expected {
+            "ret" => assert!(errors.iter().any(|e| matches!(
+                e.kind,
+                EK::BadFunction(BadFunction::StringifyOverrideReturnMustBeString(ty)) if ty == int_ty
+            ))),
+            "receiver_ty" => assert!(errors.iter().any(|e| matches!(
+                e.kind,
+                EK::BadFunction(BadFunction::StringifyOverrideReceiverTypeMismatch { expected: id, found })
+                    if id == aggregate && found == other_ty
+            ))),
+            "receiver_kind" => assert!(errors.iter().any(|e| matches!(
+                e.kind,
+                EK::BadFunction(BadFunction::StringifyOverrideReceiverTypeMismatch { expected: id, found })
+                    if id == aggregate && found == wrong_kind_ty
+            ))),
+            "receiver_role" => assert!(errors.iter().any(|e| matches!(
+                e.kind,
+                EK::BadFunction(BadFunction::StringifyOverrideMissingReceiver)
+            ))),
+            _ => unreachable!(),
+        }
+        program.aggregate_mut(aggregate).stringify_override = None;
+    }
+}
+
+#[test]
 fn aggregate_ctor_slot_type_mismatch() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -1060,8 +1338,11 @@ fn aggregate_ctor_slot_type_mismatch() {
         name: Ident::new("Pair"),
         module,
         kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![field("z", int_ty), field("a", bool_ty)],
         cycle_capable: false,
+        stringify_override: None,
     });
     let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
 
@@ -1094,6 +1375,8 @@ fn enum_struct_ctor_slot_type_mismatch() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Event"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         variants: vec![VariantDecl {
             name: Ident::new("Hit"),
             shape: VariantShape::Struct(vec![field("z", int_ty), field("a", bool_ty)]),
@@ -1134,8 +1417,11 @@ fn dataref_field_projection_reaches_field_type() {
         name: Ident::new("Node"),
         module,
         kind: AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![field("value", int_ty)],
         cycle_capable: true,
+        stringify_override: None,
     });
     let dataref_ty = builder.alloc_type(TypeData::DataRef(dataref));
 
@@ -1170,8 +1456,11 @@ fn aggregate_ctor_field_count_mismatch() {
         name: Ident::new("Pair"),
         module,
         kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![field("a", int_ty), field("b", int_ty)],
         cycle_capable: false,
+        stringify_override: None,
     });
     let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
 
@@ -1202,8 +1491,11 @@ fn aggregate_ctor_result_and_kind_mismatch() {
         name: Ident::new("Node"),
         module,
         kind: AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![field("value", int_ty)],
         cycle_capable: true,
+        stringify_override: None,
     });
 
     let errors = verify_void_entry(builder, "bad_result_kind", module, void_ty, |fb, bb0| {
@@ -1239,6 +1531,8 @@ fn enum_ctor_unit_count_tuple_type_and_result_mismatch() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("E"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         variants: vec![
             VariantDecl {
                 name: Ident::new("Unit"),
@@ -1294,8 +1588,11 @@ fn dataref_field_projection_kind_mismatch() {
         name: Ident::new("S"),
         module,
         kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![field("value", int_ty)],
         cycle_capable: false,
+        stringify_override: None,
     });
     let dataref_ty = builder.alloc_type(TypeData::DataRef(aggregate));
 
@@ -1325,8 +1622,11 @@ fn dataref_field_projection_out_of_range() {
         name: Ident::new("Node"),
         module,
         kind: AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![field("value", int_ty)],
         cycle_capable: true,
+        stringify_override: None,
     });
     let dataref_ty = builder.alloc_type(TypeData::DataRef(dataref));
 

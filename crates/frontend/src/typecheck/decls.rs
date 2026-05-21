@@ -1501,9 +1501,27 @@ pub(crate) struct MethodSchema {
     pub(crate) mode: MethodMode,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) param_spans: ParamTypeSpans,
+    pub(crate) default_sites: Vec<Option<ParamDefaultSite>>,
     pub(crate) required_params: usize,
     pub(crate) ret: ReturnSpec,
     pub(crate) policy: AccessPolicy,
+}
+
+impl AggregateSchema {
+    pub(crate) fn stringify_override(&self) -> Option<&MethodSchema> {
+        self.methods
+            .get(&MethodKey::instance(Ident::new("to_string")))
+            .filter(|method| method.is_stringify_override())
+    }
+}
+
+impl MethodSchema {
+    pub(crate) fn is_stringify_override(&self) -> bool {
+        self.mode == (MethodMode::Instance { mutable: false })
+            && self.params.is_empty()
+            && self.generics.is_empty()
+            && self.ret.ty == Type::String
+    }
 }
 
 #[derive(Clone)]
@@ -1524,6 +1542,24 @@ pub(crate) enum VariantPayload {
     Unit,
     Tuple(Vec<Type>),
     Struct(NamedSchemas<FieldSchema>),
+}
+
+impl VariantPayload {
+    pub(crate) fn for_each_type(&self, mut f: impl FnMut(&Type)) {
+        match self {
+            Self::Unit => {}
+            Self::Tuple(items) => {
+                for item in items {
+                    f(item);
+                }
+            }
+            Self::Struct(fields) => {
+                for field in fields.values() {
+                    f(&field.ty);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2160,6 +2196,11 @@ impl DeclarationIndex {
         let message = match sig.receiver {
             None => Some("to_string method must have a 'self' receiver"),
             Some(MethodReceiver::Var) => Some("to_string method must be 'self', not 'var self'"),
+            Some(MethodReceiver::Value)
+                if !sig.type_params.is_empty() || !sig.const_params.is_empty() =>
+            {
+                Some("to_string method cannot be generic")
+            }
             Some(MethodReceiver::Value) if !sig.params.is_empty() => {
                 Some("to_string method must take no parameters")
             }
@@ -2320,6 +2361,10 @@ impl DeclarationIndex {
                             mode,
                             params: resolve_func_params(&method.sig.params),
                             param_spans: ParamTypeSpans::from_params(&method.sig.params),
+                            default_sites: ParamDefaultSite::from_params(
+                                source,
+                                &method.sig.params,
+                            ),
                             required_params: required_param_count(&method.sig.params),
                             ret: method.sig.ret.clone(),
                             policy,
@@ -3896,7 +3941,7 @@ impl DeclarationIndex {
                     owner_generics: aggregate.generics.clone(),
                     generics: method.generics.clone(),
                     params,
-                    default_sites: vec![],
+                    default_sites: method.default_sites.clone(),
                     required_params: method.required_params,
                     ret,
                 },
@@ -3988,17 +4033,17 @@ fn aggregate_substitutions(
     owner_ty: &Type,
     generics: &GenericParams,
 ) -> Option<(TypeSubst, ConstSubst)> {
-    let owner = owner_ty.as_aggregate()?;
+    let owner = owner_ty.as_nominal()?;
     let type_subst: TypeSubst = generics
         .type_params
         .iter()
-        .zip(owner.type_args)
+        .zip(owner.type_args.iter())
         .map(|(param, arg)| (param.id, arg.clone()))
         .collect();
     let const_subst: ConstSubst = generics
         .const_params
         .iter()
-        .zip(owner.const_args)
+        .zip(owner.const_args.iter())
         .map(|(param, arg)| (param.id, ConstTerm::from_arg(arg)))
         .collect();
     (!type_subst.is_empty() || !const_subst.is_empty()).then_some((type_subst, const_subst))

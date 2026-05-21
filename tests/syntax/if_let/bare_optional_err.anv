@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: requires an unwrapping pattern
-// @skip: stringify not support for optional yet
 
 fn main() {
     let opt: int? = 42;

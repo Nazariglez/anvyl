@@ -1288,6 +1288,7 @@ pub(super) fn check_callable_body_frame(
     expected_ret: Option<&ReturnSpec>,
     infer_access: ReturnAccess,
     mut source: Option<PlaceIdentity>,
+    param_start: usize,
     body: CallableBody<'_>,
     span: Span,
     tc: &mut TypeChecker,
@@ -1304,7 +1305,7 @@ pub(super) fn check_callable_body_frame(
             param.ty.mutable,
             LocalDefKind::Parameter,
         );
-        tc.record_param_def(index, type_id);
+        tc.record_param_def(param_start + index, type_id);
         tc.mark_non_escaping_callback_param(param.name, type_id, param.ty, param.source_ty);
         if source.is_none() && param.ty.mutable {
             source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
@@ -1345,18 +1346,29 @@ fn check_func_body(
                 tc.define_const(*name, const_eval::const_type(value), value.clone());
             }
             let mut source = None;
-            if let Some((receiver, self_ty)) = self_binding {
+            let param_start = if let Some((receiver, self_ty)) = self_binding {
                 let kind = match receiver {
                     MethodReceiver::Var => LocalBindingKind::borrowed_self(),
                     MethodReceiver::Value => LocalBindingKind::readonly_self(),
                 };
-                let type_id = tc.define_value(Ident::new("self"), self_ty, kind, None);
-                if matches!(receiver, MethodReceiver::Var)
-                    && let Some(type_id) = type_id
-                {
-                    source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
+                let type_id = tc.define_value(Ident::new("self"), self_ty.clone(), kind, None);
+                if let Some(type_id) = type_id {
+                    tc.record_local_def(
+                        type_id,
+                        Ident::new("self"),
+                        None,
+                        matches!(receiver, MethodReceiver::Var),
+                        LocalDefKind::Parameter,
+                    );
+                    tc.record_param_def(0, type_id);
+                    if matches!(receiver, MethodReceiver::Var) {
+                        source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
+                    }
                 }
-            }
+                1
+            } else {
+                0
+            };
             let bindings = params
                 .iter()
                 .zip(param_types)
@@ -1371,6 +1383,7 @@ fn check_func_body(
                 (!ret.is_infer()).then_some(ret),
                 ret.access,
                 source,
+                param_start,
                 CallableBody::Block(body),
                 span,
                 tc,

@@ -549,11 +549,6 @@ impl Type {
     }
 
     #[inline]
-    pub fn is_stringable(&self) -> bool {
-        matches!(self, Type::Int | Type::Float | Type::Bool)
-    }
-
-    #[inline]
     pub fn is_num(&self) -> bool {
         matches!(self, Type::Int | Type::Float)
     }

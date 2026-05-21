@@ -1240,6 +1240,7 @@ pub(super) fn check_lambda_expr(
                     expected_ret.as_ref(),
                     ReturnAccess::Value,
                     None,
+                    0,
                     CallableBody::Expr(&lambda.node.body),
                     lambda.span,
                     tc,

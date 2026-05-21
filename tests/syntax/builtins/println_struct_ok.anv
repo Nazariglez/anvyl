@@ -1,7 +1,6 @@
 // @mode: check
 // @frontend: new
-// @expect: error
-// @contains: cannot be stringified
+// @expect: success
 
 struct Point { x: int }
 

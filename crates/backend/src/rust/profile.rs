@@ -235,6 +235,7 @@ impl ProfileCx<'_> {
             }
             RValue::SharedRefEq { .. }
             | RValue::Aggregate { .. }
+            | RValue::StringConcat { .. }
             | RValue::Format { .. }
             | RValue::Len { .. }
             | RValue::ListPush { .. }

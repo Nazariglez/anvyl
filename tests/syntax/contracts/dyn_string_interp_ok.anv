@@ -1,7 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: dynamic values cannot be implicitly formatted
 
 contract Action {
     fn act(self);

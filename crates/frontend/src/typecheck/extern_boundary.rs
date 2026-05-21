@@ -44,12 +44,12 @@ impl TypeChecker {
         true
     }
 
-    pub(super) fn reject_dyn_implicit_format(&mut self, ty: &Type, span: Span) -> bool {
+    pub(super) fn reject_dyn_format(&mut self, ty: &Type, span: Span) -> bool {
         if !type_contains_dyn_value(ty, &self.decls, &mut std::collections::HashSet::new()) {
             return false;
         }
         self.push_error(TypeError::CompileError {
-            message: "dynamic values cannot be implicitly formatted".to_string(),
+            message: "dynamic values cannot be formatted".to_string(),
             span: self.error_span(span),
         });
         true

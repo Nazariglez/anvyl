@@ -123,6 +123,105 @@ fn primitive_rvalues() {
 }
 
 #[test]
+fn stringify_accepts_non_scalar_source_types() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let string_ty = builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+    let dataref = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    let dataref_ty = builder.alloc_type(TypeData::DataRef(dataref));
+    let enum_id = builder.alloc_enum(EnumDecl {
+        name: Ident::new("E"),
+        module,
+        type_args: vec![],
+        const_args: vec![],
+        variants: vec![VariantDecl {
+            name: Ident::new("V"),
+            shape: VariantShape::Unit,
+        }],
+    });
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+    let extern_id = builder.alloc_extern_type(ExternTypeDecl {
+        name: Ident::new("Handle"),
+        module,
+        type_args: vec![],
+        const_args: vec![],
+        rep: ExternRep::Shared,
+        has_init: false,
+        fields: vec![],
+        methods: vec![],
+        statics: vec![],
+        operators: vec![],
+    });
+    let extern_ty = builder.alloc_type(TypeData::Extern(extern_id));
+    let dyn_ty = builder.alloc_type(TypeData::Dyn(crate::air::DynContractData {
+        display_name: "Drawable".into(),
+        method_table_key: "Drawable".into(),
+        concrete_printer: None,
+    }));
+    let source_tys = vec![
+        aggregate_ty,
+        dataref_ty,
+        enum_ty,
+        builder.alloc_type(TypeData::Tuple(vec![int_ty, string_ty])),
+        builder.alloc_type(TypeData::List(int_ty)),
+        builder.alloc_type(TypeData::Array {
+            elem: int_ty,
+            len: 2,
+        }),
+        builder.alloc_type(TypeData::Map {
+            key: string_ty,
+            value: int_ty,
+            order: MapOrder::Insertion,
+        }),
+        builder.alloc_type(TypeData::Optional(int_ty)),
+        builder.alloc_type(TypeData::Function(SignatureType::new(
+            vec![int_ty],
+            string_ty,
+        ))),
+        extern_ty,
+        builder.alloc_type(TypeData::Slice(int_ty)),
+        dyn_ty,
+    ];
+    let mut fb = FunctionBuilder::new("stringify", module, FunctionKind::Normal, void_ty);
+    let block = fb.push_block(term_return_void());
+    for ty in source_tys {
+        let local = fb.push_local(None, ty, Mutability::Immutable, LocalKind::User);
+        fb.add_statement(
+            block,
+            stmt_eval(RValue::Stringify {
+                value: op_place(local, ty),
+                source_ty: ty,
+            }),
+        );
+    }
+    builder.alloc_function(fb.finish());
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
 fn fn_params() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -149,6 +248,8 @@ fn fn_aggregate() {
         name: Ident::new("Point"),
         module,
         kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
         fields: vec![
             FieldDecl {
                 name: Ident::new("x"),
@@ -160,6 +261,7 @@ fn fn_aggregate() {
             },
         ],
         cycle_capable: false,
+        stringify_override: None,
     });
     let agg_ty = builder.alloc_type(TypeData::Aggregate(agg_id));
 
@@ -209,6 +311,8 @@ fn enum_switch() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Color"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         variants: vec![
             VariantDecl {
                 name: Ident::new("Red"),
@@ -290,6 +394,8 @@ fn extern_call() {
     builder.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("Console"),
         module,
+        type_args: vec![],
+        const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
         fields: vec![],
@@ -383,6 +489,7 @@ fn tuple_and_list() {
     builder.alloc_type(TypeData::Map {
         key: int_ty,
         value: bool_ty,
+        order: MapOrder::Insertion,
     });
     let module = test_module(&mut builder);
 

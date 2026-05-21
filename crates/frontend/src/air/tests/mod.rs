@@ -10,9 +10,9 @@ pub(super) use super::{
     AggregateCtor, AggregateDecl, AggregateKind, BasicBlock, BlockId, Callee, ConstArena,
     ConstData, ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternRep,
     ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, Local, LocalId,
-    LocalKind, ModuleId, Mutability, Operand, Param, ParamRole, Place, Program, Projection, RValue,
-    Signature, SignatureType, Terminator, TypeArena, TypeData, TypeId, VariantDecl, VariantId,
-    VariantShape, verify,
+    LocalKind, MapOrder, ModuleId, Mutability, Operand, Param, ParamRole, Place, Program,
+    Projection, RValue, Signature, SignatureType, Terminator, TypeArena, TypeData, TypeId,
+    VariantDecl, VariantId, VariantShape, verify,
 };
 
 mod structure;

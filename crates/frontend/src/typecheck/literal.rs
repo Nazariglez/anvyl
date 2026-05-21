@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use super::{
     CheckedType, TypeChecker, TypeError, VariantShape,
     annotation::DeprecatedUseKind,
-    check_expected_value_expr, check_expr_checked, check_unprojected_expected,
-    check_value_expr_checked_with_hint, checked_from_type, const_eval,
+    check_default_stringify_conversion, check_expected_value_expr, check_expr_checked,
+    check_unprojected_expected, check_value_expr_checked_with_hint, checked_from_type, const_eval,
     const_term::ConstTerm,
     decls::{
         CoreRangeKind, FieldSchema, ModuleMemberLookup, NamedSchemas, NominalKey, TypeBinding,
@@ -964,9 +964,12 @@ pub(super) fn check_string_interp(
             continue;
         };
         let checked = check_value_expr_checked_with_hint(inner, None, tc);
-        tc.reject_dyn_implicit_format(&checked.ty, inner.span);
         if let Some(spec) = spec {
+            tc.reject_dyn_format(&checked.ty, inner.span);
             validate_format_spec(&checked.ty, &spec.node, spec.span, tc);
+        } else if !checked.ty.is_str() {
+            check_default_stringify_conversion(&checked, inner.span, tc);
+            tc.record_stringify(inner.node.id, inner.node.id);
         }
         contains_extern_any |= checked.contains_extern_any;
     }
