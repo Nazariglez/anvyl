@@ -46,7 +46,6 @@ impl TypeDiagnosticContext {
 pub(crate) struct SemanticCheckOutput {
     pub(crate) warnings: Vec<CompileWarning>,
     pub(crate) lint_events: Vec<LintEvent>,
-    pub(crate) diagnostic_context: TypeDiagnosticContext,
     pub(crate) public_facts: TypecheckFacts,
     pub(crate) source_types: SourceExprTypes,
     pub(crate) program: SemanticProgram,
@@ -71,6 +70,7 @@ impl TypecheckFailure {
     }
 }
 
+#[cfg(test)]
 pub struct TypecheckOutput {
     errors: Vec<TypeError>,
     warnings: Vec<CompileWarning>,
@@ -79,6 +79,7 @@ pub struct TypecheckOutput {
     facts: Option<TypecheckFacts>,
 }
 
+#[cfg(test)]
 impl TypecheckOutput {
     pub(crate) fn success(
         warnings: Vec<CompileWarning>,
@@ -164,19 +165,23 @@ impl TypecheckFacts {
         output.public_facts
     }
 
-    pub fn lambda_escapes(&self) -> &LambdaEscapeMap {
+    #[cfg(test)]
+    pub(crate) fn lambda_escapes(&self) -> &LambdaEscapeMap {
         &self.lambda_escapes
     }
 
-    pub fn lambda_captures(&self) -> &LambdaCaptureMap {
+    #[cfg(test)]
+    pub(crate) fn lambda_captures(&self) -> &LambdaCaptureMap {
         &self.lambda_captures
     }
 
-    pub fn binding_promotions(&self) -> &BindingPromotionMap {
+    #[cfg(test)]
+    pub(crate) fn binding_promotions(&self) -> &BindingPromotionMap {
         &self.binding_promotions
     }
 
-    pub fn for_step_runtime_checks(&self) -> &ForStepRuntimeCheckMap {
+    #[cfg(test)]
+    pub(crate) fn for_step_runtime_checks(&self) -> &ForStepRuntimeCheckMap {
         &self.for_step_runtime_checks
     }
 
@@ -208,18 +213,19 @@ impl TypecheckFacts {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn validate(&self) {
-        for (expr_id, fact) in self.lambda_escapes() {
+        for (expr_id, fact) in &self.lambda_escapes {
             debug_assert_eq!(*expr_id, fact.expr_id);
         }
-        for ((lambda_id, binding_id), fact) in self.lambda_captures() {
+        for ((lambda_id, binding_id), fact) in &self.lambda_captures {
             debug_assert_eq!(*lambda_id, fact.lambda_id);
             debug_assert_eq!(*binding_id, fact.binding_id);
         }
-        for span in self.for_step_runtime_checks().values() {
+        for span in self.for_step_runtime_checks.values() {
             debug_assert!(span.span.start <= span.span.end);
         }
-        for (binding_id, fact) in self.binding_promotions() {
+        for (binding_id, fact) in &self.binding_promotions {
             debug_assert_eq!(*binding_id, fact.binding_id);
         }
     }

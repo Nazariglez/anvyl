@@ -81,7 +81,7 @@ fn function_facts_include_default_params() {
     assert_eq!(fact.params[0].ty, Type::Int);
     assert_eq!(fact.params[1].name.as_str(), "message");
     assert_eq!(fact.params[1].ty, Type::String);
-    assert_eq!(fact.return_ty, Type::Bool);
+    assert_eq!(fact.ret.ty, Type::Bool);
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn main() { id("x"); id(1); id(2); }
         assert_eq!(fact.params.len(), 1);
         assert_eq!(fact.params[0].name.as_str(), "x");
         assert_eq!(fact.params[0].ty, ty);
-        assert_eq!(fact.return_ty, ty);
+        assert_eq!(fact.ret.ty, ty);
         let body = result.expect_body(&fact.body);
         let local = body.locals.param_defs[&0];
         assert_eq!(body.locals.defs[&local].ty, fact.params[0].ty);
@@ -284,7 +284,7 @@ fn generic_inferred_return_function_fact_is_concrete() {
         .expect("missing generic function fact");
 
     assert_eq!(fact.args.type_args, vec![Type::Int]);
-    assert_eq!(fact.return_ty, Type::Int);
+    assert_eq!(fact.ret.ty, Type::Int);
 }
 
 #[test]
@@ -305,7 +305,7 @@ fn const_generic_function_fact_uses_concrete_array_len() {
 
     assert_eq!(fact.args.const_args.len(), 1);
     assert_eq!(fact.params[0].ty, expected);
-    assert_eq!(fact.return_ty, expected);
+    assert_eq!(fact.ret.ty, expected);
 }
 
 #[test]

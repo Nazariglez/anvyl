@@ -40,7 +40,19 @@ fn type_arena_all_variants() {
         method_table_key: "named::Drawable".to_string(),
         concrete_printer: None,
     }));
-    let sig = SignatureType::new(vec![int_ty, bool_ty], void_ty);
+    let sig = SignatureType::new(
+        vec![
+            ParamType {
+                ty: int_ty,
+                mode: ParamMode::Value,
+            },
+            ParamType {
+                ty: bool_ty,
+                mode: ParamMode::Value,
+            },
+        ],
+        ReturnMode::Value(void_ty),
+    );
     let fn_ty = arena.alloc(TypeData::Function(sig));
 
     assert_eq!(arena.data(int_ty), &TypeData::Int);
@@ -295,7 +307,10 @@ fn program_accessors() {
         name: Ident::new("ext_fn"),
         module,
         member: ExternMember::FreeFunction,
-        params: vec![int_ty],
+        params: vec![ExternParamDecl {
+            ty: int_ty,
+            mode: ParamMode::Value,
+        }],
         return_type: int_ty,
     });
 

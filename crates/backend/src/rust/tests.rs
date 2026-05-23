@@ -1,13 +1,14 @@
 use anvyx_frontend::{
     air::{
-        self, BasicBlock, Callee, ConstData, ConstValue, ExternDecl, ExternMember, ExternRep,
-        ExternTypeDecl, Function, FunctionKind, Local, LocalKind, Mutability, Operand, Param,
-        ParamRole, Place, Program, RValue, Signature, Statement, Terminator, TypeData,
+        self, BasicBlock, CallArg, Callee, ConstData, ConstValue, ExternDecl, ExternMember,
+        ExternParamDecl, ExternRep, ExternTypeDecl, Function, FunctionKind, Local, LocalKind,
+        Mutability, Operand, Param, ParamMode, ParamRole, Place, Program, RValue, Signature,
+        Statement, Terminator, TypeData,
     },
     ast::{BinaryOp, Ident},
 };
 
-use super::profile::{ProfileErrorKind, RustBackendProfile, RustBackendProfileError};
+use super::profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError};
 
 #[test]
 fn profile_accepts_empty_air() {
@@ -134,21 +135,38 @@ fn profile_accepts_core_println_extern_call_shape() {
     let mut program = Program::default();
     let string = program.alloc_type(TypeData::String);
     let void = program.alloc_type(TypeData::Void);
-    let extern_id = runtime_extern(&mut program, "_println", vec![string], void);
+    let extern_id = runtime_extern(
+        &mut program,
+        "_println",
+        vec![(string, ParamMode::SharedBorrow)],
+        void,
+    );
     let message = program.const_arena.alloc(ConstData {
         ty: string,
         value: ConstValue::String("ok".into()),
     });
     let module = program.alloc_module(root_module());
-    let main = program.alloc_function(void_function(
+    let message_local = air::LocalId::from_index(0);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
         module,
-        "main",
-        void,
-        vec![Statement::Eval(RValue::Call {
-            callee: Callee::Extern(extern_id),
-            args: vec![Operand::Const(message)],
-        })],
-    ));
+        kind: FunctionKind::Normal,
+        signature: Signature::new(vec![], void),
+        locals: vec![local(string, LocalKind::Temp)],
+        body: vec![BasicBlock {
+            statements: vec![
+                Statement::Init {
+                    local: message_local,
+                    value: RValue::Use(Operand::Const(message)),
+                },
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Extern(extern_id),
+                    args: vec![CallArg::SharedBorrow(place(message_local, string))],
+                }),
+            ],
+            terminator: Terminator::Return(None),
+        }],
+    });
     program.module_mut(module).functions.push(main);
 
     check(program);
@@ -160,7 +178,15 @@ fn profile_accepts_core_assert_extern_call_shape() {
     let bool_ty = program.alloc_type(TypeData::Bool);
     let string = program.alloc_type(TypeData::String);
     let void = program.alloc_type(TypeData::Void);
-    let extern_id = runtime_extern(&mut program, "_assert", vec![bool_ty, string], void);
+    let extern_id = runtime_extern(
+        &mut program,
+        "_assert",
+        vec![
+            (bool_ty, ParamMode::Value),
+            (string, ParamMode::SharedBorrow),
+        ],
+        void,
+    );
     let condition = program.const_arena.alloc(ConstData {
         ty: bool_ty,
         value: ConstValue::Bool(true),
@@ -170,15 +196,30 @@ fn profile_accepts_core_assert_extern_call_shape() {
         value: ConstValue::String("ok".into()),
     });
     let module = program.alloc_module(root_module());
-    let main = program.alloc_function(void_function(
+    let message_local = air::LocalId::from_index(0);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
         module,
-        "main",
-        void,
-        vec![Statement::Eval(RValue::Call {
-            callee: Callee::Extern(extern_id),
-            args: vec![Operand::Const(condition), Operand::Const(message)],
-        })],
-    ));
+        kind: FunctionKind::Normal,
+        signature: Signature::new(vec![], void),
+        locals: vec![local(string, LocalKind::Temp)],
+        body: vec![BasicBlock {
+            statements: vec![
+                Statement::Init {
+                    local: message_local,
+                    value: RValue::Use(Operand::Const(message)),
+                },
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Extern(extern_id),
+                    args: vec![
+                        CallArg::Value(Operand::Const(condition)),
+                        CallArg::SharedBorrow(place(message_local, string)),
+                    ],
+                }),
+            ],
+            terminator: Terminator::Return(None),
+        }],
+    });
     program.module_mut(module).functions.push(main);
 
     check(program);
@@ -255,6 +296,132 @@ fn profile_rejects_deferred_types() {
 }
 
 #[test]
+fn profile_rejects_non_immediate_value_params() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let local_id = air::LocalId::from_index(0);
+    let func = program.alloc_function(Function {
+        name: Ident::new("takes_string"),
+        module,
+        kind: FunctionKind::Normal,
+        signature: Signature::new(vec![param("x", string, ParamMode::Value, local_id)], void),
+        locals: vec![local(string, LocalKind::Arg)],
+        body: vec![BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return(None),
+        }],
+    });
+    program.module_mut(module).functions.push(func);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedParamMode);
+}
+
+#[test]
+fn profile_rejects_place_returns() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let ret_local = air::LocalId::from_index(0);
+    let func = program.alloc_function(Function {
+        name: Ident::new("returns_place"),
+        module,
+        kind: FunctionKind::Normal,
+        signature: Signature::with_return_mode(vec![], air::ReturnMode::Place(int)),
+        locals: vec![local(int, LocalKind::Return)],
+        body: vec![BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return(Some(Operand::Place(place(ret_local, int)))),
+        }],
+    });
+    program.module_mut(module).functions.push(func);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedReturnMode);
+}
+
+#[test]
+fn profile_rejects_unsupported_param_modes() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let local_id = air::LocalId::from_index(0);
+    let func = program.alloc_function(Function {
+        name: Ident::new("takes_mut"),
+        module,
+        kind: FunctionKind::Normal,
+        signature: Signature::new(
+            vec![param("x", string, ParamMode::MutBorrow, local_id)],
+            void,
+        ),
+        locals: vec![Local {
+            name: None,
+            ty: string,
+            mutability: Mutability::Mutable,
+            kind: LocalKind::Arg,
+        }],
+        body: vec![BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return(None),
+        }],
+    });
+    program.module_mut(module).functions.push(func);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedParamMode);
+}
+
+#[test]
+fn profile_rejects_mut_borrow_call_args() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let callee_local = air::LocalId::from_index(0);
+    let callee = program.alloc_function(Function {
+        name: Ident::new("callee"),
+        module,
+        kind: FunctionKind::Normal,
+        signature: Signature::new(
+            vec![param("x", int, ParamMode::MutBorrow, callee_local)],
+            void,
+        ),
+        locals: vec![Local {
+            name: None,
+            ty: int,
+            mutability: Mutability::Mutable,
+            kind: LocalKind::Arg,
+        }],
+        body: vec![BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return(None),
+        }],
+    });
+    let local_id = air::LocalId::from_index(0);
+    let func = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        signature: Signature::new(vec![], void),
+        locals: vec![local(int, LocalKind::User)],
+        body: vec![BasicBlock {
+            statements: vec![Statement::Eval(RValue::Call {
+                callee: Callee::Function(callee),
+                args: vec![CallArg::MutBorrow(place(local_id, int))],
+            })],
+            terminator: Terminator::Return(None),
+        }],
+    });
+    program.module_mut(module).functions.extend([callee, func]);
+
+    let errors = profile_errors(program);
+    assert!(errors.iter().any(|error| {
+        error.site == ProfileSite::Statement(func, 0, 0)
+            && error.kind == ProfileErrorKind::UnsupportedCallArgMode
+    }));
+}
+
+#[test]
 fn profile_rejects_deferred_function_kinds_and_param_roles() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
@@ -266,10 +433,8 @@ fn profile_rejects_deferred_function_kinds_and_param_roles() {
         kind: FunctionKind::Method,
         signature: Signature::new(
             vec![Param {
-                name: Some(Ident::new("self")),
-                ty: void,
                 role: ParamRole::Receiver,
-                local_id: self_local,
+                ..param("self", void, ParamMode::Value, self_local)
             }],
             void,
         ),
@@ -356,7 +521,10 @@ fn profile_rejects_place_projections() {
 fn profile_rejects_closure_callees() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
-    let closure_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(vec![], void)));
+    let closure_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
     let module = program.alloc_module(root_module());
     let closure_local = air::LocalId::from_index(0);
     let func = program.alloc_function(Function {
@@ -417,7 +585,12 @@ fn profile_rejects_core_runtime_extern_with_wrong_signature() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
-    runtime_extern(&mut program, "_println", vec![int], void);
+    runtime_extern(
+        &mut program,
+        "_println",
+        vec![(int, ParamMode::Value)],
+        void,
+    );
 
     expect_reject(program, ProfileErrorKind::UnsupportedExtern);
 }
@@ -431,7 +604,7 @@ fn profile_rejects_runtime_named_extern_in_wrong_module() {
         &mut program,
         &["host"],
         "_println",
-        vec![string],
+        vec![(string, ParamMode::Value)],
         void,
         ExternMember::FreeFunction,
     );
@@ -512,29 +685,10 @@ fn air_module(path: &[&str]) -> air::Module {
     }
 }
 
-fn void_function(
-    module: air::ModuleId,
-    name: &str,
-    return_type: air::TypeId,
-    statements: Vec<Statement>,
-) -> Function {
-    Function {
-        name: Ident::new(name),
-        module,
-        kind: FunctionKind::Normal,
-        signature: Signature::new(vec![], return_type),
-        locals: vec![],
-        body: vec![BasicBlock {
-            statements,
-            terminator: Terminator::Return(None),
-        }],
-    }
-}
-
 fn runtime_extern(
     program: &mut Program,
     name: &str,
-    params: Vec<air::TypeId>,
+    params: Vec<(air::TypeId, ParamMode)>,
     return_type: air::TypeId,
 ) -> air::ExternId {
     extern_in_module(
@@ -551,7 +705,7 @@ fn extern_in_module(
     program: &mut Program,
     path: &[&str],
     name: &str,
-    params: Vec<air::TypeId>,
+    params: Vec<(air::TypeId, ParamMode)>,
     return_type: air::TypeId,
     member: ExternMember,
 ) -> air::ExternId {
@@ -560,11 +714,24 @@ fn extern_in_module(
         name: Ident::new(name),
         module,
         member,
-        params,
+        params: params
+            .into_iter()
+            .map(|(ty, mode)| ExternParamDecl { ty, mode })
+            .collect(),
         return_type,
     });
     program.module_mut(module).externs.push(id);
     id
+}
+
+fn param(name: &str, ty: air::TypeId, mode: ParamMode, local_id: air::LocalId) -> Param {
+    Param {
+        name: Some(Ident::new(name)),
+        ty,
+        mode,
+        role: ParamRole::Normal,
+        local_id,
+    }
 }
 
 fn local(ty: air::TypeId, kind: LocalKind) -> Local {

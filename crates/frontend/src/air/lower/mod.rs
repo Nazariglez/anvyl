@@ -3,19 +3,20 @@ use std::collections::HashMap;
 use anvyx_externs::ParamFlow;
 
 use super::{
-    AggregateDecl, AggregateKind, BasicBlock, BlockId, Callee, ConstData, ConstValue,
+    AggregateDecl, AggregateKind, BasicBlock, BlockId, CallArg, Callee, ConstData, ConstValue,
     DynContractData, EnumDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember,
-    ExternMethodDecl, ExternOp, ExternOpDecl, ExternRep, ExternStaticDecl, ExternTypeDecl,
-    FieldDecl, Function, FunctionId, FunctionKind, Local, LocalId, LocalKind, Module, ModuleId,
-    Mutability as AirMutability, Operand, Param, ParamRole, Place, Program, RValue, Signature,
-    SignatureType, Statement, Terminator, TypeData, TypeId, VariantDecl, VariantShape, VerifyError,
+    ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
+    ExternStaticDecl, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind,
+    Local, LocalId, LocalKind, Module, ModuleId, Mutability as AirMutability, Operand, Param,
+    ParamMode, ParamRole, ParamType, Place, Program, RValue, ReturnMode, Signature, SignatureType,
+    Statement, Terminator, TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes, ScalarType},
     verify,
 };
 use crate::{
     ast::{
         self, ArrayLen, AssignOp, BinaryOp, BlockNode, ExprId, ExprKind, ExprNode, Ident, Lit,
-        Mutability as AstMutability, Pattern, Stmt, StmtNode, Type,
+        Mutability as AstMutability, Pattern, ReturnAccess, Stmt, StmtNode, Type,
     },
     externs::catalog::ExternCatalog,
     resolve::{PackageModulePath, ResolveResult},
@@ -105,6 +106,7 @@ pub(crate) enum LowerError {
         kind: &'static str,
     },
     UnterminatedBlock,
+    Ownership(Box<[ownership::OwnershipError]>),
     Verify(Box<[VerifyError]>),
     AnyTypeEmitted(TypeId),
 }
@@ -255,9 +257,22 @@ impl TypeLowerer {
             Type::Func { params, ret } => TypeData::Function(SignatureType::new(
                 params
                     .iter()
-                    .map(|param| self.lower_with_env(program, &param.ty, env.reborrow()))
-                    .collect::<Result<Vec<_>, _>>()?,
-                self.lower_with_env(program, &ret.ty, env)?,
+                    .map(|param| {
+                        let ty = self.lower_with_env(program, &param.ty, env.reborrow())?;
+                        Ok(ParamType {
+                            ty,
+                            mode: source_param_mode(param.mutable),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LowerError>>()?,
+                match ret.access {
+                    ReturnAccess::Value => {
+                        ReturnMode::Value(self.lower_with_env(program, &ret.ty, env)?)
+                    }
+                    ReturnAccess::Place => {
+                        ReturnMode::Place(self.lower_with_env(program, &ret.ty, env)?)
+                    }
+                },
             )),
             Type::Dyn(contract) => TypeData::Dyn(dyn_contract_data(contract)?),
             Type::Nominal(_) => return self.lower_nominal(program, ty, env),
@@ -277,7 +292,7 @@ impl TypeLowerer {
         &mut self,
         program: &mut Program,
         ty: &Type,
-        env: TypeLowerEnv<'_, '_>,
+        mut env: TypeLowerEnv<'_, '_>,
     ) -> Result<TypeId, LowerError> {
         let (Some(decls), Some(externs)) = (env.decls, env.externs) else {
             return Err(LowerError::UnsupportedType {
@@ -290,13 +305,13 @@ impl TypeLowerer {
             });
         };
         if key.kind == ast::NominalKind::Extern {
-            return self.lower_extern_nominal(program, ty, env, externs, key);
+            return self.lower_extern_nominal(program, ty, &mut env, externs, &key);
         }
         if decls.aggregate(&key).is_some() {
-            return self.lower_aggregate_nominal(program, ty, env, decls, key);
+            return self.lower_aggregate_nominal(program, ty, &mut env, decls, &key);
         }
         if decls.enum_schema(&key).is_some() {
-            return self.lower_enum_nominal(program, ty, env, decls, key);
+            return self.lower_enum_nominal(program, ty, &mut env, decls, &key);
         }
         Err(LowerError::UnsupportedType {
             ty: Box::new(ty.clone()),
@@ -307,11 +322,11 @@ impl TypeLowerer {
         &mut self,
         program: &mut Program,
         ty: &Type,
-        mut env: TypeLowerEnv<'_, '_>,
+        env: &mut TypeLowerEnv<'_, '_>,
         decls: &DeclarationIndex,
-        key: NominalKey,
+        key: &NominalKey,
     ) -> Result<TypeId, LowerError> {
-        let schema = decls.aggregate(&key).expect("aggregate schema exists");
+        let schema = decls.aggregate(key).expect("aggregate schema exists");
         let module = ensure_module(program, env.modules, &key.module);
         let kind = if key.kind == ast::NominalKind::DataRef {
             AggregateKind::DataRef
@@ -355,11 +370,11 @@ impl TypeLowerer {
         &mut self,
         program: &mut Program,
         ty: &Type,
-        mut env: TypeLowerEnv<'_, '_>,
+        env: &mut TypeLowerEnv<'_, '_>,
         decls: &DeclarationIndex,
-        key: NominalKey,
+        key: &NominalKey,
     ) -> Result<TypeId, LowerError> {
-        let schema = decls.enum_schema(&key).expect("enum schema exists");
+        let schema = decls.enum_schema(key).expect("enum schema exists");
         let module = ensure_module(program, env.modules, &key.module);
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
         let const_args = nominal_const_args(ty);
@@ -413,11 +428,11 @@ impl TypeLowerer {
         &mut self,
         program: &mut Program,
         ty: &Type,
-        mut env: TypeLowerEnv<'_, '_>,
+        env: &mut TypeLowerEnv<'_, '_>,
         externs: &ExternCatalog,
-        key: NominalKey,
+        key: &NominalKey,
     ) -> Result<TypeId, LowerError> {
-        let Some(source_id) = externs.type_by_nominal(&key) else {
+        let Some(source_id) = externs.type_by_nominal(key) else {
             return Err(LowerError::UnsupportedType {
                 ty: Box::new(ty.clone()),
             });
@@ -452,6 +467,14 @@ impl TypeLowerer {
                 Ok(ExternFieldDecl {
                     name: field.name,
                     ty: self.lower_with_env(program, &field.ty.ty, env.reborrow())?,
+                    get_receiver: ExternReceiverDecl {
+                        ty: id,
+                        mode: ParamMode::SharedBorrow,
+                    },
+                    set_receiver: ExternReceiverDecl {
+                        ty: id,
+                        mode: ParamMode::MutBorrow,
+                    },
                     computed: field.computed,
                 })
             })
@@ -464,14 +487,22 @@ impl TypeLowerer {
                     .signature
                     .params
                     .iter()
-                    .map(|param| self.lower_with_env(program, &param.ty.ty, env.reborrow()))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|param| {
+                        Ok(ExternParamDecl {
+                            ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
+                            mode: param_flow_mode(param.flow),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LowerError>>()?;
                 Ok(ExternMethodDecl {
                     name: method.name,
-                    receiver: match method.receiver {
-                        anvyx_externs::ReceiverMode::Value => super::MethodReceiver::Value,
-                        anvyx_externs::ReceiverMode::Shared => super::MethodReceiver::Shared,
-                        anvyx_externs::ReceiverMode::Mutable => super::MethodReceiver::Mut,
+                    receiver: ExternReceiverDecl {
+                        ty: id,
+                        mode: match method.receiver {
+                            anvyx_externs::ReceiverMode::Value => ParamMode::Value,
+                            anvyx_externs::ReceiverMode::Shared => ParamMode::SharedBorrow,
+                            anvyx_externs::ReceiverMode::Mutable => ParamMode::MutBorrow,
+                        },
                     },
                     params,
                     return_type: self.lower_with_env(
@@ -490,8 +521,13 @@ impl TypeLowerer {
                     .signature
                     .params
                     .iter()
-                    .map(|param| self.lower_with_env(program, &param.ty.ty, env.reborrow()))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|param| {
+                        Ok(ExternParamDecl {
+                            ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
+                            mode: param_flow_mode(param.flow),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LowerError>>()?;
                 Ok(ExternStaticDecl {
                     name: static_method.name,
                     params,
@@ -509,11 +545,20 @@ impl TypeLowerer {
             .map(|operator| {
                 Ok(ExternOpDecl {
                     kind: lower_extern_op(operator.op),
+                    receiver: ExternReceiverDecl {
+                        ty: id,
+                        mode: ParamMode::SharedBorrow,
+                    },
                     operand: operator
                         .signature
                         .params
                         .first()
-                        .map(|param| self.lower_with_env(program, &param.ty.ty, env.reborrow()))
+                        .map(|param| {
+                            Ok(ExternParamDecl {
+                                ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
+                                mode: param_flow_mode(param.flow),
+                            })
+                        })
                         .transpose()?,
                     return_type: self.lower_with_env(
                         program,
@@ -680,7 +725,7 @@ impl LowerCx {
         source_id: crate::externs::catalog::ExternFunctionId,
         name: Ident,
         member: ExternMember,
-        params: Vec<TypeId>,
+        params: Vec<ExternParamDecl>,
         return_type: TypeId,
     ) -> ExternId {
         let module = self.ensure_module(scope);
@@ -735,14 +780,15 @@ impl LowerCx {
                     .params
                     .iter()
                     .map(|param| {
-                        if param.flow != ParamFlow::Value
-                            || param.escape != ast::EscapeMode::NonEscaping
-                        {
+                        if param.escape != ast::EscapeMode::NonEscaping {
                             return Err(LowerError::UnsupportedExternSignature);
                         }
-                        self.lower_ty(&param.ty.ty)
+                        Ok(ExternParamDecl {
+                            ty: self.lower_ty(&param.ty.ty)?,
+                            mode: param_flow_mode(param.flow),
+                        })
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, LowerError>>()?;
                 let return_type = self.lower_ty(&function.signature.ret.ty)?;
                 self.alloc_extern_in_module(
                     module_scope,
@@ -765,7 +811,11 @@ impl LowerCx {
         for source in &functions.items {
             let module_scope = &modules.items[source.callable.module()].scope;
             let fact = source.fact;
-            let return_type = self.lower_ty(&fact.return_ty)?;
+            let return_type = self.lower_ty(&fact.ret.ty)?;
+            let return_mode = match fact.ret.access {
+                ReturnAccess::Value => ReturnMode::Value(return_type),
+                ReturnAccess::Place => ReturnMode::Place(return_type),
+            };
             let mut params = vec![];
             let mut locals = vec![];
             let mut local_map = HashMap::new();
@@ -788,7 +838,6 @@ impl LowerCx {
                 })?;
                 debug_assert_eq!(def.kind, LocalDefKind::Parameter);
                 debug_assert_eq!(def.name, param_fact.name);
-                debug_assert_eq!(def.ty, param_fact.ty);
                 debug_assert_eq!(def.mutable, param_fact.mutable);
                 let ty = self.lower_ty(&param_fact.ty)?;
                 let local_id = LocalId::from_index(locals.len());
@@ -807,6 +856,7 @@ impl LowerCx {
                 params.push(Param {
                     name: Some(param_fact.name),
                     ty,
+                    mode: source_param_mode(param_fact.mutable),
                     role: if source.callable.is_instance_method() && index == 0 {
                         ParamRole::Receiver
                     } else {
@@ -820,7 +870,7 @@ impl LowerCx {
                     name: source.callable.name(),
                     module,
                     kind: source.callable.function_kind(),
-                    signature: Signature::new(params, return_type),
+                    signature: Signature::with_return_mode(params, return_mode),
                     locals,
                     body: vec![BasicBlock {
                         statements: vec![],
@@ -921,7 +971,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             if self.returns_void() {
                 self.lower_effect(tail)?;
             } else {
-                let value = self.lower_value(tail)?;
+                let value = self.lower_return_operand(tail)?;
                 self.terminate(Terminator::Return(Some(value)))?;
             }
         }
@@ -940,6 +990,13 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             self.lower_stmt(stmt)?;
         }
         Ok(())
+    }
+
+    fn lower_return_operand(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        match self.function.signature.return_mode {
+            ReturnMode::Value(_) => self.lower_value(expr),
+            ReturnMode::Place(_) => self.lower_place_arg(expr, true).map(Operand::Place),
+        }
     }
 
     fn lower_block_value(
@@ -974,7 +1031,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             Stmt::Binding(binding) => self.lower_binding(binding),
             Stmt::Return(ret) => match &ret.node.value {
                 Some(value) => {
-                    let value = self.lower_value(value)?;
+                    let value = self.lower_return_operand(value)?;
                     self.terminate(Terminator::Return(Some(value)))
                 }
                 None => self.terminate(Terminator::Return(None)),
@@ -1026,6 +1083,139 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 kind: binding.node.pattern.node.variant_name(),
                 span: Some(self.source_span(binding.span)),
             }),
+        }
+    }
+
+    fn lower_place_arg(
+        &mut self,
+        expr: &ExprNode,
+        requires_mut: bool,
+    ) -> Result<Place, LowerError> {
+        let fact = if requires_mut {
+            self.local_use(expr, LocalUseMode::VarArgument)
+                .or_else(|_| self.local_use(expr, LocalUseMode::MutBorrow))?
+        } else {
+            match self.local_use(expr, LocalUseMode::Borrow) {
+                Ok(fact) => fact,
+                Err(_) => match self.local_use(expr, LocalUseMode::Read) {
+                    Ok(fact) => fact,
+                    Err(_) => return self.lower_shared_projected_place_arg(expr),
+                },
+            }
+        };
+        let local = self.local(fact.local)?;
+        if requires_mut && self.function.locals[local.index()].mutability != AirMutability::Mutable
+        {
+            return Err(unsupported_expr(expr));
+        }
+        self.lower_projected_place(expr, self.local_place(local))
+    }
+
+    fn lower_shared_projected_place_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        let Some(root) = projection_root(expr) else {
+            return self.materialize_shared_borrow_arg(expr);
+        };
+        let Ok(fact) = self.local_use(root, LocalUseMode::Read) else {
+            return self.materialize_shared_borrow_arg(expr);
+        };
+        let local = self.local(fact.local)?;
+        self.lower_projected_place(expr, self.local_place(local))
+    }
+
+    fn materialize_shared_borrow_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        let value = self.lower_value(expr)?;
+        match value {
+            Operand::Place(place) => Ok(place),
+            Operand::Const(value) => {
+                let value = Operand::Const(value);
+                let ty = self.cx.lower_ty(&self.operand_type(&value))?;
+                match self.emit_typed_temp(ty, RValue::Use(value))? {
+                    Operand::Place(place) => Ok(place),
+                    Operand::Const(_) => Err(unsupported_expr(expr)),
+                }
+            }
+        }
+    }
+
+    fn lower_projected_place(&mut self, expr: &ExprNode, root: Place) -> Result<Place, LowerError> {
+        match &expr.node.kind {
+            ExprKind::Ident(_) => Ok(root),
+            ExprKind::Field(field) => {
+                let place = self.lower_projected_place(&field.node.target, root)?;
+                self.project_field(expr, place, field.node.field)
+            }
+            ExprKind::TupleIndex(tuple) => {
+                let mut place = self.lower_projected_place(&tuple.node.target, root)?;
+                let TypeData::Tuple(elems) = self.cx.program.type_data(place.ty) else {
+                    return Err(unsupported_expr(expr));
+                };
+                let Some(ty) = elems.get(tuple.node.index as usize).copied() else {
+                    return Err(unsupported_expr(expr));
+                };
+                place
+                    .projection
+                    .push(crate::air::Projection::TupleField(tuple.node.index as u16));
+                place.ty = ty;
+                Ok(place)
+            }
+            ExprKind::Index(index) => {
+                if index.node.safe {
+                    return Err(unsupported_expr(expr));
+                }
+                let mut place = self.lower_projected_place(&index.node.target, root)?;
+                let index_local = self.lower_index_local(&index.node.index)?;
+                let ty = match self.cx.program.type_data(place.ty) {
+                    TypeData::List(elem) | TypeData::Array { elem, .. } => *elem,
+                    TypeData::Map { value, .. } => *value,
+                    _ => return Err(unsupported_expr(expr)),
+                };
+                place
+                    .projection
+                    .push(crate::air::Projection::Index(index_local));
+                place.ty = ty;
+                Ok(place)
+            }
+            _ => Err(unsupported_expr(expr)),
+        }
+    }
+
+    fn project_field(
+        &self,
+        expr: &ExprNode,
+        mut place: Place,
+        field_name: Ident,
+    ) -> Result<Place, LowerError> {
+        let TypeData::Aggregate(aggregate) = self.cx.program.type_data(place.ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        let decl = self.cx.program.aggregate(*aggregate);
+        if decl.kind != AggregateKind::Struct {
+            return Err(unsupported_expr(expr));
+        }
+        let Some((index, field)) = decl
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == field_name)
+        else {
+            return Err(unsupported_expr(expr));
+        };
+        place
+            .projection
+            .push(crate::air::Projection::Field(FieldId::from_index(index)));
+        place.ty = field.ty;
+        Ok(place)
+    }
+
+    fn lower_index_local(&mut self, expr: &ExprNode) -> Result<LocalId, LowerError> {
+        let value = self.lower_value(expr)?;
+        let ty = self.cx.lower_ty(&self.operand_type(&value))?;
+        match value {
+            Operand::Place(place) if place.projection.is_empty() => Ok(place.root),
+            value => match self.emit_typed_temp(ty, RValue::Use(value))? {
+                Operand::Place(place) if place.projection.is_empty() => Ok(place.root),
+                _ => Err(unsupported_expr(expr)),
+            },
         }
     }
 
@@ -1126,7 +1316,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                         string_ty,
                         RValue::Format {
                             value,
-                            spec: spec.node.clone(),
+                            spec: spec.node,
                         },
                     )?);
                 }
@@ -1211,6 +1401,31 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         self.emit_typed_temp(result_ty, RValue::Stringify { value, source_ty })
     }
 
+    fn lower_call_args<'a>(
+        &mut self,
+        expr_id: ExprId,
+        exprs: impl Iterator<Item = &'a ExprNode>,
+        modes: impl Iterator<Item = ParamMode>,
+    ) -> Result<Vec<CallArg>, LowerError> {
+        exprs
+            .zip(modes)
+            .map(|(expr, mode)| match mode {
+                ParamMode::Value => self.lower_value(expr).map(CallArg::Value),
+                ParamMode::SharedBorrow => {
+                    self.lower_place_arg(expr, false).map(CallArg::SharedBorrow)
+                }
+                ParamMode::MutBorrow => self.lower_place_arg(expr, true).map(CallArg::MutBorrow),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| match err {
+                LowerError::MissingLocalUse { .. } => LowerError::UnsupportedExpr {
+                    expr_id,
+                    kind: "borrow argument lowering",
+                },
+                err => err,
+            })
+    }
+
     fn lower_call_value(
         &mut self,
         expr: &ExprNode,
@@ -1240,11 +1455,16 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     expr_id: expr.node.id,
                 });
             };
-            let args = args
-                .iter()
-                .map(|arg| self.lower_value(arg))
-                .collect::<Result<Vec<_>, _>>()?;
             self.require_call_arity(expr.node.id, &Callee::Extern(callee), args.len())?;
+            let modes = self
+                .cx
+                .program
+                .extern_decl(callee)
+                .params
+                .iter()
+                .map(|param| param.mode)
+                .collect::<Vec<_>>();
+            let args = self.lower_call_args(expr.node.id, args.iter(), modes.into_iter())?;
             return Ok(RValue::Call {
                 callee: Callee::Extern(callee),
                 args,
@@ -1270,7 +1490,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 body: Box::new(body),
             });
         };
-        let mut operands = vec![];
+        let mut arg_exprs = vec![];
         if target.id.kind == CallableKind::InstanceMethod {
             let ExprKind::Field(field) = &call.node.func.node.kind else {
                 return Err(unsupported_expr(&call.node.func));
@@ -1283,20 +1503,39 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             {
                 return Err(unsupported_expr(&call.node.func));
             }
-            operands.push(self.lower_value(&field.node.target)?);
+            arg_exprs.push(field.node.target.as_ref());
         }
-        operands.extend(
-            args.iter()
-                .map(|arg| self.lower_value(arg))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        arg_exprs.extend(args.iter());
         let expected = self.cx.program.function(callee).signature.params.len();
-        let provided = operands.len();
-        operands.extend(self.lower_default_args(expr.node.id, provided, expected)?);
-        self.require_call_arity(expr.node.id, &Callee::Function(callee), operands.len())?;
+        let provided = arg_exprs.len();
+        if provided > expected {
+            self.require_call_arity(expr.node.id, &Callee::Function(callee), provided)?;
+        }
+        let modes = self
+            .cx
+            .program
+            .function(callee)
+            .signature
+            .params
+            .iter()
+            .map(|param| param.mode)
+            .collect::<Vec<_>>();
+        let mut args = self.lower_call_args(
+            expr.node.id,
+            arg_exprs.into_iter(),
+            modes.iter().copied().take(provided),
+        )?;
+        let defaults = self.lower_default_args(
+            expr.node.id,
+            provided,
+            expected,
+            modes.iter().copied().skip(provided),
+        )?;
+        args.extend(defaults);
+        self.require_call_arity(expr.node.id, &Callee::Function(callee), args.len())?;
         Ok(RValue::Call {
             callee: Callee::Function(callee),
-            args: operands,
+            args,
         })
     }
 
@@ -1326,7 +1565,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         call: ExprId,
         provided: usize,
         expected: usize,
-    ) -> Result<Vec<Operand>, LowerError> {
+        modes: impl Iterator<Item = ParamMode>,
+    ) -> Result<Vec<CallArg>, LowerError> {
         if provided >= expected {
             return Ok(vec![]);
         }
@@ -1347,11 +1587,16 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         defaults.sort_by_key(|fact| fact.param_index);
         defaults
             .iter()
-            .map(|fact| self.lower_default_arg(fact))
+            .zip(modes)
+            .map(|(fact, mode)| self.lower_default_arg(fact, mode))
             .collect()
     }
 
-    fn lower_default_arg(&mut self, fact: &DefaultArgFact) -> Result<Operand, LowerError> {
+    fn lower_default_arg(
+        &mut self,
+        fact: &DefaultArgFact,
+        mode: ParamMode,
+    ) -> Result<CallArg, LowerError> {
         let error = || LowerError::UnsupportedDefaultArg {
             call: fact.call,
             param_index: fact.param_index,
@@ -1371,9 +1616,15 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(error());
         };
         let ty = self.cx.lower_ty(&fact.ty)?;
-        Ok(Operand::Const(
-            self.cx.program.alloc_const(ConstData { ty, value }),
-        ))
+        let operand = Operand::Const(self.cx.program.alloc_const(ConstData { ty, value }));
+        match mode {
+            ParamMode::Value => Ok(CallArg::Value(operand)),
+            ParamMode::SharedBorrow => match self.emit_typed_temp(ty, RValue::Use(operand))? {
+                Operand::Place(place) => Ok(CallArg::SharedBorrow(place)),
+                Operand::Const(_) => Err(error()),
+            },
+            ParamMode::MutBorrow => Err(error()),
+        }
     }
 
     fn lower_lit(&mut self, expr: &ExprNode, lit: &Lit) -> Result<Operand, LowerError> {
@@ -1496,7 +1747,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn returns_void(&self) -> bool {
         self.cx
             .program
-            .type_data(self.function.signature.return_type)
+            .type_data(self.function.signature.return_type())
             == &TypeData::Void
     }
 
@@ -1687,9 +1938,10 @@ fn dyn_contract_name(contract: &ast::ContractRef) -> Result<String, LowerError> 
     match contract {
         ast::ContractRef::Named {
             qualifier, name, ..
-        } => Ok(qualifier
-            .map(|qualifier| format!("{qualifier}::{name}"))
-            .unwrap_or_else(|| name.to_string())),
+        } => Ok(match qualifier {
+            Some(qualifier) => format!("{qualifier}::{name}"),
+            None => name.to_string(),
+        }),
         ast::ContractRef::Anonymous(contract) => Ok(format!(
             "contract({})",
             contract
@@ -1819,6 +2071,22 @@ fn assign_op_to_binary(op: AssignOp) -> BinaryOp {
     }
 }
 
+fn source_param_mode(mutable: bool) -> ParamMode {
+    if mutable {
+        ParamMode::MutBorrow
+    } else {
+        ParamMode::SharedBorrow
+    }
+}
+
+fn param_flow_mode(flow: ParamFlow) -> ParamMode {
+    match flow {
+        ParamFlow::Value => ParamMode::Value,
+        ParamFlow::Borrow => ParamMode::SharedBorrow,
+        ParamFlow::MutBorrow => ParamMode::MutBorrow,
+    }
+}
+
 fn source_scalar(ty: &Type) -> Option<ScalarType> {
     match ty {
         Type::Int => Some(ScalarType::Int),
@@ -1860,15 +2128,29 @@ pub(crate) fn lower_with_modules(
         ..LowerCx::default()
     };
     cx.lower_function_shells(&index.modules, &functions)?;
+    ownership::finalize(&mut cx.program)
+        .map_err(|errors| LowerError::Ownership(errors.into_boxed_slice()))?;
     cx.attach_stringify_overrides();
     if let Some(entry) = &entry {
         cx.set_entry(entry)?;
     }
     cx.lower_extern_declarations(&functions, semantic)?;
     cx.lower_function_bodies(&functions)?;
+    ownership::finalize(&mut cx.program)
+        .map_err(|errors| LowerError::Ownership(errors.into_boxed_slice()))?;
     verify(&cx.program).map_err(|errors| LowerError::Verify(errors.into_boxed_slice()))?;
     reject_any_types(&cx.program)?;
     Ok(cx.program)
+}
+
+fn projection_root(expr: &ExprNode) -> Option<&ExprNode> {
+    match &expr.node.kind {
+        ExprKind::Ident(_) => Some(expr),
+        ExprKind::Field(field) => projection_root(&field.node.target),
+        ExprKind::TupleIndex(tuple) => projection_root(&tuple.node.target),
+        ExprKind::Index(index) => projection_root(&index.node.target),
+        _ => None,
+    }
 }
 
 fn validate_roots(
@@ -2046,7 +2328,7 @@ struct ReachableCallable<'a> {
 #[derive(Debug)]
 enum ReachableBodyFacts<'a> {
     Facts(&'a SemanticBodyFacts),
-    Empty(SemanticBodyFacts),
+    Empty(Box<SemanticBodyFacts>),
 }
 
 impl ReachableBodyFacts<'_> {
@@ -2061,7 +2343,7 @@ impl ReachableBodyFacts<'_> {
 fn can_omit_body_facts(fact: &SemanticFunctionInstanceFact, callable: SourceCallable<'_>) -> bool {
     let body = callable.body();
     fact.params.is_empty()
-        && fact.return_ty == Type::Void
+        && fact.ret.ty == Type::Void
         && body.node.stmts.is_empty()
         && body.node.tail.is_none()
 }
@@ -2176,7 +2458,7 @@ impl<'a> ReachableCallables<'a> {
             let body_facts = match semantic.facts.body(&body) {
                 Some(facts) => ReachableBodyFacts::Facts(facts),
                 None if can_omit_body_facts(fact, source) => {
-                    ReachableBodyFacts::Empty(SemanticBodyFacts::default())
+                    ReachableBodyFacts::Empty(Box::default())
                 }
                 None => {
                     return Err(LowerError::MissingSpecializedBodyFacts {
@@ -2692,7 +2974,12 @@ mod tests {
             TypeData::Int
         ));
         assert_eq!(stringify_source_types(&air), vec![TypeData::Int]);
-        assert_extern_signature(&air, "_println", &[TypeData::String], &TypeData::Void);
+        assert_extern_signature(
+            &air,
+            "_println",
+            &[(TypeData::String, ParamMode::SharedBorrow)],
+            &TypeData::Void,
+        );
     }
 
     #[test]
@@ -2723,7 +3010,10 @@ mod tests {
         assert_extern_signature(
             &air,
             "_assert",
-            &[TypeData::Bool, TypeData::String],
+            &[
+                (TypeData::Bool, ParamMode::Value),
+                (TypeData::String, ParamMode::SharedBorrow),
+            ],
             &TypeData::Void,
         );
         assert_no_deferred_core_decls(&air);
@@ -3002,7 +3292,7 @@ mod tests {
         assert_eq!(id_functions.len(), 1);
         assert_eq!(id_functions[0].signature.params.len(), 1);
         assert!(matches!(
-            air.type_arena.get(id_functions[0].signature.return_type),
+            air.type_arena.get(id_functions[0].signature.return_type()),
             Some(TypeData::Int)
         ));
     }
@@ -3010,7 +3300,7 @@ mod tests {
     #[test]
     fn generic_identity_lowers_independent_instances() {
         let source =
-            r#"fn id<T>(x: T) -> T { x } fn f() -> int { id(1) } fn g() -> string { id("x") }"#;
+            "fn id<T>(x: T) -> T { x } fn f() -> int { id(1) } fn g() -> bool { id(true) }";
         let air = lower_roots(source, &["f", "g"]).expect("lower failed");
 
         let id_functions = air
@@ -3020,12 +3310,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(id_functions.len(), 2);
         assert!(id_functions.iter().any(|function| matches!(
-            air.type_arena.get(function.signature.return_type),
+            air.type_arena.get(function.signature.return_type()),
             Some(TypeData::Int)
         )));
         assert!(id_functions.iter().any(|function| matches!(
-            air.type_arena.get(function.signature.return_type),
-            Some(TypeData::String)
+            air.type_arena.get(function.signature.return_type()),
+            Some(TypeData::Bool)
         )));
     }
 
@@ -3059,17 +3349,17 @@ mod tests {
 
     #[test]
     fn generic_call_order_drives_function_order() {
-        let source = r#"fn id<T>(x: T) -> T { x } fn f() { let a = id("x"); let b = id(1); }"#;
+        let source = "fn id<T>(x: T) -> T { x } fn f() { let a = id(true); let b = id(1); }";
         let air = lower_root(source, "f").expect("lower failed");
         let id_returns = air
             .functions
             .iter()
             .filter(|function| function.name == Ident::new("id"))
-            .map(|function| air.type_arena.get(function.signature.return_type))
+            .map(|function| air.type_arena.get(function.signature.return_type()))
             .collect::<Vec<_>>();
 
         assert_eq!(id_returns.len(), 2);
-        assert!(matches!(id_returns[0], Some(TypeData::String)));
+        assert!(matches!(id_returns[0], Some(TypeData::Bool)));
         assert!(matches!(id_returns[1], Some(TypeData::Int)));
     }
 
@@ -3166,7 +3456,7 @@ mod tests {
                 span: semantic.program.declaration_facts.functions[0].span,
                 body_span: semantic.program.declaration_facts.functions[0].body_span,
                 params: vec![],
-                return_ty: Type::Infer,
+                ret: ast::ReturnSpec::value(Type::Infer),
             });
         let err = lower_checked_roots(&root, &resolved, &semantic.program, &["main"])
             .expect_err("expected missing generic args");
@@ -3207,7 +3497,7 @@ mod tests {
 
     #[test]
     fn stringify_void_call_lowers_effect_then_void_constant() {
-        let source = r#"fn side() {} fn f() -> string { #stringify(side()) }"#;
+        let source = r"fn side() {} fn f() -> string { #stringify(side()) }";
         let air = lower_full_core_root(source, "f").expect("lower failed");
         let function = air
             .functions
@@ -3366,8 +3656,8 @@ mod tests {
                     doc: None,
                     signature: ExternSignature {
                         params: vec![ExternParam {
-                            name: Some("message".to_string()),
-                            ty: ExternTypeExpr::String,
+                            name: Some("value".to_string()),
+                            ty: ExternTypeExpr::Int,
                             flow: ParamFlow::Value,
                             escape: CallbackEscape::NonEscaping,
                         }],
@@ -3378,7 +3668,7 @@ mod tests {
             }],
         };
         let (root, resolved, semantic) = checked_with_provider(
-            "import ext:host { host_log }; fn f() { host_log(\"ok\"); }",
+            "import ext:host { host_log }; fn f() { host_log(1); }",
             provider,
         );
         let air =
@@ -3413,7 +3703,7 @@ mod tests {
                 assert_eq!(ext.name, Ident::new("host_log"));
                 assert_eq!(ext.params.len(), 1);
                 assert!(matches!(
-                    cx.program.type_arena.get(ext.params[0]),
+                    cx.program.type_arena.get(ext.params[0].ty),
                     Some(TypeData::String)
                 ));
                 assert!(matches!(
@@ -3524,7 +3814,7 @@ mod tests {
             .expect("method missing");
 
         assert!(matches!(
-            air.type_data(method.signature.return_type),
+            air.type_data(method.signature.return_type()),
             TypeData::Int
         ));
         assert!(matches!(
@@ -3581,11 +3871,11 @@ mod tests {
 
     #[test]
     fn override_body_lowers_calls_defaults_and_stringify() {
-        let source = r#"
+        let source = r"
             fn helper(x: int = 1) -> int { x }
             struct Box { value: int fn to_string(self) -> string { #stringify(helper()) } }
             fn f(value: Box) -> string { #stringify(value) }
-        "#;
+        ";
         let air = lower_full_core_root(source, "f").expect("lower failed");
         let override_fn = air
             .functions
@@ -3615,11 +3905,11 @@ mod tests {
 
     #[test]
     fn generic_override_body_fact_replay_is_stable() {
-        let source = r#"
+        let source = r"
             struct Box<T> { value: T fn to_string(self) -> string { #stringify(1) } }
             fn first(value: Box<int>) -> string { value.to_string() }
             fn second(value: Box<int>) -> string { value.to_string() }
-        "#;
+        ";
         let air = lower_roots(source, &["first", "second"]).expect("lower failed");
         let overrides = air
             .functions
@@ -3693,18 +3983,16 @@ mod tests {
     }
 
     #[test]
-    fn default_arg_lowers_to_literal_operand() {
-        let source =
-            r#"fn ok(message: string = "ok") -> string { message } fn f() -> string { ok() }"#;
+    fn default_arg_lowers_to_borrowed_literal_temp() {
+        let source = r#"fn ok(message: string = "ok") {} fn f() { ok(); }"#;
         let air = lower_root(source, "f").expect("lower failed");
 
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
-                    value: RValue::Call { args, .. },
-                    ..
-                } if args.len() == 1 && matches!(args[0], Operand::Const(_))
+                Statement::Init { value: RValue::Call { args, .. }, .. }
+                    | Statement::Eval(RValue::Call { args, .. })
+                    if args.len() == 1 && matches!(args[0], CallArg::SharedBorrow(_))
             )
         }));
     }
@@ -3716,8 +4004,8 @@ mod tests {
             &[(
                 "runtime",
                 "
-                extern fn _println(message: string);
-                pub fn println<T>(value: T) { _println(#stringify(value)); }
+                extern fn _print_int(value: int);
+                pub fn println<T>(value: T) { _print_int(1); }
                 ",
             )],
         );
@@ -3725,6 +4013,7 @@ mod tests {
             .expect("lower failed");
 
         assert_eq!(air.externs.len(), 1);
+        assert_eq!(air.externs[0].name, Ident::new("_print_int"));
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
@@ -3737,7 +4026,103 @@ mod tests {
     }
 
     #[test]
-    fn extern_mut_borrow_param_is_unsupported() {
+    fn extern_type_provider_flow_metadata_is_preserved() {
+        let provider = ProviderDescriptor {
+            provider: ProviderId {
+                name: "gfx".to_string(),
+            },
+            modules: vec![ExternModuleDescriptor {
+                path: anvyx_externs::ModulePath {
+                    segments: vec!["gfx".to_string()],
+                },
+                functions: vec![],
+                types: vec![anvyx_externs::ExternTypeDescriptor {
+                    name: "Sprite".to_string(),
+                    doc: None,
+                    rep: anvyx_externs::ExternRep::Shared,
+                    fields: vec![anvyx_externs::ExternFieldDescriptor {
+                        name: "x".to_string(),
+                        ty: ExternTypeExpr::Float,
+                        computed: false,
+                        doc: None,
+                    }],
+                    init: None,
+                    methods: vec![anvyx_externs::ExternMethodDescriptor {
+                        name: "move".to_string(),
+                        doc: None,
+                        receiver: anvyx_externs::ReceiverMode::Mutable,
+                        signature: ExternSignature {
+                            params: vec![ExternParam {
+                                name: Some("dx".to_string()),
+                                ty: ExternTypeExpr::Float,
+                                flow: ParamFlow::Borrow,
+                                escape: CallbackEscape::NonEscaping,
+                            }],
+                            ret: ExternTypeExpr::Void,
+                        },
+                        effects: ExternEffects::default(),
+                    }],
+                    statics: vec![anvyx_externs::ExternStaticDescriptor {
+                        name: "find".to_string(),
+                        doc: None,
+                        signature: ExternSignature {
+                            params: vec![ExternParam {
+                                name: Some("id".to_string()),
+                                ty: ExternTypeExpr::Int,
+                                flow: ParamFlow::MutBorrow,
+                                escape: CallbackEscape::NonEscaping,
+                            }],
+                            ret: ExternTypeExpr::Void,
+                        },
+                        effects: ExternEffects::default(),
+                    }],
+                    operators: vec![anvyx_externs::ExternOperatorDescriptor {
+                        op: anvyx_externs::ExternOperator::Binary {
+                            op: anvyx_externs::BinaryOp::Add,
+                            self_on_right: false,
+                        },
+                        signature: ExternSignature {
+                            params: vec![ExternParam {
+                                name: None,
+                                ty: ExternTypeExpr::Named {
+                                    module: None,
+                                    name: "Sprite".to_string(),
+                                    args: vec![],
+                                },
+                                flow: ParamFlow::Borrow,
+                                escape: CallbackEscape::NonEscaping,
+                            }],
+                            ret: ExternTypeExpr::Named {
+                                module: None,
+                                name: "Sprite".to_string(),
+                                args: vec![],
+                            },
+                        },
+                        effects: ExternEffects::default(),
+                    }],
+                }],
+            }],
+        };
+        let (root, resolved, semantic) = checked_with_provider(
+            "import ext:gfx { Sprite }; fn f(sprite: Sprite) { }",
+            provider,
+        );
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic.program, &["f"]).expect("lower failed");
+        let sprite = air.extern_type(crate::air::ExternTypeId::from_index(0));
+        assert_eq!(sprite.fields[0].get_receiver.mode, ParamMode::SharedBorrow);
+        assert_eq!(sprite.fields[0].set_receiver.mode, ParamMode::MutBorrow);
+        assert_eq!(sprite.methods[0].receiver.mode, ParamMode::MutBorrow);
+        assert_eq!(sprite.methods[0].params[0].mode, ParamMode::SharedBorrow);
+        assert_eq!(sprite.statics[0].params[0].mode, ParamMode::MutBorrow);
+        assert_eq!(
+            sprite.operators[0].operand.as_ref().unwrap().mode,
+            ParamMode::SharedBorrow
+        );
+    }
+
+    #[test]
+    fn extern_mut_borrow_param_flow_is_preserved() {
         let provider = ProviderDescriptor {
             provider: ProviderId {
                 name: "host".to_string(),
@@ -3767,9 +4152,151 @@ mod tests {
             "import ext:host { touch }; fn f(var x: int) { touch(x); }",
             provider,
         );
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
-            .expect_err("expected error");
-        assert!(matches!(err, LowerError::UnsupportedExternSignature));
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic.program, &["f"]).expect("lower failed");
+        let ext = air.extern_decl(ExternId::from_index(0));
+        assert_eq!(ext.params[0].mode, ParamMode::MutBorrow);
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Extern(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::MutBorrow(_)])
+            )
+        }));
+    }
+
+    #[test]
+    fn source_var_call_lowers_to_mut_borrow_arg() {
+        let air = lower_root("fn inc(var x: int) {} fn f() { var x = 1; inc(x); }", "f")
+            .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::MutBorrow(_)])
+            )
+        }));
+    }
+
+    #[test]
+    fn source_valid_read_var_alias_lowers_read_to_value_snapshot() {
+        let air = lower_root(
+            r#"
+fn both(read: string, var write: string) {
+    #stringify(read);
+    write = "changed";
+}
+fn f() {
+    var text = "hello";
+    both(text, text);
+}
+"#,
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::Value(Operand::Place(_)), CallArg::MutBorrow(_)])
+            )
+        }));
+    }
+
+    #[test]
+    fn source_shared_field_call_lowers_to_shared_borrow_projection() {
+        let air = lower_root(
+            "struct Named { name: string } fn take(name: string) {} fn f(item: Named) { take(item.name); }",
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::SharedBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Field(_)]))
+            )
+        }));
+    }
+
+    #[test]
+    fn source_shared_index_call_lowers_to_shared_borrow_projection() {
+        let air = lower_root(
+            "fn take(name: string) {} fn f(names: [string]) { take(names[0]); }",
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::SharedBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Index(_)]))
+            )
+        }));
+    }
+
+    #[test]
+    fn source_var_field_call_lowers_to_mut_borrow_projection() {
+        let air = lower_root(
+            "struct Pair { a: int, b: int } fn set(var x: int) {} fn f(var p: Pair) { set(p.a); }",
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Field(_)]))
+            )
+        }));
+    }
+
+    #[test]
+    fn source_var_tuple_field_lowers_to_mut_borrow_projection() {
+        let air = lower_root(
+            "fn set(var x: int) {} fn f(var pair: (int, int)) { set(pair.0); }",
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::TupleField(0)]))
+            )
+        }));
+    }
+
+    #[test]
+    fn source_var_index_lowers_to_mut_borrow_projection() {
+        let air = lower_root(
+            "fn set(var x: int) {} fn f(var xs: [int]) { set(xs[0]); }",
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Index(_)]))
+            )
+        }));
     }
 
     #[test]
@@ -4141,10 +4668,7 @@ fn main() {}
     }
 
     fn program_statements(program: &Program) -> impl Iterator<Item = &Statement> {
-        program
-            .functions
-            .iter()
-            .flat_map(|function| function_statements(function))
+        program.functions.iter().flat_map(function_statements)
     }
 
     fn function_statements(function: &Function) -> impl Iterator<Item = &Statement> {
@@ -4188,7 +4712,12 @@ fn main() {}
         }));
     }
 
-    fn assert_extern_signature(program: &Program, name: &str, params: &[TypeData], ret: &TypeData) {
+    fn assert_extern_signature(
+        program: &Program,
+        name: &str,
+        params: &[(TypeData, ParamMode)],
+        ret: &TypeData,
+    ) {
         let decl = program
             .externs
             .iter()
@@ -4197,7 +4726,7 @@ fn main() {}
         let actual_params = decl
             .params
             .iter()
-            .map(|ty| program.type_arena.data(*ty).clone())
+            .map(|ty| (program.type_arena.data(ty.ty).clone(), ty.mode))
             .collect::<Vec<_>>();
         assert_eq!(actual_params, params);
         assert_eq!(program.type_arena.data(decl.return_type), ret);

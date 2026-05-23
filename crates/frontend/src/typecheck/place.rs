@@ -104,6 +104,13 @@ impl PlaceIdentity {
         Self::Single(PlacePath::root(root))
     }
 
+    pub(super) fn root_local(&self) -> Option<SemanticLocalId> {
+        match self.place_root()? {
+            PlaceRoot::Local(local) => Some(local),
+            PlaceRoot::Global(_) | PlaceRoot::Temporary(_) => None,
+        }
+    }
+
     pub(super) fn field(self, field: Ident) -> Self {
         self.project(&|path| path.field(field))
     }
@@ -260,13 +267,6 @@ fn alternatives_conflict(
 }
 
 impl PlacePath {
-    fn direct_local(&self) -> Option<SemanticLocalId> {
-        let PlaceRoot::Local(local) = self.root else {
-            return None;
-        };
-        self.segments.is_empty().then_some(local)
-    }
-
     pub(super) fn root(root: PlaceRoot) -> Self {
         Self {
             root,
@@ -861,10 +861,7 @@ fn record_direct_use(
     mode: LocalUseMode,
     tc: &mut TypeChecker,
 ) {
-    let PlaceIdentity::Single(path) = &value.identity else {
-        return;
-    };
-    let Some(local) = path.direct_local() else {
+    let Some(local) = value.identity.root_local() else {
         return;
     };
     if tc.has_recordable_semantic_local(local) {
@@ -907,6 +904,7 @@ pub(super) fn record_value_read(expr_id: ExprId, value: &PlaceValue, tc: &mut Ty
 pub(super) fn record_var_argument(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.mutably_use_place(expr_id);
     record_place_global_access(expr_id, value, GlobalAccessMode::VarArgument, tc);
+    record_direct_use(expr_id, value, LocalUseMode::VarArgument, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 
@@ -919,12 +917,14 @@ pub(super) fn record_mut_receiver(expr_id: ExprId, value: &PlaceValue, tc: &mut 
 pub(super) fn record_immutable_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.read_place(expr_id);
     record_place_global_access(expr_id, value, GlobalAccessMode::ImmutableBorrow, tc);
+    record_direct_use(expr_id, value, LocalUseMode::Borrow, tc);
     record_facts_read(expr_id, &value.facts, tc);
 }
 
 pub(super) fn record_mut_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
     tc.closure.mutably_use_place(expr_id);
     record_place_global_access(expr_id, value, GlobalAccessMode::MutableBorrow, tc);
+    record_direct_use(expr_id, value, LocalUseMode::MutBorrow, tc);
     record_facts_write(expr_id, &value.facts, tc);
 }
 

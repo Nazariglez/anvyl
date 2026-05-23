@@ -1,6 +1,6 @@
 use verify::{
-    BadCall, BadConst, BadFunction, BadModule, BadPlace, BadRValue, BadReference, BadStatement,
-    BadType, ModuleItem, PrimitiveKind, VerifyError, VerifyErrorKind as EK,
+    BadCall, BadConst, BadExtern, BadFunction, BadModule, BadPlace, BadRValue, BadReference,
+    BadStatement, BadType, ModuleItem, PrimitiveKind, VerifyError, VerifyErrorKind as EK,
 };
 
 use super::*;
@@ -195,6 +195,37 @@ fn return_type_mismatch() {
 }
 
 #[test]
+fn place_return_must_return_place() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let module = test_module(&mut builder);
+    let value = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+
+    let func = Function {
+        name: Ident::new("bad_place_return"),
+        module,
+        kind: FunctionKind::Normal,
+        signature: Signature::with_return_mode(vec![], ReturnMode::Place(int_ty)),
+        locals: vec![],
+        body: vec![BasicBlock {
+            statements: vec![],
+            terminator: term_return(op_const(value)),
+        }],
+    };
+    let fid = builder.alloc_function(func);
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::PlaceReturnMustReturnPlace)
+    )));
+}
+
+#[test]
 fn void_fn_returns_value() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -324,6 +355,18 @@ fn enum_bad_variant_type() {
 }
 
 #[test]
+fn tuple_bad_nested_type_does_not_panic() {
+    let mut builder = ProgramBuilder::default();
+    builder.alloc_type(TypeData::Tuple(vec![TypeId::from_index(999)]));
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidType(TypeId(id))) if id == 999
+    )));
+}
+
+#[test]
 fn function_call_arg_type_mismatch() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -343,7 +386,7 @@ fn function_call_arg_type_mismatch() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Function(callee_id),
-            args: vec![op_place(p_arg, bool_ty)],
+            args: vec![CallArg::Value(op_place(p_arg, bool_ty))],
         }),
     );
     let caller_id = builder.alloc_function(caller.finish());
@@ -358,6 +401,47 @@ fn function_call_arg_type_mismatch() {
 }
 
 #[test]
+fn extern_member_receiver_mode_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let ext_ty = builder.alloc_extern_type(ExternTypeDecl {
+        name: Ident::new("Handle"),
+        module,
+        type_args: vec![],
+        const_args: vec![],
+        rep: ExternRep::Shared,
+        has_init: false,
+        fields: vec![],
+        methods: vec![],
+        statics: vec![],
+        operators: vec![],
+    });
+    let receiver_ty = builder.alloc_type(TypeData::Extern(ext_ty));
+    builder.alloc_extern(ExternDecl {
+        name: Ident::new("get_x"),
+        module,
+        member: ExternMember::FieldGetter {
+            owner: ext_ty,
+            receiver: ExternReceiverDecl {
+                ty: receiver_ty,
+                mode: ParamMode::MutBorrow,
+            },
+            computed: false,
+        },
+        params: vec![],
+        return_type: int_ty,
+    });
+    let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, EK::BadExtern(BadExtern::ReceiverModeMismatch)))
+    );
+}
+
+#[test]
 fn call_arity_mismatch() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -368,7 +452,16 @@ fn call_arity_mismatch() {
         name: Ident::new("ext_add"),
         module,
         member: ExternMember::FreeFunction,
-        params: vec![int_ty, int_ty],
+        params: vec![
+            ExternParamDecl {
+                ty: int_ty,
+                mode: ParamMode::Value,
+            },
+            ExternParamDecl {
+                ty: int_ty,
+                mode: ParamMode::Value,
+            },
+        ],
         return_type: int_ty,
     });
 
@@ -379,7 +472,7 @@ fn call_arity_mismatch() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Extern(ext_id),
-            args: vec![op_place(p_n, int_ty)],
+            args: vec![CallArg::Value(op_place(p_n, int_ty))],
         }),
     );
     let fid = builder.alloc_function(fb.finish());
@@ -396,6 +489,38 @@ fn call_arity_mismatch() {
 }
 
 #[test]
+fn call_value_arg_invalid_type_does_not_panic() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.void_ty();
+    let invalid_ty = TypeId::from_index(999);
+    let module = test_module(&mut builder);
+
+    let mut callee = FunctionBuilder::new("takes_invalid", module, FunctionKind::Normal, void_ty);
+    callee.push_param("value", invalid_ty, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let callee_id = builder.alloc_function(callee.finish());
+
+    let mut caller = FunctionBuilder::new("bad_call", module, FunctionKind::Normal, void_ty);
+    let arg = caller.push_local(None, invalid_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = caller.push_block(term_return_void());
+    caller.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee_id),
+            args: vec![CallArg::Value(op_place(arg, invalid_ty))],
+        }),
+    );
+    let fid = builder.alloc_function(caller.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidType(ty)) if ty == invalid_ty
+    )));
+}
+
+#[test]
 fn call_arg_type_mismatch() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -407,7 +532,16 @@ fn call_arg_type_mismatch() {
         name: Ident::new("ext_add"),
         module,
         member: ExternMember::FreeFunction,
-        params: vec![int_ty, int_ty],
+        params: vec![
+            ExternParamDecl {
+                ty: int_ty,
+                mode: ParamMode::Value,
+            },
+            ExternParamDecl {
+                ty: int_ty,
+                mode: ParamMode::Value,
+            },
+        ],
         return_type: int_ty,
     });
 
@@ -419,7 +553,10 @@ fn call_arg_type_mismatch() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Extern(ext_id),
-            args: vec![op_place(p_n, int_ty), op_place(p_b, bool_ty)],
+            args: vec![
+                CallArg::Value(op_place(p_n, int_ty)),
+                CallArg::Value(op_place(p_b, bool_ty)),
+            ],
         }),
     );
     let fid = builder.alloc_function(fb.finish());
@@ -565,7 +702,13 @@ fn closure_bad_fn() {
     let int_ty = builder.alloc_type(TypeData::Int);
     let module = test_module(&mut builder);
 
-    let sig_type = builder.alloc_type(TypeData::Function(SignatureType::new(vec![int_ty], int_ty)));
+    let sig_type = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![ParamType {
+            ty: int_ty,
+            mode: ParamMode::Value,
+        }],
+        ReturnMode::Value(int_ty),
+    )));
 
     let mut fb = FunctionBuilder::new("bad_closure", module, FunctionKind::Normal, int_ty);
     let bb0 = fb.push_block(term_return_void());
@@ -584,6 +727,50 @@ fn closure_bad_fn() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadReference(BadReference::InvalidFunction(FunctionId(id))) if id == 999
+    )));
+}
+
+#[test]
+fn call_overlapping_shared_and_mut_borrow_args() {
+    let mut builder = ProgramBuilder::default();
+    let string_ty = builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+
+    let mut callee = FunctionBuilder::new("callee", module, FunctionKind::Normal, void_ty);
+    callee.push_param_with_mode(
+        "read",
+        string_ty,
+        ParamMode::SharedBorrow,
+        ParamRole::Normal,
+    );
+    callee.push_param_with_mode("write", string_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let callee = builder.alloc_function(callee.finish());
+
+    let mut fb = FunctionBuilder::new("alias", module, FunctionKind::Normal, void_ty);
+    let local = fb.push_param_with_mode("text", string_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![
+                CallArg::SharedBorrow(place(local, string_ty)),
+                CallArg::MutBorrow(place(local, string_ty)),
+            ],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::ArgAliasConflict {
+            first: 0,
+            second: 1
+        })
     )));
 }
 
@@ -804,6 +991,7 @@ fn function_param_local_must_match() {
             vec![Param {
                 name: Some(Ident::new("p")),
                 ty: int_ty,
+                mode: ParamMode::Value,
                 role: ParamRole::Normal,
                 local_id: local,
             }],
@@ -1267,6 +1455,42 @@ fn aggregate_stringify_override_wrong_shape() {
     }))));
     let wrong_ret = builder.alloc_function(wrong_ret.finish());
 
+    let place_ret_self = LocalId::from_index(0);
+    let place_ret_value = LocalId::from_index(1);
+    let place_ret = builder.alloc_function(Function {
+        name: Ident::new("bad_ret_mode"),
+        module,
+        kind: FunctionKind::Method,
+        signature: Signature::with_return_mode(
+            vec![Param {
+                name: Some(Ident::new("self")),
+                ty: aggregate_ty,
+                mode: ParamMode::Value,
+                role: ParamRole::Receiver,
+                local_id: place_ret_self,
+            }],
+            ReturnMode::Place(string_ty),
+        ),
+        locals: vec![
+            Local {
+                name: Some(Ident::new("self")),
+                ty: aggregate_ty,
+                mutability: Mutability::Immutable,
+                kind: LocalKind::Arg,
+            },
+            Local {
+                name: Some(Ident::new("value")),
+                ty: string_ty,
+                mutability: Mutability::Mutable,
+                kind: LocalKind::User,
+            },
+        ],
+        body: vec![BasicBlock {
+            statements: vec![],
+            terminator: term_return(op_place(place_ret_value, string_ty)),
+        }],
+    });
+
     let mut wrong_receiver =
         FunctionBuilder::new("bad_receiver", module, FunctionKind::Method, string_ty);
     wrong_receiver.push_param("self", other_ty, ParamRole::Receiver);
@@ -1296,6 +1520,7 @@ fn aggregate_stringify_override_wrong_shape() {
     let mut program = builder.finish();
     for (function, expected) in [
         (wrong_ret, "ret"),
+        (place_ret, "ret_mode"),
         (wrong_receiver, "receiver_ty"),
         (wrong_kind, "receiver_kind"),
         (no_receiver, "receiver_role"),
@@ -1306,6 +1531,10 @@ fn aggregate_stringify_override_wrong_shape() {
             "ret" => assert!(errors.iter().any(|e| matches!(
                 e.kind,
                 EK::BadFunction(BadFunction::StringifyOverrideReturnMustBeString(ty)) if ty == int_ty
+            ))),
+            "ret_mode" => assert!(errors.iter().any(|e| matches!(
+                e.kind,
+                EK::BadFunction(BadFunction::StringifyOverrideReturnMustBeString(ty)) if ty == string_ty
             ))),
             "receiver_ty" => assert!(errors.iter().any(|e| matches!(
                 e.kind,

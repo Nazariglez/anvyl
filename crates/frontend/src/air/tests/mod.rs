@@ -7,12 +7,13 @@ pub(super) use support::{
 };
 
 pub(super) use super::{
-    AggregateCtor, AggregateDecl, AggregateKind, BasicBlock, BlockId, Callee, ConstArena,
-    ConstData, ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternRep,
-    ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, Local, LocalId,
-    LocalKind, MapOrder, ModuleId, Mutability, Operand, Param, ParamRole, Place, Program,
-    Projection, RValue, Signature, SignatureType, Terminator, TypeArena, TypeData, TypeId,
-    VariantDecl, VariantId, VariantShape, verify,
+    AggregateCtor, AggregateDecl, AggregateKind, BasicBlock, BlockId, CallArg, Callee, ConstArena,
+    ConstData, ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternParamDecl,
+    ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId,
+    FunctionKind, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability, Operand, Param,
+    ParamMode, ParamRole, ParamType, Place, Program, Projection, RValue, ReturnMode, Signature,
+    SignatureType, Terminator, TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape,
+    verify,
 };
 
 mod structure;

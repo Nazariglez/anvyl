@@ -97,10 +97,14 @@ fn provider_module(path: &[&str]) -> anvyx_externs::ModulePath {
 }
 
 fn provider_param(name: &str, ty: ExternTypeExpr) -> ExternParam {
+    provider_param_with_flow(name, ty, ParamFlow::Value)
+}
+
+fn provider_param_with_flow(name: &str, ty: ExternTypeExpr, flow: ParamFlow) -> ExternParam {
     ExternParam {
         name: Some(name.to_string()),
         ty,
-        flow: ParamFlow::Value,
+        flow,
         escape: CallbackEscape::NonEscaping,
     }
 }
@@ -119,16 +123,27 @@ fn provider_fn_with_effects(
     ret: ExternTypeExpr,
     effects: ExternEffects,
 ) -> ExternFunctionDescriptor {
+    provider_fn_with_params(
+        name,
+        params
+            .iter()
+            .map(|(name, ty)| provider_param(name, ty.clone()))
+            .collect(),
+        ret,
+        effects,
+    )
+}
+
+fn provider_fn_with_params(
+    name: &str,
+    params: Vec<ExternParam>,
+    ret: ExternTypeExpr,
+    effects: ExternEffects,
+) -> ExternFunctionDescriptor {
     ExternFunctionDescriptor {
         name: name.to_string(),
         doc: None,
-        signature: ExternSignature {
-            params: params
-                .iter()
-                .map(|(name, ty)| provider_param(name, ty.clone()))
-                .collect(),
-            ret,
-        },
+        signature: ExternSignature { params, ret },
         effects,
     }
 }
@@ -158,10 +173,18 @@ fn full_core_providers() -> Vec<ProviderDescriptor> {
                 path: provider_module(&["core_runtime"]),
                 types: vec![],
                 functions: vec![
-                    provider_fn("_println", &[("message", Str)], Void),
-                    provider_fn_with_effects(
+                    provider_fn_with_params(
+                        "_println",
+                        vec![provider_param_with_flow("message", Str, ParamFlow::Borrow)],
+                        Void,
+                        ExternEffects::default(),
+                    ),
+                    provider_fn_with_params(
                         "_assert",
-                        &[("condition", Bool), ("message", Str)],
+                        vec![
+                            provider_param("condition", Bool),
+                            provider_param_with_flow("message", Str, ParamFlow::Borrow),
+                        ],
                         Void,
                         ExternEffects { fallible: true },
                     ),

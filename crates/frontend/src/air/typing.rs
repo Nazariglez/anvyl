@@ -1,6 +1,6 @@
 use super::{
     Program, TypeData,
-    body::{Callee, Operand, RValue},
+    body::{CallArg, Callee, Operand, RValue},
     ids::TypeId,
 };
 use crate::ast::{BinaryOp, UnaryOp};
@@ -164,7 +164,6 @@ impl PrimitiveTypes {
     }
 
     pub(crate) fn scalar(&self, ty: TypeId) -> Option<ScalarType> {
-        // FIXME: this is better and more readable with a match statement
         if self.is_int(ty) {
             Some(ScalarType::Int)
         } else if self.is_float(ty) {
@@ -196,6 +195,13 @@ impl PrimitiveKind {
             TypeData::Any => Some(Self::Any),
             _ => None,
         }
+    }
+}
+
+pub(crate) fn call_arg_ty(program: &Program, arg: &CallArg) -> Option<TypeId> {
+    match arg {
+        CallArg::Value(op) => operand_ty(program, op),
+        CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => Some(place.ty),
     }
 }
 
@@ -253,12 +259,12 @@ fn call_ty(program: &Program, callee: &Callee) -> Option<TypeId> {
         Callee::Function(id) => program
             .functions
             .get(id.index())
-            .map(|func| func.signature.return_type),
+            .map(|func| func.signature.return_type()),
         Callee::Extern(id) => program.externs.get(id.index()).map(|ext| ext.return_type),
         Callee::Closure(op) => {
             let ty = operand_ty(program, op)?;
             match program.type_arena.get(ty) {
-                Some(TypeData::Function(sig)) => Some(sig.ret),
+                Some(TypeData::Function(sig)) => Some(sig.ret.ty()),
                 _ => None,
             }
         }

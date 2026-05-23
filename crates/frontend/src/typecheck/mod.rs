@@ -2414,7 +2414,7 @@ impl TypeChecker {
                                 &callable,
                                 GenericArgs::default(),
                                 callable.def.sig.params.clone(),
-                                callable.def.sig.ret.ty.clone(),
+                                callable.def.sig.ret.clone(),
                             ));
                             continue;
                         }
@@ -2426,7 +2426,10 @@ impl TypeChecker {
                                     SpecializationState::Done(body) if key.target == id => Some((
                                         key.args.clone(),
                                         body.params.clone(),
-                                        body.return_ty.clone(),
+                                        ReturnSpec {
+                                            access: callable.def.sig.ret.access,
+                                            ty: body.return_ty.clone(),
+                                        },
                                     )),
                                     SpecializationState::InProgress
                                     | SpecializationState::Done(_) => None,
@@ -2467,7 +2470,7 @@ impl TypeChecker {
                                 instances.push((
                                     GenericArgs::default(),
                                     method_schema.params.clone(),
-                                    method_schema.ret.ty.clone(),
+                                    method_schema.ret.clone(),
                                 ));
                             } else {
                                 instances.extend(self.specializations.iter().filter_map(
@@ -2476,7 +2479,10 @@ impl TypeChecker {
                                             Some((
                                                 key.args.clone(),
                                                 body.params.clone(),
-                                                body.return_ty.clone(),
+                                                ReturnSpec {
+                                                    access: method_schema.ret.access,
+                                                    ty: body.return_ty.clone(),
+                                                },
                                             ))
                                         }
                                         SpecializationState::InProgress
@@ -2541,7 +2547,7 @@ impl TypeChecker {
         callable: &CallableRef,
         args: GenericArgs,
         param_types: Vec<FuncParam>,
-        return_ty: Type,
+        ret: ReturnSpec,
     ) -> SemanticFunctionInstanceFact {
         let func = &func_node.node;
         let params = func
@@ -2563,7 +2569,7 @@ impl TypeChecker {
             func_node.span,
             func.body.span,
             params,
-            return_ty,
+            ret,
         )
     }
 
@@ -2575,7 +2581,7 @@ impl TypeChecker {
         callable: &CallableRef,
         args: GenericArgs,
         param_types: Vec<FuncParam>,
-        return_ty: Type,
+        ret: ReturnSpec,
     ) -> SemanticFunctionInstanceFact {
         let mut params = vec![];
         if let Some(receiver_ty) = &callable.receiver_ty {
@@ -2607,7 +2613,7 @@ impl TypeChecker {
             span,
             method.body.span,
             params,
-            return_ty,
+            ret,
         )
     }
 
@@ -2620,7 +2626,7 @@ impl TypeChecker {
         span: Span,
         body_span: Span,
         params: Vec<SemanticParamSigFact>,
-        return_ty: Type,
+        ret: ReturnSpec,
     ) -> SemanticFunctionInstanceFact {
         let body = BodyInstanceKey::Callable(CallableInstanceKey {
             target: callable.def.id.clone(),
@@ -2635,7 +2641,7 @@ impl TypeChecker {
             span: SourceSpan::from_byte_span(module.source, span),
             body_span: SourceSpan::from_byte_span(module.source, body_span),
             params,
-            return_ty,
+            ret,
         }
     }
 
@@ -2699,7 +2705,6 @@ impl TypeChecker {
         Some(SemanticCheckOutput {
             warnings: std::mem::take(&mut self.warnings),
             lint_events: std::mem::take(&mut self.lint_events),
-            diagnostic_context: TypeDiagnosticContext::from_decls(&self.decls),
             public_facts: facts,
             source_types: types,
             program: SemanticProgram {
@@ -3095,6 +3100,7 @@ impl TypeChecker {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn check_with_modules(
     program: &Program,
     resolved: &ResolveResult,
@@ -3105,7 +3111,8 @@ pub(crate) fn check_with_modules(
         Ok(mut semantic) => {
             let warnings = std::mem::take(&mut semantic.warnings);
             let lint_events = std::mem::take(&mut semantic.lint_events);
-            let diagnostic_context = semantic.diagnostic_context.clone();
+            let diagnostic_context =
+                TypeDiagnosticContext::from_decls(&semantic.program.declarations);
             TypecheckOutput::success(
                 warnings,
                 lint_events,

@@ -65,6 +65,60 @@ fn init_and_assign_mutable_local() {
 }
 
 #[test]
+fn call_distinct_mut_field_borrows() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let pair = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Pair"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![
+            FieldDecl {
+                name: Ident::new("a"),
+                ty: int_ty,
+            },
+            FieldDecl {
+                name: Ident::new("b"),
+                ty: int_ty,
+            },
+        ],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let pair_ty = builder.alloc_type(TypeData::Aggregate(pair));
+
+    let mut callee = FunctionBuilder::new("callee", module, FunctionKind::Normal, void_ty);
+    callee.push_param_with_mode("a", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_param_with_mode("b", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let callee = builder.alloc_function(callee.finish());
+
+    let mut caller = FunctionBuilder::new("caller", module, FunctionKind::Normal, void_ty);
+    let local = caller.push_local(Some("pair"), pair_ty, Mutability::Mutable, LocalKind::User);
+    let field = |index| Place {
+        root: local,
+        projection: vec![Projection::Field(FieldId::from_index(index))],
+        ty: int_ty,
+    };
+    let block = caller.push_block(term_return_void());
+    caller.add_statement(
+        block,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![CallArg::MutBorrow(field(0)), CallArg::MutBorrow(field(1))],
+        }),
+    );
+    let caller = builder.alloc_function(caller.finish());
+    builder.set_entry(caller);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
 fn primitive_rvalues() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -197,8 +251,11 @@ fn stringify_accepts_non_scalar_source_types() {
         }),
         builder.alloc_type(TypeData::Optional(int_ty)),
         builder.alloc_type(TypeData::Function(SignatureType::new(
-            vec![int_ty],
-            string_ty,
+            vec![ParamType {
+                ty: int_ty,
+                mode: ParamMode::Value,
+            }],
+            ReturnMode::Value(string_ty),
         ))),
         extern_ty,
         builder.alloc_type(TypeData::Slice(int_ty)),
@@ -374,7 +431,7 @@ fn function_call() {
             result,
             RValue::Call {
                 callee: Callee::Function(callee_id),
-                args: vec![op_place(p_arg, int_ty)],
+                args: vec![CallArg::Value(op_place(p_arg, int_ty))],
             },
         ),
     );
@@ -408,7 +465,10 @@ fn extern_call() {
         name: Ident::new("log"),
         module,
         member: ExternMember::FreeFunction,
-        params: vec![int_ty],
+        params: vec![ExternParamDecl {
+            ty: int_ty,
+            mode: ParamMode::Value,
+        }],
         return_type: void_ty,
     });
 
@@ -419,7 +479,7 @@ fn extern_call() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Extern(ext_id),
-            args: vec![op_place(p_n, int_ty)],
+            args: vec![CallArg::Value(op_place(p_n, int_ty))],
         }),
     );
 
@@ -516,7 +576,13 @@ fn closure_make_call() {
     inner_fb.push_block(term_return(op_place(ret_local, int_ty)));
     let inner_id = builder.alloc_function(inner_fb.finish());
 
-    let sig_type = builder.alloc_type(TypeData::Function(SignatureType::new(vec![int_ty], int_ty)));
+    let sig_type = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![ParamType {
+            ty: int_ty,
+            mode: ParamMode::Value,
+        }],
+        ReturnMode::Value(int_ty),
+    )));
 
     let mut outer_fb = FunctionBuilder::new("outer", module, FunctionKind::Normal, int_ty);
     let p_closure = outer_fb.push_param("f", sig_type, ParamRole::Normal);
@@ -530,7 +596,7 @@ fn closure_make_call() {
             call_result,
             RValue::Call {
                 callee: Callee::Closure(op_place(p_closure, sig_type)),
-                args: vec![op_place(p_arg, int_ty)],
+                args: vec![CallArg::Value(op_place(p_arg, int_ty))],
             },
         ),
     );

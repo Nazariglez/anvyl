@@ -1,7 +1,7 @@
 use anvyx_frontend::air::{
-    Callee, ConstId, ConstValue, ExternDecl, ExternId, ExternMember, Function, FunctionId,
-    FunctionKind, Local, LocalId, LocalKind, Module, Operand, Param, ParamRole, Place, Program,
-    RValue, Statement, Terminator, TypeData, TypeId, VerifiedProgram,
+    CallArg, Callee, ConstId, ConstValue, ExternDecl, ExternId, ExternMember, Function, FunctionId,
+    FunctionKind, Local, LocalId, LocalKind, Module, Operand, Param, ParamMode, ParamRole, Place,
+    Program, RValue, ReturnMode, Statement, Terminator, TypeData, TypeId, VerifiedProgram,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -49,6 +49,9 @@ pub enum ProfileErrorKind {
     UnsupportedModuleItem,
     UnsupportedFunctionKind,
     UnsupportedParamRole,
+    UnsupportedParamMode,
+    UnsupportedCallArgMode,
+    UnsupportedReturnMode,
     UnsupportedLocalKind,
     UnsupportedPlaceProjection,
     UnsupportedTerminator,
@@ -127,7 +130,13 @@ impl ProfileCx<'_> {
                 ProfileErrorKind::UnsupportedFunctionKind,
             );
         }
-        self.check_type_ref(ProfileSite::Function(id), function.signature.return_type);
+        if matches!(function.signature.return_mode, ReturnMode::Place(_)) {
+            self.push(
+                ProfileSite::Function(id),
+                ProfileErrorKind::UnsupportedReturnMode,
+            );
+        }
+        self.check_type_ref(ProfileSite::Function(id), function.signature.return_type());
         for (index, param) in function.signature.params.iter().enumerate() {
             self.check_param(id, index, param);
         }
@@ -148,6 +157,12 @@ impl ProfileCx<'_> {
             self.push(
                 ProfileSite::Param(function, index),
                 ProfileErrorKind::UnsupportedParamRole,
+            );
+        }
+        if !self.supports_param_mode(param.ty, param.mode) {
+            self.push(
+                ProfileSite::Param(function, index),
+                ProfileErrorKind::UnsupportedParamMode,
             );
         }
         self.check_type_ref(ProfileSite::Param(function, index), param.ty);
@@ -176,7 +191,7 @@ impl ProfileCx<'_> {
         let site = ProfileSite::Statement(function, block, statement);
         match data {
             Statement::Init { value, .. } | Statement::Eval(value) => {
-                self.check_rvalue(site, value)
+                self.check_rvalue(site, value);
             }
             Statement::Assign { dst, value } => {
                 self.check_rvalue(site, value);
@@ -219,7 +234,7 @@ impl ProfileCx<'_> {
             RValue::Call { callee, args } => {
                 self.check_callee(site, callee);
                 for arg in args {
-                    self.check_operand(site, arg);
+                    self.check_call_arg(site, arg);
                 }
             }
             RValue::Cast { value, target } => {
@@ -259,6 +274,28 @@ impl ProfileCx<'_> {
             Callee::Extern(_) | Callee::Closure(_) => {
                 self.push(site, ProfileErrorKind::UnsupportedCallee);
             }
+        }
+    }
+
+    fn check_call_arg(&mut self, site: ProfileSite, arg: &CallArg) {
+        match arg {
+            CallArg::Value(operand) => self.check_operand(site, operand),
+            CallArg::SharedBorrow(place) => self.check_place(site, place),
+            CallArg::MutBorrow(place) => {
+                self.check_place(site, place);
+                self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+            }
+        }
+    }
+
+    fn supports_param_mode(&self, ty: TypeId, mode: ParamMode) -> bool {
+        match mode {
+            ParamMode::Value => matches!(
+                self.program.type_arena.data(ty),
+                TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::Void
+            ),
+            ParamMode::SharedBorrow => matches!(self.program.type_arena.data(ty), TypeData::String),
+            ParamMode::MutBorrow => false,
         }
     }
 
@@ -344,11 +381,19 @@ fn extern_is_slice1_runtime(program: &Program, id: ExternId) -> bool {
         return false;
     }
     match decl.name.as_str() {
-        "_println" => extern_signature_is(program, decl, &[TypeData::String], TypeData::Void),
+        "_println" => extern_signature_is(
+            program,
+            decl,
+            &[(TypeData::String, ParamMode::SharedBorrow)],
+            TypeData::Void,
+        ),
         "_assert" => extern_signature_is(
             program,
             decl,
-            &[TypeData::Bool, TypeData::String],
+            &[
+                (TypeData::Bool, ParamMode::Value),
+                (TypeData::String, ParamMode::SharedBorrow),
+            ],
             TypeData::Void,
         ),
         _ => false,
@@ -358,14 +403,12 @@ fn extern_is_slice1_runtime(program: &Program, id: ExternId) -> bool {
 fn extern_signature_is(
     program: &Program,
     decl: &ExternDecl,
-    params: &[TypeData],
+    params: &[(TypeData, ParamMode)],
     ret: TypeData,
 ) -> bool {
     decl.params.len() == params.len()
-        && decl
-            .params
-            .iter()
-            .map(|ty| program.type_arena.data(*ty))
-            .eq(params)
+        && decl.params.iter().zip(params).all(|(param, (ty, mode))| {
+            program.type_arena.data(param.ty) == ty && param.mode == *mode
+        })
         && program.type_arena.data(decl.return_type) == &ret
 }

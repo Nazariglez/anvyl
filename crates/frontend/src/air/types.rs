@@ -81,13 +81,40 @@ pub struct DynContractData {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureType {
-    pub params: Vec<TypeId>,
-    pub ret: TypeId,
+    pub params: Vec<ParamType>,
+    pub ret: ReturnMode,
 }
 
 impl SignatureType {
-    pub fn new(params: Vec<TypeId>, ret: TypeId) -> Self {
+    pub fn new(params: Vec<ParamType>, ret: ReturnMode) -> Self {
         Self { params, ret }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParamMode {
+    Value,
+    SharedBorrow,
+    MutBorrow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamType {
+    pub ty: TypeId,
+    pub mode: ParamMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnMode {
+    Value(TypeId),
+    Place(TypeId),
+}
+
+impl ReturnMode {
+    pub fn ty(self) -> TypeId {
+        match self {
+            Self::Value(ty) | Self::Place(ty) => ty,
+        }
     }
 }
 

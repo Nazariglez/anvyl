@@ -1,4 +1,4 @@
-use super::ids::*;
+use super::{ids::*, types::ParamMode};
 use crate::ast::{BinaryOp, FormatSpec, UnaryOp};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +14,21 @@ pub struct Place {
     pub ty: TypeId,
 }
 
+impl Place {
+    pub(crate) fn may_overlap(&self, other: &Self) -> bool {
+        if self.root != other.root {
+            return false;
+        }
+        for (left, right) in self.projection.iter().zip(&other.projection) {
+            if projections_equal(left, right) {
+                continue;
+            }
+            return projection_may_overlap(left) || projection_may_overlap(right);
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Projection {
     Field(FieldId),
@@ -26,10 +41,61 @@ pub enum Projection {
     Index(LocalId),
 }
 
+fn projections_equal(left: &Projection, right: &Projection) -> bool {
+    match (left, right) {
+        (Projection::Field(left), Projection::Field(right)) => left == right,
+        (Projection::TupleField(left), Projection::TupleField(right)) => left == right,
+        (
+            Projection::VariantField {
+                enum_id: left_enum,
+                variant: left_variant,
+                field: left_field,
+            },
+            Projection::VariantField {
+                enum_id: right_enum,
+                variant: right_variant,
+                field: right_field,
+            },
+        ) => left_enum == right_enum && left_variant == right_variant && left_field == right_field,
+        (Projection::Index(left), Projection::Index(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn projection_may_overlap(projection: &Projection) -> bool {
+    matches!(projection, Projection::Index(_))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Place(Place),
     Const(ConstId),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallArg {
+    Value(Operand),
+    SharedBorrow(Place),
+    MutBorrow(Place),
+}
+
+impl CallArg {
+    pub fn mode(&self) -> ParamMode {
+        match self {
+            Self::Value(_) => ParamMode::Value,
+            Self::SharedBorrow(_) => ParamMode::SharedBorrow,
+            Self::MutBorrow(_) => ParamMode::MutBorrow,
+        }
+    }
+
+    pub(crate) fn place(&self) -> Option<&Place> {
+        match self {
+            Self::Value(Operand::Place(place))
+            | Self::SharedBorrow(place)
+            | Self::MutBorrow(place) => Some(place),
+            Self::Value(Operand::Const(_)) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,7 +152,7 @@ pub enum RValue {
     },
     Call {
         callee: Callee,
-        args: Vec<Operand>,
+        args: Vec<CallArg>,
     },
     Stringify {
         value: Operand,

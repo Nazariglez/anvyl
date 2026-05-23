@@ -1,8 +1,10 @@
 pub use super::typing::PrimitiveKind;
 use super::{
-    AggregateKind, BasicBlock, Function, LocalKind, Mutability, ParamRole, Program, TypeData,
-    VariantShape,
-    body::{AggregateCtor, Callee, Operand, Place, Projection, RValue, Statement, Terminator},
+    AggregateKind, BasicBlock, ExternMember, Function, LocalKind, Mutability, ParamMode, ParamRole,
+    ParamType, Program, ReturnMode, TypeData, VariantShape,
+    body::{
+        AggregateCtor, CallArg, Callee, Operand, Place, Projection, RValue, Statement, Terminator,
+    },
     ids::*,
     typing::{self, PrimitiveTypes, supports_scalar_binary, supports_scalar_unary},
 };
@@ -54,6 +56,15 @@ pub enum VerifyErrorKind {
     BadModule(BadModule),
     BadRValue(BadRValue),
     BadStatement(BadStatement),
+    BadExtern(BadExtern),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadExtern {
+    ReceiverTypeMismatch { expected: TypeId, found: TypeId },
+    OperatorOperandMismatch,
+    MemberParamCountMismatch { expected: usize, found: usize },
+    ReceiverModeMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +228,7 @@ pub enum BadFunction {
         expected: TypeId,
         found: TypeId,
     },
+    PlaceReturnMustReturnPlace,
     StringifyOverrideModuleMismatch {
         expected: ModuleId,
         found: ModuleId,
@@ -265,6 +277,10 @@ pub enum BadFunction {
         expected: TypeId,
         found: TypeId,
     },
+    MutBorrowParamLocalMustBeMutable {
+        param: usize,
+        local: LocalId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +325,15 @@ pub enum BadCall {
         index: usize,
         expected: TypeId,
         found: TypeId,
+    },
+    ArgModeMismatch {
+        index: usize,
+        expected: ParamMode,
+        found: ParamMode,
+    },
+    ArgAliasConflict {
+        first: usize,
+        second: usize,
     },
 }
 
@@ -756,23 +781,25 @@ fn verify_aggregate(cx: &mut VerifyCx<'_>, id: AggregateId) {
                 VerifyErrorKind::BadFunction(BadFunction::StringifyOverrideMissingReceiver),
             ),
         }
-        if !cx.has_type(function.signature.return_type) {
+        if !cx.has_type(function.signature.return_type()) {
             cx.push(
                 site,
                 VerifyErrorKind::BadReference(BadReference::InvalidType(
-                    function.signature.return_type,
+                    function.signature.return_type(),
                 )),
             );
             return;
         }
-        if !matches!(
-            cx.program.type_data(function.signature.return_type),
-            TypeData::String
-        ) {
+        if !matches!(function.signature.return_mode, ReturnMode::Value(_))
+            || !matches!(
+                cx.program.type_data(function.signature.return_type()),
+                TypeData::String
+            )
+        {
             cx.push(
                 site,
                 VerifyErrorKind::BadFunction(BadFunction::StringifyOverrideReturnMustBeString(
-                    function.signature.return_type,
+                    function.signature.return_type(),
                 )),
             );
         }
@@ -800,29 +827,97 @@ fn verify_enum(cx: &mut VerifyCx<'_>, id: EnumId) {
     }
 }
 
+fn extern_owner_type(cx: &VerifyCx<'_>, owner: ExternTypeId) -> Option<TypeId> {
+    cx.program
+        .type_arena
+        .iter()
+        .enumerate()
+        .find_map(|(index, ty)| {
+            matches!(ty, TypeData::Extern(id) if *id == owner).then_some(TypeId::from_index(index))
+        })
+}
+
+fn verify_receiver(cx: &mut VerifyCx<'_>, site: VerifySite, owner_ty: TypeId, receiver_ty: TypeId) {
+    cx.verify_type_ref(site.clone(), receiver_ty);
+    if owner_ty != receiver_ty {
+        cx.push(
+            site,
+            VerifyErrorKind::BadExtern(BadExtern::ReceiverTypeMismatch {
+                expected: owner_ty,
+                found: receiver_ty,
+            }),
+        );
+    }
+}
+
 fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
     let ty = cx.program.extern_type(id);
     let site = VerifySite::ExternType(id);
     cx.verify_module_ref(site.clone(), ty.module);
     verify_decl_listed_once(cx, site.clone(), ty.module, id, |m| &m.extern_types);
+    let owner_ty = extern_owner_type(cx, id);
     for field in &ty.fields {
         cx.verify_type_ref(site.clone(), field.ty);
+        if let Some(owner_ty) = owner_ty {
+            verify_receiver(cx, site.clone(), owner_ty, field.get_receiver.ty);
+            verify_receiver(cx, site.clone(), owner_ty, field.set_receiver.ty);
+        } else {
+            cx.verify_type_ref(site.clone(), field.get_receiver.ty);
+            cx.verify_type_ref(site.clone(), field.set_receiver.ty);
+        }
+        if field.get_receiver.mode != ParamMode::SharedBorrow {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadExtern(BadExtern::ReceiverModeMismatch),
+            );
+        }
+        if field.set_receiver.mode != ParamMode::MutBorrow {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadExtern(BadExtern::ReceiverModeMismatch),
+            );
+        }
     }
     for method in &ty.methods {
+        if let Some(owner_ty) = owner_ty {
+            verify_receiver(cx, site.clone(), owner_ty, method.receiver.ty);
+        } else {
+            cx.verify_type_ref(site.clone(), method.receiver.ty);
+        }
         for param in &method.params {
-            cx.verify_type_ref(site.clone(), *param);
+            cx.verify_type_ref(site.clone(), param.ty);
         }
         cx.verify_type_ref(site.clone(), method.return_type);
     }
     for static_ in &ty.statics {
         for param in &static_.params {
-            cx.verify_type_ref(site.clone(), *param);
+            cx.verify_type_ref(site.clone(), param.ty);
         }
         cx.verify_type_ref(site.clone(), static_.return_type);
     }
     for op in &ty.operators {
-        if let Some(operand) = op.operand {
-            cx.verify_type_ref(site.clone(), operand);
+        if let Some(owner_ty) = owner_ty {
+            verify_receiver(cx, site.clone(), owner_ty, op.receiver.ty);
+        } else {
+            cx.verify_type_ref(site.clone(), op.receiver.ty);
+        }
+        if op.receiver.mode != ParamMode::SharedBorrow {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadExtern(BadExtern::ReceiverModeMismatch),
+            );
+        }
+        match (&op.kind, &op.operand) {
+            (super::ExternOp::Unary(_), Some(_)) | (super::ExternOp::Binary { .. }, None) => {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadExtern(BadExtern::OperatorOperandMismatch),
+                );
+            }
+            _ => {}
+        }
+        if let Some(operand) = &op.operand {
+            cx.verify_type_ref(site.clone(), operand.ty);
         }
         cx.verify_type_ref(site.clone(), op.return_type);
     }
@@ -833,10 +928,109 @@ fn verify_extern(cx: &mut VerifyCx<'_>, id: ExternId) {
     let site = VerifySite::Extern(id);
     cx.verify_module_ref(site.clone(), ext.module);
     verify_decl_listed_once(cx, site.clone(), ext.module, id, |m| &m.externs);
+    verify_extern_member(cx, site.clone(), &ext.member, &ext.params);
     for param in &ext.params {
-        cx.verify_type_ref(site.clone(), *param);
+        cx.verify_type_ref(site.clone(), param.ty);
     }
     cx.verify_type_ref(site, ext.return_type);
+}
+
+fn verify_receiver_mode(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    found: ParamMode,
+    expected: ParamMode,
+) {
+    if found != expected {
+        cx.push(
+            site,
+            VerifyErrorKind::BadExtern(BadExtern::ReceiverModeMismatch),
+        );
+    }
+}
+
+fn verify_member_param_count(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    found: usize,
+    expected: usize,
+) {
+    if found != expected {
+        cx.push(
+            site,
+            VerifyErrorKind::BadExtern(BadExtern::MemberParamCountMismatch { expected, found }),
+        );
+    }
+}
+
+fn verify_extern_member(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    member: &ExternMember,
+    params: &[super::ExternParamDecl],
+) {
+    let expected_params = match member {
+        ExternMember::FieldGetter { .. } | ExternMember::UnaryOperator { .. } => Some(0),
+        ExternMember::FieldSetter { .. } | ExternMember::BinaryOperator { .. } => Some(1),
+        ExternMember::FreeFunction
+        | ExternMember::Init { .. }
+        | ExternMember::Method { .. }
+        | ExternMember::StaticMethod { .. } => None,
+    };
+    if let Some(expected) = expected_params {
+        verify_member_param_count(cx, site.clone(), params.len(), expected);
+    }
+    let receiver_mode = match member {
+        ExternMember::FieldGetter { receiver, .. }
+        | ExternMember::UnaryOperator { receiver, .. }
+        | ExternMember::BinaryOperator { receiver, .. } => {
+            Some((receiver.mode, ParamMode::SharedBorrow))
+        }
+        ExternMember::FieldSetter { receiver, .. } => Some((receiver.mode, ParamMode::MutBorrow)),
+        ExternMember::FreeFunction
+        | ExternMember::Init { .. }
+        | ExternMember::Method { .. }
+        | ExternMember::StaticMethod { .. } => None,
+    };
+    if let Some((found, expected)) = receiver_mode {
+        verify_receiver_mode(cx, site.clone(), found, expected);
+    }
+    match member {
+        ExternMember::FreeFunction => {}
+        ExternMember::FieldGetter {
+            owner, receiver, ..
+        }
+        | ExternMember::FieldSetter { owner, receiver }
+        | ExternMember::Method { owner, receiver }
+        | ExternMember::UnaryOperator {
+            owner, receiver, ..
+        }
+        | ExternMember::BinaryOperator {
+            owner, receiver, ..
+        } => {
+            if !cx.has_extern_type(*owner) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadReference(BadReference::InvalidExternType(*owner)),
+                );
+                cx.verify_type_ref(site, receiver.ty);
+                return;
+            }
+            if let Some(owner_ty) = extern_owner_type(cx, *owner) {
+                verify_receiver(cx, site, owner_ty, receiver.ty);
+            } else {
+                cx.verify_type_ref(site, receiver.ty);
+            }
+        }
+        ExternMember::StaticMethod { owner } | ExternMember::Init { owner } => {
+            if !cx.has_extern_type(*owner) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidExternType(*owner)),
+                );
+            }
+        }
+    }
 }
 
 fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
@@ -891,6 +1085,15 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
                     }),
                 );
             }
+            if param.mode == ParamMode::MutBorrow && local.mutability != Mutability::Mutable {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::MutBorrowParamLocalMustBeMutable {
+                        param: i,
+                        local: param.local_id,
+                    }),
+                );
+            }
         }
     }
 
@@ -898,7 +1101,7 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
         cx.verify_type_ref(site.clone(), local.ty);
     }
 
-    cx.verify_type_ref(site, func.signature.return_type);
+    cx.verify_type_ref(site, func.signature.return_type());
 
     if func.body.is_empty() {
         cx.push(
@@ -1085,7 +1288,7 @@ fn verify_terminator(
                 function_id,
                 block_id,
                 site,
-                function.signature.return_type,
+                function.signature.return_mode,
                 value.as_ref(),
             );
         }
@@ -1098,9 +1301,10 @@ fn verify_return(
     function_id: FunctionId,
     block_id: BlockId,
     site: VerifySite,
-    ret_ty: TypeId,
+    ret: ReturnMode,
     value: Option<&Operand>,
 ) {
+    let ret_ty = ret.ty();
     let ret_is_void = cx.primitives.void() == Some(ret_ty);
     match value {
         None => {
@@ -1118,6 +1322,12 @@ fn verify_return(
                 cx.push(
                     site.clone(),
                     VerifyErrorKind::BadFunction(BadFunction::VoidFunctionMustReturnNone),
+                );
+            }
+            if matches!(ret, ReturnMode::Place(_)) && !matches!(op, Operand::Place(_)) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::PlaceReturnMustReturnPlace),
                 );
             }
             verify_operand(cx, function_id, block_id, None, op);
@@ -1908,7 +2118,7 @@ fn verify_call(
     block_id: BlockId,
     stmt_index: Option<usize>,
     callee: &Callee,
-    args: &[Operand],
+    args: &[CallArg],
 ) {
     let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
 
@@ -1916,7 +2126,7 @@ fn verify_call(
         verify_operand(cx, function_id, block_id, stmt_index, op);
     }
     for arg in args {
-        verify_operand(cx, function_id, block_id, stmt_index, arg);
+        verify_call_arg(cx, function_id, block_id, stmt_index, arg);
     }
 
     match callee {
@@ -1928,15 +2138,18 @@ fn verify_call(
                 );
                 return;
             }
-            let param_tys: Vec<TypeId> = cx
+            let params: Vec<ParamType> = cx
                 .program
                 .function(*id)
                 .signature
                 .params
                 .iter()
-                .map(|p| p.ty)
+                .map(|p| ParamType {
+                    ty: p.ty,
+                    mode: p.mode,
+                })
                 .collect();
-            verify_call_args(cx, &site, args, &param_tys);
+            verify_call_args(cx, &site, args, &params);
         }
         Callee::Extern(id) => {
             if !cx.has_extern(*id) {
@@ -1946,8 +2159,17 @@ fn verify_call(
                 );
                 return;
             }
-            let param_tys = cx.program.extern_decl(*id).params.clone();
-            verify_call_args(cx, &site, args, &param_tys);
+            let params: Vec<ParamType> = cx
+                .program
+                .extern_decl(*id)
+                .params
+                .iter()
+                .map(|p| ParamType {
+                    ty: p.ty,
+                    mode: p.mode,
+                })
+                .collect();
+            verify_call_args(cx, &site, args, &params);
         }
         Callee::Closure(op) => {
             if let Some(ty) = operand_ty(cx, op) {
@@ -1963,11 +2185,26 @@ fn verify_call(
     }
 }
 
+fn verify_call_arg(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    stmt_index: Option<usize>,
+    arg: &CallArg,
+) {
+    match arg {
+        CallArg::Value(op) => verify_operand(cx, function_id, block_id, stmt_index, op),
+        CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+            verify_place(cx, function_id, block_id, stmt_index, place);
+        }
+    }
+}
+
 fn verify_call_args(
     cx: &mut VerifyCx<'_>,
     site: &VerifySite,
-    args: &[Operand],
-    expected: &[TypeId],
+    args: &[CallArg],
+    expected: &[ParamType],
 ) {
     if args.len() != expected.len() {
         cx.push(
@@ -1978,20 +2215,56 @@ fn verify_call_args(
             }),
         );
     }
-    for (i, (arg, &expected_ty)) in args.iter().zip(expected.iter()).enumerate() {
-        if let Some(found_ty) = operand_ty(cx, arg)
-            && found_ty != expected_ty
+    for first in 0..args.len() {
+        for second in first + 1..args.len() {
+            if call_args_conflict(&args[first], &args[second]) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadCall(BadCall::ArgAliasConflict { first, second }),
+                );
+            }
+        }
+    }
+    for (i, (arg, expected_param)) in args.iter().zip(expected.iter()).enumerate() {
+        if arg.mode() != expected_param.mode {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadCall(BadCall::ArgModeMismatch {
+                    index: i,
+                    expected: expected_param.mode,
+                    found: arg.mode(),
+                }),
+            );
+        }
+        if let Some(found_ty) = typing::call_arg_ty(cx.program, arg)
+            && found_ty != expected_param.ty
         {
             cx.push(
                 site.clone(),
                 VerifyErrorKind::BadCall(BadCall::ArgTypeMismatch {
                     index: i,
-                    expected: expected_ty,
+                    expected: expected_param.ty,
                     found: found_ty,
                 }),
             );
         }
     }
+}
+
+fn call_args_conflict(left: &CallArg, right: &CallArg) -> bool {
+    let borrow_conflict = matches!(
+        (left.mode(), right.mode()),
+        (ParamMode::SharedBorrow, ParamMode::MutBorrow)
+            | (
+                ParamMode::MutBorrow,
+                ParamMode::SharedBorrow | ParamMode::MutBorrow
+            )
+    );
+    borrow_conflict
+        && left
+            .place()
+            .zip(right.place())
+            .is_some_and(|(left, right)| left.may_overlap(right))
 }
 
 fn verify_slice_index(
@@ -2050,9 +2323,9 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
         }
         TypeData::Function(sig) => {
             for param in &sig.params {
-                cx.verify_type_ref(site.clone(), *param);
+                cx.verify_type_ref(site.clone(), param.ty);
             }
-            cx.verify_type_ref(site, sig.ret);
+            cx.verify_type_ref(site, sig.ret.ty());
         }
         TypeData::Dyn(contract) => {
             if contract.display_name.is_empty() || contract.method_table_key.is_empty() {

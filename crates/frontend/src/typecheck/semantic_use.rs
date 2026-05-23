@@ -7,7 +7,7 @@ use super::{
     type_ops::{TypeVisitor, type_has_unfinished_facts},
 };
 use crate::{
-    ast::{ContractRef, ExprId, Ident},
+    ast::{ContractRef, ExprId, Ident, ReturnSpec},
     externs::catalog::{
         ExternFieldRef, ExternFunctionId, ExternMethodRef, ExternOperatorRef, ExternStaticRef,
         ExternTypeId,
@@ -69,6 +69,9 @@ pub(crate) enum LocalUseMode {
     Read,
     Assign,
     CompoundAssign,
+    Borrow,
+    MutBorrow,
+    VarArgument,
 }
 
 impl LocalFacts {
@@ -127,7 +130,7 @@ pub(crate) struct SemanticFunctionInstanceFact {
     pub(crate) span: SourceSpan,
     pub(crate) body_span: SourceSpan,
     pub(crate) params: Vec<SemanticParamSigFact>,
-    pub(crate) return_ty: Type,
+    pub(crate) ret: ReturnSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +168,7 @@ impl SemanticDeclarations {
                 debug_assert!(param.span.start() <= param.span.end());
                 debug_assert!(!type_has_unfinished_facts(&param.ty));
             }
-            debug_assert!(!type_has_unfinished_facts(&fact.return_ty));
+            debug_assert!(!type_has_unfinished_facts(&fact.ret.ty));
         }
     }
 
@@ -189,7 +192,7 @@ impl SemanticDeclarations {
         for function in &self.functions {
             let Some(body) = facts.body(&function.body) else {
                 debug_assert!(
-                    function.params.is_empty() && function.return_ty == Type::Void,
+                    function.params.is_empty() && function.ret.ty == Type::Void,
                     "semantic function fact missing body facts"
                 );
                 continue;

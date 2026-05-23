@@ -2,7 +2,7 @@
 pub use super::body::{BasicBlock, Terminator};
 use super::ids::*;
 use crate::{
-    air::types::{BinaryOp, UnaryOp},
+    air::types::{BinaryOp, ParamMode, ReturnMode, UnaryOp},
     ast::Ident,
 };
 
@@ -38,15 +38,23 @@ pub enum FunctionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
     pub params: Vec<Param>,
-    pub return_type: TypeId,
+    pub return_mode: ReturnMode,
 }
 
 impl Signature {
     pub fn new(params: Vec<Param>, return_type: TypeId) -> Self {
+        Self::with_return_mode(params, ReturnMode::Value(return_type))
+    }
+
+    pub fn with_return_mode(params: Vec<Param>, return_mode: ReturnMode) -> Self {
         Self {
             params,
-            return_type,
+            return_mode,
         }
+    }
+
+    pub fn return_type(&self) -> TypeId {
+        self.return_mode.ty()
     }
 }
 
@@ -54,6 +62,7 @@ impl Signature {
 pub struct Param {
     pub name: Option<Ident>,
     pub ty: TypeId,
+    pub mode: ParamMode,
     pub role: ParamRole,
     pub local_id: LocalId,
 }
@@ -140,8 +149,20 @@ pub struct ExternDecl {
     pub name: Ident,
     pub module: ModuleId,
     pub member: ExternMember,
-    pub params: Vec<TypeId>,
+    pub params: Vec<ExternParamDecl>,
     pub return_type: TypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternParamDecl {
+    pub ty: TypeId,
+    pub mode: ParamMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternReceiverDecl {
+    pub ty: TypeId,
+    pub mode: ParamMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,14 +170,16 @@ pub enum ExternMember {
     FreeFunction,
     FieldGetter {
         owner: ExternTypeId,
+        receiver: ExternReceiverDecl,
         computed: bool,
     },
     FieldSetter {
         owner: ExternTypeId,
+        receiver: ExternReceiverDecl,
     },
     Method {
         owner: ExternTypeId,
-        receiver_mut: bool,
+        receiver: ExternReceiverDecl,
     },
     StaticMethod {
         owner: ExternTypeId,
@@ -166,10 +189,12 @@ pub enum ExternMember {
     },
     UnaryOperator {
         owner: ExternTypeId,
+        receiver: ExternReceiverDecl,
         op: UnaryOp,
     },
     BinaryOperator {
         owner: ExternTypeId,
+        receiver: ExternReceiverDecl,
         op: BinaryOp,
         self_on_right: bool,
     },
@@ -199,28 +224,31 @@ pub enum ExternRep {
 pub struct ExternFieldDecl {
     pub name: Ident,
     pub ty: TypeId,
+    pub get_receiver: ExternReceiverDecl,
+    pub set_receiver: ExternReceiverDecl,
     pub computed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternMethodDecl {
     pub name: Ident,
-    pub receiver: MethodReceiver,
-    pub params: Vec<TypeId>,
+    pub receiver: ExternReceiverDecl,
+    pub params: Vec<ExternParamDecl>,
     pub return_type: TypeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternStaticDecl {
     pub name: Ident,
-    pub params: Vec<TypeId>,
+    pub params: Vec<ExternParamDecl>,
     pub return_type: TypeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternOpDecl {
     pub kind: ExternOp,
-    pub operand: Option<TypeId>,
+    pub receiver: ExternReceiverDecl,
+    pub operand: Option<ExternParamDecl>,
     pub return_type: TypeId,
 }
 
@@ -228,11 +256,4 @@ pub struct ExternOpDecl {
 pub enum ExternOp {
     Binary { op: BinaryOp, self_on_right: bool },
     Unary(UnaryOp),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MethodReceiver {
-    Value,
-    Shared,
-    Mut,
 }

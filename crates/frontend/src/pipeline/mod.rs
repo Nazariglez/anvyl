@@ -1,4 +1,4 @@
-// Lexer -> Parser -> Resolver -> Typechecker -> AIR lowering
+// Lexer -> Parser -> Resolver -> Typechecker
 
 mod diagnostics;
 use std::{
@@ -256,14 +256,20 @@ pub fn check_packages<L: PackageSourceLoader>(
         return Ok(extern_failure(&sources, errors));
     }
 
-    let typecheck_output = typecheck::check_with_modules(
+    let semantic = match typecheck::check_semantic_with_modules(
         &root.program,
         &resolved,
         raw_externs,
         typecheck::TypecheckConfig { context },
-    );
+    ) {
+        Ok(semantic) => semantic,
+        Err(failure) => {
+            let report = typecheck_failure_report(&sources, &lint, failure);
+            return Ok(CheckOutput::failed(CheckPhase::Type, report));
+        }
+    };
 
-    let report = typecheck_report(&sources, &lint, typecheck_output);
+    let report = typecheck_success_report(&sources, &lint, semantic);
     Ok(if report.has_errors() {
         CheckOutput::failed(CheckPhase::Type, report)
     } else {
@@ -281,20 +287,32 @@ fn extern_failure(sources: &SourceTable, errors: Vec<externs::ExternInputError>)
     CheckOutput::failed(CheckPhase::Extern, report)
 }
 
-fn typecheck_report(
+fn typecheck_failure_report(
     sources: &SourceTable,
     lint: &LintConfig,
-    output: typecheck::TypecheckOutput,
+    failure: typecheck::TypecheckFailure,
 ) -> DiagnosticReport {
-    let (errors, warnings, mut lint_events, type_ctx, facts) = output.into_parts();
-    if let Some(facts) = facts {
-        // TypecheckFacts are complete only on successful typechecking; skip fact-derived lints otherwise.
-        lint_events.extend(facts.unused_import_events());
-    }
-    let diagnostics = errors
+    let diagnostics = failure
+        .errors
         .iter()
-        .map(|error| diagnose_type_error(error, &type_ctx))
-        .chain(warnings.iter().map(diagnose_compile_warning))
+        .map(|error| diagnose_type_error(error, &failure.diagnostic_context))
+        .chain(failure.warnings.iter().map(diagnose_compile_warning))
+        .chain(apply_lints(lint, failure.lint_events));
+    diagnostic_report(sources, diagnostics)
+}
+
+fn typecheck_success_report(
+    sources: &SourceTable,
+    lint: &LintConfig,
+    mut semantic: typecheck::SemanticCheckOutput,
+) -> DiagnosticReport {
+    let warnings = std::mem::take(&mut semantic.warnings);
+    let mut lint_events = std::mem::take(&mut semantic.lint_events);
+    let facts = typecheck::TypecheckFacts::from_semantic(semantic);
+    lint_events.extend(facts.unused_import_events());
+    let diagnostics = warnings
+        .iter()
+        .map(diagnose_compile_warning)
         .chain(apply_lints(lint, lint_events));
     diagnostic_report(sources, diagnostics)
 }
@@ -730,13 +748,18 @@ mod tests {
     }
 
     fn check_source(source_code: &str) -> Result<CheckOutput, Infallible> {
+        check_source_with_config(source_code, FrontendConfig::default())
+    }
+
+    fn check_source_with_config(
+        source_code: &str,
+        config: FrontendConfig,
+    ) -> Result<CheckOutput, Infallible> {
         let mut loader = TestLoader::default();
-        check(input(
-            &mut loader,
-            source(source_code, "main.anv"),
-            None,
-            vec![],
-        ))
+        pipeline_check(
+            input(&mut loader, source(source_code, "main.anv"), None, vec![]),
+            config,
+        )
     }
 
     #[test]

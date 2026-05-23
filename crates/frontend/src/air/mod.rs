@@ -1,6 +1,7 @@
 pub mod body;
 pub mod decl;
 pub mod ids;
+pub mod ownership;
 pub mod types;
 
 #[cfg(test)]
@@ -11,12 +12,15 @@ pub(crate) mod lower;
 mod typing;
 mod verify;
 
+use std::fmt::Write;
+
 pub use body::*;
 pub use decl::*;
 pub use ids::{
     AggregateId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FieldId, FunctionId, LocalId,
     ModuleId, TypeId, VariantId,
 };
+pub use ownership::*;
 pub use types::*;
 pub use verify::*;
 
@@ -136,6 +140,26 @@ impl Program {
         self.render_type(ty, TypeRender::HelperKey)
     }
 
+    fn render_param_type(&self, param: ParamType, mode: TypeRender) -> String {
+        let ty = self.render_type(param.ty, mode);
+        match (mode, param.mode) {
+            (_, ParamMode::Value) => ty,
+            (TypeRender::Display, ParamMode::SharedBorrow) => format!("borrow {ty}"),
+            (TypeRender::Display, ParamMode::MutBorrow) => format!("var {ty}"),
+            (TypeRender::HelperKey, ParamMode::SharedBorrow) => format!("borrow_{ty}"),
+            (TypeRender::HelperKey, ParamMode::MutBorrow) => format!("mut_{ty}"),
+        }
+    }
+
+    fn render_return_mode(&self, ret: ReturnMode, mode: TypeRender) -> String {
+        let ty = self.render_type(ret.ty(), mode);
+        match (mode, ret) {
+            (_, ReturnMode::Value(_)) => ty,
+            (TypeRender::Display, ReturnMode::Place(_)) => format!("var {ty}"),
+            (TypeRender::HelperKey, ReturnMode::Place(_)) => format!("place_{ty}"),
+        }
+    }
+
     fn render_type(&self, ty: TypeId, mode: TypeRender) -> String {
         match (mode, self.type_data(ty)) {
             (_, TypeData::Int) => "int".to_string(),
@@ -148,7 +172,7 @@ impl Program {
                 format!("{}?", self.render_type(*inner, mode))
             }
             (TypeRender::HelperKey, TypeData::Optional(inner)) => {
-                format!("opt_{}", helper_part(self.render_type(*inner, mode)))
+                format!("opt_{}", helper_part(&self.render_type(*inner, mode)))
             }
             (TypeRender::Display, TypeData::Tuple(items)) => format!(
                 "({})",
@@ -167,7 +191,7 @@ impl Program {
                 format!("[{}]", self.render_type(*elem, mode))
             }
             (TypeRender::HelperKey, TypeData::List(elem)) => {
-                format!("list_{}", helper_part(self.render_type(*elem, mode)))
+                format!("list_{}", helper_part(&self.render_type(*elem, mode)))
             }
             (TypeRender::Display, TypeData::Array { elem, len }) => {
                 format!("[{}; {}]", self.render_type(*elem, mode), len)
@@ -176,7 +200,7 @@ impl Program {
                 format!(
                     "array{}_{}",
                     len,
-                    helper_part(self.render_type(*elem, mode))
+                    helper_part(&self.render_type(*elem, mode))
                 )
             }
             (TypeRender::Display, TypeData::Map { key, value, .. }) => format!(
@@ -186,23 +210,23 @@ impl Program {
             ),
             (TypeRender::HelperKey, TypeData::Map { key, value, .. }) => format!(
                 "map_{}{}",
-                helper_part(self.render_type(*key, mode)),
-                helper_part(self.render_type(*value, mode))
+                helper_part(&self.render_type(*key, mode)),
+                helper_part(&self.render_type(*value, mode))
             ),
             (TypeRender::Display, TypeData::Slice(elem)) => {
                 format!("&[{}]", self.render_type(*elem, mode))
             }
             (TypeRender::HelperKey, TypeData::Slice(elem)) => {
-                format!("slice_{}", helper_part(self.render_type(*elem, mode)))
+                format!("slice_{}", helper_part(&self.render_type(*elem, mode)))
             }
             (TypeRender::Display, TypeData::Function(sig)) => format!(
                 "fn({}) -> {}",
                 sig.params
                     .iter()
-                    .map(|param| self.render_type(*param, mode))
+                    .map(|param| self.render_param_type(*param, mode))
                     .collect::<Vec<_>>()
                     .join(", "),
-                self.render_type(sig.ret, mode)
+                self.render_return_mode(sig.ret, mode)
             ),
             (TypeRender::HelperKey, TypeData::Function(sig)) => format!(
                 "fn{}_{}ret_{}",
@@ -210,9 +234,9 @@ impl Program {
                 helper_parts(
                     sig.params
                         .iter()
-                        .map(|param| self.render_type(*param, mode))
+                        .map(|param| self.render_param_type(*param, mode))
                 ),
-                helper_part(self.render_type(sig.ret, mode))
+                helper_part(&self.render_return_mode(sig.ret, mode))
             ),
             (TypeRender::Display, TypeData::Dyn(contract)) => {
                 format!("dyn {}", contract.display_name)
@@ -220,10 +244,10 @@ impl Program {
             (TypeRender::HelperKey, TypeData::Dyn(contract)) => {
                 format!(
                     "dyn_{}",
-                    helper_part(mangle_segment(&contract.method_table_key))
+                    helper_part(&mangle_segment(&contract.method_table_key))
                 )
             }
-            (_, TypeData::Aggregate(id)) | (_, TypeData::DataRef(id)) => {
+            (_, TypeData::Aggregate(id) | TypeData::DataRef(id)) => {
                 let decl = self.aggregate(*id);
                 self.render_named_type(
                     decl.module,
@@ -328,19 +352,21 @@ enum TypeRender {
 fn helper_parts(parts: impl Iterator<Item = String>) -> String {
     let mut key = String::new();
     for part in parts {
-        key.push_str(&helper_part(part));
+        key.push_str(&helper_part(&part));
     }
     key
 }
 
-fn helper_part(part: String) -> String {
-    format!("{}_{part}", part.len())
+fn helper_part(part: &str) -> String {
+    let mut key = String::new();
+    write!(key, "{}_{part}", part.len()).expect("write string");
+    key
 }
 
 fn mangle_segment(segment: &str) -> String {
-    segment
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut key = String::new();
+    for byte in segment.as_bytes() {
+        write!(key, "{byte:02x}").expect("write string");
+    }
+    key
 }

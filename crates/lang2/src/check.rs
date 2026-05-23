@@ -482,10 +482,7 @@ mod tests {
         }
     }
 
-    fn unwrap_failed(
-        result: CheckResult,
-        phase: CheckPhase,
-    ) -> anvyx_frontend::pipeline::CheckOutput {
+    fn unwrap_failed(result: CheckResult, phase: CheckPhase) -> pipeline::CheckOutput {
         let output = result.unwrap();
         assert_eq!(output.status, CheckStatus::Failed { phase });
         assert!(output.has_errors());

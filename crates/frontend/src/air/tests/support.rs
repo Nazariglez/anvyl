@@ -1,7 +1,7 @@
 use super::super::{
     AggregateDecl, BasicBlock, ConstData, EnumDecl, ExternDecl, ExternTypeDecl, Function,
-    FunctionKind, Local, LocalKind, Module, Mutability, Operand, Param, ParamRole, Place, Program,
-    RValue, Signature, Statement, Terminator, TypeData,
+    FunctionKind, Local, LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole,
+    Place, Program, RValue, Signature, Statement, Terminator, TypeData,
     ids::{
         AggregateId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FunctionId, LocalId,
         ModuleId, TypeId, VariantId,
@@ -166,10 +166,26 @@ impl FunctionBuilder {
     }
 
     pub fn push_param(&mut self, name: &str, ty: TypeId, role: ParamRole) -> LocalId {
-        let local_id = self.push_local(Some(name), ty, Mutability::Immutable, LocalKind::Arg);
+        self.push_param_with_mode(name, ty, ParamMode::Value, role)
+    }
+
+    pub fn push_param_with_mode(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        mode: ParamMode,
+        role: ParamRole,
+    ) -> LocalId {
+        let mutability = if mode == ParamMode::MutBorrow {
+            Mutability::Mutable
+        } else {
+            Mutability::Immutable
+        };
+        let local_id = self.push_local(Some(name), ty, mutability, LocalKind::Arg);
         self.params.push(Param {
             name: Some(Ident::new(name)),
             ty,
+            mode,
             role,
             local_id,
         });
