@@ -10,6 +10,9 @@ tests target="tests":
 frontend-tests target="tests/syntax":
     cargo run --package test-runner -- {{target}} --new-frontend --quiet
 
+clean-rust-tests target="tests/run/rust_backend":
+    cargo run --package test-runner -- {{target}} --new-frontend --backend rust --quiet
+
 full-tests target="tests":
     cargo test -q --workspace
     cargo run --package test-runner -- {{target}} --quiet

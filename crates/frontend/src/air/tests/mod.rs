@@ -1,19 +1,19 @@
 mod support;
 
 pub(super) use support::{
-    FunctionBuilder, ProgramBuilder, empty_module, expect_verified, op_const, op_place, place,
-    stmt_assign, stmt_eval, stmt_init, term_goto, term_if, term_return, term_return_void,
-    term_switch_enum, term_unreachable, test_module,
+    FunctionBuilder, ProgramBuilder, body_from_block, empty_module, expect_verified, op_const,
+    op_place, place, stmt_assign, stmt_eval, stmt_init, term_return, term_return_void,
+    term_unreachable, test_module,
 };
 
 pub(super) use super::{
-    AggregateCtor, AggregateDecl, AggregateKind, BasicBlock, BlockId, CallArg, Callee, ConstArena,
-    ConstData, ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternParamDecl,
+    AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
+    AirIf, AirLoop, AirLoopId, AirStmt, AirTail, BlockId, CallArg, Callee, ConstArena, ConstData,
+    ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternParamDecl,
     ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId,
     FunctionKind, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability, Operand, Param,
     ParamMode, ParamRole, ParamType, Place, Program, Projection, RValue, ReturnMode, Signature,
-    SignatureType, Terminator, TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape,
-    verify,
+    SignatureType, TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape, verify,
 };
 
 mod structure;

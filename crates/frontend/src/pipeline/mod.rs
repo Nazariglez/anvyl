@@ -11,12 +11,13 @@ use self::diagnostics::{
     diagnose_lex_error, diagnose_parse_error, diagnose_resolve_error, diagnose_type_error,
 };
 use crate::{
+    air,
     ast::Program,
     conditional,
     config::{CompilationContext, LintConfig},
     externs::{self, ExternInputs},
     lexer,
-    lint::apply_lints,
+    lint::{LintEvent, apply_lints},
     parser,
     resolve::{
         self, LoadedModule, LocalSourceLoad, LocalSourceRequest, ModuleId, ModuleLoadError,
@@ -179,35 +180,113 @@ impl<E> PipelineStop<E> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirRootConfig {
+    pub entry: Option<String>,
+    pub callables: Vec<String>,
+}
+
+impl AirRootConfig {
+    pub fn entry_main() -> Self {
+        Self {
+            entry: Some("main".to_string()),
+            callables: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirBuildOutput {
+    pub report: DiagnosticReport,
+    pub air: air::OwnedVerifiedProgram,
+}
+
+#[derive(Debug)]
+pub enum AirBuildError<E> {
+    Diagnostic(CheckOutput),
+    Lower(String),
+    Fatal(E),
+}
+
 pub fn check_packages<L: PackageSourceLoader>(
     input: PackageProgramInput<'_, L>,
     config: FrontendConfig,
 ) -> Result<CheckOutput, L::FatalError> {
+    let prepared = match prepare_pipeline(input, config) {
+        Ok(prepared) => prepared,
+        Err(stop) => return stop.into_check_result(),
+    };
+    let report = typecheck_success_report(&prepared.sources, &prepared.lint, prepared.semantic);
+    Ok(if report.has_errors() {
+        CheckOutput::failed(CheckPhase::Type, report)
+    } else {
+        CheckOutput::passed(report)
+    })
+}
+
+pub fn build_air_packages<L: PackageSourceLoader>(
+    input: PackageProgramInput<'_, L>,
+    config: FrontendConfig,
+    roots: &AirRootConfig,
+) -> Result<AirBuildOutput, AirBuildError<L::FatalError>> {
+    let prepared = prepare_pipeline(input, config).map_err(air_build_stop)?;
+    let report =
+        typecheck_success_report_ref(&prepared.sources, &prepared.lint, &prepared.semantic);
+    if report.has_errors() {
+        return Err(AirBuildError::Diagnostic(CheckOutput::failed(
+            CheckPhase::Type,
+            report,
+        )));
+    }
+    let air = air::lower::lower_with_modules(
+        &prepared.root.program,
+        &prepared.resolved,
+        &prepared.semantic.program,
+        air::lower::AirLowerConfig {
+            roots: air::lower::AirRoots {
+                entry: roots.entry.as_deref().map(|name| {
+                    root_callable(&prepared.semantic.program, &prepared.root.module, name)
+                }),
+                callables: roots
+                    .callables
+                    .iter()
+                    .map(|name| {
+                        root_callable(&prepared.semantic.program, &prepared.root.module, name)
+                    })
+                    .collect(),
+            },
+        },
+    )
+    .map_err(|error| AirBuildError::Lower(format!("{error:?}")))?;
+    let air = air::OwnedVerifiedProgram::new(air)
+        .map_err(|errors| AirBuildError::Lower(format!("{errors:?}")))?;
+    Ok(AirBuildOutput { report, air })
+}
+
+struct PreparedPipeline {
+    sources: SourceTable,
+    root: LoadedModule,
+    resolved: resolve::ResolveResult,
+    semantic: typecheck::SemanticCheckOutput,
+    lint: LintConfig,
+}
+
+fn prepare_pipeline<L: PackageSourceLoader>(
+    input: PackageProgramInput<'_, L>,
+    config: FrontendConfig,
+) -> Result<PreparedPipeline, PipelineStop<L::FatalError>> {
     let FrontendConfig {
         externs: extern_inputs,
         lint,
         context,
     } = config;
     let mut sources = SourceTable::default();
-    let root = match parse_package_module(&mut sources, input.main, SourceKind::Root, &context) {
-        Ok(root) => root,
-        Err(stop) => return stop.into_check_result(),
-    };
+    let root = parse_package_module(&mut sources, input.main, SourceKind::Root, &context)?;
+    let packages = parse_package_inputs(&mut sources, input.packages, &context)?;
+    let preloaded_modules = parse_package_modules(&mut sources, input.preloaded_modules, &context)?;
 
-    let packages = match parse_package_inputs(&mut sources, input.packages, &context) {
-        Ok(packages) => packages,
-        Err(stop) => return stop.into_check_result(),
-    };
-    let preloaded_modules =
-        match parse_package_modules(&mut sources, input.preloaded_modules, &context) {
-            Ok(modules) => modules,
-            Err(stop) => return stop.into_check_result(),
-        };
-
-    let mut raw_externs = match externs::ingest_providers(extern_inputs) {
-        Ok(externs) => externs,
-        Err(errors) => return Ok(extern_failure(&sources, errors)),
-    };
+    let mut raw_externs = externs::ingest_providers(extern_inputs)
+        .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
     let external_modules = externs::raw_extern_module_ids(&raw_externs);
 
     let resolved = {
@@ -237,44 +316,73 @@ pub fn check_packages<L: PackageSourceLoader>(
     };
     let resolved = match resolved {
         Ok(resolved) => resolved,
-        Err(ResolveFailure::Fatal(stop)) => return stop.into_check_result(),
+        Err(ResolveFailure::Fatal(stop)) => return Err(stop),
         Err(ResolveFailure::Resolve(errors)) => {
             let report = diagnostic_report(&sources, errors.iter().map(diagnose_resolve_error));
-            return Ok(CheckOutput::failed(CheckPhase::Resolve, report));
+            return Err(PipelineStop::Diagnostic(CheckOutput::failed(
+                CheckPhase::Resolve,
+                report,
+            )));
         }
     };
 
-    let source_externs = match externs::collect_source_externs(&root.program, &resolved) {
-        Ok(externs) => externs,
-        Err(errors) => return Ok(extern_failure(&sources, errors)),
-    };
+    let source_externs = externs::collect_source_externs(&root.program, &resolved)
+        .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
     raw_externs.append(source_externs);
-    if let Err(errors) = externs::validate_raw_shapes(&raw_externs) {
-        return Ok(extern_failure(&sources, errors));
-    }
-    if let Err(errors) = externs::validate_raw_identities(&raw_externs) {
-        return Ok(extern_failure(&sources, errors));
-    }
+    externs::validate_raw_shapes(&raw_externs)
+        .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
+    externs::validate_raw_identities(&raw_externs)
+        .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
 
-    let semantic = match typecheck::check_semantic_with_modules(
+    let semantic = typecheck::check_semantic_with_modules(
         &root.program,
         &resolved,
         raw_externs,
         typecheck::TypecheckConfig { context },
-    ) {
-        Ok(semantic) => semantic,
-        Err(failure) => {
-            let report = typecheck_failure_report(&sources, &lint, failure);
-            return Ok(CheckOutput::failed(CheckPhase::Type, report));
-        }
-    };
+    )
+    .map_err(|failure| {
+        let report = typecheck_failure_report(&sources, &lint, failure);
+        PipelineStop::Diagnostic(CheckOutput::failed(CheckPhase::Type, report))
+    })?;
 
-    let report = typecheck_success_report(&sources, &lint, semantic);
-    Ok(if report.has_errors() {
-        CheckOutput::failed(CheckPhase::Type, report)
-    } else {
-        CheckOutput::passed(report)
+    Ok(PreparedPipeline {
+        sources,
+        root,
+        resolved,
+        semantic,
+        lint,
     })
+}
+
+fn air_build_stop<E>(stop: PipelineStop<E>) -> AirBuildError<E> {
+    match stop {
+        PipelineStop::Diagnostic(output) => AirBuildError::Diagnostic(output),
+        PipelineStop::Fatal(error) => AirBuildError::Fatal(error),
+    }
+}
+
+fn root_callable(
+    semantic: &typecheck::SemanticProgram,
+    module: &ModuleId,
+    name: &str,
+) -> typecheck::CallableInstanceKey {
+    let scope = typecheck::ModuleScope::from_module_id(module);
+    if let Some(fact) = semantic.declaration_facts.functions.iter().find(|fact| {
+        fact.id.name.as_str() == name
+            && fact.id.module == scope
+            && fact.id.parent.is_none()
+            && fact.id.kind == typecheck::CallableKind::Function
+    }) {
+        typecheck::CallableInstanceKey {
+            target: fact.id.clone(),
+            args: fact.args.clone(),
+        }
+    } else {
+        typecheck::CallableInstanceKey {
+            target: typecheck::CallableId::function(scope, crate::ast::Ident::new(name)),
+            args: typecheck::GenericArgs::default(),
+        }
+    }
 }
 
 fn extern_failure(sources: &SourceTable, errors: Vec<externs::ExternInputError>) -> CheckOutput {
@@ -307,8 +415,32 @@ fn typecheck_success_report(
     mut semantic: typecheck::SemanticCheckOutput,
 ) -> DiagnosticReport {
     let warnings = std::mem::take(&mut semantic.warnings);
-    let mut lint_events = std::mem::take(&mut semantic.lint_events);
+    let lint_events = std::mem::take(&mut semantic.lint_events);
     let facts = typecheck::TypecheckFacts::from_semantic(semantic);
+    typecheck_success_report_parts(sources, lint, &warnings, lint_events, &facts)
+}
+
+fn typecheck_success_report_ref(
+    sources: &SourceTable,
+    lint: &LintConfig,
+    semantic: &typecheck::SemanticCheckOutput,
+) -> DiagnosticReport {
+    typecheck_success_report_parts(
+        sources,
+        lint,
+        &semantic.warnings,
+        semantic.lint_events.clone(),
+        &semantic.public_facts,
+    )
+}
+
+fn typecheck_success_report_parts(
+    sources: &SourceTable,
+    lint: &LintConfig,
+    warnings: &[typecheck::CompileWarning],
+    mut lint_events: Vec<LintEvent>,
+    facts: &typecheck::TypecheckFacts,
+) -> DiagnosticReport {
     lint_events.extend(facts.unused_import_events());
     let diagnostics = warnings
         .iter()

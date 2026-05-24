@@ -202,6 +202,7 @@ pub(crate) fn call_arg_ty(program: &Program, arg: &CallArg) -> Option<TypeId> {
     match arg {
         CallArg::Value(op) => operand_ty(program, op),
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => Some(place.ty),
+        CallArg::SharedStringConst(id) => program.const_arena.get_checked(*id).map(|data| data.ty),
     }
 }
 

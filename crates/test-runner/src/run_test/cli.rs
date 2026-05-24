@@ -116,14 +116,15 @@ fn read_child_output(child: &mut std::process::Child) -> (String, String) {
 
 fn child_args(case: &CliCase, new_frontend: bool) -> Vec<String> {
     let mut args = vec![case.mode.as_str().to_string()];
-    if new_frontend && case.mode == Mode::Check {
+    if new_frontend {
+        debug_assert!(case.mode == Mode::Check || case.backend == Some("rust"));
         args.push("--new-frontend".to_string());
     }
 
-    if case.mode == Mode::Run {
-        if let Some(backend) = case.backend {
-            args.extend(["--backend".to_string(), backend.to_string()]);
-        }
+    if case.mode == Mode::Run
+        && let Some(backend) = case.backend
+    {
+        args.extend(["--backend".to_string(), backend.to_string()]);
     }
     case.cli_options.append_args(&mut args);
 
@@ -281,13 +282,19 @@ mod tests {
     }
 
     #[test]
-    fn run_omits_new_frontend() {
+    fn run_adds_new_frontend_for_clean_rust_backend() {
         let mut case = case(Mode::Run);
-        case.backend = Some("vm");
+        case.backend = Some("rust");
 
         assert_eq!(
             child_args(&case, true),
-            vec!["run", "--backend", "vm", "tests/run/basic_ok.anv"]
+            vec![
+                "run",
+                "--new-frontend",
+                "--backend",
+                "rust",
+                "tests/run/basic_ok.anv"
+            ]
         );
     }
 

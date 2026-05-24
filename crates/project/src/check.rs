@@ -4,14 +4,90 @@ use std::{
 };
 
 use anvyx_lang2::{
-    CheckFileInput, CheckOutput, CheckPackageInput, FrontendConfig, PackageId as FrontendPackageId,
-    PackageSource, SourceOverride,
+    AirBuildError, AirBuildOutput, CheckFileInput, CheckOutput, CheckPackageInput, FrontendConfig,
+    PackageId as FrontendPackageId, PackageSource, SourceOverride,
 };
 
 use crate::{
     manifest::{Manifest, PackageGraph, PackageId},
     source_bundle,
 };
+
+#[derive(Debug)]
+pub enum CleanRustRunError {
+    Air(AirBuildError<anvyx_lang2::CheckError>),
+    Plan(anvyx_backend::rust::RustPlanError),
+    SourceJob(anvyx_backend::rust::source_job::RustSourceJobError),
+    Run(anvyx_backend::rust::source_job::RustSourceJobOutput),
+}
+
+impl std::fmt::Display for CleanRustRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Air(error) => write!(f, "{}", air_error_ref(error)),
+            Self::Plan(error) => write!(f, "{error}"),
+            Self::SourceJob(error) => write!(f, "{error}"),
+            Self::Run(output) => {
+                write!(f, "generated Rust job failed: {:?}", output.status)?;
+                if !output.stderr.is_empty() {
+                    write!(f, "\n{}", output.stderr)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CleanRustRunError {}
+
+pub struct CleanRustRunOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub fn run_clean_rust_path(
+    file: &Path,
+    config: FrontendConfig,
+) -> Result<CleanRustRunOutput, CleanRustRunError> {
+    let output = build_air_path_typed(file, config).map_err(CleanRustRunError::Air)?;
+    let plan = anvyx_backend::rust::plan(
+        &output.air.as_verified(),
+        anvyx_backend::rust::RustPlanConfig::default(),
+    )
+    .map_err(CleanRustRunError::Plan)?;
+    let source = anvyx_backend::rust::emit::emit(&plan.verified());
+    let output = anvyx_backend::rust::source_job::compile_and_run(
+        &anvyx_backend::rust::source_job::RustSourceJob {
+            source,
+            work_dir: None,
+        },
+    )
+    .map_err(CleanRustRunError::SourceJob)?;
+    if output.status != anvyx_backend::rust::source_job::SourceJobStatus::Success {
+        return Err(CleanRustRunError::Run(output));
+    }
+    Ok(CleanRustRunOutput {
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn build_air_path_typed(
+    file: &Path,
+    config: FrontendConfig,
+) -> Result<AirBuildOutput, AirBuildError<anvyx_lang2::CheckError>> {
+    build_air_path_with_source_overrides_typed(file, vec![], config)
+}
+
+fn build_air_path_with_source_overrides_typed(
+    file: &Path,
+    source_overrides: Vec<SourceOverride>,
+    config: FrontendConfig,
+) -> Result<AirBuildOutput, AirBuildError<anvyx_lang2::CheckError>> {
+    let manifest = load_nearest_manifest(file)
+        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
+    build_air_loaded_path_typed(file, source_overrides, config, manifest)
+}
 
 pub fn check_path(file: &Path, config: FrontendConfig) -> Result<CheckOutput, String> {
     check_path_with_source_overrides(file, vec![], config)
@@ -32,7 +108,7 @@ pub fn check_path_with_manifest_lints(
     let manifest = load_nearest_manifest(file)?;
     let lint = match &manifest {
         Some((_, manifest)) => crate::manifest::lint_config(Some(manifest), &[] as &[String])?,
-        None => Default::default(),
+        None => anvyx_lang2::LintConfig::default(),
     };
     check_loaded_path(
         file,
@@ -51,6 +127,36 @@ fn load_nearest_manifest(file: &Path) -> Result<Option<(PathBuf, Manifest)>, Str
     };
     let manifest = crate::manifest::parse_manifest_file(&path)?;
     Ok(Some((path, manifest)))
+}
+
+fn build_air_loaded_path_typed(
+    file: &Path,
+    source_overrides: Vec<SourceOverride>,
+    config: FrontendConfig,
+    manifest: Option<(PathBuf, Manifest)>,
+) -> Result<AirBuildOutput, AirBuildError<anvyx_lang2::CheckError>> {
+    let Some((path, manifest)) = manifest else {
+        let input = standalone_check_input_with_overrides(file, source_overrides)
+            .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?
+            .with_config(config);
+        return anvyx_lang2::build_air_file(input);
+    };
+    crate::manifest::reject_clean_frontend_inputs(Some(&manifest))
+        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
+    let graph = crate::manifest::load_package_graph(&path)
+        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
+    let input = package_check_input_with_overrides(&graph, file, source_overrides)
+        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?
+        .with_config(config);
+    anvyx_lang2::build_air_package(input)
+}
+
+fn air_error_ref(error: &AirBuildError<anvyx_lang2::CheckError>) -> String {
+    match error {
+        AirBuildError::Diagnostic(output) => output.summary().to_string(),
+        AirBuildError::Lower(message) => format!("failed to lower AIR: {message}"),
+        AirBuildError::Fatal(error) => error.to_string(),
+    }
 }
 
 fn check_loaded_path(
@@ -133,7 +239,7 @@ fn frontend_package_id(id: &PackageId) -> FrontendPackageId {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fmt::Write, fs};
 
     use super::*;
 
@@ -157,7 +263,7 @@ mod tests {
             if !deps.is_empty() {
                 manifest.push_str("\n[dependencies]\n");
                 for (alias, path) in deps {
-                    manifest.push_str(&format!("{alias} = {{ path = \"{path}\" }}\n"));
+                    writeln!(manifest, "{alias} = {{ path = \"{path}\" }}").unwrap();
                 }
             }
             fs::write(dir.join("anvyx.toml"), manifest).unwrap();

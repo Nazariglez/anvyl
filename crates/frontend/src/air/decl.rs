@@ -1,5 +1,5 @@
-// exports body types used in Function
-pub use super::body::{BasicBlock, Terminator};
+// exports body type used in Function
+pub use super::body::AirBody;
 use super::ids::*;
 use crate::{
     air::types::{BinaryOp, ParamMode, ReturnMode, UnaryOp},
@@ -21,9 +21,15 @@ pub struct Function {
     pub name: Ident,
     pub module: ModuleId,
     pub kind: FunctionKind,
+    pub owner: Option<FunctionOwner>,
     pub signature: Signature,
     pub locals: Vec<Local>,
-    pub body: Vec<BasicBlock>,
+    pub body: AirBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionOwner {
+    pub name: Ident,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

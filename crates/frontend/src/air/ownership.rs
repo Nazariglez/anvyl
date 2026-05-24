@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    AggregateKind, CallArg, Callee, Function, FunctionId, LocalId, Operand, ParamMode, Place,
-    Program, Projection, RValue, Statement, Terminator, TypeData, TypeId, VariantShape,
+    AggregateKind, AirBlock, AirStmt, AirTail, CallArg, Callee, Function, FunctionId, LocalId,
+    Operand, ParamMode, Place, Program, Projection, RValue, TypeData, TypeId, VariantShape,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -318,35 +318,51 @@ struct ParamUseAnalyzer<'a> {
 
 impl ParamUseAnalyzer<'_> {
     fn analyze(mut self) -> Vec<ParamUse> {
-        for block in &self.function.body {
-            for statement in &block.statements {
-                self.observe_statement(statement);
-            }
-            self.observe_terminator(&block.terminator);
-        }
+        self.observe_air_block(&self.function.body.block);
         self.uses
             .into_iter()
             .map(|use_| use_.unwrap_or(ParamUse::ReadOnly))
             .collect()
     }
 
-    fn observe_statement(&mut self, statement: &Statement) {
-        match statement {
-            Statement::Init { value, .. } => self.observe_rvalue(value, ValueContext::Store),
-            Statement::Assign { dst, value } => {
+    fn observe_air_block(&mut self, block: &AirBlock) {
+        for stmt in &block.stmts {
+            self.observe_air_stmt(stmt);
+        }
+        self.observe_air_tail(&block.tail);
+    }
+
+    fn observe_air_stmt(&mut self, stmt: &AirStmt) {
+        match stmt {
+            AirStmt::Init { value, .. } => self.observe_rvalue(value, ValueContext::Store),
+            AirStmt::Assign { dst, value } => {
                 self.observe_place(dst, ParamUse::ReborrowMut);
                 self.observe_rvalue(value, ValueContext::Store);
             }
-            Statement::Eval(value) => self.observe_rvalue(value, ValueContext::Read),
+            AirStmt::Eval(value) => self.observe_rvalue(value, ValueContext::Read),
+            AirStmt::If(branch) => {
+                self.observe_operand(&branch.cond, ValueContext::Read);
+                self.observe_air_block(&branch.then_block);
+                if let Some(block) = &branch.else_block {
+                    self.observe_air_block(block);
+                }
+            }
+            AirStmt::Loop(loop_) => self.observe_air_block(&loop_.body),
+            AirStmt::EnumMatch(match_) => {
+                self.observe_place(&match_.discr, ParamUse::ReadOnly);
+                for arm in &match_.arms {
+                    self.observe_air_block(&arm.block);
+                }
+                if let Some(block) = &match_.else_block {
+                    self.observe_air_block(block);
+                }
+            }
         }
     }
 
-    fn observe_terminator(&mut self, terminator: &Terminator) {
-        match terminator {
-            Terminator::Return(Some(value)) => self.observe_operand(value, ValueContext::Store),
-            Terminator::If { cond, .. } => self.observe_operand(cond, ValueContext::Read),
-            Terminator::SwitchEnum { discr, .. } => self.observe_place(discr, ParamUse::ReadOnly),
-            Terminator::Return(None) | Terminator::Goto(_) | Terminator::Unreachable => {}
+    fn observe_air_tail(&mut self, tail: &AirTail) {
+        if let AirTail::Return(Some(value)) = tail {
+            self.observe_operand(value, ValueContext::Store);
         }
     }
 
@@ -428,18 +444,20 @@ impl ParamUseAnalyzer<'_> {
                 CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
                     self.observe_place(place, ParamUse::ValueRequired);
                 }
+                CallArg::SharedStringConst(_) => {}
             },
             ParamMode::SharedBorrow => match arg {
                 CallArg::Value(operand) => self.observe_operand(operand, ValueContext::Read),
                 CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
                     self.observe_place(place, ParamUse::ReadOnly);
                 }
+                CallArg::SharedStringConst(_) => {}
             },
             ParamMode::MutBorrow => match arg {
                 CallArg::Value(Operand::Place(place))
                 | CallArg::SharedBorrow(place)
                 | CallArg::MutBorrow(place) => self.observe_place(place, ParamUse::ReborrowMut),
-                CallArg::Value(Operand::Const(_)) => {}
+                CallArg::Value(Operand::Const(_)) | CallArg::SharedStringConst(_) => {}
             },
         }
     }
@@ -602,28 +620,23 @@ fn final_param_mode(
 fn force_alias_snapshots(program: &Program, modes: &mut [Vec<ParamMode>]) -> bool {
     let mut changed = false;
     for function in &program.functions {
-        for block in &function.body {
-            for statement in &block.statements {
-                let (Statement::Init { value, .. }
-                | Statement::Assign { value, .. }
-                | Statement::Eval(value)) = statement;
-                let RValue::Call {
-                    callee: Callee::Function(callee),
-                    args,
-                } = value
-                else {
-                    continue;
-                };
-                let Some(callee_modes) = modes.get_mut(callee.index()) else {
-                    continue;
-                };
-                for first in 0..args.len() {
-                    for second in first + 1..args.len() {
-                        changed |= force_alias_snapshot(callee_modes, args, first, second);
-                    }
+        function.body.for_each_rvalue(&mut |value| {
+            let RValue::Call {
+                callee: Callee::Function(callee),
+                args,
+            } = value
+            else {
+                return;
+            };
+            let Some(callee_modes) = modes.get_mut(callee.index()) else {
+                return;
+            };
+            for first in 0..args.len() {
+                for second in first + 1..args.len() {
+                    changed |= force_alias_snapshot(callee_modes, args, first, second);
                 }
             }
-        }
+        });
     }
     changed
 }
@@ -713,33 +726,144 @@ fn rewrite_direct_call_args(program: &mut Program) {
         .collect::<Vec<_>>();
 
     for function in &mut program.functions {
-        for block in &mut function.body {
-            let mut statements = vec![];
-            for mut statement in block.statements.drain(..) {
-                let prepended = rewrite_statement_call_args(
-                    &mut statement,
-                    &modes,
-                    &function_type_modes,
-                    &const_types,
-                    &mut function.locals,
-                );
-                statements.extend(prepended);
-                statements.push(statement);
-            }
-            block.statements = statements;
-        }
+        rewrite_air_block_call_args(
+            &mut function.body.block,
+            &modes,
+            &function_type_modes,
+            &const_types,
+            &mut function.locals,
+        );
     }
 }
 
-fn rewrite_statement_call_args(
-    statement: &mut Statement,
+fn rewrite_air_block_call_args(
+    block: &mut AirBlock,
     modes: &[Vec<ParamMode>],
     function_type_modes: &HashMap<TypeId, Vec<ParamMode>>,
     const_types: &[TypeId],
     locals: &mut Vec<super::Local>,
-) -> Vec<Statement> {
-    let (Statement::Init { value, .. } | Statement::Assign { value, .. } | Statement::Eval(value)) =
-        statement;
+) {
+    for stmt in std::mem::take(&mut block.stmts) {
+        match stmt {
+            AirStmt::Init { local, value } => {
+                rewrite_air_value_stmt(
+                    &mut block.stmts,
+                    AirStmtValue::Init(local),
+                    value,
+                    modes,
+                    function_type_modes,
+                    const_types,
+                    locals,
+                );
+            }
+            AirStmt::Assign { dst, value } => {
+                rewrite_air_value_stmt(
+                    &mut block.stmts,
+                    AirStmtValue::Assign(dst),
+                    value,
+                    modes,
+                    function_type_modes,
+                    const_types,
+                    locals,
+                );
+            }
+            AirStmt::Eval(value) => {
+                rewrite_air_value_stmt(
+                    &mut block.stmts,
+                    AirStmtValue::Eval,
+                    value,
+                    modes,
+                    function_type_modes,
+                    const_types,
+                    locals,
+                );
+            }
+            AirStmt::If(mut branch) => {
+                rewrite_air_block_call_args(
+                    &mut branch.then_block,
+                    modes,
+                    function_type_modes,
+                    const_types,
+                    locals,
+                );
+                if let Some(else_block) = &mut branch.else_block {
+                    rewrite_air_block_call_args(
+                        else_block,
+                        modes,
+                        function_type_modes,
+                        const_types,
+                        locals,
+                    );
+                }
+                block.stmts.push(AirStmt::If(branch));
+            }
+            AirStmt::Loop(mut loop_) => {
+                rewrite_air_block_call_args(
+                    &mut loop_.body,
+                    modes,
+                    function_type_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::Loop(loop_));
+            }
+            AirStmt::EnumMatch(mut match_) => {
+                for arm in &mut match_.arms {
+                    rewrite_air_block_call_args(
+                        &mut arm.block,
+                        modes,
+                        function_type_modes,
+                        const_types,
+                        locals,
+                    );
+                }
+                if let Some(else_block) = &mut match_.else_block {
+                    rewrite_air_block_call_args(
+                        else_block,
+                        modes,
+                        function_type_modes,
+                        const_types,
+                        locals,
+                    );
+                }
+                block.stmts.push(AirStmt::EnumMatch(match_));
+            }
+        }
+    }
+}
+
+enum AirStmtValue {
+    Init(LocalId),
+    Assign(Place),
+    Eval,
+}
+
+fn rewrite_air_value_stmt(
+    out: &mut Vec<AirStmt>,
+    kind: AirStmtValue,
+    mut value: RValue,
+    modes: &[Vec<ParamMode>],
+    function_type_modes: &HashMap<TypeId, Vec<ParamMode>>,
+    const_types: &[TypeId],
+    locals: &mut Vec<super::Local>,
+) {
+    let prepended =
+        rewrite_value_call_args(&mut value, modes, function_type_modes, const_types, locals);
+    out.extend(prepended);
+    out.push(match kind {
+        AirStmtValue::Init(local) => AirStmt::Init { local, value },
+        AirStmtValue::Assign(dst) => AirStmt::Assign { dst, value },
+        AirStmtValue::Eval => AirStmt::Eval(value),
+    });
+}
+
+fn rewrite_value_call_args(
+    value: &mut RValue,
+    modes: &[Vec<ParamMode>],
+    function_type_modes: &HashMap<TypeId, Vec<ParamMode>>,
+    const_types: &[TypeId],
+    locals: &mut Vec<super::Local>,
+) -> Vec<AirStmt> {
     let RValue::Call { callee, args } = value else {
         return vec![];
     };
@@ -761,12 +885,15 @@ fn rewrite_call_args(
     expected: &[ParamMode],
     const_types: &[TypeId],
     locals: &mut Vec<super::Local>,
-) -> Vec<Statement> {
+) -> Vec<AirStmt> {
     let mut prepended = vec![];
     for (arg, mode) in args.iter_mut().zip(expected) {
         let replacement = match (mode, &*arg) {
             (ParamMode::Value, CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)) => {
                 Some(CallArg::Value(Operand::Place(place.clone())))
+            }
+            (ParamMode::Value, CallArg::SharedStringConst(id)) => {
+                Some(CallArg::Value(Operand::Const(*id)))
             }
             (ParamMode::SharedBorrow, CallArg::Value(Operand::Place(place))) => {
                 Some(CallArg::SharedBorrow(place.clone()))
@@ -780,7 +907,7 @@ fn rewrite_call_args(
                     mutability: super::Mutability::Immutable,
                     kind: super::LocalKind::Temp,
                 });
-                prepended.push(Statement::Init {
+                prepended.push(AirStmt::Init {
                     local,
                     value: RValue::Use(Operand::Const(*value)),
                 });
@@ -833,18 +960,13 @@ fn collect_function_type_modes(
         })
         .collect::<Vec<_>>();
     for function in &program.functions {
-        for block in &function.body {
-            for statement in &block.statements {
-                let (Statement::Init { value, .. }
-                | Statement::Assign { value, .. }
-                | Statement::Eval(value)) = statement;
-                if let RValue::MakeClosure { func, ty, .. } = value
-                    && let Some(modes) = modes.get(func.index())
-                {
-                    updates.push((*ty, modes.clone()));
-                }
+        function.body.for_each_rvalue(&mut |value| {
+            if let RValue::MakeClosure { func, ty, .. } = value
+                && let Some(modes) = modes.get(func.index())
+            {
+                updates.push((*ty, modes.clone()));
             }
-        }
+        });
     }
     updates
 }
@@ -860,10 +982,10 @@ mod tests {
     use super::*;
     use crate::{
         air::{
-            AggregateDecl, BasicBlock, CallArg, Callee, ConstData, ConstValue, DynContractData,
-            EnumDecl, ExternRep, ExternTypeDecl, FieldDecl, Function, FunctionKind, Local,
-            LocalKind, MapOrder, Module, ModuleId, Mutability, Operand, Param, ParamRole, Place,
-            RValue, ReturnMode, Signature, Statement, Terminator, VariantDecl,
+            AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CallArg, Callee, ConstData,
+            ConstValue, DynContractData, EnumDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
+            FunctionKind, Local, LocalKind, MapOrder, Module, ModuleId, Mutability, Operand, Param,
+            ParamRole, Place, RValue, ReturnMode, Signature, VariantDecl,
         },
         ast::Ident,
     };
@@ -886,8 +1008,8 @@ mod tests {
     fn param_function(
         program: &mut Program,
         ty: TypeId,
-        statements: Vec<Statement>,
-        terminator: Terminator,
+        statements: Vec<AirStmt>,
+        tail: AirTail,
     ) -> FunctionId {
         let module = module(program);
         let local = LocalId::from_index(0);
@@ -896,6 +1018,7 @@ mod tests {
             name: Ident::new("f"),
             module,
             kind: FunctionKind::Normal,
+            owner: None,
             signature: Signature {
                 params: vec![Param {
                     name: Some(Ident::new("arg")),
@@ -912,11 +1035,14 @@ mod tests {
                 mutability: Mutability::Immutable,
                 kind: LocalKind::Arg,
             }],
-            body: vec![BasicBlock {
-                statements,
-                terminator,
-            }],
+            body: test_body(statements, tail),
         })
+    }
+
+    fn test_body(stmts: Vec<AirStmt>, tail: AirTail) -> AirBody {
+        AirBody {
+            block: AirBlock { stmts, tail },
+        }
     }
 
     fn param_place(ty: TypeId) -> Place {
@@ -938,11 +1064,11 @@ mod tests {
         let function = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Stringify {
+            vec![AirStmt::Eval(RValue::Stringify {
                 value: param_operand(string),
                 source_ty: string,
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         assert_eq!(
@@ -959,7 +1085,7 @@ mod tests {
             &mut program,
             string,
             vec![],
-            Terminator::Return(Some(param_operand(string))),
+            AirTail::Return(Some(param_operand(string))),
         );
 
         assert_eq!(
@@ -976,11 +1102,11 @@ mod tests {
         let function = param_function(
             &mut program,
             string,
-            vec![Statement::Init {
+            vec![AirStmt::Init {
                 local: dst,
                 value: RValue::Use(param_operand(string)),
             }],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         program.function_mut(function).locals.push(Local {
             name: Some(Ident::new("tmp")),
@@ -1006,11 +1132,11 @@ mod tests {
         let function = param_function(
             &mut program,
             int,
-            vec![Statement::Assign {
+            vec![AirStmt::Assign {
                 dst: param_place(int),
                 value: RValue::Use(Operand::Const(value)),
             }],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         assert_eq!(
@@ -1026,11 +1152,11 @@ mod tests {
         let function = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Call {
+            vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(FunctionId::from_index(999)),
                 args: vec![CallArg::SharedBorrow(param_place(string))],
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         assert_eq!(
             analyze_param_uses(&program, function),
@@ -1040,11 +1166,11 @@ mod tests {
         let function = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Call {
+            vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(FunctionId::from_index(999)),
                 args: vec![CallArg::Value(param_operand(string))],
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         assert_eq!(
             analyze_param_uses(&program, function),
@@ -1064,11 +1190,11 @@ mod tests {
         let function = param_function(
             &mut program,
             list,
-            vec![Statement::Eval(RValue::ListPush {
+            vec![AirStmt::Eval(RValue::ListPush {
                 list: param_place(list),
                 value: Operand::Const(value),
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         assert_eq!(
@@ -1084,10 +1210,10 @@ mod tests {
         let function = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::StringConcat {
+            vec![AirStmt::Eval(RValue::StringConcat {
                 parts: vec![param_operand(string)],
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         assert_eq!(
@@ -1109,6 +1235,7 @@ mod tests {
             name: Ident::new("f"),
             module,
             kind: FunctionKind::Normal,
+            owner: None,
             signature: Signature {
                 params: vec![
                     Param {
@@ -1142,8 +1269,8 @@ mod tests {
                     kind: LocalKind::Arg,
                 },
             ],
-            body: vec![BasicBlock {
-                statements: vec![Statement::Eval(RValue::MapEntryAt {
+            body: test_body(
+                vec![AirStmt::Eval(RValue::MapEntryAt {
                     map: Place {
                         root: list_local,
                         projection: vec![],
@@ -1152,8 +1279,8 @@ mod tests {
                     index: index_local,
                     ty: int,
                 })],
-                terminator: Terminator::Return(None),
-            }],
+                AirTail::Return(None),
+            ),
         });
 
         assert_eq!(
@@ -1178,11 +1305,11 @@ mod tests {
         let function = param_function(
             &mut program,
             func_ty,
-            vec![Statement::Eval(RValue::Call {
+            vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Closure(param_operand(func_ty)),
                 args: vec![CallArg::Value(Operand::Const(arg))],
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         assert_eq!(
@@ -1202,11 +1329,11 @@ mod tests {
         let function = param_function(
             &mut program,
             int,
-            vec![Statement::Assign {
+            vec![AirStmt::Assign {
                 dst: param_place(int),
                 value: RValue::Use(Operand::Const(value)),
             }],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         let errors = finalize(&mut program).expect_err("expected ownership error");
@@ -1224,11 +1351,11 @@ mod tests {
         let function = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Stringify {
+            vec![AirStmt::Eval(RValue::Stringify {
                 value: param_operand(string),
                 source_ty: string,
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         let modes = infer_param_modes(&program).expect("mode inference failed");
@@ -1248,11 +1375,11 @@ mod tests {
         let function = param_function(
             &mut program,
             int,
-            vec![Statement::Eval(RValue::Stringify {
+            vec![AirStmt::Eval(RValue::Stringify {
                 value: param_operand(int),
                 source_ty: int,
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         let modes = infer_param_modes(&program).expect("mode inference failed");
@@ -1267,7 +1394,7 @@ mod tests {
             &mut program,
             string,
             vec![],
-            Terminator::Return(Some(param_operand(string))),
+            AirTail::Return(Some(param_operand(string))),
         );
 
         let modes = infer_param_modes(&program).expect("mode inference failed");
@@ -1282,7 +1409,7 @@ mod tests {
             &mut program,
             string,
             vec![],
-            Terminator::Return(Some(param_operand(string))),
+            AirTail::Return(Some(param_operand(string))),
         );
         program.function_mut(function).signature.params[0].mode = ParamMode::MutBorrow;
 
@@ -1303,16 +1430,16 @@ mod tests {
             &mut program,
             string,
             vec![
-                Statement::Init {
+                AirStmt::Init {
                     local: tmp,
                     value: RValue::Use(param_operand(string)),
                 },
-                Statement::Assign {
+                AirStmt::Assign {
                     dst: param_place(string),
                     value: RValue::Use(Operand::Const(replacement)),
                 },
             ],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         program.function_mut(function).signature.params[0].mode = ParamMode::MutBorrow;
         program.function_mut(function).locals.push(Local {
@@ -1333,20 +1460,20 @@ mod tests {
         let forward = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Call {
+            vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(FunctionId::from_index(1)),
                 args: vec![CallArg::Value(param_operand(string))],
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         let read = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Stringify {
+            vec![AirStmt::Eval(RValue::Stringify {
                 value: param_operand(string),
                 source_ty: string,
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         let modes = infer_param_modes(&program).expect("mode inference failed");
@@ -1361,25 +1488,25 @@ mod tests {
         let read = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Stringify {
+            vec![AirStmt::Eval(RValue::Stringify {
                 value: param_operand(string),
                 source_ty: string,
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         let caller = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Call {
+            vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(read),
                 args: vec![CallArg::Value(param_operand(string))],
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         finalize(&mut program).expect("ownership finalization failed");
-        let Statement::Eval(RValue::Call { args, .. }) =
-            &program.function(caller).body[0].statements[0]
+        let AirStmt::Eval(RValue::Call { args, .. }) =
+            &program.function(caller).body.block.stmts[0]
         else {
             panic!("expected call");
         };
@@ -1393,11 +1520,11 @@ mod tests {
         let read = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Stringify {
+            vec![AirStmt::Eval(RValue::Stringify {
                 value: param_operand(string),
                 source_ty: string,
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         let arg = program.alloc_const(ConstData {
             ty: string,
@@ -1409,25 +1536,67 @@ mod tests {
             name: Ident::new("caller"),
             module,
             kind: FunctionKind::Normal,
+            owner: None,
             signature: Signature::new(vec![], void),
             locals: vec![],
-            body: vec![BasicBlock {
-                statements: vec![Statement::Eval(RValue::Call {
+            body: test_body(
+                vec![AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(read),
                     args: vec![CallArg::Value(Operand::Const(arg))],
                 })],
-                terminator: Terminator::Return(None),
-            }],
+                AirTail::Return(None),
+            ),
         });
 
         finalize(&mut program).expect("ownership finalization failed");
-        let statements = &program.function(caller).body[0].statements;
-        assert!(matches!(statements[0], Statement::Init { .. }));
+        let stmts = &program.function(caller).body.block.stmts;
+        assert!(matches!(stmts[0], AirStmt::Init { .. }));
         assert!(matches!(
-            statements[1],
-            Statement::Eval(RValue::Call { ref args, .. })
+            stmts[1],
+            AirStmt::Eval(RValue::Call { ref args, .. })
                 if matches!(args[0], CallArg::SharedBorrow(_))
         ));
+    }
+
+    #[test]
+    fn finalize_rewrites_shared_string_const_to_value_arg() {
+        let mut program = Program::default();
+        let string = program.alloc_type(TypeData::String);
+        let id = param_function(
+            &mut program,
+            string,
+            vec![],
+            AirTail::Return(Some(param_operand(string))),
+        );
+        let arg = program.alloc_const(ConstData {
+            ty: string,
+            value: ConstValue::String("x".into()),
+        });
+        let module = module(&mut program);
+        let void = program.alloc_type(TypeData::Void);
+        let caller = program.alloc_function(Function {
+            name: Ident::new("caller"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            signature: Signature::new(vec![], void),
+            locals: vec![],
+            body: test_body(
+                vec![AirStmt::Eval(RValue::Call {
+                    callee: Callee::Function(id),
+                    args: vec![CallArg::SharedStringConst(arg)],
+                })],
+                AirTail::Return(None),
+            ),
+        });
+
+        finalize(&mut program).expect("ownership finalization failed");
+        let AirStmt::Eval(RValue::Call { args, .. }) =
+            &program.function(caller).body.block.stmts[0]
+        else {
+            panic!("expected call");
+        };
+        assert!(matches!(args[0], CallArg::Value(Operand::Const(found)) if found == arg));
     }
 
     #[test]
@@ -1452,6 +1621,7 @@ mod tests {
             name: Ident::new("caller"),
             module,
             kind: FunctionKind::Normal,
+            owner: None,
             signature: Signature::new(
                 vec![Param {
                     name: Some(Ident::new("f")),
@@ -1468,8 +1638,8 @@ mod tests {
                 mutability: Mutability::Immutable,
                 kind: LocalKind::Arg,
             }],
-            body: vec![BasicBlock {
-                statements: vec![Statement::Eval(RValue::Call {
+            body: test_body(
+                vec![AirStmt::Eval(RValue::Call {
                     callee: Callee::Closure(Operand::Place(Place {
                         root: closure_local,
                         projection: vec![],
@@ -1477,16 +1647,16 @@ mod tests {
                     })),
                     args: vec![CallArg::Value(Operand::Const(arg))],
                 })],
-                terminator: Terminator::Return(None),
-            }],
+                AirTail::Return(None),
+            ),
         });
 
         finalize(&mut program).expect("ownership finalization failed");
-        let statements = &program.function(caller).body[0].statements;
-        assert!(matches!(statements[0], Statement::Init { .. }));
+        let stmts = &program.function(caller).body.block.stmts;
+        assert!(matches!(stmts[0], AirStmt::Init { .. }));
         assert!(matches!(
-            statements[1],
-            Statement::Eval(RValue::Call { ref args, .. })
+            stmts[1],
+            AirStmt::Eval(RValue::Call { ref args, .. })
                 if matches!(args[0], CallArg::SharedBorrow(_))
         ));
     }
@@ -1499,11 +1669,11 @@ mod tests {
         let read = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Stringify {
+            vec![AirStmt::Eval(RValue::Stringify {
                 value: param_operand(string),
                 source_ty: string,
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
         let closure_ty = program.alloc_type(TypeData::Function(super::super::SignatureType {
             params: vec![super::super::ParamType {
@@ -1517,16 +1687,17 @@ mod tests {
             name: Ident::new("make"),
             module,
             kind: FunctionKind::Normal,
+            owner: None,
             signature: Signature::new(vec![], void),
             locals: vec![],
-            body: vec![BasicBlock {
-                statements: vec![Statement::Eval(RValue::MakeClosure {
+            body: test_body(
+                vec![AirStmt::Eval(RValue::MakeClosure {
                     func: read,
                     captures: vec![],
                     ty: closure_ty,
                 })],
-                terminator: Terminator::Return(None),
-            }],
+                AirTail::Return(None),
+            ),
         });
 
         finalize(&mut program).expect("ownership finalization failed");
@@ -1543,11 +1714,11 @@ mod tests {
         let function = param_function(
             &mut program,
             string,
-            vec![Statement::Eval(RValue::Call {
+            vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(FunctionId::from_index(0)),
                 args: vec![CallArg::Value(param_operand(string))],
             })],
-            Terminator::Return(None),
+            AirTail::Return(None),
         );
 
         let modes = infer_param_modes(&program).expect("mode inference failed");

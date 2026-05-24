@@ -20,27 +20,11 @@ pub struct VirCall {
     pub args: Vec<VirCallArg>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VirParamMode {
-    Value,
-    SharedBorrow,
-    MutBorrow,
-}
-
-impl From<ParamMode> for VirParamMode {
-    fn from(mode: ParamMode) -> Self {
-        match mode {
-            ParamMode::Value => Self::Value,
-            ParamMode::SharedBorrow => Self::SharedBorrow,
-            ParamMode::MutBorrow => Self::MutBorrow,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum VirCallArg {
     Value(Operand),
     SharedBorrow(Place),
+    SharedStringConst(anvyx_frontend::air::ConstId),
     MutBorrow(Place),
 }
 
@@ -49,6 +33,7 @@ impl From<&CallArg> for VirCallArg {
         match arg {
             CallArg::Value(operand) => Self::Value(operand.clone()),
             CallArg::SharedBorrow(place) => Self::SharedBorrow(place.clone()),
+            CallArg::SharedStringConst(id) => Self::SharedStringConst(*id),
             CallArg::MutBorrow(place) => Self::MutBorrow(place.clone()),
         }
     }
@@ -58,5 +43,5 @@ impl From<&CallArg> for VirCallArg {
 pub struct VirParam {
     pub local: LocalId,
     pub ty: TypeId,
-    pub mode: VirParamMode,
+    pub mode: ParamMode,
 }

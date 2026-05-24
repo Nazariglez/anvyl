@@ -1,9 +1,9 @@
 use anvyx_frontend::air::{
-    CallArg, FunctionId, Operand, ParamMode, Program, RValue, Statement, TypeId, TypePassClass,
+    CallArg, FunctionId, Operand, ParamMode, Program, RValue, TypeId, TypePassClass,
     TypePassClasses, VerifiedProgram,
 };
 
-use super::vir::{VirCall, VirCallArg, VirFunction, VirParam, VirParamMode, VirProgram};
+use super::vir::{VirCall, VirCallArg, VirFunction, VirParam, VirProgram};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmCompiler;
@@ -62,16 +62,16 @@ impl CompileCx<'_> {
                         VirParam {
                             local: param.local_id,
                             ty: param.ty,
-                            mode: VirParamMode::from(param.mode),
+                            mode: param.mode,
                         }
                     })
                     .collect();
-                let calls = function
-                    .body
-                    .iter()
-                    .flat_map(|block| &block.statements)
-                    .filter_map(|statement| self.compile_call(id, statement))
-                    .collect();
+                let mut calls = vec![];
+                function.body.for_each_rvalue(&mut |value| {
+                    if let Some(call) = self.compile_rvalue_call(id, value) {
+                        calls.push(call);
+                    }
+                });
                 VirFunction {
                     source: id,
                     params,
@@ -82,12 +82,7 @@ impl CompileCx<'_> {
         VirProgram { functions }
     }
 
-    fn compile_call(&mut self, function: FunctionId, statement: &Statement) -> Option<VirCall> {
-        let value = match statement {
-            Statement::Init { value, .. }
-            | Statement::Assign { value, .. }
-            | Statement::Eval(value) => value,
-        };
+    fn compile_rvalue_call(&mut self, function: FunctionId, value: &RValue) -> Option<VirCall> {
         let RValue::Call { callee, args } = value else {
             return None;
         };

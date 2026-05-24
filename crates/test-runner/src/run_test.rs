@@ -110,10 +110,10 @@ fn plan_test(
             contract.mode,
         ));
     }
-    if new_frontend && contract.mode == Mode::Run {
+    if new_frontend && contract.mode == Mode::Run && backend != Some("rust") {
         return TestPlan::Done(done(
             TestResult::Skip {
-                message: "new frontend only supports @mode: check".to_string(),
+                message: "new frontend run requires --backend rust".to_string(),
             },
             contract.mode,
         ));
@@ -163,12 +163,16 @@ mod tests {
     }
 
     fn plan(src: &str, new_frontend: bool) -> TestPlan {
+        plan_with_backend(src, new_frontend, Some("rust"))
+    }
+
+    fn plan_with_backend(src: &str, new_frontend: bool, backend: Option<&'static str>) -> TestPlan {
         plan_test(
             Path::new("test.anv"),
             directives(src),
             Duration::from_millis(1),
             Duration::from_millis(2),
-            Some("rust"),
+            backend,
             new_frontend,
         )
     }
@@ -202,12 +206,21 @@ mod tests {
     }
 
     #[test]
-    fn new_frontend_skips_run() {
-        let TestPlan::Done(result) = plan("// @mode: run\n// @expect: success\n", true) else {
+    fn new_frontend_skips_non_rust_run() {
+        let TestPlan::Done(result) =
+            plan_with_backend("// @mode: run\n// @expect: success\n", true, Some("vm"))
+        else {
             panic!("expected done plan");
         };
 
         assert!(matches!(result.result, TestResult::Skip { .. }));
+    }
+
+    #[test]
+    fn new_frontend_allows_rust_run() {
+        let TestPlan::Run { .. } = plan("// @mode: run\n// @expect: success\n", true) else {
+            panic!("expected runnable plan");
+        };
     }
 
     #[test]

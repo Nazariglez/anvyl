@@ -7,6 +7,21 @@ use anvyx_lang::{
 
 use crate::std_support::{collect_core, collect_std};
 
+pub fn new_frontend_cmd(
+    file: &Path,
+    lint: anvyx_lang2::LintConfig,
+    ctx: &CompilationContext,
+) -> Result<(), String> {
+    let output = anvyx_project::check::run_clean_rust_path(
+        file,
+        crate::check::new_frontend_config(lint, ctx),
+    )
+    .map_err(|error| error.to_string())?;
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    Ok(())
+}
+
 pub fn cmd(
     file: &Path,
     backend: &str,

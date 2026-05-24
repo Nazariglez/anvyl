@@ -197,13 +197,12 @@ fn function_stable_ids() {
         LocalKind::User,
     );
     fb.push_block(term_return_void());
-    fb.push_block(term_unreachable());
     let func_id = builder.alloc_function(fb.finish());
 
     let program = builder.finish();
     let func = program.function(func_id);
     assert_eq!(func.locals.len(), 2);
-    assert_eq!(func.body.len(), 2);
+    assert_eq!(func.body.block.stmts.len(), 0);
     assert_eq!(param_a.index(), 0);
     assert_eq!(local_b.index(), 1);
 }

@@ -10,6 +10,19 @@ pub enum BackendArg {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrontendArg {
+    #[default]
+    Default,
+    New,
+}
+
+impl FrontendArg {
+    pub fn is_new(self) -> bool {
+        self == Self::New
+    }
+}
+
 impl BackendArg {
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
@@ -49,7 +62,13 @@ pub struct RunnerArgs {
     pub report_json: bool,
     pub release: bool,
     pub backend: BackendArg,
-    pub new_frontend: bool,
+    pub frontend: FrontendArg,
+}
+
+impl RunnerArgs {
+    pub fn new_frontend(&self) -> bool {
+        self.frontend.is_new()
+    }
 }
 
 pub fn usage() -> String {
@@ -62,7 +81,7 @@ Arguments:
 
 Options:
   --backend <vm|rust|both>  Backend to test (default: vm)
-  --new-frontend            Run check-mode fixtures through anvyx check --new-frontend
+  --new-frontend            Run check fixtures through the clean frontend and rust run fixtures through the clean Rust backend
   --timeout <ms>            Runtime timeout in milliseconds (default: {DEFAULT_RUNTIME_TIMEOUT_MS})
   --compile-timeout <ms>    Compile timeout in milliseconds (default: {DEFAULT_COMPILE_TIMEOUT_MS})
   --jobs <n>                Maximum tests to run in parallel (default: rayon default)
@@ -87,7 +106,7 @@ impl RunnerArgs {
                 "--quiet" => parsed.quiet = true,
                 "--report-json" => parsed.report_json = true,
                 "--release" => parsed.release = true,
-                "--new-frontend" => parsed.new_frontend = true,
+                "--new-frontend" => parsed.frontend = FrontendArg::New,
                 "--timeout" => {
                     let value = parse_value(&mut iter, "--timeout")?;
                     parsed.timeout_ms = parse_u64("--timeout", &value)?;
@@ -122,7 +141,7 @@ struct ParsedArgs {
     report_json: bool,
     release: bool,
     backend: BackendArg,
-    new_frontend: bool,
+    frontend: FrontendArg,
 }
 
 impl Default for ParsedArgs {
@@ -136,7 +155,7 @@ impl Default for ParsedArgs {
             report_json: false,
             release: false,
             backend: BackendArg::Vm,
-            new_frontend: false,
+            frontend: FrontendArg::Default,
         }
     }
 }
@@ -162,7 +181,7 @@ impl ParsedArgs {
             report_json: self.report_json,
             release: self.release,
             backend: self.backend,
-            new_frontend: self.new_frontend,
+            frontend: self.frontend,
         })
     }
 }
@@ -204,7 +223,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, RunnerArgs, usage,
+        BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, FrontendArg,
+        RunnerArgs, usage,
     };
 
     fn args(items: &[&str]) -> Vec<String> {
@@ -227,7 +247,7 @@ mod tests {
         assert!(!parsed.report_json);
         assert!(!parsed.release);
         assert_eq!(parsed.backend, BackendArg::Vm);
-        assert!(!parsed.new_frontend);
+        assert_eq!(parsed.frontend, FrontendArg::Default);
     }
 
     #[test]
@@ -257,7 +277,7 @@ mod tests {
         assert!(parsed.report_json);
         assert!(parsed.release);
         assert_eq!(parsed.backend, BackendArg::Both);
-        assert!(parsed.new_frontend);
+        assert_eq!(parsed.frontend, FrontendArg::New);
     }
 
     #[test]

@@ -16,6 +16,7 @@ cargo run --package test-runner -- tests/syntax --backend vm
 cargo run --package test-runner -- tests/run --backend both --jobs 8
 cargo run --package test-runner -- tests --report-json
 cargo run --package test-runner -- tests/syntax --new-frontend --quiet
+cargo run --package test-runner -- tests/run/rust_backend --new-frontend --backend rust --quiet
 ```
 
 Options:
@@ -23,7 +24,7 @@ Options:
 | Option | Meaning |
 | --- | --- |
 | `--backend <vm|rust|both>` | Backend to test. Defaults to `vm`. |
-| `--new-frontend` | Route check-mode fixtures through `anvyx check --new-frontend`; run-mode fixtures are skipped. |
+| `--new-frontend` | Route check fixtures through `anvyx check --new-frontend`; route rust run fixtures through `anvyx run --new-frontend --backend rust`. Other run backends are skipped. |
 | `--timeout <ms>` | Runtime timeout. Defaults to `2000`. |
 | `--compile-timeout <ms>` | Compile timeout. Defaults to `300000`. |
 | `--jobs <n>` | Maximum parallel tests. Defaults to Rayon. |
@@ -33,7 +34,7 @@ Options:
 
 Options can appear before or after paths. Repeated value options use the last value.
 
-By default, fixtures run through the production CLI default frontend/backend path. `--new-frontend` uses the same compiled CLI binary and adds `--new-frontend` to check-mode child invocations. It is check-only, so run-mode fixtures are skipped before spawning `anvyx`. Use `// @frontend: new` or `// @frontend: default` for fixtures that only apply to one frontend path.
+By default, fixtures run through the production CLI default frontend/backend path. `--new-frontend` uses the same compiled CLI binary and adds `--new-frontend` to matching child invocations. Run fixtures execute only when the scheduled backend is `rust`; other backends are skipped before spawning `anvyx`. Use `// @frontend: new` or `// @frontend: default` for fixtures that only apply to one frontend path.
 
 ## Fixture directives
 

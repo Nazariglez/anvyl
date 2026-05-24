@@ -1,4 +1,4 @@
-use super::*;
+use super::{super::verify::verify_structured_body, *};
 use crate::ast::Ident;
 
 #[test]
@@ -37,6 +37,229 @@ fn fn_return() {
 }
 
 #[test]
+fn structured_straight_line_scalar_return() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let value = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("structured", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_return(op_const(value)));
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::Init {
+                local,
+                value: RValue::Use(op_const(value)),
+            }],
+            tail: AirTail::Return(Some(op_place(local, int_ty))),
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}
+
+#[test]
+fn structured_if_return_then_fallthrough() {
+    let mut builder = ProgramBuilder::default();
+    let bool_ty = builder.bool_ty();
+    let module = test_module(&mut builder);
+    let yes = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let no = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(false),
+    });
+    let mut fb = FunctionBuilder::new("branch", module, FunctionKind::Normal, bool_ty);
+    let cond = fb.push_param("cond", bool_ty, ParamRole::Normal);
+    fb.push_block(term_return(op_const(no)));
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::If(AirIf {
+                cond: op_place(cond, bool_ty),
+                then_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(Some(op_const(yes))),
+                },
+                else_block: None,
+            })],
+            tail: AirTail::Return(Some(op_const(no))),
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}
+
+#[test]
+fn structured_both_if_branches_return() {
+    let mut builder = ProgramBuilder::default();
+    let bool_ty = builder.bool_ty();
+    let module = test_module(&mut builder);
+    let yes = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let no = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(false),
+    });
+    let mut fb = FunctionBuilder::new("both_return", module, FunctionKind::Normal, bool_ty);
+    let cond = fb.push_param("cond", bool_ty, ParamRole::Normal);
+    fb.push_block(term_return(op_const(no)));
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::If(AirIf {
+                cond: op_place(cond, bool_ty),
+                then_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(Some(op_const(yes))),
+                },
+                else_block: Some(AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(Some(op_const(no))),
+                }),
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}
+
+#[test]
+fn structured_loop_break_state_reaches_after_loop() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("loop_break", module, FunctionKind::Normal, int_ty);
+    let out = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_return(op_const(one)));
+    let func_id = builder.alloc_function(fb.finish());
+    let loop_id = AirLoopId::from_index(0);
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::Loop(AirLoop {
+                id: loop_id,
+                body: AirBlock {
+                    stmts: vec![AirStmt::Init {
+                        local: out,
+                        value: RValue::Use(op_const(one)),
+                    }],
+                    tail: AirTail::Break(loop_id),
+                },
+            })],
+            tail: AirTail::Return(Some(op_place(out, int_ty))),
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}
+
+#[test]
+fn structured_branch_result_initialized_in_both_arms() {
+    let mut builder = ProgramBuilder::default();
+    let bool_ty = builder.bool_ty();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let two = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(2),
+    });
+    let mut fb = FunctionBuilder::new("branch_value", module, FunctionKind::Normal, int_ty);
+    let cond = fb.push_param("cond", bool_ty, ParamRole::Normal);
+    let out = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_return(op_const(one)));
+    let func_id = builder.alloc_function(fb.finish());
+    let init_arm = |value| AirBlock {
+        stmts: vec![AirStmt::Init {
+            local: out,
+            value: RValue::Use(op_const(value)),
+        }],
+        tail: AirTail::None,
+    };
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::If(AirIf {
+                cond: op_place(cond, bool_ty),
+                then_block: init_arm(one),
+                else_block: Some(init_arm(two)),
+            })],
+            tail: AirTail::Return(Some(op_place(out, int_ty))),
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}
+
+#[test]
+fn structured_exhaustive_unit_enum_match() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let enum_id = builder.alloc_enum(EnumDecl {
+        name: Ident::new("Choice"),
+        module,
+        type_args: vec![],
+        const_args: vec![],
+        variants: vec![
+            VariantDecl {
+                name: Ident::new("A"),
+                shape: VariantShape::Unit,
+            },
+            VariantDecl {
+                name: Ident::new("B"),
+                shape: VariantShape::Unit,
+            },
+        ],
+    });
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+    let mut fb = FunctionBuilder::new("match_enum", module, FunctionKind::Normal, void_ty);
+    let discr = fb.push_param("value", enum_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let arm = |variant| AirEnumMatchArm {
+        variant,
+        block: AirBlock {
+            stmts: vec![],
+            tail: AirTail::Return(None),
+        },
+    };
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::EnumMatch(AirEnumMatch {
+                discr: place(discr, enum_ty),
+                arms: vec![arm(VariantId::from_index(0)), arm(VariantId::from_index(1))],
+                else_block: None,
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}
+
+#[test]
 fn init_and_assign_mutable_local() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -60,60 +283,6 @@ fn init_and_assign_mutable_local() {
     );
     let func_id = builder.alloc_function(fb.finish());
     builder.set_entry(func_id);
-
-    expect_verified(&builder.finish());
-}
-
-#[test]
-fn call_distinct_mut_field_borrows() {
-    let mut builder = ProgramBuilder::default();
-    let int_ty = builder.int_ty();
-    let void_ty = builder.void_ty();
-    let module = test_module(&mut builder);
-    let pair = builder.alloc_aggregate(AggregateDecl {
-        name: Ident::new("Pair"),
-        module,
-        kind: AggregateKind::Struct,
-        type_args: vec![],
-        const_args: vec![],
-        fields: vec![
-            FieldDecl {
-                name: Ident::new("a"),
-                ty: int_ty,
-            },
-            FieldDecl {
-                name: Ident::new("b"),
-                ty: int_ty,
-            },
-        ],
-        cycle_capable: false,
-        stringify_override: None,
-    });
-    let pair_ty = builder.alloc_type(TypeData::Aggregate(pair));
-
-    let mut callee = FunctionBuilder::new("callee", module, FunctionKind::Normal, void_ty);
-    callee.push_param_with_mode("a", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
-    callee.push_param_with_mode("b", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
-    callee.push_block(term_return_void());
-    let callee = builder.alloc_function(callee.finish());
-
-    let mut caller = FunctionBuilder::new("caller", module, FunctionKind::Normal, void_ty);
-    let local = caller.push_local(Some("pair"), pair_ty, Mutability::Mutable, LocalKind::User);
-    let field = |index| Place {
-        root: local,
-        projection: vec![Projection::Field(FieldId::from_index(index))],
-        ty: int_ty,
-    };
-    let block = caller.push_block(term_return_void());
-    caller.add_statement(
-        block,
-        stmt_eval(RValue::Call {
-            callee: Callee::Function(callee),
-            args: vec![CallArg::MutBorrow(field(0)), CallArg::MutBorrow(field(1))],
-        }),
-    );
-    let caller = builder.alloc_function(caller.finish());
-    builder.set_entry(caller);
 
     expect_verified(&builder.finish());
 }
@@ -172,108 +341,6 @@ fn primitive_rvalues() {
     }
     let func_id = builder.alloc_function(fb.finish());
     builder.set_entry(func_id);
-
-    expect_verified(&builder.finish());
-}
-
-#[test]
-fn stringify_accepts_non_scalar_source_types() {
-    let mut builder = ProgramBuilder::default();
-    let int_ty = builder.int_ty();
-    let string_ty = builder.string_ty();
-    let void_ty = builder.void_ty();
-    let module = test_module(&mut builder);
-    let aggregate = builder.alloc_aggregate(AggregateDecl {
-        name: Ident::new("S"),
-        module,
-        kind: AggregateKind::Struct,
-        type_args: vec![],
-        const_args: vec![],
-        fields: vec![],
-        cycle_capable: false,
-        stringify_override: None,
-    });
-    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
-    let dataref = builder.alloc_aggregate(AggregateDecl {
-        name: Ident::new("Node"),
-        module,
-        kind: AggregateKind::DataRef,
-        type_args: vec![],
-        const_args: vec![],
-        fields: vec![],
-        cycle_capable: true,
-        stringify_override: None,
-    });
-    let dataref_ty = builder.alloc_type(TypeData::DataRef(dataref));
-    let enum_id = builder.alloc_enum(EnumDecl {
-        name: Ident::new("E"),
-        module,
-        type_args: vec![],
-        const_args: vec![],
-        variants: vec![VariantDecl {
-            name: Ident::new("V"),
-            shape: VariantShape::Unit,
-        }],
-    });
-    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
-    let extern_id = builder.alloc_extern_type(ExternTypeDecl {
-        name: Ident::new("Handle"),
-        module,
-        type_args: vec![],
-        const_args: vec![],
-        rep: ExternRep::Shared,
-        has_init: false,
-        fields: vec![],
-        methods: vec![],
-        statics: vec![],
-        operators: vec![],
-    });
-    let extern_ty = builder.alloc_type(TypeData::Extern(extern_id));
-    let dyn_ty = builder.alloc_type(TypeData::Dyn(crate::air::DynContractData {
-        display_name: "Drawable".into(),
-        method_table_key: "Drawable".into(),
-        concrete_printer: None,
-    }));
-    let source_tys = vec![
-        aggregate_ty,
-        dataref_ty,
-        enum_ty,
-        builder.alloc_type(TypeData::Tuple(vec![int_ty, string_ty])),
-        builder.alloc_type(TypeData::List(int_ty)),
-        builder.alloc_type(TypeData::Array {
-            elem: int_ty,
-            len: 2,
-        }),
-        builder.alloc_type(TypeData::Map {
-            key: string_ty,
-            value: int_ty,
-            order: MapOrder::Insertion,
-        }),
-        builder.alloc_type(TypeData::Optional(int_ty)),
-        builder.alloc_type(TypeData::Function(SignatureType::new(
-            vec![ParamType {
-                ty: int_ty,
-                mode: ParamMode::Value,
-            }],
-            ReturnMode::Value(string_ty),
-        ))),
-        extern_ty,
-        builder.alloc_type(TypeData::Slice(int_ty)),
-        dyn_ty,
-    ];
-    let mut fb = FunctionBuilder::new("stringify", module, FunctionKind::Normal, void_ty);
-    let block = fb.push_block(term_return_void());
-    for ty in source_tys {
-        let local = fb.push_local(None, ty, Mutability::Immutable, LocalKind::User);
-        fb.add_statement(
-            block,
-            stmt_eval(RValue::Stringify {
-                value: op_place(local, ty),
-                source_ty: ty,
-            }),
-        );
-    }
-    builder.alloc_function(fb.finish());
 
     expect_verified(&builder.finish());
 }
@@ -389,16 +456,33 @@ fn enum_switch() {
 
     let mut fb = FunctionBuilder::new("switch_color", module, FunctionKind::Normal, void_ty);
     let p_c = fb.push_param("c", enum_ty, ParamRole::Normal);
-    let bb_then = fb.push_block(term_return_void());
-    let bb_else = fb.push_block(term_return_void());
-    fb.push_block(term_switch_enum(
-        place(p_c, enum_ty),
-        vec![
-            (VariantId::from_index(0), bb_then),
-            (VariantId::from_index(1), bb_then),
-        ],
-        Some(bb_else),
-    ));
+    let block = fb.push_block(term_return_void());
+    fb.add_statement(
+        block,
+        AirStmt::EnumMatch(AirEnumMatch {
+            discr: place(p_c, enum_ty),
+            arms: vec![
+                AirEnumMatchArm {
+                    variant: VariantId::from_index(0),
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: term_return_void(),
+                    },
+                },
+                AirEnumMatchArm {
+                    variant: VariantId::from_index(1),
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: term_return_void(),
+                    },
+                },
+            ],
+            else_block: Some(AirBlock {
+                stmts: vec![],
+                tail: term_return_void(),
+            }),
+        }),
+    );
 
     let fid = builder.alloc_function(fb.finish());
     builder.set_entry(fid);
@@ -497,32 +581,25 @@ fn if_bool() {
 
     let mut fb = FunctionBuilder::new("branch", module, FunctionKind::Normal, void_ty);
     let p_cond = fb.push_param("cond", bool_ty, ParamRole::Normal);
-    let bb_then = fb.push_block(term_return_void());
-    let bb_else = fb.push_block(term_return_void());
-    fb.push_block(term_if(op_place(p_cond, bool_ty), bb_then, bb_else));
+    let block = fb.push_block(term_return_void());
+    fb.add_statement(
+        block,
+        AirStmt::If(AirIf {
+            cond: op_place(p_cond, bool_ty),
+            then_block: AirBlock {
+                stmts: vec![],
+                tail: term_return_void(),
+            },
+            else_block: Some(AirBlock {
+                stmts: vec![],
+                tail: term_return_void(),
+            }),
+        }),
+    );
 
     let fid = builder.alloc_function(fb.finish());
     builder.set_entry(fid);
     expect_verified(&builder.finish());
-}
-
-#[test]
-fn multi_block_goto() {
-    let mut builder = ProgramBuilder::default();
-    let void_ty = builder.void_ty();
-    let module = test_module(&mut builder);
-
-    let mut fb = FunctionBuilder::new("multi_block", module, FunctionKind::Normal, void_ty);
-    let bb_end = fb.push_block(term_return_void());
-    let bb_mid = fb.push_block(term_goto(bb_end));
-    fb.push_block(term_goto(bb_mid));
-
-    let func_id = builder.alloc_function(fb.finish());
-    builder.set_entry(func_id);
-
-    let program = builder.finish();
-    expect_verified(&program);
-    assert_eq!(program.function(func_id).body.len(), 3);
 }
 
 #[test]
@@ -536,82 +613,6 @@ fn unreachable_fn() {
 
     let fid = builder.alloc_function(fb.finish());
     builder.set_entry(fid);
-    expect_verified(&builder.finish());
-}
-
-#[test]
-fn tuple_and_list() {
-    let mut builder = ProgramBuilder::default();
-    let int_ty = builder.int_ty();
-    let bool_ty = builder.bool_ty();
-    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![int_ty, bool_ty]));
-    let list_ty = builder.alloc_type(TypeData::List(int_ty));
-    builder.alloc_type(TypeData::Map {
-        key: int_ty,
-        value: bool_ty,
-        order: MapOrder::Insertion,
-    });
-    let module = test_module(&mut builder);
-
-    let mut fb = FunctionBuilder::new("types_ok", module, FunctionKind::Normal, int_ty);
-    fb.push_local(None, tuple_ty, Mutability::Immutable, LocalKind::User);
-    fb.push_local(None, list_ty, Mutability::Mutable, LocalKind::User);
-    let local_ret = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Return);
-    fb.push_block(term_return(op_place(local_ret, int_ty)));
-
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-    expect_verified(&builder.finish());
-}
-
-#[test]
-fn closure_make_call() {
-    let mut builder = ProgramBuilder::default();
-    let int_ty = builder.int_ty();
-    let module = test_module(&mut builder);
-
-    let mut inner_fb = FunctionBuilder::new("inner", module, FunctionKind::Closure, int_ty);
-    inner_fb.push_param("e", int_ty, ParamRole::CaptureEnv);
-    let ret_local = inner_fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Return);
-    inner_fb.push_block(term_return(op_place(ret_local, int_ty)));
-    let inner_id = builder.alloc_function(inner_fb.finish());
-
-    let sig_type = builder.alloc_type(TypeData::Function(SignatureType::new(
-        vec![ParamType {
-            ty: int_ty,
-            mode: ParamMode::Value,
-        }],
-        ReturnMode::Value(int_ty),
-    )));
-
-    let mut outer_fb = FunctionBuilder::new("outer", module, FunctionKind::Normal, int_ty);
-    let p_closure = outer_fb.push_param("f", sig_type, ParamRole::Normal);
-    let p_arg = outer_fb.push_param("arg", int_ty, ParamRole::Normal);
-    let call_result = outer_fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
-
-    let bb0 = outer_fb.push_block(Terminator::Return(Some(op_place(call_result, int_ty))));
-    outer_fb.add_statement(
-        bb0,
-        stmt_init(
-            call_result,
-            RValue::Call {
-                callee: Callee::Closure(op_place(p_closure, sig_type)),
-                args: vec![CallArg::Value(op_place(p_arg, int_ty))],
-            },
-        ),
-    );
-    outer_fb.add_statement(
-        bb0,
-        stmt_eval(RValue::MakeClosure {
-            func: inner_id,
-            captures: vec![op_place(p_arg, int_ty)],
-            ty: sig_type,
-        }),
-    );
-
-    let outer_id = builder.alloc_function(outer_fb.finish());
-    builder.set_entry(outer_id);
-
     expect_verified(&builder.finish());
 }
 

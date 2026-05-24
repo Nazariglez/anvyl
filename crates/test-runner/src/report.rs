@@ -246,7 +246,7 @@ impl Summary {
         JsonReport {
             schema_version: JSON_SCHEMA_VERSION,
             backend: args.backend.as_str().to_string(),
-            new_frontend: args.new_frontend,
+            new_frontend: args.new_frontend(),
             input_paths: args
                 .paths
                 .iter()
@@ -526,7 +526,10 @@ mod tests {
 
     use super::Summary;
     use crate::{
-        args::{BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, RunnerArgs},
+        args::{
+            BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, FrontendArg,
+            RunnerArgs,
+        },
         model::{FailurePhase, Mode, RunTestResult, TestResult},
     };
 
@@ -540,13 +543,13 @@ mod tests {
             report_json: true,
             release: false,
             backend,
-            new_frontend: false,
+            frontend: FrontendArg::Default,
         }
     }
 
     fn new_frontend_args() -> RunnerArgs {
         RunnerArgs {
-            new_frontend: true,
+            frontend: FrontendArg::New,
             ..runner_args(BackendArg::Vm)
         }
     }

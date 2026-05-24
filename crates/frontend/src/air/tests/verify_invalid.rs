@@ -3,7 +3,7 @@ use verify::{
     BadStatement, BadType, ModuleItem, PrimitiveKind, VerifyError, VerifyErrorKind as EK,
 };
 
-use super::*;
+use super::{super::verify::verify_structured_body, *};
 use crate::ast::Ident;
 
 fn field(name: &str, ty: TypeId) -> FieldDecl {
@@ -43,46 +43,31 @@ fn entry_function_out_of_range() {
 }
 
 #[test]
-fn fn_no_blocks() {
+fn structured_if_not_bool() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
     let module = test_module(&mut builder);
-
-    let func = Function {
-        name: Ident::new("empty"),
-        module,
-        kind: FunctionKind::Normal,
-        signature: Signature::new(vec![], void_ty),
-        locals: vec![],
-        body: vec![],
+    let mut fb = FunctionBuilder::new("bad", module, FunctionKind::Normal, void_ty);
+    let cond = fb.push_param("cond", int_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::If(AirIf {
+                cond: op_place(cond, int_ty),
+                then_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(None),
+                },
+                else_block: None,
+            })],
+            tail: AirTail::Return(None),
+        },
     };
-    let func_id = builder.alloc_function(func);
-    builder.set_entry(func_id);
+    let program = builder.finish();
 
-    let errors = verify(&builder.finish()).unwrap_err();
-    assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e.kind, EK::BadFunction(BadFunction::FunctionHasNoBlocks)))
-    );
-}
-
-#[test]
-fn if_not_bool() {
-    let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
-    let void_ty = builder.alloc_type(TypeData::Void);
-    let module = test_module(&mut builder);
-
-    let mut fb = FunctionBuilder::new("bad_cond", module, FunctionKind::Normal, void_ty);
-    let p_n = fb.push_param("n", int_ty, ParamRole::Normal);
-    let bb_then = fb.push_block(term_return_void());
-    let bb_else = fb.push_block(term_return_void());
-    fb.push_block(term_if(op_place(p_n, int_ty), bb_then, bb_else));
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-
-    let errors = verify(&builder.finish()).unwrap_err();
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadFunction(BadFunction::IfCondMustBeBool(t)) if t == int_ty
@@ -90,60 +75,313 @@ fn if_not_bool() {
 }
 
 #[test]
-fn switch_not_enum() {
+fn structured_branch_result_missing_on_one_path() {
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let bool_ty = builder.bool_ty();
+    let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("missing", module, FunctionKind::Normal, int_ty);
+    let cond = fb.push_param("cond", bool_ty, ParamRole::Normal);
+    let out = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_return(op_const(one)));
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::If(AirIf {
+                cond: op_place(cond, bool_ty),
+                then_block: AirBlock {
+                    stmts: vec![AirStmt::Init {
+                        local: out,
+                        value: RValue::Use(op_const(one)),
+                    }],
+                    tail: AirTail::None,
+                },
+                else_block: None,
+            })],
+            tail: AirTail::Return(Some(op_place(out, int_ty))),
+        },
+    };
+    let program = builder.finish();
 
-    let mut fb = FunctionBuilder::new("bad_switch", module, FunctionKind::Normal, void_ty);
-    let p_n = fb.push_param("n", int_ty, ParamRole::Normal);
-    let bb_end = fb.push_block(term_return_void());
-    fb.push_block(term_switch_enum(place(p_n, int_ty), vec![], Some(bb_end)));
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-
-    let errors = verify(&builder.finish()).unwrap_err();
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::SwitchDiscriminantMustBeEnum(t)) if t == int_ty
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == out
     )));
 }
 
 #[test]
-fn switch_bad_variant() {
+fn closure_callee_read_must_be_initialized() {
     let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
+    let void_ty = builder.void_ty();
+    let closure_ty = builder.alloc_type(TypeData::Function(SignatureType {
+        params: vec![],
+        ret: ReturnMode::Value(void_ty),
+    }));
     let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_closure", module, FunctionKind::Normal, void_ty);
+    let closure = fb.push_local(None, closure_ty, Mutability::Immutable, LocalKind::User);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::Eval(RValue::Call {
+                callee: Callee::Closure(op_place(closure, closure_ty)),
+                args: vec![],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
 
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == closure
+    )));
+}
+
+#[test]
+fn structured_rejects_init_and_assign_errors() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("bad_init", module, FunctionKind::Normal, void_ty);
+    let local = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let uninit = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::Temp);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![
+                AirStmt::Init {
+                    local,
+                    value: RValue::Use(op_const(one)),
+                },
+                AirStmt::Init {
+                    local,
+                    value: RValue::Use(op_const(one)),
+                },
+                AirStmt::Assign {
+                    dst: place(uninit, int_ty),
+                    value: RValue::Use(op_const(one)),
+                },
+            ],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::InitImmutableLocalTwice(found)) if found == local
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::AssignUninitializedLocal(found)) if found == uninit
+    )));
+}
+
+#[test]
+fn structured_break_continue_outside_loop() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_tail", module, FunctionKind::Normal, void_ty);
+    fb.push_block(term_return_void());
+    let break_id = builder.alloc_function(fb.finish());
+    let break_body = AirBody {
+        block: AirBlock {
+            stmts: vec![],
+            tail: AirTail::Break(AirLoopId::from_index(0)),
+        },
+    };
+    let continue_body = AirBody {
+        block: AirBlock {
+            stmts: vec![],
+            tail: AirTail::Continue(AirLoopId::from_index(0)),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, break_id, &break_body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::BreakOutsideLoop(AirLoopId(0)))
+    )));
+    let errors = verify_structured_body(&program, break_id, &continue_body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::ContinueOutsideLoop(AirLoopId(0)))
+    )));
+}
+
+#[test]
+fn structured_return_and_match_errors() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let module = test_module(&mut builder);
+    let yes = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let mut fb = FunctionBuilder::new("bad_return", module, FunctionKind::Normal, int_ty);
+    fb.push_block(term_return(op_const(yes)));
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![],
+            tail: AirTail::Return(Some(op_const(yes))),
+        },
+    };
+    let program = builder.finish();
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::ReturnedTypeMismatch { expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+
+    let mut builder = ProgramBuilder::default();
+    let bool_ty = builder.bool_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let yes = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let mut fb = FunctionBuilder::new("bad_void", module, FunctionKind::Normal, void_ty);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![],
+            tail: AirTail::Return(Some(op_const(yes))),
+        },
+    };
+    let program = builder.finish();
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::VoidFunctionMustReturnNone)
+    )));
+}
+
+#[test]
+fn structured_match_rejects_wrong_discriminant_and_variant() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
     let enum_id = builder.alloc_enum(EnumDecl {
-        name: Ident::new("Color"),
+        name: Ident::new("Choice"),
         module,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
-            name: Ident::new("Red"),
+            name: Ident::new("A"),
             shape: VariantShape::Unit,
         }],
     });
     let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
-
-    let mut fb = FunctionBuilder::new("wrong_variant", module, FunctionKind::Normal, void_ty);
-    let p_c = fb.push_param("c", enum_ty, ParamRole::Normal);
-    let bb_end = fb.push_block(term_return_void());
-    fb.push_block(term_switch_enum(
-        place(p_c, enum_ty),
-        vec![(VariantId::from_index(99), bb_end)],
-        None,
-    ));
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-
-    let errors = verify(&builder.finish()).unwrap_err();
+    let mut fb = FunctionBuilder::new("bad_match", module, FunctionKind::Normal, void_ty);
+    let discr = fb.push_param("value", int_ty, ParamRole::Normal);
+    let enum_discr = fb.push_param("enum_value", enum_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let arm = AirEnumMatchArm {
+        variant: VariantId::from_index(99),
+        block: AirBlock {
+            stmts: vec![],
+            tail: AirTail::Return(None),
+        },
+    };
+    let bad_discr = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::EnumMatch(AirEnumMatch {
+                discr: place(discr, int_ty),
+                arms: vec![],
+                else_block: Some(AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(None),
+                }),
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let bad_variant = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::EnumMatch(AirEnumMatch {
+                discr: place(enum_discr, enum_ty),
+                arms: vec![arm],
+                else_block: Some(AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(None),
+                }),
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+    let errors = verify_structured_body(&program, func_id, &bad_discr).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::SwitchArmVariantMismatch { expected_enum, variant: VariantId(v) })
-            if expected_enum == enum_id && v == 99
+        EK::BadFunction(BadFunction::SwitchDiscriminantMustBeEnum(found)) if found == int_ty
+    )));
+    let errors = verify_structured_body(&program, func_id, &bad_variant).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::SwitchArmVariantMismatch { expected_enum, variant })
+            if expected_enum == enum_id && variant == VariantId::from_index(99)
+    )));
+}
+
+#[test]
+fn structured_slice_bounds_must_be_initialized() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_slice", module, FunctionKind::Normal, void_ty);
+    let list = fb.push_param("list", list_ty, ParamRole::Normal);
+    let start = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let end = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::Eval(RValue::ListSlice {
+                source: place(list, list_ty),
+                start,
+                end,
+                inclusive: false,
+                ty: list_ty,
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(found)) if found == start
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(found)) if found == end
     )));
 }
 
@@ -157,12 +395,21 @@ fn switch_invalid_enum_type_does_not_panic() {
 
     let mut fb = FunctionBuilder::new("bad_switch_enum", module, FunctionKind::Normal, void_ty);
     let value = fb.push_param("value", enum_ty, ParamRole::Normal);
-    let bb_end = fb.push_block(term_return_void());
-    fb.push_block(term_switch_enum(
-        place(value, enum_ty),
-        vec![(VariantId::from_index(0), bb_end)],
-        None,
-    ));
+    let block = fb.push_block(term_return_void());
+    fb.add_statement(
+        block,
+        AirStmt::EnumMatch(AirEnumMatch {
+            discr: place(value, enum_ty),
+            arms: vec![AirEnumMatchArm {
+                variant: VariantId::from_index(0),
+                block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(None),
+                },
+            }],
+            else_block: None,
+        }),
+    );
     let fid = builder.alloc_function(fb.finish());
     builder.set_entry(fid);
 
@@ -208,12 +455,13 @@ fn place_return_must_return_place() {
         name: Ident::new("bad_place_return"),
         module,
         kind: FunctionKind::Normal,
+        owner: None,
         signature: Signature::with_return_mode(vec![], ReturnMode::Place(int_ty)),
         locals: vec![],
-        body: vec![BasicBlock {
-            statements: vec![],
-            terminator: term_return(op_const(value)),
-        }],
+        body: body_from_block(AirBlock {
+            stmts: vec![],
+            tail: term_return(op_const(value)),
+        }),
     };
     let fid = builder.alloc_function(func);
     builder.set_entry(fid);
@@ -264,24 +512,6 @@ fn nonvoid_fn_returns_none() {
 }
 
 #[test]
-fn goto_bad_block() {
-    let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
-    let module = test_module(&mut builder);
-
-    let mut fb = FunctionBuilder::new("bad_goto", module, FunctionKind::Normal, void_ty);
-    fb.push_block(term_goto(BlockId::from_index(99)));
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-
-    let errors = verify(&builder.finish()).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(
-        e.kind,
-        EK::BadReference(BadReference::InvalidBlock(BlockId(id))) if id == 99
-    )));
-}
-
-#[test]
 fn fn_bad_type() {
     let mut builder = ProgramBuilder::default();
     builder.alloc_type(TypeData::Void);
@@ -291,12 +521,13 @@ fn fn_bad_type() {
         name: Ident::new("f"),
         module,
         kind: FunctionKind::Normal,
+        owner: None,
         signature: Signature::new(vec![], TypeId::from_index(999)),
         locals: vec![],
-        body: vec![BasicBlock {
-            statements: vec![],
-            terminator: Terminator::Return(None),
-        }],
+        body: body_from_block(AirBlock {
+            stmts: vec![],
+            tail: AirTail::Return(None),
+        }),
     };
     let fid = builder.alloc_function(func);
     builder.set_entry(fid);
@@ -521,6 +752,43 @@ fn call_value_arg_invalid_type_does_not_panic() {
 }
 
 #[test]
+fn shared_string_const_invalid_id_does_not_panic() {
+    let mut builder = ProgramBuilder::default();
+    let string_ty = builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+
+    let ext_id = builder.alloc_extern(ExternDecl {
+        name: Ident::new("print"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![ExternParamDecl {
+            ty: string_ty,
+            mode: ParamMode::SharedBorrow,
+        }],
+        return_type: void_ty,
+    });
+
+    let mut fb = FunctionBuilder::new("bad_call", module, FunctionKind::Normal, void_ty);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Extern(ext_id),
+            args: vec![CallArg::SharedStringConst(ConstId::from_index(999))],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidConst(ConstId(id))) if id == 999
+    )));
+}
+
+#[test]
 fn call_arg_type_mismatch() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -648,51 +916,6 @@ fn index_proj_non_indexable() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadPlace(BadPlace::IndexProjectionOnNonIndexable(t)) if t == int_ty
-    )));
-}
-
-#[test]
-fn duplicate_switch_arm() {
-    let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
-    let module = test_module(&mut builder);
-
-    let enum_id = builder.alloc_enum(EnumDecl {
-        name: Ident::new("Dup"),
-        module,
-        type_args: vec![],
-        const_args: vec![],
-        variants: vec![
-            VariantDecl {
-                name: Ident::new("A"),
-                shape: VariantShape::Unit,
-            },
-            VariantDecl {
-                name: Ident::new("B"),
-                shape: VariantShape::Unit,
-            },
-        ],
-    });
-    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
-
-    let mut fb = FunctionBuilder::new("dup_arm", module, FunctionKind::Normal, void_ty);
-    let p_c = fb.push_param("c", enum_ty, ParamRole::Normal);
-    let bb_end = fb.push_block(term_return_void());
-    fb.push_block(term_switch_enum(
-        place(p_c, enum_ty),
-        vec![
-            (VariantId::from_index(0), bb_end),
-            (VariantId::from_index(0), bb_end),
-        ],
-        None,
-    ));
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-
-    let errors = verify(&builder.finish()).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(
-        e.kind,
-        EK::BadFunction(BadFunction::DuplicateSwitchArm(VariantId(v))) if v == 0
     )));
 }
 
@@ -987,6 +1210,7 @@ fn function_param_local_must_match() {
         name: Ident::new("bad_param"),
         module,
         kind: FunctionKind::Normal,
+        owner: None,
         signature: Signature::new(
             vec![Param {
                 name: Some(Ident::new("p")),
@@ -1003,10 +1227,10 @@ fn function_param_local_must_match() {
             mutability: Mutability::Immutable,
             kind: LocalKind::User,
         }],
-        body: vec![BasicBlock {
-            statements: vec![],
-            terminator: term_return(op_place(local, bool_ty)),
-        }],
+        body: body_from_block(AirBlock {
+            stmts: vec![],
+            tail: term_return(op_place(local, bool_ty)),
+        }),
     };
     let fid = builder.alloc_function(func);
     builder.set_entry(fid);
@@ -1461,6 +1685,7 @@ fn aggregate_stringify_override_wrong_shape() {
         name: Ident::new("bad_ret_mode"),
         module,
         kind: FunctionKind::Method,
+        owner: None,
         signature: Signature::with_return_mode(
             vec![Param {
                 name: Some(Ident::new("self")),
@@ -1485,10 +1710,10 @@ fn aggregate_stringify_override_wrong_shape() {
                 kind: LocalKind::User,
             },
         ],
-        body: vec![BasicBlock {
-            statements: vec![],
-            terminator: term_return(op_place(place_ret_value, string_ty)),
-        }],
+        body: body_from_block(AirBlock {
+            stmts: vec![],
+            tail: term_return(op_place(place_ret_value, string_ty)),
+        }),
     });
 
     let mut wrong_receiver =

@@ -7,7 +7,6 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
 pub(crate) mod lower;
 mod typing;
 mod verify;
@@ -17,14 +16,38 @@ use std::fmt::Write;
 pub use body::*;
 pub use decl::*;
 pub use ids::{
-    AggregateId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FieldId, FunctionId, LocalId,
-    ModuleId, TypeId, VariantId,
+    AggregateId, AirLoopId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FieldId, FunctionId,
+    LocalId, ModuleId, TypeId, VariantId,
 };
 pub use ownership::*;
 pub use types::*;
 pub use verify::*;
 
 use crate::ast::Ident;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedVerifiedProgram {
+    program: Program,
+}
+
+impl OwnedVerifiedProgram {
+    pub fn new(program: Program) -> Result<Self, Vec<VerifyError>> {
+        verify(&program)?;
+        Ok(Self { program })
+    }
+
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
+    pub fn as_verified(&self) -> VerifiedProgram<'_> {
+        verify(&self.program).expect("owned AIR program was verified before construction")
+    }
+
+    pub fn into_program(self) -> Program {
+        self.program
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Program {

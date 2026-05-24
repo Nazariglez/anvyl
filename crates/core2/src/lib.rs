@@ -131,6 +131,8 @@ fn runtime_provider() -> anvyx_externs::ProviderDescriptor {
         fn _println(message: string) -> void;,
         fn _assert(condition: bool, message: string) -> void;
     );
+    provider.modules[0].functions[0].signature.params[0].flow = anvyx_externs::ParamFlow::Borrow;
+    provider.modules[0].functions[1].signature.params[1].flow = anvyx_externs::ParamFlow::Borrow;
     provider.modules[0].functions[1].effects.fallible = true;
     provider
 }
@@ -248,6 +250,10 @@ mod tests {
             runtime[0].signature.ret,
             anvyx_externs::ExternTypeExpr::Void
         );
+        assert_eq!(
+            runtime[0].signature.params[0].flow,
+            anvyx_externs::ParamFlow::Borrow
+        );
         assert!(!runtime[0].effects.fallible);
 
         assert_eq!(runtime[1].name, "_assert");
@@ -258,6 +264,14 @@ mod tests {
         assert_eq!(
             runtime[1].signature.params[1].ty,
             anvyx_externs::ExternTypeExpr::String
+        );
+        assert_eq!(
+            runtime[1].signature.params[0].flow,
+            anvyx_externs::ParamFlow::Value
+        );
+        assert_eq!(
+            runtime[1].signature.params[1].flow,
+            anvyx_externs::ParamFlow::Borrow
         );
         assert_eq!(
             runtime[1].signature.ret,

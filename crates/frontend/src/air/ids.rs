@@ -26,5 +26,6 @@ define_id!(TypeId);
 define_id!(ConstId);
 define_id!(LocalId);
 define_id!(BlockId);
+define_id!(AirLoopId);
 define_id!(FieldId);
 define_id!(VariantId);

@@ -3,13 +3,14 @@ use std::collections::HashMap;
 use anvyx_externs::ParamFlow;
 
 use super::{
-    AggregateDecl, AggregateKind, BasicBlock, BlockId, CallArg, Callee, ConstData, ConstValue,
-    DynContractData, EnumDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember,
-    ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
-    ExternStaticDecl, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind,
-    Local, LocalId, LocalKind, Module, ModuleId, Mutability as AirMutability, Operand, Param,
-    ParamMode, ParamRole, ParamType, Place, Program, RValue, ReturnMode, Signature, SignatureType,
-    Statement, Terminator, TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
+    AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
+    AirIf, AirStmt, AirTail, CallArg, Callee, ConstData, ConstId, ConstValue, DynContractData,
+    EnumDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp,
+    ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeDecl,
+    FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner, Local, LocalId,
+    LocalKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamMode, ParamRole,
+    ParamType, Place, Program, RValue, ReturnMode, Signature, SignatureType, TypeData, TypeId,
+    VariantDecl, VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes, ScalarType},
     verify,
 };
@@ -23,10 +24,10 @@ use crate::{
     source::SourceId,
     span::SourceSpan,
     typecheck::{
-        BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind, ConstTerm,
-        DeclarationIndex, DefaultArgFact, ExternUseTarget, GenericArgs, LocalDefFact, LocalDefKind,
-        LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
-        NominalKey, SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId,
+        BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind, CallableParent,
+        ConstTerm, DeclarationIndex, DefaultArgFact, ExternUseTarget, GenericArgs, LocalDefFact,
+        LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface,
+        ModuleScope, NominalKey, SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId,
         SemanticProgram, VariantPayload, nominal_generic_args, substitute_aggregate_member,
         type_has_unfinished_facts,
     },
@@ -870,12 +871,12 @@ impl LowerCx {
                     name: source.callable.name(),
                     module,
                     kind: source.callable.function_kind(),
+                    owner: source.callable.owner(),
                     signature: Signature::with_return_mode(params, return_mode),
                     locals,
-                    body: vec![BasicBlock {
-                        statements: vec![],
-                        terminator: Terminator::Unreachable,
-                    }],
+                    body: AirBody {
+                        block: AirBlock::default(),
+                    },
                 }
             });
         }
@@ -922,6 +923,11 @@ impl LowerCx {
     }
 }
 
+type EnumMatchArms<'a> = (
+    Vec<(crate::air::VariantId, &'a ExprNode)>,
+    Option<&'a ExprNode>,
+);
+
 struct FunctionLowerer<'cx, 'facts> {
     cx: &'cx mut LowerCx,
     body: BodyInstanceKey,
@@ -931,7 +937,7 @@ struct FunctionLowerer<'cx, 'facts> {
     source: SourceId,
     function: Function,
     locals: HashMap<SemanticLocalId, LocalId>,
-    current: BlockId,
+    block: AirBlock,
     terminated: bool,
 }
 
@@ -944,11 +950,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         function_id: FunctionId,
         locals: HashMap<SemanticLocalId, LocalId>,
     ) -> Self {
-        let mut function = cx.program.function(function_id).clone();
-        function.body = vec![BasicBlock {
-            statements: vec![],
-            terminator: Terminator::Unreachable,
-        }];
+        let function = cx.program.function(function_id).clone();
         Self {
             cx,
             body: source.body.clone(),
@@ -958,7 +960,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             source: source.source,
             function,
             locals,
-            current: BlockId::from_index(0),
+            block: AirBlock::default(),
             terminated: false,
         }
     }
@@ -972,15 +974,20 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 self.lower_effect(tail)?;
             } else {
                 let value = self.lower_return_operand(tail)?;
-                self.terminate(Terminator::Return(Some(value)))?;
+                if !self.terminated {
+                    self.terminate(AirTail::Return(Some(value)))?;
+                }
             }
         }
         if !self.terminated && self.returns_void() {
-            self.terminate(Terminator::Return(None))?;
+            self.terminate(AirTail::Return(None))?;
         }
         if !self.terminated {
             return Err(LowerError::UnterminatedBlock);
         }
+        self.function.body = AirBody {
+            block: std::mem::take(&mut self.block),
+        };
         self.cx.program.functions[self.function_id.index()] = self.function.clone();
         Ok(())
     }
@@ -1013,8 +1020,65 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
 
     fn lower_block_effect(&mut self, block: &BlockNode) -> Result<(), LowerError> {
         self.lower_stmts(&block.node.stmts)?;
-        if let Some(tail) = &block.node.tail {
+        if let Some(tail) = &block.node.tail
+            && !self.terminated
+        {
             self.lower_effect(tail)?;
+        }
+        Ok(())
+    }
+
+    fn lower_if_effect(&mut self, if_expr: &ast::IfNode) -> Result<(), LowerError> {
+        let cond = self.lower_if_cond(&if_expr.node.cond)?;
+        let then_block = self.lower_nested_effect(&if_expr.node.then_block)?;
+        let else_block = if let Some(else_block) = &if_expr.node.else_block {
+            Some(self.lower_nested_effect(else_block)?)
+        } else {
+            None
+        };
+        let then_falls = air_block_falls_through(&then_block);
+        let else_falls = else_block.as_ref().is_none_or(air_block_falls_through);
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::If(AirIf {
+            cond,
+            then_block,
+            else_block,
+        }));
+        if !then_falls && !else_falls {
+            self.terminate(AirTail::Unreachable)?;
+        }
+        Ok(())
+    }
+
+    fn lower_match_effect(
+        &mut self,
+        expr: &ExprNode,
+        match_expr: &ast::MatchNode,
+    ) -> Result<(), LowerError> {
+        let discr = self.lower_enum_match_discr(expr, &match_expr.node.scrutinee)?;
+        let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
+        let mut air_arms = vec![];
+        let mut any_falls = false;
+        for (variant, body) in arms {
+            let block = self.lower_nested_expr_effect(body)?;
+            any_falls |= air_block_falls_through(&block);
+            air_arms.push(AirEnumMatchArm { variant, block });
+        }
+        let else_block = if let Some(body) = else_arm {
+            let block = self.lower_nested_expr_effect(body)?;
+            any_falls |= air_block_falls_through(&block);
+            Some(block)
+        } else {
+            None
+        };
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::EnumMatch(AirEnumMatch {
+            discr,
+            arms: air_arms,
+            else_block,
+        }));
+        if !any_falls {
+            self.terminate(AirTail::Unreachable)?;
         }
         Ok(())
     }
@@ -1032,9 +1096,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             Stmt::Return(ret) => match &ret.node.value {
                 Some(value) => {
                     let value = self.lower_return_operand(value)?;
-                    self.terminate(Terminator::Return(Some(value)))
+                    self.terminate(AirTail::Return(Some(value)))
                 }
-                None => self.terminate(Terminator::Return(None)),
+                None => self.terminate(AirTail::Return(None)),
             },
             _ => Err(LowerError::UnsupportedStmt {
                 kind: stmt_kind(&stmt.node),
@@ -1046,7 +1110,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn lower_binding(&mut self, binding: &ast::BindingNode) -> Result<(), LowerError> {
         match &binding.node.pattern.node {
             Pattern::Ident(_) => {
-                let value = self.lower_value(&binding.node.value)?;
+                let init = match self.lower_binding_string_init(&binding.node.value)? {
+                    Some(value) => value,
+                    None => RValue::Use(self.lower_value(&binding.node.value)?),
+                };
                 let site = self.source_span(binding.node.pattern.span);
                 let semantic = self
                     .facts
@@ -1074,7 +1141,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     LocalKind::User,
                 );
                 self.locals.insert(semantic, local);
-                self.emit_init(local, RValue::Use(value))
+                self.emit_init(local, init)
             }
             Pattern::Wildcard if binding.node.mutability == AstMutability::Immutable => {
                 self.lower_effect(&binding.node.value)
@@ -1120,6 +1187,22 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         };
         let local = self.local(fact.local)?;
         self.lower_projected_place(expr, self.local_place(local))
+    }
+
+    fn lower_shared_call_arg(&mut self, expr: &ExprNode) -> Result<CallArg, LowerError> {
+        if matches!(expr.node.kind, ExprKind::Lit(Lit::String(_))) {
+            let Operand::Const(id) = self.lower_value(expr)? else {
+                unreachable!("string literal lowers to const")
+            };
+            return Ok(CallArg::SharedStringConst(id));
+        }
+        self.lower_place_arg(expr, false).map(CallArg::SharedBorrow)
+    }
+
+    fn const_is_string(&self, id: ConstId) -> bool {
+        let konst = self.cx.program.const_arena.get(id);
+        matches!(self.cx.program.type_arena.data(konst.ty), TypeData::String)
+            && matches!(konst.value, ConstValue::String(_))
     }
 
     fn materialize_shared_borrow_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
@@ -1222,12 +1305,19 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn lower_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.lower_lit(expr, lit),
-            ExprKind::Ident(_) => {
+            ExprKind::Ident(_) | ExprKind::Field(_) => {
+                if !self.facts.locals.uses.contains_key(&expr.node.id)
+                    && let Some(value) = self.lower_qualified_unit_enum(expr)?
+                {
+                    return Ok(value);
+                }
                 let fact = self.local_use(expr, LocalUseMode::Read)?;
-                let local = self.local(fact.local)?;
-                Ok(self.operand_place(local))
+                let place = self.lower_place(expr, &fact)?;
+                Ok(Operand::Place(place))
             }
             ExprKind::Block(block) => self.lower_block_value(expr, block),
+            ExprKind::If(if_expr) => self.lower_if_value(expr, if_expr),
+            ExprKind::Match(match_expr) => self.lower_match_value(expr, match_expr),
             ExprKind::Unary(unary) => {
                 self.require_builtin_scalar(expr)?;
                 let value = self.lower_value(&unary.node.expr)?;
@@ -1248,10 +1338,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::Binary(binary) => {
                 let result_ty = self.lower_expr_ty(expr.node.id)?;
                 if binary.node.op == BinaryOp::Add && result_ty == Type::String {
-                    return self.lower_string_concat(&[
-                        binary.node.left.as_ref(),
-                        binary.node.right.as_ref(),
-                    ]);
+                    return self.lower_string_concat(expr);
                 }
                 self.require_builtin_scalar(expr)?;
                 let lhs = self.lower_value(&binary.node.left)?;
@@ -1282,6 +1369,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::Call(call) => self.lower_call_value(expr, call),
             ExprKind::IntrinsicCall(call) => self.lower_intrinsic_value(expr, call),
             ExprKind::StringInterp(parts) => self.lower_string_interp(parts),
+            ExprKind::StructLiteral(literal) => self.lower_struct_literal(expr, literal),
+            ExprKind::InferredEnum(inferred) => self.lower_inferred_enum(expr, inferred),
             ExprKind::Cast(cast) => {
                 self.require_builtin_scalar(expr)?;
                 let source_ty = self.lower_expr_ty(cast.node.expr.node.id)?;
@@ -1303,7 +1392,447 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         }
     }
 
+    fn lower_struct_literal(
+        &mut self,
+        expr: &ExprNode,
+        literal: &ast::StructLiteralNode,
+    ) -> Result<Operand, LowerError> {
+        let ty = self.lower_expr_ty(expr.node.id)?;
+        let ty_id = self.cx.lower_ty(&ty)?;
+        match self.cx.program.type_data(ty_id) {
+            TypeData::Aggregate(aggregate) => {
+                self.lower_struct_aggregate_literal(expr, literal, *aggregate, ty_id)
+            }
+            TypeData::Enum(enum_id) => {
+                self.lower_struct_enum_literal(expr, literal, *enum_id, ty_id)
+            }
+            _ => Err(unsupported_expr(expr)),
+        }
+    }
+
+    fn lower_struct_aggregate_literal(
+        &mut self,
+        expr: &ExprNode,
+        literal: &ast::StructLiteralNode,
+        aggregate: crate::air::AggregateId,
+        ty_id: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let decl = self.cx.program.aggregate(aggregate);
+        if decl.kind != AggregateKind::Struct || decl.fields.len() != literal.node.fields.len() {
+            return Err(unsupported_expr(expr));
+        }
+        let mut values = HashMap::new();
+        for (name, field_expr) in &literal.node.fields {
+            if values.contains_key(name) {
+                return Err(unsupported_expr(expr));
+            }
+            values.insert(*name, self.lower_value(field_expr)?);
+        }
+        let mut fields = vec![];
+        for field in self.cx.program.aggregate(aggregate).fields.clone() {
+            let Some(value) = values.remove(&field.name) else {
+                return Err(unsupported_expr(expr));
+            };
+            if self.operand_type(&value) != self.air_type(field.ty) {
+                return Err(unsupported_expr(expr));
+            }
+            fields.push(value);
+        }
+        self.emit_typed_temp(
+            ty_id,
+            RValue::Aggregate {
+                kind: AggregateCtor::Struct(aggregate),
+                fields,
+                ty: ty_id,
+            },
+        )
+    }
+
+    fn lower_struct_enum_literal(
+        &mut self,
+        expr: &ExprNode,
+        literal: &ast::StructLiteralNode,
+        enum_id: crate::air::EnumId,
+        ty_id: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let Some((variant, expected)) = self.enum_struct_variant(enum_id, literal.node.name) else {
+            return Err(unsupported_expr(expr));
+        };
+        if expected.len() != literal.node.fields.len() {
+            return Err(unsupported_expr(expr));
+        }
+        let mut values = HashMap::new();
+        for (name, field_expr) in &literal.node.fields {
+            if values.contains_key(name) {
+                return Err(unsupported_expr(expr));
+            }
+            values.insert(*name, self.lower_value(field_expr)?);
+        }
+        let mut fields = vec![];
+        for (name, ty) in expected {
+            let Some(value) = values.remove(&name) else {
+                return Err(unsupported_expr(expr));
+            };
+            if self.operand_type(&value) != self.air_type(ty) {
+                return Err(unsupported_expr(expr));
+            }
+            fields.push(value);
+        }
+        self.emit_enum_variant(ty_id, enum_id, variant, fields)
+    }
+
+    fn lower_inferred_enum(
+        &mut self,
+        expr: &ExprNode,
+        inferred: &ast::InferredEnumNode,
+    ) -> Result<Operand, LowerError> {
+        let ty = self.lower_expr_ty(expr.node.id)?;
+        let ty_id = self.cx.lower_ty(&ty)?;
+        let enum_id = match self.cx.program.type_data(ty_id) {
+            TypeData::Enum(enum_id) => *enum_id,
+            _ => return Err(unsupported_expr(expr)),
+        };
+        let Some(variant) = self.enum_variant_id(enum_id, inferred.node.variant) else {
+            return Err(unsupported_expr(expr));
+        };
+        match &inferred.node.args {
+            ast::InferredEnumArgs::Unit => self.emit_enum_variant(ty_id, enum_id, variant, vec![]),
+            ast::InferredEnumArgs::Tuple(args) => {
+                let fields = args
+                    .iter()
+                    .map(|arg| self.lower_value(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.emit_enum_variant(ty_id, enum_id, variant, fields)
+            }
+            ast::InferredEnumArgs::Struct(args) => {
+                let Some((_, expected)) = self.enum_struct_variant(enum_id, inferred.node.variant)
+                else {
+                    return Err(unsupported_expr(expr));
+                };
+                if expected.len() != args.len() {
+                    return Err(unsupported_expr(expr));
+                }
+                let mut values = HashMap::new();
+                for (name, field_expr) in args {
+                    if values.contains_key(name) {
+                        return Err(unsupported_expr(expr));
+                    }
+                    values.insert(*name, self.lower_value(field_expr)?);
+                }
+                let mut fields = vec![];
+                for (name, ty) in expected {
+                    let Some(value) = values.remove(&name) else {
+                        return Err(unsupported_expr(expr));
+                    };
+                    if self.operand_type(&value) != self.air_type(ty) {
+                        return Err(unsupported_expr(expr));
+                    }
+                    fields.push(value);
+                }
+                self.emit_enum_variant(ty_id, enum_id, variant, fields)
+            }
+        }
+    }
+
+    fn lower_qualified_unit_enum(
+        &mut self,
+        expr: &ExprNode,
+    ) -> Result<Option<Operand>, LowerError> {
+        let ExprKind::Field(field) = &expr.node.kind else {
+            return Ok(None);
+        };
+        let ty = self.lower_expr_ty(expr.node.id)?;
+        let ty_id = self.cx.lower_ty(&ty)?;
+        let enum_id = match self.cx.program.type_data(ty_id) {
+            TypeData::Enum(enum_id) => *enum_id,
+            _ => return Ok(None),
+        };
+        let Some(variant) = self.enum_variant_id(enum_id, field.node.field) else {
+            return Err(unsupported_expr(expr));
+        };
+        Ok(Some(self.emit_enum_variant(
+            ty_id,
+            enum_id,
+            variant,
+            vec![],
+        )?))
+    }
+
+    fn emit_enum_variant(
+        &mut self,
+        ty: TypeId,
+        enum_id: crate::air::EnumId,
+        variant: crate::air::VariantId,
+        fields: Vec<Operand>,
+    ) -> Result<Operand, LowerError> {
+        self.emit_typed_temp(
+            ty,
+            RValue::Aggregate {
+                kind: AggregateCtor::EnumVariant { enum_id, variant },
+                fields,
+                ty,
+            },
+        )
+    }
+
+    fn enum_variant_id(
+        &self,
+        enum_id: crate::air::EnumId,
+        name: Ident,
+    ) -> Option<crate::air::VariantId> {
+        self.cx
+            .program
+            .enum_decl(enum_id)
+            .variants
+            .iter()
+            .position(|variant| variant.name == name)
+            .map(crate::air::VariantId::from_index)
+    }
+
+    fn enum_struct_variant(
+        &self,
+        enum_id: crate::air::EnumId,
+        name: Ident,
+    ) -> Option<(crate::air::VariantId, Vec<(Ident, TypeId)>)> {
+        let decl = self.cx.program.enum_decl(enum_id);
+        let (index, variant) = decl
+            .variants
+            .iter()
+            .enumerate()
+            .find(|(_, variant)| variant.name == name)?;
+        let VariantShape::Struct(fields) = &variant.shape else {
+            return None;
+        };
+        Some((
+            crate::air::VariantId::from_index(index),
+            fields.iter().map(|field| (field.name, field.ty)).collect(),
+        ))
+    }
+
+    fn lower_if_value(
+        &mut self,
+        expr: &ExprNode,
+        if_expr: &ast::IfNode,
+    ) -> Result<Operand, LowerError> {
+        let Some(else_block) = &if_expr.node.else_block else {
+            return Err(unsupported_expr(expr));
+        };
+        let result_ty = match self.lower_expr_ty(expr.node.id)? {
+            ty @ (Type::Int | Type::Float | Type::Bool | Type::String) => {
+                Some(self.cx.lower_ty(&ty)?)
+            }
+            Type::Void => None,
+            _ => return Err(unsupported_expr(expr)),
+        };
+        let result = result_ty.map(|ty| self.temp(ty));
+        let cond = self.lower_if_cond(&if_expr.node.cond)?;
+        let then_block = self.lower_nested_branch_value(&if_expr.node.then_block, expr, result)?;
+        let else_block = self.lower_nested_branch_value(else_block, expr, result)?;
+        let then_falls = air_block_falls_through(&then_block);
+        let else_falls = air_block_falls_through(&else_block);
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::If(AirIf {
+            cond,
+            then_block,
+            else_block: Some(else_block),
+        }));
+        if !then_falls && !else_falls {
+            self.terminate(AirTail::Unreachable)?;
+            return self.dummy_operand(self.function.signature.return_type());
+        }
+        let Some(result) = result else {
+            return Err(unsupported_expr(expr));
+        };
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_match_value(
+        &mut self,
+        expr: &ExprNode,
+        match_expr: &ast::MatchNode,
+    ) -> Result<Operand, LowerError> {
+        let result_ty = match self.lower_expr_ty(expr.node.id)? {
+            ty @ (Type::Int | Type::Float | Type::Bool | Type::String) => self.cx.lower_ty(&ty)?,
+            _ => return Err(unsupported_expr(expr)),
+        };
+        let result = self.temp(result_ty);
+        let discr = self.lower_enum_match_discr(expr, &match_expr.node.scrutinee)?;
+        let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
+        let mut any_falls = false;
+        let mut air_arms = vec![];
+        for (variant, body) in arms {
+            let block = self.lower_nested_expr_branch_value(body, result)?;
+            any_falls |= air_block_falls_through(&block);
+            air_arms.push(AirEnumMatchArm { variant, block });
+        }
+        let else_block = if let Some(body) = else_arm {
+            let block = self.lower_nested_expr_branch_value(body, result)?;
+            any_falls |= air_block_falls_through(&block);
+            Some(block)
+        } else {
+            None
+        };
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::EnumMatch(AirEnumMatch {
+            discr,
+            arms: air_arms,
+            else_block,
+        }));
+        if !any_falls {
+            self.terminate(AirTail::Unreachable)?;
+            return self.dummy_operand(result_ty);
+        }
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_enum_match_discr(
+        &mut self,
+        owner: &ExprNode,
+        scrutinee: &ExprNode,
+    ) -> Result<Place, LowerError> {
+        match self.lower_value(scrutinee)? {
+            Operand::Place(place)
+                if matches!(self.cx.program.type_data(place.ty), TypeData::Enum(_)) =>
+            {
+                Ok(place)
+            }
+            _ => Err(unsupported_expr(owner)),
+        }
+    }
+
+    fn enum_match_arms<'a>(
+        &self,
+        owner: &ExprNode,
+        enum_ty: TypeId,
+        arms: &'a [ast::MatchArmNode],
+    ) -> Result<EnumMatchArms<'a>, LowerError> {
+        let TypeData::Enum(enum_id) = self.cx.program.type_data(enum_ty) else {
+            return Err(unsupported_expr(owner));
+        };
+        let mut variants = vec![];
+        let mut else_arm = None;
+        for arm in arms {
+            let ast::MatchArmHead::Pattern(pattern) = &arm.node.head else {
+                return Err(unsupported_expr(owner));
+            };
+            match &pattern.node {
+                Pattern::Wildcard | Pattern::Ident(_) => {
+                    if else_arm.is_some() {
+                        return Err(unsupported_expr(owner));
+                    }
+                    else_arm = Some(&arm.node.body);
+                }
+                Pattern::EnumUnit { variant, .. } | Pattern::InferredEnumUnit { variant } => {
+                    let Some(id) = self.enum_variant_id(*enum_id, *variant) else {
+                        return Err(unsupported_expr(owner));
+                    };
+                    if !matches!(
+                        self.cx.program.enum_decl(*enum_id).variants[id.index()].shape,
+                        VariantShape::Unit
+                    ) {
+                        return Err(unsupported_expr(owner));
+                    }
+                    if variants.iter().any(|(seen, _)| *seen == id) {
+                        return Err(unsupported_expr(owner));
+                    }
+                    variants.push((id, &arm.node.body));
+                }
+                _ => return Err(unsupported_expr(owner)),
+            }
+        }
+        if else_arm.is_none()
+            && variants.len() != self.cx.program.enum_decl(*enum_id).variants.len()
+        {
+            return Err(unsupported_expr(owner));
+        }
+        Ok((variants, else_arm))
+    }
+
+    fn lower_block_branch_value(
+        &mut self,
+        block: &BlockNode,
+        owner: &ExprNode,
+    ) -> Result<Option<Operand>, LowerError> {
+        self.lower_stmts(&block.node.stmts)?;
+        if self.terminated {
+            return Ok(None);
+        }
+        let Some(tail) = &block.node.tail else {
+            return Err(unsupported_expr(owner));
+        };
+        self.lower_value(tail).map(Some)
+    }
+
+    fn lower_nested_effect(&mut self, block: &BlockNode) -> Result<AirBlock, LowerError> {
+        self.with_nested_block(|this| this.lower_block_effect(block))
+    }
+
+    fn lower_nested_expr_effect(&mut self, expr: &ExprNode) -> Result<AirBlock, LowerError> {
+        self.with_nested_block(|this| this.lower_effect(expr))
+    }
+
+    fn lower_nested_branch_value(
+        &mut self,
+        block: &BlockNode,
+        owner: &ExprNode,
+        result: Option<LocalId>,
+    ) -> Result<AirBlock, LowerError> {
+        self.with_nested_block(|this| {
+            if let Some(value) = this.lower_block_branch_value(block, owner)? {
+                let Some(result) = result else {
+                    return Err(unsupported_expr(owner));
+                };
+                this.emit_init(result, RValue::Use(value))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn lower_nested_expr_branch_value(
+        &mut self,
+        expr: &ExprNode,
+        result: LocalId,
+    ) -> Result<AirBlock, LowerError> {
+        self.with_nested_block(|this| {
+            let value = this.lower_value(expr)?;
+            if !this.terminated {
+                this.emit_init(result, RValue::Use(value))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn with_nested_block(
+        &mut self,
+        lower: impl FnOnce(&mut Self) -> Result<(), LowerError>,
+    ) -> Result<AirBlock, LowerError> {
+        let outer_block = std::mem::take(&mut self.block);
+        let outer_terminated = self.terminated;
+        self.terminated = false;
+        lower(self)?;
+        let nested = std::mem::take(&mut self.block);
+        self.block = outer_block;
+        self.terminated = outer_terminated;
+        Ok(nested)
+    }
+
+    fn lower_if_cond(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        let cond = self.lower_value(expr)?;
+        if self.terminated || self.operand_type(&cond) != Type::Bool {
+            return Err(unsupported_expr(expr));
+        }
+        Ok(cond)
+    }
+
     fn lower_string_interp(&mut self, parts: &[ast::StringPart]) -> Result<Operand, LowerError> {
+        let operands = self.lower_string_interp_parts(parts)?;
+        self.emit_string_concat(operands)
+    }
+
+    fn lower_string_interp_parts(
+        &mut self,
+        parts: &[ast::StringPart],
+    ) -> Result<Vec<Operand>, LowerError> {
         let mut operands = vec![];
         for part in parts {
             match part {
@@ -1323,15 +1852,51 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 ast::StringPart::Expr(expr, None) => operands.push(self.lower_string_part(expr)?),
             }
         }
+        Ok(operands)
+    }
+
+    fn lower_string_concat(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        let operands = self.lower_string_concat_parts(expr)?;
         self.emit_string_concat(operands)
     }
 
-    fn lower_string_concat(&mut self, parts: &[&ExprNode]) -> Result<Operand, LowerError> {
-        let operands = parts
-            .iter()
-            .map(|part| self.lower_string_part(part))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.emit_string_concat(operands)
+    fn lower_binding_string_init(&mut self, expr: &ExprNode) -> Result<Option<RValue>, LowerError> {
+        match &expr.node.kind {
+            ExprKind::Binary(binary)
+                if binary.node.op == BinaryOp::Add
+                    && self.lower_expr_ty(expr.node.id)? == Type::String =>
+            {
+                self.lower_string_concat_parts(expr)
+                    .map(|parts| Some(RValue::StringConcat { parts }))
+            }
+            ExprKind::StringInterp(parts) => self
+                .lower_string_interp_parts(parts)
+                .map(|parts| Some(RValue::StringConcat { parts })),
+            _ => Ok(None),
+        }
+    }
+
+    fn lower_string_concat_parts(&mut self, expr: &ExprNode) -> Result<Vec<Operand>, LowerError> {
+        let mut parts = vec![];
+        self.collect_string_concat_parts(expr, &mut parts)?;
+        Ok(parts)
+    }
+
+    fn collect_string_concat_parts(
+        &mut self,
+        expr: &ExprNode,
+        parts: &mut Vec<Operand>,
+    ) -> Result<(), LowerError> {
+        if let ExprKind::Binary(binary) = &expr.node.kind
+            && binary.node.op == BinaryOp::Add
+            && self.lower_expr_ty(expr.node.id)? == Type::String
+        {
+            self.collect_string_concat_parts(&binary.node.left, parts)?;
+            self.collect_string_concat_parts(&binary.node.right, parts)?;
+            return Ok(());
+        }
+        parts.push(self.lower_string_part(expr)?);
+        Ok(())
     }
 
     fn string_ty(&mut self) -> Result<TypeId, LowerError> {
@@ -1411,9 +1976,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             .zip(modes)
             .map(|(expr, mode)| match mode {
                 ParamMode::Value => self.lower_value(expr).map(CallArg::Value),
-                ParamMode::SharedBorrow => {
-                    self.lower_place_arg(expr, false).map(CallArg::SharedBorrow)
-                }
+                ParamMode::SharedBorrow => self.lower_shared_call_arg(expr),
                 ParamMode::MutBorrow => self.lower_place_arg(expr, true).map(CallArg::MutBorrow),
             })
             .collect::<Result<Vec<_>, _>>()
@@ -1476,6 +2039,36 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             .calls
             .get(&expr.node.id)
             .ok_or_else(|| unsupported_expr(expr))?;
+        if target.id.kind == CallableKind::EnumVariant {
+            let CallableParent::Nominal(key) =
+                target.id.parent.as_ref().expect("enum variant owner")
+            else {
+                return Err(unsupported_expr(expr));
+            };
+            let ty = self.lower_expr_ty(expr.node.id)?;
+            let ty_id = self.cx.lower_ty(&ty)?;
+            let enum_id = match self.cx.program.type_data(ty_id) {
+                TypeData::Enum(enum_id) => *enum_id,
+                _ => return Err(unsupported_expr(expr)),
+            };
+            let Some(variant) = self.enum_variant_id(enum_id, target.id.name) else {
+                return Err(unsupported_expr(expr));
+            };
+            if self.cx.program.enum_decl(enum_id).name != key.name {
+                return Err(unsupported_expr(expr));
+            }
+            let fields = call
+                .node
+                .args
+                .iter()
+                .map(|arg| self.lower_value(arg))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(RValue::Aggregate {
+                kind: AggregateCtor::EnumVariant { enum_id, variant },
+                fields,
+                ty: ty_id,
+            });
+        }
         if target.form != CallForm::Normal {
             return Err(LowerError::UnsupportedCallForm {
                 expr_id: expr.node.id,
@@ -1619,9 +2212,14 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let operand = Operand::Const(self.cx.program.alloc_const(ConstData { ty, value }));
         match mode {
             ParamMode::Value => Ok(CallArg::Value(operand)),
-            ParamMode::SharedBorrow => match self.emit_typed_temp(ty, RValue::Use(operand))? {
-                Operand::Place(place) => Ok(CallArg::SharedBorrow(place)),
-                Operand::Const(_) => Err(error()),
+            ParamMode::SharedBorrow => match operand {
+                Operand::Const(id) if self.const_is_string(id) => {
+                    Ok(CallArg::SharedStringConst(id))
+                }
+                operand => match self.emit_typed_temp(ty, RValue::Use(operand))? {
+                    Operand::Place(place) => Ok(CallArg::SharedBorrow(place)),
+                    Operand::Const(_) => Err(error()),
+                },
             },
             ParamMode::MutBorrow => Err(error()),
         }
@@ -1654,6 +2252,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         match &expr.node.kind {
             ExprKind::Assign(assign) => self.lower_assign(expr, assign),
             ExprKind::Block(block) => self.lower_block_effect(block),
+            ExprKind::If(if_expr) => self.lower_if_effect(if_expr),
+            ExprKind::Match(match_expr) => self.lower_match_effect(expr, match_expr),
             ExprKind::Call(call) => {
                 let value = self.lower_call_rvalue(expr, call)?;
                 self.emit_eval(value)
@@ -1670,9 +2270,6 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         expr: &ExprNode,
         assign: &ast::AssignNode,
     ) -> Result<(), LowerError> {
-        if !matches!(assign.node.target.node.kind, ExprKind::Ident(_)) {
-            return Err(unsupported_expr(&assign.node.target));
-        }
         match assign.node.op {
             AssignOp::Assign => {
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
@@ -1688,8 +2285,12 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 if binary == BinaryOp::Add && result_ty == Type::String {
                     let lhs = Operand::Place(dst.clone());
                     let rhs = self.lower_string_part(&assign.node.value)?;
-                    let tmp = self.emit_string_concat(vec![lhs, rhs])?;
-                    return self.emit_assign(dst, RValue::Use(tmp));
+                    return self.emit_assign(
+                        dst,
+                        RValue::StringConcat {
+                            parts: vec![lhs, rhs],
+                        },
+                    );
                 }
                 self.require_builtin_scalar(expr)?;
                 let lhs = Operand::Place(dst.clone());
@@ -1716,13 +2317,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn lower_place(&mut self, expr: &ExprNode, fact: &LocalUseFact) -> Result<Place, LowerError> {
-        match &expr.node.kind {
-            ExprKind::Ident(_) => {
-                let local = self.local(fact.local)?;
-                Ok(self.local_place(local))
-            }
-            _ => Err(unsupported_expr(expr)),
-        }
+        let local = self.local(fact.local)?;
+        self.lower_projected_place(expr, self.local_place(local))
     }
 
     fn require_builtin_scalar(&self, expr: &ExprNode) -> Result<(), LowerError> {
@@ -1849,6 +2445,23 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         }
     }
 
+    fn dummy_operand(&mut self, ty: TypeId) -> Result<Operand, LowerError> {
+        let value = match self.cx.program.type_data(ty) {
+            TypeData::Int => ConstValue::Int(0),
+            TypeData::Float => ConstValue::Float(0.0),
+            TypeData::Bool => ConstValue::Bool(false),
+            TypeData::String => ConstValue::String("".into()),
+            _ => {
+                return Err(LowerError::UnsupportedType {
+                    ty: Box::new(Type::Infer),
+                });
+            }
+        };
+        Ok(Operand::Const(
+            self.cx.program.alloc_const(ConstData { ty, value }),
+        ))
+    }
+
     fn air_type(&self, ty: TypeId) -> Type {
         match self.cx.program.type_data(ty) {
             TypeData::Int => Type::Int,
@@ -1862,23 +2475,19 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
 
     fn emit_init(&mut self, local: LocalId, value: RValue) -> Result<(), LowerError> {
         self.ensure_open()?;
-        self.current_block()
-            .statements
-            .push(Statement::Init { local, value });
+        self.block.stmts.push(AirStmt::Init { local, value });
         Ok(())
     }
 
     fn emit_assign(&mut self, dst: Place, value: RValue) -> Result<(), LowerError> {
         self.ensure_open()?;
-        self.current_block()
-            .statements
-            .push(Statement::Assign { dst, value });
+        self.block.stmts.push(AirStmt::Assign { dst, value });
         Ok(())
     }
 
     fn emit_eval(&mut self, value: RValue) -> Result<(), LowerError> {
         self.ensure_open()?;
-        self.current_block().statements.push(Statement::Eval(value));
+        self.block.stmts.push(AirStmt::Eval(value));
         Ok(())
     }
 
@@ -1898,9 +2507,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         Ok(self.operand_place(local))
     }
 
-    fn terminate(&mut self, term: Terminator) -> Result<(), LowerError> {
+    fn terminate(&mut self, tail: AirTail) -> Result<(), LowerError> {
         self.ensure_open()?;
-        self.current_block().terminator = term;
+        self.block.tail = tail;
         self.terminated = true;
         Ok(())
     }
@@ -1916,13 +2525,13 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         }
     }
 
-    fn current_block(&mut self) -> &mut BasicBlock {
-        &mut self.function.body[self.current.index()]
-    }
-
     fn source_span(&self, span: crate::span::Span) -> SourceSpan {
         SourceSpan::from_byte_span(self.source, span)
     }
+}
+
+fn air_block_falls_through(block: &AirBlock) -> bool {
+    matches!(block.tail, AirTail::None)
 }
 
 fn dyn_contract_data(contract: &ast::ContractRef) -> Result<DynContractData, LowerError> {
@@ -2248,6 +2857,7 @@ enum SourceCallable<'a> {
     },
     AggregateMethod {
         module: usize,
+        owner: Ident,
         method: &'a ast::Method,
         mode: MethodMode,
         source: SourceId,
@@ -2306,6 +2916,13 @@ impl<'a> SourceCallable<'a> {
         match self {
             Self::Function { .. } => FunctionKind::Normal,
             Self::AggregateMethod { .. } => FunctionKind::Method,
+        }
+    }
+
+    fn owner(self) -> Option<FunctionOwner> {
+        match self {
+            Self::Function { .. } => None,
+            Self::AggregateMethod { owner, .. } => Some(FunctionOwner { name: owner }),
         }
     }
 }
@@ -2400,6 +3017,7 @@ impl<'a> SourceProgramIndex<'a> {
                                 id,
                                 SourceCallable::AggregateMethod {
                                     module: module_index,
+                                    owner: agg.name,
                                     method,
                                     mode,
                                     source: module.source,
@@ -2438,6 +3056,9 @@ impl<'a> ReachableCallables<'a> {
         while let Some(key) = worklist.get(worklist_index).cloned() {
             worklist_index += 1;
             let Some(source) = index.callables.get(&key.target).copied() else {
+                if key.target.kind == CallableKind::EnumVariant {
+                    continue;
+                }
                 return Err(LowerError::UnsupportedCallableInstance {
                     id: Box::new(key.target.clone()),
                     args: Box::new(key.args.clone()),
@@ -2471,6 +3092,9 @@ impl<'a> ReachableCallables<'a> {
             for (expr, target) in calls {
                 if target.form != CallForm::Normal {
                     return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
+                }
+                if target.id.kind == CallableKind::EnumVariant {
+                    continue;
                 }
                 if !index.callables.contains_key(&target.id) {
                     return Err(LowerError::UnsupportedCallableInstance {
@@ -2990,6 +3614,13 @@ mod tests {
         assert_eq!(function_names(&air), vec!["main", "println"]);
         assert_eq!(extern_names(&air), vec!["_println"]);
         assert_eq!(stringify_source_types(&air), vec![TypeData::String]);
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Eval(RValue::Call { args, .. })
+                    if matches!(args.as_slice(), [CallArg::SharedStringConst(_)])
+            )
+        }));
         assert_no_deferred_core_decls(&air);
     }
 
@@ -3110,18 +3741,26 @@ mod tests {
     }
 
     #[test]
-    fn reachable_core_option_constructor_is_explicitly_unsupported() {
-        let err = lower_full_core_entry(
+    fn reachable_core_option_constructor_lowers_to_enum_variant() {
+        let air = lower_full_core_entry(
             "fn main() { let x: Option<int> = Option.Some(1); }",
             "main",
             &[],
         )
-        .expect_err("expected unsupported option constructor");
+        .expect("lower failed");
 
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedCallableInstance { .. } | LowerError::UnsupportedType { .. }
-        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::Aggregate {
+                        kind: AggregateCtor::EnumVariant { .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
@@ -3331,7 +3970,7 @@ mod tests {
             .find(|function| function.name == Ident::new("wrap"))
             .expect("missing wrap");
         assert!(function_statements(wrap).any(|statement| {
-            matches!(statement, Statement::Init { value: RValue::Call { callee: Callee::Function(_), args }, .. } if args.len() == 1)
+            matches!(statement, AirStmt::Init { value: RValue::Call { callee: Callee::Function(_), args }, .. } if args.len() == 1)
         }));
     }
 
@@ -3473,10 +4112,10 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Stringify { value: _, source_ty },
                     ..
-                } if *source_ty != string_ty
+                } if source_ty != string_ty
             )
         }));
     }
@@ -3505,17 +4144,16 @@ mod tests {
             .find(|function| function.name == Ident::new("f"))
             .expect("function missing");
 
+        let body = &function.body.block;
         assert!(matches!(
-            function.body[0].statements.first(),
-            Some(Statement::Eval(RValue::Call { .. }))
+            body.stmts.first(),
+            Some(AirStmt::Eval(RValue::Call { .. }))
         ));
-        assert!(function.body.iter().any(|block| {
-            matches!(
-                block.terminator,
-                Terminator::Return(Some(Operand::Const(id)))
-                    if matches!(air.const_data(id).value, ConstValue::String(ref s) if s.as_ref() == "<void>")
-            )
-        }));
+        assert!(matches!(
+            body.tail,
+            AirTail::Return(Some(Operand::Const(id)))
+                if matches!(air.const_data(id).value, ConstValue::String(ref s) if s.as_ref() == "<void>")
+        ));
     }
 
     #[test]
@@ -3526,10 +4164,10 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Stringify { source_ty, .. },
                     ..
-                } if matches!(air.type_data(*source_ty), TypeData::List(_))
+                } if matches!(air.type_data(source_ty), TypeData::List(_))
             )
         }));
     }
@@ -3548,12 +4186,140 @@ mod tests {
         assert!(function_statements(function).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Stringify { value: _, source_ty },
                     ..
-                } if *source_ty == int_ty
+                } if source_ty == int_ty
             )
         }));
+    }
+
+    #[test]
+    fn enum_variant_constructors_lower_to_air_aggregates() {
+        let source = r"
+            enum Message { Quit, Ping(int), Move { x: int, y: int } }
+            fn f() {
+                let a = Message.Quit;
+                let b = Message.Ping(42);
+                let c = Message.Move { x: 1, y: 2 };
+            }
+        ";
+        let air = lower_full_core_root(source, "f").expect("lower failed");
+        let enum_ty = air
+            .type_arena
+            .iter()
+            .position(|ty| matches!(ty, TypeData::Enum(_)))
+            .map(TypeId::from_index)
+            .expect("enum type missing");
+        let variants = program_statements(&air)
+            .filter_map(|statement| match statement {
+                AirStmt::Init {
+                    value:
+                        RValue::Aggregate {
+                            kind: AggregateCtor::EnumVariant { variant, .. },
+                            ty,
+                            fields,
+                        },
+                    ..
+                } if ty == enum_ty => Some((variant.index(), fields.len())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(variants, vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn inferred_enum_variants_lower_to_air_aggregates() {
+        let source = r"
+            enum Message { Quit, Ping(int), Move { x: int, y: int } }
+            fn f() {
+                let a: Message = .Quit;
+                let b: Message = .Ping(42);
+                let c: Message = .Move { x: 1, y: 2 };
+            }
+        ";
+        let air = lower_full_core_root(source, "f").expect("lower failed");
+        let variants = program_statements(&air)
+            .filter_map(|statement| match statement {
+                AirStmt::Init {
+                    value:
+                        RValue::Aggregate {
+                            kind: AggregateCtor::EnumVariant { variant, .. },
+                            fields,
+                            ..
+                        },
+                    ..
+                } => Some((variant.index(), fields.len())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(variants, vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn enum_typed_field_read_does_not_lower_as_unit_variant() {
+        let source = r"
+            enum Color { Red, Blue }
+            struct Box { color: Color }
+            fn f(box: Box) -> Color { box.color }
+        ";
+        let air = lower_full_core_root(source, "f").expect("lower failed");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("function missing");
+
+        let body = &function.body.block;
+        assert!(matches!(
+            body.tail,
+            AirTail::Return(Some(Operand::Place(Place {
+                projection: ref projections,
+                ..
+            }))) if matches!(projections.as_slice(), [crate::air::Projection::Field(_)])
+        ));
+    }
+
+    #[test]
+    fn unit_enum_match_lowers_to_structured_match() {
+        let source = r"
+            enum Color { Red, Blue }
+            fn f(c: Color) -> int {
+                match c {
+                    Color.Red => 1,
+                    Color.Blue => 2,
+                }
+            }
+        ";
+        let air = lower_full_core_root(source, "f").expect("lower failed");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("function missing");
+
+        let body = &function.body.block;
+        assert!(matches!(
+            body.stmts.as_slice(),
+            [.., AirStmt::EnumMatch(match_)] if match_.arms.len() == 2 && match_.else_block.is_none()
+        ));
+    }
+
+    #[test]
+    fn payload_enum_match_is_explicitly_unsupported() {
+        let source = r"
+            enum Event { Hit(int), Miss }
+            fn f(e: Event) -> int {
+                match e {
+                    Event.Hit(x) => x,
+                    Event.Miss => 0,
+                }
+            }
+        ";
+        let err = lower_full_core_root(source, "f").expect_err("expected unsupported match");
+        assert!(matches!(err, LowerError::UnsupportedExpr { .. }));
     }
 
     #[test]
@@ -3722,7 +4488,7 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Call {
                         callee: Callee::Function(_),
                         args,
@@ -3734,12 +4500,24 @@ mod tests {
     }
 
     #[test]
-    fn reachable_struct_literal_return_value_is_unsupported() {
+    fn reachable_struct_literal_return_value_lowers_to_aggregate() {
         let source =
             "struct S { x: int } fn make() -> S { S { x: 1 } } fn main() { let s = make(); }";
-        let err = lower_root(source, "main").expect_err("expected error");
+        let air = lower_root(source, "main").expect("lower failed");
 
-        assert!(matches!(err, LowerError::UnsupportedExpr { .. }));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::Aggregate {
+                        kind: AggregateCtor::Struct(_),
+                        fields,
+                        ..
+                    },
+                    ..
+                } if fields.len() == 1
+            )
+        }));
     }
 
     #[test]
@@ -3761,7 +4539,7 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Call {
                         callee: Callee::Function(_),
                         args,
@@ -3791,7 +4569,7 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Call {
                         callee: Callee::Function(_),
                         args,
@@ -3886,7 +4664,7 @@ mod tests {
         assert!(function_statements(override_fn).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Call { args, .. },
                     ..
                 } if args.len() == 1
@@ -3895,7 +4673,7 @@ mod tests {
         assert!(function_statements(override_fn).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Stringify { .. },
                     ..
                 }
@@ -3919,8 +4697,8 @@ mod tests {
 
         assert_eq!(overrides.len(), 1);
         assert!(!matches!(
-            overrides[0].body[0].terminator,
-            Terminator::Unreachable
+            overrides[0].body.block.tail,
+            AirTail::Unreachable
         ));
     }
 
@@ -3944,9 +4722,9 @@ mod tests {
             overrides[1].signature.params[0].ty
         );
         assert!(
-            overrides.iter().all(|function| {
-                !matches!(function.body[0].terminator, Terminator::Unreachable)
-            })
+            overrides
+                .iter()
+                .all(|function| !matches!(function.body.block.tail, AirTail::Unreachable))
         );
     }
 
@@ -3983,16 +4761,16 @@ mod tests {
     }
 
     #[test]
-    fn default_arg_lowers_to_borrowed_literal_temp() {
+    fn default_arg_lowers_to_borrowed_literal_const() {
         let source = r#"fn ok(message: string = "ok") {} fn f() { ok(); }"#;
         let air = lower_root(source, "f").expect("lower failed");
 
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init { value: RValue::Call { args, .. }, .. }
-                    | Statement::Eval(RValue::Call { args, .. })
-                    if args.len() == 1 && matches!(args[0], CallArg::SharedBorrow(_))
+                AirStmt::Init { value: RValue::Call { args, .. }, .. }
+                    | AirStmt::Eval(RValue::Call { args, .. })
+                    if args.len() == 1 && matches!(args[0], CallArg::SharedStringConst(_))
             )
         }));
     }
@@ -4017,7 +4795,7 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Extern(_),
                     ..
                 })
@@ -4159,7 +4937,7 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Extern(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::MutBorrow(_)])
@@ -4174,7 +4952,7 @@ mod tests {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::MutBorrow(_)])
@@ -4201,7 +4979,7 @@ fn f() {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::Value(Operand::Place(_)), CallArg::MutBorrow(_)])
@@ -4219,7 +4997,7 @@ fn f() {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::SharedBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Field(_)]))
@@ -4237,7 +5015,7 @@ fn f() {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::SharedBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Index(_)]))
@@ -4255,7 +5033,7 @@ fn f() {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Field(_)]))
@@ -4273,7 +5051,7 @@ fn f() {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::TupleField(0)]))
@@ -4291,7 +5069,7 @@ fn f() {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Eval(RValue::Call {
+                AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Index(_)]))
@@ -4317,19 +5095,15 @@ fn f() {
         let local = &function.locals[param.local_id.index()];
         assert_eq!(local.kind, LocalKind::Arg);
         assert_eq!(local.mutability, AirMutability::Mutable);
-        assert!(matches!(
-            function.body[0].terminator,
-            Terminator::Return(Some(_))
-        ));
+        let body = &function.body.block;
+        assert!(matches!(body.tail, AirTail::Return(Some(_))));
     }
 
     #[test]
     fn empty_void_function_lowers_to_fallthrough_return() {
         let air = lower_root("fn f() {}", "f").expect("lower failed");
-        assert!(matches!(
-            air.functions[0].body[0].terminator,
-            Terminator::Return(None)
-        ));
+        let body = &air.functions[0].body.block;
+        assert!(matches!(body.tail, AirTail::Return(None)));
     }
 
     #[test]
@@ -4347,11 +5121,9 @@ fn f(a: int) -> int {
         let air = lower_root(source, "f").expect("lower failed");
         assert_eq!(air.functions.len(), 1);
         let function = &air.functions[0];
-        assert!(function_statements(function).any(|stmt| matches!(stmt, Statement::Assign { .. })));
-        assert!(matches!(
-            function.body[0].terminator,
-            Terminator::Return(Some(_))
-        ));
+        assert!(function_statements(function).any(|stmt| matches!(stmt, AirStmt::Assign { .. })));
+        let body = &function.body.block;
+        assert!(matches!(body.tail, AirTail::Return(Some(_))));
     }
 
     #[test]
@@ -4364,10 +5136,8 @@ fn f() -> int {
 ";
         let air = lower_root(source, "f").expect("lower failed");
         let function = &air.functions[0];
-        assert!(matches!(
-            function.body[0].terminator,
-            Terminator::Return(Some(_))
-        ));
+        let body = &function.body.block;
+        assert!(matches!(body.tail, AirTail::Return(Some(_))));
     }
 
     #[test]
@@ -4377,13 +5147,13 @@ fn f() -> int {
 
         assert!(program_statements(&air).any(|statement| matches!(
             statement,
-            Statement::Init {
+            AirStmt::Init {
                 value: RValue::Stringify { .. },
                 ..
             }
         )));
         assert!(program_statements(&air).any(|statement| {
-            matches!(statement, Statement::Init { value: RValue::StringConcat { parts }, .. } if parts.len() == 2)
+            matches!(statement, AirStmt::Init { value: RValue::StringConcat { parts }, .. } if parts.len() == 2)
         }));
     }
 
@@ -4392,16 +5162,93 @@ fn f() -> int {
         let source = r#"fn f() { var s = "count: "; s += 1; }"#;
         let air = lower_root(source, "f").expect("lower failed");
 
-        assert!(program_statements(&air).any(|statement| matches!(
-            statement,
-            Statement::Assign {
-                value: RValue::Use(Operand::Place(_)),
-                ..
-            }
-        )));
         assert!(program_statements(&air).any(|statement| {
-            matches!(statement, Statement::Init { value: RValue::StringConcat { parts }, .. } if parts.len() == 2)
+            matches!(statement, AirStmt::Assign { value: RValue::StringConcat { parts }, .. } if parts.len() == 2)
         }));
+    }
+
+    #[test]
+    fn if_statement_lowers_to_structured_branch() {
+        let source = r"fn f(x: bool) -> int { var y = 0; if x { y = 1; } else { y = 2; } y }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let function = &air.functions[0];
+        let body = &function.body.block;
+
+        assert!(matches!(body.stmts[1], AirStmt::If(_)));
+        let AirStmt::If(branch) = &body.stmts[1] else {
+            unreachable!()
+        };
+        assert!(branch.else_block.is_some());
+        assert!(matches!(body.tail, AirTail::Return(Some(_))));
+    }
+
+    #[test]
+    fn if_expression_lowers_to_branch_result_temp() {
+        let source = r"fn f(x: bool) -> int { if x { 1 } else { 2 } }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let function = &air.functions[0];
+
+        let body = &function.body.block;
+        let AirStmt::If(branch) = &body.stmts[0] else {
+            panic!("missing branch")
+        };
+        assert!(matches!(branch.then_block.stmts[0], AirStmt::Init { .. }));
+        assert!(matches!(
+            branch.else_block.as_ref().unwrap().stmts[0],
+            AirStmt::Init { .. }
+        ));
+    }
+
+    #[test]
+    fn nested_if_lowers_structurally() {
+        let source = r"fn f(a: bool, b: bool) -> int { if a { if b { 1 } else { 2 } } else { 3 } }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let function = &air.functions[0];
+        let body = &function.body.block;
+        let AirStmt::If(outer) = &body.stmts[0] else {
+            panic!("missing outer branch")
+        };
+
+        assert!(
+            outer
+                .then_block
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, AirStmt::If(_)))
+        );
+    }
+
+    #[test]
+    fn if_branch_early_return_lowers_with_reachable_join() {
+        let source = r"fn f(x: bool) -> int { if x { return 1; } 2 }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let function = &air.functions[0];
+
+        let body = &function.body.block;
+        let AirStmt::If(branch) = &body.stmts[0] else {
+            panic!("missing branch")
+        };
+        assert!(matches!(branch.then_block.tail, AirTail::Return(Some(_))));
+        assert!(branch.else_block.is_none());
+        assert!(matches!(body.tail, AirTail::Return(Some(_))));
+    }
+
+    #[test]
+    fn if_both_branches_return_lowers_without_join() {
+        let source = r"fn f(x: bool) -> int { if x { return 1; } else { return 2; } }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let function = &air.functions[0];
+
+        let body = &function.body.block;
+        let AirStmt::If(branch) = &body.stmts[0] else {
+            panic!("missing branch")
+        };
+        assert!(matches!(branch.then_block.tail, AirTail::Return(Some(_))));
+        assert!(matches!(
+            branch.else_block.as_ref().unwrap().tail,
+            AirTail::Return(Some(_))
+        ));
+        assert!(matches!(body.tail, AirTail::Unreachable));
     }
 
     #[test]
@@ -4411,14 +5258,14 @@ fn f() -> int {
 
         assert!(program_statements(&air).any(|statement| matches!(
             statement,
-            Statement::Init {
+            AirStmt::Init {
                 value: RValue::Stringify { .. },
                 ..
             }
         )));
         assert!(program_statements(&air).any(|statement| matches!(
             statement,
-            Statement::Init {
+            AirStmt::Init {
                 value: RValue::Format { .. },
                 ..
             }
@@ -4426,7 +5273,7 @@ fn f() -> int {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::StringConcat { .. },
                     ..
                 }
@@ -4440,7 +5287,17 @@ fn f() -> int {
         let air = lower_root(source, "f").expect("lower failed");
 
         assert!(program_statements(&air).any(|statement| {
-            matches!(statement, Statement::Init { value: RValue::StringConcat { parts }, .. } if parts.len() == 2)
+            matches!(statement, AirStmt::Init { value: RValue::StringConcat { parts }, .. } if parts.len() == 2)
+        }));
+    }
+
+    #[test]
+    fn string_concat_chain_lowers_to_one_ordered_concat() {
+        let source = r#"fn f(x: int) -> string { "a" + x + "b" }"#;
+        let air = lower_root(source, "f").expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::StringConcat { parts }, .. } if parts.len() == 3)
         }));
     }
 
@@ -4667,30 +5524,63 @@ fn main() {}
             .collect()
     }
 
-    fn program_statements(program: &Program) -> impl Iterator<Item = &Statement> {
-        program.functions.iter().flat_map(function_statements)
+    fn program_statements(program: &Program) -> impl Iterator<Item = AirStmt> + '_ {
+        program
+            .functions
+            .iter()
+            .flat_map(|function| function_statements(function).collect::<Vec<_>>())
     }
 
-    fn function_statements(function: &Function) -> impl Iterator<Item = &Statement> {
-        function
-            .body
-            .iter()
-            .flat_map(|block| block.statements.iter())
+    fn function_statements(function: &Function) -> impl Iterator<Item = AirStmt> + '_ {
+        let mut statements = vec![];
+        collect_block_statements(&function.body.block, &mut statements);
+        statements.into_iter()
+    }
+
+    fn collect_block_statements(block: &AirBlock, statements: &mut Vec<AirStmt>) {
+        for stmt in &block.stmts {
+            match stmt {
+                AirStmt::Init { local, value } => statements.push(AirStmt::Init {
+                    local: *local,
+                    value: value.clone(),
+                }),
+                AirStmt::Assign { dst, value } => statements.push(AirStmt::Assign {
+                    dst: dst.clone(),
+                    value: value.clone(),
+                }),
+                AirStmt::Eval(value) => statements.push(AirStmt::Eval(value.clone())),
+                AirStmt::If(branch) => {
+                    collect_block_statements(&branch.then_block, statements);
+                    if let Some(block) = &branch.else_block {
+                        collect_block_statements(block, statements);
+                    }
+                }
+                AirStmt::EnumMatch(match_) => {
+                    for arm in &match_.arms {
+                        collect_block_statements(&arm.block, statements);
+                    }
+                    if let Some(block) = &match_.else_block {
+                        collect_block_statements(block, statements);
+                    }
+                }
+                AirStmt::Loop(loop_) => collect_block_statements(&loop_.body, statements),
+            }
+        }
     }
 
     fn stringify_source_types(program: &Program) -> Vec<TypeData> {
         program_statements(program)
             .filter_map(|statement| match statement {
-                Statement::Init {
+                AirStmt::Init {
                     value: RValue::Stringify { source_ty, .. },
                     ..
                 }
-                | Statement::Assign {
+                | AirStmt::Assign {
                     value: RValue::Stringify { source_ty, .. },
                     ..
                 }
-                | Statement::Eval(RValue::Stringify { source_ty, .. }) => {
-                    Some(program.type_arena.data(*source_ty).clone())
+                | AirStmt::Eval(RValue::Stringify { source_ty, .. }) => {
+                    Some(program.type_arena.data(source_ty).clone())
                 }
                 _ => None,
             })

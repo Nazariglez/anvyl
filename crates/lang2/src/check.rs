@@ -147,7 +147,27 @@ impl CheckPackageInput {
     }
 }
 
+pub fn build_air_file(
+    input: CheckFileInput,
+) -> Result<pipeline::AirBuildOutput, pipeline::AirBuildError<CheckError>> {
+    build_air_prepared(prepare_file(input).map_err(pipeline::AirBuildError::Fatal)?)
+}
+
 pub fn check_file(input: CheckFileInput) -> CheckResult {
+    check_prepared(prepare_file(input)?)
+}
+
+pub fn build_air_package(
+    input: CheckPackageInput,
+) -> Result<pipeline::AirBuildOutput, pipeline::AirBuildError<CheckError>> {
+    build_air_prepared(prepare_package(input).map_err(pipeline::AirBuildError::Fatal)?)
+}
+
+pub fn check_package(input: CheckPackageInput) -> CheckResult {
+    check_prepared(prepare_package(input)?)
+}
+
+fn prepare_file(input: CheckFileInput) -> Result<PreparedCheck, CheckError> {
     let CheckFileInput {
         file,
         sources,
@@ -165,7 +185,7 @@ pub fn check_file(input: CheckFileInput) -> CheckResult {
         },
     };
 
-    check_prepared(PreparedCheck {
+    Ok(PreparedCheck {
         root_package: PackageId::synthetic_root(),
         main: main.clone(),
         packages: HashMap::new(),
@@ -177,7 +197,7 @@ pub fn check_file(input: CheckFileInput) -> CheckResult {
     })
 }
 
-pub fn check_package(input: CheckPackageInput) -> CheckResult {
+fn prepare_package(input: CheckPackageInput) -> Result<PreparedCheck, CheckError> {
     let CheckPackageInput {
         root_package,
         root_file,
@@ -216,7 +236,7 @@ pub fn check_package(input: CheckPackageInput) -> CheckResult {
         })
         .collect::<Result<_, CheckError>>()?;
 
-    check_prepared(PreparedCheck {
+    Ok(PreparedCheck {
         root_package,
         main,
         packages: package_inputs,
@@ -239,7 +259,39 @@ struct PreparedCheck {
     config: FrontendConfig,
 }
 
+fn build_air_prepared(
+    input: PreparedCheck,
+) -> Result<pipeline::AirBuildOutput, pipeline::AirBuildError<CheckError>> {
+    match run_prepared(input, PreparedMode::Air)? {
+        PreparedOutput::Air(output) => Ok(output),
+        PreparedOutput::Check(_) => unreachable!("AIR mode returned check output"),
+    }
+}
+
 fn check_prepared(input: PreparedCheck) -> CheckResult {
+    match run_prepared(input, PreparedMode::Check) {
+        Ok(PreparedOutput::Check(output)) => Ok(output),
+        Ok(PreparedOutput::Air(_)) => unreachable!("check mode returned AIR output"),
+        Err(pipeline::AirBuildError::Fatal(error)) => Err(error),
+        Err(pipeline::AirBuildError::Diagnostic(output)) => Ok(output),
+        Err(pipeline::AirBuildError::Lower(message)) => Err(CheckError::InvalidInput(message)),
+    }
+}
+
+enum PreparedMode {
+    Check,
+    Air,
+}
+
+enum PreparedOutput {
+    Check(pipeline::CheckOutput),
+    Air(pipeline::AirBuildOutput),
+}
+
+fn run_prepared(
+    input: PreparedCheck,
+    mode: PreparedMode,
+) -> Result<PreparedOutput, pipeline::AirBuildError<CheckError>> {
     let PreparedCheck {
         root_package,
         main,
@@ -257,28 +309,31 @@ fn check_prepared(input: PreparedCheck) -> CheckResult {
         packages.insert(PackageId::std(), std);
     }
     let mut source_loader = PackageSourceEnvironment::new(ownership, &sources);
-    source_loader.cache_overrides(source_overrides)?;
+    source_loader
+        .cache_overrides(source_overrides)
+        .map_err(pipeline::AirBuildError::Fatal)?;
     source_loader.cache_sources(cached_sources);
-
-    let output = pipeline::check_packages(
-        PackageProgramInput {
-            root_package,
-            main,
-            system: SystemPackages {
-                core: sources.core().map(|_| PackageId::core()),
-                std: sources.std().map(|_| PackageId::std()),
-            },
-            packages,
-            preloaded_modules: preloaded_modules(&sources),
-            source_loader: &mut source_loader,
+    let input = PackageProgramInput {
+        root_package,
+        main,
+        system: SystemPackages {
+            core: sources.core().map(|_| PackageId::core()),
+            std: sources.std().map(|_| PackageId::std()),
         },
-        {
-            config.externs = system_externs(&sources);
-            config
-        },
-    )?;
-
-    Ok(output)
+        packages,
+        preloaded_modules: preloaded_modules(&sources),
+        source_loader: &mut source_loader,
+    };
+    config.externs = system_externs(&sources);
+    match mode {
+        PreparedMode::Check => pipeline::check_packages(input, config)
+            .map(PreparedOutput::Check)
+            .map_err(pipeline::AirBuildError::Fatal),
+        PreparedMode::Air => {
+            pipeline::build_air_packages(input, config, &pipeline::AirRootConfig::entry_main())
+                .map(PreparedOutput::Air)
+        }
+    }
 }
 
 fn read_main(file: &Path, overrides: &[SourceOverride]) -> Result<String, CheckError> {

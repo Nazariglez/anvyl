@@ -39,6 +39,8 @@ enum Command {
         #[arg(long, default_value = "vm")]
         backend: String,
         #[arg(long)]
+        new_frontend: bool,
+        #[arg(long)]
         release: bool,
         #[arg(long, value_name = "KEY=VALUE")]
         lint: Vec<String>,
@@ -152,16 +154,29 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Run {
             file,
             backend,
+            new_frontend,
             release,
             lint,
             feature,
             cfg,
         } => {
+            let compilation_ctx = build_compilation_ctx(release, &feature, &cfg)?;
+            if new_frontend {
+                if backend != "rust" {
+                    return Err("--new-frontend run currently requires --backend rust".to_string());
+                }
+                let manifest = check_manifest(file.as_deref())?;
+                let path = resolve_entry(file, manifest.as_ref())?;
+                let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
+                progress::status("Checking", &format!("{}...", path.display()));
+                progress::status("Running", &format!("{}...", path.display()));
+                run::new_frontend_cmd(&path, lint_config, &compilation_ctx)?;
+                return Ok(());
+            }
+
             let manifest = manifest::parse_manifest()?;
             let path = resolve_entry(file, manifest.as_ref())?;
             let legacy_lint = resolve_legacy_lint_config(manifest.as_ref(), &lint)?;
-            let compilation_ctx = build_compilation_ctx(release, &feature, &cfg)?;
-
             let has_externs = manifest.as_ref().is_some_and(Manifest::has_externs);
             if has_externs {
                 let manifest = manifest.as_ref().unwrap();
@@ -204,7 +219,6 @@ fn run(cli: Cli) -> Result<(), String> {
                 let path = resolve_entry(file, manifest.as_ref())?;
                 let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
                 let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
-                check::reject_new_frontend_inputs(manifest.as_ref())?;
                 progress::status("Checking", &format!("{}...", path.display()));
                 check::new_frontend_cmd(
                     &path,
@@ -422,11 +436,29 @@ mod tests {
     }
 
     #[test]
-    fn run_rejects_new_frontend_flag() {
-        let error = Cli::try_parse_from(["anvyx", "run", "--new-frontend", "main.anv"])
-            .expect_err("run must reject check-only flag");
+    fn run_accepts_new_frontend_flag() {
+        let cli = Cli::parse_from([
+            "anvyx",
+            "run",
+            "--new-frontend",
+            "--backend",
+            "rust",
+            "main.anv",
+        ]);
 
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        match cli.command {
+            Command::Run {
+                new_frontend,
+                backend,
+                file,
+                ..
+            } => {
+                assert!(new_frontend);
+                assert_eq!(backend, "rust");
+                assert_eq!(file, Some(PathBuf::from("main.anv")));
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -486,8 +518,8 @@ mod tests {
                 name: None,
                 entry: Some("main.anv".to_string()),
             },
-            dependencies: Default::default(),
-            externs: Default::default(),
+            dependencies: HashMap::default(),
+            externs: HashMap::default(),
             lint: lints
                 .iter()
                 .map(|(name, level)| ((*name).to_string(), (*level).to_string()))

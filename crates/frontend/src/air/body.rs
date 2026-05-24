@@ -2,9 +2,60 @@ use super::{ids::*, types::ParamMode};
 use crate::ast::{BinaryOp, FormatSpec, UnaryOp};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct BasicBlock {
-    pub statements: Vec<Statement>,
-    pub terminator: Terminator,
+pub struct AirBody {
+    pub block: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AirBlock {
+    pub stmts: Vec<AirStmt>,
+    pub tail: AirTail,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AirStmt {
+    Init { local: LocalId, value: RValue },
+    Assign { dst: Place, value: RValue },
+    Eval(RValue),
+    If(AirIf),
+    Loop(AirLoop),
+    EnumMatch(AirEnumMatch),
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AirTail {
+    #[default]
+    None,
+    Return(Option<Operand>),
+    Break(AirLoopId),
+    Continue(AirLoopId),
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirIf {
+    pub cond: Operand,
+    pub then_block: AirBlock,
+    pub else_block: Option<AirBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirLoop {
+    pub id: AirLoopId,
+    pub body: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirEnumMatch {
+    pub discr: Place,
+    pub arms: Vec<AirEnumMatchArm>,
+    pub else_block: Option<AirBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirEnumMatchArm {
+    pub variant: VariantId,
+    pub block: AirBlock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +127,7 @@ pub enum Operand {
 pub enum CallArg {
     Value(Operand),
     SharedBorrow(Place),
+    SharedStringConst(ConstId),
     MutBorrow(Place),
 }
 
@@ -83,7 +135,7 @@ impl CallArg {
     pub fn mode(&self) -> ParamMode {
         match self {
             Self::Value(_) => ParamMode::Value,
-            Self::SharedBorrow(_) => ParamMode::SharedBorrow,
+            Self::SharedBorrow(_) | Self::SharedStringConst(_) => ParamMode::SharedBorrow,
             Self::MutBorrow(_) => ParamMode::MutBorrow,
         }
     }
@@ -93,33 +145,9 @@ impl CallArg {
             Self::Value(Operand::Place(place))
             | Self::SharedBorrow(place)
             | Self::MutBorrow(place) => Some(place),
-            Self::Value(Operand::Const(_)) => None,
+            Self::Value(Operand::Const(_)) | Self::SharedStringConst(_) => None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Statement {
-    Init { local: LocalId, value: RValue },
-    Assign { dst: Place, value: RValue },
-    Eval(RValue),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Terminator {
-    Goto(BlockId),
-    If {
-        cond: Operand,
-        then_bb: BlockId,
-        else_bb: BlockId,
-    },
-    SwitchEnum {
-        discr: Place,
-        arms: Vec<(VariantId, BlockId)>,
-        else_bb: Option<BlockId>,
-    },
-    Return(Option<Operand>),
-    Unreachable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,4 +261,41 @@ pub enum AggregateCtor {
     Array,
     Map,
     DataRef(AggregateId),
+}
+
+impl AirBody {
+    pub fn for_each_rvalue(&self, f: &mut impl FnMut(&RValue)) {
+        self.block.for_each_rvalue(f);
+    }
+}
+
+impl AirBlock {
+    pub fn for_each_rvalue(&self, f: &mut impl FnMut(&RValue)) {
+        for stmt in &self.stmts {
+            stmt.for_each_rvalue(f);
+        }
+    }
+}
+
+impl AirStmt {
+    pub fn for_each_rvalue(&self, f: &mut impl FnMut(&RValue)) {
+        match self {
+            Self::Init { value, .. } | Self::Assign { value, .. } | Self::Eval(value) => f(value),
+            Self::If(branch) => {
+                branch.then_block.for_each_rvalue(f);
+                if let Some(block) = &branch.else_block {
+                    block.for_each_rvalue(f);
+                }
+            }
+            Self::Loop(loop_) => loop_.body.for_each_rvalue(f),
+            Self::EnumMatch(match_) => {
+                for arm in &match_.arms {
+                    arm.block.for_each_rvalue(f);
+                }
+                if let Some(block) = &match_.else_block {
+                    block.for_each_rvalue(f);
+                }
+            }
+        }
+    }
 }

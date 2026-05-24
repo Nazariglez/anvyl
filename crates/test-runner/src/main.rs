@@ -28,10 +28,11 @@ fn main() {
         std::process::exit(1);
     });
 
-    let cli = Cli::build(args.release, !args.report_json, args.new_frontend).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
-    });
+    let cli =
+        Cli::build(args.release, !args.report_json, args.new_frontend()).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
 
     let start_time = Instant::now();
     let mut files: Vec<_> = args

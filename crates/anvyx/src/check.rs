@@ -16,10 +16,7 @@ use anvyx_lang2::{
 use clap::ValueEnum;
 use serde::Serialize;
 
-use crate::{
-    manifest::Manifest,
-    std_support::{collect_core, collect_std},
-};
+use crate::std_support::{collect_core, collect_std};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CheckOutputFormat {
@@ -105,7 +102,10 @@ fn emit_check_output(
     Ok(())
 }
 
-fn new_frontend_config(lint: FrontendLintConfig, ctx: &CompilationContext) -> FrontendConfig {
+pub(crate) fn new_frontend_config(
+    lint: FrontendLintConfig,
+    ctx: &CompilationContext,
+) -> FrontendConfig {
     FrontendConfig {
         lint,
         context: new_frontend_context(ctx),
@@ -133,10 +133,6 @@ fn new_frontend_context(ctx: &CompilationContext) -> FrontendCompilationContext 
         },
         features: ctx.features.iter().cloned().collect(),
     }
-}
-
-pub fn reject_new_frontend_inputs(manifest: Option<&Manifest>) -> Result<(), String> {
-    anvyx_project::manifest::reject_clean_frontend_inputs(manifest)
 }
 
 fn emit_report(
@@ -399,9 +395,10 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use anvyx_lang2::CheckFileInput;
+    use anvyx_project::manifest::reject_clean_frontend_inputs;
 
     use super::*;
-    use crate::manifest::{DependencyEntry, ExternEntry, Project};
+    use crate::manifest::{DependencyEntry, ExternEntry, Manifest, Project};
 
     fn check_new_frontend(file: &Path) -> Result<(), String> {
         new_frontend_cmd(
@@ -587,7 +584,7 @@ mod tests {
     }
 
     fn unsupported_error(manifest: Option<&Manifest>) -> String {
-        reject_new_frontend_inputs(manifest).expect_err("input should be unsupported")
+        reject_clean_frontend_inputs(manifest).expect_err("input should be unsupported")
     }
 
     mod frontend {
@@ -1037,17 +1034,17 @@ mod tests {
 
             #[test]
             fn accepts_feature_flags() {
-                reject_new_frontend_inputs(None).unwrap();
+                reject_clean_frontend_inputs(None).unwrap();
             }
 
             #[test]
             fn accepts_cfg_flags() {
-                reject_new_frontend_inputs(None).unwrap();
+                reject_clean_frontend_inputs(None).unwrap();
             }
 
             #[test]
             fn accepts_lint_flags() {
-                reject_new_frontend_inputs(None).unwrap();
+                reject_clean_frontend_inputs(None).unwrap();
             }
 
             #[test]
@@ -1057,7 +1054,7 @@ mod tests {
                     .lint
                     .insert("internal_access".to_string(), "error".to_string());
 
-                reject_new_frontend_inputs(Some(&manifest)).unwrap();
+                reject_clean_frontend_inputs(Some(&manifest)).unwrap();
             }
 
             #[test]
@@ -1082,7 +1079,7 @@ mod tests {
             fn accepts_plain_manifest() {
                 let manifest = plain_manifest();
 
-                reject_new_frontend_inputs(Some(&manifest)).unwrap();
+                reject_clean_frontend_inputs(Some(&manifest)).unwrap();
             }
 
             #[test]
@@ -1095,7 +1092,7 @@ mod tests {
                     },
                 );
 
-                reject_new_frontend_inputs(Some(&manifest)).unwrap();
+                reject_clean_frontend_inputs(Some(&manifest)).unwrap();
             }
         }
     }

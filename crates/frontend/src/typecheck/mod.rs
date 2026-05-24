@@ -3,8 +3,6 @@ use std::{
     rc::Rc,
 };
 
-#[cfg(test)]
-pub(crate) use self::type_ops::type_has_unfinished_facts;
 pub(crate) use self::{
     annotation::DeprecatedUseKind,
     const_term::ConstTerm,
@@ -14,7 +12,7 @@ pub(crate) use self::{
     result::*,
     semantic_use::*,
     surface::*,
-    type_ops::type_closure_facts,
+    type_ops::{type_closure_facts, type_has_unfinished_facts},
     type_refs::{GenericTypeContext, TypeRefError, TypeRefResolver},
 };
 use self::{

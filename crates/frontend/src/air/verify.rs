@@ -1,9 +1,10 @@
 pub use super::typing::PrimitiveKind;
 use super::{
-    AggregateKind, BasicBlock, ExternMember, Function, LocalKind, Mutability, ParamMode, ParamRole,
+    AggregateKind, ConstValue, ExternMember, Function, LocalKind, Mutability, ParamMode, ParamRole,
     ParamType, Program, ReturnMode, TypeData, VariantShape,
     body::{
-        AggregateCtor, CallArg, Callee, Operand, Place, Projection, RValue, Statement, Terminator,
+        AggregateCtor, AirBlock, AirEnumMatch, AirIf, AirStmt, AirTail, CallArg, Callee, Operand,
+        Place, Projection, RValue,
     },
     ids::*,
     typing::{self, PrimitiveTypes, supports_scalar_binary, supports_scalar_unary},
@@ -179,6 +180,9 @@ pub enum BadStatement {
     InitTypeMismatch { expected: TypeId, found: TypeId },
     AssignTypeMismatch { expected: TypeId, found: TypeId },
     AssignImmutableLocal(LocalId),
+    ReadUninitializedLocal(LocalId),
+    AssignUninitializedLocal(LocalId),
+    InitImmutableLocalTwice(LocalId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +196,6 @@ pub enum BadReference {
     InvalidType(TypeId),
     InvalidConst(ConstId),
     InvalidLocal(LocalId),
-    InvalidBlock(BlockId),
     InvalidField {
         aggregate: AggregateId,
         field: FieldId,
@@ -206,7 +209,6 @@ pub enum BadReference {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadFunction {
-    FunctionHasNoBlocks,
     ParamLocalOutOfRange {
         param: usize,
         total_locals: usize,
@@ -281,6 +283,9 @@ pub enum BadFunction {
         param: usize,
         local: LocalId,
     },
+    BreakOutsideLoop(AirLoopId),
+    ContinueOutsideLoop(AirLoopId),
+    MatchNotExhaustive(EnumId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +347,28 @@ pub fn verify(program: &Program) -> Result<VerifiedProgram<'_>, Vec<VerifyError>
     collect_errors(&mut cx);
     if cx.errors.is_empty() {
         Ok(VerifiedProgram { program })
+    } else {
+        Err(cx.errors)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn verify_structured_body(
+    program: &Program,
+    function_id: FunctionId,
+    body: &super::AirBody,
+) -> Result<(), Vec<VerifyError>> {
+    let mut cx = VerifyCx::new(program);
+    let mut state = LocalInit::new(program.function(function_id));
+    verify_air_block(
+        &mut cx,
+        function_id,
+        &body.block,
+        &mut state,
+        &mut Vec::new(),
+    );
+    if cx.errors.is_empty() {
+        Ok(())
     } else {
         Err(cx.errors)
     }
@@ -468,15 +495,6 @@ impl<'a> VerifyCx<'a> {
         self.type_states[ty.index()] = TypeState::Done;
     }
 
-    fn verify_block_ref(&mut self, site: VerifySite, function: &Function, block: BlockId) {
-        if block.index() >= function.body.len() {
-            self.push(
-                site,
-                VerifyErrorKind::BadReference(BadReference::InvalidBlock(block)),
-            );
-        }
-    }
-
     fn variant_belongs_to_enum(&self, enum_id: EnumId, variant: VariantId) -> bool {
         self.program
             .enums
@@ -486,6 +504,57 @@ impl<'a> VerifyCx<'a> {
 
     fn type_data(&self, ty: TypeId) -> Option<&TypeData> {
         self.program.type_arena.get(ty)
+    }
+}
+
+#[derive(Clone)]
+struct LocalInit {
+    definite: Vec<bool>,
+    possible: Vec<bool>,
+}
+
+impl LocalInit {
+    fn new(function: &Function) -> Self {
+        let mut state = Self {
+            definite: vec![false; function.locals.len()],
+            possible: vec![false; function.locals.len()],
+        };
+        for param in &function.signature.params {
+            if param.local_id.index() < function.locals.len() {
+                state.definite[param.local_id.index()] = true;
+                state.possible[param.local_id.index()] = true;
+            }
+        }
+        state
+    }
+
+    fn is_definite(&self, local: LocalId) -> bool {
+        self.definite.get(local.index()).copied().unwrap_or(false)
+    }
+
+    fn is_possible(&self, local: LocalId) -> bool {
+        self.possible.get(local.index()).copied().unwrap_or(false)
+    }
+
+    fn init(&mut self, local: LocalId) {
+        if local.index() < self.definite.len() {
+            self.definite[local.index()] = true;
+            self.possible[local.index()] = true;
+        }
+    }
+
+    fn join(states: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut states = states.into_iter();
+        let mut joined = states.next()?;
+        for state in states {
+            for (left, right) in joined.definite.iter_mut().zip(state.definite) {
+                *left &= right;
+            }
+            for (left, right) in joined.possible.iter_mut().zip(state.possible) {
+                *left |= right;
+            }
+        }
+        Some(joined)
     }
 }
 
@@ -635,17 +704,11 @@ fn verify_const(cx: &mut VerifyCx<'_>, id: ConstId) {
         return;
     }
     let expected = match &konst.value {
-        super::ConstValue::Int(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Int),
-        super::ConstValue::Float(_) => {
-            required_const_primitive(cx, site.clone(), PrimitiveKind::Float)
-        }
-        super::ConstValue::Bool(_) => {
-            required_const_primitive(cx, site.clone(), PrimitiveKind::Bool)
-        }
-        super::ConstValue::String(_) => {
-            required_const_primitive(cx, site.clone(), PrimitiveKind::String)
-        }
-        super::ConstValue::Nil => {
+        ConstValue::Int(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Int),
+        ConstValue::Float(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Float),
+        ConstValue::Bool(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Bool),
+        ConstValue::String(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::String),
+        ConstValue::Nil => {
             if !matches!(cx.type_data(konst.ty), Some(TypeData::Optional(_))) {
                 cx.push(
                     site.clone(),
@@ -1103,196 +1166,455 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
 
     cx.verify_type_ref(site, func.signature.return_type());
 
-    if func.body.is_empty() {
+    let mut state = LocalInit::new(func);
+    if verify_air_block(cx, id, &func.body.block, &mut state, &mut Vec::new()).is_some()
+        && !matches!(
+            cx.type_data(func.signature.return_type()),
+            Some(TypeData::Void)
+        )
+    {
         cx.push(
             VerifySite::Function(id),
-            VerifyErrorKind::BadFunction(BadFunction::FunctionHasNoBlocks),
+            VerifyErrorKind::BadFunction(BadFunction::NonVoidFunctionMustReturnValue(
+                func.signature.return_type(),
+            )),
         );
-    } else {
-        for (block_idx, block) in func.body.iter().enumerate() {
-            verify_block(cx, id, BlockId::from_index(block_idx), block);
-        }
     }
 }
 
-fn verify_block(
+fn verify_air_block(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
-    block_id: BlockId,
-    block: &BasicBlock,
-) {
-    for (stmt_idx, stmt) in block.statements.iter().enumerate() {
-        verify_statement(cx, function_id, block_id, stmt_idx, stmt);
+    block: &AirBlock,
+    state: &mut LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        *state = verify_air_stmt(cx, function_id, index, stmt, state, loops)?;
     }
-    verify_terminator(cx, function_id, block_id, &block.terminator);
+    verify_air_tail(cx, function_id, &block.tail, state, loops)
 }
 
-fn verify_statement(
+struct LoopCtx {
+    id: AirLoopId,
+    breaks: Vec<LocalInit>,
+}
+
+fn verify_air_stmt(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
-    block_id: BlockId,
     index: usize,
-    stmt: &Statement,
-) {
-    let function = cx.program.function(function_id);
-    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    stmt: &AirStmt,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    let block_id = BlockId::from_index(0);
     match stmt {
-        Statement::Init { local, value } => {
-            if local.index() >= function.locals.len() {
-                cx.push(
-                    site.clone(),
-                    VerifyErrorKind::BadReference(BadReference::InvalidLocal(*local)),
-                );
-            } else {
-                let target = &function.locals[local.index()];
-                if function
-                    .signature
-                    .params
-                    .iter()
-                    .any(|param| param.local_id == *local)
-                {
+        AirStmt::Init { local, value } => {
+            verify_air_rvalue_reads(cx, function_id, index, value, state);
+            verify_init_stmt(cx, function_id, block_id, index, *local, value);
+            let function = cx.program.function(function_id);
+            if let Some(local_decl) = function.locals.get(local.index()) {
+                if local_decl.mutability == Mutability::Immutable && state.is_possible(*local) {
                     cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadStatement(BadStatement::InitParamLocal(*local)),
+                        VerifyCx::stmt_site(function_id, block_id, index),
+                        VerifyErrorKind::BadStatement(BadStatement::InitImmutableLocalTwice(
+                            *local,
+                        )),
                     );
                 }
-                cx.verify_type_ref(site.clone(), target.ty);
-                if let Some(value_ty) = typing::rvalue_ty(cx.program, &cx.primitives, value)
-                    && value_ty != target.ty
-                {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadStatement(BadStatement::InitTypeMismatch {
-                            expected: target.ty,
-                            found: value_ty,
-                        }),
-                    );
-                }
+                let mut next = state.clone();
+                next.init(*local);
+                return Some(next);
             }
-            verify_rvalue(cx, function_id, block_id, Some(index), value);
+            Some(state.clone())
         }
-        Statement::Assign { dst, value } => {
-            let dst_ty = verify_place(cx, function_id, block_id, Some(index), dst);
-            if function
-                .locals
-                .get(dst.root.index())
-                .is_some_and(|local| local.mutability == Mutability::Immutable)
-            {
+        AirStmt::Assign { dst, value } => {
+            verify_air_rvalue_reads(cx, function_id, index, value, state);
+            verify_air_place_read(cx, function_id, index, dst, state);
+            if !state.is_definite(dst.root) {
                 cx.push(
-                    site.clone(),
-                    VerifyErrorKind::BadStatement(BadStatement::AssignImmutableLocal(dst.root)),
+                    VerifyCx::stmt_site(function_id, block_id, index),
+                    VerifyErrorKind::BadStatement(BadStatement::AssignUninitializedLocal(dst.root)),
                 );
             }
-            verify_rvalue(cx, function_id, block_id, Some(index), value);
-            if let (Some(expected), Some(found)) =
-                (dst_ty, typing::rvalue_ty(cx.program, &cx.primitives, value))
-                && expected != found
-            {
-                cx.push(
-                    site,
-                    VerifyErrorKind::BadStatement(BadStatement::AssignTypeMismatch {
-                        expected,
-                        found,
-                    }),
-                );
-            }
+            verify_assign_stmt(cx, function_id, block_id, index, dst, value);
+            Some(state.clone())
         }
-        Statement::Eval(value) => {
+        AirStmt::Eval(value) => {
+            verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_rvalue(cx, function_id, block_id, Some(index), value);
+            Some(state.clone())
+        }
+        AirStmt::If(branch) => verify_air_if(cx, function_id, index, branch, state, loops),
+        AirStmt::Loop(loop_) => {
+            loops.push(LoopCtx {
+                id: loop_.id,
+                breaks: Vec::new(),
+            });
+            let mut body_state = state.clone();
+            verify_air_block(cx, function_id, &loop_.body, &mut body_state, loops);
+            let loop_ctx = loops.pop().unwrap();
+            LocalInit::join(loop_ctx.breaks)
+        }
+        AirStmt::EnumMatch(match_) => {
+            verify_air_match(cx, function_id, index, match_, state, loops)
         }
     }
 }
 
-fn verify_terminator(
+fn verify_air_if(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
-    block_id: BlockId,
-    term: &Terminator,
-) {
-    let function = cx.program.function(function_id);
-    let site = VerifyCx::term_site(function_id, block_id);
+    index: usize,
+    branch: &AirIf,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    let site = VerifyCx::stmt_site(function_id, BlockId::from_index(0), index);
+    verify_air_operand_read(cx, function_id, index, &branch.cond, state);
+    verify_operand(
+        cx,
+        function_id,
+        BlockId::from_index(0),
+        Some(index),
+        &branch.cond,
+    );
+    if let Some(cond_ty) = operand_ty(cx, &branch.cond)
+        && !cx.primitives.is_bool(cond_ty)
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadFunction(BadFunction::IfCondMustBeBool(cond_ty)),
+        );
+    }
 
-    match term {
-        Terminator::Goto(target) => {
-            cx.verify_block_ref(site, function, *target);
+    let mut then_state = state.clone();
+    let then_fallthrough =
+        verify_air_block(cx, function_id, &branch.then_block, &mut then_state, loops);
+    let else_fallthrough = match &branch.else_block {
+        Some(else_block) => {
+            let mut else_state = state.clone();
+            verify_air_block(cx, function_id, else_block, &mut else_state, loops)
         }
-        Terminator::If {
-            cond,
-            then_bb,
-            else_bb,
-        } => {
-            cx.verify_block_ref(site.clone(), function, *then_bb);
-            cx.verify_block_ref(site.clone(), function, *else_bb);
-            verify_operand(cx, function_id, block_id, None, cond);
-            if let Some(cond_ty) = operand_ty(cx, cond) {
-                let is_bool = cx.primitives.is_bool(cond_ty);
-                if !is_bool {
-                    cx.push(
-                        site,
-                        VerifyErrorKind::BadFunction(BadFunction::IfCondMustBeBool(cond_ty)),
-                    );
-                }
-            }
-        }
-        Terminator::SwitchEnum {
-            discr,
-            arms,
-            else_bb,
-        } => {
-            let discr_ty = verify_place(cx, function_id, block_id, None, discr);
-            let expected_enum = match discr_ty {
-                Some(ty) => match cx.type_data(ty) {
-                    Some(TypeData::Enum(id)) if cx.has_enum(*id) => Some(*id),
-                    Some(TypeData::Enum(_) | TypeData::Optional(_)) | None => None,
-                    Some(_) => {
-                        cx.push(
-                            site.clone(),
-                            VerifyErrorKind::BadFunction(
-                                BadFunction::SwitchDiscriminantMustBeEnum(ty),
-                            ),
-                        );
-                        None
-                    }
-                },
-                None => None,
-            };
+        None => Some(state.clone()),
+    };
+    LocalInit::join([then_fallthrough, else_fallthrough].into_iter().flatten())
+}
 
-            let mut seen = std::collections::HashSet::new();
-            for (variant, target) in arms {
-                if !seen.insert(*variant) {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadFunction(BadFunction::DuplicateSwitchArm(*variant)),
-                    );
-                }
-                cx.verify_block_ref(site.clone(), function, *target);
-                if let Some(enum_id) = expected_enum
-                    && !cx.variant_belongs_to_enum(enum_id, *variant)
-                {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadFunction(BadFunction::SwitchArmVariantMismatch {
-                            expected_enum: enum_id,
-                            variant: *variant,
-                        }),
-                    );
-                }
-            }
-            if let Some(target) = else_bb {
-                cx.verify_block_ref(site, function, *target);
-            }
+fn verify_air_match(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    match_: &AirEnumMatch,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    let site = VerifyCx::stmt_site(function_id, BlockId::from_index(0), index);
+    verify_air_place_read(cx, function_id, index, &match_.discr, state);
+    let discr_ty = verify_place(
+        cx,
+        function_id,
+        BlockId::from_index(0),
+        Some(index),
+        &match_.discr,
+    );
+    let Some(expected_enum) = discr_ty.and_then(|ty| match cx.type_data(ty) {
+        Some(TypeData::Enum(id)) if cx.has_enum(*id) => Some(*id),
+        Some(TypeData::Enum(_) | TypeData::Optional(_)) | None => None,
+        Some(_) => {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::SwitchDiscriminantMustBeEnum(ty)),
+            );
+            None
         }
-        Terminator::Return(value) => {
+    }) else {
+        return Some(state.clone());
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut fallthrough = Vec::new();
+    for arm in &match_.arms {
+        if !seen.insert(arm.variant) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateSwitchArm(arm.variant)),
+            );
+        }
+        if !cx.variant_belongs_to_enum(expected_enum, arm.variant) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::SwitchArmVariantMismatch {
+                    expected_enum,
+                    variant: arm.variant,
+                }),
+            );
+        }
+        let mut arm_state = state.clone();
+        if let Some(state) = verify_air_block(cx, function_id, &arm.block, &mut arm_state, loops) {
+            fallthrough.push(state);
+        }
+    }
+    if let Some(else_block) = &match_.else_block {
+        let mut else_state = state.clone();
+        if let Some(state) = verify_air_block(cx, function_id, else_block, &mut else_state, loops) {
+            fallthrough.push(state);
+        }
+    } else if seen.len() < cx.program.enum_decl(expected_enum).variants.len() {
+        cx.push(
+            site,
+            VerifyErrorKind::BadFunction(BadFunction::MatchNotExhaustive(expected_enum)),
+        );
+    }
+    LocalInit::join(fallthrough)
+}
+
+fn verify_air_tail(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    tail: &AirTail,
+    state: &LocalInit,
+    loops: &mut [LoopCtx],
+) -> Option<LocalInit> {
+    let site = VerifyCx::term_site(function_id, BlockId::from_index(0));
+    match tail {
+        AirTail::None => Some(state.clone()),
+        AirTail::Return(value) => {
+            if let Some(value) = value {
+                verify_air_operand_read(cx, function_id, 0, value, state);
+            }
+            let function = cx.program.function(function_id);
             verify_return(
                 cx,
                 function_id,
-                block_id,
+                BlockId::from_index(0),
                 site,
                 function.signature.return_mode,
                 value.as_ref(),
             );
+            None
         }
-        Terminator::Unreachable => {}
+        AirTail::Break(id) => {
+            if let Some(loop_ctx) = loops.iter_mut().rev().find(|loop_ctx| loop_ctx.id == *id) {
+                loop_ctx.breaks.push(state.clone());
+            } else {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::BreakOutsideLoop(*id)),
+                );
+            }
+            None
+        }
+        AirTail::Continue(id) => {
+            if !loops.iter().any(|loop_ctx| loop_ctx.id == *id) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::ContinueOutsideLoop(*id)),
+                );
+            }
+            None
+        }
+        AirTail::Unreachable => None,
+    }
+}
+
+fn verify_air_rvalue_reads(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    value: &RValue,
+    state: &LocalInit,
+) {
+    match value {
+        RValue::Use(op)
+        | RValue::Stringify { value: op, .. }
+        | RValue::Unary { value: op, .. }
+        | RValue::Cast { value: op, .. }
+        | RValue::Format { value: op, .. } => {
+            verify_air_operand_read(cx, function_id, index, op, state);
+        }
+        RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
+            verify_air_operand_read(cx, function_id, index, lhs, state);
+            verify_air_operand_read(cx, function_id, index, rhs, state);
+        }
+        RValue::Aggregate { fields, .. } | RValue::StringConcat { parts: fields } => {
+            for field in fields {
+                verify_air_operand_read(cx, function_id, index, field, state);
+            }
+        }
+        RValue::Call { callee, args } => {
+            if let Callee::Closure(op) = callee {
+                verify_air_operand_read(cx, function_id, index, op, state);
+            }
+            for arg in args {
+                match arg {
+                    CallArg::Value(op) => {
+                        verify_air_operand_read(cx, function_id, index, op, state);
+                    }
+                    CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+                        verify_air_place_read(cx, function_id, index, place, state);
+                    }
+                    CallArg::SharedStringConst(_) => {}
+                }
+            }
+        }
+        RValue::Len { source } | RValue::ListPop { list: source, .. } => {
+            verify_air_place_read(cx, function_id, index, source, state);
+        }
+        RValue::ListSlice {
+            source, start, end, ..
+        }
+        | RValue::SliceView {
+            source, start, end, ..
+        } => {
+            verify_air_place_read(cx, function_id, index, source, state);
+            verify_air_local_read(cx, function_id, index, *start, state);
+            verify_air_local_read(cx, function_id, index, *end, state);
+        }
+        RValue::ListPush { list, value } => {
+            verify_air_place_read(cx, function_id, index, list, state);
+            verify_air_operand_read(cx, function_id, index, value, state);
+        }
+        RValue::MapGet { map, key, .. } | RValue::MapRemove { map, key, .. } => {
+            verify_air_place_read(cx, function_id, index, map, state);
+            verify_air_operand_read(cx, function_id, index, key, state);
+        }
+        RValue::MapEntryAt {
+            map, index: key, ..
+        } => {
+            verify_air_place_read(cx, function_id, index, map, state);
+            verify_air_local_read(cx, function_id, index, *key, state);
+        }
+        RValue::MapInsert { map, key, value } => {
+            verify_air_place_read(cx, function_id, index, map, state);
+            verify_air_operand_read(cx, function_id, index, key, state);
+            verify_air_operand_read(cx, function_id, index, value, state);
+        }
+        RValue::MakeClosure { captures, .. } => {
+            for capture in captures {
+                verify_air_operand_read(cx, function_id, index, capture, state);
+            }
+        }
+    }
+}
+
+fn verify_air_operand_read(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    op: &Operand,
+    state: &LocalInit,
+) {
+    if let Operand::Place(place) = op {
+        verify_air_place_read(cx, function_id, index, place, state);
+    }
+}
+
+fn verify_air_place_read(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    place: &Place,
+    state: &LocalInit,
+) {
+    verify_air_local_read(cx, function_id, index, place.root, state);
+    for projection in &place.projection {
+        if let Projection::Index(local) = projection {
+            verify_air_local_read(cx, function_id, index, *local, state);
+        }
+    }
+}
+
+fn verify_air_local_read(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    local: LocalId,
+    state: &LocalInit,
+) {
+    if !state.is_definite(local) {
+        cx.push(
+            VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
+            VerifyErrorKind::BadStatement(BadStatement::ReadUninitializedLocal(local)),
+        );
+    }
+}
+
+fn verify_init_stmt(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    local: LocalId,
+    value: &RValue,
+) {
+    let function = cx.program.function(function_id);
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    if local.index() >= function.locals.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidLocal(local)),
+        );
+    } else {
+        let target = &function.locals[local.index()];
+        if function
+            .signature
+            .params
+            .iter()
+            .any(|param| param.local_id == local)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadStatement(BadStatement::InitParamLocal(local)),
+            );
+        }
+        cx.verify_type_ref(site.clone(), target.ty);
+        if let Some(value_ty) = typing::rvalue_ty(cx.program, &cx.primitives, value)
+            && value_ty != target.ty
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadStatement(BadStatement::InitTypeMismatch {
+                    expected: target.ty,
+                    found: value_ty,
+                }),
+            );
+        }
+    }
+    verify_rvalue(cx, function_id, block_id, Some(index), value);
+}
+
+fn verify_assign_stmt(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    dst: &Place,
+    value: &RValue,
+) {
+    let function = cx.program.function(function_id);
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    let dst_ty = verify_place(cx, function_id, block_id, Some(index), dst);
+    if function
+        .locals
+        .get(dst.root.index())
+        .is_some_and(|local| local.mutability == Mutability::Immutable)
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::AssignImmutableLocal(dst.root)),
+        );
+    }
+    verify_rvalue(cx, function_id, block_id, Some(index), value);
+    if let (Some(expected), Some(found)) =
+        (dst_ty, typing::rvalue_ty(cx.program, &cx.primitives, value))
+        && expected != found
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadStatement(BadStatement::AssignTypeMismatch { expected, found }),
+        );
     }
 }
 
@@ -2125,8 +2447,8 @@ fn verify_call(
     if let Callee::Closure(op) = callee {
         verify_operand(cx, function_id, block_id, stmt_index, op);
     }
-    for arg in args {
-        verify_call_arg(cx, function_id, block_id, stmt_index, arg);
+    for (arg_index, arg) in args.iter().enumerate() {
+        verify_call_arg(cx, function_id, block_id, stmt_index, arg_index, arg);
     }
 
     match callee {
@@ -2190,12 +2512,35 @@ fn verify_call_arg(
     function_id: FunctionId,
     block_id: BlockId,
     stmt_index: Option<usize>,
+    arg_index: usize,
     arg: &CallArg,
 ) {
     match arg {
         CallArg::Value(op) => verify_operand(cx, function_id, block_id, stmt_index, op),
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
             verify_place(cx, function_id, block_id, stmt_index, place);
+        }
+        CallArg::SharedStringConst(id) => {
+            let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
+            let Some(konst) = cx.program.const_arena.get_checked(*id) else {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidConst(*id)),
+                );
+                return;
+            };
+            if !matches!(cx.program.type_arena.data(konst.ty), TypeData::String)
+                || !matches!(konst.value, ConstValue::String(_))
+            {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadCall(BadCall::ArgTypeMismatch {
+                        index: arg_index,
+                        expected: konst.ty,
+                        found: konst.ty,
+                    }),
+                );
+            }
         }
     }
 }

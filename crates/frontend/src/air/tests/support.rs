@@ -1,10 +1,10 @@
 use super::super::{
-    AggregateDecl, BasicBlock, ConstData, EnumDecl, ExternDecl, ExternTypeDecl, Function,
-    FunctionKind, Local, LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole,
-    Place, Program, RValue, Signature, Statement, Terminator, TypeData,
+    AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, ConstData, EnumDecl, ExternDecl,
+    ExternTypeDecl, Function, FunctionKind, Local, LocalKind, Module, Mutability, Operand, Param,
+    ParamMode, ParamRole, Place, Program, RValue, Signature, TypeData,
     ids::{
         AggregateId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FunctionId, LocalId,
-        ModuleId, TypeId, VariantId,
+        ModuleId, TypeId,
     },
 };
 use crate::{
@@ -149,7 +149,7 @@ pub struct FunctionBuilder {
     return_type: TypeId,
     params: Vec<Param>,
     locals: Vec<Local>,
-    blocks: Vec<BasicBlock>,
+    block: AirBlock,
 }
 
 impl FunctionBuilder {
@@ -161,7 +161,7 @@ impl FunctionBuilder {
             return_type,
             params: Vec::new(),
             locals: Vec::new(),
-            blocks: Vec::new(),
+            block: AirBlock::default(),
         }
     }
 
@@ -209,17 +209,14 @@ impl FunctionBuilder {
         id
     }
 
-    pub fn push_block(&mut self, terminator: Terminator) -> BlockId {
-        let id = BlockId::from_index(self.blocks.len());
-        self.blocks.push(BasicBlock {
-            statements: Vec::new(),
-            terminator,
-        });
-        id
+    pub fn push_block(&mut self, tail: AirTail) -> BlockId {
+        self.block.tail = tail;
+        BlockId::from_index(0)
     }
 
-    pub fn add_statement(&mut self, block: BlockId, stmt: Statement) {
-        self.blocks[block.index()].statements.push(stmt);
+    pub fn add_statement(&mut self, block: BlockId, stmt: AirStmt) {
+        assert_eq!(block, BlockId::from_index(0));
+        self.block.stmts.push(stmt);
     }
 
     pub fn finish(self) -> Function {
@@ -227,11 +224,16 @@ impl FunctionBuilder {
             name: self.name,
             module: self.module,
             kind: self.kind,
+            owner: None,
             signature: Signature::new(self.params, self.return_type),
             locals: self.locals,
-            body: self.blocks,
+            body: AirBody { block: self.block },
         }
     }
+}
+
+pub fn body_from_block(block: AirBlock) -> AirBody {
+    AirBody { block }
 }
 
 pub fn empty_module(path: &str) -> Module {
@@ -249,52 +251,28 @@ pub fn test_module(builder: &mut ProgramBuilder) -> ModuleId {
     builder.alloc_module(empty_module("test"))
 }
 
-pub fn stmt_init(local: LocalId, value: RValue) -> Statement {
-    Statement::Init { local, value }
+pub fn stmt_init(local: LocalId, value: RValue) -> AirStmt {
+    AirStmt::Init { local, value }
 }
 
-pub fn stmt_assign(dst: Place, value: RValue) -> Statement {
-    Statement::Assign { dst, value }
+pub fn stmt_assign(dst: Place, value: RValue) -> AirStmt {
+    AirStmt::Assign { dst, value }
 }
 
-pub fn stmt_eval(value: RValue) -> Statement {
-    Statement::Eval(value)
+pub fn stmt_eval(value: RValue) -> AirStmt {
+    AirStmt::Eval(value)
 }
 
-pub fn term_goto(target: BlockId) -> Terminator {
-    Terminator::Goto(target)
+pub fn term_return(value: Operand) -> AirTail {
+    AirTail::Return(Some(value))
 }
 
-pub fn term_if(cond: Operand, then_bb: BlockId, else_bb: BlockId) -> Terminator {
-    Terminator::If {
-        cond,
-        then_bb,
-        else_bb,
-    }
+pub fn term_return_void() -> AirTail {
+    AirTail::Return(None)
 }
 
-pub fn term_switch_enum(
-    discr: Place,
-    arms: Vec<(VariantId, BlockId)>,
-    else_bb: Option<BlockId>,
-) -> Terminator {
-    Terminator::SwitchEnum {
-        discr,
-        arms,
-        else_bb,
-    }
-}
-
-pub fn term_return(value: Operand) -> Terminator {
-    Terminator::Return(Some(value))
-}
-
-pub fn term_return_void() -> Terminator {
-    Terminator::Return(None)
-}
-
-pub fn term_unreachable() -> Terminator {
-    Terminator::Unreachable
+pub fn term_unreachable() -> AirTail {
+    AirTail::Unreachable
 }
 
 pub fn place(local: LocalId, ty: TypeId) -> Place {
