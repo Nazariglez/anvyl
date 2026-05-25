@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 10
+
+struct Counter {
+    value: int,
+
+    fn new(start: int) -> Self {
+        Counter { value: start }
+    }
+}
+
+fn main() {
+    let c = Counter.new(10);
+    println(c.value);
+}

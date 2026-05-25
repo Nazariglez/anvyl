@@ -16,7 +16,7 @@ cargo run --package test-runner -- tests/syntax --backend vm
 cargo run --package test-runner -- tests/run --backend both --jobs 8
 cargo run --package test-runner -- tests --report-json
 cargo run --package test-runner -- tests/syntax --new-frontend --quiet
-cargo run --package test-runner -- tests/run/rust_backend --new-frontend --backend rust --quiet
+cargo run --package test-runner -- tests/run2 --new-frontend --backend rust --quiet
 ```
 
 Options:
@@ -30,11 +30,13 @@ Options:
 | `--jobs <n>` | Maximum parallel tests. Defaults to Rayon. |
 | `--quiet` | Hide per-test output. |
 | `--report-json` | Emit a JSON report. |
-| `--release` | Build Anvyx in release mode. |
+| `--release` | Build the `anvyx` CLI binary in release mode and pass `--release` to run fixtures. Clean Rust batch fixtures use Cargo release profile. |
 
 Options can appear before or after paths. Repeated value options use the last value.
 
 By default, fixtures run through the production CLI default frontend/backend path. `--new-frontend` uses the same compiled CLI binary and adds `--new-frontend` to matching child invocations. Run fixtures execute only when the scheduled backend is `rust`; other backends are skipped before spawning `anvyx`. Use `// @frontend: new` or `// @frontend: default` for fixtures that only apply to one frontend path.
+
+Clean frontend + clean Rust execution fixtures live under `tests/run2`. The clean Rust runner batch-builds eligible fixtures with Cargo, then runs produced binaries in parallel. Fixtures with stdin or forwarded CLI flags use the normal per-file CLI lane.
 
 ## Fixture directives
 

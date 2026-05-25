@@ -1,0 +1,20 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 2
+
+enum Choice {
+    One,
+    Two,
+}
+
+fn value(choice: Choice) -> int {
+    match choice {
+        Choice.One => 1,
+        Choice.Two => 2,
+    }
+}
+
+fn main() {
+    println(value(Choice.Two));
+}

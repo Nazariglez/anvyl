@@ -87,7 +87,7 @@ Options:
   --jobs <n>                Maximum tests to run in parallel (default: rayon default)
   --quiet                   Suppress individual test output
   --report-json             Emit machine-readable JSON instead of human output
-  --release                 Build in release mode"
+  --release                 Build the CLI and run fixtures in release mode"
     )
 }
 

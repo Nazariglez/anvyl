@@ -62,7 +62,7 @@ pub fn compile_and_run(job: &RustSourceJob) -> Result<RustSourceJobOutput, RustS
     let artifact = dir.join("main");
     fs::write(&source, job.source.as_str())?;
     let compile = Command::new("rustc")
-        .arg("--edition=2021")
+        .arg("--edition=2024")
         .arg(&source)
         .arg("-o")
         .arg(&artifact)

@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 22
+
+fn scale(a: int, nice: bool) -> int {
+    if nice { a } else { a * 10 }
+}
+
+fn main() {
+    let cond: bool = false;
+    let a: int = if cond { 1 } else { 2 };
+    println(a + scale(2, cond));
+}

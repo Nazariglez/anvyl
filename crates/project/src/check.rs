@@ -13,66 +13,7 @@ use crate::{
     source_bundle,
 };
 
-#[derive(Debug)]
-pub enum CleanRustRunError {
-    Air(AirBuildError<anvyx_lang2::CheckError>),
-    Plan(anvyx_backend::rust::RustPlanError),
-    SourceJob(anvyx_backend::rust::source_job::RustSourceJobError),
-    Run(anvyx_backend::rust::source_job::RustSourceJobOutput),
-}
-
-impl std::fmt::Display for CleanRustRunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Air(error) => write!(f, "{}", air_error_ref(error)),
-            Self::Plan(error) => write!(f, "{error}"),
-            Self::SourceJob(error) => write!(f, "{error}"),
-            Self::Run(output) => {
-                write!(f, "generated Rust job failed: {:?}", output.status)?;
-                if !output.stderr.is_empty() {
-                    write!(f, "\n{}", output.stderr)?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl std::error::Error for CleanRustRunError {}
-
-pub struct CleanRustRunOutput {
-    pub stdout: String,
-    pub stderr: String,
-}
-
-pub fn run_clean_rust_path(
-    file: &Path,
-    config: FrontendConfig,
-) -> Result<CleanRustRunOutput, CleanRustRunError> {
-    let output = build_air_path_typed(file, config).map_err(CleanRustRunError::Air)?;
-    let plan = anvyx_backend::rust::plan(
-        &output.air.as_verified(),
-        anvyx_backend::rust::RustPlanConfig::default(),
-    )
-    .map_err(CleanRustRunError::Plan)?;
-    let source = anvyx_backend::rust::emit::emit(&plan.verified());
-    let output = anvyx_backend::rust::source_job::compile_and_run(
-        &anvyx_backend::rust::source_job::RustSourceJob {
-            source,
-            work_dir: None,
-        },
-    )
-    .map_err(CleanRustRunError::SourceJob)?;
-    if output.status != anvyx_backend::rust::source_job::SourceJobStatus::Success {
-        return Err(CleanRustRunError::Run(output));
-    }
-    Ok(CleanRustRunOutput {
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-}
-
-fn build_air_path_typed(
+pub(crate) fn build_air_path_typed(
     file: &Path,
     config: FrontendConfig,
 ) -> Result<AirBuildOutput, AirBuildError<anvyx_lang2::CheckError>> {
@@ -151,7 +92,7 @@ fn build_air_loaded_path_typed(
     anvyx_lang2::build_air_package(input)
 }
 
-fn air_error_ref(error: &AirBuildError<anvyx_lang2::CheckError>) -> String {
+pub(crate) fn air_error_ref(error: &AirBuildError<anvyx_lang2::CheckError>) -> String {
     match error {
         AirBuildError::Diagnostic(output) => output.summary().to_string(),
         AirBuildError::Lower(message) => format!("failed to lower AIR: {message}"),

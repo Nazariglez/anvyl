@@ -1,5 +1,6 @@
 pub mod check;
 pub mod manifest;
+pub mod rust;
 
 use anvyx_lang2::{ModuleSource, SourceBundle, SourceText, SystemPackageSource};
 

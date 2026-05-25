@@ -16,6 +16,7 @@ use std::{
 
 use anvyx_lang::{CompilationContext, LintConfig as LegacyLintConfig, Profile};
 use anvyx_lang2::{LintConfig, LintId, LintLevel, expand_group, find_lint};
+use anvyx_project::rust::{CleanRustBuildInput, RustCargoProfile};
 use clap::{Parser, Subcommand};
 
 use crate::manifest::Manifest;
@@ -75,6 +76,10 @@ enum Command {
     Build {
         #[arg(long)]
         release: bool,
+        #[arg(long)]
+        new_frontend: bool,
+        #[arg(long)]
+        backend: Option<String>,
         #[arg(long, value_delimiter = ',')]
         feature: Vec<String>,
         #[arg(long, value_name = "KEY=VALUE")]
@@ -170,7 +175,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
                 progress::status("Checking", &format!("{}...", path.display()));
                 progress::status("Running", &format!("{}...", path.display()));
-                run::new_frontend_cmd(&path, lint_config, &compilation_ctx)?;
+                run::new_frontend_cmd(
+                    &path,
+                    lint_config,
+                    &compilation_ctx,
+                    RustCargoProfile::from_release(release),
+                )?;
                 return Ok(());
             }
 
@@ -273,12 +283,54 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Fmt { path, check, stdin } => {
             fmt::cmd(path, check, stdin)?;
         }
-        Command::Build { release, .. } => {
+        Command::Build {
+            release,
+            new_frontend,
+            backend,
+            feature,
+            cfg,
+        } => {
             let manifest =
                 manifest::parse_manifest()?.ok_or("anvyx build requires an anvyx.toml manifest")?;
             let cwd = std::env::current_dir()
                 .map_err(|e| format!("Failed to get current directory: {e}"))?;
             let project_name = build::resolve_project_name(&manifest, &cwd);
+
+            if new_frontend {
+                let backend = backend.as_deref().unwrap_or("rust");
+                if backend != "rust" {
+                    return Err(
+                        "--new-frontend build currently requires --backend rust".to_string()
+                    );
+                }
+                manifest::reject_clean_frontend_inputs(Some(&manifest))?;
+                let entry = manifest
+                    .project
+                    .entry
+                    .as_deref()
+                    .ok_or("project.entry is required for clean build")?;
+                let path = cwd.join(entry);
+                let compilation_ctx = build_compilation_ctx(release, &feature, &cfg)?;
+                let lint_config = resolve_lint_config(Some(&manifest), &[])?;
+                progress::status("Checking", &format!("{}...", path.display()));
+                progress::status("Building", &format!("{}...", path.display()));
+                let output = anvyx_project::rust::build_clean_rust(CleanRustBuildInput {
+                    file: path,
+                    project_root: cwd.clone(),
+                    project_name,
+                    frontend: check::new_frontend_config(lint_config, &compilation_ctx),
+                    cargo_profile: RustCargoProfile::from_release(release),
+                    cache_root: None,
+                    output_root: cwd.join("build"),
+                })
+                .map_err(|error| error.to_string())?;
+                progress::status("Finished", &format!("{}", output.artifact.display()));
+                return Ok(());
+            }
+
+            if let Some(backend) = backend {
+                return Err(format!("--backend {backend} requires --new-frontend"));
+            }
 
             if manifest.has_externs() {
                 prepare_externs(&manifest)?;
@@ -474,6 +526,61 @@ mod tests {
             }
             other => panic!("expected check command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_defaults_to_legacy_shape() {
+        let cli = Cli::parse_from(["anvyx", "build"]);
+
+        match cli.command {
+            Command::Build {
+                new_frontend,
+                backend,
+                ..
+            } => {
+                assert!(!new_frontend);
+                assert_eq!(backend, None);
+            }
+            other => panic!("expected build command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_accepts_clean_rust_flags() {
+        let cli = Cli::parse_from(["anvyx", "build", "--new-frontend", "--backend", "rust"]);
+
+        match cli.command {
+            Command::Build {
+                new_frontend,
+                backend,
+                ..
+            } => {
+                assert!(new_frontend);
+                assert_eq!(backend.as_deref(), Some("rust"));
+            }
+            other => panic!("expected build command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_build_rejects_non_rust_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("anvyx.toml"),
+            "[project]\nentry = \"main.anv\"\n",
+        )
+        .unwrap();
+        let old_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+        let cli = Cli::parse_from(["anvyx", "build", "--new-frontend", "--backend", "vm"]);
+
+        let error = run(cli).unwrap_err();
+        std::env::set_current_dir(old_dir).unwrap();
+
+        assert_eq!(
+            error,
+            "--new-frontend build currently requires --backend rust"
+        );
     }
 
     #[test]

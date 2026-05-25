@@ -4,13 +4,12 @@ run target:
 check target:
     cargo run -- check {{target}}
 
-tests target="tests":
-    cargo run --package test-runner -- {{target}} --quiet
+tests: frontend-tests clean-rust-tests
 
 frontend-tests target="tests/syntax":
     cargo run --package test-runner -- {{target}} --new-frontend --quiet
 
-clean-rust-tests target="tests/run/rust_backend":
+clean-rust-tests target="tests/run2":
     cargo run --package test-runner -- {{target}} --new-frontend --backend rust --quiet
 
 full-tests target="tests":

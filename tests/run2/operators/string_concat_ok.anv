@@ -1,0 +1,9 @@
+// @mode: run
+// @frontend: new
+// @skip: clean rust: owned string concat path not ready for run2
+// @expect: success
+// @match: hello world
+
+fn main() {
+    println("hello" + " world");
+}

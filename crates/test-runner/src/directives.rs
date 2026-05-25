@@ -6,7 +6,7 @@ pub(crate) struct Directives {
     pub(crate) assertions: Assertions,
     pub(crate) stdin: Stdin,
     pub(crate) cli_options: CliOptions,
-    // FIXME: remove frontend once it promoted to the only frtonend
+    // FIXME: remove frontend once it is promoted to the only frontend
     pub(crate) frontend: FrontendRequirement,
     pub(crate) skip: Option<String>,
     pub(crate) helper: bool,
@@ -143,6 +143,10 @@ pub(crate) struct CliOptions {
 impl CliOptions {
     pub(crate) fn push(&mut self, flag: CliFlag, value: String) {
         self.forwarded.push(ForwardedCliArg { flag, value });
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.forwarded.is_empty()
     }
 
     pub(crate) fn append_args(&self, args: &mut Vec<String>) {

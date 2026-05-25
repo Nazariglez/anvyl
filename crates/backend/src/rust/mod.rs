@@ -1,7 +1,9 @@
+pub mod cargo_job;
 pub mod emit;
 pub mod profile;
 pub mod rir;
-pub mod source_job;
+#[cfg(test)]
+mod source_job;
 
 use std::{collections::HashMap, error::Error, fmt};
 

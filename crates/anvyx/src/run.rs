@@ -4,6 +4,7 @@ use anvyx_lang::{
     Backend, CompilationContext, CompileOptions, CoreSource, LintConfig, RustBackendConfig,
     run_program_with_std,
 };
+use anvyx_project::rust::{CleanRustRunInput, RustCargoProfile};
 
 use crate::std_support::{collect_core, collect_std};
 
@@ -11,11 +12,14 @@ pub fn new_frontend_cmd(
     file: &Path,
     lint: anvyx_lang2::LintConfig,
     ctx: &CompilationContext,
+    cargo_profile: RustCargoProfile,
 ) -> Result<(), String> {
-    let output = anvyx_project::check::run_clean_rust_path(
-        file,
-        crate::check::new_frontend_config(lint, ctx),
-    )
+    let output = anvyx_project::rust::run_clean_rust(CleanRustRunInput {
+        file: file.to_path_buf(),
+        frontend: crate::check::new_frontend_config(lint, ctx),
+        cargo_profile,
+        cache_root: None,
+    })
     .map_err(|error| error.to_string())?;
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);

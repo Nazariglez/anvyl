@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @skip: clean rust: owned string value/copy path reports NonCopyValueRequired
+// @expect: success
+// @match: hello
+
+fn echo(s: string) -> string { s }
+
+fn main() {
+    println(echo("hello"));
+}

@@ -1,12 +1,12 @@
 use std::{
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Write},
     path::PathBuf,
     time::Duration,
 };
 
 use wait_timeout::ChildExt;
 
-use super::{CliCase, ProcessOutcome, classifier::phase_from_stderr_marker};
+use super::{CliCase, ProcessOutcome, classifier::phase_from_stderr_marker, read_child_output};
 use crate::model::{FailurePhase, Mode};
 
 const ORANGE: &str = "\x1b[93m";
@@ -15,6 +15,7 @@ const RESET: &str = "\x1b[0m";
 pub(crate) struct Cli {
     exe: String,
     new_frontend: bool,
+    release: bool,
 }
 
 impl Cli {
@@ -50,23 +51,36 @@ impl Cli {
             .join(exe_name)
             .display()
             .to_string();
-        Ok(Self { exe, new_frontend })
+        Ok(Self {
+            exe,
+            new_frontend,
+            release,
+        })
     }
 
     pub(crate) fn new_frontend(&self) -> bool {
         self.new_frontend
     }
 
+    pub(crate) fn release(&self) -> bool {
+        self.release
+    }
+
     pub(crate) fn run(&self, case: &CliCase) -> Result<ProcessOutcome, String> {
-        spawn(&self.exe, case, self.new_frontend)
+        spawn(&self.exe, case, self.new_frontend, self.release)
     }
 }
 
-fn spawn(cmd: &str, case: &CliCase, new_frontend: bool) -> Result<ProcessOutcome, String> {
+fn spawn(
+    cmd: &str,
+    case: &CliCase,
+    new_frontend: bool,
+    release: bool,
+) -> Result<ProcessOutcome, String> {
     use std::process::Stdio;
 
     let mut command = std::process::Command::new(cmd);
-    command.args(child_args(case, new_frontend));
+    command.args(child_args(case, new_frontend, release));
 
     let mut child = command
         .stdin(Stdio::piped())
@@ -100,31 +114,20 @@ fn spawn(cmd: &str, case: &CliCase, new_frontend: bool) -> Result<ProcessOutcome
     })
 }
 
-fn read_child_output(child: &mut std::process::Child) -> (String, String) {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
-
-    (stdout, stderr)
-}
-
-fn child_args(case: &CliCase, new_frontend: bool) -> Vec<String> {
+fn child_args(case: &CliCase, new_frontend: bool, release: bool) -> Vec<String> {
     let mut args = vec![case.mode.as_str().to_string()];
     if new_frontend {
         debug_assert!(case.mode == Mode::Check || case.backend == Some("rust"));
         args.push("--new-frontend".to_string());
     }
 
-    if case.mode == Mode::Run
-        && let Some(backend) = case.backend
-    {
-        args.extend(["--backend".to_string(), backend.to_string()]);
+    if case.mode == Mode::Run {
+        if release {
+            args.push("--release".to_string());
+        }
+        if let Some(backend) = case.backend {
+            args.extend(["--backend".to_string(), backend.to_string()]);
+        }
     }
     case.cli_options.append_args(&mut args);
 
@@ -222,7 +225,7 @@ mod tests {
         case.cli_options.push(CliFlag::Lint, "unused".to_string());
         case.cli_options.push(CliFlag::Feature, "gc".to_string());
         case.cli_options.push(CliFlag::Cfg, "debug".to_string());
-        let args = child_args(&case, false);
+        let args = child_args(&case, false, false);
 
         assert_eq!(args[0], "run");
         assert!(has_arg_pair(&args, "--backend", "vm"));
@@ -249,7 +252,7 @@ mod tests {
         case.backend = Some("vm");
 
         assert_eq!(
-            child_args(&case, false),
+            child_args(&case, false, false),
             vec!["check", "tests/syntax/basic_ok.anv"]
         );
     }
@@ -257,7 +260,7 @@ mod tests {
     #[test]
     fn adds_new_frontend() {
         assert_eq!(
-            child_args(&case(Mode::Check), true),
+            child_args(&case(Mode::Check), true, false),
             vec!["check", "--new-frontend", "tests/syntax/basic_ok.anv"]
         );
     }
@@ -270,7 +273,7 @@ mod tests {
         case.cli_options.push(CliFlag::Cfg, "debug".to_string());
 
         assert_eq!(
-            child_args(&case, true),
+            child_args(&case, true, false),
             vec![
                 "check",
                 "--new-frontend",
@@ -287,10 +290,28 @@ mod tests {
         case.backend = Some("rust");
 
         assert_eq!(
-            child_args(&case, true),
+            child_args(&case, true, false),
             vec![
                 "run",
                 "--new-frontend",
+                "--backend",
+                "rust",
+                "tests/run/basic_ok.anv"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_forwards_release() {
+        let mut case = case(Mode::Run);
+        case.backend = Some("rust");
+
+        assert_eq!(
+            child_args(&case, true, true),
+            vec![
+                "run",
+                "--new-frontend",
+                "--release",
                 "--backend",
                 "rust",
                 "tests/run/basic_ok.anv"

@@ -1,0 +1,13 @@
+// @mode: run
+// @frontend: new
+// @skip: clean rust: loops are rejected by RustBackendProfile
+// @expect: success
+// @match: 3
+
+fn main() {
+    var x = 0;
+    while x < 3 {
+        x = x + 1;
+    }
+    println(x);
+}

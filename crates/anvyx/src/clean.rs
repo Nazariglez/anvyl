@@ -11,8 +11,8 @@ pub fn cmd() -> Result<(), String> {
         return Ok(());
     }
 
-    fs::remove_dir_all(&cache_dir).map_err(|e| format!("Failed to remove cache: {e}"))?;
-
+    fs::remove_dir_all(&cache_dir)
+        .map_err(|e| format!("Failed to remove cache {}: {e}", cache_dir.display()))?;
     crate::progress::status("Cleaned", ".anvyx/cache/");
     Ok(())
 }

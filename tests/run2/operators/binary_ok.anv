@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 26
+
+fn main() {
+    let a: int = 10 + 10;
+    let b: int = 9 - 4;
+    let c: int = a * b / 5;
+    let d: int = c % 7;
+    println(c + d);
+}

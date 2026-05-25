@@ -1,0 +1,10 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 45
+
+fn main() {
+    let a = 42 as float;
+    let b = 3.14 as int;
+    println((a as int) + b);
+}

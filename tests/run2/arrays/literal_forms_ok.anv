@@ -1,0 +1,10 @@
+// @mode: run
+// @frontend: new
+// @skip: clean rust: array literals do not lower to AIR yet
+// @expect: success
+// @match: 3
+
+fn main() {
+    let xs = [1, 2, 3];
+    println(xs[2]);
+}
