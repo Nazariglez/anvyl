@@ -11,7 +11,7 @@ use super::{
 use crate::{
     ast,
     lexer::{Keyword, Op, Token},
-    span::{SourceSpan, Spanned},
+    span::{SourceSpan, Span, Spanned},
 };
 
 pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
@@ -21,7 +21,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let bind = binding(stmt.clone());
         let const_s = const_stmt(stmt.clone());
         let type_alias = local_type_alias_statement();
-        let ret = return_stmt(stmt.clone());
+        let ret = return_stmt(expr.clone());
         let while_let_s = while_let_stmt(stmt.clone(), expr.clone());
         let while_s = while_stmt(stmt.clone(), expr.clone());
         let for_s = for_stmt(stmt.clone(), expr.clone());
@@ -33,17 +33,16 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             .then_ignore(select! { Token::Op(Op::Assign) => () })
             .then(expression(stmt.clone()))
             .then_ignore(select! { Token::Keyword(Keyword::Else) => () })
-            .then(block_stmt(stmt.clone(), expr.clone()))
-            .map_with(|(((head, pat), value), else_block), e| {
-                let s = e.span();
-                let span = s.byte();
+            .then(let_else_fallback(stmt.clone(), expr.clone()))
+            .map_with(|(((head, pat), value), fallback), e| {
+                let span = e.span().byte();
                 Spanned::new(
                     ast::Stmt::LetElse(Spanned::new(
                         ast::LetElse {
                             head,
                             pattern: pat,
                             value,
-                            else_block,
+                            fallback,
                         },
                         span,
                     )),
@@ -341,59 +340,72 @@ fn for_stmt<'src>(
     .boxed()
 }
 
+fn let_else_fallback<'src>(
+    stmt: impl AnvParser<'src, ast::StmtNode>,
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, ast::LetElseFallbackNode> {
+    let block = block_stmt(stmt, expr.clone())
+        .map_with(|block, e| Spanned::new(ast::LetElseFallback::Block(block), e.span().byte()));
+    let ret = return_node(expr)
+        .map_with(|ret, e| Spanned::new(ast::LetElseFallback::Return(ret), e.span().byte()));
+    let break_ = control_transfer_span(Keyword::Break)
+        .map(|span| Spanned::new(ast::LetElseFallback::Break, span));
+    let continue_ = control_transfer_span(Keyword::Continue)
+        .map(|span| Spanned::new(ast::LetElseFallback::Continue, span));
+
+    choice((block, ret, break_, continue_))
+        .labelled("let-else fallback")
+        .as_context()
+        .boxed()
+}
+
+fn control_transfer_span<'src>(keyword: Keyword) -> BoxedParser<'src, Span> {
+    select! { Token::Keyword(found) if found == keyword => () }
+        .then_ignore(select! { Token::Semicolon => () })
+        .map_with(|(), e| {
+            let span: SourceSpan = e.span();
+            span.byte()
+        })
+        .boxed()
+}
+
 fn break_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
-    select! {
-        Token::Keyword(Keyword::Break) => (),
-    }
-    .then_ignore(select! {
-        Token::Semicolon => (),
-    })
-    .map_with(|(), e| {
-        let span: SourceSpan = e.span();
-        let span = span.byte();
-        Spanned::new(ast::Stmt::Break, span)
-    })
-    .labelled("break statement")
-    .as_context()
-    .boxed()
+    control_transfer_span(Keyword::Break)
+        .map(|span| Spanned::new(ast::Stmt::Break, span))
+        .labelled("break statement")
+        .as_context()
+        .boxed()
 }
 
 fn continue_stmt<'src>() -> BoxedParser<'src, ast::StmtNode> {
-    select! {
-        Token::Keyword(Keyword::Continue) => (),
-    }
-    .then_ignore(select! {
-        Token::Semicolon => (),
-    })
-    .map_with(|(), e| {
-        let span: SourceSpan = e.span();
-        let span = span.byte();
-        Spanned::new(ast::Stmt::Continue, span)
-    })
-    .labelled("continue statement")
-    .as_context()
-    .boxed()
+    control_transfer_span(Keyword::Continue)
+        .map(|span| Spanned::new(ast::Stmt::Continue, span))
+        .labelled("continue statement")
+        .as_context()
+        .boxed()
+}
+
+fn return_node<'src>(
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, ast::ReturnNode> {
+    select! { Token::Keyword(Keyword::Return) => () }
+        .ignore_then(expr.or_not())
+        .then_ignore(select! { Token::Semicolon => () })
+        .map_with(|value, e| Spanned::new(ast::Return { value }, e.span().byte()))
+        .boxed()
 }
 
 fn return_stmt<'src>(
-    stmt: impl AnvParser<'src, ast::StmtNode>,
+    expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
-    select! {
-        Token::Keyword(Keyword::Return) => (),
-    }
-    .ignore_then(expression(stmt).or_not())
-    .then_ignore(select! {
-        Token::Semicolon => (),
-    })
-    .map_with(|value_opt, e| {
-        let s = e.span();
-        let span = s.byte();
-        let ret = ast::Return { value: value_opt };
-        Spanned::new(ast::Stmt::Return(Spanned::new(ret, span)), span)
-    })
-    .labelled("return")
-    .as_context()
-    .boxed()
+    return_node(expr)
+        .map(|ret| {
+            let span = ret.span;
+            Spanned::new(ast::Stmt::Return(ret), span)
+        })
+        .labelled("return")
+        .as_context()
+        .boxed()
 }
 
 fn defer_stmt<'src>(

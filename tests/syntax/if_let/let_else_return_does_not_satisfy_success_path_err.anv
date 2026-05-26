@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: missing return value
+
+fn f(opt: int?) -> int {
+    let value? = opt else return 0;
+    println(value);
+}
+
+fn main() {}

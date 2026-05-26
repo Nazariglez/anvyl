@@ -28,19 +28,36 @@ impl Printer<'_> {
         self.write(" = ");
         self.format_expr(&le.value.node);
         self.write(" else ");
-        self.format_block(&le.else_block);
+        match &le.fallback.node {
+            ast::LetElseFallback::Block(block) => self.format_block(block),
+            ast::LetElseFallback::Return(ret) => self.format_return_body(&ret.node),
+            ast::LetElseFallback::Break => self.format_break_body(),
+            ast::LetElseFallback::Continue => self.format_continue_body(),
+        }
         self.writeln();
     }
 
-    fn format_return(&mut self, r: &ast::Return) {
-        self.write_indent();
+    fn format_return_body(&mut self, r: &ast::Return) {
         self.write("return");
         if let Some(value) = &r.value {
             self.write(" ");
             self.format_expr(&value.node);
         }
         self.write(";");
+    }
+
+    fn format_return(&mut self, r: &ast::Return) {
+        self.write_indent();
+        self.format_return_body(r);
         self.writeln();
+    }
+
+    fn format_break_body(&mut self) {
+        self.write("break;");
+    }
+
+    fn format_continue_body(&mut self) {
+        self.write("continue;");
     }
 
     fn format_while(&mut self, w: &ast::While) {
@@ -141,12 +158,12 @@ impl Printer<'_> {
             ast::Stmt::Defer(d) => self.format_defer(&d.node),
             ast::Stmt::Break => {
                 self.write_indent();
-                self.write("break;");
+                self.format_break_body();
                 self.writeln();
             }
             ast::Stmt::Continue => {
                 self.write_indent();
-                self.write("continue;");
+                self.format_continue_body();
                 self.writeln();
             }
             ast::Stmt::Expr(e) => {

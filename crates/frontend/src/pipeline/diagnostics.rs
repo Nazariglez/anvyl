@@ -787,7 +787,7 @@ pub(super) fn diagnose_type_error(
         }
         TypeError::IrrefutableLetElse { .. } => "irrefutable pattern in let-else".to_string(),
         TypeError::LetElseMustDiverge { .. } => {
-            "the else block of a let-else must always return, break, or continue".to_string()
+            "let-else fallback must always return, break, or continue".to_string()
         }
         TypeError::MemberAccessOnNonAggregate {
             ty, member, kind, ..

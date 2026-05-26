@@ -794,14 +794,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_abi() {
+    fn rejects_visible_param_abi_mismatch() {
         let mut binding = binding("ping");
-        binding.abi.needs_context = true;
+        binding.abi.params[0] = RustParamAbi::Borrow(ExternTypeExpr::Int);
 
         let error =
             validate_rust_provider_support(&[descriptor()], &[support(binding)]).unwrap_err();
 
-        assert!(error.contains("unexpected context parameter"));
+        assert!(error.contains("parameter 0 ABI mismatch"));
     }
 
     fn provider() -> ProviderId {

@@ -138,25 +138,6 @@ mod match_stmt {
     }
 
     #[test]
-    fn let_else_tail_block_diverges() {
-        assert_err_count(
-            "fn main() { let x: int? = 1; let v? = x else { { return; } } }",
-            0,
-        );
-    }
-
-    #[test]
-    fn let_else_return_isolated() {
-        let errors =
-            errors("fn f(opt: int?) -> int { let Option.Some(x) = opt else { return 0; } }");
-        assert!(
-            errors
-                .iter()
-                .any(|err| matches!(err, TypeError::MissingReturn { .. }))
-        );
-    }
-
-    #[test]
     fn non_tuple_pattern() {
         assert_err("fn main() { let _ = match 1 { (a, b) => a }; }");
     }

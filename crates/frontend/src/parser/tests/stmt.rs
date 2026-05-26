@@ -36,15 +36,48 @@ fn while_var() {
 }
 
 #[test]
-fn let_else_var() {
-    let prog = parse_program("fn main() { var x? = opt else { return; } }");
-    let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
-        panic!("expected Func");
-    };
-    let ast::Stmt::LetElse(let_else_node) = &func_node.node.body.node.stmts[0].node else {
-        panic!("expected LetElse");
-    };
-    assert!(matches!(let_else_node.node.head, ast::PatternHead::Var));
+fn let_else_source_shape() {
+    let cases = [
+        (
+            "let x? = opt else { return; }",
+            ast::PatternHead::Let,
+            "block",
+        ),
+        ("let x? = opt else return;", ast::PatternHead::Let, "return"),
+        (
+            "let x? = opt else return 0;",
+            ast::PatternHead::Let,
+            "return-value",
+        ),
+        ("let x? = opt else break;", ast::PatternHead::Let, "break"),
+        (
+            "let x? = opt else continue;",
+            ast::PatternHead::Let,
+            "continue",
+        ),
+        ("var x? = opt else return;", ast::PatternHead::Var, "return"),
+    ];
+
+    for (src, head, fallback) in cases {
+        let prog = parse_program(&format!("fn main() {{ {src} }}"));
+        let ast::Stmt::Func(func_node) = &prog.stmts[0].node else {
+            panic!("expected Func");
+        };
+        let ast::Stmt::LetElse(let_else_node) = &func_node.node.body.node.stmts[0].node else {
+            panic!("expected LetElse");
+        };
+        assert_eq!(let_else_node.node.head, head);
+        match (&let_else_node.node.fallback.node, fallback) {
+            (ast::LetElseFallback::Block(_), "block")
+            | (ast::LetElseFallback::Return(_), "return")
+            | (ast::LetElseFallback::Break, "break")
+            | (ast::LetElseFallback::Continue, "continue") => {}
+            (ast::LetElseFallback::Return(ret), "return-value") => {
+                assert!(ret.node.value.is_some());
+            }
+            _ => panic!("unexpected fallback for {src}"),
+        }
+    }
 }
 
 #[test]

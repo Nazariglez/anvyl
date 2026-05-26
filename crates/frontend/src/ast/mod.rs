@@ -345,7 +345,7 @@ impl ReturnSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Infer,
     InferReturn,
@@ -386,97 +386,6 @@ pub enum Type {
     Optional {
         inner: Box<Type>,
     },
-}
-
-impl PartialEq for Type {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Infer, Self::Infer)
-            | (Self::InferReturn, Self::InferReturn)
-            | (Self::Any, Self::Any)
-            | (Self::Int, Self::Int)
-            | (Self::Float, Self::Float)
-            | (Self::Bool, Self::Bool)
-            | (Self::String, Self::String)
-            | (Self::Void, Self::Void) => true,
-            (
-                Self::Func {
-                    params: p1,
-                    ret: r1,
-                },
-                Self::Func {
-                    params: p2,
-                    ret: r2,
-                },
-            ) => p1 == p2 && r1 == r2,
-            (Self::Dyn(a), Self::Dyn(b)) => a == b,
-            (Self::Var(a), Self::Var(b)) => a == b,
-            (Self::UnresolvedName(a), Self::UnresolvedName(b)) => a == b,
-            (
-                Self::UnresolvedNominal {
-                    qualifier: qa,
-                    name: na,
-                    generic_args: ga,
-                },
-                Self::UnresolvedNominal {
-                    qualifier: qb,
-                    name: nb,
-                    generic_args: gb,
-                },
-            ) => qa == qb && na == nb && ga == gb,
-            (Self::Tuple(a), Self::Tuple(b)) => a == b,
-            (Self::Nominal(a), Self::Nominal(b)) => a == b,
-            (Self::List { elem: a }, Self::List { elem: b })
-            | (Self::Slice { elem: a }, Self::Slice { elem: b }) => a == b,
-            (Self::Array { elem: ea, len: la }, Self::Array { elem: eb, len: lb }) => {
-                ea == eb && la == lb
-            }
-            (Self::Map { key: ka, value: va }, Self::Map { key: kb, value: vb }) => {
-                ka == kb && va == vb
-            }
-            (Self::Optional { inner: a }, Self::Optional { inner: b }) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Type {}
-
-impl std::hash::Hash for Type {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Type::Func { params, ret } => {
-                params.hash(state);
-                ret.hash(state);
-            }
-            Type::Dyn(contract) => contract.hash(state),
-            Type::Var(id) => id.hash(state),
-            Type::UnresolvedName(ident) => ident.hash(state),
-            Type::UnresolvedNominal {
-                qualifier,
-                name,
-                generic_args,
-            } => {
-                qualifier.hash(state);
-                name.hash(state);
-                generic_args.hash(state);
-            }
-            Type::Tuple(elems) => elems.hash(state),
-            Type::Nominal(nominal) => nominal.hash(state),
-            Type::List { elem } | Type::Slice { elem } => elem.hash(state),
-            Type::Array { elem, len } => {
-                elem.hash(state);
-                len.hash(state);
-            }
-            Type::Map { key, value } => {
-                key.hash(state);
-                value.hash(state);
-            }
-            Type::Optional { inner } => inner.hash(state),
-            _ => {}
-        }
-    }
 }
 
 impl Type {
@@ -1591,11 +1500,19 @@ pub struct Binding {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum LetElseFallback {
+    Block(BlockNode),
+    Return(ReturnNode),
+    Break,
+    Continue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LetElse {
     pub head: PatternHead,
     pub pattern: PatternNode,
     pub value: ExprNode,
-    pub else_block: BlockNode,
+    pub fallback: LetElseFallbackNode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1918,6 +1835,7 @@ pub type IfNode = Spanned<If>;
 pub type TernaryNode = Spanned<Ternary>;
 pub type IfLetNode = Spanned<IfLet>;
 pub type LetElseNode = Spanned<LetElse>;
+pub type LetElseFallbackNode = Spanned<LetElseFallback>;
 pub type TupleIndexNode = Spanned<TupleIndex>;
 pub type PatternNode = Spanned<Pattern>;
 pub type FieldAccessNode = Spanned<FieldAccess>;

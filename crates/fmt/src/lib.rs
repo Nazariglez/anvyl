@@ -868,11 +868,37 @@ mod tests {
     }
 
     #[test]
-    fn let_else_simple() {
-        let source = "fn f(x: int?) { let val = x else { return; } }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("let val = x else {"));
-        assert!(formatted.contains("return;"));
+    fn let_else_format() {
+        let cases = [
+            (
+                "fn f(x: int?) { let val = x else { return; } }",
+                "fn f(x: int?) {\n    let val = x else {\n        return;\n    }\n}\n",
+            ),
+            (
+                "fn f(x: int?) { var val? = x else { return; } }",
+                "fn f(x: int?) {\n    var val? = x else {\n        return;\n    }\n}\n",
+            ),
+            (
+                "fn f(x: int?) { let val? = x else return; }",
+                "fn f(x: int?) {\n    let val? = x else return;\n}\n",
+            ),
+            (
+                "fn f(x: int?) -> int { let val? = x else return 0; val }",
+                "fn f(x: int?) -> int {\n    let val? = x else return 0;\n    val\n}\n",
+            ),
+            (
+                "fn f(x: int?) { while true { let val? = x else break; } }",
+                "fn f(x: int?) {\n    while true {\n        let val? = x else break;\n    }\n}\n",
+            ),
+            (
+                "fn f(x: int?) { while true { let val? = x else continue; } }",
+                "fn f(x: int?) {\n    while true {\n        let val? = x else continue;\n    }\n}\n",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            assert_fmt(source, expected);
+        }
     }
 
     #[test]
@@ -895,13 +921,6 @@ mod tests {
         let formatted = format_source(source).expect("format failed");
         assert!(formatted.contains("    let x = 5;"));
         assert!(formatted.contains("    x"));
-    }
-
-    #[test]
-    fn let_inferred_enum_via_let_else() {
-        let source = "fn f(x: int?) { let .Some(val) = x else { return; } }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("let .Some(val) = x else {"));
     }
 
     // --- expressions ---

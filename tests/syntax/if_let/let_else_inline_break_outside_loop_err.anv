@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: break outside of loop
+
+fn main() {
+    let opt: int? = 42;
+    let value? = opt else break;
+    println(value);
+}

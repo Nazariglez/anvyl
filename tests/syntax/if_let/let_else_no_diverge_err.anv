@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: the else block of a let-else must always return, break, or continue
+// @contains: let-else fallback must always return, break, or continue
 
 fn main() {
     let opt: int? = 42;

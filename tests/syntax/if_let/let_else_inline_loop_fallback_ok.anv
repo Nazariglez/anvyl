@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let opt: int? = 42;
+    while true {
+        let value? = opt else break;
+        println(value);
+        break;
+    }
+    while true {
+        let value? = opt else continue;
+        println(value);
+        break;
+    }
+}

@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let cond = true;
+    let opt: int? = 42;
+    let value? = opt else {
+        if cond {
+            return;
+        } else {
+            return;
+        }
+    }
+    println(value);
+}

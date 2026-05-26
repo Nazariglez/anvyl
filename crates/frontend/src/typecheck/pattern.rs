@@ -1,8 +1,8 @@
 use super::{
     ActiveMutDowncastRoot, CheckedType, TypeChecker, TypeError, TypeHandle,
     annotation::AccessPolicy,
-    check_block_checked, check_block_checked_with_hint, check_expected_value_expr,
-    check_value_expr_checked_with_hint, checked_from_type, checked_void, closure, control_flow,
+    check_block_checked_with_hint, check_expected_value_expr, check_value_expr_checked_with_hint,
+    checked_from_type, checked_void, closure, control_flow,
     decls::{FieldSchema, NamedSchemas, NominalKey, TypeBinding, nominal_type},
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
@@ -1521,14 +1521,7 @@ pub(super) fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) 
     let node = &let_else_node.node;
     let mode = mode_for_head(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
-    tc.push_scope();
-    check_block_checked(&node.else_block, tc);
-    tc.pop_scope();
-    if !control_flow::block_diverges(&node.else_block) {
-        tc.push_error(TypeError::LetElseMustDiverge {
-            span: tc.error_span(node.else_block.span),
-        });
-    }
+    control_flow::check_let_else_fallback(&node.fallback, tc);
     check_place_at(
         &node.pattern,
         value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),

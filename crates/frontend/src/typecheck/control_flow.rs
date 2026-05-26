@@ -13,7 +13,8 @@ use super::{
 use crate::{
     ast::{
         BlockNode, ConstValue, DeferBody, DeferNode, ExprKind, ExprNode, For, ForBinding, ForNode,
-        MatchArmNode, MatchNode, Return, ReturnAccess, ReturnNode, Stmt, StmtNode, Type, WhileNode,
+        LetElseFallback, LetElseFallbackNode, MatchArmNode, MatchNode, Return, ReturnAccess,
+        ReturnNode, Stmt, StmtNode, Type, WhileNode,
     },
     span::Span,
 };
@@ -140,6 +141,24 @@ pub(super) fn check_continue(span: Span, tc: &mut TypeChecker) {
     }
 }
 
+pub(super) fn check_let_else_fallback(fallback: &LetElseFallbackNode, tc: &mut TypeChecker) {
+    match &fallback.node {
+        LetElseFallback::Block(block) => {
+            tc.push_scope();
+            check_block_checked(block, tc);
+            tc.pop_scope();
+            if !block_diverges(block) {
+                tc.push_error(TypeError::LetElseMustDiverge {
+                    span: tc.error_span(fallback.span),
+                });
+            }
+        }
+        LetElseFallback::Return(ret) => check_return(ret, tc),
+        LetElseFallback::Break => check_break(fallback.span, tc),
+        LetElseFallback::Continue => check_continue(fallback.span, tc),
+    }
+}
+
 pub(super) fn check_while(while_node: &WhileNode, tc: &mut TypeChecker) {
     let cond = check_expr_checked(&while_node.node.cond, tc);
     check_bool_condition(ConditionKind::While, &while_node.node.cond, cond, tc);
@@ -253,9 +272,8 @@ fn for_slot_root<'a>(
     tc: &mut TypeChecker,
 ) -> PatternRoot<'a> {
     match slot {
-        ForSlot::Owned(ty) => owned_for_root(binding, ty),
         ForSlot::Item(ty) if binding.mutable => alias_for_root(binding, ty, source, iterable, tc),
-        ForSlot::Item(ty) => owned_for_root(binding, ty),
+        ForSlot::Owned(ty) | ForSlot::Item(ty) => owned_for_root(binding, ty),
     }
 }
 

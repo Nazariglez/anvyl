@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn value_or_zero(opt: int?) -> int {
+    let value? = opt else return 0;
+    value
+}
+
+fn stop_if_missing(opt: int?) {
+    let value? = opt else return;
+    println(value);
+}
+
+fn main() {
+    let _x = value_or_zero(42);
+    stop_if_missing(42);
+}
