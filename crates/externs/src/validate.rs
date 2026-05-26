@@ -433,6 +433,10 @@ mod tests {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Float,
                         computed: false,
+                        readable: true,
+                        writable: true,
+                        get_receiver: ReceiverMode::Shared,
+                        set_receiver: ReceiverMode::Mutable,
                         doc: None,
                     }],
                     init: Some(ExternInitDescriptor {
@@ -464,6 +468,7 @@ mod tests {
                     }],
                     operators: vec![ExternOperatorDescriptor {
                         op: ExternOperator::Unary(UnaryOp::Neg),
+                        receiver: ReceiverMode::Shared,
                         signature: ExternSignature {
                             params: vec![],
                             ret: ExternTypeExpr::Named {
@@ -686,6 +691,7 @@ mod tests {
         provider.modules[0].types[0].operators = vec![
             ExternOperatorDescriptor {
                 op: ExternOperator::Unary(UnaryOp::Neg),
+                receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
                     params: vec![ExternParam {
                         name: None,
@@ -702,6 +708,7 @@ mod tests {
                     op: BinaryOp::Add,
                     self_on_right: false,
                 },
+                receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
                     params: vec![],
                     ret: ExternTypeExpr::Float,
@@ -713,6 +720,7 @@ mod tests {
                     op: BinaryOp::Sub,
                     self_on_right: false,
                 },
+                receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
                     params: vec![
                         ExternParam {
@@ -778,6 +786,7 @@ mod tests {
                     op: BinaryOp::Eq,
                     self_on_right: false,
                 },
+                receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
                     params: vec![ExternParam {
                         name: None,
@@ -794,6 +803,7 @@ mod tests {
                     op: BinaryOp::LessThan,
                     self_on_right: false,
                 },
+                receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
                     params: vec![ExternParam {
                         name: None,
@@ -814,6 +824,7 @@ mod tests {
                     op: BinaryOp::Mul,
                     self_on_right: false,
                 },
+                receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
                     params: vec![ExternParam {
                         name: None,
@@ -877,6 +888,7 @@ mod tests {
                 op: BinaryOp::Add,
                 self_on_right: false,
             },
+            receiver: ReceiverMode::Shared,
             signature: ExternSignature {
                 params: vec![ExternParam {
                     name: None,

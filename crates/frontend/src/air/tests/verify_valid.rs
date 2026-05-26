@@ -219,6 +219,7 @@ fn structured_exhaustive_unit_enum_match() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Choice"),
         module,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![
@@ -435,6 +436,7 @@ fn enum_switch() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Color"),
         module,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![
@@ -535,6 +537,7 @@ fn extern_call() {
     builder.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("Console"),
         module,
+        binding: None,
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
@@ -554,6 +557,8 @@ fn extern_call() {
             mode: ParamMode::Value,
         }],
         return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
     });
 
     let mut fb = FunctionBuilder::new("call_ext", module, FunctionKind::Normal, void_ty);

@@ -1,0 +1,14 @@
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Output {
+    descriptor: anvyx_runtime::ProviderDescriptor,
+    supports: Vec<anvyx_runtime::RustModuleSupport>,
+}
+
+fn main() {
+    println!("{}", serde_json::to_string(&Output {
+        descriptor: {{provider_crate}}::provider_descriptor(),
+        supports: {{provider_crate}}::rust_module_supports(),
+    }).unwrap());
+}

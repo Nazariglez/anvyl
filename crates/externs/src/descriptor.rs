@@ -1,19 +1,21 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{ExternOperator, ModulePath, ProviderId};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ProviderDescriptor {
     pub provider: ProviderId,
     pub modules: Vec<ExternModuleDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternModuleDescriptor {
     pub path: ModulePath,
     pub types: Vec<ExternTypeDescriptor>,
     pub functions: Vec<ExternFunctionDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternTypeDescriptor {
     pub name: String,
     pub doc: Option<String>,
@@ -25,7 +27,7 @@ pub struct ExternTypeDescriptor {
     pub operators: Vec<ExternOperatorDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternFunctionDescriptor {
     pub name: String,
     pub doc: Option<String>,
@@ -33,21 +35,29 @@ pub struct ExternFunctionDescriptor {
     pub effects: ExternEffects,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternFieldDescriptor {
     pub name: String,
     pub ty: ExternTypeExpr,
     pub computed: bool,
+    #[serde(default = "default_true")]
+    pub readable: bool,
+    #[serde(default = "default_true")]
+    pub writable: bool,
+    #[serde(default = "default_shared_receiver")]
+    pub get_receiver: ReceiverMode,
+    #[serde(default = "default_mutable_receiver")]
+    pub set_receiver: ReceiverMode,
     pub doc: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternInitDescriptor {
     pub params: Vec<ExternParam>,
     pub field_init: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternMethodDescriptor {
     pub name: String,
     pub doc: Option<String>,
@@ -56,7 +66,7 @@ pub struct ExternMethodDescriptor {
     pub effects: ExternEffects,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternStaticDescriptor {
     pub name: String,
     pub doc: Option<String>,
@@ -64,20 +74,22 @@ pub struct ExternStaticDescriptor {
     pub effects: ExternEffects,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternOperatorDescriptor {
     pub op: ExternOperator,
+    #[serde(default = "default_shared_receiver")]
+    pub receiver: ReceiverMode,
     pub signature: ExternSignature,
     pub effects: ExternEffects,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternSignature {
     pub params: Vec<ExternParam>,
     pub ret: ExternTypeExpr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternParam {
     pub name: Option<String>,
     pub ty: ExternTypeExpr,
@@ -85,7 +97,7 @@ pub struct ExternParam {
     pub escape: CallbackEscape,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ExternTypeExpr {
     Void,
     Bool,
@@ -104,57 +116,69 @@ pub enum ExternTypeExpr {
     Callback(ExternCallbackSignature),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ExternRep {
     Shared,
     Inline,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ReceiverMode {
     Value,
     Shared,
     Mutable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+fn default_true() -> bool {
+    true
+}
+
+fn default_shared_receiver() -> ReceiverMode {
+    ReceiverMode::Shared
+}
+
+fn default_mutable_receiver() -> ReceiverMode {
+    ReceiverMode::Mutable
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ParamFlow {
     Value,
     Borrow,
     MutBorrow,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternEffects {
     pub fallible: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternCallbackSignature {
     pub params: Vec<ExternCallbackParam>,
     pub ret: Box<ExternTypeExpr>,
     pub policy: CallbackPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternCallbackParam {
     pub ty: ExternTypeExpr,
     pub escape: CallbackEscape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CallbackPolicy {
     pub escape: CallbackEscape,
     pub thread: CallbackThread,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CallbackEscape {
     NonEscaping,
     Escaping,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CallbackThread {
     SameThread,
 }
@@ -245,6 +269,7 @@ mod tests {
                 op: BinaryOp::Add,
                 self_on_right: true,
             },
+            receiver: ReceiverMode::Shared,
             signature: ExternSignature {
                 params: vec![ExternParam {
                     name: None,

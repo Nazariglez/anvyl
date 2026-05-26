@@ -1,0 +1,5 @@
+error: #[function] does not support `usize`; use i64 or f64
+ --> tests/ui/function/unsupported_int.rs:4:15
+  |
+4 | fn bad(value: usize) -> i64 { value as i64 }
+  |               ^^^^^

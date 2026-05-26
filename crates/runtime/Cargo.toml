@@ -3,5 +3,14 @@ name = "anvyx-runtime"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+anvyx-externs = { path = "../externs" }
+anvyx-macros = { path = "../macros" }
+inventory = "0.3"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+trybuild = "1"
+
 [lints]
 workspace = true

@@ -281,6 +281,7 @@ fn program_accessors() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("MyEnum"),
         module,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
@@ -292,6 +293,7 @@ fn program_accessors() {
     let ext_ty_id = builder.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("Ext"),
         module,
+        binding: None,
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
@@ -311,6 +313,8 @@ fn program_accessors() {
             mode: ParamMode::Value,
         }],
         return_type: int_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
     });
 
     let mut fb = FunctionBuilder::new("my_fn", module, FunctionKind::Normal, void_ty);

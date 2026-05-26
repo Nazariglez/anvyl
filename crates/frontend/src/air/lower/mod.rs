@@ -4,10 +4,11 @@ use anvyx_externs::ParamFlow;
 
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
-    AirIf, AirStmt, AirTail, CallArg, Callee, ConstData, ConstId, ConstValue, DynContractData,
-    EnumDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp,
-    ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeDecl,
-    FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner, Local, LocalId,
+    AirIf, AirStmt, AirTail, CallArg, Callee, ConstData, ConstId, ConstValue, CoreEnumKind,
+    DynContractData, EnumDecl, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId,
+    ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl,
+    ExternRep, ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, FieldDecl, FieldId,
+    Function, FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, Local, LocalId,
     LocalKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamMode, ParamRole,
     ParamType, Place, Program, RValue, ReturnMode, Signature, SignatureType, TypeData, TypeId,
     VariantDecl, VariantShape, VerifyError, ownership,
@@ -19,17 +20,17 @@ use crate::{
         self, ArrayLen, AssignOp, BinaryOp, BlockNode, ExprId, ExprKind, ExprNode, Ident, Lit,
         Mutability as AstMutability, Pattern, ReturnAccess, Stmt, StmtNode, Type,
     },
-    externs::catalog::ExternCatalog,
+    externs::catalog::{ExternCatalog, ExternLoweringInfo},
     resolve::{PackageModulePath, ResolveResult},
     source::SourceId,
     span::SourceSpan,
     typecheck::{
         BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind, CallableParent,
-        ConstTerm, DeclarationIndex, DefaultArgFact, ExternUseTarget, GenericArgs, LocalDefFact,
-        LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface,
-        ModuleScope, NominalKey, SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId,
-        SemanticProgram, VariantPayload, nominal_generic_args, substitute_aggregate_member,
-        type_has_unfinished_facts,
+        ConstTerm, DeclarationIndex, DefaultArgFact, ExtendId, ExternUseTarget, GenericArgs,
+        LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode,
+        MethodSurface, ModuleScope, NominalKey, SemanticBodyFacts, SemanticFunctionInstanceFact,
+        SemanticLocalId, SemanticProgram, VariantPayload, nominal_generic_args,
+        substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
 
@@ -60,6 +61,7 @@ pub(crate) enum LowerError {
     },
     UnsupportedExternUse {
         expr_id: ExprId,
+        kind: UnsupportedExternUseKind,
     },
     UnsupportedExternSignature,
     UnsupportedDefaultArg {
@@ -110,6 +112,18 @@ pub(crate) enum LowerError {
     Ownership(Box<[ownership::OwnershipError]>),
     Verify(Box<[VerifyError]>),
     AnyTypeEmitted(TypeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsupportedExternUseKind {
+    FieldRead,
+    FieldWrite,
+    Method,
+    Static,
+    Init,
+    UnaryOperator,
+    BinaryOperator,
+    MissingFunction,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -384,6 +398,7 @@ impl TypeLowerer {
             module,
             type_args,
             const_args,
+            core: enum_core_kind(decls, key),
             variants: vec![],
         });
         program.module_mut(module).enums.push(enum_id);
@@ -442,9 +457,17 @@ impl TypeLowerer {
         let module = ensure_module(program, env.modules, &key.module);
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
         let const_args = nominal_const_args(ty);
+        let binding = externs
+            .type_lowering_info(source_id)
+            .map(|info| ExternTypeBindingDecl {
+                package: info.package,
+                provider: info.provider,
+                key: info.key,
+            });
         let extern_id = program.alloc_extern_type(ExternTypeDecl {
             name: key.name,
             module,
+            binding,
             type_args,
             const_args,
             rep: match source.rep {
@@ -470,13 +493,15 @@ impl TypeLowerer {
                     ty: self.lower_with_env(program, &field.ty.ty, env.reborrow())?,
                     get_receiver: ExternReceiverDecl {
                         ty: id,
-                        mode: ParamMode::SharedBorrow,
+                        mode: receiver_mode(field.get_receiver),
                     },
                     set_receiver: ExternReceiverDecl {
                         ty: id,
-                        mode: ParamMode::MutBorrow,
+                        mode: receiver_mode(field.set_receiver),
                     },
                     computed: field.computed,
+                    readable: field.readable,
+                    writable: field.writable,
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
@@ -597,6 +622,44 @@ impl TypeLowerer {
     }
 }
 
+fn receiver_mode(mode: anvyx_externs::ReceiverMode) -> ParamMode {
+    match mode {
+        anvyx_externs::ReceiverMode::Value => ParamMode::Value,
+        anvyx_externs::ReceiverMode::Shared => ParamMode::SharedBorrow,
+        anvyx_externs::ReceiverMode::Mutable => ParamMode::MutBorrow,
+    }
+}
+
+fn lower_unary_op(op: anvyx_externs::UnaryOp) -> ast::UnaryOp {
+    match op {
+        anvyx_externs::UnaryOp::Neg => ast::UnaryOp::Neg,
+    }
+}
+
+fn lower_binary_op(op: anvyx_externs::BinaryOp) -> BinaryOp {
+    match op {
+        anvyx_externs::BinaryOp::Add => BinaryOp::Add,
+        anvyx_externs::BinaryOp::Sub => BinaryOp::Sub,
+        anvyx_externs::BinaryOp::Mul => BinaryOp::Mul,
+        anvyx_externs::BinaryOp::Div => BinaryOp::Div,
+        anvyx_externs::BinaryOp::Rem => BinaryOp::Rem,
+        anvyx_externs::BinaryOp::Eq => BinaryOp::Eq,
+        anvyx_externs::BinaryOp::NotEq => BinaryOp::NotEq,
+        anvyx_externs::BinaryOp::LessThan => BinaryOp::LessThan,
+        anvyx_externs::BinaryOp::GreaterThan => BinaryOp::GreaterThan,
+        anvyx_externs::BinaryOp::LessThanEq => BinaryOp::LessThanEq,
+        anvyx_externs::BinaryOp::GreaterThanEq => BinaryOp::GreaterThanEq,
+    }
+}
+
+fn operator_name(op: anvyx_externs::ExternOperator) -> Ident {
+    let name = match op {
+        anvyx_externs::ExternOperator::Unary(_) => "__unary_op",
+        anvyx_externs::ExternOperator::Binary { .. } => "__binary_op",
+    };
+    Ident::new(name)
+}
+
 fn lower_extern_op(op: anvyx_externs::ExternOperator) -> ExternOp {
     match op {
         anvyx_externs::ExternOperator::Unary(op) => ExternOp::Unary(match op {
@@ -662,7 +725,7 @@ struct LoweringMaps {
     modules: HashMap<ModuleScope, ModuleId>,
     bodies: HashMap<BodyInstanceKey, FunctionId>,
     locals: HashMap<BodyInstanceKey, HashMap<SemanticLocalId, LocalId>>,
-    externs: HashMap<crate::externs::catalog::ExternFunctionId, ExternId>,
+    externs: HashMap<ExternUseTarget, ExternId>,
 }
 
 #[derive(Default)]
@@ -723,22 +786,36 @@ impl LowerCx {
     fn alloc_extern_in_module(
         &mut self,
         scope: &ModuleScope,
-        source_id: crate::externs::catalog::ExternFunctionId,
+        target: ExternUseTarget,
         name: Ident,
         member: ExternMember,
         params: Vec<ExternParamDecl>,
         return_type: TypeId,
+        info: ExternLoweringInfo,
     ) -> ExternId {
         let module = self.ensure_module(scope);
+        let (binding, effects) = match info {
+            ExternLoweringInfo::Provider(info) => (
+                Some(ExternBindingDecl {
+                    package: info.package,
+                    provider: info.provider,
+                    key: info.key,
+                }),
+                info.effects,
+            ),
+            ExternLoweringInfo::Source { effects } => (None, effects),
+        };
         let id = self.program.alloc_extern(ExternDecl {
             name,
             module,
             member,
             params,
             return_type,
+            binding,
+            effects,
         });
         self.program.module_mut(module).externs.push(id);
-        let old = self.maps.externs.insert(source_id, id);
+        let old = self.maps.externs.insert(target, id);
         debug_assert!(old.is_none(), "duplicate lowered extern");
         id
     }
@@ -749,59 +826,264 @@ impl LowerCx {
         semantic: &SemanticProgram,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
-            let mut externs = vec![];
-            let mut uses = source
+            let mut externs = source
                 .body_facts
                 .as_facts()
                 .extern_uses
-                .iter()
+                .values()
+                .flatten()
+                .copied()
+                .filter(|target| extern_use_requires_decl(&semantic.externs, *target))
                 .collect::<Vec<_>>();
-            uses.sort_by_key(|(expr_id, _)| expr_id.0);
-            for (expr_id, targets) in uses {
-                for target in targets {
-                    match target {
-                        ExternUseTarget::Function(id) => externs.push(*id),
-                        _ => return Err(LowerError::UnsupportedExternUse { expr_id: *expr_id }),
-                    }
-                }
-            }
-            externs.sort_by_key(|id| {
-                let function = semantic.externs.function(*id);
-                format!("{:?}::{}", function.key.module, function.key.name.as_str())
-            });
+            externs.sort_by_key(|target| extern_sort_key(&semantic.externs, *target));
             externs.dedup();
-            for id in externs {
-                if self.maps.externs.contains_key(&id) {
+            for target in externs {
+                if self.maps.externs.contains_key(&target) {
                     continue;
                 }
-                let function = semantic.externs.function(id);
-                let module_scope = &function.key.module;
-                let params = function
-                    .signature
-                    .params
-                    .iter()
-                    .map(|param| {
-                        if param.escape != ast::EscapeMode::NonEscaping {
-                            return Err(LowerError::UnsupportedExternSignature);
-                        }
-                        Ok(ExternParamDecl {
-                            ty: self.lower_ty(&param.ty.ty)?,
-                            mode: param_flow_mode(param.flow),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, LowerError>>()?;
-                let return_type = self.lower_ty(&function.signature.ret.ty)?;
-                self.alloc_extern_in_module(
-                    module_scope,
-                    id,
-                    function.key.name,
-                    ExternMember::FreeFunction,
-                    params,
-                    return_type,
-                );
+                self.lower_extern_declaration(&semantic.externs, target)?;
             }
         }
         Ok(())
+    }
+
+    fn lower_extern_declaration(
+        &mut self,
+        externs: &ExternCatalog,
+        target: ExternUseTarget,
+    ) -> Result<ExternId, LowerError> {
+        match target {
+            ExternUseTarget::Function(id) => self.lower_extern_function(externs, id),
+            ExternUseTarget::FieldRead(field) => {
+                let (ty, field_decl) = externs.field_ref(field);
+                let owner = self.lower_extern_owner(&ty.nominal)?;
+                let receiver_ty = self.extern_owner_type(owner);
+                let params = vec![];
+                let return_type = self.lower_ty(&field_decl.ty.ty)?;
+                Ok(self.alloc_extern_in_module(
+                    &ty.key.module,
+                    target,
+                    field_decl.name,
+                    ExternMember::FieldGetter {
+                        owner,
+                        receiver: ExternReceiverDecl {
+                            ty: receiver_ty,
+                            mode: receiver_mode(field_decl.get_receiver),
+                        },
+                        computed: field_decl.computed,
+                    },
+                    params,
+                    return_type,
+                    externs.field_lowering_info(field, anvyx_externs::ExternBindingOp::Get),
+                ))
+            }
+            ExternUseTarget::FieldWrite(field) => {
+                let (ty, field_decl) = externs.field_ref(field);
+                let owner = self.lower_extern_owner(&ty.nominal)?;
+                let receiver_ty = self.extern_owner_type(owner);
+                let params = vec![ExternParamDecl {
+                    ty: self.lower_ty(&field_decl.ty.ty)?,
+                    mode: ParamMode::Value,
+                }];
+                let return_type = self.lower_ty(&Type::Void)?;
+                Ok(self.alloc_extern_in_module(
+                    &ty.key.module,
+                    target,
+                    field_decl.name,
+                    ExternMember::FieldSetter {
+                        owner,
+                        receiver: ExternReceiverDecl {
+                            ty: receiver_ty,
+                            mode: receiver_mode(field_decl.set_receiver),
+                        },
+                    },
+                    params,
+                    return_type,
+                    externs.field_lowering_info(field, anvyx_externs::ExternBindingOp::Set),
+                ))
+            }
+            ExternUseTarget::Method(method_ref) => {
+                let (ty, method) = externs.method_ref(method_ref);
+                let owner = self.lower_extern_owner(&ty.nominal)?;
+                let receiver_ty = self.extern_owner_type(owner);
+                let params = self.lower_extern_signature_params(&method.signature)?;
+                let return_type = self.lower_ty(&method.signature.ret.ty)?;
+                Ok(self.alloc_extern_in_module(
+                    &ty.key.module,
+                    target,
+                    method.name,
+                    ExternMember::Method {
+                        owner,
+                        receiver: ExternReceiverDecl {
+                            ty: receiver_ty,
+                            mode: receiver_mode(method.receiver),
+                        },
+                    },
+                    params,
+                    return_type,
+                    externs.method_lowering_info(method_ref),
+                ))
+            }
+            ExternUseTarget::Static(static_ref) => {
+                let (ty, static_method) = externs.static_ref(static_ref);
+                let owner = self.lower_extern_owner(&ty.nominal)?;
+                let params = self.lower_extern_signature_params(&static_method.signature)?;
+                let return_type = self.lower_ty(&static_method.signature.ret.ty)?;
+                Ok(self.alloc_extern_in_module(
+                    &ty.key.module,
+                    target,
+                    static_method.name,
+                    ExternMember::StaticMethod { owner },
+                    params,
+                    return_type,
+                    externs.static_lowering_info(static_ref),
+                ))
+            }
+            ExternUseTarget::Init(owner_id) => {
+                let ty = externs.ty(owner_id);
+                let owner = self.lower_extern_owner(&ty.nominal)?;
+                let return_type = self.extern_owner_type(owner);
+                Ok(self.alloc_extern_in_module(
+                    &ty.key.module,
+                    target,
+                    ty.key.name,
+                    ExternMember::Init { owner },
+                    vec![],
+                    return_type,
+                    externs.init_lowering_info(owner_id),
+                ))
+            }
+            ExternUseTarget::UnaryOperator(operator_ref) => {
+                let (ty, operator) = externs.operator_ref(operator_ref);
+                let owner = self.lower_extern_owner(&ty.nominal)?;
+                let receiver_ty = self.extern_owner_type(owner);
+                let op = match operator.op {
+                    anvyx_externs::ExternOperator::Unary(op) => op,
+                    anvyx_externs::ExternOperator::Binary { .. } => unreachable!("unary target"),
+                };
+                let return_type = self.lower_ty(&operator.signature.ret.ty)?;
+                Ok(self.alloc_extern_in_module(
+                    &ty.key.module,
+                    target,
+                    operator_name(operator.op),
+                    ExternMember::UnaryOperator {
+                        owner,
+                        receiver: ExternReceiverDecl {
+                            ty: receiver_ty,
+                            mode: receiver_mode(operator.receiver),
+                        },
+                        op: lower_unary_op(op),
+                    },
+                    vec![],
+                    return_type,
+                    externs.operator_lowering_info(operator_ref),
+                ))
+            }
+            ExternUseTarget::BinaryOperator(operator_ref) => {
+                let (ty, operator) = externs.operator_ref(operator_ref);
+                let owner = self.lower_extern_owner(&ty.nominal)?;
+                let receiver_ty = self.extern_owner_type(owner);
+                let anvyx_externs::ExternOperator::Binary { op, self_on_right } = operator.op
+                else {
+                    unreachable!("binary target")
+                };
+                let params = self.lower_extern_signature_params(&operator.signature)?;
+                let return_type = self.lower_ty(&operator.signature.ret.ty)?;
+                Ok(self.alloc_extern_in_module(
+                    &ty.key.module,
+                    target,
+                    operator_name(operator.op),
+                    ExternMember::BinaryOperator {
+                        owner,
+                        receiver: ExternReceiverDecl {
+                            ty: receiver_ty,
+                            mode: receiver_mode(operator.receiver),
+                        },
+                        op: lower_binary_op(op),
+                        self_on_right,
+                    },
+                    params,
+                    return_type,
+                    externs.operator_lowering_info(operator_ref),
+                ))
+            }
+        }
+    }
+
+    fn lower_extern_function(
+        &mut self,
+        externs: &ExternCatalog,
+        id: crate::externs::catalog::ExternFunctionId,
+    ) -> Result<ExternId, LowerError> {
+        let function = externs.function(id);
+        let params = self.lower_extern_signature_params(&function.signature)?;
+        let return_type = self.lower_ty(&function.signature.ret.ty)?;
+        Ok(self.alloc_extern_in_module(
+            &function.key.module,
+            ExternUseTarget::Function(id),
+            function.key.name,
+            ExternMember::FreeFunction,
+            params,
+            return_type,
+            externs.function_lowering_info(id),
+        ))
+    }
+
+    fn lower_extern_signature_params(
+        &mut self,
+        signature: &crate::externs::catalog::ResolvedExternSignature,
+    ) -> Result<Vec<ExternParamDecl>, LowerError> {
+        signature
+            .params
+            .iter()
+            .map(|param| {
+                if param.escape != ast::EscapeMode::NonEscaping {
+                    return Err(LowerError::UnsupportedExternSignature);
+                }
+                Ok(ExternParamDecl {
+                    ty: self.lower_ty(&param.ty.ty)?,
+                    mode: param_flow_mode(param.flow),
+                })
+            })
+            .collect()
+    }
+
+    fn lower_extern_owner(
+        &mut self,
+        key: &NominalKey,
+    ) -> Result<crate::air::ExternTypeId, LowerError> {
+        let ty = Type::nominal_with_origin(
+            ast::NominalKind::Extern,
+            key.name,
+            vec![],
+            vec![],
+            key.module.nominal_origin(),
+        );
+        let ty = self.lower_ty(&ty)?;
+        let TypeData::Extern(owner) = self.program.type_data(ty) else {
+            return Err(LowerError::UnsupportedType {
+                ty: Box::new(Type::nominal_with_origin(
+                    ast::NominalKind::Extern,
+                    key.name,
+                    vec![],
+                    vec![],
+                    key.module.nominal_origin(),
+                )),
+            });
+        };
+        Ok(*owner)
+    }
+
+    fn extern_owner_type(&self, owner: crate::air::ExternTypeId) -> TypeId {
+        self.program
+            .type_arena
+            .iter()
+            .enumerate()
+            .find_map(|(index, ty)| match ty {
+                TypeData::Extern(id) if *id == owner => Some(TypeId::from_index(index)),
+                _ => None,
+            })
+            .expect("extern owner type was just lowered")
     }
 
     fn lower_function_shells(
@@ -866,12 +1148,14 @@ impl LowerCx {
                     local_id,
                 });
             }
+            let specialization = self.function_specialization(&source.body)?;
             self.alloc_function_in_module(module_scope, source.body.clone(), local_map, |module| {
                 Function {
                     name: source.callable.name(),
                     module,
                     kind: source.callable.function_kind(),
                     owner: source.callable.owner(),
+                    specialization,
                     signature: Signature::with_return_mode(params, return_mode),
                     locals,
                     body: AirBody {
@@ -881,6 +1165,45 @@ impl LowerCx {
             });
         }
         Ok(())
+    }
+
+    fn function_specialization(
+        &mut self,
+        body: &BodyInstanceKey,
+    ) -> Result<Option<FunctionSpecialization>, LowerError> {
+        let BodyInstanceKey::Callable(key) = body else {
+            return Ok(None);
+        };
+        if key.args.is_empty() {
+            return Ok(None);
+        }
+
+        let type_args = key
+            .args
+            .type_args
+            .iter()
+            .map(|ty| self.lower_ty(ty))
+            .collect::<Result<Vec<_>, _>>()?;
+        let const_args = key
+            .args
+            .const_args
+            .iter()
+            .map(|arg| match arg {
+                ConstTerm::Value(value) => Ok(lower_const_specialization_value(value)),
+                ConstTerm::Name(_)
+                | ConstTerm::Param(_)
+                | ConstTerm::ArrayInfer
+                | ConstTerm::Infer(_) => Err(LowerError::UnsupportedCallableInstance {
+                    id: Box::new(key.target.clone()),
+                    args: Box::new(key.args.clone()),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(FunctionSpecialization {
+            type_args,
+            const_args,
+        }))
     }
 
     fn attach_stringify_overrides(&mut self) {
@@ -1268,26 +1591,217 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         mut place: Place,
         field_name: Ident,
     ) -> Result<Place, LowerError> {
-        let TypeData::Aggregate(aggregate) = self.cx.program.type_data(place.ty) else {
-            return Err(unsupported_expr(expr));
-        };
-        let decl = self.cx.program.aggregate(*aggregate);
-        if decl.kind != AggregateKind::Struct {
-            return Err(unsupported_expr(expr));
-        }
-        let Some((index, field)) = decl
-            .fields
-            .iter()
-            .enumerate()
-            .find(|(_, field)| field.name == field_name)
-        else {
-            return Err(unsupported_expr(expr));
+        let (index, ty) = match self.cx.program.type_data(place.ty) {
+            TypeData::Aggregate(aggregate) => {
+                let decl = self.cx.program.aggregate(*aggregate);
+                if decl.kind != AggregateKind::Struct {
+                    return Err(unsupported_expr(expr));
+                }
+                let Some((index, field)) = decl
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, field)| field.name == field_name)
+                else {
+                    return Err(unsupported_expr(expr));
+                };
+                (index, field.ty)
+            }
+            TypeData::Extern(ext) => {
+                let decl = self.cx.program.extern_type(*ext);
+                if decl.rep != ExternRep::Inline {
+                    return Err(unsupported_expr(expr));
+                }
+                let Some((index, field)) = decl
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, field)| field.name == field_name && !field.computed)
+                else {
+                    return Err(unsupported_expr(expr));
+                };
+                (index, field.ty)
+            }
+            _ => return Err(unsupported_expr(expr)),
         };
         place
             .projection
             .push(crate::air::Projection::Field(FieldId::from_index(index)));
-        place.ty = field.ty;
+        place.ty = ty;
         Ok(place)
+    }
+
+    fn lower_extern_value(&mut self, expr: &ExprNode) -> Result<Option<Operand>, LowerError> {
+        let Some(target) = self.select_extern_target(expr.node.id, |target| {
+            matches!(
+                target,
+                ExternUseTarget::FieldRead(_)
+                    | ExternUseTarget::UnaryOperator(_)
+                    | ExternUseTarget::BinaryOperator(_)
+            ) && self.cx.maps.externs.contains_key(&target)
+        }) else {
+            return Ok(None);
+        };
+        let rvalue = match target {
+            ExternUseTarget::FieldRead(_) => self.lower_extern_field_read(expr, target)?,
+            ExternUseTarget::UnaryOperator(_) => self.lower_extern_unary(expr, target)?,
+            ExternUseTarget::BinaryOperator(_) => self.lower_extern_binary(expr, target)?,
+            ExternUseTarget::Function(_)
+            | ExternUseTarget::FieldWrite(_)
+            | ExternUseTarget::Method(_)
+            | ExternUseTarget::Static(_)
+            | ExternUseTarget::Init(_) => return Ok(None),
+        };
+        Ok(Some(self.emit_temp(rvalue)?))
+    }
+
+    fn select_extern_target(
+        &self,
+        expr_id: ExprId,
+        accepts: impl Fn(ExternUseTarget) -> bool,
+    ) -> Option<ExternUseTarget> {
+        self.facts
+            .extern_uses
+            .get(&expr_id)
+            .and_then(|targets| targets.iter().copied().find(|target| accepts(*target)))
+    }
+
+    fn lower_extern_field_read(
+        &mut self,
+        expr: &ExprNode,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        let ExprKind::Field(field) = &expr.node.kind else {
+            return Err(unsupported_expr(expr));
+        };
+        let callee = self.extern_callee(expr.node.id, target)?;
+        let receiver_mode = match &self.cx.program.extern_decl(callee).member {
+            ExternMember::FieldGetter { receiver, .. } => receiver.mode,
+            _ => return Err(unsupported_expr(expr)),
+        };
+        let args = self.lower_call_args(
+            expr.node.id,
+            std::iter::once(field.node.target.as_ref()),
+            std::iter::once(receiver_mode),
+        )?;
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
+            args,
+        })
+    }
+
+    fn lower_extern_field_write(
+        &mut self,
+        target_expr: &ExprNode,
+        value_expr: &ExprNode,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        let ExprKind::Field(field) = &target_expr.node.kind else {
+            return Err(unsupported_expr(target_expr));
+        };
+        let callee = self.extern_callee(target_expr.node.id, target)?;
+        let (receiver_mode, param_modes) = match &self.cx.program.extern_decl(callee).member {
+            ExternMember::FieldSetter { receiver, .. } => (
+                receiver.mode,
+                self.cx
+                    .program
+                    .extern_decl(callee)
+                    .params
+                    .iter()
+                    .map(|param| param.mode)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => return Err(unsupported_expr(target_expr)),
+        };
+        let exprs = std::iter::once(field.node.target.as_ref()).chain(std::iter::once(value_expr));
+        let modes = std::iter::once(receiver_mode).chain(param_modes);
+        let args = self.lower_call_args(target_expr.node.id, exprs, modes)?;
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
+            args,
+        })
+    }
+
+    fn lower_extern_unary(
+        &mut self,
+        expr: &ExprNode,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        let ExprKind::Unary(unary) = &expr.node.kind else {
+            return Err(unsupported_expr(expr));
+        };
+        let callee = self.extern_callee(expr.node.id, target)?;
+        let receiver_mode = match &self.cx.program.extern_decl(callee).member {
+            ExternMember::UnaryOperator { receiver, .. } => receiver.mode,
+            _ => return Err(unsupported_expr(expr)),
+        };
+        let args = self.lower_call_args(
+            expr.node.id,
+            std::iter::once(unary.node.expr.as_ref()),
+            std::iter::once(receiver_mode),
+        )?;
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
+            args,
+        })
+    }
+
+    fn lower_extern_binary(
+        &mut self,
+        expr: &ExprNode,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        let ExprKind::Binary(binary) = &expr.node.kind else {
+            return Err(unsupported_expr(expr));
+        };
+        let callee = self.extern_callee(expr.node.id, target)?;
+        let (receiver_mode, self_on_right, param_modes) =
+            match &self.cx.program.extern_decl(callee).member {
+                ExternMember::BinaryOperator {
+                    receiver,
+                    self_on_right,
+                    ..
+                } => (
+                    receiver.mode,
+                    *self_on_right,
+                    self.cx
+                        .program
+                        .extern_decl(callee)
+                        .params
+                        .iter()
+                        .map(|param| param.mode)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => return Err(unsupported_expr(expr)),
+            };
+        let (receiver, operand) = if self_on_right {
+            (&binary.node.right, &binary.node.left)
+        } else {
+            (&binary.node.left, &binary.node.right)
+        };
+        let exprs = std::iter::once(receiver.as_ref()).chain(std::iter::once(operand.as_ref()));
+        let modes = std::iter::once(receiver_mode).chain(param_modes);
+        let args = self.lower_call_args(expr.node.id, exprs, modes)?;
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
+            args,
+        })
+    }
+
+    fn extern_callee(
+        &self,
+        expr_id: ExprId,
+        target: ExternUseTarget,
+    ) -> Result<ExternId, LowerError> {
+        self.cx
+            .maps
+            .externs
+            .get(&target)
+            .copied()
+            .ok_or(LowerError::UnsupportedExternUse {
+                expr_id,
+                kind: unsupported_extern_kind(target),
+            })
     }
 
     fn lower_index_local(&mut self, expr: &ExprNode) -> Result<LocalId, LowerError> {
@@ -1303,6 +1817,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn lower_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        if let Some(value) = self.lower_extern_value(expr)? {
+            return Ok(value);
+        }
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.lower_lit(expr, lit),
             ExprKind::Ident(_) | ExprKind::Field(_) => {
@@ -1406,6 +1923,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             TypeData::Enum(enum_id) => {
                 self.lower_struct_enum_literal(expr, literal, *enum_id, ty_id)
             }
+            TypeData::Extern(extern_id) => {
+                self.lower_struct_extern_literal(expr, literal, *extern_id, ty_id)
+            }
             _ => Err(unsupported_expr(expr)),
         }
     }
@@ -1442,6 +1962,44 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ty_id,
             RValue::Aggregate {
                 kind: AggregateCtor::Struct(aggregate),
+                fields,
+                ty: ty_id,
+            },
+        )
+    }
+
+    fn lower_struct_extern_literal(
+        &mut self,
+        expr: &ExprNode,
+        literal: &ast::StructLiteralNode,
+        extern_id: crate::air::ExternTypeId,
+        ty_id: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let decl = self.cx.program.extern_type(extern_id);
+        if decl.rep != ExternRep::Inline || decl.fields.len() != literal.node.fields.len() {
+            return Err(unsupported_expr(expr));
+        }
+        let mut values = HashMap::new();
+        for (name, field_expr) in &literal.node.fields {
+            if values.contains_key(name) {
+                return Err(unsupported_expr(expr));
+            }
+            values.insert(*name, self.lower_value(field_expr)?);
+        }
+        let mut fields = vec![];
+        for field in self.cx.program.extern_type(extern_id).fields.clone() {
+            let Some(value) = values.remove(&field.name) else {
+                return Err(unsupported_expr(expr));
+            };
+            if self.operand_type(&value) != self.air_type(field.ty) {
+                return Err(unsupported_expr(expr));
+            }
+            fields.push(value);
+        }
+        self.emit_typed_temp(
+            ty_id,
+            RValue::Aggregate {
+                kind: AggregateCtor::Extern(extern_id),
                 fields,
                 ty: ty_id,
             },
@@ -2008,30 +2566,17 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     ) -> Result<RValue, LowerError> {
         let args = &call.node.args;
         if let Some(targets) = self.facts.extern_uses.get(&expr.node.id) {
-            let [ExternUseTarget::Function(id)] = targets.as_slice() else {
+            let [target] = targets.as_slice() else {
                 return Err(LowerError::UnsupportedExternUse {
                     expr_id: expr.node.id,
+                    kind: targets
+                        .first()
+                        .map_or(UnsupportedExternUseKind::MissingFunction, |target| {
+                            unsupported_extern_kind(*target)
+                        }),
                 });
             };
-            let Some(callee) = self.cx.maps.externs.get(id).copied() else {
-                return Err(LowerError::UnsupportedExternUse {
-                    expr_id: expr.node.id,
-                });
-            };
-            self.require_call_arity(expr.node.id, &Callee::Extern(callee), args.len())?;
-            let modes = self
-                .cx
-                .program
-                .extern_decl(callee)
-                .params
-                .iter()
-                .map(|param| param.mode)
-                .collect::<Vec<_>>();
-            let args = self.lower_call_args(expr.node.id, args.iter(), modes.into_iter())?;
-            return Ok(RValue::Call {
-                callee: Callee::Extern(callee),
-                args,
-            });
+            return self.lower_extern_call(expr, call, *target);
         }
 
         let target = self
@@ -2084,7 +2629,12 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             });
         };
         let mut arg_exprs = vec![];
-        if target.id.kind == CallableKind::InstanceMethod {
+        if target.id.kind == CallableKind::InstanceMethod
+            || matches!(
+                target.id.kind,
+                CallableKind::ExtendMethod(MethodSurface::Instance)
+            )
+        {
             let ExprKind::Field(field) = &call.node.func.node.kind else {
                 return Err(unsupported_expr(&call.node.func));
             };
@@ -2128,6 +2678,57 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         self.require_call_arity(expr.node.id, &Callee::Function(callee), args.len())?;
         Ok(RValue::Call {
             callee: Callee::Function(callee),
+            args,
+        })
+    }
+
+    fn lower_extern_call(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        let Some(callee) = self.cx.maps.externs.get(&target).copied() else {
+            return Err(LowerError::UnsupportedExternUse {
+                expr_id: expr.node.id,
+                kind: unsupported_extern_kind(target),
+            });
+        };
+        let decl = self.cx.program.extern_decl(callee);
+        let mut arg_exprs = vec![];
+        let mut modes = vec![];
+        match &decl.member {
+            ExternMember::FreeFunction
+            | ExternMember::StaticMethod { .. }
+            | ExternMember::Init { .. } => {}
+            ExternMember::Method { receiver, .. } => {
+                let ExprKind::Field(field) = &call.node.func.node.kind else {
+                    return Err(unsupported_expr(&call.node.func));
+                };
+                arg_exprs.push(field.node.target.as_ref());
+                modes.push(receiver.mode);
+            }
+            ExternMember::FieldGetter { .. }
+            | ExternMember::FieldSetter { .. }
+            | ExternMember::UnaryOperator { .. }
+            | ExternMember::BinaryOperator { .. } => {
+                return Err(LowerError::UnsupportedExternUse {
+                    expr_id: expr.node.id,
+                    kind: unsupported_extern_kind(target),
+                });
+            }
+        }
+        arg_exprs.extend(call.node.args.iter());
+        modes.extend(decl.params.iter().map(|param| param.mode));
+        if arg_exprs.len() != modes.len() {
+            return Err(LowerError::UnsupportedExpr {
+                expr_id: expr.node.id,
+                kind: "Call",
+            });
+        }
+        let args = self.lower_call_args(expr.node.id, arg_exprs.into_iter(), modes.into_iter())?;
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
             args,
         })
     }
@@ -2272,6 +2873,19 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     ) -> Result<(), LowerError> {
         match assign.node.op {
             AssignOp::Assign => {
+                if let Some(target) =
+                    self.select_extern_target(assign.node.target.node.id, |target| {
+                        matches!(target, ExternUseTarget::FieldWrite(_))
+                            && self.cx.maps.externs.contains_key(&target)
+                    })
+                {
+                    let value = self.lower_extern_field_write(
+                        &assign.node.target,
+                        &assign.node.value,
+                        target,
+                    )?;
+                    return self.emit_eval(value);
+                }
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
                 let dst = self.lower_place(&assign.node.target, &fact)?;
                 let value = self.lower_value(&assign.node.value)?;
@@ -2680,11 +3294,91 @@ fn assign_op_to_binary(op: AssignOp) -> BinaryOp {
     }
 }
 
+fn enum_core_kind(decls: &DeclarationIndex, key: &NominalKey) -> Option<CoreEnumKind> {
+    (decls.core_option_key().as_ref() == Some(key)).then_some(CoreEnumKind::Option)
+}
+
 fn source_param_mode(mutable: bool) -> ParamMode {
     if mutable {
         ParamMode::MutBorrow
     } else {
         ParamMode::SharedBorrow
+    }
+}
+
+fn extern_use_requires_decl(externs: &ExternCatalog, target: ExternUseTarget) -> bool {
+    match target {
+        ExternUseTarget::FieldRead(field) | ExternUseTarget::FieldWrite(field) => {
+            externs.field_ref(field).1.computed
+        }
+        ExternUseTarget::Init(_) => false,
+        ExternUseTarget::Function(_)
+        | ExternUseTarget::Method(_)
+        | ExternUseTarget::Static(_)
+        | ExternUseTarget::UnaryOperator(_)
+        | ExternUseTarget::BinaryOperator(_) => true,
+    }
+}
+
+fn extern_sort_key(externs: &ExternCatalog, target: ExternUseTarget) -> String {
+    match target {
+        ExternUseTarget::Function(id) => {
+            let function = externs.function(id);
+            format!("{:?}::{}", function.key.module, function.key.name.as_str())
+        }
+        ExternUseTarget::FieldRead(field) | ExternUseTarget::FieldWrite(field) => {
+            let (ty, field) = externs.field_ref(field);
+            format!(
+                "{:?}::{}::{}",
+                ty.key.module,
+                ty.key.name.as_str(),
+                field.name.as_str()
+            )
+        }
+        ExternUseTarget::Method(method) => {
+            let (ty, method) = externs.method_ref(method);
+            format!(
+                "{:?}::{}::{}",
+                ty.key.module,
+                ty.key.name.as_str(),
+                method.name.as_str()
+            )
+        }
+        ExternUseTarget::Static(static_method) => {
+            let (ty, static_method) = externs.static_ref(static_method);
+            format!(
+                "{:?}::{}::{}",
+                ty.key.module,
+                ty.key.name.as_str(),
+                static_method.name.as_str()
+            )
+        }
+        ExternUseTarget::Init(owner) => {
+            let ty = externs.ty(owner);
+            format!("{:?}::{}::__init", ty.key.module, ty.key.name.as_str())
+        }
+        ExternUseTarget::UnaryOperator(operator) | ExternUseTarget::BinaryOperator(operator) => {
+            let (ty, operator) = externs.operator_ref(operator);
+            format!(
+                "{:?}::{}::{:?}",
+                ty.key.module,
+                ty.key.name.as_str(),
+                operator.op
+            )
+        }
+    }
+}
+
+fn unsupported_extern_kind(target: ExternUseTarget) -> UnsupportedExternUseKind {
+    match target {
+        ExternUseTarget::Function(_) => UnsupportedExternUseKind::MissingFunction,
+        ExternUseTarget::FieldRead(_) => UnsupportedExternUseKind::FieldRead,
+        ExternUseTarget::FieldWrite(_) => UnsupportedExternUseKind::FieldWrite,
+        ExternUseTarget::Method(_) => UnsupportedExternUseKind::Method,
+        ExternUseTarget::Static(_) => UnsupportedExternUseKind::Static,
+        ExternUseTarget::Init(_) => UnsupportedExternUseKind::Init,
+        ExternUseTarget::UnaryOperator(_) => UnsupportedExternUseKind::UnaryOperator,
+        ExternUseTarget::BinaryOperator(_) => UnsupportedExternUseKind::BinaryOperator,
     }
 }
 
@@ -2848,6 +3542,15 @@ struct SourceProgramIndex<'a> {
     default_exprs: HashMap<(CallableId, SourceId, ExprId), &'a ExprNode>,
 }
 
+fn lower_const_specialization_value(value: &ast::ConstValue) -> ConstValue {
+    match value {
+        ast::ConstValue::Int(value) => ConstValue::Int(*value),
+        ast::ConstValue::Float(value) => ConstValue::Float(*value),
+        ast::ConstValue::Bool(value) => ConstValue::Bool(*value),
+        ast::ConstValue::String(value) => ConstValue::String(value.clone().into_boxed_str()),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SourceCallable<'a> {
     Function {
@@ -2862,18 +3565,28 @@ enum SourceCallable<'a> {
         mode: MethodMode,
         source: SourceId,
     },
+    ExtendMethod {
+        module: usize,
+        method: &'a ast::ExtendMethod,
+        mode: MethodMode,
+        source: SourceId,
+    },
 }
 
 impl<'a> SourceCallable<'a> {
     fn module(self) -> usize {
         match self {
-            Self::Function { module, .. } | Self::AggregateMethod { module, .. } => module,
+            Self::Function { module, .. }
+            | Self::AggregateMethod { module, .. }
+            | Self::ExtendMethod { module, .. } => module,
         }
     }
 
     fn source(self) -> SourceId {
         match self {
-            Self::Function { source, .. } | Self::AggregateMethod { source, .. } => source,
+            Self::Function { source, .. }
+            | Self::AggregateMethod { source, .. }
+            | Self::ExtendMethod { source, .. } => source,
         }
     }
 
@@ -2881,6 +3594,7 @@ impl<'a> SourceCallable<'a> {
         match self {
             Self::Function { func, .. } => func.node.name,
             Self::AggregateMethod { method, .. } => method.sig.name,
+            Self::ExtendMethod { method, .. } => method.sig.name,
         }
     }
 
@@ -2888,6 +3602,7 @@ impl<'a> SourceCallable<'a> {
         match self {
             Self::Function { func, .. } => &func.node.body,
             Self::AggregateMethod { method, .. } => &method.body,
+            Self::ExtendMethod { method, .. } => &method.body,
         }
     }
 
@@ -2899,6 +3614,9 @@ impl<'a> SourceCallable<'a> {
             Self::AggregateMethod { method, .. } => {
                 !method.sig.type_params.is_empty() || !method.sig.const_params.is_empty()
             }
+            Self::ExtendMethod { method, .. } => {
+                !method.sig.type_params.is_empty() || !method.sig.const_params.is_empty()
+            }
         }
     }
 
@@ -2908,6 +3626,9 @@ impl<'a> SourceCallable<'a> {
             Self::AggregateMethod {
                 mode: MethodMode::Instance { .. },
                 ..
+            } | Self::ExtendMethod {
+                mode: MethodMode::Instance { .. },
+                ..
             }
         )
     }
@@ -2915,13 +3636,13 @@ impl<'a> SourceCallable<'a> {
     fn function_kind(self) -> FunctionKind {
         match self {
             Self::Function { .. } => FunctionKind::Normal,
-            Self::AggregateMethod { .. } => FunctionKind::Method,
+            Self::AggregateMethod { .. } | Self::ExtendMethod { .. } => FunctionKind::Method,
         }
     }
 
     fn owner(self) -> Option<FunctionOwner> {
         match self {
-            Self::Function { .. } => None,
+            Self::Function { .. } | Self::ExtendMethod { .. } => None,
             Self::AggregateMethod { owner, .. } => Some(FunctionOwner { name: owner }),
         }
     }
@@ -2972,6 +3693,7 @@ impl<'a> SourceProgramIndex<'a> {
         let mut default_exprs = HashMap::new();
 
         for (module_index, module) in modules.items.iter().enumerate() {
+            let mut extend_index = 0;
             for stmt in &module.program.stmts {
                 match &stmt.node {
                     Stmt::Func(func_node) => {
@@ -3018,6 +3740,39 @@ impl<'a> SourceProgramIndex<'a> {
                                 SourceCallable::AggregateMethod {
                                     module: module_index,
                                     owner: agg.name,
+                                    method,
+                                    mode,
+                                    source: module.source,
+                                },
+                            );
+                        }
+                    }
+                    Stmt::Extend(extend_node) => {
+                        let extend_id = ExtendId {
+                            module: module.scope.clone(),
+                            index: extend_index,
+                        };
+                        extend_index += 1;
+                        for method_node in &extend_node.node.methods {
+                            let method = &method_node.node;
+                            let mode = MethodMode::from_receiver(method.sig.receiver);
+                            let id = CallableId::extend_method(
+                                extend_id.clone(),
+                                method.sig.name,
+                                mode.surface(),
+                            );
+                            for param in &method.sig.params {
+                                if let Some(default) = &param.default {
+                                    default_exprs.insert(
+                                        (id.clone(), module.source, default.node.id),
+                                        default,
+                                    );
+                                }
+                            }
+                            callables.insert(
+                                id,
+                                SourceCallable::ExtendMethod {
+                                    module: module_index,
                                     method,
                                     mode,
                                     source: module.source,
@@ -3285,8 +4040,9 @@ fn module_path(scope: &ModuleScope) -> Vec<Ident> {
 #[cfg(test)]
 mod tests {
     use anvyx_externs::{
-        CallbackEscape, ExternEffects, ExternFunctionDescriptor, ExternModuleDescriptor,
-        ExternParam, ExternSignature, ExternTypeExpr, ProviderDescriptor, ProviderId,
+        CallbackEscape, ExternBindingOp, ExternBindingTarget, ExternEffects,
+        ExternFunctionDescriptor, ExternModuleDescriptor, ExternParam, ExternSignature,
+        ExternTypeExpr, ProviderDescriptor, ProviderId,
     };
 
     use super::*;
@@ -3597,6 +4353,15 @@ mod tests {
             air.type_arena.data(println.signature.params[0].ty),
             TypeData::Int
         ));
+        let specialization = println
+            .specialization
+            .as_ref()
+            .expect("println specialization");
+        assert!(specialization.const_args.is_empty());
+        assert!(matches!(
+            specialization.type_args.as_slice(),
+            [ty] if matches!(air.type_arena.data(*ty), TypeData::Int)
+        ));
         assert_eq!(stringify_source_types(&air), vec![TypeData::Int]);
         assert_extern_signature(
             &air,
@@ -3604,6 +4369,34 @@ mod tests {
             &[(TypeData::String, ParamMode::SharedBorrow)],
             &TypeData::Void,
         );
+    }
+
+    #[test]
+    fn repeated_generic_source_name_preserves_each_specialization() {
+        let air = lower_full_core_entry("fn main() { println(1); println(2.0); }", "main", &[])
+            .expect("lower failed");
+
+        let specs = air
+            .functions
+            .iter()
+            .filter(|function| function.name.as_str() == "println")
+            .map(|function| {
+                function
+                    .specialization
+                    .as_ref()
+                    .expect("println specialization")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().any(|spec| matches!(
+            spec.type_args.as_slice(),
+            [ty] if matches!(air.type_arena.data(*ty), TypeData::Int)
+        )));
+        assert!(specs.iter().any(|spec| matches!(
+            spec.type_args.as_slice(),
+            [ty] if matches!(air.type_arena.data(*ty), TypeData::Float)
+        )));
     }
 
     #[test]
@@ -3682,32 +4475,26 @@ mod tests {
     }
 
     #[test]
-    fn reachable_extension_method_is_explicitly_unsupported() {
-        let err = lower_root(
+    fn reachable_extension_method_lowers_as_function() {
+        let air = lower_root(
             "
             extend int { fn plus_one(self) -> int { self + 1 } }
             fn main() -> int { 1.plus_one() }
             ",
             "main",
         )
-        .expect_err("expected unsupported extension method");
+        .expect("lower failed");
 
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedCallableInstance { .. }
-        ));
+        assert_eq!(function_names(&air), vec!["main", "plus_one"]);
     }
 
     #[test]
-    fn reachable_core_extension_method_is_explicitly_unsupported() {
-        let err = lower_full_core_entry("fn main() { let x = (-1).abs(); }", "main", &[])
-            .expect_err("expected unsupported extension method");
+    fn reachable_core_extension_method_lowers_with_provider_extern() {
+        let air = lower_full_core_entry("fn main() { let x = (-1).abs(); }", "main", &[])
+            .expect("lower failed");
 
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedCallableInstance { id, .. }
-                if id.name.as_str() == "abs" && id.parent.is_some()
-        ));
+        assert!(function_names(&air).contains(&"abs"));
+        assert!(extern_names(&air).contains(&"int_abs"));
     }
 
     #[test]
@@ -3726,18 +4513,21 @@ mod tests {
     }
 
     #[test]
-    fn reachable_string_extension_optional_return_is_explicitly_unsupported() {
-        let err = lower_full_core_entry(
+    fn reachable_string_extension_optional_return_lowers_to_core_option() {
+        let air = lower_full_core_entry(
             "fn main() { let x = \"abc\".substring(0, 1); }",
             "main",
             &[],
         )
-        .expect_err("expected unsupported string extension");
+        .expect("lower failed");
 
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedCallableInstance { .. } | LowerError::UnsupportedType { .. }
-        ));
+        assert!(function_names(&air).contains(&"substring"));
+        assert!(extern_names(&air).contains(&"str_substring"));
+        assert!(
+            air.enums
+                .iter()
+                .any(|decl| decl.name == Ident::new("Option"))
+        );
     }
 
     #[test]
@@ -4446,12 +5236,20 @@ mod tests {
                 .iter()
                 .any(|id| air.function(*id).name == Ident::new("f"))
         );
-        assert!(
-            air.modules[1]
-                .externs
-                .iter()
-                .any(|id| air.extern_decl(*id).name == Ident::new("host_log"))
-        );
+        let ext = air.modules[1]
+            .externs
+            .iter()
+            .map(|id| air.extern_decl(*id))
+            .find(|decl| decl.name == Ident::new("host_log"))
+            .expect("host extern lowered");
+        let binding = ext.binding.as_ref().expect("provider binding is preserved");
+        assert_eq!(binding.provider.name, "host");
+        assert_eq!(binding.key.operation, ExternBindingOp::Call);
+        let ExternBindingTarget::Function(function) = &binding.key.target else {
+            panic!("expected function binding");
+        };
+        assert_eq!(function.module.segments, ["host"]);
+        assert_eq!(function.name, "host_log");
     }
 
     #[test]
@@ -4476,6 +5274,8 @@ mod tests {
                     cx.program.type_arena.get(ext.return_type),
                     Some(TypeData::Void)
                 ));
+                assert!(ext.binding.is_none());
+                assert_eq!(ext.effects, ExternEffects::default());
             },
         );
     }
@@ -4822,6 +5622,10 @@ mod tests {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Float,
                         computed: false,
+                        readable: true,
+                        writable: true,
+                        get_receiver: anvyx_externs::ReceiverMode::Shared,
+                        set_receiver: anvyx_externs::ReceiverMode::Mutable,
                         doc: None,
                     }],
                     init: None,
@@ -4859,6 +5663,7 @@ mod tests {
                             op: anvyx_externs::BinaryOp::Add,
                             self_on_right: false,
                         },
+                        receiver: anvyx_externs::ReceiverMode::Shared,
                         signature: ExternSignature {
                             params: vec![ExternParam {
                                 name: None,

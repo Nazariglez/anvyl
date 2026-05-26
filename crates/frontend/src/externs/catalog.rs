@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use anvyx_externs::{
-    BinaryOp, CallbackEscape, ExternEffects, ExternOperator, ExternParam, ExternRep,
-    ExternSignature, ExternTypeExpr, OperatorReturn, ParamFlow, ReceiverMode, UnaryOp,
+    BinaryOp, CallbackEscape, ExternBindingKey, ExternBindingOp, ExternBindingTarget,
+    ExternEffects, ExternFunctionKey, ExternMemberKey, ExternMemberSelector, ExternOperator,
+    ExternParam, ExternRep, ExternSignature, ExternTypeExpr, ExternTypeKey, OperatorReturn,
+    ParamFlow, ProviderId, ReceiverMode, UnaryOp,
 };
 
 use crate::{
@@ -15,7 +17,7 @@ use crate::{
         },
         raw_module_scope,
     },
-    resolve::{ModuleId, ModulePath},
+    resolve::{ModuleId, ModulePath, PackageId},
     typecheck::{
         DeclarationIndex, GenericTypeContext, ModuleScope, NominalKey, TypeRefError,
         TypeRefResolver, type_closure_facts,
@@ -144,6 +146,28 @@ impl Default for ResolvedExternTy {
     fn default() -> Self {
         Self { ty: Type::Void }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExternLoweringInfo {
+    Provider(ProviderExternLoweringInfo),
+    Source { effects: ExternEffects },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderExternLoweringInfo {
+    pub(crate) package: PackageId,
+    pub(crate) provider: ProviderId,
+    pub(crate) module: anvyx_externs::ModulePath,
+    pub(crate) key: ExternBindingKey,
+    pub(crate) effects: ExternEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderExternTypeLoweringInfo {
+    pub(crate) package: PackageId,
+    pub(crate) provider: ProviderId,
+    pub(crate) key: ExternTypeKey,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -283,8 +307,144 @@ impl ExternCatalog {
         &self.functions[id.0]
     }
 
+    pub(crate) fn function_lowering_info(&self, id: ExternFunctionId) -> ExternLoweringInfo {
+        let function = self.function(id);
+        match &function.provenance {
+            ExternProvenance::Provider { package, provider } => {
+                let module = provider_module_path(&function.key.module);
+                ExternLoweringInfo::Provider(ProviderExternLoweringInfo {
+                    package: package.clone(),
+                    provider: provider.clone(),
+                    module: module.clone(),
+                    key: ExternBindingKey {
+                        target: ExternBindingTarget::Function(ExternFunctionKey {
+                            module,
+                            name: function.key.name.to_string(),
+                        }),
+                        operation: ExternBindingOp::Call,
+                    },
+                    effects: function.effects,
+                })
+            }
+            ExternProvenance::Source { .. } => ExternLoweringInfo::Source {
+                effects: function.effects,
+            },
+        }
+    }
+
     pub(crate) fn ty(&self, id: ExternTypeId) -> &ExternType {
         &self.types[id.0]
+    }
+
+    pub(crate) fn type_lowering_info(
+        &self,
+        id: ExternTypeId,
+    ) -> Option<ProviderExternTypeLoweringInfo> {
+        let ty = self.ty(id);
+        match &ty.context.provenance {
+            ExternProvenance::Provider { package, provider } => {
+                Some(ProviderExternTypeLoweringInfo {
+                    package: package.clone(),
+                    provider: provider.clone(),
+                    key: ExternTypeKey {
+                        module: provider_module_path(&ty.key.module),
+                        name: ty.key.name.to_string(),
+                    },
+                })
+            }
+            ExternProvenance::Source { .. } => None,
+        }
+    }
+
+    pub(crate) fn field_lowering_info(
+        &self,
+        field_ref: ExternFieldRef,
+        operation: ExternBindingOp,
+    ) -> ExternLoweringInfo {
+        let ty = self.ty(field_ref.owner);
+        let field = &ty.fields[field_ref.id.0];
+        Self::member_lowering_info(
+            ty,
+            ExternMemberSelector::Field(field.name.to_string()),
+            operation,
+            ExternEffects::default(),
+        )
+    }
+
+    pub(crate) fn method_lowering_info(&self, method_ref: ExternMethodRef) -> ExternLoweringInfo {
+        let ty = self.ty(method_ref.owner);
+        let method = &ty.methods[method_ref.id.0];
+        Self::member_lowering_info(
+            ty,
+            ExternMemberSelector::Method(method.name.to_string()),
+            ExternBindingOp::Call,
+            method.effects,
+        )
+    }
+
+    pub(crate) fn static_lowering_info(&self, static_ref: ExternStaticRef) -> ExternLoweringInfo {
+        let ty = self.ty(static_ref.owner);
+        let static_method = &ty.statics[static_ref.id.0];
+        Self::member_lowering_info(
+            ty,
+            ExternMemberSelector::Static(static_method.name.to_string()),
+            ExternBindingOp::Call,
+            static_method.effects,
+        )
+    }
+
+    pub(crate) fn init_lowering_info(&self, owner: ExternTypeId) -> ExternLoweringInfo {
+        let ty = self.ty(owner);
+        Self::member_lowering_info(
+            ty,
+            ExternMemberSelector::Init,
+            ExternBindingOp::Call,
+            ExternEffects::default(),
+        )
+    }
+
+    pub(crate) fn operator_lowering_info(
+        &self,
+        operator_ref: ExternOperatorRef,
+    ) -> ExternLoweringInfo {
+        let ty = self.ty(operator_ref.owner);
+        let operator = &ty.operators[operator_ref.id.0];
+        Self::member_lowering_info(
+            ty,
+            ExternMemberSelector::Operator(operator.op),
+            ExternBindingOp::Call,
+            operator.effects,
+        )
+    }
+
+    fn member_lowering_info(
+        ty: &ExternType,
+        selector: ExternMemberSelector,
+        operation: ExternBindingOp,
+        effects: ExternEffects,
+    ) -> ExternLoweringInfo {
+        match &ty.context.provenance {
+            ExternProvenance::Provider { package, provider } => {
+                let module = provider_module_path(&ty.key.module);
+                ExternLoweringInfo::Provider(ProviderExternLoweringInfo {
+                    package: package.clone(),
+                    provider: provider.clone(),
+                    module: module.clone(),
+                    key: ExternBindingKey {
+                        target: ExternBindingTarget::Member(ExternMemberKey {
+                            owner: ExternTypeKey {
+                                module,
+                                name: ty.key.name.to_string(),
+                            },
+                            selector,
+                        }),
+                        operation,
+                    },
+                    effects,
+                })
+            }
+            ExternProvenance::Source { .. } => ExternLoweringInfo::Source { effects },
+        }
     }
 
     pub(crate) fn function_by_key(&self, key: &FunctionKey) -> Option<ExternFunctionId> {
@@ -297,6 +457,29 @@ impl ExternCatalog {
 
     pub(crate) fn type_by_nominal(&self, key: &NominalKey) -> Option<ExternTypeId> {
         self.types_by_nominal.get(key).copied()
+    }
+
+    pub(crate) fn field_ref(&self, field_ref: ExternFieldRef) -> (&ExternType, &ExternField) {
+        let ty = self.ty(field_ref.owner);
+        (ty, &ty.fields[field_ref.id.0])
+    }
+
+    pub(crate) fn method_ref(&self, method_ref: ExternMethodRef) -> (&ExternType, &ExternMethod) {
+        let ty = self.ty(method_ref.owner);
+        (ty, &ty.methods[method_ref.id.0])
+    }
+
+    pub(crate) fn static_ref(&self, static_ref: ExternStaticRef) -> (&ExternType, &ExternStatic) {
+        let ty = self.ty(static_ref.owner);
+        (ty, &ty.statics[static_ref.id.0])
+    }
+
+    pub(crate) fn operator_ref(
+        &self,
+        operator_ref: ExternOperatorRef,
+    ) -> (&ExternType, &ExternOperatorDecl) {
+        let ty = self.ty(operator_ref.owner);
+        (ty, &ty.operators[operator_ref.id.0])
     }
 
     pub(crate) fn field(
@@ -461,6 +644,10 @@ pub(crate) struct ExternField {
     pub(crate) name: Ident,
     pub(crate) ty: ResolvedExternTy,
     pub(crate) computed: bool,
+    pub(crate) readable: bool,
+    pub(crate) writable: bool,
+    pub(crate) get_receiver: ReceiverMode,
+    pub(crate) set_receiver: ReceiverMode,
     pub(crate) site: RawExternSite,
     pub(crate) doc: Option<String>,
 }
@@ -496,6 +683,7 @@ pub(crate) struct ExternStatic {
 pub(crate) struct ExternOperatorDecl {
     pub(crate) id: ExternOperatorId,
     pub(crate) op: ExternOperator,
+    pub(crate) receiver: ReceiverMode,
     pub(crate) signature: ResolvedExternSignature,
     pub(crate) effects: ExternEffects,
     pub(crate) site: RawExternSite,
@@ -875,6 +1063,10 @@ impl<'a> CatalogBuilder<'a> {
                 name,
                 ty,
                 computed: raw_field.decl.computed,
+                readable: raw_field.decl.readable,
+                writable: raw_field.decl.writable,
+                get_receiver: raw_field.decl.get_receiver,
+                set_receiver: raw_field.decl.set_receiver,
                 site: raw_field.site,
                 doc: raw_field.decl.doc.clone(),
             });
@@ -968,6 +1160,7 @@ impl<'a> CatalogBuilder<'a> {
         ty.operators.push(ExternOperatorDecl {
             id,
             op: raw.decl.op,
+            receiver: raw.decl.receiver,
             signature,
             effects: raw.decl.effects,
             site: raw.site,
@@ -1277,6 +1470,19 @@ fn missing_type_module(
         ExternProvenance::Provider { .. } => provider_module_scope(scope, module),
         ExternProvenance::Source { .. } => extern_module_scope(module),
     }
+}
+
+fn provider_module_path(scope: &ModuleScope) -> anvyx_externs::ModulePath {
+    let segments = match scope {
+        ModuleScope::Package(current) => current
+            .provider_path()
+            .expect("provider extern scope has provider path")
+            .segments()
+            .to_vec(),
+        ModuleScope::Named(path) => path.segments().to_vec(),
+        ModuleScope::Root => vec![],
+    };
+    anvyx_externs::ModulePath { segments }
 }
 
 fn provider_module_scope(scope: &ModuleScope, module: &anvyx_externs::ModulePath) -> ModuleScope {
@@ -1628,6 +1834,10 @@ mod tests {
                 name,
                 ty: resolved_ty(Type::Int),
                 computed: false,
+                readable: true,
+                writable: true,
+                get_receiver: ReceiverMode::Shared,
+                set_receiver: ReceiverMode::Mutable,
                 site: RawExternSite::default(),
                 doc: None,
             });
@@ -1685,6 +1895,7 @@ mod tests {
             ty.operators.push(ExternOperatorDecl {
                 id,
                 op,
+                receiver: ReceiverMode::Shared,
                 signature: ResolvedExternSignature::default(),
                 effects: ExternEffects::default(),
                 site: RawExternSite::default(),
@@ -1857,6 +2068,65 @@ mod tests {
             statics: vec![],
             operators: vec![],
         }
+    }
+
+    #[test]
+    fn provider_function_lowering_info_has_binding_identity() {
+        let raw = provider_raw(ExternModuleDescriptor {
+            path: extern_module(&["math"]),
+            types: vec![],
+            functions: vec![ExternFunctionDescriptor {
+                name: "abs".to_string(),
+                doc: None,
+                signature: ext_signature(
+                    vec![ext_param("x", ExternTypeExpr::Int)],
+                    ExternTypeExpr::Int,
+                ),
+                effects: ExternEffects { fallible: true },
+            }],
+        });
+        let catalog = build(raw, &decls("", &[], &RawExterns::default())).unwrap();
+        let id = catalog
+            .function_by_key(&function_key(provider_scope("math"), "abs"))
+            .expect("function is cataloged");
+
+        let ExternLoweringInfo::Provider(info) = catalog.function_lowering_info(id) else {
+            panic!("expected provider lowering info");
+        };
+        assert_eq!(info.package, PackageId::synthetic_root());
+        assert_eq!(info.provider.name, "host");
+        assert_eq!(info.module.segments, ["math"]);
+        assert_eq!(info.effects, ExternEffects { fallible: true });
+        assert_eq!(info.key.operation, ExternBindingOp::Call);
+        let ExternBindingTarget::Function(function) = info.key.target else {
+            panic!("expected function key");
+        };
+        assert_eq!(function.module.segments, ["math"]);
+        assert_eq!(function.name, "abs");
+    }
+
+    #[test]
+    fn source_function_lowering_info_has_no_provider_binding() {
+        let raw = source_raw("extern fn host(x: int) -> int;", &[]);
+        let catalog = build(
+            raw,
+            &decls(
+                "extern fn host(x: int) -> int;",
+                &[],
+                &RawExterns::default(),
+            ),
+        )
+        .unwrap();
+        let id = catalog
+            .function_by_key(&function_key(ModuleScope::Root, "host"))
+            .expect("source function is cataloged");
+
+        assert_eq!(
+            catalog.function_lowering_info(id),
+            ExternLoweringInfo::Source {
+                effects: ExternEffects::default()
+            }
+        );
     }
 
     mod member_validation {
@@ -2525,6 +2795,10 @@ mod tests {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Int,
                         computed: true,
+                        readable: true,
+                        writable: true,
+                        get_receiver: ReceiverMode::Shared,
+                        set_receiver: ReceiverMode::Mutable,
                         doc: None,
                     }],
                     init: Some(ExternInitDescriptor {
@@ -2560,6 +2834,10 @@ mod tests {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Int,
                         computed: false,
+                        readable: true,
+                        writable: true,
+                        get_receiver: ReceiverMode::Shared,
+                        set_receiver: ReceiverMode::Mutable,
                         doc: None,
                     }],
                     init: Some(ExternInitDescriptor {
@@ -2697,6 +2975,10 @@ mod tests {
                         name: "value".to_string(),
                         ty: ExternTypeExpr::Any,
                         computed: false,
+                        readable: true,
+                        writable: true,
+                        get_receiver: ReceiverMode::Shared,
+                        set_receiver: ReceiverMode::Mutable,
                         doc: None,
                     }],
                     ..descriptor_type("Box")

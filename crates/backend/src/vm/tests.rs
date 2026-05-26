@@ -34,6 +34,7 @@ fn compiler_lowers_value_and_shared_borrow_modes() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![
                 param("value", int, ParamMode::Value, value_local),
@@ -61,6 +62,7 @@ fn compiler_lowers_value_and_shared_borrow_modes() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![local(string, Mutability::Immutable, LocalKind::User)],
         body: structured_body(
@@ -108,6 +110,7 @@ fn compiler_lowers_mut_borrow_as_projected_place_ref() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![param("mut", int, ParamMode::MutBorrow, arg_local)],
             void,
@@ -126,6 +129,7 @@ fn compiler_lowers_mut_borrow_as_projected_place_ref() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![local(pair, Mutability::Mutable, LocalKind::User)],
         body: structured_body(
@@ -172,6 +176,7 @@ fn compiler_collects_calls_inside_structured_control() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![],
         body: structured_body(vec![], air::AirTail::Return(None)),
@@ -185,6 +190,7 @@ fn compiler_collects_calls_inside_structured_control() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![],
         body: AirBody {
@@ -227,6 +233,7 @@ fn compiler_rejects_noncheap_value_params() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![param("value", string, ParamMode::Value, local_id)],
             void,
@@ -256,6 +263,7 @@ fn compiler_rejects_noncheap_value_call_args() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![param("value", string, ParamMode::Value, callee_local)],
             void,
@@ -273,6 +281,7 @@ fn compiler_rejects_noncheap_value_call_args() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![local(string, Mutability::Immutable, LocalKind::User)],
         body: structured_body(

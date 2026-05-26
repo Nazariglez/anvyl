@@ -20,6 +20,21 @@ pub(crate) fn build_air_path_typed(
     build_air_path_with_source_overrides_typed(file, vec![], config)
 }
 
+pub(crate) fn build_air_path_with_loaded_native_providers_typed(
+    file: &Path,
+    config: FrontendConfig,
+    manifest_path: &Path,
+    native_providers: &crate::manifest::NativeProviderLoad,
+) -> Result<AirBuildOutput, AirBuildError<anvyx_lang2::CheckError>> {
+    let graph = crate::manifest::load_package_graph(manifest_path)
+        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
+    let input = package_check_input_with_overrides(&graph, file, vec![])
+        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?
+        .with_package_externs(native_provider_externs(&graph, native_providers))
+        .with_config(config);
+    anvyx_lang2::build_air_package(input)
+}
+
 fn build_air_path_with_source_overrides_typed(
     file: &Path,
     source_overrides: Vec<SourceOverride>,
@@ -82,12 +97,13 @@ fn build_air_loaded_path_typed(
             .with_config(config);
         return anvyx_lang2::build_air_file(input);
     };
-    crate::manifest::reject_clean_frontend_inputs(Some(&manifest))
+    let native_providers = crate::manifest::load_native_providers(&path, &manifest)
         .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
     let graph = crate::manifest::load_package_graph(&path)
         .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
     let input = package_check_input_with_overrides(&graph, file, source_overrides)
         .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?
+        .with_package_externs(native_provider_externs(&graph, &native_providers))
         .with_config(config);
     anvyx_lang2::build_air_package(input)
 }
@@ -111,10 +127,11 @@ fn check_loaded_path(
             standalone_check_input_with_overrides(file, source_overrides)?.with_config(config);
         return anvyx_lang2::check_file(input).map_err(|error| error.to_string());
     };
-    crate::manifest::reject_clean_frontend_inputs(Some(&manifest))?;
+    let native_providers = crate::manifest::load_native_providers(&path, &manifest)?;
     let graph = crate::manifest::load_package_graph(&path)?;
-    let input =
-        package_check_input_with_overrides(&graph, file, source_overrides)?.with_config(config);
+    let input = package_check_input_with_overrides(&graph, file, source_overrides)?
+        .with_package_externs(native_provider_externs(&graph, &native_providers))
+        .with_config(config);
     anvyx_lang2::check_package(input).map_err(|error| error.to_string())
 }
 
@@ -145,6 +162,21 @@ pub fn package_check_input_with_overrides(
     source_overrides: Vec<SourceOverride>,
 ) -> Result<CheckPackageInput, String> {
     Ok(package_check_input(graph, file)?.with_source_overrides(source_overrides))
+}
+
+fn native_provider_externs(
+    graph: &PackageGraph,
+    providers: &crate::manifest::NativeProviderLoad,
+) -> Vec<(FrontendPackageId, Vec<anvyx_runtime::ProviderDescriptor>)> {
+    let descriptors = providers
+        .providers
+        .iter()
+        .map(|provider| provider.descriptor.clone())
+        .collect::<Vec<_>>();
+    if descriptors.is_empty() {
+        return vec![];
+    }
+    vec![(frontend_package_id(&graph.root().id), descriptors)]
 }
 
 fn package_sources(graph: &PackageGraph) -> Result<Vec<PackageSource>, String> {

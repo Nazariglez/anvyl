@@ -1,0 +1,5 @@
+error: generic paths are not supported here
+ --> tests/ui/module/generic_path.rs:1:34
+  |
+1 | anvyx_runtime::module!(exports: [bad::<i64>]);
+  |                                  ^^^^^^^^^^

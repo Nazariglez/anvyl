@@ -873,7 +873,10 @@ impl LocalBindingKind {
     fn is_air_local(self) -> bool {
         matches!(
             self.storage,
-            CaptureStorageOrigin::Owned | CaptureStorageOrigin::BorrowedParam
+            CaptureStorageOrigin::Owned
+                | CaptureStorageOrigin::BorrowedParam
+                | CaptureStorageOrigin::ReadonlySelf
+                | CaptureStorageOrigin::VarSelf
         )
     }
 
@@ -1257,6 +1260,9 @@ impl TypeChecker {
                 (
                     Some(CallableParent::Nominal(_)),
                     CallableKind::InstanceMethod | CallableKind::StaticMethod,
+                ) | (
+                    Some(CallableParent::Extend(_)),
+                    CallableKind::ExtendMethod(_),
                 )
             )
     }
@@ -2440,6 +2446,9 @@ impl TypeChecker {
                             ));
                         }
                     }
+                    Stmt::Extend(extend_node) => {
+                        self.push_extend_method_facts(module, extend_node, &mut facts);
+                    }
                     Stmt::Aggregate(agg_node) => {
                         let agg = &agg_node.node;
                         let owner = NominalKey {
@@ -2538,6 +2547,91 @@ impl TypeChecker {
         facts
     }
 
+    fn push_extend_method_facts(
+        &self,
+        module: &SourceModuleFactsInput,
+        extend_node: &ExtendDeclNode,
+        facts: &mut SemanticDeclarations,
+    ) {
+        let Some(schema) = self
+            .decls
+            .extends()
+            .find(|schema| schema.origin == module.scope && schema.span.byte() == extend_node.span)
+        else {
+            return;
+        };
+        for method_node in &extend_node.node.methods {
+            let method = &method_node.node;
+            let mode = MethodMode::from_receiver(method.sig.receiver);
+            let Some(method_schema) = schema
+                .methods
+                .get(&MethodKey::new(method.sig.name, mode.surface()))
+            else {
+                continue;
+            };
+            let id = CallableId::extend_method(schema.id.clone(), method.sig.name, mode.surface());
+            let mut instances = vec![];
+            if schema.generics.is_empty() && !method_sig_is_generic(&method.sig) {
+                instances.push((
+                    GenericArgs::default(),
+                    method_schema.params.clone(),
+                    method_schema.ret.clone(),
+                    GenericArgs::default(),
+                ));
+            } else {
+                instances.extend(self.specializations.iter().filter_map(
+                    |(key, state)| match state {
+                        SpecializationState::Done(body) if key.target == id => {
+                            let owner_len = schema.generics.type_params.len();
+                            let const_len = schema.generics.const_params.len();
+                            let owner_args = GenericArgs {
+                                type_args: key.args.type_args[..owner_len].to_vec(),
+                                const_args: key.args.const_args[..const_len].to_vec(),
+                            };
+                            Some((
+                                key.args.clone(),
+                                body.params.clone(),
+                                ReturnSpec {
+                                    access: method_schema.ret.access,
+                                    ty: body.return_ty.clone(),
+                                },
+                                owner_args,
+                            ))
+                        }
+                        SpecializationState::InProgress | SpecializationState::Done(_) => None,
+                    },
+                ));
+                instances.sort_by_key(|(args, ..)| format!("{args:?}"));
+            }
+            for (args, params, return_ty, owner_args) in instances {
+                let callable = match mode {
+                    MethodMode::Instance { .. } => self.decls.callable_for_extend_method(
+                        self_ty_for_extend(schema, &owner_args),
+                        schema,
+                        method.sig.name,
+                        method_schema,
+                        owner_args,
+                    ),
+                    MethodMode::Static => self.decls.callable_for_static_extend_method(
+                        schema,
+                        method.sig.name,
+                        method_schema,
+                        owner_args,
+                    ),
+                };
+                facts.functions.push(self.semantic_extend_method_fact(
+                    module,
+                    method,
+                    method_node.span,
+                    &callable,
+                    args,
+                    params,
+                    return_ty,
+                ));
+            }
+        }
+    }
+
     fn semantic_function_fact(
         &self,
         module: &SourceModuleFactsInput,
@@ -2575,6 +2669,50 @@ impl TypeChecker {
         &self,
         module: &SourceModuleFactsInput,
         method: &Method,
+        span: Span,
+        callable: &CallableRef,
+        args: GenericArgs,
+        param_types: Vec<FuncParam>,
+        ret: ReturnSpec,
+    ) -> SemanticFunctionInstanceFact {
+        let mut params = vec![];
+        if let Some(receiver_ty) = &callable.receiver_ty {
+            params.push(SemanticParamSigFact {
+                name: Ident::new("self"),
+                span: SourceSpan::from_byte_span(module.source, span),
+                ty: receiver_ty.clone(),
+                mutable: matches!(method.sig.receiver, Some(MethodReceiver::Var)),
+            });
+        }
+        params.extend(
+            method
+                .sig
+                .params
+                .iter()
+                .zip(param_types)
+                .map(|(source, sig)| SemanticParamSigFact {
+                    name: source.name,
+                    span: SourceSpan::from_byte_span(module.source, source.ty_span),
+                    ty: sig.ty,
+                    mutable: sig.mutable,
+                }),
+        );
+        self.semantic_callable_fact(
+            module,
+            callable,
+            args,
+            method.sig.name,
+            span,
+            method.body.span,
+            params,
+            ret,
+        )
+    }
+
+    fn semantic_extend_method_fact(
+        &self,
+        module: &SourceModuleFactsInput,
+        method: &ExtendMethod,
         span: Span,
         callable: &CallableRef,
         args: GenericArgs,
@@ -3221,6 +3359,11 @@ fn typechecker_for_modules(
     }
 
     Ok(tc)
+}
+
+fn self_ty_for_extend(schema: &ExtendSchema, owner_args: &GenericArgs) -> Type {
+    let (type_subst, const_subst) = schema.generics.substitutions(owner_args);
+    substitute(&schema.target, &type_subst, &const_subst)
 }
 
 fn decl_errors(errors: &[DeclError]) -> Vec<TypeError> {

@@ -1,0 +1,5 @@
+error: expected `name`, `ret`, or `params`
+ --> tests/ui/function/unknown_key.rs:3:12
+  |
+3 | #[function(foo = "bar")]
+  |            ^^^

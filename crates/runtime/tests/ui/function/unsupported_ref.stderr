@@ -1,0 +1,5 @@
+error: #[function] only supports &str references in the MVP
+ --> tests/ui/function/unsupported_ref.rs:4:15
+  |
+4 | fn bad(value: &i64) -> i64 { *value }
+  |               ^^^^

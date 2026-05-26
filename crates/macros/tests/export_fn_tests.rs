@@ -1344,7 +1344,7 @@ mod method_tests {
 
     #[test]
     fn export_methods_convenience_function() {
-        let handlers = __anvyx_methods_Vec2();
+        let handlers = __anvyx_methods_vec2();
         let keys: Vec<&str> = handlers.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&"Vec2::new"));
         assert!(keys.contains(&"Vec2::zero"));
@@ -1360,7 +1360,7 @@ mod method_tests {
     #[test]
     fn export_methods_full_round_trip() {
         let handler_map: std::collections::HashMap<&str, _> =
-            __anvyx_methods_Vec2().into_iter().collect();
+            __anvyx_methods_vec2().into_iter().collect();
 
         let result = handler_map["Vec2::new"](vec![Value::Float(1.0), Value::Float(2.0)]).unwrap();
         let Value::ExternHandle(id) = result else {
@@ -2390,7 +2390,7 @@ mod op_tests {
 
     #[test]
     fn op_handlers_registered_in_companion() {
-        let handlers = __anvyx_methods_OpVec2();
+        let handlers = __anvyx_methods_opvec2();
         let keys: Vec<&str> = handlers.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&"Vec2::__op_add__Vec2"));
         assert!(keys.contains(&"Vec2::__op_sub__Vec2"));

@@ -1,0 +1,28 @@
+[package]
+name = "{{package_name}}"
+version = "{{version}}"
+edition = "{{edition}}"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "{{binary_name}}"
+path = "src/main.rs"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+incremental = false
+debug = false
+strip = true
+opt-level = 3
+
+{{dependencies}}

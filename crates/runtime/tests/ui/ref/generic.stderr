@@ -1,0 +1,5 @@
+error: AnvyxRef does not support generic structs yet
+ --> tests/ui/ref/generic.rs:4:13
+  |
+4 | struct Boxed<T> {
+  |             ^^^

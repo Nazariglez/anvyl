@@ -1,0 +1,5 @@
+error: AnvyxInline does not support generic structs yet
+ --> tests/ui/inline/generic.rs:4:13
+  |
+4 | struct Boxed<T> {
+  |             ^^^

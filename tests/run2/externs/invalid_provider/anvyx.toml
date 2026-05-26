@@ -1,0 +1,6 @@
+[project]
+name = "invalid_provider_game"
+entry = "src/main.anv"
+
+[externs.host]
+path = "provider"

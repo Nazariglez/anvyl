@@ -1,7 +1,7 @@
 use super::{
     CheckedType, Exposure, ExternUseTarget, GlobalAccessMode, GlobalKey, GlobalSig, LocalUseMode,
     MemberAccessKind, MemberPathFact, MemberPathKind, SemanticLocalId, TypeChecker, TypeError,
-    ValueDecl, check_expr_checked, member,
+    ValueDecl, check_expr_checked, member, nominal_type,
     postfix::{check_index_access, check_tuple_index_access},
 };
 use crate::{
@@ -957,20 +957,50 @@ pub(super) fn record_facts_write(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mu
 
 fn record_prefix_reads(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {
     for field_ref in &facts.prefix_reads {
-        tc.record_extern_use(expr_id, ExternUseTarget::FieldRead(*field_ref));
+        if let Some(error) = extern_field_read_error(*field_ref, tc) {
+            tc.push_error(error);
+        } else {
+            tc.record_extern_use(expr_id, ExternUseTarget::FieldRead(*field_ref));
+        }
     }
 }
 
 fn record_target_reads(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {
     for field_ref in &facts.targets {
-        tc.record_extern_use(expr_id, ExternUseTarget::FieldRead(*field_ref));
+        if let Some(error) = extern_field_read_error(*field_ref, tc) {
+            tc.push_error(error);
+        } else {
+            tc.record_extern_use(expr_id, ExternUseTarget::FieldRead(*field_ref));
+        }
     }
 }
 
 fn record_target_writes(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {
     for field_ref in &facts.targets {
-        tc.record_extern_use(expr_id, ExternUseTarget::FieldWrite(*field_ref));
+        if let Some(error) = extern_field_write_error(*field_ref, tc) {
+            tc.push_error(error);
+        } else {
+            tc.record_extern_use(expr_id, ExternUseTarget::FieldWrite(*field_ref));
+        }
     }
+}
+
+fn extern_field_read_error(field_ref: ExternFieldRef, tc: &TypeChecker) -> Option<TypeError> {
+    let (owner, field) = tc.externs.field_ref(field_ref);
+    (!field.readable).then_some(TypeError::UnknownMember {
+        ty: nominal_type(&owner.nominal),
+        member: field.name,
+        kind: MemberAccessKind::Field,
+        span: None,
+    })
+}
+
+fn extern_field_write_error(field_ref: ExternFieldRef, tc: &TypeChecker) -> Option<TypeError> {
+    let (_, field) = tc.externs.field_ref(field_ref);
+    (!field.writable).then_some(TypeError::ImmutableAssignment {
+        name: field.name,
+        span: None,
+    })
 }
 
 impl CheckedPlace {
@@ -1018,8 +1048,12 @@ pub(super) fn projected_field_access(receiver_access: PlaceAccess) -> PlaceAcces
     }
 }
 
-pub(super) fn extern_field_access(receiver_access: PlaceAccess, computed: bool) -> PlaceAccess {
-    if receiver_access == PlaceAccess::Mutable && computed {
+pub(super) fn extern_field_access(
+    receiver_access: PlaceAccess,
+    computed: bool,
+    writable: bool,
+) -> PlaceAccess {
+    if receiver_access == PlaceAccess::Mutable && computed && writable {
         PlaceAccess::Settable
     } else {
         projected_field_access(receiver_access)

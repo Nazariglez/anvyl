@@ -1,14 +1,43 @@
+mod clean_function;
+mod clean_inline;
+mod clean_methods;
+mod clean_module;
+mod clean_ref;
+mod clean_type_derive;
+mod clean_type_map;
+mod naming;
+mod util;
+
+// Legacy VM/provider macro implementation used by `anvyx-lang` re-exports.
 mod codegen;
 mod expand;
 mod export_methods;
 mod export_type;
-mod naming;
 mod provider;
 mod provider_descriptor;
 mod type_map;
-mod util;
 
 use proc_macro::TokenStream;
+
+#[proc_macro_attribute]
+pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
+    clean_function::expand(attr.into(), item.into()).into()
+}
+
+#[proc_macro_derive(AnvyxInline, attributes(anvyx))]
+pub fn derive_anvyx_inline(item: TokenStream) -> TokenStream {
+    clean_inline::expand(item.into()).into()
+}
+
+#[proc_macro_derive(AnvyxRef, attributes(anvyx))]
+pub fn derive_anvyx_ref(item: TokenStream) -> TokenStream {
+    clean_ref::expand(item.into()).into()
+}
+
+#[proc_macro_attribute]
+pub fn methods(attr: TokenStream, item: TokenStream) -> TokenStream {
+    clean_methods::expand(attr.into(), item.into()).into()
+}
 
 /// # Override the exported name
 ///
@@ -41,6 +70,16 @@ pub fn export_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+pub fn module(input: TokenStream) -> TokenStream {
+    clean_module::expand_module(input.into()).into()
+}
+
+#[proc_macro]
+pub fn builtin_module(input: TokenStream) -> TokenStream {
+    clean_module::expand_builtin(input.into()).into()
+}
+
+#[proc_macro]
 pub fn provider(input: TokenStream) -> TokenStream {
     provider::expand(input.into()).into()
 }
@@ -48,4 +87,29 @@ pub fn provider(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn provider_descriptor(input: TokenStream) -> TokenStream {
     provider_descriptor::expand(input.into()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    const CLEAN_MODULES: &[(&str, &str)] = &[
+        ("clean_function.rs", include_str!("clean_function.rs")),
+        ("clean_inline.rs", include_str!("clean_inline.rs")),
+        ("clean_methods.rs", include_str!("clean_methods.rs")),
+        ("clean_module.rs", include_str!("clean_module.rs")),
+        ("clean_ref.rs", include_str!("clean_ref.rs")),
+        ("clean_type_derive.rs", include_str!("clean_type_derive.rs")),
+        ("clean_type_map.rs", include_str!("clean_type_map.rs")),
+    ];
+
+    #[test]
+    fn clean_macros_do_not_reference_legacy_runtime() {
+        for (name, source) in CLEAN_MODULES {
+            for banned in ["anvyx_lang", "ExternHandler", "StdModule"] {
+                assert!(
+                    !source.contains(banned),
+                    "{name} must not reference legacy {banned}"
+                );
+            }
+        }
+    }
 }

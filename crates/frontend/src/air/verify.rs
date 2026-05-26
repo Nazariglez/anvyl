@@ -1,3 +1,8 @@
+use anvyx_externs::{
+    BinaryOp as ExternBinaryOp, ExternBindingOp, ExternBindingTarget, ExternMemberSelector,
+    ExternOperator, ExternTypeKey, ModulePath as ExternModulePath, UnaryOp as ExternUnaryOp,
+};
+
 pub use super::typing::PrimitiveKind;
 use super::{
     AggregateKind, ConstValue, ExternMember, Function, LocalKind, Mutability, ParamMode, ParamRole,
@@ -9,6 +14,7 @@ use super::{
     ids::*,
     typing::{self, PrimitiveTypes, supports_scalar_binary, supports_scalar_unary},
 };
+use crate::ast::{BinaryOp, UnaryOp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyError {
@@ -66,6 +72,7 @@ pub enum BadExtern {
     OperatorOperandMismatch,
     MemberParamCountMismatch { expected: usize, found: usize },
     ReceiverModeMismatch,
+    BindingMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +125,7 @@ pub enum BadRValue {
         rhs: TypeId,
         result: TypeId,
     },
-    UnsupportedBinaryOp(crate::ast::BinaryOp),
+    UnsupportedBinaryOp(BinaryOp),
     CastMustConvertIntAndFloat {
         value: TypeId,
         target: TypeId,
@@ -151,6 +158,21 @@ pub enum BadRValue {
     },
     AggregateCtorFieldTypeMismatch {
         aggregate: AggregateId,
+        field: usize,
+        expected: TypeId,
+        found: TypeId,
+    },
+    ExternCtorResultTypeMismatch {
+        extern_id: ExternTypeId,
+        found: TypeId,
+    },
+    ExternCtorFieldCountMismatch {
+        extern_id: ExternTypeId,
+        expected: usize,
+        found: usize,
+    },
+    ExternCtorFieldTypeMismatch {
+        extern_id: ExternTypeId,
         field: usize,
         expected: TypeId,
         found: TypeId,
@@ -991,11 +1013,149 @@ fn verify_extern(cx: &mut VerifyCx<'_>, id: ExternId) {
     let site = VerifySite::Extern(id);
     cx.verify_module_ref(site.clone(), ext.module);
     verify_decl_listed_once(cx, site.clone(), ext.module, id, |m| &m.externs);
+    verify_extern_binding(cx, site.clone(), ext);
     verify_extern_member(cx, site.clone(), &ext.member, &ext.params);
     for param in &ext.params {
         cx.verify_type_ref(site.clone(), param.ty);
     }
     cx.verify_type_ref(site, ext.return_type);
+}
+
+fn verify_extern_binding(cx: &mut VerifyCx<'_>, site: VerifySite, ext: &super::ExternDecl) {
+    let Some(binding) = &ext.binding else {
+        return;
+    };
+    let valid = match (&ext.member, &binding.key.target, binding.key.operation) {
+        (
+            ExternMember::FreeFunction,
+            ExternBindingTarget::Function(function),
+            ExternBindingOp::Call,
+        ) => {
+            function.name == ext.name.to_string()
+                && function.module == extern_module_path(cx, ext.module)
+        }
+        (
+            ExternMember::FieldGetter { owner, .. },
+            ExternBindingTarget::Member(member),
+            ExternBindingOp::Get,
+        )
+        | (
+            ExternMember::FieldSetter { owner, .. },
+            ExternBindingTarget::Member(member),
+            ExternBindingOp::Set,
+        ) => {
+            member.owner == extern_owner_key(cx, *owner)
+                && member.selector == ExternMemberSelector::Field(ext.name.to_string())
+        }
+        (
+            ExternMember::Method { owner, .. },
+            ExternBindingTarget::Member(member),
+            ExternBindingOp::Call,
+        ) => {
+            member.owner == extern_owner_key(cx, *owner)
+                && member.selector == ExternMemberSelector::Method(ext.name.to_string())
+        }
+        (
+            ExternMember::StaticMethod { owner },
+            ExternBindingTarget::Member(member),
+            ExternBindingOp::Call,
+        ) => {
+            member.owner == extern_owner_key(cx, *owner)
+                && member.selector == ExternMemberSelector::Static(ext.name.to_string())
+        }
+        (
+            ExternMember::Init { owner },
+            ExternBindingTarget::Member(member),
+            ExternBindingOp::Call,
+        ) => {
+            member.owner == extern_owner_key(cx, *owner)
+                && member.selector == ExternMemberSelector::Init
+        }
+        (
+            ExternMember::UnaryOperator { owner, op, .. },
+            ExternBindingTarget::Member(member),
+            ExternBindingOp::Call,
+        ) => extern_unary_op(*op).is_some_and(|op| {
+            member.owner == extern_owner_key(cx, *owner)
+                && member.selector == ExternMemberSelector::Operator(ExternOperator::Unary(op))
+        }),
+        (
+            ExternMember::BinaryOperator {
+                owner,
+                op,
+                self_on_right,
+                ..
+            },
+            ExternBindingTarget::Member(member),
+            ExternBindingOp::Call,
+        ) => extern_binary_op(*op).is_some_and(|op| {
+            member.owner == extern_owner_key(cx, *owner)
+                && member.selector
+                    == ExternMemberSelector::Operator(ExternOperator::Binary {
+                        op,
+                        self_on_right: *self_on_right,
+                    })
+        }),
+        _ => false,
+    };
+    if !valid {
+        cx.push(site, VerifyErrorKind::BadExtern(BadExtern::BindingMismatch));
+    }
+}
+
+fn extern_owner_key(cx: &VerifyCx<'_>, id: ExternTypeId) -> ExternTypeKey {
+    if !cx.has_extern_type(id) {
+        return ExternTypeKey {
+            module: ExternModulePath { segments: vec![] },
+            name: String::new(),
+        };
+    }
+    let ty = cx.program.extern_type(id);
+    ExternTypeKey {
+        module: extern_module_path(cx, ty.module),
+        name: ty.name.to_string(),
+    }
+}
+
+fn extern_module_path(cx: &VerifyCx<'_>, id: ModuleId) -> ExternModulePath {
+    let segments = cx
+        .program
+        .modules
+        .get(id.index())
+        .map(|module| module.path.iter().map(ToString::to_string).collect())
+        .unwrap_or_default();
+    ExternModulePath { segments }
+}
+
+fn extern_unary_op(op: UnaryOp) -> Option<ExternUnaryOp> {
+    match op {
+        UnaryOp::Neg => Some(ExternUnaryOp::Neg),
+        UnaryOp::Not | UnaryOp::BitNot => None,
+    }
+}
+
+fn extern_binary_op(op: BinaryOp) -> Option<ExternBinaryOp> {
+    match op {
+        BinaryOp::Add => Some(ExternBinaryOp::Add),
+        BinaryOp::Sub => Some(ExternBinaryOp::Sub),
+        BinaryOp::Mul => Some(ExternBinaryOp::Mul),
+        BinaryOp::Div => Some(ExternBinaryOp::Div),
+        BinaryOp::Rem => Some(ExternBinaryOp::Rem),
+        BinaryOp::Eq => Some(ExternBinaryOp::Eq),
+        BinaryOp::NotEq => Some(ExternBinaryOp::NotEq),
+        BinaryOp::LessThan => Some(ExternBinaryOp::LessThan),
+        BinaryOp::GreaterThan => Some(ExternBinaryOp::GreaterThan),
+        BinaryOp::LessThanEq => Some(ExternBinaryOp::LessThanEq),
+        BinaryOp::GreaterThanEq => Some(ExternBinaryOp::GreaterThanEq),
+        BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Xor
+        | BinaryOp::BitAnd
+        | BinaryOp::BitOr
+        | BinaryOp::Shl
+        | BinaryOp::Shr
+        | BinaryOp::Coalesce => None,
+    }
 }
 
 fn verify_receiver_mode(
@@ -1162,6 +1322,11 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
 
     for local in &func.locals {
         cx.verify_type_ref(site.clone(), local.ty);
+    }
+    if let Some(specialization) = &func.specialization {
+        for ty in &specialization.type_args {
+            cx.verify_type_ref(site.clone(), *ty);
+        }
     }
 
     cx.verify_type_ref(site, func.signature.return_type());
@@ -1756,12 +1921,7 @@ fn verify_rvalue(
             verify_operand(cx, function_id, block_id, stmt_index, lhs);
             verify_operand(cx, function_id, block_id, stmt_index, rhs);
             cx.verify_type_ref(site.clone(), *ty);
-            if matches!(
-                op,
-                crate::ast::BinaryOp::And
-                    | crate::ast::BinaryOp::Or
-                    | crate::ast::BinaryOp::Coalesce
-            ) {
+            if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce) {
                 cx.push(
                     site,
                     VerifyErrorKind::BadRValue(BadRValue::UnsupportedBinaryOp(*op)),
@@ -1833,6 +1993,9 @@ fn verify_rvalue(
                     *ty,
                     fields,
                 ),
+                AggregateCtor::Extern(id) => {
+                    verify_extern_ctor(cx, site.clone(), *id, *ty, fields);
+                }
                 AggregateCtor::EnumVariant { enum_id, variant } => {
                     verify_enum_ctor(cx, site.clone(), *enum_id, *variant, *ty, fields);
                 }
@@ -2354,6 +2517,56 @@ fn verify_aggregate_ctor(
     }
 }
 
+fn verify_extern_ctor(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    extern_id: ExternTypeId,
+    ty: TypeId,
+    fields: &[Operand],
+) {
+    let Some(decl) = cx.program.extern_types.get(extern_id.index()) else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidExternType(extern_id)),
+        );
+        return;
+    };
+    if cx.type_data(ty) != Some(&TypeData::Extern(extern_id)) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::ExternCtorResultTypeMismatch {
+                extern_id,
+                found: ty,
+            }),
+        );
+    }
+    if fields.len() != decl.fields.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::ExternCtorFieldCountMismatch {
+                extern_id,
+                expected: decl.fields.len(),
+                found: fields.len(),
+            }),
+        );
+    }
+    for (index, (operand, field)) in fields.iter().zip(&decl.fields).enumerate() {
+        if let Some(found) = operand_ty(cx, operand)
+            && found != field.ty
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadRValue(BadRValue::ExternCtorFieldTypeMismatch {
+                    extern_id,
+                    field: index,
+                    expected: field.ty,
+                    found,
+                }),
+            );
+        }
+    }
+}
+
 fn verify_enum_ctor(
     cx: &mut VerifyCx<'_>,
     site: VerifySite,
@@ -2481,16 +2694,7 @@ fn verify_call(
                 );
                 return;
             }
-            let params: Vec<ParamType> = cx
-                .program
-                .extern_decl(*id)
-                .params
-                .iter()
-                .map(|p| ParamType {
-                    ty: p.ty,
-                    mode: p.mode,
-                })
-                .collect();
+            let params = cx.program.extern_decl(*id).call_params();
             verify_call_args(cx, &site, args, &params);
         }
         Callee::Closure(op) => {

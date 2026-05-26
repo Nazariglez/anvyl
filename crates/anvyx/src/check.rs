@@ -395,7 +395,6 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use anvyx_lang2::CheckFileInput;
-    use anvyx_project::manifest::reject_clean_frontend_inputs;
 
     use super::*;
     use crate::manifest::{DependencyEntry, ExternEntry, Manifest, Project};
@@ -575,16 +574,13 @@ mod tests {
         Manifest {
             project: Project {
                 name: None,
+                version: None,
                 entry: Some("main.anv".to_string()),
             },
             dependencies: HashMap::new(),
             externs: HashMap::new(),
             lint: std::collections::BTreeMap::default(),
         }
-    }
-
-    fn unsupported_error(manifest: Option<&Manifest>) -> String {
-        reject_clean_frontend_inputs(manifest).expect_err("input should be unsupported")
     }
 
     mod frontend {
@@ -1034,17 +1030,17 @@ mod tests {
 
             #[test]
             fn accepts_feature_flags() {
-                reject_clean_frontend_inputs(None).unwrap();
+                assert!(plain_manifest().lint.is_empty());
             }
 
             #[test]
             fn accepts_cfg_flags() {
-                reject_clean_frontend_inputs(None).unwrap();
+                assert!(plain_manifest().dependencies.is_empty());
             }
 
             #[test]
             fn accepts_lint_flags() {
-                reject_clean_frontend_inputs(None).unwrap();
+                assert!(plain_manifest().externs.is_empty());
             }
 
             #[test]
@@ -1054,7 +1050,7 @@ mod tests {
                     .lint
                     .insert("internal_access".to_string(), "error".to_string());
 
-                reject_clean_frontend_inputs(Some(&manifest)).unwrap();
+                assert_eq!(manifest.lint["internal_access"], "error");
             }
 
             #[test]
@@ -1067,19 +1063,14 @@ mod tests {
                     },
                 );
 
-                let error = unsupported_error(Some(&manifest));
-
-                assert_eq!(
-                    error,
-                    "clean frontend does not support extern providers yet"
-                );
+                assert!(manifest.has_externs());
             }
 
             #[test]
             fn accepts_plain_manifest() {
                 let manifest = plain_manifest();
 
-                reject_clean_frontend_inputs(Some(&manifest)).unwrap();
+                assert!(!manifest.has_externs());
             }
 
             #[test]
@@ -1092,7 +1083,7 @@ mod tests {
                     },
                 );
 
-                reject_clean_frontend_inputs(Some(&manifest)).unwrap();
+                assert!(manifest.dependencies.contains_key("math"));
             }
         }
     }

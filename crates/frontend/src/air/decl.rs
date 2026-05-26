@@ -1,8 +1,10 @@
 // exports body type used in Function
+use anvyx_externs::{ExternBindingKey, ExternEffects, ExternTypeKey, ProviderId};
+
 pub use super::body::AirBody;
 use super::ids::*;
 use crate::{
-    air::types::{BinaryOp, ParamMode, ReturnMode, UnaryOp},
+    air::types::{BinaryOp, ConstValue, ParamMode, ParamType, ReturnMode, UnaryOp},
     ast::Ident,
 };
 
@@ -22,9 +24,16 @@ pub struct Function {
     pub module: ModuleId,
     pub kind: FunctionKind,
     pub owner: Option<FunctionOwner>,
+    pub specialization: Option<FunctionSpecialization>,
     pub signature: Signature,
     pub locals: Vec<Local>,
     pub body: AirBody,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionSpecialization {
+    pub type_args: Vec<TypeId>,
+    pub const_args: Vec<ConstValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +143,13 @@ pub struct EnumDecl {
     pub module: ModuleId,
     pub type_args: Vec<TypeId>,
     pub const_args: Vec<String>,
+    pub core: Option<CoreEnumKind>,
     pub variants: Vec<VariantDecl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreEnumKind {
+    Option,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +172,22 @@ pub struct ExternDecl {
     pub member: ExternMember,
     pub params: Vec<ExternParamDecl>,
     pub return_type: TypeId,
+    pub binding: Option<ExternBindingDecl>,
+    pub effects: ExternEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternBindingDecl {
+    pub package: crate::resolve::PackageId,
+    pub provider: ProviderId,
+    pub key: ExternBindingKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternTypeBindingDecl {
+    pub package: crate::resolve::PackageId,
+    pub provider: ProviderId,
+    pub key: ExternTypeKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +200,46 @@ pub struct ExternParamDecl {
 pub struct ExternReceiverDecl {
     pub ty: TypeId,
     pub mode: ParamMode,
+}
+
+impl ExternDecl {
+    pub fn call_params(&self) -> Vec<ParamType> {
+        self.receiver_param()
+            .into_iter()
+            .chain(self.params.iter().map(ExternParamDecl::param_type))
+            .collect()
+    }
+
+    fn receiver_param(&self) -> Option<ParamType> {
+        match &self.member {
+            ExternMember::FieldGetter { receiver, .. }
+            | ExternMember::FieldSetter { receiver, .. }
+            | ExternMember::Method { receiver, .. }
+            | ExternMember::UnaryOperator { receiver, .. }
+            | ExternMember::BinaryOperator { receiver, .. } => Some(receiver.param_type()),
+            ExternMember::FreeFunction
+            | ExternMember::StaticMethod { .. }
+            | ExternMember::Init { .. } => None,
+        }
+    }
+}
+
+impl ExternParamDecl {
+    pub fn param_type(&self) -> ParamType {
+        ParamType {
+            ty: self.ty,
+            mode: self.mode,
+        }
+    }
+}
+
+impl ExternReceiverDecl {
+    pub fn param_type(&self) -> ParamType {
+        ParamType {
+            ty: self.ty,
+            mode: self.mode,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +281,7 @@ pub enum ExternMember {
 pub struct ExternTypeDecl {
     pub name: Ident,
     pub module: ModuleId,
+    pub binding: Option<ExternTypeBindingDecl>,
     pub type_args: Vec<TypeId>,
     pub const_args: Vec<String>,
     pub rep: ExternRep,
@@ -233,6 +305,8 @@ pub struct ExternFieldDecl {
     pub get_receiver: ExternReceiverDecl,
     pub set_receiver: ExternReceiverDecl,
     pub computed: bool,
+    pub readable: bool,
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

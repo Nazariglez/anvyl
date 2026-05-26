@@ -58,8 +58,17 @@ fn main() {
     let compile_timeout = Duration::from_millis(args.compile_timeout_ms);
     let run_work = || {
         if args.new_frontend() && args.backend == BackendArg::Rust {
-            run_new_frontend_rust_work(&work, runtime_timeout, compile_timeout, &cli)
+            run_new_frontend_rust_work(
+                &work,
+                runtime_timeout,
+                compile_timeout,
+                &cli,
+                !args.report_json,
+            )
         } else {
+            if !args.report_json {
+                report::print_test_run();
+            }
             work.par_iter()
                 .map(|(file, backend)| {
                     let result =
@@ -111,6 +120,7 @@ fn run_new_frontend_rust_work(
     runtime_timeout: Duration,
     compile_timeout: Duration,
     cli: &Cli,
+    show_status: bool,
 ) -> Vec<(PathBuf, Option<&'static str>, RunTestResult)> {
     let mut batch_plans = vec![];
     let mut other = vec![];
@@ -124,17 +134,11 @@ fn run_new_frontend_rust_work(
         }
     }
 
-    let mut results = other
-        .par_iter()
-        .map(|(file, backend)| {
-            let result = run_test_file(file, runtime_timeout, compile_timeout, *backend, cli)
-                .unwrap_or_else(|e| runner_error(FailurePhase::Compile, Mode::Check, None, e));
-            (file.clone(), *backend, result)
-        })
-        .collect::<Vec<_>>();
-
     if batch_plans.is_empty() {
-        return results;
+        if show_status {
+            report::print_test_run();
+        }
+        return run_other_work(&other, runtime_timeout, compile_timeout, cli);
     }
 
     let batch_frontend = batch_frontend_config(cli.release());
@@ -153,10 +157,19 @@ fn run_new_frontend_rust_work(
             .collect(),
         cargo_profile: anvyx_project::rust::RustCargoProfile::from_release(cli.release()),
         cache_root: None,
-        timeout: Some(compile_timeout),
+        timeout: Some(batch_compile_timeout(compile_timeout, batch_plans.len())),
     };
 
-    match anvyx_project::rust::build_clean_rust_batch(batch_input) {
+    if show_status {
+        report::print_rust_batch_compile(batch_plans.len());
+    }
+    let batch = anvyx_project::rust::build_clean_rust_batch(batch_input);
+    if show_status {
+        report::print_test_run();
+    }
+
+    let mut results = run_other_work(&other, runtime_timeout, compile_timeout, cli);
+    match batch {
         Ok(output) => {
             let binaries = output
                 .binaries
@@ -178,38 +191,39 @@ fn run_new_frontend_rust_work(
                 .collect::<Vec<_>>();
             results.extend(batch_results);
         }
-        Err(error) => {
-            let mut fallback_failed = false;
-            let mut batch_results = vec![];
-            for (file, backend, _) in batch_plans {
-                let result = run_test_file(&file, runtime_timeout, compile_timeout, backend, cli)
-                    .unwrap_or_else(|e| runner_error(FailurePhase::Compile, Mode::Check, None, e));
-                if !matches!(
-                    result.result,
-                    TestResult::Pass | TestResult::Skip { .. } | TestResult::Helper
-                ) {
-                    fallback_failed = true;
-                }
-                batch_results.push((file, backend, result));
-            }
-            if fallback_failed {
-                results.extend(batch_results);
-            } else {
-                results.extend(
-                    batch_results
-                        .into_iter()
-                        .map(|(file, backend, mut result)| {
-                            result.result = fail_result(
-                                FailurePhase::Compile,
-                                format!("Batch build failed but per-case fallback passed: {error}"),
-                            );
-                            (file, backend, result)
-                        }),
-                );
-            }
+        Err(_) => {
+            let fallback = batch_plans
+                .into_iter()
+                .map(|(file, backend, _)| (file, backend))
+                .collect::<Vec<_>>();
+            results.extend(run_other_work(
+                &fallback,
+                runtime_timeout,
+                compile_timeout,
+                cli,
+            ));
         }
     }
     results
+}
+
+fn batch_compile_timeout(per_case: Duration, cases: usize) -> Duration {
+    per_case.saturating_mul(u32::try_from(cases).unwrap_or(u32::MAX))
+}
+
+fn run_other_work(
+    work: &[(PathBuf, Option<&'static str>)],
+    runtime_timeout: Duration,
+    compile_timeout: Duration,
+    cli: &Cli,
+) -> Vec<(PathBuf, Option<&'static str>, RunTestResult)> {
+    work.par_iter()
+        .map(|(file, backend)| {
+            let result = run_test_file(file, runtime_timeout, compile_timeout, *backend, cli)
+                .unwrap_or_else(|e| runner_error(FailurePhase::Compile, Mode::Check, None, e));
+            (file.clone(), *backend, result)
+        })
+        .collect()
 }
 
 fn runner_error(
@@ -219,15 +233,14 @@ fn runner_error(
     error: impl std::fmt::Display,
 ) -> RunTestResult {
     RunTestResult {
-        result: fail_result(phase, format!("Test runner error: {error}")),
+        result: TestResult::Fail {
+            phase,
+            message: format!("Test runner error: {error}"),
+        },
         mode,
         backend,
         duration: Duration::ZERO,
     }
-}
-
-fn fail_result(phase: FailurePhase, message: String) -> TestResult {
-    TestResult::Fail { phase, message }
 }
 
 fn batch_frontend_config(release: bool) -> anvyx_lang2::FrontendConfig {
@@ -267,9 +280,9 @@ fn expand_backend_work(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
-    use super::{BackendArg, batch_frontend_config, expand_backend_work};
+    use super::{BackendArg, batch_compile_timeout, batch_frontend_config, expand_backend_work};
 
     #[test]
     fn both_backend_work_uses_vm_then_rust_per_file() {
@@ -297,6 +310,14 @@ mod tests {
         assert_eq!(
             batch_frontend_config(true).context.profile,
             anvyx_lang2::Profile::Release
+        );
+    }
+
+    #[test]
+    fn batch_timeout_scales_per_case_budget() {
+        assert_eq!(
+            batch_compile_timeout(Duration::from_secs(2), 3),
+            Duration::from_secs(6)
         );
     }
 }

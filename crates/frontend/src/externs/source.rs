@@ -193,6 +193,10 @@ fn normalize_member(
                 name: name.to_string(),
                 ty: type_expr(source, ty, span)?,
                 computed: *computed,
+                readable: true,
+                writable: true,
+                get_receiver: ReceiverMode::Shared,
+                set_receiver: ReceiverMode::Mutable,
                 doc: doc.clone(),
             },
             site: site(source, span),
@@ -242,6 +246,7 @@ fn normalize_member(
                     op: binary_op(source, *op, span)?,
                     self_on_right: *self_on_right,
                 },
+                receiver: ReceiverMode::Shared,
                 signature: ExternSignature {
                     params: vec![ExternParam {
                         name: None,
@@ -259,6 +264,7 @@ fn normalize_member(
             Ok(RawSourceMember::Operator(RawExternOperator {
                 decl: ExternOperatorDescriptor {
                     op: ExternOperator::Unary(unary_op(source, *op, span)?),
+                    receiver: ReceiverMode::Shared,
                     signature: ExternSignature {
                         params: vec![],
                         ret: type_expr(source, ret, span)?,

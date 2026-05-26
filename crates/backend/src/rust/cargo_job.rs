@@ -15,7 +15,11 @@ use sha2::{Digest, Sha256};
 use super::emit::RustSource;
 
 pub const RUST_CARGO_FINGERPRINT_SCHEMA: &str = "anvyx-cargo-v1";
+pub const RUST_CARGO_IDENTITY_SCHEMA: &str = "anvyx-cargo-id-v1";
 pub const RUST_CARGO_NAME_DIGEST_LEN: usize = 16;
+pub const DEFAULT_CARGO_EDITION: &str = "2024";
+pub const DEFAULT_CARGO_VERSION: &str = "0.0.0";
+
 #[derive(Debug, Clone)]
 pub struct RustCargoJob {
     source: RustSource,
@@ -23,7 +27,7 @@ pub struct RustCargoJob {
     mode: RustCargoMode,
     profile: RustCargoProfile,
     cache_root: PathBuf,
-    fingerprint: RustCargoFingerprint,
+    crate_identity: RustCargoCrateIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +36,7 @@ pub struct RustCargoBatchJob {
     package: RustPackageSpec,
     profile: RustCargoProfile,
     cache_root: PathBuf,
-    fingerprint: RustCargoFingerprint,
+    crate_identity: RustCargoCrateIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -96,14 +100,31 @@ struct RustPackageSpec {
     package_name: RustCargoName,
     binary_name: RustCargoName,
     dependencies: Vec<RustCargoDependency>,
+    metadata: RustCargoPackageMetadata,
 }
 
-const SINGLE_PROGRAM_MANIFEST: &str = "single-bin-edition-2024-empty-deps-profile-sections";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustCargoPackageMetadata {
+    pub edition: String,
+    pub version: String,
+}
+
+impl Default for RustCargoPackageMetadata {
+    fn default() -> Self {
+        Self {
+            edition: DEFAULT_CARGO_EDITION.to_string(),
+            version: DEFAULT_CARGO_VERSION.to_string(),
+        }
+    }
+}
+
+const SINGLE_MANIFEST_TEMPLATE: &str = include_str!("templates/cargo_single_manifest.toml.in");
+const BATCH_MANIFEST_TEMPLATE: &str = include_str!("templates/cargo_batch_manifest.toml.in");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustCargoDependency {
     pub name: RustCargoName,
-    pub package: Option<RustCargoName>,
+    pub package: Option<RustCargoPackageName>,
     pub source: RustCargoDependencySource,
     pub features: Vec<String>,
     pub default_features: bool,
@@ -116,9 +137,13 @@ impl RustCargoDependency {
             RustCargoDependencySource::Path(path) => format!("path:{path}"),
         };
         format!(
-            "{}|{}|{source}",
+            "{}|{}|{source}|{}|{}",
             self.name.as_str(),
-            self.package.as_ref().map_or("", RustCargoName::as_str)
+            self.package
+                .as_ref()
+                .map_or("", RustCargoPackageName::as_str),
+            self.default_features,
+            self.features.join(",")
         )
     }
 }
@@ -216,26 +241,51 @@ pub fn single_program_job_with_dependencies(
     semantic_profile: &str,
     dependencies: Vec<RustCargoDependency>,
 ) -> RustCargoJob {
+    single_program_job_configured(
+        source,
+        cache_root,
+        profile,
+        mode,
+        semantic_profile,
+        dependencies,
+        RustCargoPackageMetadata::default(),
+        None,
+    )
+}
+
+pub fn single_program_job_configured(
+    source: RustSource,
+    cache_root: PathBuf,
+    profile: RustCargoProfile,
+    mode: RustCargoMode,
+    semantic_profile: &str,
+    dependencies: Vec<RustCargoDependency>,
+    metadata: RustCargoPackageMetadata,
+    crate_identity: Option<RustCargoCrateIdentity>,
+) -> RustCargoJob {
     let dependencies = normalized_dependencies(dependencies);
     let fingerprint = cargo_fingerprint(&RustCargoFingerprintInput {
         source: source.as_str(),
-        manifest_template: SINGLE_PROGRAM_MANIFEST,
+        manifest_template: SINGLE_MANIFEST_TEMPLATE,
         semantic_profile,
         cargo_profile: profile,
         dependencies: &dependencies,
     });
-    let name = single_package_name(&fingerprint);
+    let crate_identity =
+        crate_identity.unwrap_or_else(|| RustCargoCrateIdentity(fingerprint.0.clone()));
+    let name = single_package_name(&crate_identity);
     RustCargoJob {
         source,
         package: RustPackageSpec {
             package_name: name.clone(),
             binary_name: name,
             dependencies,
+            metadata,
         },
         mode,
         profile,
         cache_root,
-        fingerprint,
+        crate_identity,
     }
 }
 
@@ -245,13 +295,25 @@ pub fn batch_job(
     profile: RustCargoProfile,
     semantic_profile: &str,
 ) -> RustCargoBatchJob {
+    batch_job_with_dependencies(cases, cache_root, profile, semantic_profile, vec![])
+}
+
+pub fn batch_job_with_dependencies(
+    cases: Vec<RustCargoBatchCase>,
+    cache_root: PathBuf,
+    profile: RustCargoProfile,
+    semantic_profile: &str,
+    dependencies: Vec<RustCargoDependency>,
+) -> RustCargoBatchJob {
+    let dependencies = normalized_dependencies(dependencies);
     let mut writer = FingerprintWriter::default();
     writer.field(RUST_CARGO_FINGERPRINT_SCHEMA);
-    writer.field("batch-bin-edition-2024-empty-deps");
+    writer.field(BATCH_MANIFEST_TEMPLATE);
     writer.field(semantic_profile);
     writer.field(profile.name());
+    fingerprint_dependencies(&mut writer, &dependencies);
     let mut cases = cases;
-    cases.sort_by_key(|case| case.name.as_str().to_string());
+    cases.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
     for case in &cases {
         writer.field(case.name.as_str());
         writer.field(case.source.as_str());
@@ -263,18 +325,19 @@ pub fn batch_job(
         package: RustPackageSpec {
             package_name: package_name.clone(),
             binary_name: package_name,
-            dependencies: vec![],
+            dependencies,
+            metadata: RustCargoPackageMetadata::default(),
         },
         profile,
         cache_root,
-        fingerprint,
+        crate_identity: RustCargoCrateIdentity(fingerprint.0.clone()),
     }
 }
 
 pub fn execute(job: &RustCargoJob) -> Result<RustCargoOutput, RustCargoError> {
     validate_package(&job.package)?;
 
-    let layout = RustCargoLayout::new(job.cache_root.clone(), job.fingerprint.clone());
+    let layout = RustCargoLayout::new(job.cache_root.clone(), job.crate_identity.clone());
     let _lock = LockFile::acquire(layout.lock_path(), None)?;
     write_single_package(job, &layout)?;
 
@@ -343,7 +406,7 @@ pub fn execute_batch_with_timeout(
     validate_package(&job.package)?;
     validate_batch_cases(&job.cases)?;
     let started = Instant::now();
-    let layout = RustCargoLayout::new(job.cache_root.clone(), job.fingerprint.clone());
+    let layout = RustCargoLayout::new(job.cache_root.clone(), job.crate_identity.clone());
     let _lock = LockFile::acquire(layout.lock_path(), timeout)?;
     write_batch_package(job, &layout)?;
 
@@ -418,39 +481,63 @@ fn write_batch_package(
 }
 
 fn render_batch_manifest(package: &RustPackageSpec, cases: &[RustCargoBatchCase]) -> String {
-    let mut text = format!(
-        "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[profile.dev]\nopt-level = 0\n\n[profile.release]\nopt-level = 3\n",
-        package.package_name.as_str()
-    );
+    let mut bin_sections = String::new();
     for case in cases {
         write!(
-            text,
+            bin_sections,
             "\n[[bin]]\nname = \"{}\"\npath = \"src/bin/{}.rs\"\n",
             case.name.as_str(),
             case.name.as_str()
         )
         .expect("write to string succeeds");
     }
-    text
+    render_template(
+        BATCH_MANIFEST_TEMPLATE,
+        &[
+            ("package_name", package.package_name.as_str()),
+            ("version", &package.metadata.version),
+            ("edition", &package.metadata.edition),
+            ("bin_sections", &bin_sections),
+            ("dependencies", &render_dependencies(&package.dependencies)),
+        ],
+    )
 }
 
 fn render_manifest(package: &RustPackageSpec) -> String {
-    let mut text = format!(
-        "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[[bin]]\nname = \"{}\"\npath = \"src/main.rs\"\n\n[profile.dev]\nopt-level = 0\n\n[profile.release]\nopt-level = 3\n",
-        package.package_name.as_str(),
-        package.binary_name.as_str()
-    );
-    let dependencies = sorted_dependencies(&package.dependencies);
-    if !dependencies.is_empty() {
-        text.push_str("\n[dependencies]\n");
-        for dep in dependencies {
-            text.push_str(&render_dependency(dep));
-        }
+    render_template(
+        SINGLE_MANIFEST_TEMPLATE,
+        &[
+            ("package_name", package.package_name.as_str()),
+            ("version", &package.metadata.version),
+            ("edition", &package.metadata.edition),
+            ("binary_name", package.binary_name.as_str()),
+            ("dependencies", &render_dependencies(&package.dependencies)),
+        ],
+    )
+}
+
+fn render_dependencies(dependencies: &[RustCargoDependency]) -> String {
+    let dependencies = sorted_dependencies(dependencies);
+    if dependencies.is_empty() {
+        return String::new();
+    }
+    let mut text = "\n[dependencies]\n".to_string();
+    for dep in dependencies {
+        text.push_str(&render_dependency(dep));
+    }
+    text
+}
+
+fn render_template(template: &str, fields: &[(&str, &str)]) -> String {
+    let mut text = template.to_string();
+    for (name, value) in fields {
+        text = text.replace(&format!("{{{{{name}}}}}"), value);
     }
     text
 }
 
 fn validate_package(package: &RustPackageSpec) -> Result<(), RustCargoError> {
+    validate_metadata(&package.metadata)?;
     let mut names = std::collections::HashSet::new();
     for dep in &package.dependencies {
         if !names.insert(dep.name.as_str()) {
@@ -461,6 +548,34 @@ fn validate_package(package: &RustPackageSpec) -> Result<(), RustCargoError> {
         }
     }
     Ok(())
+}
+
+fn validate_metadata(metadata: &RustCargoPackageMetadata) -> Result<(), RustCargoError> {
+    if !matches!(metadata.edition.as_str(), "2015" | "2018" | "2021" | "2024") {
+        return Err(RustCargoError::InvalidJob(format!(
+            "unsupported Cargo edition `{}`",
+            metadata.edition
+        )));
+    }
+    if !valid_version(&metadata.version) {
+        return Err(RustCargoError::InvalidJob(format!(
+            "invalid Cargo package version `{}`",
+            metadata.version
+        )));
+    }
+    Ok(())
+}
+
+fn valid_version(version: &str) -> bool {
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3 && parts.iter().all(|part| valid_version_number(part))
+}
+
+fn valid_version_number(part: &str) -> bool {
+    !part.is_empty()
+        && (part == "0" || !part.starts_with('0'))
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && part.parse::<u64>().is_ok()
 }
 
 fn validate_batch_cases(cases: &[RustCargoBatchCase]) -> Result<(), RustCargoError> {
@@ -478,7 +593,7 @@ fn validate_batch_cases(cases: &[RustCargoBatchCase]) -> Result<(), RustCargoErr
 
 fn sorted_dependencies(dependencies: &[RustCargoDependency]) -> Vec<&RustCargoDependency> {
     let mut deps = dependencies.iter().collect::<Vec<_>>();
-    deps.sort_by_key(|dep| dep.name.as_str());
+    deps.sort_by_key(|dep| dep.sort_key());
     deps
 }
 
@@ -493,6 +608,9 @@ fn normalized_dependencies(mut dependencies: Vec<RustCargoDependency>) -> Vec<Ru
 
 fn render_dependency(dep: &RustCargoDependency) -> String {
     let mut fields = vec![];
+    if let Some(package) = &dep.package {
+        fields.push(format!("package = \"{}\"", toml_escape(package.as_str())));
+    }
     match &dep.source {
         RustCargoDependencySource::Registry { version } => {
             fields.push(format!("version = \"{}\"", toml_escape(version)));
@@ -500,9 +618,6 @@ fn render_dependency(dep: &RustCargoDependency) -> String {
         RustCargoDependencySource::Path(path) => {
             fields.push(format!("path = \"{}\"", toml_escape(path)));
         }
-    }
-    if let Some(package) = &dep.package {
-        fields.push(format!("package = \"{}\"", toml_escape(package.as_str())));
     }
     if !dep.default_features {
         fields.push("default-features = false".to_string());
@@ -689,21 +804,21 @@ impl Drop for LockFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RustCargoLayout {
     cache_root: PathBuf,
-    fingerprint: RustCargoFingerprint,
+    crate_identity: RustCargoCrateIdentity,
 }
 
 impl RustCargoLayout {
-    fn new(cache_root: PathBuf, fingerprint: RustCargoFingerprint) -> Self {
+    fn new(cache_root: PathBuf, crate_identity: RustCargoCrateIdentity) -> Self {
         Self {
             cache_root,
-            fingerprint,
+            crate_identity,
         }
     }
 
     fn crate_dir(&self) -> PathBuf {
         self.cache_root
             .join("crates")
-            .join(self.fingerprint.as_str())
+            .join(self.crate_identity.as_str())
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -721,7 +836,7 @@ impl RustCargoLayout {
     fn lock_path(&self) -> PathBuf {
         self.cache_root
             .join("locks")
-            .join(format!("{}.lock", self.fingerprint.as_str()))
+            .join(format!("{}.lock", self.crate_identity.as_str()))
     }
 
     fn batch_case_source_path(&self, case_name: &RustCargoName) -> PathBuf {
@@ -764,6 +879,23 @@ impl RustCargoFingerprint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RustCargoCrateIdentity(String);
+
+impl RustCargoCrateIdentity {
+    pub fn parse(text: impl Into<String>) -> Result<Self, String> {
+        RustCargoFingerprint::parse(text).map(|fingerprint| Self(fingerprint.0))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn short(&self) -> &str {
+        &self.0[..RUST_CARGO_NAME_DIGEST_LEN]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RustCargoName(String);
 
 impl RustCargoName {
@@ -786,29 +918,60 @@ impl fmt::Display for RustCargoName {
     }
 }
 
-fn single_package_name(fingerprint: &RustCargoFingerprint) -> RustCargoName {
-    generated_name("anvyx_gen", fingerprint)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RustCargoPackageName(String);
+
+impl RustCargoPackageName {
+    pub fn parse(text: impl Into<String>) -> Result<Self, String> {
+        let text = text.into();
+        if !valid_cargo_package_name(&text) {
+            return Err(format!("invalid Cargo package name `{text}`"));
+        }
+        Ok(Self(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RustCargoPackageName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn single_package_name(identity: &RustCargoCrateIdentity) -> RustCargoName {
+    generated_name("anvyx_gen", identity.short())
 }
 
 fn batch_package_name(fingerprint: &RustCargoFingerprint) -> RustCargoName {
-    generated_name("anvyx_test_batch", fingerprint)
+    generated_name("anvyx_test_batch", fingerprint.short())
 }
 
 pub fn batch_case_name(fingerprint: &RustCargoFingerprint) -> RustCargoName {
-    generated_name("case", fingerprint)
+    generated_name("case", fingerprint.short())
 }
 
-fn generated_name(prefix: &str, fingerprint: &RustCargoFingerprint) -> RustCargoName {
-    RustCargoName::parse(format!("{prefix}_{}", fingerprint.short()))
-        .expect("generated Cargo name is valid")
+fn generated_name(prefix: &str, suffix: &str) -> RustCargoName {
+    RustCargoName::parse(format!("{prefix}_{suffix}")).expect("generated Cargo name is valid")
 }
 
 fn valid_cargo_name(name: &str) -> bool {
+    valid_cargo_identifier(name, false)
+}
+
+fn valid_cargo_package_name(name: &str) -> bool {
+    valid_cargo_identifier(name, true)
+}
+
+fn valid_cargo_identifier(name: &str, allow_hyphen: bool) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    first.is_ascii_alphabetic()
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || allow_hyphen && c == '-')
 }
 
 fn host_binary_name(name: &RustCargoName) -> String {
@@ -827,11 +990,31 @@ pub fn cargo_fingerprint(input: &RustCargoFingerprintInput<'_>) -> RustCargoFing
     writer.field(input.semantic_profile);
     writer.field(input.cargo_profile.name());
 
-    let mut dependencies = input.dependencies.to_vec();
-    dependencies.sort_by_key(RustCargoDependency::sort_key);
-    for dep in dependencies {
+    fingerprint_dependencies(&mut writer, input.dependencies);
+    writer.finish()
+}
+
+pub fn single_program_crate_identity(
+    input: &RustCargoCrateIdentityInput<'_>,
+) -> RustCargoCrateIdentity {
+    let mut writer = FingerprintWriter::default();
+    writer.field(RUST_CARGO_IDENTITY_SCHEMA);
+    writer.field(input.seed);
+    writer.field(SINGLE_MANIFEST_TEMPLATE);
+    writer.field(input.semantic_profile);
+    writer.field(input.cargo_profile.name());
+    fingerprint_dependencies(&mut writer, input.dependencies);
+    RustCargoCrateIdentity(writer.finish().0)
+}
+
+fn fingerprint_dependencies(writer: &mut FingerprintWriter, dependencies: &[RustCargoDependency]) {
+    for dep in sorted_dependencies(dependencies) {
         writer.field(dep.name.as_str());
-        writer.field(dep.package.as_ref().map_or("", RustCargoName::as_str));
+        writer.field(
+            dep.package
+                .as_ref()
+                .map_or("", RustCargoPackageName::as_str),
+        );
         match &dep.source {
             RustCargoDependencySource::Registry { version } => {
                 writer.field("version");
@@ -854,14 +1037,20 @@ pub fn cargo_fingerprint(input: &RustCargoFingerprintInput<'_>) -> RustCargoFing
             writer.field(&feature);
         }
     }
-
-    writer.finish()
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct RustCargoFingerprintInput<'a> {
     pub source: &'a str,
     pub manifest_template: &'a str,
+    pub semantic_profile: &'a str,
+    pub cargo_profile: RustCargoProfile,
+    pub dependencies: &'a [RustCargoDependency],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RustCargoCrateIdentityInput<'a> {
+    pub seed: &'a str,
     pub semantic_profile: &'a str,
     pub cargo_profile: RustCargoProfile,
     pub dependencies: &'a [RustCargoDependency],
@@ -895,8 +1084,19 @@ mod tests {
         .unwrap()
     }
 
+    fn identity() -> RustCargoCrateIdentity {
+        RustCargoCrateIdentity::parse(
+            "abcdef0123456789fedcba9876543210abcdef0123456789fedcba9876543210",
+        )
+        .unwrap()
+    }
+
     fn name(text: &str) -> RustCargoName {
         RustCargoName::parse(text).unwrap()
+    }
+
+    fn package_name(text: &str) -> RustCargoPackageName {
+        RustCargoPackageName::parse(text).unwrap()
     }
 
     fn dep(name_text: &str, version: &str) -> RustCargoDependency {
@@ -929,7 +1129,7 @@ mod tests {
 
     #[test]
     fn layout_paths_are_centralized() {
-        let layout = RustCargoLayout::new(PathBuf::from("cache"), fp());
+        let layout = RustCargoLayout::new(PathBuf::from("cache"), identity());
         let digest = fp().as_str().to_string();
 
         assert_eq!(
@@ -957,7 +1157,7 @@ mod tests {
 
     #[test]
     fn binary_paths_use_profile_and_host_suffix() {
-        let layout = RustCargoLayout::new(PathBuf::from("cache"), fp());
+        let layout = RustCargoLayout::new(PathBuf::from("cache"), identity());
         let bin = name("anvyx_gen_abcdef");
         let suffix = std::env::consts::EXE_SUFFIX;
 
@@ -976,7 +1176,7 @@ mod tests {
         let fingerprint = fp();
 
         for name in [
-            single_package_name(&fingerprint),
+            single_package_name(&identity()),
             batch_package_name(&fingerprint),
             batch_case_name(&fingerprint),
         ] {
@@ -986,6 +1186,8 @@ mod tests {
         assert!(RustCargoName::parse("").is_err());
         assert!(RustCargoName::parse("1bad").is_err());
         assert!(RustCargoName::parse("bad-name").is_err());
+        assert!(RustCargoPackageName::parse("anvyx-core2").is_ok());
+        assert!(RustCargoPackageName::parse("bad name").is_err());
         assert!(RustCargoFingerprint::parse("not-hex").is_err());
     }
 
@@ -1068,6 +1270,25 @@ mod tests {
                 &[dep("a", "2")]
             )
         );
+
+        let mut renamed = dep("a", "1");
+        renamed.package = Some(package_name("real-a"));
+        assert_ne!(
+            fingerprint(
+                "src",
+                "manifest",
+                "debug",
+                RustCargoProfile::Dev,
+                &[dep("a", "1")]
+            ),
+            fingerprint(
+                "src",
+                "manifest",
+                "debug",
+                RustCargoProfile::Dev,
+                &[renamed]
+            )
+        );
     }
 
     #[test]
@@ -1076,12 +1297,18 @@ mod tests {
             package_name: name("anvyx_gen_abcdef"),
             binary_name: name("anvyx_gen_abcdef"),
             dependencies: vec![],
+            metadata: RustCargoPackageMetadata {
+                edition: "2021".to_string(),
+                version: "1.2.3".to_string(),
+            },
         };
 
-        assert_eq!(
-            render_manifest(&package),
-            "[package]\nname = \"anvyx_gen_abcdef\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[[bin]]\nname = \"anvyx_gen_abcdef\"\npath = \"src/main.rs\"\n\n[profile.dev]\nopt-level = 0\n\n[profile.release]\nopt-level = 3\n"
-        );
+        let manifest = render_manifest(&package);
+
+        assert!(manifest.contains("name = \"anvyx_gen_abcdef\""));
+        assert!(manifest.contains("version = \"1.2.3\""));
+        assert!(manifest.contains("edition = \"2021\""));
+        assert!(manifest.contains("name = \"anvyx_gen_abcdef\"\npath = \"src/main.rs\""));
     }
 
     #[test]
@@ -1092,21 +1319,90 @@ mod tests {
             dependencies: vec![
                 RustCargoDependency {
                     name: name("z_dep"),
-                    package: Some(name("real_z")),
+                    package: Some(package_name("real-z")),
                     source: RustCargoDependencySource::Path("../native crate".to_string()),
                     features: vec!["b".to_string(), "a".to_string(), "a".to_string()],
                     default_features: false,
                 },
                 dep("a_dep", "1.2.3"),
             ],
+            metadata: RustCargoPackageMetadata::default(),
         };
         let mut package = package;
         package.dependencies = normalized_dependencies(package.dependencies);
 
+        let manifest = render_manifest(&package);
+
+        assert!(manifest.contains("[dependencies]\na_dep = { version = \"1.2.3\" }\nz_dep = { package = \"real-z\", path = \"../native crate\", default-features = false, features = [\"a\", \"b\"] }\n"));
+    }
+
+    #[test]
+    fn renders_batch_manifest_bins_and_dependencies_from_template() {
+        let package = RustPackageSpec {
+            package_name: name("anvyx_test_batch_abcdef"),
+            binary_name: name("anvyx_test_batch_abcdef"),
+            dependencies: vec![dep("serde", "1")],
+            metadata: RustCargoPackageMetadata::default(),
+        };
+        let cases = [
+            RustCargoBatchCase {
+                name: name("case_a"),
+                source: RustSource::new("fn main() {}\n".to_string()),
+            },
+            RustCargoBatchCase {
+                name: name("case_b"),
+                source: RustSource::new("fn main() {}\n".to_string()),
+            },
+        ];
+
         assert_eq!(
-            render_manifest(&package),
-            "[package]\nname = \"anvyx_gen_abcdef\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[[bin]]\nname = \"anvyx_gen_abcdef\"\npath = \"src/main.rs\"\n\n[profile.dev]\nopt-level = 0\n\n[profile.release]\nopt-level = 3\n\n[dependencies]\na_dep = { version = \"1.2.3\" }\nz_dep = { path = \"../native crate\", package = \"real_z\", default-features = false, features = [\"a\", \"b\"] }\n"
+            render_batch_manifest(&package, &cases),
+            "[package]\nname = \"anvyx_test_batch_abcdef\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[profile.dev]\nopt-level = 0\n\n[profile.release]\nopt-level = 3\n\n[[bin]]\nname = \"case_a\"\npath = \"src/bin/case_a.rs\"\n\n[[bin]]\nname = \"case_b\"\npath = \"src/bin/case_b.rs\"\n\n[dependencies]\nserde = { version = \"1\" }\n"
         );
+    }
+
+    #[test]
+    fn renders_hyphenated_package_dependency() {
+        let package = RustPackageSpec {
+            package_name: name("anvyx_gen_abcdef"),
+            binary_name: name("anvyx_gen_abcdef"),
+            dependencies: vec![RustCargoDependency {
+                name: name("anvyx_core2"),
+                package: Some(package_name("anvyx-core2")),
+                source: RustCargoDependencySource::Path("../core2".to_string()),
+                features: vec![],
+                default_features: true,
+            }],
+            metadata: RustCargoPackageMetadata::default(),
+        };
+
+        assert!(RustCargoName::parse("anvyx-core2").is_err());
+        let dependency = "anvyx_core2 = { package = \"anvyx-core2\", path = \"../core2\" }";
+        assert!(render_manifest(&package).contains(dependency));
+        assert!(render_batch_manifest(&package, &[]).contains(dependency));
+    }
+
+    #[test]
+    fn rejects_invalid_package_metadata() {
+        let mut package = RustPackageSpec {
+            package_name: name("anvyx_gen_abcdef"),
+            binary_name: name("anvyx_gen_abcdef"),
+            dependencies: vec![],
+            metadata: RustCargoPackageMetadata::default(),
+        };
+
+        package.metadata.version = "01.0.0".to_string();
+        assert!(matches!(
+            validate_package(&package),
+            Err(RustCargoError::InvalidJob(_))
+        ));
+
+        package.metadata.version = DEFAULT_CARGO_VERSION.to_string();
+        package.metadata.edition = "2030".to_string();
+        assert!(matches!(
+            validate_package(&package),
+            Err(RustCargoError::InvalidJob(_))
+        ));
     }
 
     #[test]
@@ -1137,7 +1433,7 @@ mod tests {
         let dep_dir = tempfile::tempdir().unwrap();
         fs::write(
             dep_dir.path().join("Cargo.toml"),
-            "[package]\nname = \"dep_crate\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+            "[package]\nname = \"dep-crate\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
         )
         .unwrap();
         fs::create_dir(dep_dir.path().join("src")).unwrap();
@@ -1155,7 +1451,7 @@ mod tests {
             "debug",
             vec![RustCargoDependency {
                 name: name("dep_crate"),
-                package: None,
+                package: Some(package_name("dep-crate")),
                 source: RustCargoDependencySource::Path(dep_path),
                 features: vec![],
                 default_features: true,
@@ -1180,6 +1476,41 @@ mod tests {
         };
 
         assert_eq!(output.stdout, "7\n");
+    }
+
+    #[test]
+    fn batch_job_carries_dependencies_in_manifest_and_identity() {
+        let case = RustCargoBatchCase {
+            name: name("case_0"),
+            source: RustSource::new("fn main() {}\n".to_string()),
+        };
+        let dep = RustCargoDependency {
+            name: name("anvyx_core2"),
+            package: Some(package_name("anvyx-core2")),
+            source: RustCargoDependencySource::Path("../core2".to_string()),
+            features: vec![],
+            default_features: true,
+        };
+
+        let without = batch_job(
+            vec![case.clone()],
+            PathBuf::from("cache"),
+            RustCargoProfile::Dev,
+            "debug",
+        );
+        let with = batch_job_with_dependencies(
+            vec![case],
+            PathBuf::from("cache"),
+            RustCargoProfile::Dev,
+            "debug",
+            vec![dep],
+        );
+
+        assert_ne!(with.crate_identity, without.crate_identity);
+        assert!(
+            render_batch_manifest(&with.package, &with.cases)
+                .contains("anvyx_core2 = { package = \"anvyx-core2\", path = \"../core2\" }")
+        );
     }
 
     #[test]
@@ -1210,6 +1541,51 @@ mod tests {
         for (_, binary) in output.binaries {
             assert!(binary.exists());
         }
+    }
+
+    #[test]
+    fn stable_identity_reuses_crate_dir_across_source_changes() {
+        let cache = tempfile::tempdir().unwrap();
+        let crate_identity = single_program_crate_identity(&RustCargoCrateIdentityInput {
+            seed: "project\0/root\0main.anv",
+            semantic_profile: "debug",
+            cargo_profile: RustCargoProfile::Dev,
+            dependencies: &[],
+        });
+        let first = single_program_job_configured(
+            RustSource::new("fn main() { println!(\"one\"); }\n".to_string()),
+            cache.path().to_path_buf(),
+            RustCargoProfile::Dev,
+            RustCargoMode::Build,
+            "debug",
+            vec![],
+            RustCargoPackageMetadata::default(),
+            Some(crate_identity.clone()),
+        );
+        let second = single_program_job_configured(
+            RustSource::new("fn main() { println!(\"two\"); }\n".to_string()),
+            cache.path().to_path_buf(),
+            RustCargoProfile::Dev,
+            RustCargoMode::Build,
+            "debug",
+            vec![],
+            RustCargoPackageMetadata::default(),
+            Some(crate_identity),
+        );
+
+        let first_layout =
+            RustCargoLayout::new(cache.path().to_path_buf(), first.crate_identity.clone());
+        let second_layout =
+            RustCargoLayout::new(cache.path().to_path_buf(), second.crate_identity.clone());
+        write_single_package(&first, &first_layout).unwrap();
+        write_single_package(&second, &second_layout).unwrap();
+
+        assert_eq!(first_layout.crate_dir(), second_layout.crate_dir());
+        assert!(
+            fs::read_to_string(second_layout.source_path())
+                .unwrap()
+                .contains("two")
+        );
     }
 
     #[test]

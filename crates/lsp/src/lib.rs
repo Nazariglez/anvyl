@@ -953,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn check_open_document_publishes_unsupported_extern_manifest() {
+    fn check_open_document_publishes_invalid_extern_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("game");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -975,9 +975,10 @@ mod tests {
             publishes[0].diagnostics[0].severity,
             Some(LspSeverity::ERROR)
         );
-        assert_eq!(
-            publishes[0].diagnostics[0].message,
-            "clean frontend does not support extern providers yet"
+        assert!(
+            publishes[0].diagnostics[0]
+                .message
+                .contains("extern provider `engine` path does not exist")
         );
     }
 

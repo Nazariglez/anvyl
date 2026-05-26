@@ -225,6 +225,7 @@ impl FunctionBuilder {
             module: self.module,
             kind: self.kind,
             owner: None,
+            specialization: None,
             signature: Signature::new(self.params, self.return_type),
             locals: self.locals,
             body: AirBody { block: self.block },

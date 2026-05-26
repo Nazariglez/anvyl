@@ -4,6 +4,7 @@ use anvyx_frontend::{
     air::{self, FunctionId},
     ast::{BinaryOp, UnaryOp},
 };
+use anvyx_runtime::{ExternTypeExpr, ExternTypeKey, RustExternAbi, RustParamAbi, RustReturnAbi};
 
 macro_rules! rir_id {
     ($name:ident) => {
@@ -68,6 +69,8 @@ pub struct RirStruct {
     pub air_id: Option<air::AggregateId>,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
+    pub native_path: Option<Vec<String>>,
+    pub native_key: Option<ExternTypeKey>,
     pub copyable: bool,
     pub fields: Vec<RirField>,
 }
@@ -83,10 +86,16 @@ pub struct RirField {
 pub struct RirEnum {
     pub id: RirEnumId,
     pub air_id: Option<air::EnumId>,
+    pub core: Option<RirCoreEnumKind>,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
     pub copyable: bool,
     pub variants: Vec<RirVariant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirCoreEnumKind {
+    Option,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,10 +433,15 @@ pub struct RirExtern {
     pub ret: RirTypeId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirExternKind {
-    CorePrintln,
-    CoreAssert,
+    Native(RirNativeExtern),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirNativeExtern {
+    pub path: Vec<String>,
+    pub abi: RustExternAbi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,6 +545,98 @@ struct VerifyCx<'a> {
     errors: Vec<RirVerifyError>,
     initialized: Vec<bool>,
     possibly_initialized: Vec<bool>,
+}
+
+fn native_extern_signature_ok(
+    program: &RirProgram,
+    native: &RirNativeExtern,
+    ext: &RirExtern,
+    void: Option<RirTypeId>,
+) -> bool {
+    !native.path.is_empty()
+        && native.path.iter().all(|segment| !segment.is_empty())
+        && native.abi.support == anvyx_runtime::RustAbiSupport::Direct
+        && native.abi.params.len() == ext.params.len()
+        && native
+            .abi
+            .params
+            .iter()
+            .zip(&ext.params)
+            .all(|(abi, param)| native_param_abi_ok(program, abi, *param))
+        && native_return_abi_ok(program, &native.abi.ret, ext.ret, void)
+}
+
+fn native_param_abi_ok(program: &RirProgram, abi: &RustParamAbi, param: RirExternParam) -> bool {
+    match abi {
+        RustParamAbi::Value(ty) => {
+            param.abi == RirParamAbi::Value && rir_type_matches_extern(program, param.ty, ty)
+        }
+        RustParamAbi::Borrow(ty) => {
+            param.abi == RirParamAbi::SharedBorrow && rir_type_matches_extern(program, param.ty, ty)
+        }
+        RustParamAbi::MutBorrow(ty) => {
+            param.abi == RirParamAbi::MutBorrow && rir_type_matches_extern(program, param.ty, ty)
+        }
+        RustParamAbi::Option(_) | RustParamAbi::List(_) => false,
+    }
+}
+
+fn native_return_abi_ok(
+    program: &RirProgram,
+    abi: &RustReturnAbi,
+    ret: RirTypeId,
+    void: Option<RirTypeId>,
+) -> bool {
+    match abi {
+        RustReturnAbi::Void => Some(ret) == void,
+        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, ret, ty),
+        RustReturnAbi::Option(inner) => rir_type_matches_option(program, ret, inner),
+        RustReturnAbi::List(_) => false,
+    }
+}
+
+fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &ExternTypeExpr) -> bool {
+    let Some(found) = program.types.get(id.index()) else {
+        return false;
+    };
+    match (found, expected) {
+        (RirType::Void, ExternTypeExpr::Void)
+        | (RirType::Bool, ExternTypeExpr::Bool)
+        | (RirType::Int, ExternTypeExpr::Int)
+        | (RirType::Float, ExternTypeExpr::Float)
+        | (RirType::String, ExternTypeExpr::String) => true,
+        (RirType::Struct(struct_id), ExternTypeExpr::Named { module, name, args }) => {
+            let strukt = &program.structs[struct_id.index()];
+            args.is_empty()
+                && strukt.native_key.as_ref().is_some_and(|key| {
+                    module.as_ref().is_none_or(|module| key.module == *module) && key.name == *name
+                })
+        }
+        _ => false,
+    }
+}
+
+fn rir_type_matches_option(program: &RirProgram, id: RirTypeId, inner: &RustReturnAbi) -> bool {
+    let Some(RirType::Enum(enum_id)) = program.types.get(id.index()) else {
+        return false;
+    };
+    let enm = &program.enums[enum_id.index()];
+    if enm.core != Some(RirCoreEnumKind::Option) {
+        return false;
+    }
+    let [none, some] = enm.variants.as_slice() else {
+        return false;
+    };
+    if none.kind != RirVariantKind::Unit || some.kind != RirVariantKind::Tuple {
+        return false;
+    }
+    let [field] = some.fields.as_slice() else {
+        return false;
+    };
+    match inner {
+        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, field.ty, ty),
+        RustReturnAbi::Void | RustReturnAbi::Option(_) | RustReturnAbi::List(_) => false,
+    }
 }
 
 impl VerifyCx<'_> {
@@ -815,32 +921,10 @@ impl VerifyCx<'_> {
 
     fn check_extern_signature(&mut self, id: RirExternId, ext: &RirExtern) {
         let site = RirVerifySite::Extern(id);
-        let string = self.type_id(RirType::String);
-        let bool_ty = self.type_id(RirType::Bool);
         let void = self.type_id(RirType::Void);
-        let ok = match ext.kind {
-            RirExternKind::CorePrintln => {
-                ext.params.len() == 1
-                    && Some(ext.ret) == void
-                    && ext.params.first().is_some_and(|param| {
-                        Some(param.ty) == string
-                            && param.semantic == RirParamSemantic::SharedBorrow
-                            && param.abi == RirParamAbi::SharedBorrow
-                    })
-            }
-            RirExternKind::CoreAssert => {
-                ext.params.len() == 2
-                    && Some(ext.ret) == void
-                    && ext.params.first().is_some_and(|param| {
-                        Some(param.ty) == bool_ty
-                            && param.semantic == RirParamSemantic::Value
-                            && param.abi == RirParamAbi::Value
-                    })
-                    && ext.params.get(1).is_some_and(|param| {
-                        Some(param.ty) == string
-                            && param.semantic == RirParamSemantic::SharedBorrow
-                            && param.abi == RirParamAbi::SharedBorrow
-                    })
+        let ok = match &ext.kind {
+            RirExternKind::Native(native) => {
+                native_extern_signature_ok(self.program, native, ext, void)
             }
         };
         if !ok {

@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 3.0
+// @skip: floats must be printed with decimal point
+
+fn main() {
+    let x = (-3.0).abs();
+    assert(x == 3.0);
+    println(x);
+}

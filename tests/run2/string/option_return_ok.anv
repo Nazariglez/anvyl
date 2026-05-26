@@ -1,0 +1,20 @@
+// @mode: run
+// @frontend: new
+// @skip: clean rust: optional match/coalesce execution is not ready; backend emission covers Option<String> return conversion
+// @expect: success
+// @match-begin
+// 1
+// 0
+// @match-end
+
+fn present(x: string?) -> int {
+    match x {
+        Option.Some(_) => 1,
+        Option.None => 0,
+    }
+}
+
+fn main() {
+    println(present("abcd".substring(1, 2)));
+    println(present("xyz".char_at(9)));
+}

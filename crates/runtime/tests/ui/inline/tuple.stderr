@@ -1,0 +1,5 @@
+error: AnvyxInline requires a named-field struct
+ --> tests/ui/inline/tuple.rs:4:12
+  |
+4 | struct Pair(#[anvyx(field)] i64, #[anvyx(field)] i64);
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

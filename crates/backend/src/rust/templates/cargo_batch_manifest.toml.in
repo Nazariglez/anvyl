@@ -1,0 +1,14 @@
+[package]
+name = "{{package_name}}"
+version = "{{version}}"
+edition = "{{edition}}"
+publish = false
+
+[workspace]
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+{{bin_sections}}{{dependencies}}

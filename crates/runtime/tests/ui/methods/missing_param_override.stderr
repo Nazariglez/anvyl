@@ -1,0 +1,5 @@
+error: unknown parameter override `missing`
+ --> tests/ui/methods/missing_param_override.rs:8:9
+  |
+8 |     pub fn x(&self, value: i64) -> i64 { value }
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

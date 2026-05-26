@@ -1,0 +1,5 @@
+error: Self binary operator operand must be Self
+ --> tests/ui/methods/operator_self_mismatch.rs:8:28
+  |
+8 |     pub fn add(&self, rhs: i64) -> i64 { rhs }
+  |                            ^^^

@@ -1,0 +1,5 @@
+error: #[anvyx(init)] currently supports only parameterless associated functions
+ --> tests/ui/methods/init_params.rs:8:9
+  |
+8 |     pub fn new(x: i64) -> Self { Self { x } }
+  |         ^^^^^^^^^^^^^^^^^^^^^^

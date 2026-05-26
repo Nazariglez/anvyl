@@ -15,19 +15,20 @@ use anvyx_frontend::{
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
+use anvyx_runtime::{RustAbiSupport, RustExternBinding, RustProviderSupport};
 
 use self::{
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rir::{
-        RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCtxPlan, RirEnum,
-        RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId, RirExternKind,
-        RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign,
-        RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal, RirLocalId, RirOperand,
-        RirParam, RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
-        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram,
+        RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
+        RirCtxPlan, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId,
+        RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind,
+        RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal, RirLocalId,
+        RirNativeExtern, RirOperand, RirParam, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
+        RirProjection, RirRValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
+        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
+        RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -37,12 +38,14 @@ mod tests;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustPlanConfig {
     pub symbol_prefix: String,
+    pub native_providers: Vec<RustProviderSupport>,
 }
 
 impl Default for RustPlanConfig {
     fn default() -> Self {
         Self {
             symbol_prefix: "anv".into(),
+            native_providers: vec![],
         }
     }
 }
@@ -256,7 +259,7 @@ impl<'a> PlanCx<'a> {
         self.plan_stringify_helpers(&mut program)?;
         for index in 0..self.air.functions.len() {
             let id = FunctionId::from_index(index);
-            program.functions.push(self.plan_function(id)?);
+            program.functions.push(self.plan_function(id, &program)?);
         }
         program.entry = self.air.entry().map(|entry| self.function_map[&entry]);
         Ok(program)
@@ -269,6 +272,7 @@ impl<'a> PlanCx<'a> {
         }
 
         let mut aggregate_types = vec![];
+        let mut extern_types = vec![];
         let mut enum_types = vec![];
         for (index, ty) in self.air.type_arena.iter().enumerate() {
             debug_assert_eq!(program.types.len(), index);
@@ -289,6 +293,11 @@ impl<'a> PlanCx<'a> {
                     enum_types.push((type_id, *enm, enum_id));
                     RirType::Enum(enum_id)
                 }
+                TypeData::Extern(ext) => {
+                    let struct_id = self.reserve_extern_struct(program, type_id, *ext)?;
+                    extern_types.push((type_id, *ext, struct_id));
+                    RirType::Struct(struct_id)
+                }
                 TypeData::Array { elem, len } => RirType::Array {
                     elem: self.type_map[elem],
                     len: *len as u64,
@@ -301,8 +310,7 @@ impl<'a> PlanCx<'a> {
                 | TypeData::Map { .. }
                 | TypeData::Function(_)
                 | TypeData::Dyn(_)
-                | TypeData::DataRef(_)
-                | TypeData::Extern(_) => {
+                | TypeData::DataRef(_) => {
                     return Err(self.gap(
                         RustTargetGapSite::Type(type_id),
                         RustTargetGapKind::UnsupportedType,
@@ -313,6 +321,9 @@ impl<'a> PlanCx<'a> {
         }
         for (type_id, aggregate, struct_id) in aggregate_types {
             self.fill_struct(program, type_id, aggregate, struct_id)?;
+        }
+        for (type_id, ext, struct_id) in extern_types {
+            self.fill_extern_struct(program, type_id, ext, struct_id)?;
         }
         for (type_id, enm, enum_id) in enum_types {
             self.fill_enum(program, type_id, enm, enum_id)?;
@@ -344,6 +355,8 @@ impl<'a> PlanCx<'a> {
                 sanitize(decl.name.as_str())
             )),
             display: RirSymbol::new(decl.name.as_str()),
+            native_path: None,
+            native_key: None,
             copyable: true,
             fields: vec![],
         });
@@ -385,6 +398,70 @@ impl<'a> PlanCx<'a> {
         Ok(())
     }
 
+    fn reserve_extern_struct(
+        &mut self,
+        program: &mut RirProgram,
+        type_id: TypeId,
+        ext: air::ExternTypeId,
+    ) -> Result<RirStructId, RustPlanError> {
+        let decl = self.air.extern_type(ext);
+        if decl.rep != air::ExternRep::Inline {
+            return Err(self.gap(
+                RustTargetGapSite::Type(type_id),
+                RustTargetGapKind::UnsupportedType,
+            ));
+        }
+        let id = RirStructId::from_index(program.structs.len());
+        let native = self.native_type_binding(type_id, decl)?;
+        program.structs.push(RirStruct {
+            id,
+            air_id: None,
+            symbol: RirSymbol::new(format!(
+                "{}T{}_{}",
+                self.config.symbol_prefix,
+                type_id.index(),
+                sanitize(decl.name.as_str())
+            )),
+            display: RirSymbol::new(decl.name.as_str()),
+            native_path: Some(native_type_path(native)),
+            native_key: Some(native.key.clone()),
+            copyable: true,
+            fields: vec![],
+        });
+        Ok(id)
+    }
+
+    fn fill_extern_struct(
+        &self,
+        program: &mut RirProgram,
+        _type_id: TypeId,
+        ext: air::ExternTypeId,
+        struct_id: RirStructId,
+    ) -> Result<(), RustPlanError> {
+        let decl = self.air.extern_type(ext);
+        let mut seen = vec![];
+        let fields = decl
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let Some(&ty) = self.type_map.get(&field.ty) else {
+                    return Err(self.gap(
+                        RustTargetGapSite::Type(field.ty),
+                        RustTargetGapKind::UnsupportedType,
+                    ));
+                };
+                Ok(RirField {
+                    id: RirFieldId::from_index(index),
+                    symbol: scoped_symbol(field.name.as_str(), &mut seen),
+                    ty,
+                })
+            })
+            .collect::<Result<Vec<_>, RustPlanError>>()?;
+        program.structs[struct_id.index()].fields = fields;
+        Ok(())
+    }
+
     fn reserve_enum(
         &mut self,
         program: &mut RirProgram,
@@ -396,6 +473,7 @@ impl<'a> PlanCx<'a> {
         program.enums.push(RirEnum {
             id,
             air_id: Some(enm),
+            core: decl.core.map(rir_core_enum_kind),
             symbol: RirSymbol::new(format!(
                 "{}T{}_{}",
                 self.config.symbol_prefix,
@@ -593,9 +671,9 @@ impl<'a> PlanCx<'a> {
             id,
             ty: rir_ty,
             symbol: RirSymbol::new(format!(
-                "{}stringify_t{}",
+                "{}stringify_{}",
                 self.config.symbol_prefix,
-                ty.index()
+                type_suffix(program, rir_ty)
             )),
         });
         Ok(id)
@@ -633,15 +711,8 @@ impl<'a> PlanCx<'a> {
             let air_id = ExternId::from_index(index);
             let decl = self.air.extern_decl(air_id);
             let id = RirExternId::from_index(program.externs.len());
-            let params = decl
-                .params
-                .iter()
-                .map(|param| RirExternParam {
-                    ty: self.type_map[&param.ty],
-                    semantic: rir::semantic_from_air(param.mode),
-                    abi: abi_for(param.mode),
-                })
-                .collect();
+            let params = self.extern_params(decl);
+            let kind = self.extern_kind(air_id, decl)?;
             program.externs.push(RirExtern {
                 id,
                 symbol: RirSymbol::new(format!(
@@ -649,22 +720,104 @@ impl<'a> PlanCx<'a> {
                     self.config.symbol_prefix,
                     sanitize(decl.name.as_str())
                 )),
-                kind: match decl.name.as_str() {
-                    "_println" => RirExternKind::CorePrintln,
-                    "_assert" => RirExternKind::CoreAssert,
-                    _ => {
-                        return Err(self.gap(
-                            RustTargetGapSite::Extern(air_id),
-                            RustTargetGapKind::UnsupportedExtern,
-                        ));
-                    }
-                },
+                kind,
                 params,
                 ret: self.type_map[&decl.return_type],
             });
             self.extern_map.insert(air_id, id);
         }
         Ok(())
+    }
+
+    fn extern_params(&self, decl: &air::ExternDecl) -> Vec<RirExternParam> {
+        decl.call_params()
+            .into_iter()
+            .map(|param| RirExternParam {
+                ty: self.type_map[&param.ty],
+                semantic: rir::semantic_from_air(param.mode),
+                abi: abi_for(param.mode),
+            })
+            .collect()
+    }
+
+    fn extern_kind(
+        &self,
+        air_id: ExternId,
+        decl: &air::ExternDecl,
+    ) -> Result<RirExternKind, RustPlanError> {
+        if let Some(binding) = &decl.binding {
+            let native = self.native_binding(binding).ok_or_else(|| {
+                self.gap(
+                    RustTargetGapSite::Extern(air_id),
+                    RustTargetGapKind::UnsupportedExtern,
+                )
+            })?;
+            if native.abi.support != RustAbiSupport::Direct {
+                return Err(self.gap(
+                    RustTargetGapSite::Extern(air_id),
+                    RustTargetGapKind::UnsupportedRustAbi,
+                ));
+            }
+            return Ok(RirExternKind::Native(RirNativeExtern {
+                path: native_path(native),
+                abi: native.abi.clone(),
+            }));
+        }
+
+        Err(self.gap(
+            RustTargetGapSite::Extern(air_id),
+            RustTargetGapKind::UnsupportedExtern,
+        ))
+    }
+
+    fn native_type_binding(
+        &self,
+        type_id: TypeId,
+        decl: &air::ExternTypeDecl,
+    ) -> Result<&anvyx_runtime::RustTypeBinding, RustPlanError> {
+        let Some(binding) = &decl.binding else {
+            return Err(self.gap(
+                RustTargetGapSite::Type(type_id),
+                RustTargetGapKind::UnsupportedExtern,
+            ));
+        };
+        self.config
+            .native_providers
+            .iter()
+            .find(|provider| {
+                provider.package == binding.package.as_str()
+                    && provider.provider == binding.provider
+            })
+            .and_then(|provider| {
+                provider
+                    .modules
+                    .iter()
+                    .flat_map(|module| &module.types)
+                    .find(|native| native.key == binding.key)
+            })
+            .ok_or_else(|| {
+                self.gap(
+                    RustTargetGapSite::Type(type_id),
+                    RustTargetGapKind::UnsupportedExtern,
+                )
+            })
+    }
+
+    fn native_binding(&self, binding: &air::ExternBindingDecl) -> Option<&RustExternBinding> {
+        self.config
+            .native_providers
+            .iter()
+            .find(|provider| {
+                provider.package == binding.package.as_str()
+                    && provider.provider == binding.provider
+            })
+            .and_then(|provider| {
+                provider
+                    .modules
+                    .iter()
+                    .flat_map(|module| &module.bindings)
+                    .find(|native| native.key == binding.key)
+            })
     }
 
     fn plan_function_ids(&mut self) {
@@ -675,7 +828,11 @@ impl<'a> PlanCx<'a> {
         }
     }
 
-    fn plan_function(&self, air_id: FunctionId) -> Result<RirFunction, RustPlanError> {
+    fn plan_function(
+        &self,
+        air_id: FunctionId,
+        program: &RirProgram,
+    ) -> Result<RirFunction, RustPlanError> {
         let function = self.air.function(air_id);
         let mut locals = function
             .locals
@@ -709,7 +866,14 @@ impl<'a> PlanCx<'a> {
         Ok(RirFunction {
             id: self.function_map[&air_id],
             air_id: Some(air_id),
-            symbol: function_symbol(&self.config.symbol_prefix, air_id, function, self.air),
+            symbol: function_symbol(
+                &self.config.symbol_prefix,
+                air_id,
+                function,
+                self.air,
+                program,
+                &self.type_map,
+            )?,
             params,
             ret: RirReturn {
                 ty: self.type_map[&function.signature.return_type()],
@@ -931,7 +1095,7 @@ impl<'a> PlanCx<'a> {
         ty: TypeId,
     ) -> Result<RirRValue, RustPlanError> {
         match kind {
-            AggregateCtor::Struct(_) => Ok(RirRValue::Struct {
+            AggregateCtor::Struct(_) | AggregateCtor::Extern(_) => Ok(RirRValue::Struct {
                 ty: self.type_map[&ty],
                 fields: fields
                     .iter()
@@ -1072,6 +1236,24 @@ fn rir_format_spec(spec: FormatSpec) -> RirFormatSpec {
     }
 }
 
+fn rir_core_enum_kind(kind: air::CoreEnumKind) -> RirCoreEnumKind {
+    match kind {
+        air::CoreEnumKind::Option => RirCoreEnumKind::Option,
+    }
+}
+
+fn native_type_path(binding: &anvyx_runtime::RustTypeBinding) -> Vec<String> {
+    let mut path = vec![binding.path.crate_name.clone()];
+    path.extend(binding.path.segments.clone());
+    path
+}
+
+fn native_path(binding: &RustExternBinding) -> Vec<String> {
+    let mut path = vec![binding.path.crate_name.clone()];
+    path.extend(binding.path.segments.clone());
+    path
+}
+
 fn abi_for(mode: ParamMode) -> RirParamAbi {
     match mode {
         ParamMode::Value => RirParamAbi::Value,
@@ -1084,18 +1266,79 @@ fn function_symbol(
     prefix: &str,
     id: FunctionId,
     function: &air::Function,
-    program: &air::Program,
-) -> RirSymbol {
+    air: &air::Program,
+    rir: &RirProgram,
+    type_map: &HashMap<TypeId, RirTypeId>,
+) -> Result<RirSymbol, RustPlanError> {
     let name = sanitize(function.name.as_str());
-    let Some(owner) = method_owner_name(function, program) else {
-        return RirSymbol::new(format!("{prefix}_f{}_{}", id.index(), name));
+    let mut symbol = match method_owner_name(function, air) {
+        Some(owner) => format!("{prefix}_f{}_{}_{}", id.index(), sanitize(owner), name),
+        None => format!("{prefix}_f{}_{}", id.index(), name),
     };
-    RirSymbol::new(format!(
-        "{prefix}_f{}_{}_{}",
-        id.index(),
-        sanitize(owner),
-        name
-    ))
+    if let Some(specialization) = &function.specialization {
+        let mut parts = vec![];
+        for ty in &specialization.type_args {
+            let Some(&rir_ty) = type_map.get(ty) else {
+                return Err(RustPlanError::TargetGaps(vec![RustTargetGap {
+                    site: RustTargetGapSite::Function(id),
+                    kind: RustTargetGapKind::UnsupportedType,
+                }]));
+            };
+            parts.push(type_suffix(rir, rir_ty));
+        }
+        parts.extend(specialization.const_args.iter().map(const_suffix));
+        if !parts.is_empty() {
+            symbol.push('_');
+            symbol.push_str(&parts.join("_"));
+        }
+    }
+    Ok(RirSymbol::new(symbol))
+}
+
+fn type_suffix(program: &RirProgram, ty: RirTypeId) -> String {
+    match program.types[ty.index()] {
+        RirType::Int => "int".to_string(),
+        RirType::Float => "float".to_string(),
+        RirType::Bool => "bool".to_string(),
+        RirType::String => "string".to_string(),
+        RirType::Void => "void".to_string(),
+        RirType::List(elem) => format!("list_{}", type_suffix(program, elem)),
+        RirType::Slice(elem) => format!("slice_{}", type_suffix(program, elem)),
+        RirType::Array { elem, len } => format!("array_{}_{}", len, type_suffix(program, elem)),
+        RirType::Struct(id) => named_type_suffix(ty.index(), &program.structs[id.index()].display),
+        RirType::Enum(id) => {
+            let enm = &program.enums[id.index()];
+            if enm.core == Some(RirCoreEnumKind::Option) {
+                let some = enm
+                    .variants
+                    .iter()
+                    .find(|variant| variant.kind == RirVariantKind::Tuple);
+                if let Some(field) = some.and_then(|variant| variant.fields.first()) {
+                    return format!("option_{}", type_suffix(program, field.ty));
+                }
+            }
+            named_type_suffix(ty.index(), &enm.display)
+        }
+    }
+}
+
+fn named_type_suffix(index: usize, display: &RirSymbol) -> String {
+    format!(
+        "t{}_{}",
+        index,
+        sanitize(display.as_str()).to_ascii_lowercase()
+    )
+}
+
+fn const_suffix(value: &ConstValue) -> String {
+    match value {
+        ConstValue::Int(value) if *value < 0 => format!("n_neg_{}", value.unsigned_abs()),
+        ConstValue::Int(value) => format!("n{value}"),
+        ConstValue::Float(value) => sanitize(&format!("f{value}")),
+        ConstValue::Bool(value) => value.to_string(),
+        ConstValue::String(value) => sanitize(value).to_ascii_lowercase(),
+        ConstValue::Nil => "nil".to_string(),
+    }
 }
 
 fn method_owner_name<'a>(

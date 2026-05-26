@@ -171,6 +171,10 @@ fn field(name: &str, ty: ExternTypeExpr) -> ExternFieldDescriptor {
         name: name.to_string(),
         ty,
         computed: false,
+        readable: true,
+        writable: true,
+        get_receiver: ReceiverMode::Shared,
+        set_receiver: ReceiverMode::Mutable,
         doc: None,
     }
 }
@@ -217,6 +221,7 @@ fn operator(
 ) -> ExternOperatorDescriptor {
     ExternOperatorDescriptor {
         op,
+        receiver: ReceiverMode::Shared,
         signature: ExternSignature { params, ret },
         effects: ExternEffects::default(),
     }
@@ -907,6 +912,66 @@ mod fields {
             .expect("extern field");
 
         assert_use(&result, ExternUseTarget::FieldWrite(field));
+    }
+
+    #[test]
+    fn provider_rejects_unreadable_field_read() {
+        let Err(errors) = check_with_provider(
+            r"
+            import ext:host { Point };
+            fn read(p: Point) -> float { p.x }
+            ",
+            provider(ExternModuleDescriptor {
+                path: extern_path(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![ExternFieldDescriptor {
+                        readable: false,
+                        ..computed_field("x", ExternTypeExpr::Float)
+                    }],
+                    ..extern_type("Point")
+                }],
+                functions: vec![],
+            }),
+        ) else {
+            panic!("unreadable field read should fail");
+        };
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, TypeError::UnknownMember { .. })),
+            "unexpected errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn provider_rejects_unwritable_field_write() {
+        let Err(errors) = check_with_provider(
+            r"
+            import ext:host { Point };
+            fn write(var p: Point) { p.x = 2.0; }
+            ",
+            provider(ExternModuleDescriptor {
+                path: extern_path(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![ExternFieldDescriptor {
+                        writable: false,
+                        ..computed_field("x", ExternTypeExpr::Float)
+                    }],
+                    ..extern_type("Point")
+                }],
+                functions: vec![],
+            }),
+        ) else {
+            panic!("unwritable field write should fail");
+        };
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, TypeError::ImmutableAssignment { .. })),
+            "unexpected errors: {errors:?}"
+        );
     }
 
     #[test]

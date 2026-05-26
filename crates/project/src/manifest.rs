@@ -1,11 +1,21 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::DefaultHasher},
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anvyx_lang2::LintConfig;
+use anvyx_runtime::{
+    ProviderDescriptor, RustModuleSupport, RustProviderCargo, RustProviderSupport,
+    validate_rust_provider_support,
+};
 use serde::Deserialize;
+use wait_timeout::ChildExt;
+
+const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type ManifestLint = BTreeMap<String, String>;
 
@@ -26,21 +36,336 @@ impl Manifest {
     }
 }
 
-pub fn reject_clean_frontend_inputs(manifest: Option<&Manifest>) -> Result<(), String> {
-    let Some(manifest) = manifest else {
-        return Ok(());
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProviderLoad {
+    pub providers: Vec<LoadedExternProvider>,
+}
 
-    if manifest.has_externs() {
-        return Err("clean frontend does not support extern providers yet".to_string());
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedExternProvider {
+    pub name: String,
+    pub crate_root: PathBuf,
+    pub cargo_manifest: PathBuf,
+    pub cargo_package: String,
+    pub cargo_alias: String,
+    pub descriptor: ProviderDescriptor,
+    pub supports: Vec<RustModuleSupport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedExternProvider {
+    name: String,
+    crate_root: PathBuf,
+    cargo_manifest: PathBuf,
+    cargo_package: String,
+    cargo_alias: String,
+}
+
+pub fn load_native_providers(
+    manifest_path: &Path,
+    manifest: &Manifest,
+) -> Result<NativeProviderLoad, String> {
+    let providers = validate_extern_providers(manifest_path, manifest)?
+        .into_iter()
+        .map(load_extern_provider)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NativeProviderLoad { providers })
+}
+
+fn validate_extern_providers(
+    manifest_path: &Path,
+    manifest: &Manifest,
+) -> Result<Vec<ValidatedExternProvider>, String> {
+    let root = manifest_path
+        .parent()
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
+    let mut providers = manifest.externs.iter().collect::<Vec<_>>();
+    providers.sort_unstable_by_key(|(name, _)| name.as_str());
+    providers
+        .into_iter()
+        .map(|(name, ext)| validate_extern_provider(root, name, ext))
+        .collect()
+}
+
+fn validate_extern_provider(
+    root: &Path,
+    name: &str,
+    ext: &ExternEntry,
+) -> Result<ValidatedExternProvider, String> {
+    anvyx_lang2::validate_dependency_alias(name)
+        .map_err(|_| format!("invalid extern provider name `{name}`"))?;
+    let path = root.join(&ext.path);
+    if !path.exists() {
+        return Err(format!(
+            "extern provider `{name}` path does not exist: {}",
+            path.display()
+        ));
     }
+    let cargo_manifest = path.join("Cargo.toml");
+    if !cargo_manifest.is_file() {
+        return Err(format!(
+            "extern provider `{name}` must point to a Rust crate with Cargo.toml: {}",
+            path.display()
+        ));
+    }
+    let crate_root = path.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize extern provider `{name}` path {}: {error}",
+            path.display()
+        )
+    })?;
+    let cargo_manifest = crate_root.join("Cargo.toml");
+    let cargo = parse_provider_cargo(&cargo_manifest, name)?;
+    Ok(ValidatedExternProvider {
+        name: name.to_string(),
+        crate_root,
+        cargo_manifest,
+        cargo_package: cargo.package.name,
+        cargo_alias: provider_cargo_alias(name),
+    })
+}
 
-    Ok(())
+#[derive(Debug, Deserialize)]
+struct ProviderCargoManifest {
+    package: ProviderCargoPackage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderCargoPackage {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderProbeOutput {
+    descriptor: ProviderDescriptor,
+    supports: Vec<RustModuleSupport>,
+}
+
+fn parse_provider_cargo(path: &Path, name: &str) -> Result<ProviderCargoManifest, String> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "failed to read extern provider `{name}` Cargo.toml {}: {error}",
+            path.display()
+        )
+    })?;
+    toml::from_str(&text).map_err(|error| {
+        format!(
+            "failed to parse extern provider `{name}` Cargo.toml {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn load_extern_provider(provider: ValidatedExternProvider) -> Result<LoadedExternProvider, String> {
+    let output = run_provider_probe(&provider)?;
+    if output.descriptor.provider.name != provider.name {
+        return Err(format!(
+            "extern provider `{}` crate reports provider `{}`",
+            provider.name, output.descriptor.provider.name
+        ));
+    }
+    let support = RustProviderSupport {
+        package: provider.name.clone(),
+        provider: output.descriptor.provider.clone(),
+        cargo: RustProviderCargo {
+            manifest_key: provider.cargo_alias.clone(),
+            package: Some(provider.cargo_package.clone()),
+            path: Some(provider.crate_root.clone()),
+            features: vec![],
+            default_features: true,
+        },
+        modules: output.supports.clone(),
+    };
+    validate_rust_provider_support(std::slice::from_ref(&output.descriptor), &[support]).map_err(
+        |error| {
+            format!(
+                "extern provider `{}` has invalid native support: {error}",
+                provider.name
+            )
+        },
+    )?;
+    Ok(LoadedExternProvider {
+        name: provider.name,
+        crate_root: provider.crate_root,
+        cargo_manifest: provider.cargo_manifest,
+        cargo_package: provider.cargo_package,
+        cargo_alias: provider.cargo_alias,
+        descriptor: output.descriptor,
+        supports: output.supports,
+    })
+}
+
+fn run_provider_probe(provider: &ValidatedExternProvider) -> Result<ProviderProbeOutput, String> {
+    let dir = provider_probe_dir(provider);
+    fs::create_dir_all(dir.join("src")).map_err(|error| {
+        format!(
+            "failed to create extern provider `{}` probe at {}: {error}",
+            provider.name,
+            dir.display()
+        )
+    })?;
+    fs::write(dir.join("Cargo.toml"), provider_probe_manifest(provider)).map_err(|error| {
+        format!(
+            "failed to write extern provider `{}` probe manifest: {error}",
+            provider.name
+        )
+    })?;
+    fs::write(dir.join("src/main.rs"), provider_probe_main(provider)).map_err(|error| {
+        format!(
+            "failed to write extern provider `{}` probe main: {error}",
+            provider.name
+        )
+    })?;
+
+    let stdout_path = dir.join("stdout.json");
+    let stderr_path = dir.join("stderr.txt");
+    let stdout_file = fs::File::create(&stdout_path).map_err(|error| {
+        format!(
+            "failed to create extern provider `{}` probe stdout file: {error}",
+            provider.name
+        )
+    })?;
+    let stderr_file = fs::File::create(&stderr_path).map_err(|error| {
+        format!(
+            "failed to create extern provider `{}` probe stderr file: {error}",
+            provider.name
+        )
+    })?;
+    let mut child = Command::new("cargo")
+        .args(["run", "--quiet"])
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "failed to run extern provider `{}` probe: {error}",
+                provider.name
+            )
+        })?;
+    let Some(status) = child
+        .wait_timeout(PROVIDER_PROBE_TIMEOUT)
+        .map_err(|error| {
+            format!(
+                "failed to wait for extern provider `{}` probe: {error}",
+                provider.name
+            )
+        })?
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+        return Err(format!(
+            "extern provider `{}` probe timed out",
+            provider.name
+        ));
+    };
+    let stdout = fs::read(&stdout_path).unwrap_or_default();
+    let stderr = fs::read(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&dir);
+    if !status.success() {
+        return Err(format!(
+            "extern provider `{}` probe failed\n{}",
+            provider.name,
+            String::from_utf8_lossy(&stderr)
+        ));
+    }
+    serde_json::from_slice(&stdout).map_err(|error| {
+        format!(
+            "extern provider `{}` probe emitted invalid metadata: {error}",
+            provider.name
+        )
+    })
+}
+
+fn provider_probe_dir(provider: &ValidatedExternProvider) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is after unix epoch")
+        .as_nanos();
+    let mut hash = DefaultHasher::new();
+    provider.crate_root.hash(&mut hash);
+    let hash = hash.finish();
+    std::env::temp_dir().join(format!(
+        "anvyx-provider-{}-{}-{hash:x}-{stamp}",
+        std::process::id(),
+        provider.name
+    ))
+}
+
+fn provider_probe_manifest(provider: &ValidatedExternProvider) -> String {
+    let dependency = format!(
+        "{} = {{ package = {}, path = {} }}",
+        provider.cargo_alias,
+        toml_string(&provider.cargo_package),
+        toml_string(&provider.crate_root.display().to_string())
+    );
+    render_probe_template(
+        include_str!("templates/provider_probe_manifest.toml.in"),
+        &[
+            (
+                "runtime_path",
+                toml_string(&workspace_crate_path("runtime").display().to_string()),
+            ),
+            ("provider_dependency", dependency),
+        ],
+    )
+}
+
+fn provider_probe_main(provider: &ValidatedExternProvider) -> String {
+    render_probe_template(
+        include_str!("templates/provider_probe_main.rs.in"),
+        &[("provider_crate", provider.cargo_alias.clone())],
+    )
+}
+
+fn provider_cargo_alias(name: &str) -> String {
+    format!("anvyx_provider_{name}")
+}
+
+fn toml_string(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() + 2);
+    escaped.push('"');
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            ch if ch.is_control() => {
+                use std::fmt::Write as _;
+                write!(escaped, "\\u{:04X}", ch as u32).expect("write to string succeeds");
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn render_probe_template(template: &str, values: &[(&str, String)]) -> String {
+    let mut rendered = template.to_string();
+    for (key, value) in values {
+        rendered = rendered.replace(&format!("{{{{{key}}}}}"), value);
+    }
+    rendered
+}
+
+fn workspace_crate_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("project crate lives below workspace crates directory")
+        .join(name)
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Project {
     pub name: Option<String>,
+    pub version: Option<String>,
     pub entry: Option<String>,
 }
 
@@ -66,7 +391,34 @@ pub fn parse_manifest() -> Result<Option<Manifest>, String> {
 pub fn parse_manifest_file(path: &Path) -> Result<Manifest, String> {
     let contents =
         fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    toml::from_str(&contents).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+    let manifest = toml::from_str(&contents)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    validate_manifest(&manifest).map_err(|error| format!("Invalid {}: {error}", path.display()))?;
+    Ok(manifest)
+}
+
+fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    if let Some(version) = &manifest.project.version {
+        validate_project_version(version)?;
+    }
+    Ok(())
+}
+
+fn validate_project_version(version: &str) -> Result<(), String> {
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() == 3 && parts.iter().all(|part| valid_version_number(part)) {
+        return Ok(());
+    }
+    Err(format!(
+        "project.version must be MAJOR.MINOR.PATCH, got `{version}`"
+    ))
+}
+
+fn valid_version_number(part: &str) -> bool {
+    !part.is_empty()
+        && (part == "0" || !part.starts_with('0'))
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && part.parse::<u64>().is_ok()
 }
 
 pub fn lint_config(
@@ -113,9 +465,16 @@ pub struct PackageSourceInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct NativePackageInfo {
+    pub crate_root: PathBuf,
+    pub cargo_manifest: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct PackageNode {
     pub id: PackageId,
     pub source: Option<PackageSourceInfo>,
+    pub native: Option<NativePackageInfo>,
     pub dependencies: HashMap<String, PackageId>,
 }
 
@@ -220,6 +579,9 @@ impl PackageGraphLoader {
         self.stack.push(id.clone());
 
         let manifest = parse_manifest_file(id.manifest_path())?;
+        validate_extern_providers(id.manifest_path(), &manifest).map_err(|error| {
+            format!("failed to validate extern providers for package {id}: {error}")
+        })?;
         let dir = id
             .manifest_path()
             .parent()
@@ -235,7 +597,12 @@ impl PackageGraphLoader {
                 .to_path_buf();
             PackageSourceInfo { entry, source_root }
         });
-        if source.is_none() && !dir.join("Cargo.toml").is_file() {
+        let cargo_manifest = dir.join("Cargo.toml");
+        let native = cargo_manifest.is_file().then(|| NativePackageInfo {
+            crate_root: dir.clone(),
+            cargo_manifest,
+        });
+        if source.is_none() && native.is_none() {
             return Err(format!(
                 "package {id} has no project.entry and no Cargo.toml native marker"
             ));
@@ -243,6 +610,7 @@ impl PackageGraphLoader {
         self.packages.push(PackageNode {
             id: id.clone(),
             source,
+            native,
             dependencies,
         });
 
@@ -340,7 +708,9 @@ mod tests {
     use super::*;
 
     fn parse(toml: &str) -> Result<Manifest, String> {
-        toml::from_str(toml).map_err(|e| format!("Failed to parse: {e}"))
+        let manifest = toml::from_str(toml).map_err(|e| format!("Failed to parse: {e}"))?;
+        validate_manifest(&manifest)?;
+        Ok(manifest)
     }
 
     #[test]
@@ -399,7 +769,9 @@ mod tests {
     }
 
     #[test]
-    fn clean_frontend_rejects_externs() {
+    fn clean_frontend_validates_extern_provider_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest_path = root.path().join("anvyx.toml");
         let manifest = parse(
             r#"
             [project]
@@ -411,12 +783,37 @@ mod tests {
         )
         .unwrap();
 
-        let error = reject_clean_frontend_inputs(Some(&manifest)).unwrap_err();
+        let error = load_native_providers(&manifest_path, &manifest).unwrap_err();
+        assert!(error.contains("extern provider `engine` path does not exist"));
 
-        assert_eq!(
-            error,
-            "clean frontend does not support extern providers yet"
-        );
+        let provider = root.path().join("my_externs/engine");
+        fs::create_dir_all(&provider).unwrap();
+        fs::write(
+            provider.join("Cargo.toml"),
+            "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let error = load_native_providers(&manifest_path, &manifest).unwrap_err();
+        assert!(error.contains("extern provider `engine` probe failed"));
+    }
+
+    #[test]
+    fn clean_frontend_rejects_invalid_extern_provider_names() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest_path = root.path().join("anvyx.toml");
+        let manifest = parse(
+            r#"
+            [project]
+            entry = "src/main.anv"
+
+            [externs.BadName]
+            path = "provider"
+            "#,
+        )
+        .unwrap();
+
+        let error = load_native_providers(&manifest_path, &manifest).unwrap_err();
+        assert_eq!(error, "invalid extern provider name `BadName`");
     }
 
     #[test]
@@ -453,6 +850,23 @@ mod tests {
         .unwrap();
 
         assert!(without_name.project.name.is_none());
+    }
+
+    #[test]
+    fn parse_manifest_with_optional_version() {
+        let manifest = parse(
+            r#"
+            [project]
+            version = "1.2.3"
+            entry = "src/main.anv"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.project.version.as_deref(), Some("1.2.3"));
+        for version in ["1.2", "01.2.3", "1.02.3", "1.2.03"] {
+            assert!(parse(&format!("[project]\nversion = \"{version}\"\n")).is_err());
+        }
     }
 
     #[test]
@@ -526,6 +940,53 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("invalid type"), "{error}");
+    }
+
+    #[test]
+    fn provider_probe_manifest_renders_template_package_shape() {
+        let provider = provider_fixture("physics", "physics-provider");
+
+        let manifest = provider_probe_manifest(&provider);
+
+        assert!(manifest.contains("[package]\nname = \"anvyx-provider-probe\""));
+        assert!(manifest.contains("anvyx-runtime = { path = "));
+        assert!(manifest.contains("serde = { version = \"1\", features = [\"derive\"] }"));
+        assert!(manifest.contains("serde_json = \"1\""));
+        assert!(manifest.contains(
+            "anvyx_provider_physics = { package = \"physics-provider\", path = \"/tmp/physics-provider\" }"
+        ));
+    }
+
+    #[test]
+    fn provider_probe_manifest_escapes_toml_paths() {
+        let mut provider = provider_fixture("physics", "physics-provider");
+        provider.crate_root = PathBuf::from("/tmp/physics \"quoted\"");
+
+        let manifest = provider_probe_manifest(&provider);
+
+        assert!(manifest.contains("path = \"/tmp/physics \\\"quoted\\\"\""));
+    }
+
+    #[test]
+    fn provider_probe_main_calls_descriptor_and_supports_through_alias() {
+        let provider = provider_fixture("physics", "type");
+
+        let main = provider_probe_main(&provider);
+
+        assert!(main.contains("descriptor: anvyx_provider_physics::provider_descriptor(),"));
+        assert!(main.contains("supports: anvyx_provider_physics::rust_module_supports(),"));
+        assert!(!main.contains("type::"));
+    }
+
+    fn provider_fixture(name: &str, cargo_package: &str) -> ValidatedExternProvider {
+        let root = PathBuf::from(format!("/tmp/{cargo_package}"));
+        ValidatedExternProvider {
+            name: name.to_string(),
+            cargo_manifest: root.join("Cargo.toml"),
+            crate_root: root,
+            cargo_package: cargo_package.to_string(),
+            cargo_alias: provider_cargo_alias(name),
+        }
     }
 
     struct PackageFixture {
@@ -710,12 +1171,14 @@ mod tests {
         fixture.write_native_package("host", &[]);
 
         let graph = load_package_graph(&fixture.manifest("game")).unwrap();
-        assert!(
-            graph
-                .packages()
-                .iter()
-                .any(|package| package.dependencies.is_empty() && package.source.is_none())
-        );
+        let host = graph
+            .packages()
+            .iter()
+            .find(|package| package.source.is_none())
+            .expect("native dependency package");
+        assert!(host.dependencies.is_empty());
+        let native = host.native.as_ref().expect("native package marker");
+        assert!(native.cargo_manifest.ends_with("Cargo.toml"));
     }
 
     #[test]

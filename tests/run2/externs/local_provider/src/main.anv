@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @lint: unused=allow
+// @match-begin
+// 12
+// 5
+// @match-end
+
+import ext:host { host_add, host_len };
+
+fn main() {
+    println(host_add(5, 7));
+    println(host_len("hello"));
+}

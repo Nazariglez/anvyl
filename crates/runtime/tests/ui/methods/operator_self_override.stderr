@@ -1,0 +1,5 @@
+error: Self operators do not support ret/params overrides
+ --> tests/ui/methods/operator_self_override.rs:8:9
+  |
+8 |     pub fn add(&self, rhs: Point) -> Point { rhs }
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

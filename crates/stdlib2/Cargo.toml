@@ -6,7 +6,7 @@ description.workspace = true
 
 [dependencies]
 anvyx-externs = { path = "../externs" }
-anvyx-lang = { path = "../lang" }
+anvyx-runtime = { path = "../runtime" }
 
 [lints]
 workspace = true

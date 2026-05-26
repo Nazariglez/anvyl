@@ -1,0 +1,5 @@
+error: expected #[anvyx(field)]
+ --> tests/ui/inline/unknown_field_attr.rs:5:13
+  |
+5 |     #[anvyx(getter)]
+  |             ^^^^^^

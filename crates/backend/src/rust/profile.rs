@@ -1,9 +1,9 @@
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
-        EnumId, ExternDecl, ExternId, ExternMember, Function, FunctionId, FunctionKind, Local,
-        LocalId, LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place,
-        Program, Projection, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
+        EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, Local, LocalId,
+        LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place, Program,
+        Projection, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
         VariantShape, VerifiedProgram,
     },
     ast::{FormatKind, FormatSign, FormatSpec},
@@ -112,6 +112,7 @@ impl ProfileCx<'_> {
         let ok = match self.program.type_arena.data(id) {
             TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
             TypeData::Enum(enm) => self.enum_decl_supported(*enm),
+            TypeData::Extern(ext) => self.extern_type_supported(*ext),
             TypeData::Array { elem, .. } => !self.non_copy_type(*elem),
             TypeData::List(elem) | TypeData::Slice(elem) => {
                 self.check_type_ref(ProfileSite::Type(id), *elem);
@@ -147,6 +148,17 @@ impl ProfileCx<'_> {
         })
     }
 
+    fn extern_type_supported(&self, ext: air::ExternTypeId) -> bool {
+        let decl = self.program.extern_type(ext);
+        decl.rep == air::ExternRep::Inline
+            && decl.fields.iter().all(|field| {
+                matches!(
+                    self.program.type_arena.data(field.ty),
+                    TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String
+                )
+            })
+    }
+
     fn check_const(&mut self, id: ConstId) {
         if !const_is_slice1(self.program, id) {
             self.push(ProfileSite::Const(id), ProfileErrorKind::UnsupportedConst);
@@ -178,12 +190,6 @@ impl ProfileCx<'_> {
                     self.check_type_ref(ProfileSite::Module(index), ty);
                 }
             }
-        }
-        if !module.extern_types.is_empty() {
-            self.push(
-                ProfileSite::Module(index),
-                ProfileErrorKind::UnsupportedModuleItem,
-            );
         }
     }
 
@@ -447,6 +453,25 @@ impl ProfileCx<'_> {
                     }
                 }
             }
+            AggregateCtor::Extern(ext) => {
+                if !matches!(self.program.type_arena.data(ty), TypeData::Extern(id) if id == ext) {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    return;
+                }
+                let decl = self.program.extern_type(*ext);
+                if decl.rep != air::ExternRep::Inline || decl.fields.len() != fields.len() {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
+                for (field, operand) in decl.fields.iter().zip(fields) {
+                    self.check_operand(site, operand);
+                    if self.operand_ty(operand) != field.ty {
+                        self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    }
+                    if self.non_copy_value_operand(operand) {
+                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
+                    }
+                }
+            }
             AggregateCtor::EnumVariant { enum_id, variant } => {
                 if !matches!(self.program.type_arena.data(ty), TypeData::Enum(id) if id == enum_id)
                 {
@@ -567,7 +592,7 @@ impl ProfileCx<'_> {
     fn check_callee(&mut self, site: ProfileSite, callee: &Callee) {
         match callee {
             Callee::Function(_) => {}
-            Callee::Extern(id) if extern_is_slice1_runtime(self.program, *id) => {}
+            Callee::Extern(id) if self.program.extern_decl(*id).binding.is_some() => {}
             Callee::Extern(_) | Callee::Closure(_) => {
                 self.push(site, ProfileErrorKind::UnsupportedCallee);
             }
@@ -631,6 +656,7 @@ impl ProfileCx<'_> {
                     | TypeData::Void
                     | TypeData::Aggregate(_)
                     | TypeData::Enum(_)
+                    | TypeData::Extern(_)
                     | TypeData::Array { .. }
                     | TypeData::List(_)
             ),
@@ -639,10 +665,11 @@ impl ProfileCx<'_> {
                 TypeData::String
                     | TypeData::Aggregate(_)
                     | TypeData::Enum(_)
+                    | TypeData::Extern(_)
                     | TypeData::Array { .. }
                     | TypeData::List(_)
             ),
-            ParamMode::MutBorrow => false,
+            ParamMode::MutBorrow => matches!(self.program.type_arena.data(ty), TypeData::Extern(_)),
         }
     }
 
@@ -665,13 +692,7 @@ impl ProfileCx<'_> {
     }
 
     fn check_extern(&mut self, id: ExternId, decl: &ExternDecl) {
-        if decl.member != ExternMember::FreeFunction {
-            self.push(
-                ProfileSite::Extern(id),
-                ProfileErrorKind::UnsupportedExternMember,
-            );
-        }
-        if !extern_is_slice1_runtime(self.program, id) {
+        if decl.binding.is_none() {
             self.push(ProfileSite::Extern(id), ProfileErrorKind::UnsupportedExtern);
         }
     }
@@ -680,6 +701,7 @@ impl ProfileCx<'_> {
         let ok = match self.program.type_arena.data(ty) {
             TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
             TypeData::Enum(enm) => self.enum_decl_supported(*enm),
+            TypeData::Extern(ext) => self.extern_type_supported(*ext),
             TypeData::Array { elem, .. } => {
                 self.check_type_ref(site, *elem);
                 !self.non_copy_type(*elem)
@@ -758,49 +780,4 @@ fn const_is_slice1(program: &Program, id: ConstId) -> bool {
             | (TypeData::Bool, ConstValue::Bool(_))
             | (TypeData::String, ConstValue::String(_))
     )
-}
-
-fn extern_is_slice1_runtime(program: &Program, id: ExternId) -> bool {
-    let decl = program.extern_decl(id);
-    if decl.member != ExternMember::FreeFunction {
-        return false;
-    }
-    let module = program.module(decl.module);
-    let [segment] = module.path.as_slice() else {
-        return false;
-    };
-    if segment.as_str() != "core_runtime" {
-        return false;
-    }
-    match decl.name.as_str() {
-        "_println" => extern_signature_is(
-            program,
-            decl,
-            &[(TypeData::String, ParamMode::SharedBorrow)],
-            TypeData::Void,
-        ),
-        "_assert" => extern_signature_is(
-            program,
-            decl,
-            &[
-                (TypeData::Bool, ParamMode::Value),
-                (TypeData::String, ParamMode::SharedBorrow),
-            ],
-            TypeData::Void,
-        ),
-        _ => false,
-    }
-}
-
-fn extern_signature_is(
-    program: &Program,
-    decl: &ExternDecl,
-    params: &[(TypeData, ParamMode)],
-    ret: TypeData,
-) -> bool {
-    decl.params.len() == params.len()
-        && decl.params.iter().zip(params).all(|(param, (ty, mode))| {
-            program.type_arena.data(param.ty) == ty && param.mode == *mode
-        })
-        && program.type_arena.data(decl.return_type) == &ret
 }

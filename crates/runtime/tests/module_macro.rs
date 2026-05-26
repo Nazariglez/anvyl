@@ -1,0 +1,125 @@
+#![allow(dead_code)]
+
+use anvyx_runtime::{AnvyxInline, ExternBindingOp, ExternBindingTarget, function};
+
+mod root_module {
+    use super::{AnvyxInline, function};
+
+    #[derive(AnvyxInline)]
+    pub struct Point {
+        #[anvyx(field)]
+        pub x: i64,
+    }
+
+    #[function]
+    pub fn ping(value: i64) -> i64 {
+        value + 1
+    }
+
+    anvyx_runtime::module!(root: game, exports: [ping, Point]);
+}
+
+mod tree_module {
+    use super::function;
+
+    pub mod child {
+        use super::function;
+
+        #[function]
+        pub fn pong(value: i64) -> i64 {
+            value * 2
+        }
+
+        anvyx_runtime::module!(exports: [pong]);
+    }
+
+    #[function]
+    pub fn ping(value: i64) -> i64 {
+        value + 1
+    }
+
+    anvyx_runtime::module!(root: game, modules: [child], exports: [ping]);
+}
+
+mod builtin {
+    use super::{AnvyxInline, function};
+
+    #[derive(AnvyxInline)]
+    pub struct Point {
+        #[anvyx(field)]
+        pub x: i64,
+    }
+
+    #[function(name = "int_abs")]
+    pub fn abs(value: i64) -> i64 {
+        value.abs()
+    }
+
+    anvyx_runtime::builtin_module! {
+        name: "core_int",
+        source: "",
+        exports: [abs, Point],
+    }
+}
+
+#[test]
+fn module_assembles_root_provider_and_native_tree() {
+    let provider = root_module::provider_descriptor();
+
+    assert_eq!(provider.provider.name, "game");
+    assert_eq!(provider.modules[0].path.segments, ["game"]);
+    assert_eq!(provider.modules[0].functions[0].name, "ping");
+    assert_eq!(provider.modules[0].types[0].name, "Point");
+    assert_eq!(root_module::__anvyx_native::ping(41), 42);
+
+    let support = root_module::rust_module_support();
+    assert_eq!(support.module.segments, ["game"]);
+    assert_eq!(support.bindings[0].key.operation, ExternBindingOp::Call);
+}
+
+#[test]
+fn module_assembles_child_descriptors_and_support() {
+    let provider = tree_module::provider_descriptor();
+
+    assert_eq!(provider.modules.len(), 2);
+    assert_eq!(provider.modules[0].path.segments, ["game"]);
+    assert_eq!(provider.modules[1].path.segments, ["game", "child"]);
+    assert_eq!(provider.modules[1].functions[0].name, "pong");
+    assert_eq!(tree_module::__anvyx_native::child::pong(21), 42);
+
+    let supports = tree_module::rust_module_supports();
+    assert_eq!(supports.len(), 2);
+    assert_eq!(supports[0].module.segments, ["game"]);
+    assert_eq!(supports[1].module.segments, ["game", "child"]);
+    assert_eq!(
+        supports[1].bindings[0].path.segments,
+        ["__anvyx_native", "child", "pong"]
+    );
+}
+
+#[test]
+fn builtin_assembles_descriptor_and_native_support() {
+    let provider = builtin::provider_descriptor();
+    let support = builtin::rust_module_support();
+
+    assert_eq!(provider.provider.name, "core_int");
+    assert_eq!(provider.modules[0].path.segments, ["core_int"]);
+    assert_eq!(provider.modules[0].functions[0].name, "int_abs");
+    assert_eq!(builtin::__anvyx_native::int_abs(-3), 3);
+    assert_eq!(support.module.segments, ["core_int"]);
+    assert_eq!(support.types.len(), 1);
+    assert_eq!(support.types[0].key.name, "Point");
+    assert_eq!(support.types[0].key.module.segments, ["core_int"]);
+    assert_eq!(support.types[0].path.crate_name, "crate");
+    assert_eq!(support.types[0].path.segments, ["builtin", "Point"]);
+    assert_eq!(
+        support.bindings[0].path.segments,
+        ["__anvyx_native", "int_abs"]
+    );
+    assert_eq!(support.bindings[0].key.operation, ExternBindingOp::Call);
+    let ExternBindingTarget::Function(function) = &support.bindings[0].key.target else {
+        panic!("expected function binding");
+    };
+    assert_eq!(function.module.segments, ["core_int"]);
+    assert_eq!(function.name, "int_abs");
+}

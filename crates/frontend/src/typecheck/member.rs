@@ -577,7 +577,7 @@ fn resolve_extern_field(
         field_ref,
         ty: decl.ty.ty.clone(),
         contains_any: decl.ty.contains_any(),
-        access: place::extern_field_access(receiver_access, decl.computed),
+        access: place::extern_field_access(receiver_access, decl.computed, decl.writable),
     })
 }
 

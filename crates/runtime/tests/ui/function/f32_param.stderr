@@ -1,0 +1,5 @@
+error: #[function] does not support `f32`; use i64 or f64
+ --> tests/ui/function/f32_param.rs:4:15
+  |
+4 | fn bad(value: f32) -> f64 { value as f64 }
+  |               ^^^

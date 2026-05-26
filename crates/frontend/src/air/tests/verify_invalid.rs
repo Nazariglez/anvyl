@@ -4,7 +4,10 @@ use verify::{
 };
 
 use super::{super::verify::verify_structured_body, *};
-use crate::ast::Ident;
+use crate::{
+    air::{ExternBindingDecl, ExternTypeId, FunctionSpecialization},
+    ast::Ident,
+};
 
 fn field(name: &str, ty: TypeId) -> FieldDecl {
     FieldDecl {
@@ -287,6 +290,7 @@ fn structured_match_rejects_wrong_discriminant_and_variant() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Choice"),
         module,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
@@ -456,6 +460,7 @@ fn place_return_must_return_place() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::with_return_mode(vec![], ReturnMode::Place(int_ty)),
         locals: vec![],
         body: body_from_block(AirBlock {
@@ -522,6 +527,7 @@ fn fn_bad_type() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], TypeId::from_index(999)),
         locals: vec![],
         body: body_from_block(AirBlock {
@@ -531,6 +537,36 @@ fn fn_bad_type() {
     };
     let fid = builder.alloc_function(func);
     builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidType(TypeId(id))) if id == 999
+    )));
+}
+
+#[test]
+fn function_specialization_type_must_exist() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let func = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: Some(FunctionSpecialization {
+            type_args: vec![TypeId::from_index(999)],
+            const_args: vec![],
+        }),
+        signature: Signature::new(vec![], void_ty),
+        locals: vec![],
+        body: body_from_block(AirBlock {
+            stmts: vec![],
+            tail: AirTail::Return(None),
+        }),
+    };
+    builder.alloc_function(func);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
@@ -570,6 +606,7 @@ fn enum_bad_variant_type() {
     builder.alloc_enum(EnumDecl {
         name: Ident::new("BadEnum"),
         module,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
@@ -640,6 +677,7 @@ fn extern_member_receiver_mode_mismatch() {
     let ext_ty = builder.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("Handle"),
         module,
+        binding: None,
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
@@ -663,6 +701,8 @@ fn extern_member_receiver_mode_mismatch() {
         },
         params: vec![],
         return_type: int_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
     });
     let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
     assert!(
@@ -670,6 +710,103 @@ fn extern_member_receiver_mode_mismatch() {
             .iter()
             .any(|e| matches!(e.kind, EK::BadExtern(BadExtern::ReceiverModeMismatch)))
     );
+}
+
+#[test]
+fn extern_binding_must_match_decl_identity() {
+    use anvyx_externs::{
+        ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternFunctionKey, ModulePath,
+        ProviderId,
+    };
+
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    builder.alloc_extern(ExternDecl {
+        name: Ident::new("host_log"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![],
+        return_type: void_ty,
+        binding: Some(ExternBindingDecl {
+            package: crate::resolve::PackageId::synthetic_root(),
+            provider: ProviderId {
+                name: "host".to_string(),
+            },
+            key: ExternBindingKey {
+                target: ExternBindingTarget::Function(ExternFunctionKey {
+                    module: ModulePath {
+                        segments: vec!["host".to_string()],
+                    },
+                    name: "other".to_string(),
+                }),
+                operation: ExternBindingOp::Call,
+            },
+        }),
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
+    assert!(
+        errors
+            .iter()
+            .any(|e| { matches!(e.kind, EK::BadExtern(BadExtern::BindingMismatch)) })
+    );
+}
+
+#[test]
+fn extern_binding_with_invalid_owner_does_not_panic() {
+    use anvyx_externs::{
+        ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternMemberKey,
+        ExternMemberSelector, ExternTypeKey, ModulePath, ProviderId,
+    };
+
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let receiver_ty = builder.alloc_type(TypeData::Extern(ExternTypeId::from_index(99)));
+    builder.alloc_extern(ExternDecl {
+        name: Ident::new("x"),
+        module,
+        member: ExternMember::FieldGetter {
+            owner: ExternTypeId::from_index(99),
+            receiver: ExternReceiverDecl {
+                ty: receiver_ty,
+                mode: ParamMode::SharedBorrow,
+            },
+            computed: false,
+        },
+        params: vec![],
+        return_type: int_ty,
+        binding: Some(ExternBindingDecl {
+            package: crate::resolve::PackageId::synthetic_root(),
+            provider: ProviderId {
+                name: "host".to_string(),
+            },
+            key: ExternBindingKey {
+                target: ExternBindingTarget::Member(ExternMemberKey {
+                    owner: ExternTypeKey {
+                        module: ModulePath {
+                            segments: vec!["host".to_string()],
+                        },
+                        name: "Handle".to_string(),
+                    },
+                    selector: ExternMemberSelector::Field("x".to_string()),
+                }),
+                operation: ExternBindingOp::Get,
+            },
+        }),
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
+    assert!(errors.iter().any(|e| {
+        matches!(
+            e.kind,
+            EK::BadReference(BadReference::InvalidExternType(id)) if id == ExternTypeId::from_index(99)
+        )
+    }));
 }
 
 #[test]
@@ -694,6 +831,8 @@ fn call_arity_mismatch() {
             },
         ],
         return_type: int_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
     });
 
     let mut fb = FunctionBuilder::new("arity_bad", module, FunctionKind::Normal, void_ty);
@@ -767,6 +906,8 @@ fn shared_string_const_invalid_id_does_not_panic() {
             mode: ParamMode::SharedBorrow,
         }],
         return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
     });
 
     let mut fb = FunctionBuilder::new("bad_call", module, FunctionKind::Normal, void_ty);
@@ -811,6 +952,8 @@ fn call_arg_type_mismatch() {
             },
         ],
         return_type: int_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
     });
 
     let mut fb = FunctionBuilder::new("arg_type_bad", module, FunctionKind::Normal, void_ty);
@@ -1211,6 +1354,7 @@ fn function_param_local_must_match() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![Param {
                 name: Some(Ident::new("p")),
@@ -1262,6 +1406,7 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
     let missing_enum = builder.alloc_enum_raw(EnumDecl {
         name: Ident::new("MissingEnum"),
         module: m0,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![],
@@ -1269,6 +1414,7 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
     let missing_ext_ty = builder.alloc_extern_type_raw(ExternTypeDecl {
         name: Ident::new("MissingExtType"),
         module: m0,
+        binding: None,
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
@@ -1284,6 +1430,8 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         member: ExternMember::FreeFunction,
         params: vec![],
         return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
     });
 
     let mut fb = FunctionBuilder::new("wrong", m1, FunctionKind::Normal, void_ty);
@@ -1686,6 +1834,7 @@ fn aggregate_stringify_override_wrong_shape() {
         module,
         kind: FunctionKind::Method,
         owner: None,
+        specialization: None,
         signature: Signature::with_return_mode(
             vec![Param {
                 name: Some(Ident::new("self")),
@@ -1829,6 +1978,7 @@ fn enum_struct_ctor_slot_type_mismatch() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("Event"),
         module,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
@@ -1985,6 +2135,7 @@ fn enum_ctor_unit_count_tuple_type_and_result_mismatch() {
     let enum_id = builder.alloc_enum(EnumDecl {
         name: Ident::new("E"),
         module,
+        core: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![

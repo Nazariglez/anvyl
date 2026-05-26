@@ -458,7 +458,7 @@ fn resolve_relative_path(project_root: &Path, rel_to_root: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use anvyx_lang::LintConfig;
 
@@ -473,11 +473,12 @@ mod tests {
         Manifest {
             project: Project {
                 name: name.map(str::to_string),
+                version: None,
                 entry: Some(entry.into()),
             },
             dependencies: HashMap::new(),
             externs,
-            lint: Default::default(),
+            lint: BTreeMap::default(),
         }
     }
 

@@ -111,7 +111,8 @@ impl TypePassClassAnalyzer<'_> {
             TypeData::Extern(id) => {
                 match self.program.extern_types.get(id.index()).map(|ty| ty.rep) {
                     Some(super::ExternRep::Shared) => TypePassClass::CheapHandle,
-                    Some(super::ExternRep::Inline) | None => TypePassClass::Opaque,
+                    Some(super::ExternRep::Inline) => inline_class(self.extern_layout(*id)),
+                    None => TypePassClass::Opaque,
                 }
             }
             TypeData::Optional(inner) => inline_class(self.optional_layout(*inner)),
@@ -173,6 +174,16 @@ impl TypePassClassAnalyzer<'_> {
             AggregateKind::Struct => self.sequence_layout(aggregate.fields.iter().map(|f| f.ty)),
             AggregateKind::DataRef => LayoutResult::Copy(HANDLE_LAYOUT),
         }
+    }
+
+    fn extern_layout(&mut self, id: super::ExternTypeId) -> LayoutResult {
+        let Some(decl) = self.program.extern_types.get(id.index()) else {
+            return LayoutResult::Opaque;
+        };
+        if decl.rep != super::ExternRep::Inline {
+            return LayoutResult::Opaque;
+        }
+        self.sequence_layout(decl.fields.iter().map(|f| f.ty))
     }
 
     fn enum_layout(&mut self, id: super::EnumId) -> LayoutResult {
@@ -1019,6 +1030,7 @@ mod tests {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature {
                 params: vec![Param {
                     name: Some(Ident::new("arg")),
@@ -1236,6 +1248,7 @@ mod tests {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature {
                 params: vec![
                     Param {
@@ -1537,6 +1550,7 @@ mod tests {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], void),
             locals: vec![],
             body: test_body(
@@ -1579,6 +1593,7 @@ mod tests {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], void),
             locals: vec![],
             body: test_body(
@@ -1622,6 +1637,7 @@ mod tests {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(
                 vec![Param {
                     name: Some(Ident::new("f")),
@@ -1688,6 +1704,7 @@ mod tests {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], void),
             locals: vec![],
             body: test_body(
@@ -1773,6 +1790,7 @@ mod tests {
         let shared_ext = program.alloc_extern_type(ExternTypeDecl {
             name: Ident::new("SharedExt"),
             module,
+            binding: None,
             type_args: vec![],
             const_args: vec![],
             rep: ExternRep::Shared,
@@ -1785,6 +1803,7 @@ mod tests {
         let inline_ext = program.alloc_extern_type(ExternTypeDecl {
             name: Ident::new("InlineExt"),
             module,
+            binding: None,
             type_args: vec![],
             const_args: vec![],
             rep: ExternRep::Inline,
@@ -1814,7 +1833,10 @@ mod tests {
         assert_eq!(classes.class(function), TypePassClass::CheapHandle);
         assert_eq!(classes.class(dyn_), TypePassClass::CheapHandle);
         assert_eq!(classes.class(shared_ext), TypePassClass::CheapHandle);
-        assert_eq!(classes.class(inline_ext), TypePassClass::Opaque);
+        assert_eq!(
+            classes.class(inline_ext),
+            TypePassClass::SmallCopyInline(AirCopyLayout { size: 0, align: 1 })
+        );
         assert_eq!(classes.class(any), TypePassClass::Opaque);
         assert_eq!(classes.class(slice), TypePassClass::Opaque);
     }
@@ -2002,6 +2024,7 @@ mod tests {
             module,
             type_args: vec![],
             const_args: vec![],
+            core: None,
             variants: vec![
                 VariantDecl {
                     name: Ident::new("None"),
@@ -2030,6 +2053,7 @@ mod tests {
             module,
             type_args: vec![],
             const_args: vec![],
+            core: None,
             variants: vec![
                 VariantDecl {
                     name: Ident::new("A"),

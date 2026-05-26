@@ -1,0 +1,13 @@
+// @mode: run
+// @frontend: new
+// @skip: clean rust: consuming owned string-return values still reports NonCopyValueRequired
+// @expect: success
+// @match-begin
+// ABC
+// hi
+// @match-end
+
+fn main() {
+    println("abc".to_upper());
+    println("  hi  ".trim());
+}

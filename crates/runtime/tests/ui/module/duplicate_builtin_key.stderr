@@ -1,0 +1,5 @@
+error: duplicate builtin_module! key `name`
+ --> tests/ui/module/duplicate_builtin_key.rs:3:5
+  |
+3 |     name: "b",
+  |     ^^^^

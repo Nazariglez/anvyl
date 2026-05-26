@@ -1,0 +1,5 @@
+error: by-value self is not supported
+ --> tests/ui/methods/by_value_self.rs:7:20
+  |
+7 |     pub fn consume(self) {}
+  |                    ^^^^

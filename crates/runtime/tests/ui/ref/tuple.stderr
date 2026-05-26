@@ -1,0 +1,5 @@
+error: AnvyxRef requires a named-field struct
+ --> tests/ui/ref/tuple.rs:4:12
+  |
+4 | struct Pair(#[anvyx(field)] i64, #[anvyx(field)] i64);
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

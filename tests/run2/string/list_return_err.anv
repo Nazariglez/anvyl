@@ -1,0 +1,8 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @contains: UnsupportedRustAbi
+
+fn main() {
+    "a,b".split(",");
+}

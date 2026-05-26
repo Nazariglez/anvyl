@@ -1,0 +1,5 @@
+error: duplicate module! key `exports`
+ --> tests/ui/module/duplicate_module_key.rs:1:37
+  |
+1 | anvyx_runtime::module!(exports: [], exports: []);
+  |                                     ^^^^^^^

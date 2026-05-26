@@ -1,0 +1,6 @@
+// @mode: run
+// @expect: error
+// @frontend: new
+// @contains: extern provider `host` probe failed
+
+fn main() {}

@@ -22,8 +22,16 @@ const GREY: &str = "\x1b[90m";
 
 pub(crate) fn print_start(test_count: usize) {
     println!();
-    println!("{CYAN}Running {test_count} tests...{RESET}");
+    println!("{CYAN}Detected {test_count} test cases...{RESET}");
     println!();
+}
+
+pub(crate) fn print_test_run() {
+    println!("Running test cases...");
+}
+
+pub(crate) fn print_rust_batch_compile(count: usize) {
+    println!("Compiling {count} Rust run tests...");
 }
 
 #[derive(Debug, Default)]

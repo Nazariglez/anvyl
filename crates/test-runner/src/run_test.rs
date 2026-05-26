@@ -164,8 +164,18 @@ pub(crate) fn is_batch_eligible(plan: &TestPlan) -> bool {
                 && case.backend == Some("rust")
                 && case.cli_options.is_empty()
                 && case.stdin.is_empty()
+                && !case_blocks_batch(&case.file)
         }
         TestPlan::Done(_) => false,
+    }
+}
+
+fn case_blocks_batch(file: &Path) -> bool {
+    match anvyx_project::manifest::find_nearest_manifest(file) {
+        Ok(Some(path)) => anvyx_project::manifest::parse_manifest_file(&path)
+            .map_or(true, |manifest| manifest.has_externs()),
+        Ok(None) => false,
+        Err(_) => true,
     }
 }
 
@@ -237,9 +247,9 @@ fn done(result: TestResult, mode: Mode) -> RunTestResult {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::Duration};
+    use std::{fs, path::Path, time::Duration};
 
-    use super::{TestPlan, plan_test};
+    use super::{TestPlan, is_batch_eligible, plan_test};
     use crate::{
         directives::Directives,
         model::{Mode, TestResult},
@@ -254,8 +264,17 @@ mod tests {
     }
 
     fn plan_with_backend(src: &str, new_frontend: bool, backend: Option<&'static str>) -> TestPlan {
+        plan_file(Path::new("test.anv"), src, new_frontend, backend)
+    }
+
+    fn plan_file(
+        file: &Path,
+        src: &str,
+        new_frontend: bool,
+        backend: Option<&'static str>,
+    ) -> TestPlan {
         plan_test(
-            Path::new("test.anv"),
+            file,
             directives(src),
             Duration::from_millis(1),
             Duration::from_millis(2),
@@ -406,5 +425,69 @@ mod tests {
         };
 
         assert_eq!(assertions.selected.contains, ["available"]);
+    }
+
+    #[test]
+    fn check_mode_is_not_batch_eligible() {
+        let plan = plan("// @mode: check\n// @expect: success\n", true);
+
+        assert!(!is_batch_eligible(&plan));
+    }
+
+    #[test]
+    fn batch_eligibility_requires_plain_successful_rust_run() {
+        assert!(is_batch_eligible(&plan(
+            "// @mode: run\n// @expect: success\n",
+            true,
+        )));
+        assert!(!is_batch_eligible(&plan(
+            "// @mode: run\n// @expect: error\n",
+            true,
+        )));
+        assert!(!is_batch_eligible(&plan_with_backend(
+            "// @mode: run\n// @expect: success\n",
+            true,
+            Some("vm"),
+        )));
+        assert!(!is_batch_eligible(&plan(
+            "// @mode: run\n// @expect: success\n// @stdin: input\n",
+            true,
+        )));
+        assert!(!is_batch_eligible(&plan(
+            "// @mode: run\n// @expect: success\n// @cfg: debug\n",
+            true,
+        )));
+    }
+
+    #[test]
+    fn manifest_externs_and_errors_are_not_batch_eligible() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("test.anv");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        fs::write(
+            temp.path().join("anvyx.toml"),
+            "[project]\nentry = \"test.anv\"\n\n[externs.engine]\npath = \"provider\"\n",
+        )
+        .unwrap();
+        let plan = plan_file(
+            &file,
+            "// @mode: run\n// @expect: success\n",
+            true,
+            Some("rust"),
+        );
+        assert!(!is_batch_eligible(&plan));
+
+        fs::write(
+            temp.path().join("anvyx.toml"),
+            "[project]\nversion = \"01.0.0\"\nentry = \"test.anv\"\n",
+        )
+        .unwrap();
+        let plan = plan_file(
+            &file,
+            "// @mode: run\n// @expect: success\n",
+            true,
+            Some("rust"),
+        );
+        assert!(!is_batch_eligible(&plan));
     }
 }

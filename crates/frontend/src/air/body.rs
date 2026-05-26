@@ -255,6 +255,7 @@ pub enum Callee {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateCtor {
     Struct(AggregateId),
+    Extern(ExternTypeId),
     Tuple,
     EnumVariant { enum_id: EnumId, variant: VariantId },
     List,

@@ -1,0 +1,5 @@
+error: #[function] does not support generic functions
+ --> tests/ui/function/generic.rs:4:7
+  |
+4 | fn bad<T>(value: i64) -> i64 { value }
+  |       ^^^

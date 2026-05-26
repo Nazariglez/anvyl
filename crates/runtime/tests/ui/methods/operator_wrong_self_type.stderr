@@ -1,0 +1,5 @@
+error: Self binary operator operand must be Self
+ --> tests/ui/methods/operator_wrong_self_type.rs:9:28
+  |
+9 |     pub fn add(&self, rhs: Other) -> i64 { 1 }
+  |                            ^^^^^

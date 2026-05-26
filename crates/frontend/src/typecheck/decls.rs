@@ -4944,6 +4944,10 @@ mod tests {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Int,
                         computed: false,
+                        readable: true,
+                        writable: true,
+                        get_receiver: anvyx_externs::ReceiverMode::Shared,
+                        set_receiver: anvyx_externs::ReceiverMode::Mutable,
                         doc: None,
                     }],
                     ..extern_type("Handle")

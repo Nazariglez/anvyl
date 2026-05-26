@@ -74,6 +74,7 @@ pub struct CheckPackageInput {
     root_file: PathBuf,
     packages: Vec<PackageSource>,
     sources: SourceBundle,
+    externs: Vec<PackageExternInputs>,
     source_overrides: Vec<SourceOverride>,
     config: FrontendConfig,
 }
@@ -109,6 +110,7 @@ impl CheckPackageInput {
             root_file,
             packages,
             sources,
+            externs: vec![],
             source_overrides: vec![],
             config: FrontendConfig::default(),
         })
@@ -123,6 +125,18 @@ impl CheckPackageInput {
     #[must_use]
     pub fn with_source_overrides(mut self, source_overrides: Vec<SourceOverride>) -> Self {
         self.source_overrides = source_overrides;
+        self
+    }
+
+    #[must_use]
+    pub fn with_package_externs(
+        mut self,
+        externs: Vec<(PackageId, Vec<anvyx_externs::ProviderDescriptor>)>,
+    ) -> Self {
+        self.externs = externs
+            .into_iter()
+            .map(|(package, providers)| PackageExternInputs { package, providers })
+            .collect();
         self
     }
 
@@ -191,6 +205,7 @@ fn prepare_file(input: CheckFileInput) -> Result<PreparedCheck, CheckError> {
         packages: HashMap::new(),
         cached_sources: vec![main],
         ownership: SourceOwnership::new(&[])?,
+        externs: vec![],
         source_overrides,
         sources,
         config,
@@ -203,6 +218,7 @@ fn prepare_package(input: CheckPackageInput) -> Result<PreparedCheck, CheckError
         root_file,
         packages,
         sources,
+        externs,
         source_overrides,
         config,
     } = input;
@@ -242,6 +258,7 @@ fn prepare_package(input: CheckPackageInput) -> Result<PreparedCheck, CheckError
         packages: package_inputs,
         cached_sources,
         ownership,
+        externs,
         source_overrides,
         sources,
         config,
@@ -254,6 +271,7 @@ struct PreparedCheck {
     packages: HashMap<PackageId, PackageSourceInput>,
     cached_sources: Vec<PackageModuleInput>,
     ownership: SourceOwnership,
+    externs: Vec<PackageExternInputs>,
     source_overrides: Vec<SourceOverride>,
     sources: SourceBundle,
     config: FrontendConfig,
@@ -298,6 +316,7 @@ fn run_prepared(
         mut packages,
         cached_sources,
         ownership,
+        externs,
         source_overrides,
         sources,
         mut config,
@@ -324,7 +343,7 @@ fn run_prepared(
         preloaded_modules: preloaded_modules(&sources),
         source_loader: &mut source_loader,
     };
-    config.externs = system_externs(&sources);
+    config.externs = system_externs(&sources, externs);
     match mode {
         PreparedMode::Check => pipeline::check_packages(input, config)
             .map(PreparedOutput::Check)
@@ -401,8 +420,7 @@ fn read_package_root(
         .map(|source| source.with_path(path.to_path_buf()))
 }
 
-fn system_externs(sources: &SourceBundle) -> ExternInputs {
-    let mut packages = vec![];
+fn system_externs(sources: &SourceBundle, mut packages: Vec<PackageExternInputs>) -> ExternInputs {
     if let Some(core) = sources.core()
         && !core.providers().is_empty()
     {

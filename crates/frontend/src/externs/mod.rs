@@ -1166,6 +1166,10 @@ mod tests {
                             name: "x".to_string(),
                             ty: ExternTypeExpr::Float,
                             computed: true,
+                            readable: true,
+                            writable: true,
+                            get_receiver: ReceiverMode::Shared,
+                            set_receiver: ReceiverMode::Mutable,
                             doc: Some("x pos".to_string()),
                         }],
                         init: Some(ExternInitDescriptor {
@@ -1201,6 +1205,7 @@ mod tests {
                                 op: BinaryOp::Add,
                                 self_on_right: true,
                             },
+                            receiver: ReceiverMode::Shared,
                             signature: signature(
                                 vec![param("other", ExternTypeExpr::Int)],
                                 ExternTypeExpr::Int,

@@ -1,3 +1,24 @@
+pub mod core_float;
+pub mod core_int;
+pub mod core_runtime;
+pub mod core_string;
+
+#[doc(hidden)]
+pub mod __anvyx_native {
+    pub mod core_float {
+        pub use crate::core_float::__anvyx_native::*;
+    }
+    pub mod core_int {
+        pub use crate::core_int::__anvyx_native::*;
+    }
+    pub mod core_runtime {
+        pub use crate::core_runtime::__anvyx_native::*;
+    }
+    pub mod core_string {
+        pub use crate::core_string::__anvyx_native::*;
+    }
+}
+
 pub struct SourceFile {
     pub path: &'static [&'static str],
     pub label: &'static str,
@@ -55,86 +76,46 @@ pub const MODULES: &[SourceFile] = &[
 
 pub fn provider_descriptors() -> Vec<anvyx_externs::ProviderDescriptor> {
     vec![
-        int_provider(),
-        float_provider(),
-        string_provider(),
-        runtime_provider(),
+        core_int::provider_descriptor(),
+        core_float::provider_descriptor(),
+        core_string::provider_descriptor(),
+        core_runtime::provider_descriptor(),
     ]
 }
 
-fn int_provider() -> anvyx_externs::ProviderDescriptor {
-    anvyx_lang::provider_descriptor!(
-        provider = "core_int",
-        module = "core_int",
-        fn int_abs(x: int) -> int;,
-        fn int_min(a: int, b: int) -> int;,
-        fn int_max(a: int, b: int) -> int;,
-        fn int_clamp(x: int, lo: int, hi: int) -> int;
-    )
+pub fn rust_provider_supports() -> Vec<anvyx_runtime::RustProviderSupport> {
+    vec![
+        provider_support("core_int", core_int::rust_module_support()),
+        provider_support("core_float", core_float::rust_module_support()),
+        provider_support("core_string", core_string::rust_module_support()),
+        provider_support("core_runtime", core_runtime::rust_module_support()),
+    ]
 }
 
-fn float_provider() -> anvyx_externs::ProviderDescriptor {
-    anvyx_lang::provider_descriptor!(
-        provider = "core_float",
-        module = "core_float",
-        fn float_sin(x: float) -> float;,
-        fn float_cos(x: float) -> float;,
-        fn float_tan(x: float) -> float;,
-        fn float_asin(x: float) -> float;,
-        fn float_acos(x: float) -> float;,
-        fn float_atan(x: float) -> float;,
-        fn float_atan2(y: float, x: float) -> float;,
-        fn float_floor(x: float) -> float;,
-        fn float_ceil(x: float) -> float;,
-        fn float_round(x: float) -> float;,
-        fn float_trunc(x: float) -> float;,
-        fn float_sqrt(x: float) -> float;,
-        fn float_cbrt(x: float) -> float;,
-        fn float_pow(x: float, exp: float) -> float;,
-        fn float_exp(x: float) -> float;,
-        fn float_ln(x: float) -> float;,
-        fn float_abs(x: float) -> float;,
-        fn float_min(a: float, b: float) -> float;,
-        fn float_max(a: float, b: float) -> float;,
-        fn float_clamp(x: float, lo: float, hi: float) -> float;,
-        fn float_lerp(x: float, target: float, t: float) -> float;,
-        fn float_to_radians(x: float) -> float;,
-        fn float_to_degrees(x: float) -> float;
-    )
-}
-
-fn string_provider() -> anvyx_externs::ProviderDescriptor {
-    anvyx_lang::provider_descriptor!(
-        provider = "core_string",
-        module = "core_string",
-        fn str_len(s: string) -> int;
-        fn str_contains(s: string, sub: string) -> bool;
-        fn str_starts_with(s: string, prefix: string) -> bool;
-        fn str_ends_with(s: string, suffix: string) -> bool;
-        fn str_find(s: string, sub: string) -> int;
-        fn str_to_upper(s: string) -> string;
-        fn str_to_lower(s: string) -> string;
-        fn str_trim(s: string) -> string;
-        fn str_trim_start(s: string) -> string;
-        fn str_trim_end(s: string) -> string;
-        fn str_substring(s: string, start: int, len: int) -> string?;
-        fn str_char_at(s: string, index: int) -> string?;
-        fn str_split(s: string, sep: string) -> [string];
-        fn str_replace(s: string, from: string, to: string) -> string;
-    )
-}
-
-fn runtime_provider() -> anvyx_externs::ProviderDescriptor {
-    let mut provider = anvyx_lang::provider_descriptor!(
-        provider = "core_runtime",
-        module = "core_runtime",
-        fn _println(message: string) -> void;,
-        fn _assert(condition: bool, message: string) -> void;
-    );
-    provider.modules[0].functions[0].signature.params[0].flow = anvyx_externs::ParamFlow::Borrow;
-    provider.modules[0].functions[1].signature.params[1].flow = anvyx_externs::ParamFlow::Borrow;
-    provider.modules[0].functions[1].effects.fallible = true;
-    provider
+fn provider_support(
+    provider: &str,
+    mut module: anvyx_runtime::RustModuleSupport,
+) -> anvyx_runtime::RustProviderSupport {
+    for ty in &mut module.types {
+        ty.path.crate_name = "anvyx_core2".to_string();
+    }
+    let native_prefix = [provider.to_string()];
+    for binding in &mut module.bindings {
+        binding.path.crate_name = "anvyx_core2".to_string();
+        binding.path.prefix_native(&native_prefix);
+    }
+    anvyx_runtime::RustProviderSupport {
+        package: "<core>".to_string(),
+        provider: anvyx_runtime::ProviderId {
+            name: provider.to_string(),
+        },
+        cargo: anvyx_runtime::RustProviderCargo {
+            manifest_key: "anvyx_core2".to_string(),
+            package: Some("anvyx-core2".to_string()),
+            ..Default::default()
+        },
+        modules: vec![module],
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +259,73 @@ mod tests {
             anvyx_externs::ExternTypeExpr::Void
         );
         assert!(runtime[1].effects.fallible);
+    }
+
+    #[test]
+    fn scalar_provider_metadata() {
+        let providers = provider_descriptors();
+        let int = &providers[0].modules[0].functions;
+        assert_eq!(
+            int.iter()
+                .map(|function| function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["int_abs", "int_min", "int_max", "int_clamp"]
+        );
+        for function in int {
+            assert_eq!(function.signature.ret, anvyx_externs::ExternTypeExpr::Int);
+            assert!(
+                function
+                    .signature
+                    .params
+                    .iter()
+                    .all(|param| param.ty == anvyx_externs::ExternTypeExpr::Int)
+            );
+        }
+
+        let float = &providers[1].modules[0].functions;
+        assert!(float.iter().any(|function| function.name == "float_lerp"));
+        for function in float {
+            assert_eq!(function.signature.ret, anvyx_externs::ExternTypeExpr::Float);
+            assert!(
+                function
+                    .signature
+                    .params
+                    .iter()
+                    .all(|param| param.ty == anvyx_externs::ExternTypeExpr::Float)
+            );
+        }
+    }
+
+    #[test]
+    fn string_provider_metadata_and_support() {
+        let providers = provider_descriptors();
+        let string = &providers[2].modules[0].functions;
+        assert_eq!(string.len(), 14);
+        assert!(
+            string
+                .iter()
+                .flat_map(|function| &function.signature.params)
+                .filter(|param| param.ty == anvyx_externs::ExternTypeExpr::String)
+                .all(|param| param.flow == anvyx_externs::ParamFlow::Borrow)
+        );
+
+        let support = rust_provider_supports();
+        assert_eq!(support.len(), 4);
+        assert_eq!(support[0].cargo.manifest_key, "anvyx_core2");
+        assert_eq!(support[0].cargo.package.as_deref(), Some("anvyx-core2"));
+        let string_support = &support[2].modules[0];
+        assert!(
+            string_support
+                .bindings
+                .iter()
+                .any(|binding| binding.abi.support == anvyx_runtime::RustAbiSupport::Direct)
+        );
+        assert!(
+            string_support
+                .bindings
+                .iter()
+                .any(|binding| binding.abi.support == anvyx_runtime::RustAbiSupport::Unsupported)
+        );
     }
 
     #[test]

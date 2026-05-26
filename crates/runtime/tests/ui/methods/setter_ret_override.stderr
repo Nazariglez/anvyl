@@ -1,0 +1,5 @@
+error: #[anvyx(setter)] does not support ret overrides
+ --> tests/ui/methods/setter_ret_override.rs:8:9
+  |
+8 |     pub fn x(&mut self, value: i64) {}
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: expected #[anvyx(name = ...)]
+ --> tests/ui/inline/unknown_attr.rs:4:9
+  |
+4 | #[anvyx(shared)]
+  |         ^^^^^^

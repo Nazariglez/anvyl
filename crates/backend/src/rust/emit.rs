@@ -60,7 +60,6 @@ impl EmitCx<'_> {
         for helper in &self.program.stringify_helpers {
             self.emit_stringify_helper(helper);
         }
-        self.emit_runtime_externs();
         for function in &self.program.functions {
             self.emit_function(function);
         }
@@ -77,6 +76,15 @@ impl EmitCx<'_> {
     }
 
     fn emit_struct(&mut self, strukt: &super::rir::RirStruct) {
+        if let Some(path) = &strukt.native_path {
+            self.line(&format!(
+                "type {} = {};",
+                strukt.symbol.as_str(),
+                path.join("::")
+            ));
+            self.line("");
+            return;
+        }
         self.line(&format!("struct {} {{", strukt.symbol.as_str()));
         for field in &strukt.fields {
             self.line(&format!(
@@ -182,32 +190,6 @@ impl EmitCx<'_> {
         self.line("    out");
         self.line("}");
         self.line("");
-    }
-
-    fn emit_runtime_externs(&mut self) {
-        for ext in &self.program.externs {
-            let symbol = ext.symbol.as_str();
-            match ext.kind {
-                RirExternKind::CorePrintln => {
-                    self.line(&format!(
-                        "fn {symbol}(_ctx: &mut {}, message: &str) {{",
-                        self.program.ctx.symbol.as_str()
-                    ));
-                    self.line("    println!(\"{}\", message);");
-                    self.line("}");
-                    self.line("");
-                }
-                RirExternKind::CoreAssert => {
-                    self.line(&format!(
-                        "fn {symbol}(_ctx: &mut {}, condition: bool, message: &str) {{",
-                        self.program.ctx.symbol.as_str()
-                    ));
-                    self.line("    assert!(condition, \"{}\", message);");
-                    self.line("}");
-                    self.line("");
-                }
-            }
-        }
     }
 
     fn emit_function(&mut self, function: &RirFunction) {
@@ -512,17 +494,15 @@ impl EmitCx<'_> {
             RirRValue::Cast { value, target } => {
                 format!("{} as {}", self.operand(function, value), self.ty(*target))
             }
-            RirRValue::Call { callee, args, .. } => {
-                let symbol = match callee {
-                    RirCallTarget::Function(id) => {
-                        self.program.functions[id.index()].symbol.as_str()
-                    }
-                    RirCallTarget::Extern(id) => self.program.externs[id.index()].symbol.as_str(),
-                };
-                let mut rendered = vec!["ctx".to_string()];
-                rendered.extend(args.iter().map(|arg| self.call_arg(function, arg)));
-                format!("{symbol}({})", rendered.join(", "))
-            }
+            RirRValue::Call { callee, args, .. } => match callee {
+                RirCallTarget::Function(id) => {
+                    let symbol = self.program.functions[id.index()].symbol.as_str();
+                    let mut rendered = vec!["ctx".to_string()];
+                    rendered.extend(args.iter().map(|arg| self.call_arg(function, arg)));
+                    format!("{symbol}({})", rendered.join(", "))
+                }
+                RirCallTarget::Extern(id) => self.extern_call(function, *id, args),
+            },
             RirRValue::Stringify { value, source_ty } => {
                 match self.program.types[source_ty.index()] {
                     RirType::String => self.operand(function, value),
@@ -644,6 +624,83 @@ impl EmitCx<'_> {
                 }
             }
             _ => self.operand(function, operand),
+        }
+    }
+
+    fn extern_call(
+        &self,
+        function: &RirFunction,
+        id: super::rir::RirExternId,
+        args: &[RirCallArg],
+    ) -> String {
+        let ext = &self.program.externs[id.index()];
+        let (symbol, mut rendered, fallible, ret_abi) = match &ext.kind {
+            RirExternKind::Native(native) => {
+                let mut rendered = vec![];
+                if native.abi.needs_context {
+                    rendered.push("ctx".to_string());
+                }
+                (
+                    native.path.join("::"),
+                    rendered,
+                    native.abi.fallible,
+                    &native.abi.ret,
+                )
+            }
+        };
+        rendered.extend(args.iter().map(|arg| self.call_arg(function, arg)));
+        let call = format!("{symbol}({})", rendered.join(", "));
+        let call = if fallible {
+            format!("{call}.unwrap()")
+        } else {
+            call
+        };
+        self.native_return_call(ext.ret, ret_abi, call)
+    }
+
+    fn native_return_call(
+        &self,
+        ret: RirTypeId,
+        abi: &anvyx_runtime::RustReturnAbi,
+        call: String,
+    ) -> String {
+        match abi {
+            anvyx_runtime::RustReturnAbi::Option(inner) => {
+                self.option_return_call(ret, inner, call)
+            }
+            _ => call,
+        }
+    }
+
+    fn option_return_call(
+        &self,
+        ret: RirTypeId,
+        inner: &anvyx_runtime::RustReturnAbi,
+        call: String,
+    ) -> String {
+        let RirType::Enum(enum_id) = self.program.types[ret.index()] else {
+            unreachable!("verified native option return type")
+        };
+        let enm = &self.program.enums[enum_id.index()];
+        let none = &enm.variants[0];
+        let some = &enm.variants[1];
+        let value = match inner {
+            anvyx_runtime::RustReturnAbi::Value(_) => "value".to_string(),
+            _ => unreachable!("verified native option return inner"),
+        };
+        format!(
+            "match {call} {{ Some(value) => {}::{}, None => {}::{} }}",
+            enm.symbol.as_str(),
+            self.option_some_expr(some, &value),
+            enm.symbol.as_str(),
+            none.symbol.as_str()
+        )
+    }
+
+    fn option_some_expr(&self, variant: &RirVariant, value: &str) -> String {
+        match variant.kind {
+            RirVariantKind::Tuple => format!("{}({value})", variant.symbol.as_str()),
+            _ => unreachable!("verified native option some variant"),
         }
     }
 

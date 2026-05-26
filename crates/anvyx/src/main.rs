@@ -303,7 +303,6 @@ fn run(cli: Cli) -> Result<(), String> {
                         "--new-frontend build currently requires --backend rust".to_string()
                     );
                 }
-                manifest::reject_clean_frontend_inputs(Some(&manifest))?;
                 let entry = manifest
                     .project
                     .entry
@@ -623,6 +622,7 @@ mod tests {
         Manifest {
             project: manifest::Project {
                 name: None,
+                version: None,
                 entry: Some("main.anv".to_string()),
             },
             dependencies: HashMap::default(),

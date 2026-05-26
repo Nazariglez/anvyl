@@ -1,28 +1,29 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, AggregateCtor, AirBody, CallArg, Callee, ConstData, ConstValue, EnumDecl, ExternDecl,
-        ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
-        FunctionKind, Local, LocalKind, Mutability, Operand, Param, ParamMode, ParamRole, Place,
-        Program, Projection, RValue, Signature, TypeData, VariantDecl, VariantId, VariantShape,
+        self, AggregateCtor, AirBody, CallArg, Callee, ConstData, ConstValue, EnumDecl,
+        ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl,
+        FieldDecl, Function, FunctionKind, FunctionSpecialization, Local, LocalKind, Mutability,
+        Operand, Param, ParamMode, ParamRole, Place, Program, Projection, RValue, Signature,
+        TypeData, VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
 
 use super::{
-    RustPlanConfig, emit, plan,
+    RustPlanConfig, cargo_job, emit, plan,
     profile::{ProfileErrorKind, RustBackendProfile, RustBackendProfileError},
     rir::{
-        self, RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirEnum, RirEnumId,
-        RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId, RirExternKind, RirExternParam,
-        RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirIf,
-        RirLocal, RirLocalId, RirOperand, RirParam, RirParamAbi, RirParamSemantic, RirPlace,
-        RirProgram, RirRValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
-        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
-        RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, RirVerifyErrorKind,
+        self, RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
+        RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId, RirExternKind,
+        RirExternParam, RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction,
+        RirFunctionId, RirIf, RirLocal, RirLocalId, RirOperand, RirParam, RirParamAbi,
+        RirParamSemantic, RirPlace, RirProgram, RirRValue, RirReturn, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant,
+        RirVariantId, RirVariantKind, RirVerifyErrorKind,
     },
-    source_job::{self, RustSourceJob, SourceJobStatus},
+    source_job::{self, SourceJobStatus},
 };
 
 fn structured_body(stmts: Vec<Statement>, tail: air::AirTail) -> AirBody {
@@ -55,6 +56,7 @@ fn profile_accepts_scalar_arithmetic_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![local(int, LocalKind::Temp)],
         body: structured_body(
@@ -92,6 +94,7 @@ fn profile_accepts_numeric_cast_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], float),
         locals: vec![local(float, LocalKind::Temp)],
         body: structured_body(
@@ -124,6 +127,7 @@ fn profile_accepts_direct_function_call_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![],
         body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one)))),
@@ -134,6 +138,7 @@ fn profile_accepts_direct_function_call_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![local(int, LocalKind::Temp)],
         body: structured_body(
@@ -174,6 +179,7 @@ fn profile_accepts_core_println_extern_call_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![local(string, LocalKind::Temp)],
         body: structured_body(
@@ -225,6 +231,7 @@ fn profile_accepts_core_assert_extern_call_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![local(string, LocalKind::Temp)],
         body: structured_body(
@@ -275,6 +282,7 @@ fn profile_rejects_tuple_construction_as_explicit_target_gap() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], tuple),
         locals: vec![local(tuple, LocalKind::Temp)],
         body: structured_body(
@@ -310,6 +318,7 @@ fn profile_rejects_unsupported_format_source() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![param("x", tuple, ParamMode::Value, arg)], string),
         locals: vec![local(tuple, LocalKind::Arg), local(string, LocalKind::Temp)],
         body: structured_body(
@@ -346,6 +355,7 @@ fn profile_rejects_invalid_format_spec_for_source_type() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], string),
         locals: vec![local(string, LocalKind::Temp)],
         body: structured_body(
@@ -377,6 +387,7 @@ fn profile_accepts_unreachable_terminator() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![],
         body: structured_body(vec![], air::AirTail::Unreachable),
@@ -412,7 +423,7 @@ fn source_job_compiles_struct_stringify_helper() {
     let source = plan_source(program);
 
     assert!(source.as_str().contains("use std::fmt::Write;"));
-    assert!(source.as_str().contains("fn anvstringify_t3"));
+    assert!(source.as_str().contains("fn anvstringify_t3_point"));
     assert!(
         source
             .as_str()
@@ -449,6 +460,7 @@ fn stringify_override_value_receiver_uses_copy_reconstruction() {
         module,
         kind: FunctionKind::Method,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![Param {
                 name: Some(Ident::new("self")),
@@ -514,6 +526,7 @@ fn stringify_override_noncopy_value_receiver_is_target_gap() {
         module,
         kind: FunctionKind::Method,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![Param {
                 name: Some(Ident::new("self")),
@@ -543,6 +556,7 @@ fn stringify_override_noncopy_value_receiver_is_target_gap() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
             local(named, LocalKind::Temp),
@@ -606,9 +620,113 @@ fn stringify_planning_dedupes_struct_requirements() {
     );
 
     let verified = air::verify(&program).expect("AIR verify failed");
-    let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
 
     assert_eq!(plan.program().stringify_helpers.len(), 1);
+}
+
+#[test]
+fn source_job_suffixes_generic_function_specializations() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let float = program.alloc_type(TypeData::Float);
+    let bool_ty = program.alloc_type(TypeData::Bool);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    for ty in [int, float, bool_ty] {
+        let func = program.alloc_function(Function {
+            name: Ident::new("println"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: Some(FunctionSpecialization {
+                type_args: vec![ty],
+                const_args: vec![],
+            }),
+            signature: Signature::new(vec![], void),
+            locals: vec![],
+            body: structured_body(vec![], air::AirTail::Return(None)),
+        });
+        program.module_mut(module).functions.push(func);
+    }
+
+    let source = plan_source(program).into_string();
+
+    assert!(source.contains("fn anv_f0_println_int"));
+    assert!(source.contains("fn anv_f1_println_float"));
+    assert!(source.contains("fn anv_f2_println_bool"));
+}
+
+#[test]
+fn source_job_suffixes_nested_generic_function_specialization() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let option_enum = program.alloc_enum(EnumDecl {
+        name: Ident::new("Option"),
+        module: air::ModuleId::from_index(0),
+        type_args: vec![string],
+        const_args: vec![],
+        core: Some(air::CoreEnumKind::Option),
+        variants: vec![
+            VariantDecl {
+                name: Ident::new("None"),
+                shape: VariantShape::Unit,
+            },
+            VariantDecl {
+                name: Ident::new("Some"),
+                shape: VariantShape::Tuple(vec![string]),
+            },
+        ],
+    });
+    let option = program.alloc_type(TypeData::Enum(option_enum));
+    let list = program.alloc_type(TypeData::List(option));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    program.enum_decl_mut(option_enum).module = module;
+    let func = program.alloc_function(Function {
+        name: Ident::new("show"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: Some(FunctionSpecialization {
+            type_args: vec![list],
+            const_args: vec![],
+        }),
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).enums.push(option_enum);
+    program.module_mut(module).functions.push(func);
+
+    let source = plan_source(program).into_string();
+
+    assert!(source.contains("fn anv_f0_show_list_option_string"));
+}
+
+#[test]
+fn source_job_suffixes_negative_const_specialization() {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let func = program.alloc_function(Function {
+        name: Ident::new("show"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: Some(FunctionSpecialization {
+            type_args: vec![],
+            const_args: vec![ConstValue::Int(-1)],
+        }),
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(func);
+
+    let source = plan_source(program).into_string();
+
+    assert!(source.contains("fn anv_f0_show_n_neg_1"));
 }
 
 #[test]
@@ -776,6 +894,7 @@ fn source_job_compiles_rust_keyword_member_symbols() {
         module,
         type_args: vec![],
         const_args: vec![],
+        core: None,
         variants: vec![VariantDecl {
             name: Ident::new("dyn"),
             shape: VariantShape::Unit,
@@ -802,6 +921,7 @@ fn source_job_compiles_rust_keyword_member_symbols() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![
             local(record, LocalKind::Temp),
@@ -864,6 +984,7 @@ fn plan_handles_non_topological_type_arena_refs() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], array),
         locals: vec![local(array, LocalKind::Temp)],
         body: structured_body(
@@ -974,6 +1095,8 @@ fn rir_verify_rejects_bad_struct_declarations() {
         air_id: None,
         symbol: RirSymbol::new("S"),
         display: RirSymbol::new("S"),
+        native_path: None,
+        native_key: None,
         copyable: true,
         fields: vec![
             RirField {
@@ -1011,6 +1134,8 @@ fn rir_verify_rejects_bad_struct_construction_and_projection() {
         air_id: None,
         symbol: RirSymbol::new("S"),
         display: RirSymbol::new("S"),
+        native_path: None,
+        native_key: None,
         copyable: true,
         fields: vec![RirField {
             id: RirFieldId::from_index(0),
@@ -1088,6 +1213,7 @@ fn profile_rejects_non_immediate_value_params() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![param("x", string, ParamMode::Value, local_id)], void),
         locals: vec![local(string, LocalKind::Arg)],
         body: structured_body(vec![], air::AirTail::Return(None)),
@@ -1109,6 +1235,7 @@ fn profile_rejects_unsupported_param_modes() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![param("x", string, ParamMode::MutBorrow, local_id)],
             void,
@@ -1137,6 +1264,7 @@ fn profile_rejects_deferred_function_kinds_and_param_roles() {
         module,
         kind: FunctionKind::ExtendMethod,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![Param {
                 role: ParamRole::Receiver,
@@ -1167,6 +1295,7 @@ fn profile_rejects_closure_locals_and_rvalues() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
             local(void, LocalKind::Capture),
@@ -1204,6 +1333,7 @@ fn profile_rejects_closure_callees() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![param("f", closure_ty, ParamMode::Value, closure_local)],
             void,
@@ -1241,6 +1371,7 @@ fn profile_rejects_collection_rvalues() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![local(list, LocalKind::Temp)],
         body: structured_body(
@@ -1267,15 +1398,117 @@ fn profile_rejects_collection_rvalues() {
 }
 
 #[test]
-fn profile_rejects_core_runtime_extern_with_wrong_signature() {
+fn profile_accepts_provider_bound_non_runtime_extern_call() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let ext = extern_in_module(
+        &mut program,
+        &["core_int"],
+        "int_abs",
+        vec![(int, ParamMode::Value)],
+        int,
+        ExternMember::FreeFunction,
+    );
+    program.externs[ext.index()].binding = Some(ExternBindingDecl {
+        package: anvyx_frontend::resolve::PackageId::core(),
+        provider: anvyx_runtime::ProviderId {
+            name: "core_int".to_string(),
+        },
+        key: anvyx_runtime::ExternBindingKey {
+            target: anvyx_runtime::ExternBindingTarget::Function(
+                anvyx_runtime::ExternFunctionKey {
+                    module: anvyx_runtime::ModulePath {
+                        segments: vec!["core_int".to_string()],
+                    },
+                    name: "int_abs".to_string(),
+                },
+            ),
+            operation: anvyx_runtime::ExternBindingOp::Call,
+        },
+    });
+    let module = program.alloc_module(root_module());
+    let tmp = air::LocalId::from_index(0);
+    let arg = program.const_arena.alloc(ConstData {
+        ty: int,
+        value: ConstValue::Int(-7),
+    });
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: tmp,
+                value: RValue::Call {
+                    callee: Callee::Extern(ext),
+                    args: vec![CallArg::Value(Operand::Const(arg))],
+                },
+            }],
+            air::AirTail::Return(Some(Operand::Place(place(tmp, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+
+    check(program);
+}
+
+#[test]
+fn plan_accepts_core_runtime_native_binding() {
+    let program = scalar_print_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+
+    assert!(matches!(
+        plan.program().externs[0].kind,
+        RirExternKind::Native(_)
+    ));
+}
+
+#[test]
+fn plan_rejects_missing_native_binding() {
+    let program = scalar_print_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let Err(err) = plan(&verified, RustPlanConfig::default()) else {
+        panic!("plan should reject missing native binding");
+    };
+
+    assert!(
+        matches!(err, super::RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == super::RustTargetGapKind::UnsupportedExtern))
+    );
+}
+
+#[test]
+fn plan_rejects_unsupported_native_abi() {
+    let program = scalar_print_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let mut config = rust_plan_config();
+    let binding = &mut config.native_providers[0].modules[0].bindings[0];
+    binding.abi.support = anvyx_runtime::RustAbiSupport::Unsupported;
+    let Err(err) = plan(&verified, config) else {
+        panic!("plan should reject unsupported native ABI");
+    };
+
+    assert!(
+        matches!(err, super::RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == super::RustTargetGapKind::UnsupportedRustAbi))
+    );
+}
+
+#[test]
+fn profile_rejects_source_only_extern() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
-    runtime_extern(
+    extern_in_module(
         &mut program,
+        &["core_runtime"],
         "_println",
         vec![(int, ParamMode::Value)],
         void,
+        ExternMember::FreeFunction,
     );
 
     expect_reject(program, ProfileErrorKind::UnsupportedExtern);
@@ -1299,13 +1532,14 @@ fn profile_rejects_runtime_named_extern_in_wrong_module() {
 }
 
 #[test]
-fn profile_rejects_non_free_extern_members() {
+fn profile_accepts_bound_extern_members_but_rejects_missing_binding() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(runtime_module());
     let owner = program.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("Host"),
         module,
+        binding: None,
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
@@ -1322,14 +1556,12 @@ fn profile_rejects_non_free_extern_members() {
         member: ExternMember::StaticMethod { owner },
         params: vec![],
         return_type: void,
+        binding: None,
+        effects: anvyx_runtime::ExternEffects::default(),
     });
     program.module_mut(module).externs.push(id);
 
     let errors = profile_errors(program);
-    assert!(has_error(
-        &errors,
-        ProfileErrorKind::UnsupportedExternMember
-    ));
     assert!(has_error(&errors, ProfileErrorKind::UnsupportedExtern));
 }
 
@@ -1355,6 +1587,7 @@ fn plan_signatures_uses_stable_ids_and_context_first_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![param("x", int, ParamMode::Value, arg)], int),
         locals: vec![local(int, LocalKind::Arg)],
         body: structured_body(
@@ -1371,6 +1604,7 @@ fn plan_signatures_uses_stable_ids_and_context_first_shape() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![],
         body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one)))),
@@ -1433,6 +1667,7 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
         module,
         kind: FunctionKind::Method,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![Param {
                 role: ParamRole::Receiver,
@@ -1448,6 +1683,7 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
         module,
         kind: FunctionKind::Method,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![Param {
                 role: ParamRole::Receiver,
@@ -1465,6 +1701,7 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
         owner: Some(air::FunctionOwner {
             name: Ident::new("First"),
         }),
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![],
         body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one)))),
@@ -1474,6 +1711,7 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![],
         body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one)))),
@@ -1485,6 +1723,7 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
             local(first_ty, LocalKind::Temp),
@@ -1589,8 +1828,8 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
     let source = plan_source(program).into_string();
 
     assert!(source.contains("fn anv_f0_main(ctx: &mut AnvCtx)"));
-    assert!(source.contains("fn anv_extern__println(_ctx: &mut AnvCtx, message: &str)"));
-    assert!(source.contains("anv_extern__println(ctx, v0.as_str())"));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(v0.as_str())"));
+    assert!(!source.contains("fn anv_extern__println"));
     assert!(!source.contains("impl "));
     assert!(!source.contains("trait "));
     assert!(!source.contains(".clone()"));
@@ -1611,6 +1850,7 @@ fn emit_uses_underscored_context_only_for_leaf_bodies() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![],
         body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one)))),
@@ -1620,6 +1860,7 @@ fn emit_uses_underscored_context_only_for_leaf_bodies() {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![local(int, LocalKind::Temp)],
         body: structured_body(
@@ -1657,7 +1898,7 @@ fn emit_uses_underscored_context_for_primitive_struct_stringify_helper() {
     }
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("fn anvstringify_t3(_ctx: &mut AnvCtx, value: &anvT3_Point)"));
+    assert!(source.contains("fn anvstringify_t3_point(_ctx: &mut AnvCtx, value: &anvT3_Point)"));
 }
 
 #[test]
@@ -1677,6 +1918,8 @@ fn emit_keeps_context_name_for_nested_struct_stringify_helper() {
                 air_id: None,
                 symbol: RirSymbol::new("Inner"),
                 display: RirSymbol::new("Inner"),
+                native_path: None,
+                native_key: None,
                 copyable: true,
                 fields: vec![RirField {
                     id: RirFieldId::from_index(0),
@@ -1689,6 +1932,8 @@ fn emit_keeps_context_name_for_nested_struct_stringify_helper() {
                 air_id: None,
                 symbol: RirSymbol::new("Outer"),
                 display: RirSymbol::new("Outer"),
+                native_path: None,
+                native_key: None,
                 copyable: true,
                 fields: vec![RirField {
                     id: RirFieldId::from_index(0),
@@ -1757,7 +2002,7 @@ fn source_job_compiles_and_runs_string_concat_program() {
 fn emit_borrows_string_literal_call_arg_without_owned_temp() {
     let source = plan_source(borrow_string_literal_program()).into_string();
 
-    assert!(source.contains("anv_extern__println(ctx, \"ready\");"));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(\"ready\");"));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -1767,9 +2012,26 @@ fn emit_forwards_borrowed_string_param_as_str_without_double_borrow() {
     let source = plan_source(shared_string_forward_program()).into_string();
 
     assert!(source.contains(": &str"));
-    assert!(source.contains("anv_extern__println(ctx, v0);"));
-    assert!(!source.contains("anv_extern__println(ctx, &v0);"));
-    assert!(!source.contains("anv_extern__println(ctx, v0.as_str());"));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(v0);"));
+    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(&v0);"));
+    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(v0.as_str());"));
+}
+
+#[test]
+fn emit_borrows_string_constant_for_native_string_param() {
+    let source = plan_source(native_str_len_const_program()).into_string();
+
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(\"abc\")"));
+    assert!(!source.contains("String::from"));
+    assert!(!source.contains("to_string()"));
+}
+
+#[test]
+fn emit_borrows_string_local_for_native_string_param() {
+    let source = plan_source(native_str_len_local_program()).into_string();
+
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(v0.as_str())"));
+    assert!(!source.contains("anvyx_core2::__anvyx_native::core_string::str_len(&v0)"));
 }
 
 #[test]
@@ -2123,13 +2385,91 @@ fn rir_verify_rejects_bad_extern_signature() {
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("bad_println"),
-        kind: RirExternKind::CorePrintln,
+        kind: RirExternKind::Native(rir::RirNativeExtern {
+            path: vec!["host".to_string(), "println".to_string()],
+            abi: anvyx_runtime::RustExternAbi {
+                params: vec![anvyx_runtime::RustParamAbi::Borrow(
+                    anvyx_runtime::ExternTypeExpr::String,
+                )],
+                ret: anvyx_runtime::RustReturnAbi::Void,
+                needs_context: false,
+                fallible: false,
+                support: anvyx_runtime::RustAbiSupport::Direct,
+            },
+        }),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(0),
             semantic: RirParamSemantic::Value,
             abi: RirParamAbi::Value,
         }],
         ret: RirTypeId::from_index(2),
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_native_extern_param_type_mismatch() {
+    let mut program = empty_rir_function(RirType::Int);
+    program.types.push(RirType::Void);
+    program.externs.push(RirExtern {
+        id: RirExternId::from_index(0),
+        symbol: RirSymbol::new("bad_bool"),
+        kind: RirExternKind::Native(rir::RirNativeExtern {
+            path: vec!["host".to_string(), "bad_bool".to_string()],
+            abi: anvyx_runtime::RustExternAbi {
+                params: vec![anvyx_runtime::RustParamAbi::Value(
+                    anvyx_runtime::ExternTypeExpr::Bool,
+                )],
+                ret: anvyx_runtime::RustReturnAbi::Void,
+                needs_context: false,
+                fallible: false,
+                support: anvyx_runtime::RustAbiSupport::Direct,
+            },
+        }),
+        params: vec![RirExternParam {
+            ty: RirTypeId::from_index(0),
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+        }],
+        ret: RirTypeId::from_index(1),
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_accepts_native_core_option_return() {
+    let program = native_option_return_program(Some(RirCoreEnumKind::Option));
+
+    rir::verify(&program).expect("core option return should verify");
+}
+
+#[test]
+fn rir_verify_rejects_native_option_return_for_non_core_option_shape() {
+    let program = native_option_return_program(None);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_native_extern_return_type_mismatch() {
+    let mut program = empty_rir_function(RirType::Int);
+    program.externs.push(RirExtern {
+        id: RirExternId::from_index(0),
+        symbol: RirSymbol::new("bad_return"),
+        kind: RirExternKind::Native(rir::RirNativeExtern {
+            path: vec!["host".to_string(), "bad_return".to_string()],
+            abi: anvyx_runtime::RustExternAbi {
+                params: vec![],
+                ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::Bool),
+                needs_context: false,
+                fallible: false,
+                support: anvyx_runtime::RustAbiSupport::Direct,
+            },
+        }),
+        params: vec![],
+        ret: RirTypeId::from_index(0),
     });
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
@@ -2194,6 +2534,7 @@ fn enum_match_rir(
     program.enums.push(RirEnum {
         id: RirEnumId::from_index(0),
         air_id: None,
+        core: None,
         symbol: RirSymbol::new("E"),
         display: RirSymbol::new("E"),
         copyable: true,
@@ -2326,6 +2667,7 @@ fn struct_method_program() -> Program {
         module,
         kind: FunctionKind::Method,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![Param {
                 name: Some(Ident::new("self")),
@@ -2364,6 +2706,7 @@ fn struct_method_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
             local(point, LocalKind::Temp),
@@ -2446,6 +2789,7 @@ fn struct_field_read_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
             local(point, LocalKind::Temp),
@@ -2532,6 +2876,7 @@ fn scalar_branch_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], int),
         locals: vec![local(int, LocalKind::Temp)],
         body: AirBody {
@@ -2611,6 +2956,7 @@ fn format_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
             Local {
@@ -2757,6 +3103,7 @@ fn string_concat_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
             Local {
@@ -2832,6 +3179,7 @@ fn borrow_string_literal_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![],
         body: structured_body(
@@ -2863,6 +3211,7 @@ fn shared_string_forward_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![param("message", string, ParamMode::SharedBorrow, message)],
             void,
@@ -2880,6 +3229,93 @@ fn shared_string_forward_program() -> Program {
     program
 }
 
+fn native_str_len_const_program() -> Program {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let int = program.alloc_type(TypeData::Int);
+    let str_len = string_extern(
+        &mut program,
+        "str_len",
+        vec![(string, ParamMode::SharedBorrow)],
+        int,
+    );
+    let text = program.const_arena.alloc(ConstData {
+        ty: string,
+        value: ConstValue::String("abc".into()),
+    });
+    let out = air::LocalId::from_index(0);
+    let module = program.alloc_module(root_module());
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: out,
+                value: RValue::Call {
+                    callee: Callee::Extern(str_len),
+                    args: vec![CallArg::SharedStringConst(text)],
+                },
+            }],
+            air::AirTail::Return(Some(Operand::Place(place(out, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    program
+}
+
+fn native_str_len_local_program() -> Program {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let int = program.alloc_type(TypeData::Int);
+    let str_len = string_extern(
+        &mut program,
+        "str_len",
+        vec![(string, ParamMode::SharedBorrow)],
+        int,
+    );
+    let text = program.const_arena.alloc(ConstData {
+        ty: string,
+        value: ConstValue::String("abc".into()),
+    });
+    let text_local = air::LocalId::from_index(0);
+    let out = air::LocalId::from_index(1);
+    let module = program.alloc_module(root_module());
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![local(string, LocalKind::Temp), local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: text_local,
+                    value: RValue::Use(Operand::Const(text)),
+                },
+                Statement::Init {
+                    local: out,
+                    value: RValue::Call {
+                        callee: Callee::Extern(str_len),
+                        args: vec![CallArg::SharedBorrow(place(text_local, string))],
+                    },
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(place(out, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    program
+}
+
 fn format_borrowed_string_program() -> Program {
     let mut program = Program::default();
     let string = program.alloc_type(TypeData::String);
@@ -2891,6 +3327,7 @@ fn format_borrowed_string_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(
             vec![param("input", string, ParamMode::SharedBorrow, input)],
             string,
@@ -2944,6 +3381,7 @@ fn scalar_print_program() -> Program {
         module,
         kind: FunctionKind::Normal,
         owner: None,
+        specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![local(string, LocalKind::Temp)],
         body: structured_body(
@@ -3002,6 +3440,7 @@ mod enums {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(
                 vec![param("event", enum_ty, ParamMode::Value, value)],
                 enum_ty,
@@ -3097,6 +3536,7 @@ mod enums {
         program.enums.push(RirEnum {
             id: RirEnumId::from_index(0),
             air_id: None,
+            core: None,
             symbol: RirSymbol::new("E"),
             display: RirSymbol::new("E"),
             copyable: true,
@@ -3132,6 +3572,7 @@ mod enums {
         program.enums.push(RirEnum {
             id: RirEnumId::from_index(0),
             air_id: None,
+            core: None,
             symbol: RirSymbol::new("E"),
             display: RirSymbol::new("E"),
             copyable: true,
@@ -3171,6 +3612,8 @@ mod enums {
             air_id: None,
             symbol: RirSymbol::new("S"),
             display: RirSymbol::new("S"),
+            native_path: None,
+            native_key: None,
             copyable: true,
             fields: vec![RirField {
                 id: RirFieldId::from_index(0),
@@ -3181,6 +3624,7 @@ mod enums {
         program.enums.push(RirEnum {
             id: RirEnumId::from_index(0),
             air_id: None,
+            core: None,
             symbol: RirSymbol::new("E"),
             display: RirSymbol::new("E"),
             copyable: true,
@@ -3216,6 +3660,7 @@ mod enums {
             module,
             type_args: vec![],
             const_args: vec![],
+            core: None,
             variants: vec![
                 VariantDecl {
                     name: Ident::new("Start"),
@@ -3259,6 +3704,7 @@ mod enums {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], void),
             locals: vec![
                 local(event, LocalKind::Temp),
@@ -3301,6 +3747,7 @@ mod enums {
             module,
             type_args: vec![],
             const_args: vec![],
+            core: None,
             variants: vec![VariantDecl {
                 name: Ident::new("Text"),
                 shape: VariantShape::Tuple(vec![string]),
@@ -3331,6 +3778,7 @@ mod enums {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], void),
             locals: vec![local(message, LocalKind::Temp)],
             body: structured_body(statements, air::AirTail::Return(None)),
@@ -3393,6 +3841,7 @@ mod arrays {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![
                 local(array, LocalKind::Temp),
@@ -3452,6 +3901,7 @@ mod arrays {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(
                 vec![param("items", array, ParamMode::SharedBorrow, arg)],
                 int,
@@ -3466,6 +3916,7 @@ mod arrays {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![local(array, LocalKind::Temp), local(int, LocalKind::Temp)],
             body: structured_body(
@@ -3532,6 +3983,7 @@ mod arrays {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], array),
             locals: vec![
                 local(point, LocalKind::Temp),
@@ -3584,6 +4036,7 @@ mod arrays {
             module,
             type_args: vec![],
             const_args: vec![],
+            core: None,
             variants: vec![VariantDecl {
                 name: Ident::new("Some"),
                 shape: VariantShape::Tuple(vec![int]),
@@ -3604,6 +4057,7 @@ mod arrays {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], array),
             locals: vec![
                 local(choice, LocalKind::Temp),
@@ -3667,6 +4121,7 @@ mod arrays {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![
                 local(array, LocalKind::Temp),
@@ -3724,6 +4179,7 @@ mod arrays {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], array),
             locals: vec![local(array, LocalKind::Temp), local(array, LocalKind::Temp)],
             body: structured_body(
@@ -3825,6 +4281,7 @@ mod lists {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![
                 mut_local(list, LocalKind::Temp),
@@ -3889,6 +4346,7 @@ mod lists {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(
                 vec![param("items", list, ParamMode::SharedBorrow, arg)],
                 int,
@@ -3903,6 +4361,7 @@ mod lists {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![local(list, LocalKind::Temp), local(int, LocalKind::Temp)],
             body: structured_body(
@@ -3950,6 +4409,7 @@ mod lists {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![local(list, LocalKind::Temp)],
             body: structured_body(
@@ -3994,6 +4454,7 @@ mod lists {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![
                 local(list, LocalKind::Temp),
@@ -4045,6 +4506,7 @@ mod lists {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], list),
             locals: vec![local(list, LocalKind::Temp), local(list, LocalKind::Temp)],
             body: structured_body(
@@ -4086,6 +4548,7 @@ mod lists {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![local(list, LocalKind::Temp)],
             body: structured_body(
@@ -4135,6 +4598,7 @@ mod slices {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![
                 local(array, LocalKind::Temp),
@@ -4206,6 +4670,7 @@ mod slices {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![
                 local(list, LocalKind::Temp),
@@ -4284,6 +4749,7 @@ mod slices {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], int),
             locals: vec![
                 local(array, LocalKind::Temp),
@@ -4361,6 +4827,7 @@ mod slices {
             module,
             kind: FunctionKind::Normal,
             owner: None,
+            specialization: None,
             signature: Signature::new(vec![], list),
             locals: vec![
                 local(list, LocalKind::Temp),
@@ -4408,6 +4875,61 @@ mod slices {
     }
 }
 
+fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
+    let mut program = RirProgram::default();
+    let string = RirTypeId::from_index(0);
+    let option = RirTypeId::from_index(1);
+    program.types.push(RirType::String);
+    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    program.enums.push(RirEnum {
+        id: RirEnumId::from_index(0),
+        air_id: None,
+        core,
+        symbol: RirSymbol::new("OptionString"),
+        display: RirSymbol::new("Option"),
+        copyable: false,
+        variants: vec![
+            RirVariant {
+                id: RirVariantId::from_index(0),
+                symbol: RirSymbol::new("None"),
+                display: RirSymbol::new("None"),
+                kind: RirVariantKind::Unit,
+                fields: vec![],
+            },
+            RirVariant {
+                id: RirVariantId::from_index(1),
+                symbol: RirSymbol::new("Some"),
+                display: RirSymbol::new("Some"),
+                kind: RirVariantKind::Tuple,
+                fields: vec![RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("f0"),
+                    ty: string,
+                }],
+            },
+        ],
+    });
+    program.externs.push(RirExtern {
+        id: RirExternId::from_index(0),
+        symbol: RirSymbol::new("substring"),
+        kind: RirExternKind::Native(rir::RirNativeExtern {
+            path: vec!["host".to_string(), "substring".to_string()],
+            abi: anvyx_runtime::RustExternAbi {
+                params: vec![],
+                ret: anvyx_runtime::RustReturnAbi::Option(Box::new(
+                    anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String),
+                )),
+                needs_context: false,
+                fallible: false,
+                support: anvyx_runtime::RustAbiSupport::Direct,
+            },
+        }),
+        params: vec![],
+        ret: option,
+    });
+    program
+}
+
 fn mut_local(ty: air::TypeId, kind: LocalKind) -> Local {
     Local {
         name: None,
@@ -4426,16 +4948,61 @@ fn int_const(program: &mut Program, ty: air::TypeId, value: i64) -> air::ConstId
 
 fn plan_source(program: Program) -> emit::RustSource {
     let verified = air::verify(&program).expect("AIR verify failed");
-    let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     emit::emit(&plan.verified())
 }
 
+fn rust_plan_config() -> RustPlanConfig {
+    RustPlanConfig {
+        symbol_prefix: "anv".into(),
+        native_providers: vec![core2_runtime_support(), core2_string_support()],
+    }
+}
+
 fn run_source(source: emit::RustSource) -> source_job::RustSourceJobOutput {
-    source_job::compile_and_run(&RustSourceJob {
+    let cache = tempfile::tempdir().expect("temp dir failed");
+    let dep = cargo_job::RustCargoDependency {
+        name: cargo_job::RustCargoName::parse("anvyx_core2").unwrap(),
+        package: Some(cargo_job::RustCargoPackageName::parse("anvyx-core2").unwrap()),
+        source: cargo_job::RustCargoDependencySource::Path(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("core2")
+                .display()
+                .to_string(),
+        ),
+        features: vec![],
+        default_features: true,
+    };
+    let job = cargo_job::single_program_job_with_dependencies(
         source,
-        work_dir: None,
-    })
-    .expect("source job failed")
+        cache.path().to_path_buf(),
+        cargo_job::RustCargoProfile::Dev,
+        cargo_job::RustCargoMode::Run,
+        "test",
+        vec![dep],
+    );
+    match cargo_job::execute(&job).expect("Cargo job failed") {
+        cargo_job::RustCargoOutput::Success(output) => source_job::RustSourceJobOutput {
+            status: SourceJobStatus::Success,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            artifact: output.binary_path,
+        },
+        cargo_job::RustCargoOutput::CargoFailed(output) => source_job::RustSourceJobOutput {
+            status: SourceJobStatus::CompileFailed(output.status),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            artifact: output.target_dir,
+        },
+        cargo_job::RustCargoOutput::RunFailed(output) => source_job::RustSourceJobOutput {
+            status: SourceJobStatus::RunFailed(output.status),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            artifact: output.target_dir,
+        },
+    }
 }
 
 fn check(program: Program) {
@@ -4457,6 +5024,131 @@ fn has_error(errors: &[RustBackendProfileError], kind: ProfileErrorKind) -> bool
     errors.iter().any(|error| error.kind == kind)
 }
 
+fn core2_runtime_support() -> anvyx_runtime::RustProviderSupport {
+    use anvyx_runtime::{
+        ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternFunctionKey, ExternTypeExpr,
+        ModulePath, ProviderId, RustAbiSupport, RustExternAbi, RustExternBinding,
+        RustModuleSupport, RustParamAbi, RustPath, RustProviderCargo, RustProviderSupport,
+        RustReturnAbi,
+    };
+
+    let module = ModulePath {
+        segments: vec!["core_runtime".to_string()],
+    };
+    RustProviderSupport {
+        package: "<core>".to_string(),
+        provider: ProviderId {
+            name: "core_runtime".to_string(),
+        },
+        cargo: RustProviderCargo::default(),
+        modules: vec![RustModuleSupport {
+            module: module.clone(),
+            types: vec![],
+            bindings: vec![
+                RustExternBinding {
+                    key: ExternBindingKey {
+                        target: ExternBindingTarget::Function(ExternFunctionKey {
+                            module: module.clone(),
+                            name: "_println".to_string(),
+                        }),
+                        operation: ExternBindingOp::Call,
+                    },
+                    path: RustPath {
+                        crate_name: "anvyx_core2".to_string(),
+                        segments: vec![
+                            "__anvyx_native".to_string(),
+                            "core_runtime".to_string(),
+                            "_println".to_string(),
+                        ],
+                    },
+                    abi: RustExternAbi {
+                        params: vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
+                        ret: RustReturnAbi::Void,
+                        needs_context: false,
+                        fallible: false,
+                        support: RustAbiSupport::Direct,
+                    },
+                },
+                RustExternBinding {
+                    key: ExternBindingKey {
+                        target: ExternBindingTarget::Function(ExternFunctionKey {
+                            module,
+                            name: "_assert".to_string(),
+                        }),
+                        operation: ExternBindingOp::Call,
+                    },
+                    path: RustPath {
+                        crate_name: "anvyx_core2".to_string(),
+                        segments: vec![
+                            "__anvyx_native".to_string(),
+                            "core_runtime".to_string(),
+                            "_assert".to_string(),
+                        ],
+                    },
+                    abi: RustExternAbi {
+                        params: vec![
+                            RustParamAbi::Value(ExternTypeExpr::Bool),
+                            RustParamAbi::Borrow(ExternTypeExpr::String),
+                        ],
+                        ret: RustReturnAbi::Void,
+                        needs_context: false,
+                        fallible: true,
+                        support: RustAbiSupport::Direct,
+                    },
+                },
+            ],
+        }],
+    }
+}
+
+fn core2_string_support() -> anvyx_runtime::RustProviderSupport {
+    use anvyx_runtime::{
+        ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternFunctionKey, ExternTypeExpr,
+        ModulePath, ProviderId, RustAbiSupport, RustExternAbi, RustExternBinding,
+        RustModuleSupport, RustParamAbi, RustPath, RustProviderCargo, RustProviderSupport,
+        RustReturnAbi,
+    };
+
+    let module = ModulePath {
+        segments: vec!["core_string".to_string()],
+    };
+    RustProviderSupport {
+        package: "<core>".to_string(),
+        provider: ProviderId {
+            name: "core_string".to_string(),
+        },
+        cargo: RustProviderCargo::default(),
+        modules: vec![RustModuleSupport {
+            module: module.clone(),
+            types: vec![],
+            bindings: vec![RustExternBinding {
+                key: ExternBindingKey {
+                    target: ExternBindingTarget::Function(ExternFunctionKey {
+                        module,
+                        name: "str_len".to_string(),
+                    }),
+                    operation: ExternBindingOp::Call,
+                },
+                path: RustPath {
+                    crate_name: "anvyx_core2".to_string(),
+                    segments: vec![
+                        "__anvyx_native".to_string(),
+                        "core_string".to_string(),
+                        "str_len".to_string(),
+                    ],
+                },
+                abi: RustExternAbi {
+                    params: vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
+                    ret: RustReturnAbi::Value(ExternTypeExpr::Int),
+                    needs_context: false,
+                    fallible: false,
+                    support: RustAbiSupport::Direct,
+                },
+            }],
+        }],
+    }
+}
+
 fn root_module() -> air::Module {
     air_module(&[])
 }
@@ -4476,20 +5168,60 @@ fn air_module(path: &[&str]) -> air::Module {
     }
 }
 
+fn string_extern(
+    program: &mut Program,
+    name: &str,
+    params: Vec<(air::TypeId, ParamMode)>,
+    return_type: air::TypeId,
+) -> air::ExternId {
+    let id = extern_in_module(
+        program,
+        &["core_string"],
+        name,
+        params,
+        return_type,
+        ExternMember::FreeFunction,
+    );
+    program.externs[id.index()].binding = Some(provider_binding("core_string", name));
+    id
+}
+
 fn runtime_extern(
     program: &mut Program,
     name: &str,
     params: Vec<(air::TypeId, ParamMode)>,
     return_type: air::TypeId,
 ) -> air::ExternId {
-    extern_in_module(
+    let id = extern_in_module(
         program,
         &["core_runtime"],
         name,
         params,
         return_type,
         ExternMember::FreeFunction,
-    )
+    );
+    program.externs[id.index()].binding = Some(provider_binding("core_runtime", name));
+    id
+}
+
+fn provider_binding(provider: &str, name: &str) -> ExternBindingDecl {
+    ExternBindingDecl {
+        package: anvyx_frontend::resolve::PackageId::core(),
+        provider: anvyx_runtime::ProviderId {
+            name: provider.to_string(),
+        },
+        key: anvyx_runtime::ExternBindingKey {
+            target: anvyx_runtime::ExternBindingTarget::Function(
+                anvyx_runtime::ExternFunctionKey {
+                    module: anvyx_runtime::ModulePath {
+                        segments: vec![provider.to_string()],
+                    },
+                    name: name.to_string(),
+                },
+            ),
+            operation: anvyx_runtime::ExternBindingOp::Call,
+        },
+    }
 }
 
 fn extern_in_module(
@@ -4510,6 +5242,8 @@ fn extern_in_module(
             .map(|(ty, mode)| ExternParamDecl { ty, mode })
             .collect(),
         return_type,
+        binding: None,
+        effects: anvyx_runtime::ExternEffects::default(),
     });
     program.module_mut(module).externs.push(id);
     id
