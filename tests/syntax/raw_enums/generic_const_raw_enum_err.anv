@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: raw enum 'E' cannot be generic
+
+enum E<N: int>: int {
+    A,
+}

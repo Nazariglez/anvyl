@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: casts only to 'int', not 'string'
+
+enum State: int {
+    Idle,
+}
+
+fn main() {
+    let s = State.Idle as string;
+}

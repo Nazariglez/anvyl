@@ -137,15 +137,21 @@ impl ProfileCx<'_> {
     }
 
     fn enum_decl_supported(&self, enm: EnumId) -> bool {
-        self.program.enum_decl(enm).variants.iter().all(|variant| {
-            variant_field_tys(variant).into_iter().all(|ty| {
-                match self.program.type_arena.data(ty) {
-                    TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
-                    TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
-                    _ => false,
-                }
-            })
+        let decl = self.program.enum_decl(enm);
+        decl.variants.iter().all(|variant| {
+            variant_field_tys(variant)
+                .into_iter()
+                .all(|ty| self.enum_field_supported(decl.core, ty))
         })
+    }
+
+    fn enum_field_supported(&self, core: Option<air::CoreEnumKind>, ty: TypeId) -> bool {
+        match self.program.type_arena.data(ty) {
+            TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
+            TypeData::Enum(_) if core == Some(air::CoreEnumKind::Option) => true,
+            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
+            _ => false,
+        }
     }
 
     fn extern_type_supported(&self, ext: air::ExternTypeId) -> bool {

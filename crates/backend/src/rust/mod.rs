@@ -21,14 +21,14 @@ use self::{
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rir::{
         RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
-        RirCtxPlan, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId,
-        RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind,
-        RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal, RirLocalId,
-        RirNativeExtern, RirOperand, RirParam, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
-        RirProjection, RirRValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
-        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
-        RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirCtxPlan, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern,
+        RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign,
+        RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal,
+        RirLocalId, RirNativeExtern, RirOperand, RirParam, RirParamAbi, RirParamSemantic, RirPlace,
+        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -220,6 +220,7 @@ struct PlanCx<'a> {
     const_map: HashMap<ConstId, RirConstId>,
     function_map: HashMap<FunctionId, RirFunctionId>,
     extern_map: HashMap<ExternId, RirExternId>,
+    enum_map: HashMap<air::EnumId, RirEnumId>,
 }
 
 impl<'a> PlanCx<'a> {
@@ -234,6 +235,7 @@ impl<'a> PlanCx<'a> {
             const_map: HashMap::new(),
             function_map: HashMap::new(),
             extern_map: HashMap::new(),
+            enum_map: HashMap::new(),
         }
     }
 
@@ -470,10 +472,13 @@ impl<'a> PlanCx<'a> {
     ) -> RirEnumId {
         let decl = self.air.enum_decl(enm);
         let id = RirEnumId::from_index(program.enums.len());
+        self.enum_map.insert(enm, id);
         program.enums.push(RirEnum {
             id,
             air_id: Some(enm),
             core: decl.core.map(rir_core_enum_kind),
+            repr: rir_enum_repr(decl.repr),
+            raw_type: decl.raw_type.map(|ty| self.type_map[&ty]),
             symbol: RirSymbol::new(format!(
                 "{}T{}_{}",
                 self.config.symbol_prefix,
@@ -504,7 +509,7 @@ impl<'a> PlanCx<'a> {
                     let fields = types
                         .iter()
                         .enumerate()
-                        .map(|(index, ty)| self.enum_field(program, type_id, *ty, index))
+                        .map(|(index, ty)| self.enum_field(program, decl.core, type_id, *ty, index))
                         .collect::<Result<Vec<_>, _>>()?;
                     (RirVariantKind::Tuple, fields)
                 }
@@ -514,7 +519,7 @@ impl<'a> PlanCx<'a> {
                         .iter()
                         .enumerate()
                         .map(|(index, field)| {
-                            self.enum_field(program, type_id, field.ty, index)
+                            self.enum_field(program, decl.core, type_id, field.ty, index)
                                 .map(|mut rir| {
                                     rir.symbol =
                                         scoped_symbol(field.name.as_str(), &mut seen_fields);
@@ -530,6 +535,7 @@ impl<'a> PlanCx<'a> {
                 symbol: scoped_symbol(variant.name.as_str(), &mut seen_variants),
                 display: RirSymbol::new(variant.name.as_str()),
                 kind,
+                raw_value: variant.raw_value.as_ref().map(rir_raw_enum_value),
                 fields,
             });
         }
@@ -542,6 +548,7 @@ impl<'a> PlanCx<'a> {
     fn enum_field(
         &self,
         program: &RirProgram,
+        enum_core: Option<air::CoreEnumKind>,
         enum_ty: TypeId,
         ty: TypeId,
         index: usize,
@@ -552,7 +559,9 @@ impl<'a> PlanCx<'a> {
                 RustTargetGapKind::UnsupportedType,
             ));
         };
-        if ty == enum_ty || matches!(program.types[rir_ty.index()], RirType::Enum(_)) {
+        let recursive = ty == enum_ty;
+        let nested_enum = matches!(program.types[rir_ty.index()], RirType::Enum(_));
+        if recursive || (nested_enum && enum_core != Some(air::CoreEnumKind::Option)) {
             return Err(self.gap(
                 RustTargetGapSite::Type(ty),
                 RustTargetGapKind::UnsupportedType,
@@ -1239,6 +1248,21 @@ fn rir_format_spec(spec: FormatSpec) -> RirFormatSpec {
 fn rir_core_enum_kind(kind: air::CoreEnumKind) -> RirCoreEnumKind {
     match kind {
         air::CoreEnumKind::Option => RirCoreEnumKind::Option,
+    }
+}
+
+fn rir_enum_repr(repr: air::EnumRepr) -> RirEnumRepr {
+    match repr {
+        air::EnumRepr::Adt => RirEnumRepr::Adt,
+        air::EnumRepr::RawInt => RirEnumRepr::RawInt,
+        air::EnumRepr::RawString => RirEnumRepr::RawString,
+    }
+}
+
+fn rir_raw_enum_value(value: &air::RawEnumValue) -> RirRawEnumValue {
+    match value {
+        air::RawEnumValue::Int(value) => RirRawEnumValue::Int(*value),
+        air::RawEnumValue::String(value) => RirRawEnumValue::String(value.clone()),
     }
 }
 

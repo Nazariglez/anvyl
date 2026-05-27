@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Delta: int {
+    Down = -1,
+    Flat,
+    Up,
+}
+
+fn main() {}

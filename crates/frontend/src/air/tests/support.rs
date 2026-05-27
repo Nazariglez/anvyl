@@ -1,7 +1,8 @@
 use super::super::{
-    AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, ConstData, EnumDecl, ExternDecl,
+    AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, ConstData, EnumDecl, EnumRepr, ExternDecl,
     ExternTypeDecl, Function, FunctionKind, Local, LocalKind, Module, Mutability, Operand, Param,
-    ParamMode, ParamRole, Place, Program, RValue, Signature, TypeData,
+    ParamMode, ParamRole, Place, Program, RValue, RawEnumValue, Signature, TypeData, VariantDecl,
+    VariantShape,
     ids::{
         AggregateId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FunctionId, LocalId,
         ModuleId, TypeId,
@@ -84,6 +85,51 @@ impl ProgramBuilder {
             module.enums.push(id);
         }
         id
+    }
+
+    pub fn unit_enum(&mut self, module: ModuleId, name: &str) -> (EnumId, TypeId) {
+        let id = self.alloc_enum(EnumDecl {
+            name: Ident::new(name),
+            module,
+            core: None,
+            repr: EnumRepr::Adt,
+            raw_type: None,
+            type_args: vec![],
+            const_args: vec![],
+            variants: vec![VariantDecl {
+                name: Ident::new("Idle"),
+                shape: VariantShape::Unit,
+                raw_value: None,
+            }],
+        });
+        (id, self.alloc_type(TypeData::Enum(id)))
+    }
+
+    pub fn raw_int_enum(
+        &mut self,
+        module: ModuleId,
+        name: &str,
+        variants: Vec<(&str, i64)>,
+    ) -> (EnumId, TypeId) {
+        let int = self.int_ty();
+        let id = self.alloc_enum(EnumDecl {
+            name: Ident::new(name),
+            module,
+            core: None,
+            repr: EnumRepr::RawInt,
+            raw_type: Some(int),
+            type_args: vec![],
+            const_args: vec![],
+            variants: variants
+                .into_iter()
+                .map(|(name, value)| VariantDecl {
+                    name: Ident::new(name),
+                    shape: VariantShape::Unit,
+                    raw_value: Some(RawEnumValue::Int(value)),
+                })
+                .collect(),
+        });
+        (id, self.alloc_type(TypeData::Enum(id)))
     }
 
     pub fn alloc_extern_type_raw(&mut self, decl: ExternTypeDecl) -> ExternTypeId {

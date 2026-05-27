@@ -496,6 +496,49 @@ fn parse_aggregate(source: &str) -> ast::StructDecl {
     node.node
 }
 
+fn parse_enum(source: &str) -> ast::EnumDecl {
+    let mut prog = parse_program(source);
+    assert_eq!(prog.stmts.len(), 1);
+    let ast::Stmt::Enum(node) = prog.stmts.pop().unwrap().node else {
+        panic!("expected Enum");
+    };
+    node.node
+}
+
+#[test]
+fn raw_enum_syntax_preserves_backing_and_values() {
+    let state = parse_enum("enum State: int { Idle, Dead = 10 }");
+    assert_eq!(
+        state.raw_backing.as_ref().map(|ty| &ty.node),
+        Some(&Type::Int)
+    );
+    assert!(state.variants[0].raw_value.is_none());
+    assert!(matches!(
+        raw_expr_kind(&state.variants[1]),
+        Some(ast::ExprKind::Lit(ast::Lit::Int(10)))
+    ));
+
+    let anim = parse_enum(r#"enum Anim: string { Idle = "idle" }"#);
+    assert_eq!(
+        anim.raw_backing.as_ref().map(|ty| &ty.node),
+        Some(&Type::String)
+    );
+    assert!(matches!(
+        raw_expr_kind(&anim.variants[0]),
+        Some(ast::ExprKind::Lit(ast::Lit::String(s))) if s == "idle"
+    ));
+
+    let unsupported = parse_enum("enum E: float { A }");
+    assert_eq!(
+        unsupported.raw_backing.as_ref().map(|ty| &ty.node),
+        Some(&Type::Float)
+    );
+}
+
+fn raw_expr_kind(variant: &ast::EnumVariant) -> Option<&ast::ExprKind> {
+    variant.raw_value.as_ref().map(|expr| &expr.node.kind)
+}
+
 fn parse_aggregate_method(source: &str) -> ast::Method {
     let aggregate = parse_aggregate(source);
     assert_eq!(aggregate.methods.len(), 1);

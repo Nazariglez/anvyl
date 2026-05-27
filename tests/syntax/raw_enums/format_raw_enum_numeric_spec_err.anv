@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: requires int
+
+enum State: int {
+    Idle,
+}
+
+fn main() {
+    let state = State.Idle;
+    let text = f"{state:x}";
+}

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: non-raw enum 'Color' cannot be cast to 'int'
+
+enum Color {
+    Red,
+}
+
+fn main() {
+    let n = Color.Red as int;
+}

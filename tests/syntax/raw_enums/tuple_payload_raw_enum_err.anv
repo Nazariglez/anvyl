@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: raw enum variant 'E.A' must be a unit variant
+
+enum E: int {
+    A(int) = 1,
+}

@@ -565,6 +565,10 @@ impl Printer<'_> {
                 self.write(" }");
             }
         }
+        if let Some(raw_value) = &variant.raw_value {
+            self.write(" = ");
+            self.format_expr(&raw_value.node);
+        }
         self.write(",");
         self.writeln();
     }
@@ -578,6 +582,10 @@ impl Printer<'_> {
         self.write("enum ");
         self.write_fmt(decl.name);
         self.format_type_params(&decl.type_params, &decl.const_params);
+        if let Some(raw_backing) = &decl.raw_backing {
+            self.write(": ");
+            self.format_type(&raw_backing.node);
+        }
         self.write(" {");
         self.writeln();
         self.indent();

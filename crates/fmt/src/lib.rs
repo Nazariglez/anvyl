@@ -650,47 +650,43 @@ mod tests {
     // --- enum formatting ---
 
     #[test]
-    fn enum_unit_variants() {
-        let source = "enum Color { Red, Green, Blue }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("enum Color {"));
-        assert!(formatted.contains("    Red,"));
-        assert!(formatted.contains("    Green,"));
-        assert!(formatted.contains("    Blue,"));
-    }
-
-    #[test]
-    fn enum_tuple_variant() {
-        let source = "enum Wrapper<T> { Some(T), None }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("enum Wrapper<T> {"));
-        assert!(formatted.contains("    Some(T),"));
-        assert!(formatted.contains("    None,"));
-    }
-
-    #[test]
-    fn enum_struct_variant() {
-        let source = "enum Event { Click { x: int, y: int }, Quit }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("enum Event {"));
-        assert!(formatted.contains("Click { x: int, y: int },"));
-        assert!(formatted.contains("    Quit,"));
-    }
-
-    #[test]
-    fn enum_generic() {
-        let source = "enum Result<T, E> { Ok(T), Err(E) }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("enum Result<T, E> {"));
-        assert!(formatted.contains("    Ok(T),"));
-        assert!(formatted.contains("    Err(E),"));
-    }
-
-    #[test]
-    fn enum_pub() {
-        let source = "pub enum Direction { Up, Down }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("pub enum Direction {"));
+    fn enum_decls() {
+        for (source, expected) in [
+            (
+                "enum Color { Red, Green, Blue }",
+                "enum Color {\n    Red,\n    Green,\n    Blue,\n}\n",
+            ),
+            (
+                "enum Wrapper<T> { Some(T), None }",
+                "enum Wrapper<T> {\n    Some(T),\n    None,\n}\n",
+            ),
+            (
+                "enum Event { Click { x: int, y: int }, Quit }",
+                "enum Event {\n    Click { x: int, y: int },\n    Quit,\n}\n",
+            ),
+            (
+                "enum Result<T, E> { Ok(T), Err(E) }",
+                "enum Result<T, E> {\n    Ok(T),\n    Err(E),\n}\n",
+            ),
+            (
+                "pub enum Direction { Up, Down }",
+                "pub enum Direction {\n    Up,\n    Down,\n}\n",
+            ),
+            (
+                "enum State:int{Idle,Dead=10,Respawn}",
+                "enum State: int {\n    Idle,\n    Dead = 10,\n    Respawn,\n}\n",
+            ),
+            (
+                r#"enum Anim:string{Idle="idle",Run="run"}"#,
+                "enum Anim: string {\n    Idle = \"idle\",\n    Run = \"run\",\n}\n",
+            ),
+            (
+                "enum E: int { A = BASE + 1 }",
+                "enum E: int {\n    A = BASE + 1,\n}\n",
+            ),
+        ] {
+            assert_fmt(source, expected);
+        }
     }
 
     // --- extend formatting ---

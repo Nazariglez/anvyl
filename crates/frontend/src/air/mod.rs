@@ -141,6 +141,16 @@ impl Program {
         &mut self.enums[id.index()]
     }
 
+    pub fn enum_repr(&self, id: EnumId) -> EnumRepr {
+        self.enum_decl(id).repr
+    }
+
+    pub fn raw_enum_raw_type(&self, id: EnumId) -> Option<TypeId> {
+        (self.enum_repr(id) != EnumRepr::Adt)
+            .then(|| self.enum_decl(id).raw_type)
+            .flatten()
+    }
+
     pub fn alloc_extern_type(&mut self, ty: ExternTypeDecl) -> ExternTypeId {
         let id = ExternTypeId::from_index(self.extern_types.len());
         self.extern_types.push(ty);

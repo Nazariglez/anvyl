@@ -5,8 +5,8 @@ use anvyx_externs::{
 
 pub use super::typing::PrimitiveKind;
 use super::{
-    AggregateKind, ConstValue, ExternMember, Function, LocalKind, Mutability, ParamMode, ParamRole,
-    ParamType, Program, ReturnMode, TypeData, VariantShape,
+    AggregateKind, ConstValue, EnumRepr, ExternMember, Function, LocalKind, Mutability, ParamMode,
+    ParamRole, ParamType, Program, RawEnumValue, ReturnMode, TypeData, VariantShape,
     body::{
         AggregateCtor, AirBlock, AirEnumMatch, AirIf, AirStmt, AirTail, CallArg, Callee, Operand,
         Place, Projection, RValue,
@@ -61,6 +61,7 @@ pub enum VerifyErrorKind {
     BadType(BadType),
     BadConst(BadConst),
     BadModule(BadModule),
+    BadEnum(BadEnum),
     BadRValue(BadRValue),
     BadStatement(BadStatement),
     BadExtern(BadExtern),
@@ -91,6 +92,20 @@ pub enum BadConst {
     TypeMismatch { expected: TypeId, found: TypeId },
     NilMustBeOptional(TypeId),
     MissingPrimitive(PrimitiveKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadEnum {
+    AdtHasRawType,
+    RawMissingRawType,
+    RawTypeMismatch(TypeId),
+    RawGeneric,
+    AdtVariantHasRawValue(VariantId),
+    RawVariantMissingValue(VariantId),
+    RawVariantPayload(VariantId),
+    RawIntVariantValueType(VariantId),
+    RawStringVariantValueType(VariantId),
+    DuplicateRawValue(VariantId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -893,19 +908,88 @@ fn verify_aggregate(cx: &mut VerifyCx<'_>, id: AggregateId) {
 
 fn verify_enum(cx: &mut VerifyCx<'_>, id: EnumId) {
     let enm = cx.program.enum_decl(id);
-    cx.verify_module_ref(VerifySite::Enum(id), enm.module);
-    verify_decl_listed_once(cx, VerifySite::Enum(id), enm.module, id, |m| &m.enums);
-    for variant in &enm.variants {
+    let site = VerifySite::Enum(id);
+    cx.verify_module_ref(site.clone(), enm.module);
+    verify_decl_listed_once(cx, site.clone(), enm.module, id, |m| &m.enums);
+    match enm.repr {
+        EnumRepr::Adt if enm.raw_type.is_some() => cx.push(
+            site.clone(),
+            VerifyErrorKind::BadEnum(BadEnum::AdtHasRawType),
+        ),
+        EnumRepr::Adt => {}
+        EnumRepr::RawInt | EnumRepr::RawString => {
+            if !enm.type_args.is_empty() || !enm.const_args.is_empty() {
+                cx.push(site.clone(), VerifyErrorKind::BadEnum(BadEnum::RawGeneric));
+            }
+            let Some(raw_type) = enm.raw_type else {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadEnum(BadEnum::RawMissingRawType),
+                );
+                return;
+            };
+            cx.verify_type_ref(site.clone(), raw_type);
+            let expected = match enm.repr {
+                EnumRepr::RawInt => TypeData::Int,
+                EnumRepr::RawString => TypeData::String,
+                EnumRepr::Adt => unreachable!(),
+            };
+            if cx.has_type(raw_type) && cx.program.type_data(raw_type) != &expected {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadEnum(BadEnum::RawTypeMismatch(raw_type)),
+                );
+            }
+        }
+    }
+    let mut raw_values = std::collections::HashSet::new();
+    for (index, variant) in enm.variants.iter().enumerate() {
+        let variant_id = VariantId::from_index(index);
+        match (&enm.repr, &variant.raw_value) {
+            (EnumRepr::Adt, None) => {}
+            (EnumRepr::Adt, Some(_)) => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadEnum(BadEnum::AdtVariantHasRawValue(variant_id)),
+            ),
+            (EnumRepr::RawInt, Some(RawEnumValue::Int(_)))
+            | (EnumRepr::RawString, Some(RawEnumValue::String(_))) => {
+                if !raw_values.insert(variant.raw_value.as_ref()) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadEnum(BadEnum::DuplicateRawValue(variant_id)),
+                    );
+                }
+                if !matches!(variant.shape, VariantShape::Unit) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadEnum(BadEnum::RawVariantPayload(variant_id)),
+                    );
+                }
+            }
+            (EnumRepr::RawInt, Some(_)) => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadEnum(BadEnum::RawIntVariantValueType(variant_id)),
+            ),
+            (EnumRepr::RawString, Some(_)) => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadEnum(BadEnum::RawStringVariantValueType(variant_id)),
+            ),
+            (EnumRepr::RawInt | EnumRepr::RawString, None) => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadEnum(BadEnum::RawVariantMissingValue(variant_id)),
+            ),
+        }
+
         match &variant.shape {
             VariantShape::Unit => {}
             VariantShape::Tuple(types) => {
                 for ty in types {
-                    cx.verify_type_ref(VerifySite::Enum(id), *ty);
+                    cx.verify_type_ref(site.clone(), *ty);
                 }
             }
             VariantShape::Struct(fields) => {
                 for field in fields {
-                    cx.verify_type_ref(VerifySite::Enum(id), field.ty);
+                    cx.verify_type_ref(site.clone(), field.ty);
                 }
             }
         }
@@ -1958,18 +2042,16 @@ fn verify_rvalue(
         RValue::Cast { value: op, target } => {
             verify_operand(cx, function_id, block_id, stmt_index, op);
             cx.verify_type_ref(site.clone(), *target);
-            if let Some(value_ty) = operand_ty(cx, op) {
-                let valid = (cx.primitives.is_int(value_ty) && cx.primitives.is_float(*target))
-                    || (cx.primitives.is_float(value_ty) && cx.primitives.is_int(*target));
-                if !valid {
-                    cx.push(
-                        site,
-                        VerifyErrorKind::BadRValue(BadRValue::CastMustConvertIntAndFloat {
-                            value: value_ty,
-                            target: *target,
-                        }),
-                    );
-                }
+            if let Some(value_ty) = operand_ty(cx, op)
+                && !valid_cast(cx, value_ty, *target)
+            {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadRValue(BadRValue::CastMustConvertIntAndFloat {
+                        value: value_ty,
+                        target: *target,
+                    }),
+                );
             }
         }
         RValue::Aggregate { kind, fields, ty } => {
@@ -2448,6 +2530,18 @@ fn verify_place(
     }
 
     Some(current_ty)
+}
+
+fn valid_cast(cx: &VerifyCx<'_>, source: TypeId, target: TypeId) -> bool {
+    if (cx.primitives.is_int(source) && cx.primitives.is_float(target))
+        || (cx.primitives.is_float(source) && cx.primitives.is_int(target))
+    {
+        return true;
+    }
+    let Some(TypeData::Enum(enum_id)) = cx.type_data(source) else {
+        return false;
+    };
+    cx.has_enum(*enum_id) && cx.program.raw_enum_raw_type(*enum_id) == Some(target)
 }
 
 fn verify_aggregate_ctor(

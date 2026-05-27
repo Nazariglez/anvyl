@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: invalid literal pattern
+
+enum State: int {
+    Idle,
+}
+
+fn main() {
+    let state = State.Idle;
+    match state {
+        0 => {},
+        _ => {},
+    }
+}

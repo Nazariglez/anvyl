@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State: int {
+    Idle,
+    Run = 2,
+}
+
+fn main() {
+    let state: State = State.Idle;
+    let same: bool = state == State.Idle;
+}

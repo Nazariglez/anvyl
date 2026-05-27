@@ -1,16 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    CallableKind, CastConversionSchema, DeclError, DeclarationIndex, DynInference, ExtendSchema,
-    GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams, MethodKey,
-    MethodSurface, NominalKey, TypeAliasDef, TypeChecker, TypeError, ValueDecl, VariantPayload,
-    contracts, same_extend_target, type_ops::TypeVisitor, type_refs::GenericParamError,
+    CallableKind, CastConversionSchema, DeclError, DeclarationIndex, DynInference, EnumRepr,
+    ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams,
+    MethodKey, MethodSurface, NominalKey, PendingRawEnum, RawEnumValue, TypeAliasDef, TypeChecker,
+    TypeError, ValueDecl, VariantPayload, const_eval::const_type, contracts, same_extend_target,
+    type_ops::TypeVisitor, type_refs::GenericParamError,
 };
 use crate::{
     ast::{
-        AggregateKind, ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef, EscapeMode, Func,
-        FuncParam, Ident, MethodReceiver, MethodSig, Mutability, NominalKind, Param, Program,
-        ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId,
+        AggregateKind, ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef,
+        EscapeMode, Func, FuncParam, Ident, MethodReceiver, MethodSig, Mutability, NominalKind,
+        Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId,
     },
     source::SourceId,
     span::{SourceSpan, Span},
@@ -830,6 +831,18 @@ fn check_method_generic_shadow(
     });
 }
 
+fn raw_backing_repr(backing: &Type) -> Option<EnumRepr> {
+    match backing {
+        Type::Int => Some(EnumRepr::RawInt),
+        Type::String => Some(EnumRepr::RawString),
+        _ => None,
+    }
+}
+
+fn raw_span(pending: &PendingRawEnum, span: Span) -> SourceSpan {
+    SourceSpan::from_byte_span(pending.source, span)
+}
+
 impl TypeChecker {
     pub(super) fn finalize_declarations(&mut self) {
         let saved_module = self.current_module.clone();
@@ -848,6 +861,9 @@ impl TypeChecker {
             self.push_error(generic_param_decl_type_error(error, source));
         }
         validate_type_alias_decls(&decls, &mut self.errors);
+        self.decls = decls;
+        self.validate_raw_enum_declarations();
+        decls = std::mem::take(&mut self.decls);
         contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.lint_events);
         validate_dyn_infer_decls(&decls, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
@@ -860,6 +876,198 @@ impl TypeChecker {
         self.validate_final_decl_type_uses(&mut decls);
         self.current_module = saved_module;
         self.decls = decls;
+    }
+
+    fn validate_raw_enum_declarations(&mut self) {
+        let pending = self.decls.take_pending_raw_enums();
+        for (key, pending) in pending {
+            self.validate_raw_enum_declaration(&key, &pending);
+        }
+    }
+
+    fn validate_raw_enum_declaration(&mut self, key: &NominalKey, pending: &PendingRawEnum) {
+        let saved_module = self.current_module.clone();
+        self.current_module = key.module.clone();
+        let valid = match &pending.backing {
+            Some(backing) => match raw_backing_repr(&backing.node) {
+                Some(repr) => self.resolve_raw_enum_values(key, pending, repr),
+                None => {
+                    self.push_error(TypeError::Decl(DeclError::RawEnumInvalidBacking {
+                        owner: key.clone(),
+                        span: Some(raw_span(pending, backing.span)),
+                    }));
+                    false
+                }
+            },
+            None => {
+                for variant in &pending.variants {
+                    if variant.value.is_some() {
+                        self.push_error(TypeError::Decl(DeclError::RawEnumValueWithoutBacking {
+                            owner: key.clone(),
+                            variant: variant.name,
+                            span: Some(raw_span(pending, variant.span)),
+                        }));
+                    }
+                }
+                false
+            }
+        };
+        if !valid {
+            self.decls.sanitize_raw_enum(key);
+        }
+        self.current_module = saved_module;
+    }
+
+    fn resolve_raw_enum_values(
+        &mut self,
+        key: &NominalKey,
+        pending: &PendingRawEnum,
+        repr: EnumRepr,
+    ) -> bool {
+        let Some(schema) = self.decls.enum_schema(key).cloned() else {
+            return false;
+        };
+        let mut valid = true;
+        if !schema.generics.is_empty() {
+            let span = self
+                .decls
+                .type_span(key)
+                .map(|span| raw_span(pending, span));
+            self.push_error(TypeError::Decl(DeclError::RawEnumGenericParams {
+                owner: key.clone(),
+                span,
+            }));
+            valid = false;
+        }
+        for raw_variant in &pending.variants {
+            let Some(variant) = schema.variants.get(raw_variant.name) else {
+                continue;
+            };
+            if !matches!(variant.payload, VariantPayload::Unit) {
+                self.push_error(TypeError::Decl(DeclError::RawEnumPayloadVariant {
+                    owner: key.clone(),
+                    variant: raw_variant.name,
+                    span: Some(raw_span(pending, raw_variant.span)),
+                }));
+                valid = false;
+            }
+        }
+
+        let values = match repr {
+            EnumRepr::Adt => unreachable!(),
+            EnumRepr::RawInt => self.resolve_raw_int_values(key, pending, &mut valid),
+            EnumRepr::RawString => self.resolve_raw_string_values(key, pending, &mut valid),
+        };
+        if valid && !self.decls.install_raw_enum_metadata(key, repr, values) {
+            self.decls.sanitize_raw_enum(key);
+            return false;
+        }
+        valid
+    }
+
+    fn resolve_raw_int_values(
+        &mut self,
+        key: &NominalKey,
+        pending: &PendingRawEnum,
+        valid: &mut bool,
+    ) -> Vec<(Ident, RawEnumValue)> {
+        let mut values = vec![];
+        let mut seen = HashSet::new();
+        let mut next = Some(0_i64);
+        for variant in &pending.variants {
+            let value = match &variant.value {
+                Some(expr) => match self.eval_const_expr(expr, true) {
+                    Ok(ConstValue::Int(value)) => value,
+                    Ok(other) => {
+                        self.push_error(TypeError::RawEnumExpectedIntValue {
+                            found: const_type(&other),
+                            span: self.error_span(expr.span),
+                        });
+                        *valid = false;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.push_error(error);
+                        *valid = false;
+                        continue;
+                    }
+                },
+                None => match next {
+                    Some(value) => value,
+                    None => {
+                        self.push_error(TypeError::Decl(DeclError::RawEnumIntOverflow {
+                            owner: key.clone(),
+                            variant: variant.name,
+                            span: Some(raw_span(pending, variant.span)),
+                        }));
+                        *valid = false;
+                        continue;
+                    }
+                },
+            };
+            let raw = RawEnumValue::Int(value);
+            if !seen.insert(raw.clone()) {
+                self.push_error(TypeError::Decl(DeclError::RawEnumDuplicateValue {
+                    owner: key.clone(),
+                    variant: variant.name,
+                    value: raw.clone(),
+                    span: Some(raw_span(pending, variant.span)),
+                }));
+                *valid = false;
+            }
+            values.push((variant.name, raw));
+            next = value.checked_add(1);
+        }
+        values
+    }
+
+    fn resolve_raw_string_values(
+        &mut self,
+        key: &NominalKey,
+        pending: &PendingRawEnum,
+        valid: &mut bool,
+    ) -> Vec<(Ident, RawEnumValue)> {
+        let mut values = vec![];
+        let mut seen = HashSet::new();
+        for variant in &pending.variants {
+            let Some(expr) = &variant.value else {
+                self.push_error(TypeError::Decl(DeclError::RawEnumMissingStringValue {
+                    owner: key.clone(),
+                    variant: variant.name,
+                    span: Some(raw_span(pending, variant.span)),
+                }));
+                *valid = false;
+                continue;
+            };
+            let value = match self.eval_const_expr(expr, true) {
+                Ok(ConstValue::String(value)) => value,
+                Ok(other) => {
+                    self.push_error(TypeError::RawEnumExpectedStringValue {
+                        found: const_type(&other),
+                        span: self.error_span(expr.span),
+                    });
+                    *valid = false;
+                    continue;
+                }
+                Err(error) => {
+                    self.push_error(error);
+                    *valid = false;
+                    continue;
+                }
+            };
+            let raw = RawEnumValue::String(value);
+            if !seen.insert(raw.clone()) {
+                self.push_error(TypeError::Decl(DeclError::RawEnumDuplicateValue {
+                    owner: key.clone(),
+                    variant: variant.name,
+                    value: raw.clone(),
+                    span: Some(raw_span(pending, variant.span)),
+                }));
+                *valid = false;
+            }
+            values.push((variant.name, raw));
+        }
+        values
     }
 
     fn validate_final_decl_type_uses(&mut self, decls: &mut DeclarationIndex) {

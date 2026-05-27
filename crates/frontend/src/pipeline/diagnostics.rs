@@ -25,8 +25,8 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, CaptureStorageOrigin, CompileWarning,
-        ConstDiagnostic, DeclError, DynContainerConversionKind, ModuleScope, TryCarrierKind,
-        TypeDiagnosticContext, TypeError, VariantShape, nominal_key_for_type,
+        ConstDiagnostic, DeclError, DynContainerConversionKind, ModuleScope, RawEnumValue,
+        TryCarrierKind, TypeDiagnosticContext, TypeError, VariantShape, nominal_key_for_type,
     },
 };
 
@@ -994,11 +994,23 @@ pub(super) fn diagnose_type_error(
         } => {
             format!("constant type mismatch: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx))
         }
+        TypeError::RawEnumExpectedIntValue { found, .. } => {
+            format!("raw int enum value must be an int constant, found '{}'", render_surface_type(found, type_ctx))
+        }
+        TypeError::RawEnumExpectedStringValue { found, .. } => {
+            format!("raw string enum value must be a string constant, found '{}'", render_surface_type(found, type_ctx))
+        }
         TypeError::InvalidConstCast { from, to, .. } => {
             format!("cannot cast constant from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
         }
         TypeError::InvalidCast { from, to, .. } => {
             format!("Invalid cast: cannot cast from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
+        }
+        TypeError::RawEnumWrongRawCast { enum_ty, expected, found, .. } => {
+            format!("raw enum '{}' casts only to '{}', not '{}'", render_surface_type(enum_ty, type_ctx), render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx))
+        }
+        TypeError::NonRawEnumRawCast { enum_ty, raw_ty, .. } => {
+            format!("non-raw enum '{}' cannot be cast to '{}'", render_surface_type(enum_ty, type_ctx), render_surface_type(raw_ty, type_ctx))
         }
         TypeError::ConstDivisionByZero { .. } => {
             "division by zero in constant expression".to_string()
@@ -1338,8 +1350,12 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::DefaultReferencesField { span, .. }
         | TypeError::VarParamDefault { span, .. }
         | TypeError::ConstTypeMismatch { span, .. }
+        | TypeError::RawEnumExpectedIntValue { span, .. }
+        | TypeError::RawEnumExpectedStringValue { span, .. }
         | TypeError::InvalidConstCast { span, .. }
         | TypeError::InvalidCast { span, .. }
+        | TypeError::RawEnumWrongRawCast { span, .. }
+        | TypeError::NonRawEnumRawCast { span, .. }
         | TypeError::ConstDivisionByZero { span, .. }
         | TypeError::ConstOverflow { span, .. }
         | TypeError::ExpectedIntConst { span, .. }
@@ -1356,6 +1372,13 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
     }
 }
 
+fn render_raw_enum_value(value: &RawEnumValue) -> String {
+    match value {
+        RawEnumValue::Int(value) => value.to_string(),
+        RawEnumValue::String(value) => format!("{value:?}"),
+    }
+}
+
 fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
     match error {
         DeclError::DuplicateValue { span, .. }
@@ -1368,6 +1391,13 @@ fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
         | DeclError::DuplicateAggregateMethod { span, .. }
         | DeclError::DuplicateAggregateField { span, .. }
         | DeclError::DuplicateEnumVariant { span, .. }
+        | DeclError::RawEnumInvalidBacking { span, .. }
+        | DeclError::RawEnumGenericParams { span, .. }
+        | DeclError::RawEnumValueWithoutBacking { span, .. }
+        | DeclError::RawEnumPayloadVariant { span, .. }
+        | DeclError::RawEnumMissingStringValue { span, .. }
+        | DeclError::RawEnumDuplicateValue { span, .. }
+        | DeclError::RawEnumIntOverflow { span, .. }
         | DeclError::DuplicateVariantField { span, .. }
         | DeclError::DuplicateContractRequirement { span, .. }
         | DeclError::DuplicateExtendMethod { span, .. }
@@ -2017,6 +2047,51 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
         }
         DeclError::DuplicateEnumVariant { owner, name, .. } => {
             format!("duplicate variant '{name}' in enum '{}'", owner.name)
+        }
+        DeclError::RawEnumInvalidBacking { owner, .. } => {
+            format!(
+                "raw enum '{}' must use literal int or string backing",
+                owner.name
+            )
+        }
+        DeclError::RawEnumGenericParams { owner, .. } => {
+            format!("raw enum '{}' cannot be generic", owner.name)
+        }
+        DeclError::RawEnumValueWithoutBacking { owner, variant, .. } => {
+            format!(
+                "variant '{}.{variant}' cannot have a raw value without enum backing",
+                owner.name
+            )
+        }
+        DeclError::RawEnumPayloadVariant { owner, variant, .. } => {
+            format!(
+                "raw enum variant '{}.{variant}' must be a unit variant",
+                owner.name
+            )
+        }
+        DeclError::RawEnumMissingStringValue { owner, variant, .. } => {
+            format!(
+                "raw string enum variant '{}.{variant}' must have an explicit string value",
+                owner.name
+            )
+        }
+        DeclError::RawEnumDuplicateValue {
+            owner,
+            variant,
+            value,
+            ..
+        } => {
+            format!(
+                "duplicate raw enum value {} on variant '{}.{variant}'",
+                render_raw_enum_value(value),
+                owner.name
+            )
+        }
+        DeclError::RawEnumIntOverflow { owner, variant, .. } => {
+            format!(
+                "raw int enum auto-increment overflows at variant '{}.{variant}'",
+                owner.name
+            )
         }
         DeclError::DuplicateVariantField {
             owner,

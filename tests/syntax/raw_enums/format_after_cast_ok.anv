@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State: int {
+    Idle,
+}
+
+enum Anim: string {
+    Idle = "idle",
+}
+
+fn main() {
+    let state = State.Idle;
+    let anim = Anim.Idle;
+    let a: string = f"{state as int:04}";
+    let b: string = f"{anim as string:.2}";
+}

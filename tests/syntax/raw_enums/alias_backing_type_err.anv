@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: raw enum 'E' must use literal int or string backing
+
+type I = int;
+
+enum E: I {
+    A,
+}

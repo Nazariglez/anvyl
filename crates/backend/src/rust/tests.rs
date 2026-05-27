@@ -4,8 +4,8 @@ use anvyx_frontend::{
         self, AggregateCtor, AirBody, CallArg, Callee, ConstData, ConstValue, EnumDecl,
         ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl,
         FieldDecl, Function, FunctionKind, FunctionSpecialization, Local, LocalKind, Mutability,
-        Operand, Param, ParamMode, ParamRole, Place, Program, Projection, RValue, Signature,
-        TypeData, VariantDecl, VariantId, VariantShape,
+        Operand, Param, ParamMode, ParamRole, Place, Program, Projection, RValue, RawEnumValue,
+        Signature, TypeData, VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -667,14 +667,18 @@ fn source_job_suffixes_nested_generic_function_specialization() {
         type_args: vec![string],
         const_args: vec![],
         core: Some(air::CoreEnumKind::Option),
+        repr: air::EnumRepr::Adt,
+        raw_type: None,
         variants: vec![
             VariantDecl {
                 name: Ident::new("None"),
                 shape: VariantShape::Unit,
+                raw_value: None,
             },
             VariantDecl {
                 name: Ident::new("Some"),
                 shape: VariantShape::Tuple(vec![string]),
+                raw_value: None,
             },
         ],
     });
@@ -895,9 +899,12 @@ fn source_job_compiles_rust_keyword_member_symbols() {
         type_args: vec![],
         const_args: vec![],
         core: None,
+        repr: air::EnumRepr::Adt,
+        raw_type: None,
         variants: vec![VariantDecl {
             name: Ident::new("dyn"),
             shape: VariantShape::Unit,
+            raw_value: None,
         }],
     });
     program.module_mut(module).enums.push(enum_id);
@@ -2535,6 +2542,8 @@ fn enum_match_rir(
         id: RirEnumId::from_index(0),
         air_id: None,
         core: None,
+        repr: rir::RirEnumRepr::Adt,
+        raw_type: None,
         symbol: RirSymbol::new("E"),
         display: RirSymbol::new("E"),
         copyable: true,
@@ -2544,6 +2553,7 @@ fn enum_match_rir(
                 symbol: RirSymbol::new("A"),
                 display: RirSymbol::new("A"),
                 kind: RirVariantKind::Unit,
+                raw_value: None,
                 fields: vec![],
             },
             RirVariant {
@@ -2551,6 +2561,7 @@ fn enum_match_rir(
                 symbol: RirSymbol::new("B"),
                 display: RirSymbol::new("B"),
                 kind: RirVariantKind::Unit,
+                raw_value: None,
                 fields: vec![],
             },
         ],
@@ -3537,6 +3548,8 @@ mod enums {
             id: RirEnumId::from_index(0),
             air_id: None,
             core: None,
+            repr: rir::RirEnumRepr::Adt,
+            raw_type: None,
             symbol: RirSymbol::new("E"),
             display: RirSymbol::new("E"),
             copyable: true,
@@ -3545,6 +3558,7 @@ mod enums {
                 symbol: RirSymbol::new("Unit"),
                 display: RirSymbol::new("Unit"),
                 kind: RirVariantKind::Unit,
+                raw_value: None,
                 fields: vec![RirField {
                     id: RirFieldId::from_index(0),
                     symbol: RirSymbol::new("f0"),
@@ -3573,6 +3587,8 @@ mod enums {
             id: RirEnumId::from_index(0),
             air_id: None,
             core: None,
+            repr: rir::RirEnumRepr::Adt,
+            raw_type: None,
             symbol: RirSymbol::new("E"),
             display: RirSymbol::new("E"),
             copyable: true,
@@ -3581,6 +3597,7 @@ mod enums {
                 symbol: RirSymbol::new("Text"),
                 display: RirSymbol::new("Text"),
                 kind: RirVariantKind::Tuple,
+                raw_value: None,
                 fields: vec![RirField {
                     id: RirFieldId::from_index(0),
                     symbol: RirSymbol::new("f0"),
@@ -3625,6 +3642,8 @@ mod enums {
             id: RirEnumId::from_index(0),
             air_id: None,
             core: None,
+            repr: rir::RirEnumRepr::Adt,
+            raw_type: None,
             symbol: RirSymbol::new("E"),
             display: RirSymbol::new("E"),
             copyable: true,
@@ -3633,6 +3652,7 @@ mod enums {
                 symbol: RirSymbol::new("Struct"),
                 display: RirSymbol::new("Struct"),
                 kind: RirVariantKind::Tuple,
+                raw_value: None,
                 fields: vec![RirField {
                     id: RirFieldId::from_index(0),
                     symbol: RirSymbol::new("f0"),
@@ -3661,14 +3681,18 @@ mod enums {
             type_args: vec![],
             const_args: vec![],
             core: None,
+            repr: air::EnumRepr::Adt,
+            raw_type: None,
             variants: vec![
                 VariantDecl {
                     name: Ident::new("Start"),
                     shape: VariantShape::Unit,
+                    raw_value: None,
                 },
                 VariantDecl {
                     name: Ident::new("Hit"),
                     shape: VariantShape::Tuple(vec![int, bool_ty]),
+                    raw_value: None,
                 },
                 VariantDecl {
                     name: Ident::new("Move"),
@@ -3682,6 +3706,7 @@ mod enums {
                             ty: int,
                         },
                     ]),
+                    raw_value: None,
                 },
             ],
         });
@@ -3748,9 +3773,12 @@ mod enums {
             type_args: vec![],
             const_args: vec![],
             core: None,
+            repr: air::EnumRepr::Adt,
+            raw_type: None,
             variants: vec![VariantDecl {
                 name: Ident::new("Text"),
                 shape: VariantShape::Tuple(vec![string]),
+                raw_value: None,
             }],
         });
         program.module_mut(module).enums.push(enum_id);
@@ -4037,9 +4065,12 @@ mod arrays {
             type_args: vec![],
             const_args: vec![],
             core: None,
+            repr: air::EnumRepr::Adt,
+            raw_type: None,
             variants: vec![VariantDecl {
                 name: Ident::new("Some"),
                 shape: VariantShape::Tuple(vec![int]),
+                raw_value: None,
             }],
         });
         program.module_mut(module).enums.push(enum_id);
@@ -4875,6 +4906,422 @@ mod slices {
     }
 }
 
+#[test]
+fn rir_verifies_raw_enum_metadata_and_cast() {
+    let mut program = RirProgram::default();
+    let int = RirTypeId::from_index(0);
+    let state = RirTypeId::from_index(1);
+    program.types.push(RirType::Int);
+    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    program.enums.push(RirEnum {
+        id: RirEnumId::from_index(0),
+        air_id: None,
+        core: None,
+        repr: rir::RirEnumRepr::RawInt,
+        raw_type: Some(int),
+        symbol: RirSymbol::new("State"),
+        display: RirSymbol::new("State"),
+        copyable: true,
+        variants: vec![RirVariant {
+            id: RirVariantId::from_index(0),
+            symbol: RirSymbol::new("Idle"),
+            display: RirSymbol::new("Idle"),
+            kind: RirVariantKind::Unit,
+            raw_value: Some(rir::RirRawEnumValue::Int(0)),
+            fields: vec![],
+        }],
+    });
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(0),
+        air_id: None,
+        symbol: RirSymbol::new("cast"),
+        params: vec![RirParam {
+            local: RirLocalId::from_index(0),
+            ty: state,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+        }],
+        ret: RirReturn { ty: int },
+        locals: vec![RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: state,
+            mutable: false,
+            symbol: RirSymbol::new("state"),
+            initialized: true,
+        }],
+        body: RirStructuredBlock {
+            stmts: vec![RirStmt::Eval(RirRValue::Cast {
+                value: RirOperand::Place(RirPlace {
+                    local: RirLocalId::from_index(0),
+                    projections: vec![],
+                    ty: state,
+                }),
+                target: int,
+            })],
+            term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+        },
+    });
+    program.consts.push(RirConst {
+        id: RirConstId::from_index(0),
+        ty: int,
+        value: RirConstValue::Int(0),
+    });
+
+    assert!(rir::verify(&program).is_ok());
+}
+
+#[test]
+fn rir_rejects_raw_enum_wrong_value_type() {
+    let mut program = RirProgram::default();
+    program.types.push(RirType::Int);
+    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    program.enums.push(raw_int_rir_enum(RirVariant {
+        id: RirVariantId::from_index(0),
+        symbol: RirSymbol::new("Bad"),
+        display: RirSymbol::new("Bad"),
+        kind: RirVariantKind::Unit,
+        raw_value: Some(rir::RirRawEnumValue::String("bad".into())),
+        fields: vec![],
+    }));
+
+    let errors = rir::verify(&program).expect_err("malformed raw enum verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, RirVerifyErrorKind::RawEnumWrongValue))
+    );
+}
+
+#[test]
+fn rir_rejects_raw_enum_payload() {
+    let mut program = RirProgram::default();
+    let int = RirTypeId::from_index(0);
+    program.types.push(RirType::Int);
+    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    program.enums.push(raw_int_rir_enum(RirVariant {
+        id: RirVariantId::from_index(0),
+        symbol: RirSymbol::new("Bad"),
+        display: RirSymbol::new("Bad"),
+        kind: RirVariantKind::Tuple,
+        raw_value: Some(rir::RirRawEnumValue::Int(0)),
+        fields: vec![RirField {
+            id: RirFieldId::from_index(0),
+            symbol: RirSymbol::new("f0"),
+            ty: int,
+        }],
+    }));
+
+    let errors = rir::verify(&program).expect_err("malformed raw enum verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, RirVerifyErrorKind::RawEnumPayload))
+    );
+}
+
+fn raw_int_rir_enum(variant: RirVariant) -> RirEnum {
+    RirEnum {
+        id: RirEnumId::from_index(0),
+        air_id: None,
+        core: None,
+        repr: rir::RirEnumRepr::RawInt,
+        raw_type: Some(RirTypeId::from_index(0)),
+        symbol: RirSymbol::new("State"),
+        display: RirSymbol::new("State"),
+        copyable: true,
+        variants: vec![variant],
+    }
+}
+
+fn raw_air_enum(
+    program: &mut Program,
+    module: air::ModuleId,
+    name: &str,
+    repr: air::EnumRepr,
+    raw_type: air::TypeId,
+    variants: Vec<(&str, RawEnumValue)>,
+) -> (air::EnumId, air::TypeId) {
+    let enum_id = program.alloc_enum(EnumDecl {
+        name: Ident::new(name),
+        module,
+        type_args: vec![],
+        const_args: vec![],
+        core: None,
+        repr,
+        raw_type: Some(raw_type),
+        variants: variants
+            .into_iter()
+            .map(|(name, raw_value)| VariantDecl {
+                name: Ident::new(name),
+                shape: VariantShape::Unit,
+                raw_value: Some(raw_value),
+            })
+            .collect(),
+    });
+    program.module_mut(module).enums.push(enum_id);
+    (enum_id, program.alloc_type(TypeData::Enum(enum_id)))
+}
+
+fn raw_int_air_enum(
+    program: &mut Program,
+    module: air::ModuleId,
+    raw_type: air::TypeId,
+    name: &str,
+    variants: Vec<(&str, i64)>,
+) -> (air::EnumId, air::TypeId) {
+    raw_air_enum(
+        program,
+        module,
+        name,
+        air::EnumRepr::RawInt,
+        raw_type,
+        variants
+            .into_iter()
+            .map(|(name, value)| (name, RawEnumValue::Int(value)))
+            .collect(),
+    )
+}
+
+fn raw_string_air_enum(
+    program: &mut Program,
+    module: air::ModuleId,
+    raw_type: air::TypeId,
+    name: &str,
+    variants: Vec<(&str, &str)>,
+) -> (air::EnumId, air::TypeId) {
+    raw_air_enum(
+        program,
+        module,
+        name,
+        air::EnumRepr::RawString,
+        raw_type,
+        variants
+            .into_iter()
+            .map(|(name, value)| (name, RawEnumValue::String(value.into())))
+            .collect(),
+    )
+}
+
+#[test]
+fn raw_int_enum_cast_emits_repr_discriminants_and_cast() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let (enum_id, state) = raw_int_air_enum(&mut program, module, int, "State", vec![("Dead", -1)]);
+    let state_local = air::LocalId::from_index(0);
+    let raw_local = air::LocalId::from_index(1);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![local(state, LocalKind::Temp), local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: state_local,
+                    value: RValue::Aggregate {
+                        kind: AggregateCtor::EnumVariant {
+                            enum_id,
+                            variant: VariantId::from_index(0),
+                        },
+                        fields: vec![],
+                        ty: state,
+                    },
+                },
+                Statement::Init {
+                    local: raw_local,
+                    value: RValue::Cast {
+                        value: Operand::Place(place(state_local, state)),
+                        target: int,
+                    },
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(place(raw_local, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+
+    let source = plan_source(program);
+    let text = source.as_str();
+    assert!(text.contains("#[derive(Clone, Copy)]"));
+    assert!(text.contains("#[repr(i64)]"));
+    assert!(text.contains("Dead = -1"));
+    assert!(text.contains("v0 as i64"));
+}
+
+#[test]
+fn raw_int_enum_cast_does_not_consume_source_place() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let (enum_id, state) = raw_int_air_enum(&mut program, module, int, "State", vec![("Idle", 0)]);
+    let state_local = air::LocalId::from_index(0);
+    let first = air::LocalId::from_index(1);
+    let second = air::LocalId::from_index(2);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![
+            local(state, LocalKind::Temp),
+            local(int, LocalKind::Temp),
+            local(int, LocalKind::Temp),
+        ],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: state_local,
+                    value: RValue::Aggregate {
+                        kind: AggregateCtor::EnumVariant {
+                            enum_id,
+                            variant: VariantId::from_index(0),
+                        },
+                        fields: vec![],
+                        ty: state,
+                    },
+                },
+                Statement::Init {
+                    local: first,
+                    value: RValue::Cast {
+                        value: Operand::Place(place(state_local, state)),
+                        target: int,
+                    },
+                },
+                Statement::Init {
+                    local: second,
+                    value: RValue::Cast {
+                        value: Operand::Place(place(state_local, state)),
+                        target: int,
+                    },
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(place(second, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+
+    let output = run_source(plan_source(program));
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn empty_raw_int_enum_cast_emits_impossible_match_without_repr() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let (_, never) = raw_int_air_enum(&mut program, module, int, "Never", vec![]);
+    let arg = air::LocalId::from_index(0);
+    let raw = air::LocalId::from_index(1);
+    let main = program.alloc_function(Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![Param {
+                name: Some(Ident::new("value")),
+                ty: never,
+                mode: ParamMode::Value,
+                role: ParamRole::Normal,
+                local_id: arg,
+            }],
+            int,
+        ),
+        locals: vec![local(never, LocalKind::Arg), local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: raw,
+                value: RValue::Cast {
+                    value: Operand::Place(place(arg, never)),
+                    target: int,
+                },
+            }],
+            air::AirTail::Return(Some(Operand::Place(place(raw, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    let zero = int_const(&mut program, int, 0);
+    let entry = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(zero)))),
+    });
+    program.module_mut(module).functions.push(entry);
+    program.set_entry(entry);
+
+    let source = plan_source(program);
+    let text = source.as_str();
+    assert!(!text.contains("#[repr(i64)]"));
+    assert!(text.contains("match &"));
+    assert!(text.contains("_ => unreachable!()"));
+}
+
+#[test]
+fn raw_string_enum_cast_emits_match() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let module = program.alloc_module(root_module());
+    let (enum_id, anim) =
+        raw_string_air_enum(&mut program, module, string, "Anim", vec![("Idle", "idle")]);
+    let anim_local = air::LocalId::from_index(0);
+    let raw_local = air::LocalId::from_index(1);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], string),
+        locals: vec![local(anim, LocalKind::Temp), local(string, LocalKind::Temp)],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: anim_local,
+                    value: RValue::Aggregate {
+                        kind: AggregateCtor::EnumVariant {
+                            enum_id,
+                            variant: VariantId::from_index(0),
+                        },
+                        fields: vec![],
+                        ty: anim,
+                    },
+                },
+                Statement::Init {
+                    local: raw_local,
+                    value: RValue::Cast {
+                        value: Operand::Place(place(anim_local, anim)),
+                        target: string,
+                    },
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(place(raw_local, string)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+
+    let source = plan_source(program);
+    let text = source.as_str();
+    assert!(text.contains("match &v0"));
+    assert!(text.contains("=> String::from(\"idle\")"));
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
 fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
     let mut program = RirProgram::default();
     let string = RirTypeId::from_index(0);
@@ -4885,6 +5332,8 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
         id: RirEnumId::from_index(0),
         air_id: None,
         core,
+        repr: rir::RirEnumRepr::Adt,
+        raw_type: None,
         symbol: RirSymbol::new("OptionString"),
         display: RirSymbol::new("Option"),
         copyable: false,
@@ -4894,6 +5343,7 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
                 symbol: RirSymbol::new("None"),
                 display: RirSymbol::new("None"),
                 kind: RirVariantKind::Unit,
+                raw_value: None,
                 fields: vec![],
             },
             RirVariant {
@@ -4901,6 +5351,7 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
                 symbol: RirSymbol::new("Some"),
                 display: RirSymbol::new("Some"),
                 kind: RirVariantKind::Tuple,
+                raw_value: None,
                 fields: vec![RirField {
                     id: RirFieldId::from_index(0),
                     symbol: RirSymbol::new("f0"),

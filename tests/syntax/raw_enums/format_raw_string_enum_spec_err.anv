@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: precision requires float or string
+
+enum Anim: string {
+    Idle = "idle",
+}
+
+fn main() {
+    let anim = Anim.Idle;
+    let text = f"{anim:.2}";
+}

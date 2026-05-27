@@ -953,6 +953,7 @@ pub struct EnumVariant {
     pub span: Span,
     pub name: Ident,
     pub kind: VariantKind,
+    pub raw_value: Option<ExprNode>,
     pub doc: Option<String>,
 }
 
@@ -964,6 +965,7 @@ pub struct EnumDecl {
     pub visibility: Visibility,
     pub type_params: Vec<TypeParam>,
     pub const_params: Vec<ConstParam>,
+    pub raw_backing: Option<Spanned<Type>>,
     pub variants: Vec<EnumVariant>,
 }
 

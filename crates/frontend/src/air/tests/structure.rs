@@ -282,11 +282,14 @@ fn program_accessors() {
         name: Ident::new("MyEnum"),
         module,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
             name: Ident::new("V"),
             shape: VariantShape::Unit,
+            raw_value: None,
         }],
     });
 

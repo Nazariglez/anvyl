@@ -12,8 +12,9 @@ pub(super) use super::{
     ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternParamDecl,
     ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId,
     FunctionKind, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability, Operand, Param,
-    ParamMode, ParamRole, ParamType, Place, Program, Projection, RValue, ReturnMode, Signature,
-    SignatureType, TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape, verify,
+    ParamMode, ParamRole, ParamType, Place, Program, Projection, RValue, RawEnumValue, ReturnMode,
+    Signature, SignatureType, TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape,
+    verify,
 };
 
 mod structure;

@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: raw string enum value must be a string constant
+
+enum E: string {
+    A = 1,
+}

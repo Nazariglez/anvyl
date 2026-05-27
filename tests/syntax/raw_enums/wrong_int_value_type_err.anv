@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: raw int enum value must be an int constant
+
+enum E: int {
+    A = "a",
+}

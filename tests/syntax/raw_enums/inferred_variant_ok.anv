@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State: int {
+    Idle,
+    Run,
+}
+
+fn main() {
+    let state: State = .Run;
+}

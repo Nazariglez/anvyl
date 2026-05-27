@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: not a constant expression
+
+fn value() -> int { 1 }
+
+enum E: int {
+    A = value(),
+}

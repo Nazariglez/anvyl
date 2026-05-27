@@ -3,10 +3,11 @@ use std::fmt::Write;
 use anvyx_frontend::ast::{BinaryOp, UnaryOp};
 
 use super::rir::{
-    RirCallArg, RirCallTarget, RirConst, RirConstValue, RirEnum, RirEnumMatch, RirExternKind,
-    RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirOperand,
-    RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirRValue, RirStmt, RirStructuredBlock,
-    RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+    RirCallArg, RirCallTarget, RirConst, RirConstValue, RirEnum, RirEnumMatch, RirEnumRepr,
+    RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
+    RirOperand, RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirRValue, RirRawEnumValue,
+    RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
+    RirVariantKind, VerifiedRirProgram,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,11 +99,19 @@ impl EmitCx<'_> {
     }
 
     fn emit_enum(&mut self, enm: &RirEnum) {
+        if enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty() {
+            self.line("#[derive(Clone, Copy)]");
+            self.line("#[repr(i64)]");
+        }
         self.line(&format!("enum {} {{", enm.symbol.as_str()));
         for variant in &enm.variants {
             match variant.kind {
                 RirVariantKind::Unit => {
-                    self.line(&format!("    {},", variant.symbol.as_str()));
+                    let raw = match &variant.raw_value {
+                        Some(RirRawEnumValue::Int(value)) => format!(" = {value}"),
+                        _ => String::new(),
+                    };
+                    self.line(&format!("    {}{raw},", variant.symbol.as_str()));
                 }
                 RirVariantKind::Tuple => {
                     let fields = variant
@@ -491,9 +500,7 @@ impl EmitCx<'_> {
                 binary_op(*op),
                 self.operand(function, rhs)
             ),
-            RirRValue::Cast { value, target } => {
-                format!("{} as {}", self.operand(function, value), self.ty(*target))
-            }
+            RirRValue::Cast { value, target } => self.cast(function, value, *target),
             RirRValue::Call { callee, args, .. } => match callee {
                 RirCallTarget::Function(id) => {
                     let symbol = self.program.functions[id.index()].symbol.as_str();
@@ -556,6 +563,64 @@ impl EmitCx<'_> {
                 ..
             } => self.list_slice(function, source, *start, *end, *inclusive),
         }
+    }
+
+    fn cast(&self, function: &RirFunction, value: &RirOperand, target: RirTypeId) -> String {
+        if self.program.types[target.index()] == RirType::Int
+            && let Some((enm, value)) = self.raw_enum_place(function, value, RirEnumRepr::RawInt)
+        {
+            return if enm.variants.is_empty() {
+                self.raw_enum_cast_match(&value, String::new())
+            } else {
+                format!("{value} as {}", self.ty(target))
+            };
+        }
+        if self.program.types[target.index()] == RirType::String
+            && let Some((enm, value)) = self.raw_enum_place(function, value, RirEnumRepr::RawString)
+        {
+            let arms = enm
+                .variants
+                .iter()
+                .map(|variant| {
+                    let Some(RirRawEnumValue::String(raw)) = &variant.raw_value else {
+                        unreachable!("verified raw string enum value")
+                    };
+                    format!(
+                        "{}::{} => String::from({})",
+                        enm.symbol.as_str(),
+                        variant.symbol.as_str(),
+                        rust_string(raw)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return self.raw_enum_cast_match(&value, arms);
+        }
+        format!("{} as {}", self.operand(function, value), self.ty(target))
+    }
+
+    fn raw_enum_cast_match(&self, value: &str, arms: String) -> String {
+        if arms.is_empty() {
+            format!("match &{value} {{ _ => unreachable!() }}")
+        } else {
+            format!("match &{value} {{ {arms} }}")
+        }
+    }
+
+    fn raw_enum_place(
+        &self,
+        function: &RirFunction,
+        value: &RirOperand,
+        repr: RirEnumRepr,
+    ) -> Option<(&RirEnum, String)> {
+        let RirOperand::Place(place) = value else {
+            return None;
+        };
+        let RirType::Enum(enum_id) = self.program.types[place.ty.index()] else {
+            return None;
+        };
+        let enm = &self.program.enums[enum_id.index()];
+        (enm.repr == repr).then(|| (enm, self.place(function, place)))
     }
 
     fn list_slice(
@@ -909,6 +974,9 @@ impl EmitCx<'_> {
             unreachable!("verified enum copy expression")
         };
         let enm = &self.program.enums[enum_id.index()];
+        if enm.variants.is_empty() {
+            return format!("match {source} {{}}");
+        }
         let arms = enm
             .variants
             .iter()
@@ -985,6 +1053,9 @@ impl EmitCx<'_> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("[{elems}]")
+            }
+            RirType::Enum(id) if self.program.enums[id.index()].variants.is_empty() => {
+                format!("match *{expr} {{}}")
             }
             RirType::Enum(_) => self.copy_enum_expr(expr, ty),
             RirType::List(_) | RirType::Slice(_) | RirType::String | RirType::Void => {

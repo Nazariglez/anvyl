@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mismatched types
+
+enum State: int {
+    Idle,
+}
+
+fn main() {
+    let n: int = State.Idle;
+}

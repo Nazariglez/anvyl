@@ -703,6 +703,14 @@ pub(crate) enum TypeError {
         found: Type,
         span: Option<SourceSpan>,
     },
+    RawEnumExpectedIntValue {
+        found: Type,
+        span: Option<SourceSpan>,
+    },
+    RawEnumExpectedStringValue {
+        found: Type,
+        span: Option<SourceSpan>,
+    },
     InvalidConstCast {
         from: Type,
         to: Type,
@@ -711,6 +719,17 @@ pub(crate) enum TypeError {
     InvalidCast {
         from: Type,
         to: Type,
+        span: Option<SourceSpan>,
+    },
+    RawEnumWrongRawCast {
+        enum_ty: Type,
+        expected: Type,
+        found: Type,
+        span: Option<SourceSpan>,
+    },
+    NonRawEnumRawCast {
+        enum_ty: Type,
+        raw_ty: Type,
         span: Option<SourceSpan>,
     },
     ConstDivisionByZero {

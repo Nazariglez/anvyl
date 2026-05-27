@@ -2025,14 +2025,18 @@ mod tests {
             type_args: vec![],
             const_args: vec![],
             core: None,
+            repr: crate::air::EnumRepr::Adt,
+            raw_type: None,
             variants: vec![
                 VariantDecl {
                     name: Ident::new("None"),
                     shape: VariantShape::Unit,
+                    raw_value: None,
                 },
                 VariantDecl {
                     name: Ident::new("Some"),
                     shape: VariantShape::Tuple(vec![int]),
+                    raw_value: None,
                 },
             ],
         });
@@ -2054,14 +2058,18 @@ mod tests {
             type_args: vec![],
             const_args: vec![],
             core: None,
+            repr: crate::air::EnumRepr::Adt,
+            raw_type: None,
             variants: vec![
                 VariantDecl {
                     name: Ident::new("A"),
                     shape: VariantShape::Tuple(vec![int]),
+                    raw_value: None,
                 },
                 VariantDecl {
                     name: Ident::new("B"),
                     shape: VariantShape::Tuple(vec![int, int]),
+                    raw_value: None,
                 },
             ],
         });

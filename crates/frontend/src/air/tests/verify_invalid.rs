@@ -291,11 +291,14 @@ fn structured_match_rejects_wrong_discriminant_and_variant() {
         name: Ident::new("Choice"),
         module,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
             name: Ident::new("A"),
             shape: VariantShape::Unit,
+            raw_value: None,
         }],
     });
     let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
@@ -607,11 +610,14 @@ fn enum_bad_variant_type() {
         name: Ident::new("BadEnum"),
         module,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
             name: Ident::new("V"),
             shape: VariantShape::Tuple(vec![TypeId::from_index(888)]),
+            raw_value: None,
         }],
     });
 
@@ -1343,6 +1349,84 @@ fn rvalue_binary_and_cast_invariants() {
 }
 
 #[test]
+fn raw_enum_cast_must_match_backing() {
+    let mut builder = ProgramBuilder::default();
+    let string_ty = builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let (_, enum_ty) = builder.raw_int_enum(module, "State", vec![("Idle", 0)]);
+
+    let errors = verify_void_entry(builder, "bad_cast", module, void_ty, |fb, bb0| {
+        let state = fb.push_param("state", enum_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Cast {
+                value: op_place(state, enum_ty),
+                target: string_ty,
+            }),
+        );
+    });
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target })
+            if value == enum_ty && target == string_ty
+    )));
+}
+
+#[test]
+fn non_raw_enum_cast_to_primitive_is_invalid() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let (_, enum_ty) = builder.unit_enum(module, "State");
+
+    let errors = verify_void_entry(builder, "bad_cast", module, void_ty, |fb, bb0| {
+        let state = fb.push_param("state", enum_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Cast {
+                value: op_place(state, enum_ty),
+                target: int_ty,
+            }),
+        );
+    });
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target })
+            if value == enum_ty && target == int_ty
+    )));
+}
+
+#[test]
+fn primitive_cast_to_enum_is_invalid() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let (_, enum_ty) = builder.raw_int_enum(module, "State", vec![("Idle", 0)]);
+
+    let errors = verify_void_entry(builder, "bad_cast", module, void_ty, |fb, bb0| {
+        let raw = fb.push_param("raw", int_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Cast {
+                value: op_place(raw, int_ty),
+                target: enum_ty,
+            }),
+        );
+    });
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target })
+            if value == int_ty && target == enum_ty
+    )));
+}
+
+#[test]
 fn function_param_local_must_match() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -1407,6 +1491,8 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         name: Ident::new("MissingEnum"),
         module: m0,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![],
@@ -1979,11 +2065,14 @@ fn enum_struct_ctor_slot_type_mismatch() {
         name: Ident::new("Event"),
         module,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![VariantDecl {
             name: Ident::new("Hit"),
             shape: VariantShape::Struct(vec![field("z", int_ty), field("a", bool_ty)]),
+            raw_value: None,
         }],
     });
     let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
@@ -2136,16 +2225,20 @@ fn enum_ctor_unit_count_tuple_type_and_result_mismatch() {
         name: Ident::new("E"),
         module,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![
             VariantDecl {
                 name: Ident::new("Unit"),
                 shape: VariantShape::Unit,
+                raw_value: None,
             },
             VariantDecl {
                 name: Ident::new("Tuple"),
                 shape: VariantShape::Tuple(vec![int_ty]),
+                raw_value: None,
             },
         ],
     });

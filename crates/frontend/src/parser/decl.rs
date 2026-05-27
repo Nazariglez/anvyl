@@ -1380,6 +1380,10 @@ fn enum_variant_struct_payload<'src>(
 fn enum_variant<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::EnumVariant> {
+    let raw_value = select! { Token::Op(Op::Assign) => () }
+        .ignore_then(expression(stmt.clone()))
+        .or_not();
+
     annotations()
         .then(doc_comment_block())
         .then(identifier())
@@ -1388,13 +1392,17 @@ fn enum_variant<'src>(
             enum_variant_struct_payload(stmt),
             empty().to(ast::VariantKind::Unit),
         )))
-        .map_with(|(((annotations, doc), name), kind), e| ast::EnumVariant {
-            annotations,
-            span: e.span().byte(),
-            name,
-            kind,
-            doc,
-        })
+        .then(raw_value)
+        .map_with(
+            |((((annotations, doc), name), kind), raw_value), e| ast::EnumVariant {
+                annotations,
+                span: e.span().byte(),
+                name,
+                kind,
+                raw_value,
+                doc,
+            },
+        )
         .labelled("enum variant")
         .as_context()
         .boxed()
@@ -1403,10 +1411,15 @@ fn enum_variant<'src>(
 pub(super) fn enum_declaration<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::EnumDeclNode> {
+    let raw_backing = select! { Token::Colon => () }
+        .ignore_then(type_ident().map_with(|ty, e| Spanned::new(ty, e.span().byte())))
+        .or_not();
+
     visibility()
         .then_ignore(select! { Token::Keyword(Keyword::Enum) => () })
         .then(identifier())
         .then(generic_params())
+        .then(raw_backing)
         .then(
             select! { Token::Open(Delimiter::Brace) => () }
                 .ignore_then(
@@ -1417,7 +1430,7 @@ pub(super) fn enum_declaration<'src>(
                 )
                 .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
         )
-        .map_with(|(((vis, name), gp), variants), e| {
+        .map_with(|((((vis, name), gp), raw_backing), variants), e| {
             let s = e.span();
             let GenericParams {
                 type_params,
@@ -1471,6 +1484,7 @@ pub(super) fn enum_declaration<'src>(
                         span: v.span,
                         name: v.name,
                         kind: resolved_kind,
+                        raw_value: v.raw_value,
                         doc: v.doc,
                     }
                 })
@@ -1484,6 +1498,7 @@ pub(super) fn enum_declaration<'src>(
                     visibility: vis,
                     type_params,
                     const_params,
+                    raw_backing,
                     variants: resolved_variants,
                 },
                 s.byte(),

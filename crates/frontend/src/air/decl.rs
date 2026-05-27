@@ -137,6 +137,19 @@ pub enum AggregateKind {
     DataRef,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnumRepr {
+    Adt,
+    RawInt,
+    RawString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RawEnumValue {
+    Int(i64),
+    String(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumDecl {
     pub name: Ident,
@@ -144,6 +157,8 @@ pub struct EnumDecl {
     pub type_args: Vec<TypeId>,
     pub const_args: Vec<String>,
     pub core: Option<CoreEnumKind>,
+    pub repr: EnumRepr,
+    pub raw_type: Option<TypeId>,
     pub variants: Vec<VariantDecl>,
 }
 
@@ -156,6 +171,7 @@ pub enum CoreEnumKind {
 pub struct VariantDecl {
     pub name: Ident,
     pub shape: VariantShape,
+    pub raw_value: Option<RawEnumValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

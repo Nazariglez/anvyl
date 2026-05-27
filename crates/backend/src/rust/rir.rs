@@ -87,10 +87,25 @@ pub struct RirEnum {
     pub id: RirEnumId,
     pub air_id: Option<air::EnumId>,
     pub core: Option<RirCoreEnumKind>,
+    pub repr: RirEnumRepr,
+    pub raw_type: Option<RirTypeId>,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
     pub copyable: bool,
     pub variants: Vec<RirVariant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RirEnumRepr {
+    Adt,
+    RawInt,
+    RawString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RirRawEnumValue {
+    Int(i64),
+    String(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +119,7 @@ pub struct RirVariant {
     pub symbol: RirSymbol,
     pub display: RirSymbol,
     pub kind: RirVariantKind,
+    pub raw_value: Option<RirRawEnumValue>,
     pub fields: Vec<RirField>,
 }
 
@@ -518,6 +534,12 @@ pub enum RirVerifyErrorKind {
     UninitializedLocal(RirLocalId),
     UnsupportedAbi,
     UnsupportedRValueType,
+    RawEnumMissingRawType,
+    RawEnumWrongRawType,
+    RawEnumMissingValue,
+    RawEnumWrongValue,
+    RawEnumPayload,
+    RawEnumDuplicateValue,
     NonCopyValueRequired,
     FieldCount {
         expected: usize,
@@ -620,23 +642,35 @@ fn rir_type_matches_option(program: &RirProgram, id: RirTypeId, inner: &RustRetu
     let Some(RirType::Enum(enum_id)) = program.types.get(id.index()) else {
         return false;
     };
-    let enm = &program.enums[enum_id.index()];
-    if enm.core != Some(RirCoreEnumKind::Option) {
-        return false;
-    }
-    let [none, some] = enm.variants.as_slice() else {
-        return false;
-    };
-    if none.kind != RirVariantKind::Unit || some.kind != RirVariantKind::Tuple {
-        return false;
-    }
-    let [field] = some.fields.as_slice() else {
+    let Some(payload) = rir_option_payload_ty(program, *enum_id) else {
         return false;
     };
     match inner {
-        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, field.ty, ty),
+        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, payload, ty),
         RustReturnAbi::Void | RustReturnAbi::Option(_) | RustReturnAbi::List(_) => false,
     }
+}
+
+fn rir_option_payload_ty(program: &RirProgram, enum_id: RirEnumId) -> Option<RirTypeId> {
+    let enm = program.enums.get(enum_id.index())?;
+    if enm.core != Some(RirCoreEnumKind::Option) {
+        return None;
+    }
+    let [none, some] = enm.variants.as_slice() else {
+        return None;
+    };
+    if none.display.as_str() != "None"
+        || none.kind != RirVariantKind::Unit
+        || !none.fields.is_empty()
+        || some.display.as_str() != "Some"
+        || some.kind != RirVariantKind::Tuple
+    {
+        return None;
+    }
+    let [field] = some.fields.as_slice() else {
+        return None;
+    };
+    Some(field.ty)
 }
 
 impl VerifyCx<'_> {
@@ -731,6 +765,7 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::DuplicateSymbol);
             }
             symbols.push(enm.symbol.clone());
+            self.check_raw_enum(site, enm);
             let mut variant_symbols = Vec::new();
             for (variant_index, variant) in enm.variants.iter().enumerate() {
                 if variant.id != RirVariantId::from_index(variant_index) {
@@ -773,6 +808,55 @@ impl VerifyCx<'_> {
                     }
                 }
             }
+        }
+    }
+
+    fn check_raw_enum(&mut self, site: RirVerifySite, enm: &RirEnum) {
+        match enm.repr {
+            RirEnumRepr::Adt => {
+                if enm.raw_type.is_some()
+                    || enm
+                        .variants
+                        .iter()
+                        .any(|variant| variant.raw_value.is_some())
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+            }
+            RirEnumRepr::RawInt | RirEnumRepr::RawString => {
+                let Some(raw_type) = enm.raw_type else {
+                    self.push(site, RirVerifyErrorKind::RawEnumMissingRawType);
+                    return;
+                };
+                self.check_type_id(site, raw_type);
+                if Some(raw_type) != self.raw_enum_primitive_type(enm.repr) {
+                    self.push(site, RirVerifyErrorKind::RawEnumWrongRawType);
+                }
+                let mut raw_values = std::collections::HashSet::new();
+                for variant in &enm.variants {
+                    if variant.kind != RirVariantKind::Unit || !variant.fields.is_empty() {
+                        self.push(site, RirVerifyErrorKind::RawEnumPayload);
+                    }
+                    match (enm.repr, variant.raw_value.as_ref()) {
+                        (RirEnumRepr::RawInt, Some(raw @ RirRawEnumValue::Int(_)))
+                        | (RirEnumRepr::RawString, Some(raw @ RirRawEnumValue::String(_))) => {
+                            if !raw_values.insert(raw) {
+                                self.push(site, RirVerifyErrorKind::RawEnumDuplicateValue);
+                            }
+                        }
+                        (_, Some(_)) => self.push(site, RirVerifyErrorKind::RawEnumWrongValue),
+                        (_, None) => self.push(site, RirVerifyErrorKind::RawEnumMissingValue),
+                    }
+                }
+            }
+        }
+    }
+
+    fn raw_enum_primitive_type(&self, repr: RirEnumRepr) -> Option<RirTypeId> {
+        match repr {
+            RirEnumRepr::Adt => None,
+            RirEnumRepr::RawInt => self.type_id(RirType::Int),
+            RirEnumRepr::RawString => self.type_id(RirType::String),
         }
     }
 
@@ -1711,13 +1795,22 @@ impl VerifyCx<'_> {
     }
 
     fn cast_ok(&self, value: Option<RirTypeId>, ret: RirTypeId) -> bool {
-        matches!(
+        if matches!(
             (value.and_then(|ty| self.ty(ty)), self.ty(ret)),
             (
                 Some(RirType::Int | RirType::Float),
                 Some(RirType::Int | RirType::Float)
             )
-        )
+        ) {
+            return true;
+        }
+        let Some(RirType::Enum(enum_id)) = value.and_then(|ty| self.ty(ty)) else {
+            return false;
+        };
+        self.program
+            .enums
+            .get(enum_id.index())
+            .is_some_and(|enm| enm.raw_type == Some(ret))
     }
 
     fn stringify_ok(&self, value: &RirOperand, source_ty: RirTypeId) -> bool {

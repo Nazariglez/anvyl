@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: raw string enum variant 'Anim.Idle' must have an explicit string value
+
+enum Anim: string {
+    Idle,
+}

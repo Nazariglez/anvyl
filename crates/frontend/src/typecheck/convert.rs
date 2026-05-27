@@ -1,6 +1,7 @@
 use super::{
-    CastConversionMatch, CheckedType, DynContainerConversionKind, EscapeMode, ModuleScope,
-    TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint, checked_from_type,
+    CastConversionMatch, CheckedType, DynContainerConversionKind, EnumRepr, EscapeMode,
+    ModuleScope, TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint,
+    checked_from_type,
     contracts::{self, ContractMatchError, RequirementError},
     projection::{
         ExpectedFit, ExpectedProjectionMode, SourceAcceptance, apply_value_projection,
@@ -17,6 +18,7 @@ use crate::{
 pub(super) enum ExplicitCast {
     Identity,
     Builtin,
+    RawEnum,
     CastFrom {
         escape: EscapeMode,
         origin: ModuleScope,
@@ -52,6 +54,11 @@ impl TypeChecker {
         }
         if builtin_numeric_cast(source, target) {
             return Some(ExplicitCast::Builtin);
+        }
+        match classify_raw_enum_cast(&self.decls, source, target) {
+            Some(RawEnumCast::Accept) => return Some(ExplicitCast::RawEnum),
+            Some(RawEnumCast::Reject) => return None,
+            None => {}
         }
         self.cast_from_conversion(source, target)
             .map(|(escape, origin)| ExplicitCast::CastFrom { escape, origin })
@@ -485,6 +492,62 @@ fn requirement_error_detail(name: Ident, error: &RequirementError) -> String {
     format!("method '{name}' {reason}")
 }
 
+enum RawEnumCast {
+    Accept,
+    Reject,
+}
+
+fn classify_raw_enum_cast(
+    decls: &super::DeclarationIndex,
+    source: &Type,
+    target: &Type,
+) -> Option<RawEnumCast> {
+    if matches!(target, Type::Int | Type::String)
+        && let Some(key) = decls.key_for_type(source)
+        && decls
+            .enum_repr_for_key(&key)
+            .is_some_and(|repr| repr != EnumRepr::Adt)
+    {
+        return Some(if decls.raw_enum_raw_type(&key).as_ref() == Some(target) {
+            RawEnumCast::Accept
+        } else {
+            RawEnumCast::Reject
+        });
+    }
+    None
+}
+
+fn push_raw_enum_cast_error(tc: &mut TypeChecker, span: Span, from: &Type, to: &Type) -> bool {
+    let from_key = tc.decls.key_for_type(from);
+    if let Some(key) = from_key
+        && matches!(to, Type::Int | Type::String)
+    {
+        match tc.decls.enum_repr_for_key(&key) {
+            Some(EnumRepr::RawInt | EnumRepr::RawString) => {
+                if let Some(raw_ty) = tc.decls.raw_enum_raw_type(&key) {
+                    tc.push_error(TypeError::RawEnumWrongRawCast {
+                        enum_ty: from.clone(),
+                        expected: raw_ty,
+                        found: to.clone(),
+                        span: tc.error_span(span),
+                    });
+                    return true;
+                }
+            }
+            Some(EnumRepr::Adt) => {
+                tc.push_error(TypeError::NonRawEnumRawCast {
+                    enum_ty: from.clone(),
+                    raw_ty: to.clone(),
+                    span: tc.error_span(span),
+                });
+                return true;
+            }
+            None => {}
+        }
+    }
+    false
+}
+
 fn builtin_numeric_cast(source: &Type, target: &Type) -> bool {
     matches!(
         (source, target),
@@ -539,11 +602,13 @@ pub(super) fn check_cast_expr(
             cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
         }
         ExpectedFit::Deferred | ExpectedFit::Mismatch => {
-            tc.push_error(TypeError::InvalidCast {
-                from,
-                to: target,
-                span: tc.error_span(cast.span),
-            });
+            if !push_raw_enum_cast_error(tc, cast.span, &from, &target) {
+                tc.push_error(TypeError::InvalidCast {
+                    from,
+                    to: target,
+                    span: tc.error_span(cast.span),
+                });
+            }
             cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
         }
         ExpectedFit::SourceAccepted(_) | ExpectedFit::Project { .. } => unreachable!(),
@@ -564,7 +629,7 @@ fn apply_explicit_cast_effects(
             tc.mark_activation_imports_used(&origin);
             tc.check_argument_escape(&cast.node.expr, escape);
         }
-        ExplicitCast::Builtin => {}
+        ExplicitCast::Builtin | ExplicitCast::RawEnum => {}
     }
 }
 

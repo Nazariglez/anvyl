@@ -5,13 +5,13 @@ use anvyx_externs::ParamFlow;
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
     AirIf, AirStmt, AirTail, CallArg, Callee, ConstData, ConstId, ConstValue, CoreEnumKind,
-    DynContractData, EnumDecl, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId,
+    DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId,
     ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl,
     ExternRep, ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, FieldDecl, FieldId,
     Function, FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, Local, LocalId,
     LocalKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamMode, ParamRole,
-    ParamType, Place, Program, RValue, ReturnMode, Signature, SignatureType, TypeData, TypeId,
-    VariantDecl, VariantShape, VerifyError, ownership,
+    ParamType, Place, Program, RValue, RawEnumValue, ReturnMode, Signature, SignatureType,
+    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes, ScalarType},
     verify,
 };
@@ -26,9 +26,10 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind, CallableParent,
-        ConstTerm, DeclarationIndex, DefaultArgFact, ExtendId, ExternUseTarget, GenericArgs,
-        LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode,
-        MethodSurface, ModuleScope, NominalKey, SemanticBodyFacts, SemanticFunctionInstanceFact,
+        ConstTerm, DeclarationIndex, DefaultArgFact, EnumRepr as TcEnumRepr, ExtendId,
+        ExternUseTarget, GenericArgs, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode,
+        MemberPathKind, MethodMode, MethodSurface, ModuleScope, NominalKey,
+        RawEnumValue as TcRawEnumValue, SemanticBodyFacts, SemanticFunctionInstanceFact,
         SemanticLocalId, SemanticProgram, VariantPayload, nominal_generic_args,
         substitute_aggregate_member, type_has_unfinished_facts,
     },
@@ -393,12 +394,18 @@ impl TypeLowerer {
         let module = ensure_module(program, env.modules, &key.module);
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
         let const_args = nominal_const_args(ty);
+        let raw_type = decls
+            .raw_enum_raw_type(key)
+            .map(|ty| self.lower_with_env(program, &ty, env.reborrow()))
+            .transpose()?;
         let enum_id = program.alloc_enum(EnumDecl {
             name: key.name,
             module,
             type_args,
             const_args,
             core: enum_core_kind(decls, key),
+            repr: lower_enum_repr(schema.repr),
+            raw_type,
             variants: vec![],
         });
         program.module_mut(module).enums.push(enum_id);
@@ -433,7 +440,11 @@ impl TypeLowerer {
                             .collect::<Result<Vec<_>, LowerError>>()?,
                     ),
                 };
-                Ok(VariantDecl { name, shape })
+                Ok(VariantDecl {
+                    name,
+                    shape,
+                    raw_value: variant.raw_value.as_ref().map(lower_raw_enum_value),
+                })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
         program.enum_decl_mut(enum_id).variants = variants;
@@ -1888,25 +1899,44 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::StringInterp(parts) => self.lower_string_interp(parts),
             ExprKind::StructLiteral(literal) => self.lower_struct_literal(expr, literal),
             ExprKind::InferredEnum(inferred) => self.lower_inferred_enum(expr, inferred),
-            ExprKind::Cast(cast) => {
-                self.require_builtin_scalar(expr)?;
-                let source_ty = self.lower_expr_ty(cast.node.expr.node.id)?;
-                let target_ty = self.lower_expr_ty(expr.node.id)?;
-                let value = self.lower_value(&cast.node.expr)?;
-                if source_ty == target_ty {
-                    return Ok(value);
-                }
-                if !matches!(
-                    (&source_ty, &target_ty),
-                    (Type::Int, Type::Float) | (Type::Float, Type::Int)
-                ) {
-                    return Err(unsupported_expr(expr));
-                }
-                let target = self.cx.lower_ty(&target_ty)?;
-                self.emit_temp(RValue::Cast { value, target })
-            }
+            ExprKind::Cast(cast) => self.lower_cast_expr(expr, cast),
             _ => Err(unsupported_expr(expr)),
         }
+    }
+
+    fn lower_cast_expr(
+        &mut self,
+        expr: &ExprNode,
+        cast: &crate::span::Spanned<ast::Cast>,
+    ) -> Result<Operand, LowerError> {
+        self.require_builtin_scalar(expr)?;
+        let source_ty = self.lower_expr_ty(cast.node.expr.node.id)?;
+        let target_ty = self.lower_expr_ty(expr.node.id)?;
+        let value = self.lower_value(&cast.node.expr)?;
+        if source_ty == target_ty {
+            return Ok(value);
+        }
+        if !self.supports_cast(&source_ty, &target_ty) {
+            return Err(unsupported_expr(expr));
+        }
+        let target = self.cx.lower_ty(&target_ty)?;
+        self.emit_temp(RValue::Cast { value, target })
+    }
+
+    fn supports_cast(&self, source_ty: &Type, target_ty: &Type) -> bool {
+        if matches!(
+            (source_ty, target_ty),
+            (Type::Int, Type::Float) | (Type::Float, Type::Int)
+        ) {
+            return true;
+        }
+        let Some(decls) = self.cx.decls.as_ref() else {
+            return false;
+        };
+        let Some(key) = decls.key_for_type(source_ty) else {
+            return false;
+        };
+        decls.raw_enum_raw_type(&key).as_ref() == Some(target_ty)
     }
 
     fn lower_struct_literal(
@@ -3291,6 +3321,21 @@ fn assign_op_to_binary(op: AssignOp) -> BinaryOp {
         AssignOp::BitOrAssign => BinaryOp::BitOr,
         AssignOp::ShlAssign => BinaryOp::Shl,
         AssignOp::ShrAssign => BinaryOp::Shr,
+    }
+}
+
+fn lower_enum_repr(repr: TcEnumRepr) -> EnumRepr {
+    match repr {
+        TcEnumRepr::Adt => EnumRepr::Adt,
+        TcEnumRepr::RawInt => EnumRepr::RawInt,
+        TcEnumRepr::RawString => EnumRepr::RawString,
+    }
+}
+
+fn lower_raw_enum_value(value: &TcRawEnumValue) -> RawEnumValue {
+    match value {
+        TcRawEnumValue::Int(value) => RawEnumValue::Int(*value),
+        TcRawEnumValue::String(value) => RawEnumValue::String(value.clone()),
     }
 }
 

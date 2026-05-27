@@ -17,6 +17,34 @@ fn returns_verified_wrapper() {
 }
 
 #[test]
+fn raw_enum_to_raw_cast_is_valid() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let (_, enum_ty) = builder.raw_int_enum(module, "State", vec![("Idle", 0)]);
+
+    let mut fb = FunctionBuilder::new("cast", module, FunctionKind::Normal, void_ty);
+    let state = fb.push_param("state", enum_ty, ParamRole::Normal);
+    let out = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_init(
+            out,
+            RValue::Cast {
+                value: op_place(state, enum_ty),
+                target: int_ty,
+            },
+        ),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
 fn fn_return() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -220,16 +248,20 @@ fn structured_exhaustive_unit_enum_match() {
         name: Ident::new("Choice"),
         module,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![
             VariantDecl {
                 name: Ident::new("A"),
                 shape: VariantShape::Unit,
+                raw_value: None,
             },
             VariantDecl {
                 name: Ident::new("B"),
                 shape: VariantShape::Unit,
+                raw_value: None,
             },
         ],
     });
@@ -437,20 +469,25 @@ fn enum_switch() {
         name: Ident::new("Color"),
         module,
         core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
         type_args: vec![],
         const_args: vec![],
         variants: vec![
             VariantDecl {
                 name: Ident::new("Red"),
                 shape: VariantShape::Unit,
+                raw_value: None,
             },
             VariantDecl {
                 name: Ident::new("Green"),
                 shape: VariantShape::Unit,
+                raw_value: None,
             },
             VariantDecl {
                 name: Ident::new("Blue"),
                 shape: VariantShape::Unit,
+                raw_value: None,
             },
         ],
     });
