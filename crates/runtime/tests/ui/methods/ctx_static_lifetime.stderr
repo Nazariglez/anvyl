@@ -1,0 +1,5 @@
+error: #[anvyx(ctx)] ctx parameter must be `&mut anvyx_runtime::Ctx`
+ --> tests/ui/methods/ctx_static_lifetime.rs:8:28
+  |
+8 |     pub fn bad(&self, ctx: &mut anvyx_runtime::Ctx<'static, '_>) -> i64 {
+  |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

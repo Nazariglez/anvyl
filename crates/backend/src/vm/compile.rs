@@ -1,9 +1,11 @@
 use anvyx_frontend::air::{
-    CallArg, FunctionId, Operand, ParamMode, Program, RValue, TypeId, TypePassClass,
+    CallArg, ExternId, FunctionId, Operand, ParamMode, Program, RValue, TypeId, TypePassClass,
     TypePassClasses, VerifiedProgram,
 };
 
-use super::vir::{VirCall, VirCallArg, VirFunction, VirParam, VirProgram};
+use super::vir::{
+    VirCall, VirCallArg, VirCallee, VirExtern, VirExternParam, VirFunction, VirParam, VirProgram,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmCompiler;
@@ -79,7 +81,25 @@ impl CompileCx<'_> {
                 }
             })
             .collect();
-        VirProgram { functions }
+        let externs = self
+            .program
+            .externs
+            .iter()
+            .enumerate()
+            .map(|(index, decl)| VirExtern {
+                source: ExternId::from_index(index),
+                params: decl
+                    .call_params()
+                    .iter()
+                    .map(|param| VirExternParam {
+                        ty: param.ty,
+                        mode: param.mode,
+                    })
+                    .collect(),
+                ret: decl.return_type,
+            })
+            .collect();
+        VirProgram { functions, externs }
     }
 
     fn compile_rvalue_call(&mut self, function: FunctionId, value: &RValue) -> Option<VirCall> {
@@ -98,10 +118,12 @@ impl CompileCx<'_> {
                 VirCallArg::from(arg)
             })
             .collect();
-        Some(VirCall {
-            callee: callee.clone(),
-            args,
-        })
+        let callee = match callee {
+            anvyx_frontend::air::Callee::Function(id) => VirCallee::Function(*id),
+            anvyx_frontend::air::Callee::Extern(id) => VirCallee::Extern(*id),
+            anvyx_frontend::air::Callee::Closure(operand) => VirCallee::Closure(operand.clone()),
+        };
+        Some(VirCall { callee, args })
     }
 
     fn operand_ty(&self, operand: &Operand) -> Option<TypeId> {

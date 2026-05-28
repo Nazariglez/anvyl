@@ -1,0 +1,5 @@
+error: #[function(ctx)] ctx parameter must be named `ctx`
+ --> tests/ui/function/ctx_missing.rs:4:8
+  |
+4 | fn bad(value: i64) -> i64 {
+  |        ^^^^^

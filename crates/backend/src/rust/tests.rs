@@ -739,7 +739,9 @@ fn source_job_compiles_methods_as_free_functions() {
     let source = plan_source(program);
     let text = source.as_str();
 
-    assert!(text.contains("fn anv_f0_Point_value(_ctx: &mut AnvCtx, v0: anvT3_Point) -> i64"));
+    assert!(text.contains(
+        "fn anv_f0_Point_value<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>, v0: anvT3_Point) -> i64"
+    ));
     assert!(text.contains("anv_f0_Point_value(ctx, anvT3_Point { x: v0.x })"));
     assert!(!text.contains("impl "));
     assert!(!text.contains("trait "));
@@ -1834,8 +1836,10 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
     let program = scalar_print_program();
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("fn anv_f0_main(ctx: &mut AnvCtx)"));
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(v0.as_str())"));
+    assert!(source.contains("fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(
+        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, v0.as_str())")
+    );
     assert!(!source.contains("fn anv_extern__println"));
     assert!(!source.contains("impl "));
     assert!(!source.contains("trait "));
@@ -1888,8 +1892,8 @@ fn emit_uses_underscored_context_only_for_leaf_bodies() {
 
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("fn anv_f0_leaf(_ctx: &mut AnvCtx) -> i64"));
-    assert!(source.contains("fn anv_f1_caller(ctx: &mut AnvCtx) -> i64"));
+    assert!(source.contains("fn anv_f0_leaf<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>) -> i64"));
+    assert!(source.contains("fn anv_f1_caller<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> i64"));
     assert!(source.contains("anv_f0_leaf(ctx)"));
 }
 
@@ -1905,7 +1909,9 @@ fn emit_uses_underscored_context_for_primitive_struct_stringify_helper() {
     }
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("fn anvstringify_t3_point(_ctx: &mut AnvCtx, value: &anvT3_Point)"));
+    assert!(source.contains(
+        "fn anvstringify_t3_point<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>, value: &anvT3_Point)"
+    ));
 }
 
 #[test]
@@ -1978,8 +1984,12 @@ fn emit_keeps_context_name_for_nested_struct_stringify_helper() {
     let verified = rir::verify(&program).expect("RIR verify failed");
     let source = emit::emit(&verified).into_string();
 
-    assert!(source.contains("fn stringify_inner(_ctx: &mut AnvCtx, value: &Inner)"));
-    assert!(source.contains("fn stringify_outer(ctx: &mut AnvCtx, value: &Outer)"));
+    assert!(
+        source.contains("fn stringify_inner<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>, value: &Inner)")
+    );
+    assert!(
+        source.contains("fn stringify_outer<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>, value: &Outer)")
+    );
     assert!(source.contains("stringify_inner(ctx, &value.inner)"));
 }
 
@@ -2006,10 +2016,46 @@ fn source_job_compiles_and_runs_string_concat_program() {
 }
 
 #[test]
+fn emit_propagates_fallible_native_calls() {
+    let source = plan_source(fallible_call_program(false, false)).into_string();
+
+    assert!(source.contains(
+        "fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> Result<(), anvyx_runtime::RuntimeError>"
+    ));
+    assert!(source.contains("host::fallible(ctx, 41)?;"));
+    assert!(source.contains("fn main() -> Result<(), anvyx_runtime::RuntimeError>"));
+    assert!(source.contains("let _ = anv_f0_main(&mut ctx)?;"));
+    assert!(!source.contains(".unwrap()"));
+}
+
+#[test]
+fn emit_propagates_generated_fallibility_transitively() {
+    let source = plan_source(fallible_call_program(true, false)).into_string();
+
+    assert!(source.contains(
+        "fn anv_f0_leaf<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> Result<(), anvyx_runtime::RuntimeError>"
+    ));
+    assert!(source.contains(
+        "fn anv_f1_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> Result<(), anvyx_runtime::RuntimeError>"
+    ));
+    assert!(source.contains("anv_f0_leaf(ctx)?;"));
+}
+
+#[test]
+fn source_job_compiles_fallible_non_void_entry() {
+    let source = with_fallible_host(plan_source(fallible_call_program(false, true)));
+    let output = run_source(source);
+
+    assert_eq!(output.status, SourceJobStatus::Success);
+}
+
+#[test]
 fn emit_borrows_string_literal_call_arg_without_owned_temp() {
     let source = plan_source(borrow_string_literal_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(\"ready\");"));
+    assert!(
+        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, \"ready\");")
+    );
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -2019,16 +2065,18 @@ fn emit_forwards_borrowed_string_param_as_str_without_double_borrow() {
     let source = plan_source(shared_string_forward_program()).into_string();
 
     assert!(source.contains(": &str"));
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(v0);"));
-    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(&v0);"));
-    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(v0.as_str());"));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, v0);"));
+    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, &v0);"));
+    assert!(
+        !source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, v0.as_str());")
+    );
 }
 
 #[test]
 fn emit_borrows_string_constant_for_native_string_param() {
     let source = plan_source(native_str_len_const_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(\"abc\")"));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx, \"abc\")"));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -2037,8 +2085,8 @@ fn emit_borrows_string_constant_for_native_string_param() {
 fn emit_borrows_string_local_for_native_string_param() {
     let source = plan_source(native_str_len_local_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(v0.as_str())"));
-    assert!(!source.contains("anvyx_core2::__anvyx_native::core_string::str_len(&v0)"));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx, v0.as_str())"));
+    assert!(!source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx, &v0)"));
 }
 
 #[test]
@@ -2399,7 +2447,6 @@ fn rir_verify_rejects_bad_extern_signature() {
                     anvyx_runtime::ExternTypeExpr::String,
                 )],
                 ret: anvyx_runtime::RustReturnAbi::Void,
-                needs_context: false,
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
             },
@@ -2429,7 +2476,6 @@ fn rir_verify_rejects_native_extern_param_type_mismatch() {
                     anvyx_runtime::ExternTypeExpr::Bool,
                 )],
                 ret: anvyx_runtime::RustReturnAbi::Void,
-                needs_context: false,
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
             },
@@ -2470,7 +2516,6 @@ fn rir_verify_rejects_native_extern_return_type_mismatch() {
             abi: anvyx_runtime::RustExternAbi {
                 params: vec![],
                 ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::Bool),
-                needs_context: false,
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
             },
@@ -3167,6 +3212,62 @@ fn string_concat_program() -> Program {
     });
     program.module_mut(module).functions.push(main);
     program.set_entry(main);
+    program
+}
+
+fn fallible_call_program(transitive: bool, returns_value: bool) -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let fallible = fallible_extern(&mut program, int);
+    let value = program.const_arena.alloc(ConstData {
+        ty: int,
+        value: ConstValue::Int(41),
+    });
+    let module = program.alloc_module(root_module());
+    let tmp = air::LocalId::from_index(0);
+    let leaf = program.alloc_function(Function {
+        name: Ident::new(if transitive { "leaf" } else { "main" }),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], if returns_value { int } else { void }),
+        locals: vec![local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: tmp,
+                value: RValue::Call {
+                    callee: Callee::Extern(fallible),
+                    args: vec![CallArg::Value(Operand::Const(value))],
+                },
+            }],
+            air::AirTail::Return(returns_value.then_some(Operand::Place(place(tmp, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(leaf);
+    if transitive {
+        let main = program.alloc_function(Function {
+            name: Ident::new("main"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(vec![], void),
+            locals: vec![],
+            body: structured_body(
+                vec![Statement::Eval(RValue::Call {
+                    callee: Callee::Function(leaf),
+                    args: vec![],
+                })],
+                air::AirTail::Return(None),
+            ),
+        });
+        program.module_mut(module).functions.push(main);
+        program.entry = Some(main);
+    } else {
+        program.entry = Some(leaf);
+    }
     program
 }
 
@@ -5370,7 +5471,6 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
                 ret: anvyx_runtime::RustReturnAbi::Option(Box::new(
                     anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String),
                 )),
-                needs_context: false,
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
             },
@@ -5406,33 +5506,54 @@ fn plan_source(program: Program) -> emit::RustSource {
 fn rust_plan_config() -> RustPlanConfig {
     RustPlanConfig {
         symbol_prefix: "anv".into(),
-        native_providers: vec![core2_runtime_support(), core2_string_support()],
+        native_providers: vec![
+            core2_runtime_support(),
+            core2_string_support(),
+            fallible_host_support(),
+        ],
     }
+}
+
+fn workspace_crate_path(name: &str) -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join(name)
+        .display()
+        .to_string()
+}
+
+fn with_fallible_host(source: emit::RustSource) -> emit::RustSource {
+    emit::RustSource::new(format!(
+        "mod host {{ pub fn fallible<'cx, 'rt>(_ctx: &mut anvyx_runtime::Ctx<'cx, 'rt>, value: i64) -> Result<i64, anvyx_runtime::RuntimeError> {{ Ok(value) }} }}\n{}",
+        source.into_string()
+    ))
 }
 
 fn run_source(source: emit::RustSource) -> source_job::RustSourceJobOutput {
     let cache = tempfile::tempdir().expect("temp dir failed");
-    let dep = cargo_job::RustCargoDependency {
-        name: cargo_job::RustCargoName::parse("anvyx_core2").unwrap(),
-        package: Some(cargo_job::RustCargoPackageName::parse("anvyx-core2").unwrap()),
-        source: cargo_job::RustCargoDependencySource::Path(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .join("core2")
-                .display()
-                .to_string(),
-        ),
-        features: vec![],
-        default_features: true,
-    };
+    let deps = [
+        ("anvyx_core2", "anvyx-core2", "core2"),
+        ("anvyx_runtime", "anvyx-runtime", "runtime"),
+    ]
+    .into_iter()
+    .map(
+        |(name, package, crate_dir)| cargo_job::RustCargoDependency {
+            name: cargo_job::RustCargoName::parse(name).unwrap(),
+            package: Some(cargo_job::RustCargoPackageName::parse(package).unwrap()),
+            source: cargo_job::RustCargoDependencySource::Path(workspace_crate_path(crate_dir)),
+            features: vec![],
+            default_features: true,
+        },
+    )
+    .collect();
     let job = cargo_job::single_program_job_with_dependencies(
         source,
         cache.path().to_path_buf(),
         cargo_job::RustCargoProfile::Dev,
         cargo_job::RustCargoMode::Run,
         "test",
-        vec![dep],
+        deps,
     );
     match cargo_job::execute(&job).expect("Cargo job failed") {
         cargo_job::RustCargoOutput::Success(output) => source_job::RustSourceJobOutput {
@@ -5476,127 +5597,121 @@ fn has_error(errors: &[RustBackendProfileError], kind: ProfileErrorKind) -> bool
 }
 
 fn core2_runtime_support() -> anvyx_runtime::RustProviderSupport {
-    use anvyx_runtime::{
-        ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternFunctionKey, ExternTypeExpr,
-        ModulePath, ProviderId, RustAbiSupport, RustExternAbi, RustExternBinding,
-        RustModuleSupport, RustParamAbi, RustPath, RustProviderCargo, RustProviderSupport,
-        RustReturnAbi,
-    };
+    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
 
-    let module = ModulePath {
-        segments: vec!["core_runtime".to_string()],
-    };
-    RustProviderSupport {
+    provider_support(
+        "core_runtime",
+        vec![
+            function_binding(
+                "core_runtime",
+                "anvyx_core2",
+                &["__anvyx_native", "core_runtime", "_println"],
+                "_println",
+                vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
+                RustReturnAbi::Void,
+                false,
+            ),
+            function_binding(
+                "core_runtime",
+                "anvyx_core2",
+                &["__anvyx_native", "core_runtime", "_assert"],
+                "_assert",
+                vec![
+                    RustParamAbi::Value(ExternTypeExpr::Bool),
+                    RustParamAbi::Borrow(ExternTypeExpr::String),
+                ],
+                RustReturnAbi::Void,
+                false,
+            ),
+        ],
+    )
+}
+
+fn core2_string_support() -> anvyx_runtime::RustProviderSupport {
+    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+
+    provider_support(
+        "core_string",
+        vec![function_binding(
+            "core_string",
+            "anvyx_core2",
+            &["__anvyx_native", "core_string", "str_len"],
+            "str_len",
+            vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
+            RustReturnAbi::Value(ExternTypeExpr::Int),
+            false,
+        )],
+    )
+}
+
+fn fallible_host_support() -> anvyx_runtime::RustProviderSupport {
+    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+
+    provider_support(
+        "fallible_host",
+        vec![function_binding(
+            "fallible_host",
+            "host",
+            &["fallible"],
+            "fallible",
+            vec![RustParamAbi::Value(ExternTypeExpr::Int)],
+            RustReturnAbi::Value(ExternTypeExpr::Int),
+            true,
+        )],
+    )
+}
+
+fn provider_support(
+    provider: &str,
+    bindings: Vec<anvyx_runtime::RustExternBinding>,
+) -> anvyx_runtime::RustProviderSupport {
+    anvyx_runtime::RustProviderSupport {
         package: "<core>".to_string(),
-        provider: ProviderId {
-            name: "core_runtime".to_string(),
+        provider: anvyx_runtime::ProviderId {
+            name: provider.to_string(),
         },
-        cargo: RustProviderCargo::default(),
-        modules: vec![RustModuleSupport {
-            module: module.clone(),
+        cargo: anvyx_runtime::RustProviderCargo::default(),
+        modules: vec![anvyx_runtime::RustModuleSupport {
+            module: anvyx_runtime::ModulePath {
+                segments: vec![provider.to_string()],
+            },
             types: vec![],
-            bindings: vec![
-                RustExternBinding {
-                    key: ExternBindingKey {
-                        target: ExternBindingTarget::Function(ExternFunctionKey {
-                            module: module.clone(),
-                            name: "_println".to_string(),
-                        }),
-                        operation: ExternBindingOp::Call,
-                    },
-                    path: RustPath {
-                        crate_name: "anvyx_core2".to_string(),
-                        segments: vec![
-                            "__anvyx_native".to_string(),
-                            "core_runtime".to_string(),
-                            "_println".to_string(),
-                        ],
-                    },
-                    abi: RustExternAbi {
-                        params: vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
-                        ret: RustReturnAbi::Void,
-                        needs_context: false,
-                        fallible: false,
-                        support: RustAbiSupport::Direct,
-                    },
-                },
-                RustExternBinding {
-                    key: ExternBindingKey {
-                        target: ExternBindingTarget::Function(ExternFunctionKey {
-                            module,
-                            name: "_assert".to_string(),
-                        }),
-                        operation: ExternBindingOp::Call,
-                    },
-                    path: RustPath {
-                        crate_name: "anvyx_core2".to_string(),
-                        segments: vec![
-                            "__anvyx_native".to_string(),
-                            "core_runtime".to_string(),
-                            "_assert".to_string(),
-                        ],
-                    },
-                    abi: RustExternAbi {
-                        params: vec![
-                            RustParamAbi::Value(ExternTypeExpr::Bool),
-                            RustParamAbi::Borrow(ExternTypeExpr::String),
-                        ],
-                        ret: RustReturnAbi::Void,
-                        needs_context: false,
-                        fallible: true,
-                        support: RustAbiSupport::Direct,
-                    },
-                },
-            ],
+            bindings,
         }],
     }
 }
 
-fn core2_string_support() -> anvyx_runtime::RustProviderSupport {
-    use anvyx_runtime::{
-        ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternFunctionKey, ExternTypeExpr,
-        ModulePath, ProviderId, RustAbiSupport, RustExternAbi, RustExternBinding,
-        RustModuleSupport, RustParamAbi, RustPath, RustProviderCargo, RustProviderSupport,
-        RustReturnAbi,
-    };
-
-    let module = ModulePath {
-        segments: vec!["core_string".to_string()],
-    };
-    RustProviderSupport {
-        package: "<core>".to_string(),
-        provider: ProviderId {
-            name: "core_string".to_string(),
+fn function_binding(
+    provider: &str,
+    crate_name: &str,
+    segments: &[&str],
+    name: &str,
+    params: Vec<anvyx_runtime::RustParamAbi>,
+    ret: anvyx_runtime::RustReturnAbi,
+    fallible: bool,
+) -> anvyx_runtime::RustExternBinding {
+    anvyx_runtime::RustExternBinding {
+        key: anvyx_runtime::ExternBindingKey {
+            target: anvyx_runtime::ExternBindingTarget::Function(
+                anvyx_runtime::ExternFunctionKey {
+                    module: anvyx_runtime::ModulePath {
+                        segments: vec![provider.to_string()],
+                    },
+                    name: name.to_string(),
+                },
+            ),
+            operation: anvyx_runtime::ExternBindingOp::Call,
         },
-        cargo: RustProviderCargo::default(),
-        modules: vec![RustModuleSupport {
-            module: module.clone(),
-            types: vec![],
-            bindings: vec![RustExternBinding {
-                key: ExternBindingKey {
-                    target: ExternBindingTarget::Function(ExternFunctionKey {
-                        module,
-                        name: "str_len".to_string(),
-                    }),
-                    operation: ExternBindingOp::Call,
-                },
-                path: RustPath {
-                    crate_name: "anvyx_core2".to_string(),
-                    segments: vec![
-                        "__anvyx_native".to_string(),
-                        "core_string".to_string(),
-                        "str_len".to_string(),
-                    ],
-                },
-                abi: RustExternAbi {
-                    params: vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
-                    ret: RustReturnAbi::Value(ExternTypeExpr::Int),
-                    needs_context: false,
-                    fallible: false,
-                    support: RustAbiSupport::Direct,
-                },
-            }],
-        }],
+        path: anvyx_runtime::RustPath {
+            crate_name: crate_name.to_string(),
+            segments: segments.iter().map(|segment| segment.to_string()).collect(),
+        },
+        abi: anvyx_runtime::RustExternAbi {
+            params,
+            ret,
+            fallible,
+            support: anvyx_runtime::RustAbiSupport::Direct,
+        },
     }
 }
 
@@ -5652,6 +5767,21 @@ fn runtime_extern(
         ExternMember::FreeFunction,
     );
     program.externs[id.index()].binding = Some(provider_binding("core_runtime", name));
+    id
+}
+
+fn fallible_extern(program: &mut Program, int: air::TypeId) -> air::ExternId {
+    let id = extern_in_module(
+        program,
+        &["fallible_host"],
+        "fallible",
+        vec![(int, ParamMode::Value)],
+        int,
+        ExternMember::FreeFunction,
+    );
+    let decl = &mut program.externs[id.index()];
+    decl.binding = Some(provider_binding("fallible_host", "fallible"));
+    decl.effects.fallible = true;
     id
 }
 

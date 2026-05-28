@@ -1,9 +1,10 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, AirBody, CallArg, Callee, Function, FunctionKind, Local, LocalKind, Mutability,
-        Operand, Param, ParamMode, ParamRole, Place, Program, Projection, RValue, Signature,
-        TypeData,
+        self, AirBody, CallArg, Callee, ExternDecl, ExternMember, ExternParamDecl,
+        ExternReceiverDecl, ExternRep, ExternTypeDecl, Function, FunctionKind, Local, LocalKind,
+        Mutability, Operand, Param, ParamMode, ParamRole, Place, Program, Projection, RValue,
+        Signature, TypeData,
     },
     ast::Ident,
 };
@@ -16,8 +17,8 @@ fn structured_body(stmts: Vec<Statement>, tail: air::AirTail) -> AirBody {
 
 use super::{
     compile::{VmCompileError, VmCompileErrorKind, VmCompiler},
-    runtime::CallFrame,
-    vir::{VirCall, VirCallArg, VirParam},
+    runtime::{ExternDispatcher, NoExterns, unsupported_callback},
+    vir::{VirCallArg, VirCallee},
 };
 
 #[test]
@@ -158,7 +159,10 @@ fn compiler_lowers_mut_borrow_as_projected_place_ref() {
     let verified = air::verify(&program).expect("AIR verify failed");
     let vir = VmCompiler::compile(verified).expect("VM compile failed");
     assert_eq!(vir.functions[0].params[0].mode, ParamMode::MutBorrow);
-    assert_eq!(vir.functions[1].calls[0].callee, Callee::Function(callee));
+    assert_eq!(
+        vir.functions[1].calls[0].callee,
+        VirCallee::Function(callee)
+    );
     assert_eq!(
         vir.functions[1].calls[0].args[0],
         VirCallArg::MutBorrow(projected)
@@ -218,7 +222,132 @@ fn compiler_collects_calls_inside_structured_control() {
     let verified = air::verify(&program).expect("AIR verify failed");
     let vir = VmCompiler::compile(verified).expect("VM compile failed");
     assert_eq!(vir.functions[1].calls.len(), 1);
-    assert_eq!(vir.functions[1].calls[0].callee, Callee::Function(callee));
+    assert_eq!(
+        vir.functions[1].calls[0].callee,
+        VirCallee::Function(callee)
+    );
+}
+
+#[test]
+fn compiler_records_extern_metadata_from_call_params() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let ext = program.alloc_extern(ExternDecl {
+        name: Ident::new("touch"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![ExternParamDecl {
+            ty: int,
+            mode: ParamMode::Value,
+        }],
+        return_type: void,
+        binding: None,
+        effects: anvyx_runtime::ExternEffects::default(),
+    });
+    let konst = program.alloc_const(air::ConstData {
+        ty: int,
+        value: air::ConstValue::Int(1),
+    });
+    program.module_mut(module).externs.push(ext);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("caller"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::Eval(RValue::Call {
+                callee: Callee::Extern(ext),
+                args: vec![CallArg::Value(Operand::Const(konst))],
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(caller);
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+
+    assert_eq!(vir.externs[0].source, ext);
+    assert_eq!(vir.externs[0].params[0].ty, int);
+    assert_eq!(vir.externs[0].params[0].mode, ParamMode::Value);
+    assert_eq!(vir.externs[0].ret, void);
+    assert_eq!(vir.functions[0].calls[0].callee, VirCallee::Extern(ext));
+}
+
+#[test]
+fn compiler_records_member_extern_receiver_metadata() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let owner = program.alloc_extern_type(ExternTypeDecl {
+        name: Ident::new("Thing"),
+        module,
+        binding: None,
+        type_args: vec![],
+        const_args: vec![],
+        rep: ExternRep::Shared,
+        has_init: false,
+        fields: vec![],
+        methods: vec![],
+        statics: vec![],
+        operators: vec![],
+    });
+    program.module_mut(module).extern_types.push(owner);
+    let owner_ty = program.alloc_type(TypeData::Extern(owner));
+    let ext = program.alloc_extern(ExternDecl {
+        name: Ident::new("touch"),
+        module,
+        member: ExternMember::Method {
+            owner,
+            receiver: ExternReceiverDecl {
+                ty: owner_ty,
+                mode: ParamMode::SharedBorrow,
+            },
+        },
+        params: vec![ExternParamDecl {
+            ty: int,
+            mode: ParamMode::Value,
+        }],
+        return_type: void,
+        binding: None,
+        effects: anvyx_runtime::ExternEffects::default(),
+    });
+    program.module_mut(module).externs.push(ext);
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+
+    assert_eq!(vir.externs[0].params.len(), 2);
+    assert_eq!(vir.externs[0].params[0].ty, owner_ty);
+    assert_eq!(vir.externs[0].params[0].mode, ParamMode::SharedBorrow);
+    assert_eq!(vir.externs[0].params[1].ty, int);
+    assert_eq!(vir.externs[0].params[1].mode, ParamMode::Value);
+}
+
+#[test]
+fn no_extern_dispatch_reports_missing_id() {
+    let mut dispatcher = NoExterns;
+    let id = air::ExternId::from_index(7);
+    let err = anvyx_runtime::Heap::scope(|heap| {
+        let mut ctx = anvyx_runtime::Ctx::new(heap);
+        dispatcher.call(&mut ctx, id, &[])
+    })
+    .unwrap_err();
+
+    assert_eq!(err.message(), "missing VM extern dispatch for extern #7");
+}
+
+#[test]
+fn callback_dispatch_reports_typed_runtime_gap() {
+    let err = unsupported_callback(air::ExternId::from_index(3));
+
+    assert_eq!(err.message(), "VM callback extern #3 is not supported");
 }
 
 #[test]
@@ -309,43 +438,6 @@ fn compiler_rejects_noncheap_value_call_args() {
         caller,
         VmCompileErrorKind::NonCheapValueArg
     ));
-}
-
-#[test]
-fn call_frame_binds_shared_string_consts() {
-    let string = air::TypeId::from_index(0);
-    let konst = air::ConstId::from_index(0);
-    let params = vec![VirParam {
-        local: air::LocalId::from_index(0),
-        ty: string,
-        mode: ParamMode::SharedBorrow,
-    }];
-    let call = VirCall {
-        callee: Callee::Function(air::FunctionId::from_index(0)),
-        args: vec![VirCallArg::SharedStringConst(konst)],
-    };
-
-    let frame = CallFrame::bind(&params, &call).expect("call frame should bind");
-    assert_eq!(frame.bindings, vec![VirCallArg::SharedStringConst(konst)]);
-}
-
-#[test]
-fn call_frame_binds_mut_borrows_to_caller_places() {
-    let int = air::TypeId::from_index(0);
-    let place = projected_place(air::LocalId::from_index(0), int);
-    let params = vec![VirParam {
-        local: air::LocalId::from_index(0),
-        ty: int,
-        mode: ParamMode::MutBorrow,
-    }];
-    let call = VirCall {
-        callee: Callee::Function(air::FunctionId::from_index(0)),
-        args: vec![VirCallArg::MutBorrow(place.clone())],
-    };
-
-    let frame = CallFrame::bind(&params, &call).expect("call frame should bind");
-    assert_eq!(frame.bindings, vec![VirCallArg::MutBorrow(place.clone())]);
-    assert_eq!(frame.mut_borrows().collect::<Vec<_>>(), vec![&place]);
 }
 
 fn compile_errors(program: &Program) -> Vec<VmCompileError> {

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, path::PathBuf};
+use std::{collections::HashSet, fmt::Debug, path::PathBuf};
 
 pub use anvyx_externs::{
     BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternBindingKey, ExternBindingOp,
@@ -172,7 +172,7 @@ fn validate_type_members(ty: &ExternTypeDescriptor) {
 
 fn assert_unique<T>(items: impl IntoIterator<Item = T>, label: &str)
 where
-    T: Eq + std::hash::Hash + fmt::Debug,
+    T: Eq + std::hash::Hash + Debug,
 {
     let mut seen = HashSet::new();
     for item in items {
@@ -370,7 +370,6 @@ impl RustPath {
 pub struct RustExternAbi {
     pub params: Vec<RustParamAbi>,
     pub ret: RustReturnAbi,
-    pub needs_context: bool,
     pub fallible: bool,
     pub support: RustAbiSupport,
 }
@@ -642,13 +641,6 @@ fn validate_native_abi(
     signature: &NativeSignature,
     abi: &RustExternAbi,
 ) -> Result<(), String> {
-    if abi.needs_context {
-        return Err(native_abi_error(
-            descriptor,
-            key,
-            "unexpected context parameter",
-        ));
-    }
     if abi.fallible != signature.effects.fallible {
         return Err(native_abi_error(descriptor, key, "fallible flag mismatch"));
     }
@@ -722,31 +714,6 @@ pub trait AnvyxRefExport {}
 
 pub trait AnvyxEnumExport {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeError {
-    message: String,
-}
-
-impl RuntimeError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RuntimeError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,14 +726,6 @@ mod tests {
         assert!(cargo.features.is_empty());
         assert!(cargo.package.is_none());
         assert!(cargo.path.is_none());
-    }
-
-    #[test]
-    fn runtime_error_exposes_message() {
-        let err = RuntimeError::new("boom");
-
-        assert_eq!(err.message(), "boom");
-        assert_eq!(err.to_string(), "boom");
     }
 
     #[test]
@@ -875,7 +834,6 @@ mod tests {
             abi: RustExternAbi {
                 params: vec![RustParamAbi::Value(ExternTypeExpr::Int)],
                 ret: RustReturnAbi::Value(ExternTypeExpr::Bool),
-                needs_context: false,
                 fallible: false,
                 support: RustAbiSupport::Direct,
             },

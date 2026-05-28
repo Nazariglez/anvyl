@@ -30,8 +30,10 @@ impl RustSource {
 }
 
 pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
+    let program = program.program();
     let mut cx = EmitCx {
-        program: program.program(),
+        program,
+        fallible_functions: fallible_functions(program),
         out: String::new(),
     };
     cx.emit_program();
@@ -40,7 +42,74 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
 
 struct EmitCx<'a> {
     program: &'a RirProgram,
+    fallible_functions: Vec<bool>,
     out: String,
+}
+
+fn fallible_functions(program: &RirProgram) -> Vec<bool> {
+    let mut fallible = vec![false; program.functions.len()];
+    loop {
+        let mut changed = false;
+        for function in &program.functions {
+            let is_fallible = block_calls_fallible(program, &fallible, &function.body);
+            let slot = &mut fallible[function.id.index()];
+            if is_fallible && !*slot {
+                *slot = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return fallible;
+        }
+    }
+}
+
+fn block_calls_fallible(
+    program: &RirProgram,
+    fallible: &[bool],
+    block: &RirStructuredBlock,
+) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_calls_fallible(program, fallible, stmt))
+}
+
+fn stmt_calls_fallible(program: &RirProgram, fallible: &[bool], stmt: &RirStmt) -> bool {
+    match stmt {
+        RirStmt::Init { value, .. } | RirStmt::Assign { value, .. } | RirStmt::Eval(value) => {
+            rvalue_calls_fallible(program, fallible, value)
+        }
+        RirStmt::If(branch) => {
+            block_calls_fallible(program, fallible, &branch.then_block)
+                || branch
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| block_calls_fallible(program, fallible, block))
+        }
+        RirStmt::EnumMatch(match_) => {
+            match_
+                .arms
+                .iter()
+                .any(|arm| block_calls_fallible(program, fallible, &arm.block))
+                || match_
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| block_calls_fallible(program, fallible, block))
+        }
+    }
+}
+
+fn rvalue_calls_fallible(program: &RirProgram, fallible: &[bool], value: &RirRValue) -> bool {
+    match value {
+        RirRValue::Call { callee, .. } => match callee {
+            RirCallTarget::Function(id) => fallible[id.index()],
+            RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
+                RirExternKind::Native(native) => native.abi.fallible,
+            },
+        },
+        _ => false,
+    }
 }
 
 impl EmitCx<'_> {
@@ -49,8 +118,10 @@ impl EmitCx<'_> {
             self.line("use std::fmt::Write;");
             self.line("");
         }
-        self.line("#[derive(Default)]");
-        self.line(&format!("struct {} {{}}", self.program.ctx.symbol.as_str()));
+        self.line(&format!(
+            "type {}<'cx, 'rt> = anvyx_runtime::Ctx<'cx, 'rt>;",
+            self.program.ctx.symbol.as_str()
+        ));
         self.line("");
         for strukt in &self.program.structs {
             self.emit_struct(strukt);
@@ -65,15 +136,32 @@ impl EmitCx<'_> {
             self.emit_function(function);
         }
         if let Some(entry) = self.program.entry {
-            self.line("fn main() {");
-            self.line(&format!(
-                "    let mut ctx = {}::default();",
-                self.program.ctx.symbol.as_str()
-            ));
-            let symbol = self.program.functions[entry.index()].symbol.as_str();
-            self.line(&format!("    let _ = {symbol}(&mut ctx);"));
-            self.line("}");
+            self.emit_main(entry);
         }
+    }
+
+    fn emit_main(&mut self, entry: super::rir::RirFunctionId) {
+        let symbol = self.program.functions[entry.index()].symbol.as_str();
+        let fallible = self.fallible_functions[entry.index()];
+        let ret = if fallible {
+            " -> Result<(), anvyx_runtime::RuntimeError>"
+        } else {
+            ""
+        };
+        self.line(&format!("fn main(){ret} {{"));
+        self.line("    anvyx_runtime::Heap::scope(|heap| {");
+        self.line("        let mut ctx = anvyx_runtime::Ctx::new(heap);");
+        self.line(&format!(
+            "        let _ = {symbol}(&mut ctx){};",
+            if fallible { "?" } else { "" }
+        ));
+        if fallible {
+            self.line("        Ok(())");
+            self.line("    })");
+        } else {
+            self.line("    });");
+        }
+        self.line("}");
     }
 
     fn emit_struct(&mut self, strukt: &super::rir::RirStruct) {
@@ -148,9 +236,9 @@ impl EmitCx<'_> {
         let strukt = &self.program.structs[struct_id.index()];
         let ctx = self.stringify_helper_ctx_name(strukt);
         self.line(&format!(
-            "fn {}({ctx}: &mut {}, value: &{}) -> String {{",
+            "fn {}<'cx, 'rt>({ctx}: &mut {}, value: &{}) -> String {{",
             helper.symbol.as_str(),
-            self.program.ctx.symbol.as_str(),
+            self.ctx_ty(),
             strukt.symbol.as_str()
         ));
         self.line("    let mut out = String::new();");
@@ -202,12 +290,12 @@ impl EmitCx<'_> {
     }
 
     fn emit_function(&mut self, function: &RirFunction) {
-        let ctx = if self.function_needs_context(function) {
+        let ctx = if self.function_uses_ctx(function) {
             "ctx"
         } else {
             "_ctx"
         };
-        let mut params = vec![format!("{ctx}: &mut {}", self.program.ctx.symbol.as_str())];
+        let mut params = vec![format!("{ctx}: &mut {}", self.ctx_ty())];
         params.extend(function.params.iter().map(|param| {
             let local = &function.locals[param.local.index()];
             format!(
@@ -216,16 +304,16 @@ impl EmitCx<'_> {
                 self.param_ty(param.ty, param.abi)
             )
         }));
-        let ret = self.ty(function.ret.ty);
+        let ret = self.function_ret_ty(function);
         if ret == "()" {
             self.line(&format!(
-                "fn {}({}) {{",
+                "fn {}<'cx, 'rt>({}) {{",
                 function.symbol.as_str(),
                 params.join(", ")
             ));
         } else {
             self.line(&format!(
-                "fn {}({}) -> {ret} {{",
+                "fn {}<'cx, 'rt>({}) -> {ret} {{",
                 function.symbol.as_str(),
                 params.join(", ")
             ));
@@ -246,6 +334,22 @@ impl EmitCx<'_> {
         self.line("");
     }
 
+    fn function_ret_ty(&self, function: &RirFunction) -> String {
+        let ret = self.ty(function.ret.ty);
+        if !self.fallible_functions[function.id.index()] {
+            return ret;
+        }
+        if ret == "()" {
+            "Result<(), anvyx_runtime::RuntimeError>".to_string()
+        } else {
+            format!("Result<{ret}, anvyx_runtime::RuntimeError>")
+        }
+    }
+
+    fn ctx_ty(&self) -> String {
+        format!("{}<'cx, 'rt>", self.program.ctx.symbol.as_str())
+    }
+
     fn emit_local_declarations(&mut self, function: &RirFunction) {
         for local in &function.locals {
             if function.params.iter().any(|param| param.local == local.id) {
@@ -260,40 +364,40 @@ impl EmitCx<'_> {
         }
     }
 
-    fn function_needs_context(&self, function: &RirFunction) -> bool {
-        self.block_needs_context(&function.body)
+    fn function_uses_ctx(&self, function: &RirFunction) -> bool {
+        self.block_uses_ctx(&function.body)
     }
 
-    fn stmt_needs_context(&self, stmt: &RirStmt) -> bool {
+    fn stmt_uses_ctx(&self, stmt: &RirStmt) -> bool {
         match stmt {
             RirStmt::Init { value, .. } | RirStmt::Assign { value, .. } | RirStmt::Eval(value) => {
-                self.rvalue_needs_context(value)
+                self.rvalue_uses_ctx(value)
             }
             RirStmt::If(branch) => {
-                self.block_needs_context(&branch.then_block)
+                self.block_uses_ctx(&branch.then_block)
                     || branch
                         .else_block
                         .as_ref()
-                        .is_some_and(|block| self.block_needs_context(block))
+                        .is_some_and(|block| self.block_uses_ctx(block))
             }
             RirStmt::EnumMatch(match_) => {
                 match_
                     .arms
                     .iter()
-                    .any(|arm| self.block_needs_context(&arm.block))
+                    .any(|arm| self.block_uses_ctx(&arm.block))
                     || match_
                         .else_block
                         .as_ref()
-                        .is_some_and(|block| self.block_needs_context(block))
+                        .is_some_and(|block| self.block_uses_ctx(block))
             }
         }
     }
 
-    fn block_needs_context(&self, block: &RirStructuredBlock) -> bool {
-        block.stmts.iter().any(|stmt| self.stmt_needs_context(stmt))
+    fn block_uses_ctx(&self, block: &RirStructuredBlock) -> bool {
+        block.stmts.iter().any(|stmt| self.stmt_uses_ctx(stmt))
     }
 
-    fn rvalue_needs_context(&self, value: &RirRValue) -> bool {
+    fn rvalue_uses_ctx(&self, value: &RirRValue) -> bool {
         match value {
             RirRValue::Call { .. } => true,
             RirRValue::Stringify { source_ty, .. } => {
@@ -441,12 +545,20 @@ impl EmitCx<'_> {
     fn emit_term(&mut self, function: &RirFunction, term: &RirTerm, indent: &str) {
         match term {
             RirTerm::None => {}
-            RirTerm::Return(None) => self.line(&format!("{indent}return;")),
+            RirTerm::Return(None) => {
+                if self.fallible_functions[function.id.index()] {
+                    self.line(&format!("{indent}return Ok(());"));
+                } else {
+                    self.line(&format!("{indent}return;"));
+                }
+            }
             RirTerm::Return(Some(operand)) => {
-                self.line(&format!(
-                    "{indent}return {};",
-                    self.operand(function, operand)
-                ));
+                let value = self.operand(function, operand);
+                if self.fallible_functions[function.id.index()] {
+                    self.line(&format!("{indent}return Ok({value});"));
+                } else {
+                    self.line(&format!("{indent}return {value};"));
+                }
             }
             RirTerm::Unreachable => self.line(&format!("{indent}unreachable!();")),
         }
@@ -506,7 +618,12 @@ impl EmitCx<'_> {
                     let symbol = self.program.functions[id.index()].symbol.as_str();
                     let mut rendered = vec!["ctx".to_string()];
                     rendered.extend(args.iter().map(|arg| self.call_arg(function, arg)));
-                    format!("{symbol}({})", rendered.join(", "))
+                    let call = format!("{symbol}({})", rendered.join(", "));
+                    if self.fallible_functions[id.index()] {
+                        format!("{call}?")
+                    } else {
+                        call
+                    }
                 }
                 RirCallTarget::Extern(id) => self.extern_call(function, *id, args),
             },
@@ -700,26 +817,16 @@ impl EmitCx<'_> {
     ) -> String {
         let ext = &self.program.externs[id.index()];
         let (symbol, mut rendered, fallible, ret_abi) = match &ext.kind {
-            RirExternKind::Native(native) => {
-                let mut rendered = vec![];
-                if native.abi.needs_context {
-                    rendered.push("ctx".to_string());
-                }
-                (
-                    native.path.join("::"),
-                    rendered,
-                    native.abi.fallible,
-                    &native.abi.ret,
-                )
-            }
+            RirExternKind::Native(native) => (
+                native.path.join("::"),
+                vec!["ctx".to_string()],
+                native.abi.fallible,
+                &native.abi.ret,
+            ),
         };
         rendered.extend(args.iter().map(|arg| self.call_arg(function, arg)));
         let call = format!("{symbol}({})", rendered.join(", "));
-        let call = if fallible {
-            format!("{call}.unwrap()")
-        } else {
-            call
-        };
+        let call = if fallible { format!("{call}?") } else { call };
         self.native_return_call(ext.ret, ret_abi, call)
     }
 

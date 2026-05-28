@@ -2,17 +2,17 @@ use anvyx_runtime::function;
 
 #[function]
 pub fn collect_cycles() {
-    anvyx_runtime::collect_cycles();
+    unimplemented!("std:mem heap support is not implemented")
 }
 
 #[function]
-pub fn auto_collect(enabled: bool) {
-    anvyx_runtime::set_auto_collect(enabled);
+pub fn auto_collect(_enabled: bool) {
+    unimplemented!("std:mem heap support is not implemented")
 }
 
 #[function]
 pub fn managed_count() -> i64 {
-    anvyx_runtime::managed_alloc_count() as i64
+    unimplemented!("std:mem heap support is not implemented")
 }
 
 anvyx_runtime::builtin_module! {

@@ -1,49 +1,36 @@
-use anvyx_frontend::air::{ParamMode, Place};
+use anvyx_frontend::air::ExternId;
+use anvyx_runtime::{Ctx, RuntimeError};
 
-use super::vir::{VirCall, VirCallArg, VirParam};
+use super::vir::VirCallArg;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CallFrame {
-    pub bindings: Vec<VirCallArg>,
+pub trait ExternDispatcher {
+    fn call(
+        &mut self,
+        ctx: &mut Ctx<'_, '_>,
+        id: ExternId,
+        args: &[VirCallArg],
+    ) -> Result<(), RuntimeError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindError {
-    Arity,
-    Mode,
-}
+pub struct NoExterns;
 
-impl CallFrame {
-    pub fn bind(params: &[VirParam], call: &VirCall) -> Result<Self, BindError> {
-        if params.len() != call.args.len() {
-            return Err(BindError::Arity);
-        }
-        let bindings = params
-            .iter()
-            .zip(&call.args)
-            .map(bind_arg)
-            .collect::<Result<_, _>>()?;
-        Ok(Self { bindings })
-    }
-
-    pub fn mut_borrows(&self) -> impl Iterator<Item = &Place> {
-        self.bindings.iter().filter_map(|binding| match binding {
-            VirCallArg::MutBorrow(place) => Some(place),
-            VirCallArg::Value(_)
-            | VirCallArg::SharedBorrow(_)
-            | VirCallArg::SharedStringConst(_) => None,
-        })
+impl ExternDispatcher for NoExterns {
+    fn call(
+        &mut self,
+        _ctx: &mut Ctx<'_, '_>,
+        id: ExternId,
+        _args: &[VirCallArg],
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::new(format!(
+            "missing VM extern dispatch for extern #{}",
+            id.index()
+        )))
     }
 }
 
-fn bind_arg((param, arg): (&VirParam, &VirCallArg)) -> Result<VirCallArg, BindError> {
-    match (param.mode, arg) {
-        (ParamMode::Value, VirCallArg::Value(_))
-        | (
-            ParamMode::SharedBorrow,
-            VirCallArg::SharedBorrow(_) | VirCallArg::SharedStringConst(_),
-        )
-        | (ParamMode::MutBorrow, VirCallArg::MutBorrow(_)) => Ok(arg.clone()),
-        _ => Err(BindError::Mode),
-    }
+pub fn unsupported_callback(id: ExternId) -> RuntimeError {
+    RuntimeError::new(format!(
+        "VM callback extern #{} is not supported",
+        id.index()
+    ))
 }

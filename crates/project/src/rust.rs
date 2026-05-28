@@ -567,6 +567,7 @@ fn native_provider_dependencies(
     supports: &[RustProviderSupport],
 ) -> Result<Vec<RustCargoDependency>, CleanRustError> {
     let mut dependencies = std::collections::BTreeMap::new();
+    merge_dependency(&mut dependencies, runtime_dependency())?;
     for support in supports {
         let cargo = support.cargo.clone();
         let source = cargo
@@ -587,6 +588,20 @@ fn native_provider_dependencies(
         merge_dependency(&mut dependencies, dep)?;
     }
     Ok(dependencies.into_values().collect())
+}
+
+fn runtime_dependency() -> RustCargoDependency {
+    RustCargoDependency {
+        name: RustCargoName::parse("anvyx_runtime").expect("valid runtime crate name"),
+        package: Some(
+            RustCargoPackageName::parse("anvyx-runtime").expect("valid runtime package name"),
+        ),
+        source: RustCargoDependencySource::Path(
+            workspace_crate_path("runtime").display().to_string(),
+        ),
+        features: vec![],
+        default_features: true,
+    }
 }
 
 fn merge_dependency(
@@ -752,7 +767,13 @@ mod tests {
         let providers = system_native_provider_supports().unwrap();
         let deps = native_provider_dependencies(&providers).unwrap();
 
-        assert_eq!(deps.len(), 2);
+        assert_eq!(deps.len(), 3);
+        let runtime = deps
+            .iter()
+            .find(|dep| dep.name.as_str() == "anvyx_runtime")
+            .expect("runtime dependency");
+        assert_eq!(runtime.package.as_ref().unwrap().as_str(), "anvyx-runtime");
+        assert!(matches!(runtime.source, RustCargoDependencySource::Path(_)));
         let core = deps
             .iter()
             .find(|dep| dep.name.as_str() == "anvyx_core2")
@@ -768,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn emitted_native_dependencies_follow_used_providers() {
+    fn emitted_dependencies_include_runtime_without_used_providers() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("main.anv");
         fs::write(&file, "fn main() {}\n").unwrap();
@@ -777,7 +798,8 @@ mod tests {
             emit_source(file, FrontendConfig::default(), &system_native_context()).unwrap();
         let deps = native_provider_dependencies(&emitted.native_providers).unwrap();
 
-        assert!(deps.is_empty());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name.as_str(), "anvyx_runtime");
     }
 
     #[test]

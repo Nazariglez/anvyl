@@ -1,0 +1,5 @@
+error: #[function(ctx)] ctx parameter must be named `ctx`
+ --> tests/ui/function/ctx_wrong_position.rs:4:8
+  |
+4 | fn bad(value: i64, ctx: &mut Ctx<'_, '_>) -> i64 {
+  |        ^^^^^

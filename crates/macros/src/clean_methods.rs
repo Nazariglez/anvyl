@@ -6,11 +6,12 @@ use syn::{
     Attribute, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, LitStr, ReturnType, Token, Type,
     Visibility,
     parse::{Parse, ParseStream},
+    spanned::Spanned,
 };
 
 use crate::clean_type_map::{
     classify_param, classify_return, flow_tokens, merge_conversions, param_abi_tokens,
-    return_abi_tokens, type_expr_tokens, validate_callable_signature,
+    return_abi_tokens, type_expr_tokens, validate_callable_signature, validate_ctx_param,
 };
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -46,7 +47,6 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
     let export_name = args.name.unwrap_or_else(|| owner.to_string());
     let mut descriptor_methods = vec![];
     let mut descriptor_statics = vec![];
-    let mut descriptor_fields = vec![];
     let mut descriptor_operators = vec![];
     let mut init = None;
     let mut bindings = vec![];
@@ -69,8 +69,8 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
             }
             continue;
         }
-        validate_callable_signature(&method.sig, "#[methods]", "method")?;
         let export = MethodExport::parse(&owner, method)?;
+        validate_callable_signature(&method.sig, "#[methods]", "method", export.ctx)?;
         match &export.role {
             Role::Method(receiver) => {
                 descriptor_methods.push(method_descriptor(method, *receiver, &export)?);
@@ -82,8 +82,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                 }
                 init = Some(init_descriptor(method)?);
             }
-            Role::Getter => descriptor_fields.push(getter_field_descriptor(method, &export)?),
-            Role::Setter => descriptor_fields.push(setter_field_descriptor(method, &export)?),
+            Role::Getter | Role::Setter => {}
             Role::Operator(op) => descriptor_operators.push(operator_descriptor(
                 method,
                 &owner,
@@ -94,7 +93,12 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         }
         bindings.push(member_binding(&owner, &export_name, method, &export)?);
         wrappers.push(native_wrapper(&owner, method, &export));
-        method.attrs.retain(|attr| !attr.path().is_ident("anvyx"));
+    }
+    let descriptor_fields = computed_property_descriptors(&imp.items)?;
+    for item in &mut imp.items {
+        if let ImplItem::Fn(method) = item {
+            method.attrs.retain(|attr| !attr.path().is_ident("anvyx"));
+        }
     }
     let init = init.map_or_else(|| quote! { None }, |init| quote! { Some(#init) });
 
@@ -178,6 +182,7 @@ struct MethodExport {
     operation: TokenStream,
     ret_override: Option<String>,
     param_overrides: HashMap<String, String>,
+    ctx: bool,
 }
 
 #[derive(Clone)]
@@ -215,8 +220,12 @@ impl MethodExport {
                 quote! { anvyx_runtime::ExternMemberSelector::Static(#name.to_string()) }
             }
             Role::Init => quote! { anvyx_runtime::ExternMemberSelector::Init },
-            Role::Getter | Role::Setter => {
+            Role::Getter => {
                 quote! { anvyx_runtime::ExternMemberSelector::Field(#name.to_string()) }
+            }
+            Role::Setter => {
+                let field = setter_field_name(method)?;
+                quote! { anvyx_runtime::ExternMemberSelector::Field(#field.to_string()) }
             }
             Role::Operator(op) => {
                 let op = &op.tokens;
@@ -234,6 +243,7 @@ impl MethodExport {
             operation,
             ret_override: attrs.ret,
             param_overrides: attrs.params,
+            ctx: attrs.ctx,
         })
     }
 }
@@ -249,6 +259,7 @@ fn validate_role(
     receiver: Option<Receiver>,
     attrs: &MethodAttrs,
 ) -> syn::Result<()> {
+    validate_ctx_position(&method.sig.inputs, receiver, attrs.ctx)?;
     match role {
         Role::Method(_) if receiver.is_none() => Err(syn::Error::new_spanned(
             &method.sig.ident,
@@ -261,7 +272,7 @@ fn validate_role(
                     "#[anvyx(init)] does not support ret/params overrides",
                 ));
             }
-            if receiver.is_some() || !method.sig.inputs.is_empty() {
+            if receiver.is_some() || !visible_typed_params(method, attrs.ctx)?.is_empty() {
                 return Err(syn::Error::new_spanned(
                     &method.sig,
                     "#[anvyx(init)] currently supports only parameterless associated functions",
@@ -277,18 +288,9 @@ fn validate_role(
             &method.sig,
             "#[anvyx(getter)] cannot have parameter overrides",
         )),
-        Role::Getter
-            if method
-                .sig
-                .inputs
-                .iter()
-                .any(|arg| matches!(arg, FnArg::Typed(_))) =>
-        {
-            Err(syn::Error::new_spanned(
-                &method.sig,
-                "#[anvyx(getter)] cannot take value parameters",
-            ))
-        }
+        Role::Getter if !visible_typed_params(method, attrs.ctx)?.is_empty() => Err(
+            syn::Error::new_spanned(&method.sig, "#[anvyx(getter)] cannot take value parameters"),
+        ),
         Role::Setter if attrs.ret.is_some() => Err(syn::Error::new_spanned(
             &method.sig,
             "#[anvyx(setter)] does not support ret overrides",
@@ -308,7 +310,7 @@ fn validate_role(
                     "Self operators do not support ret/params overrides",
                 ));
             }
-            validate_operator_signature(owner, method, op)
+            validate_operator_signature(owner, method, op, attrs.ctx)
         }
         Role::Static if receiver.is_some() => Err(syn::Error::new_spanned(
             &method.sig,
@@ -323,6 +325,7 @@ struct MethodAttrs {
     role: Option<Role>,
     ret: Option<String>,
     params: HashMap<String, String>,
+    ctx: bool,
 }
 
 impl MethodAttrs {
@@ -344,6 +347,12 @@ impl MethodAttrs {
                         meta.error("duplicate #[anvyx(...)] role"),
                         Role::Operator(op),
                     )
+                } else if meta.path.is_ident("ctx") {
+                    if parsed.ctx {
+                        return Err(meta.error("duplicate #[anvyx(ctx)]"));
+                    }
+                    parsed.ctx = true;
+                    Ok(())
                 } else if meta.path.is_ident("ret") {
                     if parsed.ret.is_some() {
                         return Err(meta.error("duplicate #[anvyx(ret = ...)]"));
@@ -374,8 +383,9 @@ impl MethodAttrs {
                     }
                     Ok(())
                 } else {
-                    Err(meta
-                        .error("expected init, getter, setter, op(...), ret = ..., or params(...)"))
+                    Err(meta.error(
+                        "expected init, getter, setter, ctx, op(...), ret = ..., or params(...)",
+                    ))
                 }
             })?;
         }
@@ -460,24 +470,17 @@ fn validate_operator_signature(
     owner: &Ident,
     method: &ImplItemFn,
     op: &OperatorRole,
+    skip_ctx: bool,
 ) -> syn::Result<()> {
     if !op.rhs_self {
         return Ok(());
     }
-    let typed_params = method
-        .sig
-        .inputs
-        .iter()
-        .filter(|arg| matches!(arg, FnArg::Typed(_)))
-        .collect::<Vec<_>>();
+    let typed_params = visible_typed_params(method, skip_ctx)?;
     let [param] = typed_params.as_slice() else {
         return Err(syn::Error::new_spanned(
             &method.sig,
             "Self binary operators require exactly one Self operand",
         ));
-    };
-    let FnArg::Typed(param) = param else {
-        unreachable!("filtered typed params")
     };
     let Type::Path(path) = param.ty.as_ref() else {
         return Err(syn::Error::new_spanned(
@@ -519,6 +522,45 @@ fn receiver(
         )),
         FnArg::Typed(_) => Ok(None),
     }
+}
+
+fn validate_ctx_position(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    receiver: Option<Receiver>,
+    needs_ctx: bool,
+) -> syn::Result<()> {
+    if !needs_ctx {
+        return Ok(());
+    }
+    let index = usize::from(receiver.is_some());
+    let Some(arg) = inputs.iter().nth(index) else {
+        return Err(syn::Error::new(
+            inputs.span(),
+            "#[anvyx(ctx)] requires a `ctx` parameter",
+        ));
+    };
+    let FnArg::Typed(param) = arg else {
+        return Err(syn::Error::new_spanned(
+            arg,
+            "#[anvyx(ctx)] requires a `ctx` parameter",
+        ));
+    };
+    validate_ctx_param(param, "#[anvyx(ctx)]")
+}
+
+fn visible_typed_params(method: &ImplItemFn, skip_ctx: bool) -> syn::Result<Vec<&syn::PatType>> {
+    let receiver = receiver(&method.sig.inputs)?;
+    let ctx_index = skip_ctx.then_some(usize::from(receiver.is_some()));
+    method
+        .sig
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| match arg {
+            FnArg::Typed(param) if Some(index) != ctx_index => Some(Ok(param)),
+            FnArg::Typed(_) | FnArg::Receiver(_) => None,
+        })
+        .collect()
 }
 
 fn method_descriptor(
@@ -575,14 +617,102 @@ fn init_descriptor(method: &ImplItemFn) -> syn::Result<TokenStream> {
     Ok(quote! { anvyx_runtime::ExternInitDescriptor { params: vec![], field_init: vec![] } })
 }
 
-fn getter_field_descriptor(method: &ImplItemFn, export: &MethodExport) -> syn::Result<TokenStream> {
-    let name = method.sig.ident.to_string();
-    let ty = match &method.sig.output {
-        ReturnType::Type(_, _) => match export.ret_override.as_deref() {
-            Some(override_ty) => {
-                type_expr_tokens(&crate::clean_type_map::parse_type_expr(override_ty)?)
+struct ComputedGetter<'a> {
+    method: &'a ImplItemFn,
+    ty: crate::clean_type_map::CleanType,
+    ty_tokens: TokenStream,
+}
+
+struct ComputedSetter<'a> {
+    method: &'a ImplItemFn,
+    ty: crate::clean_type_map::CleanType,
+}
+
+fn computed_property_descriptors(items: &[ImplItem]) -> syn::Result<Vec<TokenStream>> {
+    let mut getters = HashMap::<String, ComputedGetter>::new();
+    let mut setters = HashMap::<String, ComputedSetter>::new();
+    let mut order = vec![];
+    for item in items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+        let attrs = MethodAttrs::parse(&method.attrs)?;
+        match attrs.role {
+            Some(Role::Getter) => {
+                let name = method.sig.ident.to_string();
+                let (ty, ty_tokens) = getter_ty(method, &attrs)?;
+                if getters
+                    .insert(
+                        name.clone(),
+                        ComputedGetter {
+                            method,
+                            ty,
+                            ty_tokens,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(syn::Error::new_spanned(method, "duplicate computed getter"));
+                }
+                order.push(name);
             }
-            None => type_expr_tokens(&classify_return(&method.sig.output)?.ty),
+            Some(Role::Setter) => {
+                let field = setter_field_name(method)?;
+                let ty = setter_ty(method, &attrs)?;
+                if setters
+                    .insert(field, ComputedSetter { method, ty })
+                    .is_some()
+                {
+                    return Err(syn::Error::new_spanned(method, "duplicate computed setter"));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (field, setter) in &setters {
+        if !getters.contains_key(field) {
+            return Err(syn::Error::new_spanned(
+                setter.method,
+                format!("computed setter `set_{field}` requires matching getter `{field}`"),
+            ));
+        }
+    }
+    order
+        .into_iter()
+        .map(|field| {
+            let getter = getters.get(&field).expect("ordered getter exists");
+            let setter = setters.get(&field).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    getter.method,
+                    format!("computed getter `{field}` requires matching setter `set_{field}`"),
+                )
+            })?;
+            if getter.ty != setter.ty {
+                return Err(syn::Error::new_spanned(
+                    getter.method,
+                    format!("computed property `{field}` getter/setter types differ"),
+                ));
+            }
+            Ok(computed_field(
+                &getter.method.attrs,
+                &field,
+                &getter.ty_tokens,
+            ))
+        })
+        .collect()
+}
+
+fn getter_ty(
+    method: &ImplItemFn,
+    attrs: &MethodAttrs,
+) -> syn::Result<(crate::clean_type_map::CleanType, TokenStream)> {
+    let ty = match &method.sig.output {
+        ReturnType::Type(_, _) => match attrs.ret.as_deref() {
+            Some(override_ty) => crate::clean_type_map::parse_type_expr(override_ty)?,
+            None => classify_return(&method.sig.output)?.ty,
         },
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
@@ -591,17 +721,15 @@ fn getter_field_descriptor(method: &ImplItemFn, export: &MethodExport) -> syn::R
             ));
         }
     };
-    Ok(computed_field(&method.attrs, &name, &ty, true, false))
+    let tokens = type_expr_tokens(&ty);
+    Ok((ty, tokens))
 }
 
-fn setter_field_descriptor(method: &ImplItemFn, export: &MethodExport) -> syn::Result<TokenStream> {
-    let name = method.sig.ident.to_string();
-    let typed_params = method
-        .sig
-        .inputs
-        .iter()
-        .filter(|arg| matches!(arg, FnArg::Typed(_)))
-        .collect::<Vec<_>>();
+fn setter_ty(
+    method: &ImplItemFn,
+    attrs: &MethodAttrs,
+) -> syn::Result<crate::clean_type_map::CleanType> {
+    let typed_params = visible_typed_params(method, attrs.ctx)?;
     let [param] = typed_params.as_slice() else {
         return Err(syn::Error::new_spanned(
             &method.sig,
@@ -609,13 +737,7 @@ fn setter_field_descriptor(method: &ImplItemFn, export: &MethodExport) -> syn::R
         ));
     };
     let param = classify_param(param)?;
-    let ty = match export.param_overrides.get(&param.name) {
-        Some(override_ty) => {
-            type_expr_tokens(&crate::clean_type_map::parse_type_expr(override_ty)?)
-        }
-        None => type_expr_tokens(&param.ty),
-    };
-    for override_name in export.param_overrides.keys() {
+    for override_name in attrs.params.keys() {
         if override_name != &param.name {
             return Err(syn::Error::new_spanned(
                 &method.sig,
@@ -623,24 +745,34 @@ fn setter_field_descriptor(method: &ImplItemFn, export: &MethodExport) -> syn::R
             ));
         }
     }
-    Ok(computed_field(&method.attrs, &name, &ty, false, true))
+    match attrs.params.get(&param.name) {
+        Some(override_ty) => crate::clean_type_map::parse_type_expr(override_ty),
+        None => Ok(param.ty),
+    }
 }
 
-fn computed_field(
-    attrs: &[Attribute],
-    name: &str,
-    ty: &TokenStream,
-    readable: bool,
-    writable: bool,
-) -> TokenStream {
+fn setter_field_name(method: &ImplItemFn) -> syn::Result<String> {
+    method
+        .sig
+        .ident
+        .to_string()
+        .strip_prefix("set_")
+        .filter(|field| !field.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            syn::Error::new_spanned(method, "computed setter names must start with `set_`")
+        })
+}
+
+fn computed_field(attrs: &[Attribute], name: &str, ty: &TokenStream) -> TokenStream {
     let doc = doc_tokens(attrs);
     quote! {
         anvyx_runtime::ExternFieldDescriptor {
             name: #name.to_string(),
             ty: #ty,
             computed: true,
-            readable: #readable,
-            writable: #writable,
+            readable: true,
+            writable: true,
             get_receiver: anvyx_runtime::ReceiverMode::Shared,
             set_receiver: anvyx_runtime::ReceiverMode::Mutable,
             doc: #doc,
@@ -656,7 +788,7 @@ fn operator_descriptor(
     export: &MethodExport,
 ) -> syn::Result<TokenStream> {
     let signature = if op.rhs_self {
-        self_operator_signature(method, owner, export_name)?
+        self_operator_signature(method, owner, export_name, export.ctx)?
     } else {
         signature_tokens(method, Some(export))?
     };
@@ -677,21 +809,14 @@ fn self_operator_signature(
     method: &ImplItemFn,
     owner: &Ident,
     export_name: &str,
+    skip_ctx: bool,
 ) -> syn::Result<TokenStream> {
-    let typed_params = method
-        .sig
-        .inputs
-        .iter()
-        .filter(|arg| matches!(arg, FnArg::Typed(_)))
-        .collect::<Vec<_>>();
+    let typed_params = visible_typed_params(method, skip_ctx)?;
     let [param] = typed_params.as_slice() else {
         return Err(syn::Error::new_spanned(
             &method.sig,
             "Self binary operators require exactly one Self operand",
         ));
-    };
-    let FnArg::Typed(param) = param else {
-        unreachable!("filtered typed params")
     };
     let name = match param.pat.as_ref() {
         syn::Pat::Ident(ident) => ident.ident.to_string(),
@@ -746,16 +871,10 @@ fn signature_tokens(
     export: Option<&MethodExport>,
 ) -> syn::Result<TokenStream> {
     let mut used_overrides = std::collections::HashSet::new();
-    let params = method
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(_) => Some(classify_param(arg)),
-            FnArg::Receiver(_) => None,
-        })
+    let params = visible_typed_params(method, export.is_some_and(|export| export.ctx))?
+        .into_iter()
         .map(|param| {
-            let param = param?;
+            let param = classify_param(param)?;
             let name = param.name;
             let ty = match export.and_then(|export| export.param_overrides.get(&name)) {
                 Some(override_ty) => {
@@ -803,45 +922,58 @@ fn effects_tokens(method: &ImplItemFn) -> syn::Result<TokenStream> {
 
 fn native_wrapper(owner: &Ident, method: &ImplItemFn, export: &MethodExport) -> TokenStream {
     let ident = &method.sig.ident;
-    let inputs = wrapper_inputs(owner, method, &export.role);
+    let ctx = if export.ctx {
+        quote! { ctx }
+    } else {
+        quote! { _ctx }
+    };
+    let inputs = wrapper_inputs(owner, method, export, &ctx);
     let output = wrapper_output(owner, method, &export.role);
-    let args = method
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            FnArg::Typed(pat) => Some(&pat.pat),
-            FnArg::Receiver(_) => None,
-        })
+    let args = visible_typed_params(method, export.ctx)
+        .expect("validated method signature")
+        .into_iter()
+        .map(|param| &param.pat)
         .collect::<Vec<_>>();
+    let call_args = if export.ctx {
+        quote! { ctx, #(#args),* }
+    } else {
+        quote! { #(#args),* }
+    };
     let call = match export.role {
         Role::Method(_) | Role::Getter | Role::Setter | Role::Operator(_) => {
-            quote! { receiver.#ident(#(#args),*) }
+            quote! { receiver.#ident(#call_args) }
         }
-        Role::Static | Role::Init => quote! { super::#owner::#ident(#(#args),*) },
+        Role::Static | Role::Init => quote! { super::#owner::#ident(#call_args) },
     };
     quote! {
-        pub fn #ident(#inputs) #output {
+        pub fn #ident<'cx>(#inputs) #output {
             #call
         }
     }
 }
 
-fn wrapper_inputs(owner: &Ident, method: &ImplItemFn, role: &Role) -> TokenStream {
-    let params = method.sig.inputs.iter().filter_map(|arg| match arg {
-        FnArg::Typed(pat) => Some(quote! { #pat }),
-        FnArg::Receiver(_) => None,
-    });
-    match role {
+fn wrapper_inputs(
+    owner: &Ident,
+    method: &ImplItemFn,
+    export: &MethodExport,
+    ctx: &TokenStream,
+) -> TokenStream {
+    let params = visible_typed_params(method, export.ctx)
+        .expect("validated method signature")
+        .into_iter()
+        .map(|param| quote! { #param });
+    match &export.role {
         Role::Method(_) | Role::Getter | Role::Operator(_) | Role::Setter => {
-            let receiver = if role_receiver(method, role) == Some(Receiver::Mutable) {
+            let receiver = if role_receiver(method, &export.role) == Some(Receiver::Mutable) {
                 quote! { receiver: &mut super::#owner }
             } else {
                 quote! { receiver: &super::#owner }
             };
-            quote! { #receiver, #(#params),* }
+            quote! { #ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #receiver, #(#params),* }
         }
-        Role::Static | Role::Init => quote! { #(#params),* },
+        Role::Static | Role::Init => {
+            quote! { #ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#params),* }
+        }
     }
 }
 
@@ -866,15 +998,9 @@ fn member_binding(
     let abis = if self_operator {
         vec![quote! { anvyx_runtime::RustParamAbi::Value(#owner_ty) }]
     } else {
-        method
-            .sig
-            .inputs
-            .iter()
-            .filter_map(|arg| match arg {
-                FnArg::Typed(_) => Some(classify_param(arg)),
-                FnArg::Receiver(_) => None,
-            })
-            .map(|param| param.map(|param| param_abi_tokens(&param.abi)))
+        visible_typed_params(method, export.ctx)?
+            .into_iter()
+            .map(|param| classify_param(param).map(|param| param_abi_tokens(&param.abi)))
             .collect::<syn::Result<Vec<_>>>()?
     };
     let (ret_abi, support, fallible) = if matches!(export.role, Role::Init) {
@@ -900,14 +1026,9 @@ fn member_binding(
         let ret = classify_return(&method.sig.output)?;
         let ret_abi = return_abi_tokens(&ret.abi);
         let support = crate::clean_type_map::conversion_tokens(merge_conversions(
-            method
-                .sig
-                .inputs
-                .iter()
-                .filter_map(|arg| match arg {
-                    FnArg::Typed(_) => Some(classify_param(arg)),
-                    FnArg::Receiver(_) => None,
-                })
+            visible_typed_params(method, export.ctx)?
+                .into_iter()
+                .map(classify_param)
                 .collect::<syn::Result<Vec<_>>>()?
                 .into_iter()
                 .map(|param| param.conversion)
@@ -932,7 +1053,6 @@ fn member_binding(
             abi: anvyx_runtime::RustExternAbi {
                 params: vec![#(#abis),*],
                 ret: #ret_abi,
-                needs_context: false,
                 fallible: #fallible,
                 support: #support,
             },

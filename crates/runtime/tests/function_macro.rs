@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anvyx_runtime::{ExternTypeExpr, ParamFlow, RustAbiSupport, function};
+use anvyx_runtime::{Ctx, ExternTypeExpr, Heap, ParamFlow, RustAbiSupport, RustParamAbi, function};
 
 /// Adds numbers.
 #[function]
@@ -35,6 +35,18 @@ fn maybe_return(value: i64) -> Option<i64> {
 #[function]
 fn strings(values: Vec<String>) -> Vec<String> {
     values
+}
+
+#[function(ctx)]
+fn with_ctx(ctx: &mut Ctx<'_, '_>, value: i64) -> i64 {
+    let _ = ctx.heap();
+    value + 1
+}
+
+#[function(ctx)]
+fn with_ctx_lifetime<'cx>(ctx: &mut Ctx<'cx, '_>, name: &'cx str) -> i64 {
+    let _ = ctx.heap();
+    name.len() as i64
 }
 
 #[test]
@@ -108,4 +120,23 @@ fn option_result_and_list_support_metadata() {
 
     let export = __anvyx_export_strings();
     assert_eq!(export.rust.abi.support, RustAbiSupport::Unsupported);
+}
+
+#[test]
+fn ctx_is_hidden_from_metadata_and_passed_to_authored_function() {
+    let export = __anvyx_export_with_ctx();
+
+    assert_eq!(export.descriptor.signature.params.len(), 1);
+    assert_eq!(export.rust.abi.params.len(), 1);
+    assert_eq!(
+        export.rust.abi.params[0],
+        RustParamAbi::Value(ExternTypeExpr::Int)
+    );
+    Heap::scope(|heap| {
+        let mut ctx = Ctx::new(heap);
+        assert_eq!(__anvyx_native_export_with_ctx::with_ctx(&mut ctx, 41), 42);
+    });
+
+    let export = __anvyx_export_with_ctx_lifetime();
+    assert_eq!(export.descriptor.signature.params.len(), 1);
 }

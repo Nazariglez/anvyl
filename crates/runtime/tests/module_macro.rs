@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anvyx_runtime::{AnvyxInline, ExternBindingOp, ExternBindingTarget, function};
+use anvyx_runtime::{AnvyxInline, Ctx, ExternBindingOp, ExternBindingTarget, Heap, function};
 
 mod root_module {
     use super::{AnvyxInline, function};
@@ -70,7 +70,10 @@ fn module_assembles_root_provider_and_native_tree() {
     assert_eq!(provider.modules[0].path.segments, ["game"]);
     assert_eq!(provider.modules[0].functions[0].name, "ping");
     assert_eq!(provider.modules[0].types[0].name, "Point");
-    assert_eq!(root_module::__anvyx_native::ping(41), 42);
+    Heap::scope(|heap| {
+        let mut ctx = Ctx::new(heap);
+        assert_eq!(root_module::__anvyx_native::ping(&mut ctx, 41), 42);
+    });
 
     let support = root_module::rust_module_support();
     assert_eq!(support.module.segments, ["game"]);
@@ -85,7 +88,10 @@ fn module_assembles_child_descriptors_and_support() {
     assert_eq!(provider.modules[0].path.segments, ["game"]);
     assert_eq!(provider.modules[1].path.segments, ["game", "child"]);
     assert_eq!(provider.modules[1].functions[0].name, "pong");
-    assert_eq!(tree_module::__anvyx_native::child::pong(21), 42);
+    Heap::scope(|heap| {
+        let mut ctx = Ctx::new(heap);
+        assert_eq!(tree_module::__anvyx_native::child::pong(&mut ctx, 21), 42);
+    });
 
     let supports = tree_module::rust_module_supports();
     assert_eq!(supports.len(), 2);
@@ -105,7 +111,10 @@ fn builtin_assembles_descriptor_and_native_support() {
     assert_eq!(provider.provider.name, "core_int");
     assert_eq!(provider.modules[0].path.segments, ["core_int"]);
     assert_eq!(provider.modules[0].functions[0].name, "int_abs");
-    assert_eq!(builtin::__anvyx_native::int_abs(-3), 3);
+    Heap::scope(|heap| {
+        let mut ctx = Ctx::new(heap);
+        assert_eq!(builtin::__anvyx_native::int_abs(&mut ctx, -3), 3);
+    });
     assert_eq!(support.module.segments, ["core_int"]);
     assert_eq!(support.types.len(), 1);
     assert_eq!(support.types[0].key.name, "Point");

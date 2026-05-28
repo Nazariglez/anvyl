@@ -258,7 +258,7 @@ mod tests {
             runtime[1].signature.ret,
             anvyx_externs::ExternTypeExpr::Void
         );
-        assert!(runtime[1].effects.fallible);
+        assert!(!runtime[1].effects.fallible);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{FnArg, GenericArgument, PathArguments, ReturnType, Signature, Type, TypePath};
+use syn::{GenericArgument, PathArguments, ReturnType, Signature, Type, TypePath};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanParam {
@@ -63,8 +63,9 @@ pub fn validate_callable_signature(
     sig: &Signature,
     macro_name: &str,
     noun: &str,
+    allow_ctx_lifetime: bool,
 ) -> syn::Result<()> {
-    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+    if invalid_generics(sig, allow_ctx_lifetime) {
         return Err(syn::Error::new_spanned(
             &sig.generics,
             format!("{macro_name} does not support generic {noun}s"),
@@ -97,13 +98,83 @@ pub fn validate_callable_signature(
     Ok(())
 }
 
-pub fn classify_param(arg: &FnArg) -> syn::Result<CleanParam> {
-    let FnArg::Typed(pat_ty) = arg else {
+fn invalid_generics(sig: &Signature, allow_ctx_lifetime: bool) -> bool {
+    sig.generics.where_clause.is_some()
+        || sig.generics.params.iter().any(|param| {
+            !allow_ctx_lifetime
+                || !matches!(param, syn::GenericParam::Lifetime(lifetime) if lifetime.lifetime.ident == "cx")
+        })
+}
+
+pub fn validate_ctx_param(param: &syn::PatType, macro_name: &str) -> syn::Result<()> {
+    if !matches!(param.pat.as_ref(), syn::Pat::Ident(ident) if ident.ident == "ctx") {
         return Err(syn::Error::new_spanned(
-            arg,
-            "#[function] does not support self receivers",
+            &param.pat,
+            format!("{macro_name} ctx parameter must be named `ctx`"),
         ));
+    }
+    if !is_ctx_type(&param.ty) {
+        return Err(syn::Error::new_spanned(
+            &param.ty,
+            format!("{macro_name} ctx parameter must be `&mut anvyx_runtime::Ctx`"),
+        ));
+    }
+    Ok(())
+}
+
+fn is_ctx_type(ty: &Type) -> bool {
+    let Type::Reference(reference) = ty else {
+        return false;
     };
+    if reference.lifetime.is_some() || reference.mutability.is_none() {
+        return false;
+    }
+    let Type::Path(path) = reference.elem.as_ref() else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    let mut segments = path.path.segments.iter();
+    let first = segments.next();
+    let second = segments.next();
+    if segments.next().is_some() {
+        return false;
+    }
+    match (first, second) {
+        (Some(ctx), None) => ctx.ident == "Ctx" && valid_ctx_args(&ctx.arguments),
+        (Some(runtime), Some(ctx)) => {
+            runtime.ident == "anvyx_runtime"
+                && matches!(runtime.arguments, PathArguments::None)
+                && ctx.ident == "Ctx"
+                && valid_ctx_args(&ctx.arguments)
+        }
+        _ => false,
+    }
+}
+
+fn valid_ctx_args(args: &PathArguments) -> bool {
+    match args {
+        PathArguments::None => true,
+        PathArguments::AngleBracketed(args) if args.args.len() == 2 => {
+            let mut args = args.args.iter();
+            valid_ctx_brand(args.next().expect("checked len"))
+                && valid_inferred_lifetime(args.next().expect("checked len"))
+        }
+        _ => false,
+    }
+}
+
+fn valid_ctx_brand(arg: &GenericArgument) -> bool {
+    valid_inferred_lifetime(arg)
+        || matches!(arg, GenericArgument::Lifetime(lifetime) if lifetime.ident == "cx")
+}
+
+fn valid_inferred_lifetime(arg: &GenericArgument) -> bool {
+    matches!(arg, GenericArgument::Lifetime(lifetime) if lifetime.ident == "_")
+}
+
+pub fn classify_param(pat_ty: &syn::PatType) -> syn::Result<CleanParam> {
     let syn::Pat::Ident(ident) = pat_ty.pat.as_ref() else {
         return Err(syn::Error::new_spanned(
             &pat_ty.pat,
@@ -540,7 +611,10 @@ mod tests {
 
     fn first_param(tokens: TokenStream) -> syn::Result<CleanParam> {
         let func: ItemFn = syn::parse2(quote! { fn f(#tokens) {} }).unwrap();
-        classify_param(func.sig.inputs.first().unwrap())
+        let Some(syn::FnArg::Typed(param)) = func.sig.inputs.first() else {
+            unreachable!();
+        };
+        classify_param(param)
     }
 
     fn ret(output: ReturnType) -> syn::Result<CleanReturn> {

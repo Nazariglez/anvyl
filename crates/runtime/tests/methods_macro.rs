@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxInline, BinaryOp, ExternBindingOp, ExternMemberSelector, ExternOperator, ReceiverMode,
-    methods,
+    AnvyxInline, BinaryOp, Ctx, ExternBindingOp, ExternMemberSelector, ExternOperator, Heap,
+    ReceiverMode, RustParamAbi, methods,
 };
 
 #[derive(AnvyxInline)]
@@ -17,6 +17,38 @@ impl DerivedVec2 {
     pub fn x(&self) -> f64 {
         self.x
     }
+}
+
+struct CtxBox {
+    value: i64,
+}
+
+#[methods]
+impl CtxBox {
+    #[anvyx(ctx)]
+    pub fn add(&self, ctx: &mut Ctx<'_, '_>, value: i64) -> i64 {
+        let _ = ctx.heap();
+        self.value + value
+    }
+}
+
+#[test]
+fn ctx_method_hides_ctx_from_metadata_and_wrapper_uses_ctx_first() {
+    let export = __anvyx_methods_ctxbox();
+
+    assert_eq!(export.descriptor.methods[0].signature.params.len(), 1);
+    assert_eq!(
+        export.bindings[0].abi.params,
+        [RustParamAbi::Value(anvyx_runtime::ExternTypeExpr::Int)]
+    );
+    Heap::scope(|heap| {
+        let mut ctx = Ctx::new(heap);
+        let receiver = CtxBox { value: 40 };
+        assert_eq!(
+            __anvyx_methods_native_ctxbox::add(&mut ctx, &receiver, 2),
+            42
+        );
+    });
 }
 
 struct Vec2 {
@@ -57,7 +89,7 @@ impl Vec2 {
     }
 
     #[anvyx(setter)]
-    pub fn magnitude(&mut self, value: f64) {
+    pub fn set_length(&mut self, value: f64) {
         self.x = value;
     }
 
@@ -144,8 +176,10 @@ fn methods_descriptor_covers_member_roles() {
     assert_eq!(export.descriptor.methods[1].receiver, ReceiverMode::Mutable);
     assert_eq!(export.descriptor.statics[0].name, "unit");
     assert!(export.descriptor.init.is_some());
-    assert_eq!(export.descriptor.fields.len(), 2);
+    assert_eq!(export.descriptor.fields.len(), 1);
     assert!(export.descriptor.fields.iter().all(|field| field.computed));
+    assert!(export.descriptor.fields[0].readable);
+    assert!(export.descriptor.fields[0].writable);
     assert_eq!(export.descriptor.operators.len(), 3);
     assert!(export.descriptor.operators.iter().any(|op| op.op
         == ExternOperator::Binary {
@@ -206,7 +240,7 @@ fn method_bindings_use_member_keys_and_operations() {
     )));
     assert!(export.bindings.iter().any(|binding| matches!(
         (&binding.selector, binding.operation),
-        (ExternMemberSelector::Field(name), ExternBindingOp::Set) if name == "magnitude"
+        (ExternMemberSelector::Field(name), ExternBindingOp::Set) if name == "length"
     )));
     assert!(export.bindings.iter().any(|binding| matches!(
         (&binding.selector, binding.operation),

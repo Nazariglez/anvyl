@@ -7,8 +7,8 @@ impl Point {
     #[anvyx(getter)]
     pub fn x(&self) -> i64 { 0 }
 
-    #[anvyx(setter, params(missing = "int"))]
-    pub fn set_x(&mut self, value: i64) {}
+    #[anvyx(setter)]
+    pub fn set_x(&mut self, value: bool) {}
 }
 
 fn main() {}

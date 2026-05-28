@@ -1,4 +1,7 @@
+pub mod ctx;
 pub mod cycle_collector;
+pub mod error;
+pub mod heap;
 pub mod managed_rc;
 pub mod provider;
 pub mod suspect_buffer;
@@ -6,7 +9,10 @@ pub mod type_registry;
 
 pub use anvyx_externs;
 pub use anvyx_macros::{AnvyxInline, AnvyxRef, builtin_module, function, methods, module};
+pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
+pub use error::RuntimeError;
+pub use heap::Heap;
 pub use inventory;
 pub use managed_rc::{
     CycleColor, CycleVtable, ManagedRc, ManagedRcInner, RcHeader, managed_alloc_count,
@@ -20,10 +26,10 @@ pub use provider::{
     ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator, ExternOperatorDescriptor,
     ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor, ExternTypeDescriptor,
     ExternTypeExpr, ExternTypeKey, FunctionExport, ModuleExport, ModuleExportItem, ModulePath,
-    ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, RuntimeError, RustAbiSupport,
-    RustExternAbi, RustExternBinding, RustLocalBinding, RustMemberBinding, RustModuleSupport,
-    RustParamAbi, RustPath, RustProviderCargo, RustProviderSupport, RustReturnAbi, RustTypeBinding,
-    TypeExport, TypeMemberExport, UnaryOp, merge_type_members, validate_rust_provider_support,
+    ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, RustAbiSupport, RustExternAbi,
+    RustExternBinding, RustLocalBinding, RustMemberBinding, RustModuleSupport, RustParamAbi,
+    RustPath, RustProviderCargo, RustProviderSupport, RustReturnAbi, RustTypeBinding, TypeExport,
+    TypeMemberExport, UnaryOp, merge_type_members, validate_rust_provider_support,
 };
 pub use type_registry::{
     get_type_entry, is_cycle_capable, register_child_traverser, register_cycle_capable,

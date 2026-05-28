@@ -1,0 +1,6 @@
+error: computed property `x` getter/setter types differ
+ --> tests/ui/methods/getter_setter_type_mismatch.rs:7:5
+  |
+7 | /     #[anvyx(getter)]
+8 | |     pub fn x(&self) -> i64 { 0 }
+  | |________________________________^

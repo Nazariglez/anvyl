@@ -1,5 +1,5 @@
 error: unknown parameter override `missing`
- --> tests/ui/methods/setter_missing_param_override.rs:8:9
-  |
-8 |     pub fn x(&mut self, value: i64) {}
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  --> tests/ui/methods/setter_missing_param_override.rs:11:9
+   |
+11 |     pub fn set_x(&mut self, value: i64) {}
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

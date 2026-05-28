@@ -5,18 +5,20 @@ use quote::{format_ident, quote};
 use syn::{
     ItemFn, LitStr, Token,
     parse::{Parse, ParseStream},
+    spanned::Spanned,
 };
 
 use crate::clean_type_map::{
     classify_param, classify_return, conversion_tokens, flow_tokens, merge_conversions,
     param_abi_tokens, parse_type_expr, return_abi_tokens, type_expr_tokens,
-    validate_callable_signature,
+    validate_callable_signature, validate_ctx_param,
 };
 
 struct FunctionArgs {
     name: Option<String>,
     ret: Option<String>,
     params: HashMap<String, String>,
+    ctx: bool,
 }
 
 impl Parse for FunctionArgs {
@@ -24,6 +26,7 @@ impl Parse for FunctionArgs {
         let mut name = None;
         let mut ret = None;
         let mut params = None;
+        let mut ctx = false;
 
         while !input.is_empty() {
             let key: syn::Ident = input.parse()?;
@@ -37,10 +40,19 @@ impl Parse for FunctionArgs {
                     set_once(&mut ret, &key, input.parse::<LitStr>()?.value())?;
                 }
                 "params" => set_once(&mut params, &key, parse_param_overrides(input)?)?,
+                "ctx" => {
+                    if ctx {
+                        return Err(syn::Error::new_spanned(
+                            key,
+                            "duplicate #[function] key `ctx`",
+                        ));
+                    }
+                    ctx = true;
+                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "expected `name`, `ret`, or `params`",
+                        "expected `name`, `ret`, `params`, or `ctx`",
                     ));
                 }
             }
@@ -53,6 +65,7 @@ impl Parse for FunctionArgs {
             name,
             ret,
             params: params.unwrap_or_default(),
+            ctx,
         })
     }
 }
@@ -97,7 +110,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let args: FunctionArgs = syn::parse2(attr)?;
     let func: ItemFn = syn::parse2(item)?;
-    validate_callable_signature(&func.sig, "#[function]", "function")?;
+    validate_callable_signature(&func.sig, "#[function]", "function", args.ctx)?;
 
     let ident = &func.sig.ident;
     let export_name = args.name.clone().unwrap_or_else(|| ident.to_string());
@@ -105,10 +118,10 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
     let native_mod = crate::naming::native_export_module_ident(ident);
     let wrapper = format_ident!("{}", export_name);
 
-    let params = func
-        .sig
-        .inputs
+    let visible_inputs = visible_function_inputs(&func.sig.inputs, args.ctx)?;
+    let params = visible_inputs
         .iter()
+        .copied()
         .map(classify_param)
         .collect::<syn::Result<Vec<_>>>()?;
     validate_overrides(&args, &params)?;
@@ -146,12 +159,22 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
             .chain(std::iter::once(ret.conversion)),
     ));
     let fallible = ret.fallible;
-    let native_inputs = func.sig.inputs.iter();
+    let native_ctx = if args.ctx {
+        quote! { ctx }
+    } else {
+        quote! { _ctx }
+    };
+    let native_inputs = visible_inputs.iter();
     let native_output = &func.sig.output;
-    let native_args = func.sig.inputs.iter().map(|arg| match arg {
-        syn::FnArg::Typed(pat_ty) => &pat_ty.pat,
-        syn::FnArg::Receiver(_) => unreachable!("validated by classifier"),
-    });
+    let visible_args = visible_inputs
+        .iter()
+        .map(|pat_ty| &pat_ty.pat)
+        .collect::<Vec<_>>();
+    let native_args = if args.ctx {
+        quote! { ctx, #(#visible_args),* }
+    } else {
+        quote! { #(#visible_args),* }
+    };
     let doc = crate::codegen::extract_doc(&func.attrs)
         .map_or_else(|| quote! { None }, |doc| quote! { Some(#doc.to_string()) });
     Ok(quote! {
@@ -174,7 +197,6 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                     abi: anvyx_runtime::RustExternAbi {
                         params: vec![#(#param_abis),*],
                         ret: #ret_abi,
-                        needs_context: false,
                         fallible: #fallible,
                         support: #support,
                     },
@@ -186,11 +208,38 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         pub mod #native_mod {
             use super::*;
 
-            pub fn #wrapper(#(#native_inputs),*) #native_output {
-                super::#ident(#(#native_args),*)
+            pub fn #wrapper<'cx>(#native_ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#native_inputs),*) #native_output {
+                super::#ident(#native_args)
             }
         }
     })
+}
+
+fn visible_function_inputs(
+    inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
+    needs_ctx: bool,
+) -> syn::Result<Vec<&syn::PatType>> {
+    let typed = inputs
+        .iter()
+        .map(|arg| match arg {
+            syn::FnArg::Typed(pat) => Ok(pat),
+            syn::FnArg::Receiver(_) => Err(syn::Error::new_spanned(
+                arg,
+                "#[function] does not support self receivers",
+            )),
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    if !needs_ctx {
+        return Ok(typed);
+    }
+    let Some((ctx, rest)) = typed.split_first() else {
+        return Err(syn::Error::new(
+            inputs.span(),
+            "#[function(ctx)] requires a first `ctx` parameter",
+        ));
+    };
+    validate_ctx_param(ctx, "#[function(ctx)]")?;
+    Ok(rest.to_vec())
 }
 
 fn validate_overrides(

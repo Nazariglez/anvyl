@@ -1,0 +1,6 @@
+error: computed setter `set_x` requires matching getter `x`
+ --> tests/ui/methods/setter_without_getter.rs:7:5
+  |
+7 | /     #[anvyx(setter)]
+8 | |     pub fn set_x(&mut self, value: i64) {}
+  | |__________________________________________^

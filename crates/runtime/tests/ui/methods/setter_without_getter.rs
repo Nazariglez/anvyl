@@ -4,10 +4,7 @@ struct Point;
 
 #[methods]
 impl Point {
-    #[anvyx(getter)]
-    pub fn x(&self) -> i64 { 0 }
-
-    #[anvyx(setter, params(missing = "int"))]
+    #[anvyx(setter)]
     pub fn set_x(&mut self, value: i64) {}
 }
 

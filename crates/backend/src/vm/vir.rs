@@ -1,10 +1,24 @@
 use anvyx_frontend::air::{
-    CallArg, Callee, FunctionId, LocalId, Operand, ParamMode, Place, TypeId,
+    CallArg, ExternId, FunctionId, LocalId, Operand, ParamMode, Place, TypeId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirProgram {
     pub functions: Vec<VirFunction>,
+    pub externs: Vec<VirExtern>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirExtern {
+    pub source: ExternId,
+    pub params: Vec<VirExternParam>,
+    pub ret: TypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirExternParam {
+    pub ty: TypeId,
+    pub mode: ParamMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,8 +30,15 @@ pub struct VirFunction {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirCall {
-    pub callee: Callee,
+    pub callee: VirCallee,
     pub args: Vec<VirCallArg>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VirCallee {
+    Function(FunctionId),
+    Extern(ExternId),
+    Closure(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq)]

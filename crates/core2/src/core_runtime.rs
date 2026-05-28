@@ -1,4 +1,4 @@
-use anvyx_runtime::{RuntimeError, function};
+use anvyx_runtime::function;
 
 #[inline(always)]
 #[function]
@@ -8,12 +8,8 @@ pub fn _println(message: &str) {
 
 #[inline(always)]
 #[function]
-pub fn _assert(condition: bool, message: &str) -> Result<(), RuntimeError> {
-    if condition {
-        Ok(())
-    } else {
-        Err(RuntimeError::new(message))
-    }
+pub fn _assert(condition: bool, message: &str) {
+    assert!(condition, "{message}");
 }
 
 anvyx_runtime::builtin_module! {
