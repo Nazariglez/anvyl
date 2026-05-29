@@ -1,0 +1,5 @@
+error: Trace cannot be derived for unions
+ --> tests/ui/fail/union.rs:2:1
+  |
+2 | union Bad {
+  | ^^^^^

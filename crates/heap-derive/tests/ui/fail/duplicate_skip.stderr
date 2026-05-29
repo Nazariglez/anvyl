@@ -1,0 +1,5 @@
+error: duplicate `trace(skip_unchecked)` attribute
+ --> tests/ui/fail/duplicate_skip.rs:3:29
+  |
+3 |     #[trace(skip_unchecked, skip_unchecked)]
+  |                             ^^^^^^^^^^^^^^

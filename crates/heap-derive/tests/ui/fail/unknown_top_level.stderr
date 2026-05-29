@@ -1,0 +1,5 @@
+error: unknown trace attribute
+ --> tests/ui/fail/unknown_top_level.rs:2:9
+  |
+2 | #[trace(nope)]
+  |         ^^^^

@@ -1,0 +1,5 @@
+error: duplicate `crate` trace attribute
+ --> tests/ui/fail/duplicate_crate.rs:2:29
+  |
+2 | #[trace(crate = anvyx_heap, crate = ::anvyx_heap)]
+  |                             ^^^^^

@@ -1,0 +1,15 @@
+[package]
+name = "anvyx-heap"
+version.workspace = true
+description.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+anvyx-heap-derive = { path = "../heap-derive" }
+
+[lints]
+workspace = true

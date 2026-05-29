@@ -1,0 +1,5 @@
+error: heap context lifetime must be named `'cx`
+ --> tests/ui/fail/bad_ctx_attr.rs:2:15
+  |
+2 | #[trace(ctx = 'ctx)]
+  |               ^^^^

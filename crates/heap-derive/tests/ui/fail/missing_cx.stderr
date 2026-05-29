@@ -1,0 +1,5 @@
+error: heap context lifetime must be named `'cx`
+ --> tests/ui/fail/missing_cx.rs:2:8
+  |
+2 | struct Bad<'a> {
+  |        ^^^

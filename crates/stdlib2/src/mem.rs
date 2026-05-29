@@ -1,18 +1,18 @@
-use anvyx_runtime::function;
+use anvyx_runtime::{Ctx, function};
 
-#[function]
-pub fn collect_cycles() {
-    unimplemented!("std:mem heap support is not implemented")
+#[function(ctx)]
+pub fn collect_cycles(ctx: &mut Ctx<'_, '_>) {
+    ctx.heap().collect_all();
 }
 
-#[function]
-pub fn auto_collect(_enabled: bool) {
-    unimplemented!("std:mem heap support is not implemented")
+#[function(ctx)]
+pub fn auto_collect(ctx: &mut Ctx<'_, '_>, enabled: bool) {
+    ctx.heap().set_collection_enabled(enabled);
 }
 
-#[function]
-pub fn managed_count() -> i64 {
-    unimplemented!("std:mem heap support is not implemented")
+#[function(ctx)]
+pub fn managed_count(ctx: &mut Ctx<'_, '_>) -> i64 {
+    ctx.heap().stats().live as i64
 }
 
 anvyx_runtime::builtin_module! {

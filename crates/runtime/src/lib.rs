@@ -1,18 +1,21 @@
 pub mod ctx;
 pub mod cycle_collector;
 pub mod error;
-pub mod heap;
 pub mod managed_rc;
 pub mod provider;
 pub mod suspect_buffer;
 pub mod type_registry;
 
 pub use anvyx_externs;
+pub use anvyx_heap::{
+    AccessError, CollectOutcome, CycleStatus, ErasedHandle, Handle, Heap, HeapConfig, HeapStats,
+    HeapType, HeapTypeId, LeakReport, LeakTypeReport, RootId, Trace, TraceDriver, TraceMode,
+    Visitor,
+};
 pub use anvyx_macros::{AnvyxInline, AnvyxRef, builtin_module, function, methods, module};
 pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::RuntimeError;
-pub use heap::Heap;
 pub use inventory;
 pub use managed_rc::{
     CycleColor, CycleVtable, ManagedRc, ManagedRcInner, RcHeader, managed_alloc_count,

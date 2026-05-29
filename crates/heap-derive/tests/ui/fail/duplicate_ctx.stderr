@@ -1,0 +1,5 @@
+error: duplicate `ctx` trace attribute
+ --> tests/ui/fail/duplicate_ctx.rs:2:20
+  |
+2 | #[trace(ctx = 'cx, ctx = 'cx)]
+  |                    ^^^
