@@ -11,14 +11,16 @@ use super::{
     },
     decls::{
         AggregateSchema, CallableDef, CallableId, CallableKind, CallableRef, CallableSig,
-        DeclError, ExtendId, MethodKey, MethodMode, ModuleScope, NominalKey, ParamDefaultSite,
-        TypeAliasDef, generic_params, nominal_type, required_param_count, stmt_visibility,
+        CastFromConversion, DeclError, ExtendId, MethodKey, MethodMode, ModuleScope, NominalKey,
+        ParamDefaultSite, TypeAliasDef, generic_params, nominal_type, required_param_count,
+        stmt_visibility,
     },
     defaults,
     dyn_infer::DynInference,
     generic::{
         ConstSubst, GenericArgs, GenericOwnerFrame, GenericParams, SpecializationState, TypeSubst,
-        check_with_specialization, combined_callable_params, specialization_key,
+        callable_const_bindings, check_with_specialization, combined_callable_params,
+        specialization_key,
     },
     infer::TypeHandle,
     pattern::{self, check_binding},
@@ -27,8 +29,8 @@ use super::{
 };
 use crate::{
     ast::{
-        AggregateDeclNode, BlockNode, ConstValue, ExprKind, ExprNode, ExtendDeclNode, Func,
-        FuncNode, FuncParam, Ident, MethodReceiver, Mutability, Param, Pattern, PatternHead,
+        AggregateDeclNode, BlockNode, CastFromNode, ConstValue, ExprKind, ExprNode, ExtendDeclNode,
+        Func, FuncNode, FuncParam, Ident, MethodReceiver, Mutability, Param, Pattern, PatternHead,
         PatternNode, Program, ReturnAccess, ReturnSpec, Stmt, StmtNode, StructDecl, Type,
         TypeAliasDeclNode, Visibility,
     },
@@ -1038,23 +1040,20 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
     }
     for (index, (cast, cast_schema)) in extend.cast_froms.iter().zip(schema.cast_froms).enumerate()
     {
-        let key = BodyInstanceKey::CastFrom(CastFromInstanceKey {
-            extend: schema.id.clone(),
-            index,
-            args: GenericArgs::default(),
-        });
-        tc.with_body_instance(key, |tc| {
-            check_func_body(
-                None,
-                std::slice::from_ref(&cast.node.param),
-                std::slice::from_ref(&cast_schema.param),
-                &ReturnSpec::value(self_ty.clone()),
-                &cast.node.body,
-                cast.span,
-                &[],
-                tc,
-            );
-        });
+        check_cast_from_body(
+            CastFromInstanceKey {
+                extend: schema.id.clone(),
+                index,
+                args: GenericArgs::default(),
+            },
+            &cast.node.param,
+            &cast_schema.param,
+            self_ty.clone(),
+            &cast.node.body,
+            cast.span,
+            &[],
+            tc,
+        );
     }
 }
 
@@ -1507,6 +1506,123 @@ pub(super) fn check_specialized_callable_body(
             })
         },
     )
+}
+
+pub(super) fn check_cast_from_conversion_body(
+    conversion: &CastFromConversion,
+    source: &Type,
+    target: &Type,
+    tc: &mut TypeChecker,
+) {
+    let key = conversion.instance.clone();
+    let Some(schema) = tc.decls.extend(&key.extend).cloned() else {
+        return;
+    };
+    let Some(cast_schema) = schema.cast_froms.get(key.index) else {
+        return;
+    };
+    let module = key.extend.module.clone();
+    let Some((extend_node, cast_node)) = tc
+        .module_programs
+        .get(&module)
+        .and_then(|program| cast_from_node(program, key.extend.index, key.index))
+    else {
+        return;
+    };
+
+    let (type_subst, const_subst) = schema.generics.substitutions(&key.args);
+    let const_bindings = callable_const_bindings(
+        &schema.generics,
+        &key.args,
+        &GenericParams::default(),
+        &GenericArgs::default(),
+    );
+    let param_ty = FuncParam::new(
+        source.clone(),
+        cast_schema.param.mutable,
+        cast_schema.param.cast_accept,
+        cast_schema.param.escape,
+    );
+
+    with_source_module_scope(&module, tc, |tc| {
+        let generics = tc.generic_context(
+            &extend_node.node.type_params,
+            &extend_node.node.const_params,
+            extend_node.span,
+        );
+        let owner_frame = GenericOwnerFrame {
+            params: schema.generics,
+            args: key.args.clone(),
+            generics: generics.clone(),
+        };
+        tc.solve_constraints();
+        tc.push_type_subst(type_subst);
+        tc.push_const_subst(const_subst);
+        tc.push_generic_context(generics);
+        tc.push_generic_owner_frame(owner_frame);
+        check_cast_from_body(
+            key,
+            &cast_node.node.param,
+            &param_ty,
+            target.clone(),
+            &cast_node.node.body,
+            cast_node.span,
+            &const_bindings,
+            tc,
+        );
+        tc.solve_constraints();
+        tc.pop_generic_owner_frame();
+        tc.pop_generic_context();
+        tc.pop_const_subst();
+        tc.pop_type_subst();
+    });
+}
+
+fn check_cast_from_body(
+    key: CastFromInstanceKey,
+    param: &Param,
+    param_ty: &FuncParam,
+    ret_ty: Type,
+    body: &BlockNode,
+    span: Span,
+    const_bindings: &[(Ident, ConstValue)],
+    tc: &mut TypeChecker,
+) {
+    let body_key = BodyInstanceKey::CastFrom(key);
+    if tc.active_bodies.contains(&body_key) || tc.semantic_facts.body(&body_key).is_some() {
+        return;
+    }
+    let ret = ReturnSpec::value(ret_ty);
+    tc.with_body_instance(body_key, |tc| {
+        check_func_body(
+            None,
+            std::slice::from_ref(param),
+            std::slice::from_ref(param_ty),
+            &ret,
+            body,
+            span,
+            const_bindings,
+            tc,
+        );
+    });
+}
+
+fn cast_from_node(
+    program: &Program,
+    extend_index: usize,
+    cast_index: usize,
+) -> Option<(ExtendDeclNode, CastFromNode)> {
+    let extend = program
+        .stmts
+        .iter()
+        .filter_map(|stmt| match &stmt.node {
+            Stmt::Extend(extend) => Some(extend),
+            _ => None,
+        })
+        .nth(extend_index)?
+        .clone();
+    let cast = extend.node.cast_froms.get(cast_index)?.clone();
+    Some((extend, cast))
 }
 
 fn with_global_scope<R>(tc: &mut TypeChecker, f: impl FnOnce(&mut TypeChecker) -> R) -> R {

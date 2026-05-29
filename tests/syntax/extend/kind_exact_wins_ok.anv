@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State {
+    Idle,
+}
+
+extend<E> enum E {
+    fn label(self) -> string { "enum" }
+}
+
+extend State {
+    fn label(self) -> int { 1 }
+}
+
+fn main() {
+    let s: State = State.Idle;
+    let label: int = s.label();
+}

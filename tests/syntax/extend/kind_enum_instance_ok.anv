@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State {
+    Idle,
+    Run,
+}
+
+extend<E> enum E {
+    fn same(self, other: E) -> bool { true }
+}
+
+fn main() {
+    let a: State = State.Idle;
+    let b: State = State.Run;
+    let ok: bool = a.same(b);
+}

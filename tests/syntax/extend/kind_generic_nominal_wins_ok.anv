@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> {
+    item: T,
+}
+
+extend<S> struct S {
+    fn label(self) -> string { "struct" }
+}
+
+extend<T> Box<T> {
+    fn label(self) -> int { 1 }
+}
+
+fn main() {
+    let b = Box<int> { item: 1 };
+    let label: int = b.label();
+}

@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+dataref Node {
+    value: int,
+}
+
+extend<D> dataref D {
+    fn tag(self) -> string { "dataref" }
+}
+
+fn main() {
+    let n = Node { value: 1 };
+    let s: string = n.tag();
+}

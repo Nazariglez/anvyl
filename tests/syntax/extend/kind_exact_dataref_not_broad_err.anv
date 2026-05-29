@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'get' for type 'OtherNode'
+
+dataref Node { value: int }
+dataref OtherNode { value: int }
+
+extend dataref Node {
+    fn get(self) -> int { self.value }
+}
+
+fn main() {
+    let other = OtherNode { value: 2 };
+    other.get();
+}

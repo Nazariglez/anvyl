@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Boxed<T> {
+    Full(T),
+    Empty,
+}
+
+extend<T> enum Boxed<T> {
+    fn full(value: T) -> Boxed<T> { Boxed.Full(value) }
+
+    fn has_value(self) -> bool {
+        match self {
+            Boxed.Full(_) => true,
+            Boxed.Empty => false,
+        }
+    }
+}
+
+fn main() {
+    let b: Boxed<int> = <Boxed<int>>.full(1);
+    let ok: bool = b.has_value();
+}

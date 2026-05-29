@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: wrong number of type parameters
+
+struct Box<T> {
+    item: T,
+}
+
+extend<T, U> struct Box<T, U> {
+    fn bad(self) -> int { 0 }
+}

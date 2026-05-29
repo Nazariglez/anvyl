@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Buf<T, N: int> {
+    item: T,
+}
+
+extend<T, N: int> struct Buf<T, N> {
+    fn get(self) -> T { self.item }
+}
+
+fn main() {
+    let b = Buf<int, 4> { item: 1 };
+    let x: int = b.get();
+}

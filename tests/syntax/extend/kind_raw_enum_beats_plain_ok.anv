@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Code: int {
+    Ok = 0,
+}
+
+extend<E> enum E {
+    fn rank() -> string { "enum" }
+}
+
+extend<E> enum E: int {
+    fn rank() -> int { 1 }
+    fn exact_rank() -> int { 2 }
+}
+
+extend Code {
+    fn exact_rank() -> bool { true }
+}
+
+fn main() {
+    let rank: int = Code.rank();
+    let exact: bool = Code.exact_rank();
+}

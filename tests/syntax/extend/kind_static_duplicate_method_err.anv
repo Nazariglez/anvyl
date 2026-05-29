@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate extend static method 'tag'
+
+extend<E> enum E {
+    fn tag() -> string { "a" }
+}
+
+extend<E> enum E {
+    fn tag() -> string { "b" }
+}

@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate extend instance method 'get'
+
+struct Box<T> {
+    item: T,
+}
+
+extend<T> Box<T> {
+    fn get(self) -> T { self.item }
+}
+
+extend<T> struct Box<T> {
+    fn get(self) -> T { self.item }
+}

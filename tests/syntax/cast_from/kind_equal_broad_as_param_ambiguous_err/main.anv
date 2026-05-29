@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ambiguous cast
+
+import a;
+import b;
+
+struct Wrapper {
+    n: int,
+}
+
+fn take(w: as Wrapper) {}
+
+fn main() {
+    take([Wrapper { n: 1 }]);
+}

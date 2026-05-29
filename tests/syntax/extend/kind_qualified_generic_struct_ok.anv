@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> {
+    item: T,
+}
+
+extend<T> struct Box<T> {
+    fn get(self) -> T { self.item }
+    fn make(value: T) -> Box<T> { Box<T> { item: value } }
+}
+
+fn main() {
+    let a: Box<int> = Box.make(1);
+    let b: Box<int> = <Box<int>>.make(2);
+    let x: int = a.get();
+    let y: int = b.get();
+}

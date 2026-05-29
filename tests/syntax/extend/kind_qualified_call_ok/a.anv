@@ -1,0 +1,9 @@
+// @helper
+
+pub enum State {
+    Idle,
+}
+
+pub extend<E> enum E {
+    fn tag(self) -> string { "a" }
+}

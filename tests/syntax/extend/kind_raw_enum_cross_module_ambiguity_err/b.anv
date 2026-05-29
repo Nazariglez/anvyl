@@ -1,0 +1,5 @@
+// @helper
+
+pub extend<E> enum E: int {
+    fn tag() -> int { 2 }
+}

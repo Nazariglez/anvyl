@@ -227,6 +227,51 @@ pub enum NominalKind {
     Extern,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RawEnumBackingConstraint {
+    Int,
+    String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtendTargetConstraint {
+    Enum {
+        backing: Option<RawEnumBackingConstraint>,
+    },
+    Struct,
+    DataRef,
+}
+
+impl RawEnumBackingConstraint {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Int => "int",
+            Self::String => "string",
+        }
+    }
+}
+
+impl ExtendTargetConstraint {
+    pub fn nominal_kind(self) -> NominalKind {
+        match self {
+            Self::Enum { .. } => NominalKind::Enum,
+            Self::Struct => NominalKind::Struct,
+            Self::DataRef => NominalKind::DataRef,
+        }
+    }
+
+    pub fn backing(self) -> Option<RawEnumBackingConstraint> {
+        match self {
+            Self::Enum { backing } => backing,
+            Self::Struct | Self::DataRef => None,
+        }
+    }
+
+    pub fn keyword(self) -> &'static str {
+        self.nominal_kind().keyword()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NominalType {
     pub kind: NominalKind,
@@ -1165,6 +1210,7 @@ pub struct ExtendMethod {
 pub struct ExtendDecl {
     pub visibility: Visibility,
     pub ty: Type,
+    pub target_constraint: Option<ExtendTargetConstraint>,
     pub type_params: Vec<TypeParam>,
     pub const_params: Vec<ConstParam>,
     pub methods: Vec<ExtendMethodNode>,

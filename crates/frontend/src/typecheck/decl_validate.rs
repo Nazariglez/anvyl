@@ -4,8 +4,13 @@ use super::{
     CallableKind, CastConversionSchema, DeclError, DeclarationIndex, DynInference, EnumRepr,
     ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams,
     MethodKey, MethodSurface, NominalKey, PendingRawEnum, RawEnumValue, TypeAliasDef, TypeChecker,
-    TypeError, ValueDecl, VariantPayload, const_eval::const_type, contracts, same_extend_target,
-    type_ops::TypeVisitor, type_refs::GenericParamError,
+    TypeError, ValueDecl, VariantPayload,
+    const_eval::const_type,
+    contracts,
+    extend_target::{ExtendTargetPattern, same_target_pattern, validate_constrained_target},
+    same_extend_target,
+    type_ops::TypeVisitor,
+    type_refs::GenericParamError,
 };
 use crate::{
     ast::{
@@ -263,7 +268,9 @@ fn validate_extend_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) 
             continue;
         }
         let facts = target_facts(&extend.target);
-        if unsupported_extend_target(&extend.target, &facts) {
+        let unsupported = !validate_constrained_target(decls, &ExtendTargetPattern::from(extend))
+            || unsupported_extend_target(&extend.target, &facts);
+        if unsupported {
             errors.push(TypeError::Decl(DeclError::UnsupportedExtendTarget {
                 ty: extend.target.clone(),
                 span: Some(extend.span),
@@ -295,11 +302,9 @@ fn validate_duplicate_extend_methods(decls: &DeclarationIndex, errors: &mut Vec<
     for (index, extend) in extends.iter().enumerate() {
         for prior in &extends[..index] {
             if prior.origin != extend.origin
-                || !same_extend_target(
-                    &prior.target,
-                    &prior.generics,
-                    &extend.target,
-                    &extend.generics,
+                || !same_target_pattern(
+                    &ExtendTargetPattern::from(*prior),
+                    &ExtendTargetPattern::from(*extend),
                 )
             {
                 continue;
@@ -425,11 +430,9 @@ fn has_duplicate_cast_from(
             continue;
         }
         if other_extend.origin != extend.origin
-            || !same_extend_target(
-                &other_extend.target,
-                &other_extend.generics,
-                &extend.target,
-                &extend.generics,
+            || !same_target_pattern(
+                &ExtendTargetPattern::from(other_extend),
+                &ExtendTargetPattern::from(extend),
             )
         {
             continue;

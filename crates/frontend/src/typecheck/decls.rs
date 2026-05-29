@@ -1,19 +1,23 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use super::{
-    ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, TypeSubst, annotation,
+    CastFromInstanceKey, ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, TypeSubst,
+    annotation,
     const_term::ConstTerm,
-    generic_template_type, match_cast_conversion, same_extend_target, substitute,
+    extend_target::{
+        ExtendTargetPattern, MatchedTargetPattern, match_exact_target, most_specific_target_match,
+    },
+    generic_template_type, match_cast_conversion, substitute,
     surface::{dependent_embed_template_valid, projection_path_valid},
     type_ops::type_depends_on_generics,
     type_refs::{GenericParamError, GenericTypeContext, TypeRefError, TypeRefResolver},
 };
 use crate::{
     ast::{
-        self, AggregateKind, ConstArg, ConstParam, ContractRef, EscapeMode, FuncParam, GenericArg,
-        Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig, ModuleOrigin, Mutability,
-        NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type, TypeParam, VariantKind,
-        Visibility,
+        self, AggregateKind, ConstArg, ConstParam, ContractRef, EscapeMode, ExtendTargetConstraint,
+        FuncParam, GenericArg, Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig,
+        ModuleOrigin, Mutability, NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type,
+        TypeParam, VariantKind, Visibility,
     },
     externs::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
@@ -1637,6 +1641,7 @@ pub(crate) struct ExtendSchema {
     pub(crate) origin: ModuleScope,
     pub(crate) exported: bool,
     pub(crate) target: Type,
+    pub(crate) target_constraint: Option<ExtendTargetConstraint>,
     pub(crate) generics: GenericParams,
     pub(crate) methods: HashMap<MethodKey, ExtendMethodSchema>,
     pub(crate) cast_froms: Vec<CastConversionSchema>,
@@ -1672,11 +1677,15 @@ pub(crate) enum ExtendMethodMatch<'a> {
     Ambiguous,
 }
 
+#[derive(Clone)]
+pub(crate) struct CastFromConversion {
+    pub(crate) escape: EscapeMode,
+    pub(crate) origin: ModuleScope,
+    pub(crate) instance: CastFromInstanceKey,
+}
+
 pub(crate) enum CastConversionMatch {
-    Match {
-        escape: EscapeMode,
-        origin: ModuleScope,
-    },
+    Match(CastFromConversion),
     Ambiguous,
 }
 
@@ -2784,25 +2793,21 @@ impl DeclarationIndex {
                             ret: m.sig.ret.clone(),
                             policy,
                         };
-                        if methods.contains_key(&key)
-                            || self.extends.iter().any(|prior| {
-                                prior.origin == scope
-                                    && same_extend_target(
-                                        &prior.target,
-                                        &prior.generics,
-                                        &ext.ty,
-                                        &generics,
-                                    )
-                                    && prior.methods.contains_key(&key)
-                            })
-                        {
-                            self.errors.push(DeclError::DuplicateExtendMethod {
-                                name: m.sig.name,
-                                surface: key.surface,
-                                span: Some(SourceSpan::from_byte_span(source, method_node.span)),
-                            });
-                        } else {
-                            methods.insert(key, schema);
+                        let surface = key.surface;
+                        match methods.entry(key) {
+                            Entry::Occupied(_) => {
+                                self.errors.push(DeclError::DuplicateExtendMethod {
+                                    name: m.sig.name,
+                                    surface,
+                                    span: Some(SourceSpan::from_byte_span(
+                                        source,
+                                        method_node.span,
+                                    )),
+                                });
+                            }
+                            Entry::Vacant(entry) => {
+                                entry.insert(schema);
+                            }
                         }
                     }
                     let cast_froms = ext
@@ -2825,6 +2830,7 @@ impl DeclarationIndex {
                         origin: scope.clone(),
                         exported,
                         target: ext.ty.clone(),
+                        target_constraint: ext.target_constraint,
                         generics,
                         methods,
                         cast_froms,
@@ -4018,29 +4024,78 @@ impl DeclarationIndex {
         target: &Type,
         visible: impl Fn(&ExtendSchema) -> bool,
     ) -> Option<CastConversionMatch> {
-        let mut selected = None;
+        struct CastCandidate<'a> {
+            extend: &'a ExtendSchema,
+            index: usize,
+            args: GenericArgs,
+            target: Type,
+        }
+
+        let mut candidates = vec![];
         for extend in self.extends.iter().filter(|extend| visible(extend)) {
-            let target_template = generic_template_type(&extend.target, &extend.generics);
-            for cast in &extend.cast_froms {
+            let pattern = ExtendTargetPattern::from(extend);
+            let Some(target_match) = match_exact_target(self, &pattern, target, false) else {
+                continue;
+            };
+            for (index, cast) in extend.cast_froms.iter().enumerate() {
                 let source_template = generic_template_type(&cast.param.ty, &extend.generics);
-                if match_cast_conversion(
+                let Some(args) = Self::cast_source_args(
                     &extend.generics,
                     &source_template,
                     source,
-                    &target_template,
+                    &target_match.owner_args,
+                    &target_match.templated_target,
                     target,
-                )
-                .is_none()
-                {
+                ) else {
                     continue;
-                }
-                if selected.is_some() {
-                    return Some(CastConversionMatch::Ambiguous);
-                }
-                selected = Some((cast.param.escape, extend.origin.clone()));
+                };
+                candidates.push(CastCandidate {
+                    extend,
+                    index,
+                    args,
+                    target: target_match.templated_target.clone(),
+                });
             }
         }
-        selected.map(|(escape, origin)| CastConversionMatch::Match { escape, origin })
+
+        let target_matches = candidates
+            .iter()
+            .map(|candidate| MatchedTargetPattern {
+                pattern: ExtendTargetPattern::from(candidate.extend),
+                target: &candidate.target,
+            })
+            .collect::<Vec<_>>();
+        let Some(winner) = most_specific_target_match(&target_matches) else {
+            return (!candidates.is_empty()).then_some(CastConversionMatch::Ambiguous);
+        };
+        let winner = &candidates[winner];
+        let cast = &winner.extend.cast_froms[winner.index];
+        Some(CastConversionMatch::Match(CastFromConversion {
+            escape: cast.param.escape,
+            origin: winner.extend.origin.clone(),
+            instance: CastFromInstanceKey {
+                extend: winner.extend.id.clone(),
+                index: winner.index,
+                args: winner.args.clone(),
+            },
+        }))
+    }
+
+    fn cast_source_args(
+        generics: &GenericParams,
+        source_template: &Type,
+        source: &Type,
+        target_args: &Result<GenericArgs, Vec<Ident>>,
+        target_template: &Type,
+        target: &Type,
+    ) -> Option<GenericArgs> {
+        if let Ok(args) = target_args {
+            let (types, consts) = generics.substitutions(args);
+            let source_template = substitute(source_template, &types, &consts);
+            return (source_template == *source).then(|| args.clone());
+        }
+
+        match_cast_conversion(generics, source_template, source, target_template, target)?.ok()
     }
 
     fn module_surface_contains(&self, module: &ModuleScope, origin: &ModuleScope) -> bool {

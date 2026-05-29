@@ -624,19 +624,6 @@ impl Printer<'_> {
         self.writeln();
     }
 
-    fn format_extend_type(&mut self, ty: &ast::Type) {
-        if let ast::Type::Nominal(nominal) = ty
-            && matches!(nominal.kind, ast::NominalKind::DataRef)
-            && nominal.type_args.is_empty()
-            && nominal.const_args.is_empty()
-        {
-            self.write("dataref ");
-            self.write_fmt(nominal.name);
-            return;
-        }
-        self.format_type(ty);
-    }
-
     pub(super) fn format_extend(&mut self, decl: &ast::ExtendDecl) {
         self.populate_type_param_names(&decl.type_params, &decl.const_params);
         self.write_indent();
@@ -646,7 +633,18 @@ impl Printer<'_> {
             self.format_type_params(&decl.type_params, &decl.const_params);
         }
         self.write(" ");
-        self.format_extend_type(&decl.ty);
+        if let Some(constraint) = decl.target_constraint {
+            self.write(constraint.keyword());
+            self.write(" ");
+        }
+        self.format_type(&decl.ty);
+        if let Some(backing) = decl
+            .target_constraint
+            .and_then(ast::ExtendTargetConstraint::backing)
+        {
+            self.write(": ");
+            self.write(backing.keyword());
+        }
 
         self.write(" {");
         self.writeln();

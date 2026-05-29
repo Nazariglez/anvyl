@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ambiguous cast
+
+import a;
+import b;
+
+struct Wrapper {
+    n: int,
+}
+
+fn main() {
+    let w: Wrapper = [Wrapper { n: 1 }] as Wrapper;
+}

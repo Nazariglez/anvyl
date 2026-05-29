@@ -1,0 +1,10 @@
+// @helper
+
+pub enum State {
+    Idle,
+}
+
+pub extend<E> enum E {
+    fn kind_tag(self) -> string { "enum" }
+    fn kind_static_tag() -> string { "enum" }
+}

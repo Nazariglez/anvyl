@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box<T> {
+    item: T,
+}
+
+extend<S> struct S {
+    fn same(self, other: S) -> bool { true }
+    fn tag() -> string { "struct" }
+}
+
+fn main() {
+    let a = Box<int> { item: 1 };
+    let b = Box<int> { item: 2 };
+    let ok: bool = a.same(b);
+    let label: string = <Box<int>>.tag();
+}

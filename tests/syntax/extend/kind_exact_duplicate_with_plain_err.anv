@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: duplicate extend static method 'tag'
+
+enum State { Idle }
+
+extend State {
+    fn tag() -> int { 1 }
+}
+
+extend enum State {
+    fn tag() -> int { 2 }
+}

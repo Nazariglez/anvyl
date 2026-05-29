@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mismatched types
+
+struct Wrapper {
+    n: int,
+}
+
+extend<S> struct S {
+    cast from(xs: [S; 1]) -> S { 1 }
+}
+
+fn main() {
+    let w: Wrapper = [Wrapper { n: 1 }] as Wrapper;
+}

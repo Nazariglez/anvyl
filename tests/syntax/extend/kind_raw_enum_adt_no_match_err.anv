@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variant 'raw_only'
+
+enum State {
+    Idle,
+}
+
+extend<E> enum E: int {
+    fn raw_only() -> bool { true }
+}
+
+fn main() {
+    let ok: bool = <State>.raw_only();
+}

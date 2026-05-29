@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: cannot extend type 'Player'
+
+struct Player { hp: int }
+
+extend enum Player {
+    fn tag() -> int { 1 }
+}

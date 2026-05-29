@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+dataref Node<T> {
+    value: T,
+}
+
+extend<T> dataref Node<T> {
+    fn get(self) -> T { self.value }
+}
+
+fn main() {
+    let n = Node<int> { value: 1 };
+    let x: int = n.get();
+}

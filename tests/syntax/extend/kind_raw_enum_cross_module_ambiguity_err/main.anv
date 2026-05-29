@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ambiguous method 'tag'
+
+import a;
+import b;
+
+enum Code: int {
+    Ok = 0,
+}
+
+fn main() {
+    let x: int = Code.tag();
+}

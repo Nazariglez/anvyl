@@ -1006,6 +1006,9 @@ pub(super) fn diagnose_type_error(
         TypeError::InvalidCast { from, to, .. } => {
             format!("Invalid cast: cannot cast from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
         }
+        TypeError::AmbiguousCast { from, to, .. } => {
+            format!("ambiguous cast from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
+        }
         TypeError::RawEnumWrongRawCast { enum_ty, expected, found, .. } => {
             format!("raw enum '{}' casts only to '{}', not '{}'", render_surface_type(enum_ty, type_ctx), render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx))
         }
@@ -1354,6 +1357,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::RawEnumExpectedStringValue { span, .. }
         | TypeError::InvalidConstCast { span, .. }
         | TypeError::InvalidCast { span, .. }
+        | TypeError::AmbiguousCast { span, .. }
         | TypeError::RawEnumWrongRawCast { span, .. }
         | TypeError::NonRawEnumRawCast { span, .. }
         | TypeError::ConstDivisionByZero { span, .. }

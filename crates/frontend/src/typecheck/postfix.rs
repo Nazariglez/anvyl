@@ -1869,9 +1869,11 @@ fn finish_cast_accept_arg(
         SourceAcceptance::Dyn { plan } => {
             super::convert::apply_expected_dyn_plan(tc, arg.span, Some(arg.node.id), plan);
         }
-        SourceAcceptance::CastFrom { escape, origin } => {
-            tc.mark_activation_imports_used(&origin);
-            tc.check_argument_escape(arg, escape);
+        SourceAcceptance::CastFrom(conversion) => {
+            let target = tc.handle_type(&param.ty);
+            super::body::check_cast_from_conversion_body(&conversion, &checked.ty, &target, tc);
+            tc.mark_activation_imports_used(&conversion.origin);
+            tc.check_argument_escape(arg, conversion.escape);
         }
         SourceAcceptance::ExplicitCast { .. } => unreachable!(),
     }
@@ -1888,6 +1890,18 @@ fn finish_unaccepted_cast_arg(
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
     tc.reject_extern_any_escape(&checked, arg.span);
+    let target = tc.handle_type(&param.ty);
+    if tc.cast_from_ambiguous(&checked.ty, &target) {
+        tc.push_error(TypeError::AmbiguousCast {
+            from: checked.ty,
+            to: target,
+            span: tc.error_span(arg.span),
+        });
+        return SourceArgCheck {
+            failed: true,
+            mutable_arg: None,
+        };
+    }
     tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
     SourceArgCheck {
         failed: tc.solve_constraints(),

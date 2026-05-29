@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'tag' for type 'int'
+
+extend<E> enum E {
+    fn tag(self) -> string { "enum" }
+}
+
+fn main() {
+    let n = 1;
+    let s: string = n.tag();
+}

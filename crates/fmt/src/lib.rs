@@ -731,9 +731,29 @@ mod tests {
 
     #[test]
     fn extend_dataref() {
-        let source = "dataref Node { value: int }\nextend dataref Node { fn get(self) -> int { self.value } }";
+        let source =
+            "dataref Node { value: int }\nextend Node { fn get(self) -> int { self.value } }";
         let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("extend dataref Node {"));
+        assert!(formatted.contains("extend Node {"));
+    }
+
+    #[test]
+    fn extend_target_constraints() {
+        let member = "fn tag() -> string { \"target\" }";
+        for head in [
+            "extend<E> enum E",
+            "extend<E> enum E: int",
+            "extend enum State",
+            "extend enum Code: int",
+            "extend<T> struct Box<T>",
+            "extend<T> enum Result<T>",
+            "extend<T> dataref Node<T>",
+        ] {
+            assert_fmt(
+                &format!("{head} {{ {member} }}"),
+                &format!("{head} {{\n    {member}\n}}\n"),
+            );
+        }
     }
 
     #[test]

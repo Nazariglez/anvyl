@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+dataref Node { value: int }
+dataref OtherNode { value: int }
+
+extend dataref Node {
+    fn get(self) -> int { self.value }
+}
+
+fn main() {
+    let node = Node { value: 1 };
+    let x: int = node.get();
+    let other = OtherNode { value: 2 };
+    let y: int = other.value;
+}

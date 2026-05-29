@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State { Idle }
+enum Other { One }
+
+extend enum State {
+    fn tag(self) -> int { 1 }
+}
+
+fn main() {
+    let s: State = State.Idle;
+    let x: int = s.tag();
+    let o: Other = Other.One;
+    let y: Other = o;
+}

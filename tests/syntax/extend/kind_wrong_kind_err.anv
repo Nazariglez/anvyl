@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'tag' for type 'Player'
+
+struct Player {
+    hp: int,
+}
+
+extend<E> enum E {
+    fn tag() -> string { "enum" }
+}
+
+fn main() {
+    let s: string = Player.tag();
+}

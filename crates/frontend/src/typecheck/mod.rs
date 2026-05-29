@@ -76,6 +76,7 @@ mod defaults;
 mod downcast;
 mod dyn_infer;
 mod enum_variant;
+mod extend_target;
 mod extern_boundary;
 mod extern_ops;
 mod field_check;
@@ -717,6 +718,11 @@ pub(crate) enum TypeError {
         span: Option<SourceSpan>,
     },
     InvalidCast {
+        from: Type,
+        to: Type,
+        span: Option<SourceSpan>,
+    },
+    AmbiguousCast {
         from: Type,
         to: Type,
         span: Option<SourceSpan>,
@@ -3332,9 +3338,9 @@ fn typechecker_for_modules(
             source,
             program: Rc::clone(&program),
         });
+        tc.module_programs
+            .insert(scope.clone(), Rc::clone(&program));
         if scope != root_scope {
-            tc.module_programs
-                .insert(scope.clone(), Rc::clone(&program));
             module_bodies.push((scope.clone(), Rc::clone(&program)));
         }
         tc.with_current_module(&scope, |tc| {

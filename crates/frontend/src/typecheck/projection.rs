@@ -1,13 +1,13 @@
 use super::{
-    CheckedType, ExpectedProjectionFact, ModuleScope, ProjectionPath, TypeChecker, TypeError,
-    checked_from_type, checked_type, convert,
+    CastFromConversion, CheckedType, ExpectedProjectionFact, ProjectionPath, TypeChecker,
+    TypeError, checked_from_type, checked_type, convert,
     convert::{ExpectedDynPlan, ExplicitCast},
     infer::TypeHandle,
     place,
     type_ops::type_depends_on_generics,
 };
 use crate::{
-    ast::{EscapeMode, ExprNode, Ident, Type},
+    ast::{ExprNode, Ident, Type},
     span::Span,
 };
 
@@ -33,16 +33,9 @@ impl ExpectedReturnConstraint {
 #[derive(Clone)]
 pub(super) enum SourceAcceptance {
     Assignable,
-    Dyn {
-        plan: ExpectedDynPlan,
-    },
-    CastFrom {
-        escape: EscapeMode,
-        origin: ModuleScope,
-    },
-    ExplicitCast {
-        conversion: ExplicitCast,
-    },
+    Dyn { plan: ExpectedDynPlan },
+    CastFrom(CastFromConversion),
+    ExplicitCast { conversion: ExplicitCast },
 }
 
 pub(super) enum ExpectedFit {
@@ -402,7 +395,7 @@ fn cast_from_acceptance_without_effects(
     target: &Type,
 ) -> Option<SourceAcceptance> {
     tc.probe_compatibility_without_effects(|tc| tc.cast_from_conversion(source, target))
-        .map(|(escape, origin)| SourceAcceptance::CastFrom { escape, origin })
+        .map(SourceAcceptance::CastFrom)
 }
 
 fn dyn_assignable_plan_without_effects(

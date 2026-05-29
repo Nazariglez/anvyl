@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State: int {
+    Idle = 0,
+    Run = 1,
+}
+
+extend<E> enum E {
+    fn tag() -> string { "enum" }
+}
+
+fn main() {
+    let label: string = State.tag();
+}

@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Code: int {
+    Ok = 0,
+}
+
+extend<E> enum E {
+    cast from(n: int) -> E { 1 }
+}
+
+extend<E> enum E: int {
+    cast from(n: int) -> E { Code.Ok }
+}
+
+fn main() {
+    let code: Code = 1 as Code;
+}

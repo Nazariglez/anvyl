@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import a;
+import b;
+
+fn main() {
+    let s: a.State = a.State.Idle;
+    let label: string = a.tag(s);
+}

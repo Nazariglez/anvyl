@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Player { hp: int }
+struct Enemy { hp: int }
+
+extend struct Player {
+    fn hp_value(self) -> int { self.hp }
+}
+
+fn main() {
+    let p = Player { hp: 3 };
+    let hp: int = p.hp_value();
+    let e = Enemy { hp: 4 };
+    let same: int = e.hp;
+}

@@ -1,0 +1,7 @@
+// @helper
+
+import types;
+
+pub extend<T> struct types.Box<T> {
+    fn get(self) -> T { self.item }
+}

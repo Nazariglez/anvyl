@@ -1,10 +1,13 @@
 use super::{
     CallableRef, DeclarationIndex, Exposure, ExtendMethodMatch, ExtendMethodSchema, ExtendSchema,
     GenericArgs, GenericParams, MethodKey, MethodMode, MethodSurface, ModuleScope, PromotedAlias,
-    Specificity, SurfaceSlot, TypeChecker,
+    SurfaceSlot, TypeChecker,
     annotation::AccessPolicy,
-    compare_specificity,
     decls::nominal_type,
+    extend_target::{
+        ExtendTargetPattern, MatchedTargetPattern, match_exact_target, most_specific_target_match,
+        permits_receiver_conversion,
+    },
     generic_template_type, match_generic_template_args,
     place::{self, PlaceAccess},
 };
@@ -179,7 +182,7 @@ impl DeclarationIndex {
         let candidates = self
             .extends()
             .filter(|ext| visible(ext))
-            .filter_map(|ext| extend_candidate(ext, method_key, subject))
+            .filter_map(|ext| extend_candidate(self, ext, method_key, subject))
             .collect::<Vec<_>>();
 
         select_extend_candidate(candidates)
@@ -202,43 +205,46 @@ struct ExtendCandidate<'a> {
 }
 
 fn extend_candidate<'a>(
+    decls: &DeclarationIndex,
     ext: &'a ExtendSchema,
     method_key: MethodKey,
     subject: &Type,
 ) -> Option<ExtendCandidate<'a>> {
     let method = ext.methods.get(&method_key)?;
+    let pattern = ExtendTargetPattern::from(ext);
+    let static_nominal_family = method_key.surface == MethodSurface::Static;
+    if let Some(target_match) = match_exact_target(decls, &pattern, subject, static_nominal_family)
+    {
+        return Some(ExtendCandidate {
+            extend: ext,
+            method,
+            target: target_match.templated_target,
+            receiver_ty: target_match.receiver_ty,
+            owner_args: target_match.owner_args,
+            receiver_match: ExtendReceiverMatch::Exact,
+        });
+    }
+
+    if !permits_receiver_conversion(&pattern) || method_key.surface != MethodSurface::Instance {
+        return None;
+    }
     let target = generic_template_type(&ext.target, &ext.generics);
-    let (receiver_ty, owner_args, receiver_match) =
-        extend_receiver_match(&ext.generics, &target, subject, method_key.surface)?;
+    let (receiver_ty, owner_args) = slice_view_receiver_match(&ext.generics, &target, subject)?;
     Some(ExtendCandidate {
         extend: ext,
         method,
         target,
         receiver_ty,
         owner_args,
-        receiver_match,
+        receiver_match: ExtendReceiverMatch::SliceView,
     })
 }
 
-fn extend_receiver_match(
+fn slice_view_receiver_match(
     generics: &GenericParams,
     target: &Type,
     subject: &Type,
-    surface: MethodSurface,
-) -> Option<(Type, Result<GenericArgs, Vec<Ident>>, ExtendReceiverMatch)> {
-    if surface == MethodSurface::Static && static_nominal_family_match(target, subject) {
-        return Some((
-            subject.clone(),
-            Ok(GenericArgs::default()),
-            ExtendReceiverMatch::Exact,
-        ));
-    }
-
-    match match_generic_template_args(generics, target, subject) {
-        Some(owner_args) => return Some((subject.clone(), owner_args, ExtendReceiverMatch::Exact)),
-        None if surface != MethodSurface::Instance => return None,
-        None => {}
-    }
+) -> Option<(Type, Result<GenericArgs, Vec<Ident>>)> {
     let Type::Slice { elem: target_elem } = target else {
         return None;
     };
@@ -253,18 +259,7 @@ fn extend_receiver_match(
         elem: subject_elem.clone(),
     };
     let owner_args = match_generic_template_args(generics, target_elem, subject_elem)?;
-    Some((receiver_ty, owner_args, ExtendReceiverMatch::SliceView))
-}
-
-fn static_nominal_family_match(target: &Type, subject: &Type) -> bool {
-    let (Type::Nominal(target), Type::Nominal(subject)) = (target, subject) else {
-        return false;
-    };
-    target.kind == subject.kind
-        && target.name == subject.name
-        && target.origin == subject.origin
-        && subject.type_args.is_empty()
-        && subject.const_args.is_empty()
+    Some((receiver_ty, owner_args))
 }
 
 fn select_extend_candidate(
@@ -293,24 +288,16 @@ fn select_extend_candidate(
 }
 
 fn most_specific_extend(mut candidates: Vec<ExtendCandidate<'_>>) -> ExtendMethodMatch<'_> {
-    let winner = (1..candidates.len()).fold(0, |best, i| {
-        if compare_specificity(&candidates[i].target, &candidates[best].target)
-            == Specificity::MoreSpecific
-        {
-            i
-        } else {
-            best
-        }
-    });
-
-    let winner_target = &candidates[winner].target;
-    let dominates_all = candidates.iter().enumerate().all(|(i, candidate)| {
-        i == winner
-            || compare_specificity(winner_target, &candidate.target) == Specificity::MoreSpecific
-    });
-    if !dominates_all {
+    let target_matches = candidates
+        .iter()
+        .map(|candidate| MatchedTargetPattern {
+            pattern: ExtendTargetPattern::from(candidate.extend),
+            target: &candidate.target,
+        })
+        .collect::<Vec<_>>();
+    let Some(winner) = most_specific_target_match(&target_matches) else {
         return ExtendMethodMatch::Ambiguous;
-    }
+    };
 
     let candidate = candidates.swap_remove(winner);
     ExtendMethodMatch::Match {

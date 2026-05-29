@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import types;
+import exts;
+
+fn main() {
+    let b = types.Box<int> { item: 1 };
+    let x: int = b.get();
+}

@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Code: int {
+    Ok = 0,
+}
+
+enum Name: string {
+    Bob = "bob",
+}
+
+extend<E> enum E: int {
+    fn backing() -> string { "int" }
+}
+
+extend<E> enum E: string {
+    fn backing() -> string { "string" }
+}
+
+fn main() {
+    let a: string = Code.backing();
+    let b: string = Name.backing();
+}

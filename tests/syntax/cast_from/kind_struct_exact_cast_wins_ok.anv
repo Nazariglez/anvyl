@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Wrapper {
+    n: int,
+}
+
+extend<S> struct S {
+    cast from(xs: [S; 1]) -> S { 1 }
+}
+
+extend Wrapper {
+    cast from(xs: [Wrapper; 1]) -> Wrapper { xs[0] }
+}
+
+fn main() {
+    let w: Wrapper = [Wrapper { n: 1 }] as Wrapper;
+}

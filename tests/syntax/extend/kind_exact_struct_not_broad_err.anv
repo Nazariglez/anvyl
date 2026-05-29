@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown method 'hp_value' for type 'Enemy'
+
+struct Player { hp: int }
+struct Enemy { hp: int }
+
+extend struct Player {
+    fn hp_value(self) -> int { self.hp }
+}
+
+fn main() {
+    let e = Enemy { hp: 4 };
+    e.hp_value();
+}

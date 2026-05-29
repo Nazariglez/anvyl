@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Player {
+    hp: int,
+}
+
+extend<S> struct S {
+    fn tag(self) -> string { "struct" }
+}
+
+fn main() {
+    let p = Player { hp: 10 };
+    let s: string = p.tag();
+}

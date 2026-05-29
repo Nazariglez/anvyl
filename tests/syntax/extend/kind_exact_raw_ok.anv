@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum Code: int { Ok = 0 }
+enum Name: string { Bob = "bob" }
+
+extend enum Code: int {
+    fn tag(self) -> int { 1 }
+}
+
+fn main() {
+    let c: Code = Code.Ok;
+    let x: int = c.tag();
+    let n: Name = Name.Bob;
+    let y: Name = n;
+}

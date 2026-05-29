@@ -1593,24 +1593,41 @@ pub(super) fn extend_declaration<'src>(
         CastFrom(Box<ast::CastFromNode>),
     }
 
-    let extend_head = choice((
-        // extend<T, ...> type_expr, explicit type params followed by any type expression
-        required_generic_params()
-            .then(extend_type_ident())
-            .map(|(gp, ty)| (ty, gp)),
-        // dataref keyword followed by identifier targets that dataref type
-        select! { Token::Keyword(Keyword::DataRef) => () }
-            .ignore_then(identifier())
-            .then(generic_params())
-            .map(|(name, gp)| {
-                (
-                    ast::Type::nominal(ast::NominalKind::DataRef, name, vec![], vec![], None),
-                    gp,
-                )
-            }),
-        // target type expression without extend params
-        extend_type_ident().map(|ty| (ty, GenericParams::default())),
+    struct ExtendHead {
+        ty: ast::Type,
+        generics: GenericParams,
+        target_constraint: Option<ast::ExtendTargetConstraint>,
+    }
+
+    let raw_enum_backing = select! { Token::Colon => () }.ignore_then(select! {
+        Token::Keyword(Keyword::Int) => ast::RawEnumBackingConstraint::Int,
+        Token::Keyword(Keyword::String) => ast::RawEnumBackingConstraint::String,
+    });
+
+    let enum_target = select! { Token::Keyword(Keyword::Enum) => () }
+        .ignore_then(extend_type_ident())
+        .then(raw_enum_backing.or_not())
+        .map(|(ty, backing)| (ty, Some(ast::ExtendTargetConstraint::Enum { backing })));
+    let struct_target = select! { Token::Keyword(Keyword::Struct) => () }
+        .ignore_then(extend_type_ident())
+        .map(|ty| (ty, Some(ast::ExtendTargetConstraint::Struct)));
+    let dataref_target = select! { Token::Keyword(Keyword::DataRef) => () }
+        .ignore_then(extend_type_ident())
+        .map(|ty| (ty, Some(ast::ExtendTargetConstraint::DataRef)));
+    let target = choice((
+        enum_target,
+        struct_target,
+        dataref_target,
+        extend_type_ident().map(|ty| (ty, None)),
     ));
+
+    let extend_head = generic_params()
+        .then(target)
+        .map(|(generics, (ty, target_constraint))| ExtendHead {
+            ty,
+            generics,
+            target_constraint,
+        });
 
     visibility()
         .then_ignore(select! {
@@ -1629,12 +1646,12 @@ pub(super) fn extend_declaration<'src>(
                 )
                 .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
         )
-        .map_with(|((vis, (ty, gp)), members), e| {
+        .map_with(|((vis, head), members), e| {
             let s = e.span();
             let GenericParams {
                 type_params,
                 const_params,
-            } = gp;
+            } = head.generics;
             let mut methods = vec![];
             let mut cast_froms = vec![];
             for m in members {
@@ -1646,7 +1663,8 @@ pub(super) fn extend_declaration<'src>(
             Spanned::new(
                 ast::ExtendDecl {
                     visibility: vis,
-                    ty,
+                    ty: head.ty,
+                    target_constraint: head.target_constraint,
                     type_params,
                     const_params,
                     methods,

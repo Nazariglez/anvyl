@@ -1,0 +1,5 @@
+// @helper
+
+pub extend<E> enum E {
+    fn tag(self) -> string { "b" }
+}

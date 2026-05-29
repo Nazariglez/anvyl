@@ -1,7 +1,6 @@
 use super::{
-    CastConversionMatch, CheckedType, DynContainerConversionKind, EnumRepr, EscapeMode,
-    ModuleScope, TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint,
-    checked_from_type,
+    CastConversionMatch, CastFromConversion, CheckedType, DynContainerConversionKind, EnumRepr,
+    TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint, checked_from_type,
     contracts::{self, ContractMatchError, RequirementError},
     projection::{
         ExpectedFit, ExpectedProjectionMode, SourceAcceptance, apply_value_projection,
@@ -19,10 +18,7 @@ pub(super) enum ExplicitCast {
     Identity,
     Builtin,
     RawEnum,
-    CastFrom {
-        escape: EscapeMode,
-        origin: ModuleScope,
-    },
+    CastFrom(CastFromConversion),
 }
 
 impl TypeChecker {
@@ -61,7 +57,7 @@ impl TypeChecker {
             None => {}
         }
         self.cast_from_conversion(source, target)
-            .map(|(escape, origin)| ExplicitCast::CastFrom { escape, origin })
+            .map(ExplicitCast::CastFrom)
     }
 
     pub(super) fn explicit_cast_plan_without_effects(
@@ -76,14 +72,22 @@ impl TypeChecker {
         &mut self,
         source: &Type,
         target: &Type,
-    ) -> Option<(EscapeMode, ModuleScope)> {
+    ) -> Option<CastFromConversion> {
         match self
             .decls
             .find_cast_conversion(source, target, |ext| self.extend_visible(ext))
         {
-            Some(CastConversionMatch::Match { escape, origin }) => Some((escape, origin)),
+            Some(CastConversionMatch::Match(conversion)) => Some(conversion),
             Some(CastConversionMatch::Ambiguous) | None => None,
         }
+    }
+
+    pub(super) fn cast_from_ambiguous(&mut self, source: &Type, target: &Type) -> bool {
+        matches!(
+            self.decls
+                .find_cast_conversion(source, target, |ext| self.extend_visible(ext)),
+            Some(CastConversionMatch::Ambiguous)
+        )
     }
 }
 
@@ -571,7 +575,7 @@ pub(super) fn check_cast_expr(
         ExpectedProjectionMode::ExplicitCast,
     ) {
         ExpectedFit::SourceAccepted(SourceAcceptance::ExplicitCast { conversion }) => {
-            apply_explicit_cast_effects(expr, cast, conversion, tc);
+            apply_explicit_cast_effects(expr, cast, conversion, &from, &target, tc);
             cast_expr_checked(expr, target, checked.contains_extern_any, tc)
         }
         ExpectedFit::Project {
@@ -580,7 +584,7 @@ pub(super) fn check_cast_expr(
         } => {
             let projected =
                 apply_value_projection(tc, &cast.node.expr, &checked, &from, projection);
-            apply_explicit_cast_effects(expr, cast, conversion, tc);
+            apply_explicit_cast_effects(expr, cast, conversion, &projected.ty, &target, tc);
             cast_expr_checked(expr, target, projected.contains_extern_any, tc)
         }
         ExpectedFit::Deferred if matches!(from, Type::Infer) || matches!(target, Type::Infer) => {
@@ -603,11 +607,19 @@ pub(super) fn check_cast_expr(
         }
         ExpectedFit::Deferred | ExpectedFit::Mismatch => {
             if !push_raw_enum_cast_error(tc, cast.span, &from, &target) {
-                tc.push_error(TypeError::InvalidCast {
-                    from,
-                    to: target,
-                    span: tc.error_span(cast.span),
-                });
+                if tc.cast_from_ambiguous(&from, &target) {
+                    tc.push_error(TypeError::AmbiguousCast {
+                        from,
+                        to: target,
+                        span: tc.error_span(cast.span),
+                    });
+                } else {
+                    tc.push_error(TypeError::InvalidCast {
+                        from,
+                        to: target,
+                        span: tc.error_span(cast.span),
+                    });
+                }
             }
             cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
         }
@@ -619,15 +631,18 @@ fn apply_explicit_cast_effects(
     expr: &ExprNode,
     cast: &CastNode,
     conversion: ExplicitCast,
+    source: &Type,
+    target: &Type,
     tc: &mut TypeChecker,
 ) {
     match conversion {
         ExplicitCast::Identity => tc
             .closure
             .copy_expr_flow(cast.node.expr.node.id, expr.node.id),
-        ExplicitCast::CastFrom { escape, origin } => {
-            tc.mark_activation_imports_used(&origin);
-            tc.check_argument_escape(&cast.node.expr, escape);
+        ExplicitCast::CastFrom(conversion) => {
+            super::body::check_cast_from_conversion_body(&conversion, source, target, tc);
+            tc.mark_activation_imports_used(&conversion.origin);
+            tc.check_argument_escape(&cast.node.expr, conversion.escape);
         }
         ExplicitCast::Builtin | ExplicitCast::RawEnum => {}
     }

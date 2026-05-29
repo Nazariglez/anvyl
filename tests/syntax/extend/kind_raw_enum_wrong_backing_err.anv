@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unknown variant 'only_int'
+
+enum Name: string {
+    Bob = "bob",
+}
+
+extend<E> enum E: int {
+    fn only_int() -> bool { true }
+}
+
+fn main() {
+    let ok: bool = Name.only_int();
+}

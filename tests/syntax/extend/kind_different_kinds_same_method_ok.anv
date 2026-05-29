@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+enum State {
+    Idle,
+}
+
+struct Player {
+    hp: int,
+}
+
+extend<E> enum E {
+    fn tag(self) -> string { "enum" }
+}
+
+extend<S> struct S {
+    fn tag(self) -> string { "struct" }
+}
+
+fn main() {
+    let s: State = State.Idle;
+    let p = Player { hp: 1 };
+    let a: string = s.tag();
+    let b: string = p.tag();
+}

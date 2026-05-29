@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import ext_kind;
+
+fn main() {
+    let s: ext_kind.State = ext_kind.State.Idle;
+    let a: string = s.tag();
+    let b: string = ext_kind.State.type_tag();
+}

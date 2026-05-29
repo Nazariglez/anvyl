@@ -1,0 +1,11 @@
+// @frontend: new
+// @mode: check
+// @expect: success
+// @lint: unused_import=error
+
+import kind_ext;
+
+fn main() {
+    let s: kind_ext.State = kind_ext.State.Idle;
+    let x = s.kind_tag();
+}
