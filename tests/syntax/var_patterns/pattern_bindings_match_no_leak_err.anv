@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unknown variable
+
+fn main() {
+    match (1, 2) {
+        (a, b) => a + b,
+    };
+    a;
+}

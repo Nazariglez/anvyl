@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable { fn update(var self); }
+struct Enemy { hp: int, fn update(var self) {} }
+struct Bullet { speed: int, fn update(var self) {} }
+
+fn main() {
+    var actor: dyn Updatable = Enemy { hp: 1 };
+    match var actor as? {
+        Enemy(_) => 1,
+        _ => 2,
+    };
+}

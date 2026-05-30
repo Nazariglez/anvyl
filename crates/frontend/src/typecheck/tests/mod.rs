@@ -7,6 +7,5 @@ mod globals;
 mod imports;
 mod lambdas;
 mod members;
-mod patterns;
 mod semantic_facts;
 mod support;

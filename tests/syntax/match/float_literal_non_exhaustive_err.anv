@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: non-exhaustive
+
+fn main(x: float) {
+    match x {
+        1.0 => 1,
+    };
+}

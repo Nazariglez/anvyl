@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable { fn draw(self); }
+contract Updatable { fn update(var self); }
+struct Actor { fn draw(self) {} fn update(var self) {} }
+
+fn take(actor: dyn Drawable + Updatable) {
+    actor.draw();
+}
+
+fn inferred(actor: dyn _) {
+    actor.draw();
+}
+
+fn main() {
+    let actor: dyn Drawable = Actor {};
+    let both: dyn Drawable + Updatable = Actor {};
+    take(both);
+    inferred(actor);
+}

@@ -1,13 +1,11 @@
-use super::support::{
-    assert_deprecated_warning, assert_typecheck_closed, check, errors, generic_body, nominal_struct,
-};
+use super::support::{assert_typecheck_closed, check, generic_body, nominal_struct};
 use crate::{
     ast::{ContractRef, Ident, Type},
     externs,
     span::Span,
     test_support::{empty_resolved, module_path, parse_program, resolved_modules},
     typecheck::{
-        DeprecatedUseKind, ModuleScope, TypeError, TypecheckConfig, contracts,
+        ModuleScope, TypecheckConfig, contracts,
         contracts::{ContractMatchError, ContractSlotTarget, RequirementError},
         typechecker_for_modules,
     },
@@ -87,17 +85,6 @@ fn inclusion_duplicate_requirement_collapses() {
 }
 
 #[test]
-fn inclusion_cycle_is_error() {
-    let errors = errors("contract A { B; } contract B { A; }");
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("contract inclusion cycle")
-    )));
-}
-
-#[test]
 fn dynamic_intersection_matches_and_canonicalizes_order() {
     let result = check(
         "contract A { fn a(self); }
@@ -116,61 +103,6 @@ fn dynamic_intersection_matches_and_canonicalizes_order() {
 }
 
 #[test]
-fn deprecated_contract_inclusion_warns() {
-    let result = check(
-        "@deprecated(\"use New\") contract Old { fn f(self); }
-        contract New { Old; }",
-    )
-    .expect("typecheck failed");
-
-    assert_deprecated_warning(&result, DeprecatedUseKind::Contract, "Old", Some("use New"));
-}
-
-#[test]
-fn static_bound_uses_declaration_module() {
-    checker_with_modules(
-        "import api { take };
-        import thing { Thing };
-        fn main() { take(Thing {}); }",
-        &[
-            ("thing", "pub struct Thing { fn a(self) {} }"),
-            (
-                "api",
-                "pub contract A { fn a(self); }
-                pub fn take<T: A>(value: T) {}",
-            ),
-        ],
-    );
-}
-
-#[test]
-fn deprecated_contract_bound_warns() {
-    let result = check(
-        "@deprecated(\"use New\") contract Old { fn f(self); }
-        fn take<T: Old>(value: T) {}",
-    )
-    .expect("typecheck failed");
-
-    assert_deprecated_warning(&result, DeprecatedUseKind::Contract, "Old", Some("use New"));
-}
-
-#[test]
-fn nominal_literal_checks_owner_bounds() {
-    let errors = errors(
-        "contract Named { fn name(self) -> string; }
-        struct Rock {}
-        struct Box<T: Named> { value: T }
-        fn main() { let box = Box<Rock> { value: Rock {} }; }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("does not satisfy contract bound 'Named'")
-    )));
-}
-
-#[test]
 fn static_bound_does_not_create_witness_for_concrete_arg() {
     let result = check(
         "contract A { fn a(self); }
@@ -182,87 +114,6 @@ fn static_bound_does_not_create_witness_for_concrete_arg() {
 
     assert!(result.contract_witnesses().is_empty());
     assert!(result.dyn_conversions().is_empty());
-}
-
-#[test]
-fn inferred_dynamic_receiver_mutability_uses_access() {
-    checker(
-        "struct Actor { fn update(var self, dt: float) {} }
-        fn use_actor(var actor: dyn _) { actor.update(1.0); }
-        fn main() { var actor = Actor {}; use_actor(actor); }",
-    );
-}
-
-#[test]
-fn inferred_dynamic_expected_context_solves_empty_surface() {
-    checker(
-        "contract Drawable { fn draw(self); }
-        struct Actor { fn draw(self) {} }
-        fn take(actor: dyn Drawable) {}
-        fn use_actor(actor: dyn _) { take(actor); }
-        fn main() { use_actor(Actor {}); }",
-    );
-}
-
-#[test]
-fn inferred_dynamic_rejects_conflicting_requirements() {
-    let errors = errors(
-        "struct Actor {
-            fn f(self, x: int) {}
-        }
-        fn use_actor(actor: dyn _) {
-            actor.f(1);
-            actor.f(\"x\");
-        }
-        fn main() { use_actor(Actor {}); }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("conflicting inferred dynamic requirement 'f'")
-    )));
-}
-
-#[test]
-fn inferred_dynamic_rejects_unknown_argument_type() {
-    let errors = errors(
-        "struct Actor { fn f(self, x: int) {} }
-        fn use_actor(actor: dyn _) { actor.f(nil); }
-        fn main() { use_actor(Actor {}); }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("cannot infer parameter type for dynamic method 'f'")
-    )));
-}
-
-#[test]
-fn inferred_dynamic_rejects_unsolved_return_type() {
-    let errors = errors(
-        "struct Actor { fn count(self) -> int { 1 } }
-        fn use_actor(actor: dyn _) { let count = actor.count(); }
-        fn main() { use_actor(Actor {}); }",
-    );
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("cannot infer return type for dynamic method 'count'")
-    )));
-}
-
-#[test]
-fn inferred_dynamic_rejects_stored_positions() {
-    let errors = errors("struct Box { actor: dyn _ }");
-
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        TypeError::CompileError { message, .. }
-            if message.contains("direct parameters of callables")
-    )));
 }
 
 #[test]
@@ -431,37 +282,6 @@ fn for_var_dynamic_call_records_fact() {
     assert_eq!(result.dyn_calls().len(), 1);
 }
 
-#[test]
-fn deprecated_contract_declaration_does_not_warn() {
-    let result = check("@deprecated contract Old { fn f(self); }").expect("typecheck failed");
-
-    assert!(result.warnings().is_empty());
-}
-
-#[test]
-fn deprecated_contract_reference_warns() {
-    let result = check(
-        "@deprecated(\"use New\") contract Old { fn f(self); }
-        fn takes_old(x: dyn Old) {}",
-    )
-    .expect("typecheck failed");
-
-    assert_deprecated_warning(&result, DeprecatedUseKind::Contract, "Old", Some("use New"));
-}
-
-#[test]
-fn deprecated_contract_reference_warns_once_for_dynamic_call() {
-    let result = check(
-        "@deprecated contract Old { fn f(self); }
-        struct Thing { fn f(self) {} }
-        fn takes_old(x: dyn Old) { x.f(); }
-        fn main() { takes_old(Thing {}); }",
-    )
-    .expect("typecheck failed");
-
-    assert_deprecated_warning(&result, DeprecatedUseKind::Contract, "Old", None);
-}
-
 fn assert_matches(source: &str, ty_name: &str, contract_name: &str) -> contracts::ContractMatch {
     let mut tc = checker(source);
     let ty = root_type(&mut tc, ty_name);
@@ -500,16 +320,6 @@ fn direct_method_matches() {
         matched.slots[0].target,
         ContractSlotTarget::Direct(_)
     ));
-}
-
-#[test]
-fn mutating_requirement_accepts_readonly_method() {
-    assert_matches(
-        "contract Drawable { fn draw(var self); }
-        struct Sprite { fn draw(self) {} }",
-        "Sprite",
-        "Drawable",
-    );
 }
 
 #[test]
@@ -565,16 +375,6 @@ fn default_parameter_does_not_reduce_arity() {
             found: 1
         }
     ));
-}
-
-#[test]
-fn concrete_defaults_do_not_change_matching_arity() {
-    assert_matches(
-        "contract Drawable { fn draw(self, layer: int); }
-        struct Sprite { fn draw(self, layer: int = 0) {} }",
-        "Sprite",
-        "Drawable",
-    );
 }
 
 #[test]

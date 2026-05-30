@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let 1 = 1;
+    let true = true;
+    let false = false;
+    let "hi" = "hi";
+}

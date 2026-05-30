@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Bag { xs: [int] }
+
+fn main() {
+    var bag = Bag { xs: [1, 2] };
+    bag.xs[0] = 3;
+}

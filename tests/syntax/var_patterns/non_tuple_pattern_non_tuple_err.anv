@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: tuple
+
+fn main() {
+    let (a, b) = 1;
+}

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: expected `Point`, found `int`
+
+struct Point { x: int }
+
+fn main() {
+    let Point { x } = 1;
+}

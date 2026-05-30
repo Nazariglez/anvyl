@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unexpected token
+
+@fn
+fn main() {}

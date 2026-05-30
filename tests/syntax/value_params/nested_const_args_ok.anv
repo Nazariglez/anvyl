@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct FixedBuf<T, N: int> { data: [T; N] }
+struct Outer<T, N: int> { value: T, data: [int; N] }
+
+fn main() {
+    let inner = FixedBuf<int, 3> { data: [1, 2, 3] };
+    let _ = Outer<FixedBuf<int, 3>, 2> { value: inner, data: [4, 5] };
+}

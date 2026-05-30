@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+import ...shared.types { Id };
+import ....too.high;
+
+fn main() {
+    let _: Id = Id {};
+    let _: int = high.value();
+}

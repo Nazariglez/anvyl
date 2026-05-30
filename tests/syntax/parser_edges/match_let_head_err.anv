@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: Unexpected token
+
+fn main() {
+    let opt: int? = 1;
+    match let opt {
+        _ => 1,
+    };
+}

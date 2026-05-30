@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn first<T, N: int>(xs: [T; N]) -> T {
+    xs[0]
+}
+
+fn main() {
+    let x = first<int, 3>([1, 2, 3]);
+    let _: int = x;
+}

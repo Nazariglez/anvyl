@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: unknown variable
+
+fn main() {
+    let opt: int? = 1;
+    if let value? = opt {
+        value;
+    } else {}
+    value;
+}
