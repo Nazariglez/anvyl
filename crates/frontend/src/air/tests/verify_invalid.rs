@@ -2175,6 +2175,102 @@ fn aggregate_ctor_field_count_mismatch() {
 }
 
 #[test]
+fn array_ctor_shape_is_verified() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let array_ty = builder.alloc_type(TypeData::Array {
+        elem: int_ty,
+        len: 2,
+    });
+    let module = test_module(&mut builder);
+
+    let errors = verify_void_entry(builder, "bad_array", module, void_ty, |fb, bb0| {
+        let p = fb.push_param("p", bool_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::Array,
+                fields: vec![op_place(p, bool_ty)],
+                ty: array_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CollectionCtorFieldCountMismatch {
+            ctor: AggregateCtor::Array,
+            expected: 2,
+            found: 1
+        })
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CollectionCtorFieldTypeMismatch { ctor: AggregateCtor::Array, field: 0, expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn list_ctor_shape_is_verified() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let module = test_module(&mut builder);
+
+    let errors = verify_void_entry(builder, "bad_list", module, void_ty, |fb, bb0| {
+        let p = fb.push_param("p", bool_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::List,
+                fields: vec![op_place(p, bool_ty)],
+                ty: list_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CollectionCtorFieldTypeMismatch { ctor: AggregateCtor::List, field: 0, expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn collection_ctor_result_type_is_verified() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+
+    let errors = verify_void_entry(
+        builder,
+        "bad_collection_result",
+        module,
+        void_ty,
+        |fb, bb0| {
+            let p = fb.push_param("p", int_ty, ParamRole::Normal);
+            fb.add_statement(
+                bb0,
+                stmt_eval(RValue::Aggregate {
+                    kind: AggregateCtor::Array,
+                    fields: vec![op_place(p, int_ty)],
+                    ty: int_ty,
+                }),
+            );
+        },
+    );
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CollectionCtorResultTypeMismatch { ctor: AggregateCtor::Array, found })
+            if found == int_ty
+    )));
+}
+
+#[test]
 fn aggregate_ctor_result_and_kind_mismatch() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);

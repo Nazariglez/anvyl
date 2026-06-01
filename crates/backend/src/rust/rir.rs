@@ -6,6 +6,8 @@ use anvyx_frontend::{
 };
 use anvyx_runtime::{ExternTypeExpr, ExternTypeKey, RustExternAbi, RustParamAbi, RustReturnAbi};
 
+use super::rep_policy::RustRepPolicy;
+
 macro_rules! rir_id {
     ($name:ident) => {
         #[repr(transparent)]
@@ -29,6 +31,7 @@ rir_id!(RirExternId);
 rir_id!(RirTypeId);
 rir_id!(RirConstId);
 rir_id!(RirLocalId);
+rir_id!(RirLoopId);
 rir_id!(RirStructId);
 rir_id!(RirEnumId);
 rir_id!(RirVariantId);
@@ -197,7 +200,6 @@ pub enum RirParamAbi {
     Value,
     SharedBorrow,
     MutBorrow,
-    PlaceHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +222,7 @@ pub enum RirStmt {
     Assign { dst: RirPlace, value: RirRValue },
     Eval(RirRValue),
     If(RirIf),
+    Loop(RirLoop),
     EnumMatch(RirEnumMatch),
 }
 
@@ -234,6 +237,12 @@ pub struct RirIf {
     pub cond: RirOperand,
     pub then_block: RirStructuredBlock,
     pub else_block: Option<RirStructuredBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RirLoop {
+    pub id: RirLoopId,
+    pub body: RirStructuredBlock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -263,6 +272,10 @@ pub enum RirRValue {
     List {
         ty: RirTypeId,
         elems: Vec<RirOperand>,
+    },
+    Map {
+        ty: RirTypeId,
+        entries: Vec<(RirOperand, RirOperand)>,
     },
     EnumVariant {
         ty: RirTypeId,
@@ -320,6 +333,21 @@ pub enum RirRValue {
         start: RirLocalId,
         end: RirLocalId,
         inclusive: bool,
+        ty: RirTypeId,
+    },
+    MapGet {
+        map: RirPlace,
+        key: RirOperand,
+        ty: RirTypeId,
+    },
+    MapInsert {
+        map: RirPlace,
+        key: RirOperand,
+        value: RirOperand,
+    },
+    MapRemove {
+        map: RirPlace,
+        key: RirOperand,
         ty: RirTypeId,
     },
 }
@@ -408,6 +436,8 @@ pub enum RirTerm {
     #[default]
     None,
     Return(Option<RirOperand>),
+    Break(RirLoopId),
+    Continue(RirLoopId),
     Unreachable,
 }
 
@@ -422,6 +452,8 @@ pub enum RirType {
     Enum(RirEnumId),
     Array { elem: RirTypeId, len: u64 },
     List(RirTypeId),
+    Map { key: RirTypeId, value: RirTypeId },
+    Option(RirTypeId),
     Slice(RirTypeId),
 }
 
@@ -484,6 +516,7 @@ pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVer
         errors: vec![],
         initialized: vec![],
         possibly_initialized: vec![],
+        loops: vec![],
     };
     cx.check();
     if cx.errors.is_empty() {
@@ -552,6 +585,8 @@ pub enum RirVerifyErrorKind {
     CallArgMode,
     DuplicateMatchArm,
     MatchNotExhaustive,
+    BreakOutsideLoop(RirLoopId),
+    ContinueOutsideLoop(RirLoopId),
 }
 
 impl fmt::Display for RirVerifyError {
@@ -567,6 +602,7 @@ struct VerifyCx<'a> {
     errors: Vec<RirVerifyError>,
     initialized: Vec<bool>,
     possibly_initialized: Vec<bool>,
+    loops: Vec<RirLoopId>,
 }
 
 fn native_extern_signature_ok(
@@ -690,6 +726,11 @@ impl VerifyCx<'_> {
                 RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => {
                     self.check_type_id(site, *elem);
                 }
+                RirType::Map { key, value } => {
+                    self.check_type_id(site, *key);
+                    self.check_type_id(site, *value);
+                }
+                RirType::Option(inner) => self.check_type_id(site, *inner),
                 _ => {}
             }
         }
@@ -1160,6 +1201,17 @@ impl VerifyCx<'_> {
                 );
                 self.merge_structured_states([then_state, else_state]);
             }
+            RirStmt::Loop(loop_) => {
+                self.loops.push(loop_.id);
+                self.check_structured_block(
+                    function_id,
+                    function,
+                    &loop_.body,
+                    self.initialized.clone(),
+                    self.possibly_initialized.clone(),
+                );
+                self.loops.pop();
+            }
             RirStmt::EnumMatch(match_) => {
                 self.check_place(site, function, &match_.discr);
                 let enum_id = match self.ty(match_.discr.ty) {
@@ -1258,6 +1310,7 @@ impl VerifyCx<'_> {
                     None => arm_falls || !self.enum_match_is_exhaustive(match_),
                 }
             }
+            RirStmt::Loop(_) => true,
             RirStmt::Init { .. } | RirStmt::Assign { .. } | RirStmt::Eval(_) => true,
         }
     }
@@ -1334,16 +1387,7 @@ impl VerifyCx<'_> {
                     );
                 }
                 for (field, operand) in strukt.fields.iter().zip(fields) {
-                    let found = self.value_operand_ty(site, function, operand);
-                    if found != Some(field.ty) {
-                        self.push(
-                            site,
-                            RirVerifyErrorKind::TypeMismatch {
-                                expected: field.ty,
-                                found: found.unwrap_or(field.ty),
-                            },
-                        );
-                    }
+                    self.check_value_operand_ty(site, function, operand, field.ty);
                 }
                 Some(*ty)
             }
@@ -1363,16 +1407,7 @@ impl VerifyCx<'_> {
                     );
                 }
                 for elem_value in elems {
-                    let found = self.value_operand_ty(site, function, elem_value);
-                    if found != Some(elem) {
-                        self.push(
-                            site,
-                            RirVerifyErrorKind::TypeMismatch {
-                                expected: elem,
-                                found: found.unwrap_or(elem),
-                            },
-                        );
-                    }
+                    self.check_value_operand_ty(site, function, elem_value, elem);
                 }
                 Some(*ty)
             }
@@ -1383,16 +1418,19 @@ impl VerifyCx<'_> {
                     return;
                 };
                 for elem_value in elems {
-                    let found = self.value_operand_ty(site, function, elem_value);
-                    if found != Some(elem) {
-                        self.push(
-                            site,
-                            RirVerifyErrorKind::TypeMismatch {
-                                expected: elem,
-                                found: found.unwrap_or(elem),
-                            },
-                        );
-                    }
+                    self.check_value_operand_ty(site, function, elem_value, elem);
+                }
+                Some(*ty)
+            }
+            RirRValue::Map { ty, entries } => {
+                self.check_type_id(site, *ty);
+                let Some(RirType::Map { key, value }) = self.ty(*ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                for (entry_key, entry_value) in entries {
+                    self.check_value_operand_ty(site, function, entry_key, key);
+                    self.check_value_operand_ty(site, function, entry_value, value);
                 }
                 Some(*ty)
             }
@@ -1424,16 +1462,7 @@ impl VerifyCx<'_> {
                     );
                 }
                 for (field, operand) in variant.fields.iter().zip(fields) {
-                    let found = self.value_operand_ty(site, function, operand);
-                    if found != Some(field.ty) {
-                        self.push(
-                            site,
-                            RirVerifyErrorKind::TypeMismatch {
-                                expected: field.ty,
-                                found: found.unwrap_or(field.ty),
-                            },
-                        );
-                    }
+                    self.check_value_operand_ty(site, function, operand, field.ty);
                 }
                 Some(*ty)
             }
@@ -1524,16 +1553,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                let found = self.value_operand_ty(site, function, value);
-                if found != Some(elem) {
-                    self.push(
-                        site,
-                        RirVerifyErrorKind::TypeMismatch {
-                            expected: elem,
-                            found: found.unwrap_or(elem),
-                        },
-                    );
-                }
+                self.check_value_operand_ty(site, function, value, elem);
                 self.type_id(RirType::Void)
             }
             RirRValue::SliceView {
@@ -1574,13 +1594,65 @@ impl VerifyCx<'_> {
                 };
                 match self.ty(source.ty) {
                     Some(RirType::List(source_elem)) if source_elem == elem => {
-                        if !self.copyable_type(elem) {
+                        if !RustRepPolicy::new(self.program).shareable_value(elem) {
                             self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                         }
                     }
                     _ => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
                 }
                 Some(*ty)
+            }
+            RirRValue::MapGet { map, key, ty } | RirRValue::MapRemove { map, key, ty } => {
+                self.check_place(site, function, map);
+                if matches!(value, RirRValue::MapRemove { .. })
+                    && function
+                        .locals
+                        .get(map.local.index())
+                        .is_some_and(|local| !local.mutable)
+                {
+                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
+                }
+                self.check_type_id(site, *ty);
+                let Some(RirType::Map { key: key_ty, value }) = self.ty(map.ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                let Some(RirType::Option(option_value)) = self.ty(*ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                if option_value != value {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: value,
+                            found: option_value,
+                        },
+                    );
+                }
+                self.check_value_operand_ty(site, function, key, key_ty);
+                Some(*ty)
+            }
+            RirRValue::MapInsert { map, key, value } => {
+                self.check_place(site, function, map);
+                if function
+                    .locals
+                    .get(map.local.index())
+                    .is_some_and(|local| !local.mutable)
+                {
+                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
+                }
+                let Some(RirType::Map {
+                    key: key_ty,
+                    value: value_ty,
+                }) = self.ty(map.ty)
+                else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                self.check_value_operand_ty(site, function, key, key_ty);
+                self.check_value_operand_ty(site, function, value, value_ty);
+                self.type_id(RirType::Void)
             }
         };
         if let (Some(expected), Some(found)) = (expected, found)
@@ -1607,7 +1679,7 @@ impl VerifyCx<'_> {
                         function
                             .params
                             .iter()
-                            .map(|param| (param.ty, param.semantic))
+                            .map(|param| (param.ty, param.semantic, param.abi))
                             .collect::<Vec<_>>(),
                         function.ret.ty,
                     ),
@@ -1620,7 +1692,7 @@ impl VerifyCx<'_> {
                     Some(ext) => (
                         ext.params
                             .iter()
-                            .map(|param| (param.ty, param.semantic))
+                            .map(|param| (param.ty, param.semantic, param.abi))
                             .collect::<Vec<_>>(),
                         ext.ret,
                     ),
@@ -1647,10 +1719,13 @@ impl VerifyCx<'_> {
                 },
             );
         }
-        for (index, (arg, (ty, mode))) in args.iter().zip(expected).enumerate() {
+        for (index, (arg, (ty, mode, abi))) in args.iter().zip(expected).enumerate() {
             let site = RirVerifySite::CallArg(function_id, stmt, index);
             if arg.semantic() != mode {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
+            }
+            if RustRepPolicy::new(self.program).call_arg_abi(ty, arg.semantic()) != Some(abi) {
+                self.push(site, RirVerifyErrorKind::UnsupportedAbi);
             }
             let found = match arg {
                 RirCallArg::Value(operand) => self.value_operand_ty(site, function, operand),
@@ -1687,7 +1762,7 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::UnexpectedReturnValue);
             }
             RirTerm::Return(Some(operand)) => {
-                if let Some(found) = self.operand_ty(site, function, operand) {
+                if let Some(found) = self.value_operand_ty(site, function, operand) {
                     if found != function.ret.ty {
                         self.push(
                             site,
@@ -1702,6 +1777,16 @@ impl VerifyCx<'_> {
                     }
                 }
             }
+            RirTerm::Break(id) => {
+                if !self.loops.contains(id) {
+                    self.push(site, RirVerifyErrorKind::BreakOutsideLoop(*id));
+                }
+            }
+            RirTerm::Continue(id) => {
+                if !self.loops.contains(id) {
+                    self.push(site, RirVerifyErrorKind::ContinueOutsideLoop(*id));
+                }
+            }
             RirTerm::None | RirTerm::Return(None) | RirTerm::Unreachable => {}
         }
     }
@@ -1713,33 +1798,12 @@ impl VerifyCx<'_> {
         semantic: RirParamSemantic,
         abi: RirParamAbi,
     ) {
-        let supported = matches!(
-            (semantic, abi, self.ty(ty)),
-            (
-                RirParamSemantic::Value,
-                RirParamAbi::Value,
-                Some(
-                    RirType::Int
-                        | RirType::Float
-                        | RirType::Bool
-                        | RirType::Void
-                        | RirType::Struct(_)
-                        | RirType::Enum(_)
-                        | RirType::Array { .. }
-                        | RirType::List(_)
-                ),
-            ) | (
-                RirParamSemantic::SharedBorrow,
-                RirParamAbi::SharedBorrow,
-                Some(
-                    RirType::String
-                        | RirType::Struct(_)
-                        | RirType::Enum(_)
-                        | RirType::Array { .. }
-                        | RirType::List(_)
-                ),
-            )
-        );
+        if self.ty(ty).is_none() {
+            self.push(site, RirVerifyErrorKind::UnsupportedAbi);
+            return;
+        }
+        let policy = RustRepPolicy::new(self.program);
+        let supported = policy.supports_param(ty, semantic) && abi == policy.param_abi(semantic);
         if !supported {
             self.push(site, RirVerifyErrorKind::UnsupportedAbi);
         }
@@ -1816,7 +1880,7 @@ impl VerifyCx<'_> {
     fn stringify_ok(&self, value: &RirOperand, source_ty: RirTypeId) -> bool {
         match self.ty(source_ty) {
             Some(RirType::Int | RirType::Float | RirType::Bool) => true,
-            Some(RirType::String) => matches!(value, RirOperand::Const(_)),
+            Some(RirType::String) => true,
             Some(RirType::Struct(_)) => {
                 matches!(value, RirOperand::Place(_))
                     && matches!(
@@ -1832,6 +1896,8 @@ impl VerifyCx<'_> {
                 | RirType::Enum(_)
                 | RirType::Array { .. }
                 | RirType::List(_)
+                | RirType::Map { .. }
+                | RirType::Option(_)
                 | RirType::Slice(_),
             )
             | None => false,
@@ -1849,6 +1915,8 @@ impl VerifyCx<'_> {
             | RirType::Enum(_)
             | RirType::Array { .. }
             | RirType::List(_)
+            | RirType::Map { .. }
+            | RirType::Option(_)
             | RirType::Slice(_) => {
                 return false;
             }
@@ -1898,10 +1966,31 @@ impl VerifyCx<'_> {
         operand: &RirOperand,
     ) -> Option<RirTypeId> {
         let ty = self.operand_ty(site, function, operand);
-        if matches!(operand, RirOperand::Place(_)) && ty.is_some_and(|ty| !self.copyable_type(ty)) {
+        if matches!(operand, RirOperand::Place(_))
+            && ty.is_some_and(|ty| !RustRepPolicy::new(self.program).shareable_value(ty))
+        {
             self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
         }
         ty
+    }
+
+    fn check_value_operand_ty(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        operand: &RirOperand,
+        expected: RirTypeId,
+    ) {
+        let found = self.value_operand_ty(site, function, operand);
+        if found != Some(expected) {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected,
+                    found: found.unwrap_or(expected),
+                },
+            );
+        }
     }
 
     fn check_slice_range(
@@ -2042,23 +2131,15 @@ impl VerifyCx<'_> {
 
     fn copyable_type(&self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
-            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::Void) => true,
-            Some(RirType::Struct(id)) => {
-                self.program
-                    .structs
-                    .get(id.index())
-                    .is_some_and(|strukt| strukt.copyable)
-                    && self.inherently_copyable_type(ty)
+            Some(RirType::Struct(id)) if self.program.structs.get(id.index()).is_some() => {
+                RustRepPolicy::new(self.program).copyable(ty) && self.inherently_copyable_type(ty)
             }
-            Some(RirType::Enum(id)) => {
-                self.program
-                    .enums
-                    .get(id.index())
-                    .is_some_and(|enm| enm.copyable)
-                    && self.inherently_copyable_type(ty)
+            Some(RirType::Enum(id)) if self.program.enums.get(id.index()).is_some() => {
+                RustRepPolicy::new(self.program).copyable(ty) && self.inherently_copyable_type(ty)
             }
             Some(RirType::Array { .. }) => self.inherently_copyable_type(ty),
-            Some(RirType::List(_) | RirType::Slice(_) | RirType::String) | None => false,
+            Some(_) => RustRepPolicy::new(self.program).copyable(ty),
+            None => false,
         }
     }
 
@@ -2082,7 +2163,9 @@ impl VerifyCx<'_> {
                 })
             }),
             Some(RirType::Array { elem, .. }) => self.inherently_copyable_type(elem),
-            Some(RirType::List(_) | RirType::Slice(_) | RirType::String) | None => false,
+            Some(RirType::Option(inner)) => self.inherently_copyable_type(inner),
+            Some(RirType::List(_) | RirType::Map { .. } | RirType::Slice(_) | RirType::String)
+            | None => false,
         }
     }
 

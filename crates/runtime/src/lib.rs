@@ -5,6 +5,7 @@ pub mod managed_rc;
 pub mod provider;
 pub mod suspect_buffer;
 pub mod type_registry;
+pub mod value;
 
 pub use anvyx_externs;
 pub use anvyx_heap::{
@@ -37,3 +38,4 @@ pub use provider::{
 pub use type_registry::{
     get_type_entry, is_cycle_capable, register_child_traverser, register_cycle_capable,
 };
+pub use value::{AnvList, AnvMap, AnvString};

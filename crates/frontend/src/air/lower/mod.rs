@@ -4,14 +4,15 @@ use anvyx_externs::ParamFlow;
 
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
-    AirIf, AirStmt, AirTail, CallArg, Callee, ConstData, ConstId, ConstValue, CoreEnumKind,
-    DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId,
-    ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl,
-    ExternRep, ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, FieldDecl, FieldId,
-    Function, FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, Local, LocalId,
-    LocalKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamMode, ParamRole,
-    ParamType, Place, Program, RValue, RawEnumValue, ReturnMode, Signature, SignatureType,
-    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
+    AirIf, AirLoop, AirLoopId, AirStmt, AirTail, CallArg, Callee, ConstData, ConstId, ConstValue,
+    CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl,
+    ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
+    ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
+    ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
+    FunctionSpecialization, Local, LocalId, LocalKind, Module, ModuleId,
+    Mutability as AirMutability, Operand, Param, ParamMode, ParamRole, ParamType, Place, Program,
+    RValue, RawEnumValue, ReturnMode, Signature, SignatureType, TypeData, TypeId, VariantDecl,
+    VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes, ScalarType},
     verify,
 };
@@ -21,7 +22,7 @@ use crate::{
         Mutability as AstMutability, Pattern, ReturnAccess, Stmt, StmtNode, Type,
     },
     externs::catalog::{ExternCatalog, ExternLoweringInfo},
-    resolve::{PackageModulePath, ResolveResult},
+    resolve::{PackageId, PackageModulePath, ResolveResult},
     source::SourceId,
     span::SourceSpan,
     typecheck::{
@@ -1273,6 +1274,8 @@ struct FunctionLowerer<'cx, 'facts> {
     locals: HashMap<SemanticLocalId, LocalId>,
     block: AirBlock,
     terminated: bool,
+    next_loop: u32,
+    active_loops: Vec<AirLoopId>,
 }
 
 impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
@@ -1296,6 +1299,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             locals,
             block: AirBlock::default(),
             terminated: false,
+            next_loop: 0,
+            active_loops: vec![],
         }
     }
 
@@ -1434,6 +1439,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 }
                 None => self.terminate(AirTail::Return(None)),
             },
+            Stmt::While(while_) => self.lower_while(&while_.node),
+            Stmt::Break => self.lower_loop_tail(stmt, AirTail::Break),
+            Stmt::Continue => self.lower_loop_tail(stmt, AirTail::Continue),
             _ => Err(LowerError::UnsupportedStmt {
                 kind: stmt_kind(&stmt.node),
                 span: Some(self.source_span(stmt.span)),
@@ -1441,13 +1449,68 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         }
     }
 
+    fn lower_while(&mut self, while_: &ast::While) -> Result<(), LowerError> {
+        let id = self.alloc_loop();
+        self.active_loops.push(id);
+        let body = self.with_nested_block(|this| this.lower_while_body(id, while_));
+        self.active_loops.pop();
+        let body = body?;
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::Loop(AirLoop { id, body }));
+        Ok(())
+    }
+
+    fn lower_while_body(&mut self, id: AirLoopId, while_: &ast::While) -> Result<(), LowerError> {
+        let cond = self.lower_while_cond(&while_.cond)?;
+        let mut then_block = self.lower_nested_effect(&while_.body)?;
+        if air_block_falls_through(&then_block) {
+            then_block.tail = AirTail::Continue(id);
+        }
+        let else_block = AirBlock {
+            stmts: vec![],
+            tail: AirTail::Break(id),
+        };
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::If(AirIf {
+            cond,
+            then_block,
+            else_block: Some(else_block),
+        }));
+        Ok(())
+    }
+
+    fn lower_while_cond(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        let cond = self.lower_value(expr)?;
+        if self.terminated || self.operand_type(&cond) != Type::Bool {
+            return Err(unsupported_expr(expr));
+        }
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        self.emit_typed_temp(bool_ty, RValue::Use(cond))
+    }
+
+    fn lower_loop_tail(
+        &mut self,
+        stmt: &StmtNode,
+        tail: fn(AirLoopId) -> AirTail,
+    ) -> Result<(), LowerError> {
+        let Some(id) = self.active_loops.last().copied() else {
+            return Err(LowerError::UnsupportedStmt {
+                kind: stmt_kind(&stmt.node),
+                span: Some(self.source_span(stmt.span)),
+            });
+        };
+        self.terminate(tail(id))
+    }
+
+    fn alloc_loop(&mut self) -> AirLoopId {
+        let id = AirLoopId(self.next_loop);
+        self.next_loop += 1;
+        id
+    }
+
     fn lower_binding(&mut self, binding: &ast::BindingNode) -> Result<(), LowerError> {
         match &binding.node.pattern.node {
             Pattern::Ident(_) => {
-                let init = match self.lower_binding_string_init(&binding.node.value)? {
-                    Some(value) => value,
-                    None => RValue::Use(self.lower_value(&binding.node.value)?),
-                };
                 let site = self.source_span(binding.node.pattern.span);
                 let semantic = self
                     .facts
@@ -1464,6 +1527,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 let mutable = def.mutable;
                 let ty = def.ty.clone();
                 let ty = self.cx.lower_ty(&ty)?;
+                let init = match self.lower_binding_string_init(&binding.node.value)? {
+                    Some(value) => value,
+                    None => RValue::Use(self.lower_value(&binding.node.value)?),
+                };
                 let local = self.push_local(
                     Some(name),
                     ty,
@@ -1583,7 +1650,6 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 let index_local = self.lower_index_local(&index.node.index)?;
                 let ty = match self.cx.program.type_data(place.ty) {
                     TypeData::List(elem) | TypeData::Array { elem, .. } => *elem,
-                    TypeData::Map { value, .. } => *value,
                     _ => return Err(unsupported_expr(expr)),
                 };
                 place
@@ -1843,6 +1909,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 let place = self.lower_place(expr, &fact)?;
                 Ok(Operand::Place(place))
             }
+            ExprKind::Index(index) => self.lower_index_value(expr, index),
             ExprKind::Block(block) => self.lower_block_value(expr, block),
             ExprKind::If(if_expr) => self.lower_if_value(expr, if_expr),
             ExprKind::Match(match_expr) => self.lower_match_value(expr, match_expr),
@@ -1898,6 +1965,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::IntrinsicCall(call) => self.lower_intrinsic_value(expr, call),
             ExprKind::StringInterp(parts) => self.lower_string_interp(parts),
             ExprKind::StructLiteral(literal) => self.lower_struct_literal(expr, literal),
+            ExprKind::ArrayLiteral(literal) => self.lower_array_literal(expr, literal),
+            ExprKind::ArrayFill(fill) => self.lower_array_fill(expr, fill),
+            ExprKind::MapLiteral(literal) => self.lower_map_literal(expr, literal),
             ExprKind::InferredEnum(inferred) => self.lower_inferred_enum(expr, inferred),
             ExprKind::Cast(cast) => self.lower_cast_expr(expr, cast),
             _ => Err(unsupported_expr(expr)),
@@ -1958,6 +2028,158 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             }
             _ => Err(unsupported_expr(expr)),
         }
+    }
+
+    fn lower_map_literal(
+        &mut self,
+        expr: &ExprNode,
+        literal: &ast::MapLiteralNode,
+    ) -> Result<Operand, LowerError> {
+        let ty = self.lower_expr_ty(expr.node.id)?;
+        let Type::Map { key, value } = &ty else {
+            return Err(unsupported_expr(expr));
+        };
+        let key_ty = self.cx.lower_ty(key)?;
+        let value_ty = self.cx.lower_ty(value)?;
+        let mut fields = vec![];
+        for (key_expr, value_expr) in &literal.node.entries {
+            fields.push(self.lower_value_of_type(key_expr, key_ty, expr)?);
+            fields.push(self.lower_value_of_type(value_expr, value_ty, expr)?);
+        }
+        let ty = self.cx.lower_ty(&ty)?;
+        self.emit_typed_temp(
+            ty,
+            RValue::Aggregate {
+                kind: AggregateCtor::Map,
+                fields,
+                ty,
+            },
+        )
+    }
+
+    fn lower_value_of_type(
+        &mut self,
+        expr: &ExprNode,
+        expected: TypeId,
+        err: &ExprNode,
+    ) -> Result<Operand, LowerError> {
+        let value = self.lower_value(expr)?;
+        if self.operand_ty(&value) != expected {
+            return Err(unsupported_expr(err));
+        }
+        Ok(value)
+    }
+
+    fn lower_index_value(
+        &mut self,
+        expr: &ExprNode,
+        index: &ast::IndexNode,
+    ) -> Result<Operand, LowerError> {
+        let Ok(map) = self.lower_place_arg(&index.node.target, false) else {
+            return self.lower_place_arg(expr, false).map(Operand::Place);
+        };
+        let TypeData::Map { key, value, .. } = self.cx.program.type_data(map.ty) else {
+            return self.lower_place_arg(expr, false).map(Operand::Place);
+        };
+        let key_ty = *key;
+        let value_ty = *value;
+        let key = self.lower_value_of_type(&index.node.index, key_ty, expr)?;
+        let ty = self.optional_type(value_ty);
+        self.emit_typed_temp(ty, RValue::MapGet { map, key, ty })
+    }
+
+    fn optional_type(&mut self, inner: TypeId) -> TypeId {
+        let existing =
+            self.cx
+                .program
+                .type_arena
+                .iter()
+                .enumerate()
+                .find_map(|(index, ty)| match ty {
+                    TypeData::Optional(found) if *found == inner => Some(TypeId::from_index(index)),
+                    _ => None,
+                });
+        existing.unwrap_or_else(|| self.cx.program.alloc_type(TypeData::Optional(inner)))
+    }
+
+    fn lower_map_index_assign(
+        &mut self,
+        index: &ast::IndexNode,
+        value_expr: &ExprNode,
+    ) -> Result<Option<RValue>, LowerError> {
+        let map = match self.lower_place_arg(&index.node.target, true) {
+            Ok(place) => place,
+            Err(LowerError::MissingLocalUse { .. }) => {
+                self.named_local_place(&index.node.target)?
+            }
+            Err(_) => return Ok(None),
+        };
+        if self.function.locals[map.root.index()].mutability != AirMutability::Mutable {
+            return Err(unsupported_expr(value_expr));
+        }
+        let TypeData::Map { key, value, .. } = self.cx.program.type_data(map.ty) else {
+            return Ok(None);
+        };
+        let key_ty = *key;
+        let value_ty = *value;
+        let key = self.lower_value_of_type(&index.node.index, key_ty, value_expr)?;
+        let value = self.lower_value_of_type(value_expr, value_ty, value_expr)?;
+        Ok(Some(RValue::MapInsert { map, key, value }))
+    }
+
+    fn lower_array_fill(
+        &mut self,
+        expr: &ExprNode,
+        fill: &ast::ArrayFillNode,
+    ) -> Result<Operand, LowerError> {
+        let ty = self.lower_expr_ty(expr.node.id)?;
+        let Type::Array { elem, len } = &ty else {
+            return Err(unsupported_expr(expr));
+        };
+        let ArrayLen::Fixed(len) = len else {
+            return Err(unsupported_expr(expr));
+        };
+        let elem_ty = self.cx.lower_ty(elem)?;
+        let value = self.lower_value_of_type(&fill.node.value, elem_ty, expr)?;
+        let ty = self.cx.lower_ty(&ty)?;
+        self.emit_typed_temp(
+            ty,
+            RValue::Aggregate {
+                kind: AggregateCtor::Array,
+                fields: vec![value; *len],
+                ty,
+            },
+        )
+    }
+
+    fn lower_array_literal(
+        &mut self,
+        expr: &ExprNode,
+        literal: &ast::ArrayLiteralNode,
+    ) -> Result<Operand, LowerError> {
+        let ty = self.lower_expr_ty(expr.node.id)?;
+        let (kind, elem_ty) = match &ty {
+            Type::Array { elem, len } => {
+                let ArrayLen::Fixed(len) = len else {
+                    return Err(unsupported_expr(expr));
+                };
+                if *len != literal.node.elements.len() {
+                    return Err(unsupported_expr(expr));
+                }
+                (AggregateCtor::Array, elem.as_ref())
+            }
+            Type::List { elem } => (AggregateCtor::List, elem.as_ref()),
+            _ => return Err(unsupported_expr(expr)),
+        };
+        let elem_ty = self.cx.lower_ty(elem_ty)?;
+        let fields = literal
+            .node
+            .elements
+            .iter()
+            .map(|element| self.lower_value_of_type(element, elem_ty, expr))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ty = self.cx.lower_ty(&ty)?;
+        self.emit_typed_temp(ty, RValue::Aggregate { kind, fields, ty })
     }
 
     fn lower_struct_aggregate_literal(
@@ -2595,6 +2817,20 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         call: &ast::CallNode,
     ) -> Result<RValue, LowerError> {
         let args = &call.node.args;
+        if let Some(target) = self.facts.calls.get(&expr.node.id)
+            && is_lowered_collection_stub(&target.id)
+        {
+            if let Some(value) = self.lower_list_push_call(expr, call)? {
+                return Ok(value);
+            }
+            if let Some(value) = self.lower_map_insert_call(expr, call)? {
+                return Ok(value);
+            }
+            if let Some(value) = self.lower_map_remove_call(expr, call)? {
+                return Ok(value);
+            }
+            return Err(unsupported_expr(expr));
+        }
         if let Some(targets) = self.facts.extern_uses.get(&expr.node.id) {
             let [target] = targets.as_slice() else {
                 return Err(LowerError::UnsupportedExternUse {
@@ -2709,6 +2945,107 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         Ok(RValue::Call {
             callee: Callee::Function(callee),
             args,
+        })
+    }
+
+    fn lower_list_push_call(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<Option<RValue>, LowerError> {
+        let ExprKind::Field(field) = &call.node.func.node.kind else {
+            return Ok(None);
+        };
+        if field.node.field != Ident::new("push") || call.node.args.len() != 1 {
+            return Ok(None);
+        }
+        let list = self.lower_method_target(&field.node.target)?;
+        let TypeData::List(elem) = self.cx.program.type_data(list.ty) else {
+            return Ok(None);
+        };
+        self.require_mutable_place(expr, &list)?;
+        let value = self.lower_value_of_type(&call.node.args[0], *elem, expr)?;
+        Ok(Some(RValue::ListPush { list, value }))
+    }
+
+    fn lower_map_insert_call(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<Option<RValue>, LowerError> {
+        let ExprKind::Field(field) = &call.node.func.node.kind else {
+            return Ok(None);
+        };
+        if field.node.field != Ident::new("insert") || call.node.args.len() != 2 {
+            return Ok(None);
+        }
+        let map = self.lower_method_target(&field.node.target)?;
+        let TypeData::Map { key, value, .. } = self.cx.program.type_data(map.ty) else {
+            return Ok(None);
+        };
+        self.require_mutable_place(expr, &map)?;
+        let key_ty = *key;
+        let value_ty = *value;
+        let key = self.lower_value_of_type(&call.node.args[0], key_ty, expr)?;
+        let value = self.lower_value_of_type(&call.node.args[1], value_ty, expr)?;
+        Ok(Some(RValue::MapInsert { map, key, value }))
+    }
+
+    fn lower_map_remove_call(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<Option<RValue>, LowerError> {
+        let ExprKind::Field(field) = &call.node.func.node.kind else {
+            return Ok(None);
+        };
+        if field.node.field != Ident::new("remove") || call.node.args.len() != 1 {
+            return Ok(None);
+        }
+        let map = self.lower_method_target(&field.node.target)?;
+        let TypeData::Map { key, value, .. } = self.cx.program.type_data(map.ty) else {
+            return Ok(None);
+        };
+        self.require_mutable_place(expr, &map)?;
+        let key_ty = *key;
+        let value_ty = *value;
+        let key = self.lower_value_of_type(&call.node.args[0], key_ty, expr)?;
+        let ty = self.optional_type(value_ty);
+        Ok(Some(RValue::MapRemove { map, key, ty }))
+    }
+
+    fn lower_method_target(&mut self, target: &ExprNode) -> Result<Place, LowerError> {
+        match self.lower_place_arg(target, false) {
+            Ok(place) => Ok(place),
+            Err(LowerError::MissingLocalUse { .. }) => self.named_local_place(target),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn require_mutable_place(&self, expr: &ExprNode, place: &Place) -> Result<(), LowerError> {
+        if self.function.locals[place.root.index()].mutability == AirMutability::Mutable {
+            return Ok(());
+        }
+        Err(unsupported_expr(expr))
+    }
+
+    fn named_local_place(&self, expr: &ExprNode) -> Result<Place, LowerError> {
+        let ExprKind::Ident(name) = expr.node.kind else {
+            return Err(unsupported_expr(expr));
+        };
+        let Some((local, data)) = self
+            .function
+            .locals
+            .iter()
+            .enumerate()
+            .find(|(_, local)| local.name == Some(name))
+        else {
+            return Err(unsupported_expr(expr));
+        };
+        Ok(Place {
+            root: LocalId::from_index(local),
+            projection: vec![],
+            ty: data.ty,
         })
     }
 
@@ -2916,6 +3253,11 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     )?;
                     return self.emit_eval(value);
                 }
+                if let ExprKind::Index(index) = &assign.node.target.node.kind
+                    && let Some(value) = self.lower_map_index_assign(index, &assign.node.value)?
+                {
+                    return self.emit_eval(value);
+                }
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
                 let dst = self.lower_place(&assign.node.target, &fact)?;
                 let value = self.lower_value(&assign.node.value)?;
@@ -3083,9 +3425,13 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn operand_type(&self, operand: &Operand) -> Type {
+        self.air_type(self.operand_ty(operand))
+    }
+
+    fn operand_ty(&self, operand: &Operand) -> TypeId {
         match operand {
-            Operand::Place(place) => self.air_type(place.ty),
-            Operand::Const(id) => self.air_type(self.cx.program.const_data(*id).ty),
+            Operand::Place(place) => place.ty,
+            Operand::Const(id) => self.cx.program.const_data(*id).ty,
         }
     }
 
@@ -3893,7 +4239,9 @@ impl<'a> ReachableCallables<'a> {
                 if target.form != CallForm::Normal {
                     return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
                 }
-                if target.id.kind == CallableKind::EnumVariant {
+                if target.id.kind == CallableKind::EnumVariant
+                    || is_lowered_collection_stub(&target.id)
+                {
                     continue;
                 }
                 if !index.callables.contains_key(&target.id) {
@@ -3930,6 +4278,19 @@ impl<'a> ReachableCallables<'a> {
 
 fn is_stringify_override(id: &CallableId) -> bool {
     id.kind == CallableKind::InstanceMethod && id.name == Ident::new("to_string")
+}
+
+fn is_lowered_collection_stub(id: &CallableId) -> bool {
+    matches!(
+        (id.kind, id.name.as_str()),
+        (
+            CallableKind::ExtendMethod(MethodSurface::Instance),
+            "push" | "insert" | "remove"
+        )
+    ) && matches!(&id.module, ModuleScope::Package(module)
+        if module.package_context() == Some(&PackageId::core())
+            && matches!(module.path(), PackageModulePath::Named(path)
+                if path.segments().len() == 1 && path.segments()[0] == "collections"))
 }
 
 fn queue_callable(
@@ -4269,10 +4630,7 @@ mod tests {
         .expect("lower failed");
 
         assert!(air.modules.is_empty());
-        assert_eq!(
-            resolved.system.core,
-            Some(crate::resolve::PackageId::core())
-        );
+        assert_eq!(resolved.system.core, Some(PackageId::core()));
         assert_eq!(
             core_fixture_module_paths(&resolved),
             vec![
@@ -4287,7 +4645,7 @@ mod tests {
                 vec!["core_string"],
             ]
         );
-        let core_root = crate::resolve::ModuleId::root(crate::resolve::PackageId::core());
+        let core_root = crate::resolve::ModuleId::root(PackageId::core());
         let root_imports = resolved
             .import_edges
             .get(&core_root)
@@ -4848,6 +5206,97 @@ mod tests {
             err,
             LowerError::UnsupportedCallableInstance { .. }
         ));
+    }
+
+    #[test]
+    fn while_lowers_to_loop_with_condition_branch_and_fallthrough_continue() {
+        let air = lower_root("fn f() { var x = 0; while x < 2 { x = x + 1; } }", "f")
+            .expect("lower failed");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+        let loop_ = function
+            .body
+            .block
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                AirStmt::Loop(loop_) => Some(loop_),
+                _ => None,
+            })
+            .expect("missing loop");
+
+        assert_eq!(loop_.id, AirLoopId::from_index(0));
+        let branch_index = loop_
+            .body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(stmt, AirStmt::If(_)))
+            .expect("missing loop condition branch");
+        assert!(
+            loop_.body.stmts[..branch_index]
+                .iter()
+                .all(|stmt| matches!(stmt, AirStmt::Init { .. }))
+        );
+        let AirStmt::If(branch) = &loop_.body.stmts[branch_index] else {
+            unreachable!()
+        };
+        assert_eq!(branch.then_block.tail, AirTail::Continue(loop_.id));
+        assert!(matches!(
+            branch.else_block.as_ref().map(|block| &block.tail),
+            Some(AirTail::Break(id)) if *id == loop_.id
+        ));
+    }
+
+    #[test]
+    fn while_preserves_explicit_break_and_continue_tails() {
+        let air = lower_root(
+            "fn f() { while true { break; } while true { continue; } }",
+            "f",
+        )
+        .expect("lower failed");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+        let loops = function
+            .body
+            .block
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AirStmt::Loop(loop_) => Some(loop_),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(loops.len(), 2);
+        let first_branch = loops[0]
+            .body
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                AirStmt::If(branch) => Some(branch),
+                _ => None,
+            })
+            .expect("missing first branch");
+        assert_eq!(first_branch.then_block.tail, AirTail::Break(loops[0].id));
+        let second_branch = loops[1]
+            .body
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                AirStmt::If(branch) => Some(branch),
+                _ => None,
+            })
+            .expect("missing second branch");
+        assert_eq!(
+            second_branch.then_block.tail,
+            AirTail::Continue(loops[1].id)
+        );
     }
 
     #[test]
@@ -6541,7 +6990,7 @@ fn main() {}
         let root = parse_program(source);
         let provider_raw = externs::ingest_providers(ExternInputs {
             packages: vec![PackageExternInputs {
-                package: crate::resolve::PackageId::synthetic_root(),
+                package: PackageId::synthetic_root(),
                 providers,
             }],
         })

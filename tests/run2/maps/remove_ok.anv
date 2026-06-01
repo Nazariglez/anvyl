@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 1
+
+fn main() {
+    var m: [string: int] = ["a": 1, "b": 2];
+    let _ = m.remove("a");
+    let _ = m["a"];
+    println(1);
+}

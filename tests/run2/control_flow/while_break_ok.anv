@@ -1,11 +1,12 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @match: 3
+// @match: 2
 
 fn main() {
     var x = 0;
-    while x < 3 {
+    while true {
+        if x == 2 { break; }
         x = x + 1;
     }
     println(x);

@@ -2,12 +2,15 @@ use std::fmt::Write;
 
 use anvyx_frontend::ast::{BinaryOp, UnaryOp};
 
-use super::rir::{
-    RirCallArg, RirCallTarget, RirConst, RirConstValue, RirEnum, RirEnumMatch, RirEnumRepr,
-    RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
-    RirOperand, RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirRValue, RirRawEnumValue,
-    RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-    RirVariantKind, VerifiedRirProgram,
+use super::{
+    rep_policy::{RustBorrowView, RustRepPolicy},
+    rir::{
+        RirCallArg, RirCallTarget, RirConst, RirConstValue, RirEnum, RirEnumMatch, RirEnumRepr,
+        RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
+        RirIf, RirLoop, RirLoopId, RirOperand, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
+        RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId,
+        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +90,7 @@ fn stmt_calls_fallible(program: &RirProgram, fallible: &[bool], stmt: &RirStmt) 
                     .as_ref()
                     .is_some_and(|block| block_calls_fallible(program, fallible, block))
         }
+        RirStmt::Loop(loop_) => block_calls_fallible(program, fallible, &loop_.body),
         RirStmt::EnumMatch(match_) => {
             match_
                 .arms
@@ -174,6 +178,7 @@ impl EmitCx<'_> {
             self.line("");
             return;
         }
+        self.line("#[derive(Clone)]");
         self.line(&format!("struct {} {{", strukt.symbol.as_str()));
         for field in &strukt.fields {
             self.line(&format!(
@@ -190,6 +195,8 @@ impl EmitCx<'_> {
         if enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty() {
             self.line("#[derive(Clone, Copy)]");
             self.line("#[repr(i64)]");
+        } else {
+            self.line("#[derive(Clone)]");
         }
         self.line(&format!("enum {} {{", enm.symbol.as_str()));
         for variant in &enm.variants {
@@ -236,7 +243,7 @@ impl EmitCx<'_> {
         let strukt = &self.program.structs[struct_id.index()];
         let ctx = self.stringify_helper_ctx_name(strukt);
         self.line(&format!(
-            "fn {}<'cx, 'rt>({ctx}: &mut {}, value: &{}) -> String {{",
+            "fn {}<'cx, 'rt>({ctx}: &mut {}, value: &{}) -> anvyx_runtime::AnvString {{",
             helper.symbol.as_str(),
             self.ctx_ty(),
             strukt.symbol.as_str()
@@ -280,11 +287,13 @@ impl EmitCx<'_> {
                 | RirType::Enum(_)
                 | RirType::Array { .. }
                 | RirType::List(_)
+                | RirType::Map { .. }
+                | RirType::Option(_)
                 | RirType::Slice(_) => unreachable!("verified stringify helper field"),
             }
         }
         self.line("    out.push(')');");
-        self.line("    out");
+        self.line("    anvyx_runtime::AnvString::from(out)");
         self.line("}");
         self.line("");
     }
@@ -319,10 +328,12 @@ impl EmitCx<'_> {
             ));
         }
         let block = &function.body;
-        let predeclare = block
-            .stmts
-            .iter()
-            .any(|stmt| matches!(stmt, RirStmt::If(_) | RirStmt::EnumMatch(_)));
+        let predeclare = block.stmts.iter().any(|stmt| {
+            matches!(
+                stmt,
+                RirStmt::If(_) | RirStmt::Loop(_) | RirStmt::EnumMatch(_)
+            )
+        });
         if predeclare {
             self.emit_local_declarations(function);
         }
@@ -355,9 +366,8 @@ impl EmitCx<'_> {
             if function.params.iter().any(|param| param.local == local.id) {
                 continue;
             }
-            let mutability = if local.mutable { "mut " } else { "" };
             self.line(&format!(
-                "    let {mutability}{}: {};",
+                "    let mut {}: {};",
                 local.symbol.as_str(),
                 self.ty(local.ty)
             ));
@@ -380,6 +390,7 @@ impl EmitCx<'_> {
                         .as_ref()
                         .is_some_and(|block| self.block_uses_ctx(block))
             }
+            RirStmt::Loop(loop_) => self.block_uses_ctx(&loop_.body),
             RirStmt::EnumMatch(match_) => {
                 match_
                     .arms
@@ -414,6 +425,10 @@ impl EmitCx<'_> {
             | RirRValue::SliceView { .. }
             | RirRValue::Array { .. }
             | RirRValue::List { .. }
+            | RirRValue::Map { .. }
+            | RirRValue::MapGet { .. }
+            | RirRValue::MapInsert { .. }
+            | RirRValue::MapRemove { .. }
             | RirRValue::ListSlice { .. }
             | RirRValue::Struct { .. }
             | RirRValue::EnumVariant { .. } => false,
@@ -467,8 +482,21 @@ impl EmitCx<'_> {
                 self.line(&format!("{indent}{};", self.rvalue(function, value)));
             }
             RirStmt::If(branch) => self.emit_if(function, branch, indent, predeclared),
+            RirStmt::Loop(loop_) => self.emit_loop(function, loop_, indent, predeclared),
             RirStmt::EnumMatch(match_) => self.emit_match(function, match_, indent, predeclared),
         }
+    }
+
+    fn emit_loop(
+        &mut self,
+        function: &RirFunction,
+        loop_: &RirLoop,
+        indent: &str,
+        predeclared: bool,
+    ) {
+        self.line(&format!("{indent}{}: loop {{", loop_label(loop_.id)));
+        self.emit_structured_block(function, &loop_.body, &format!("{indent}    "), predeclared);
+        self.line(&format!("{indent}}}"));
     }
 
     fn emit_if(&mut self, function: &RirFunction, branch: &RirIf, indent: &str, predeclared: bool) {
@@ -553,13 +581,15 @@ impl EmitCx<'_> {
                 }
             }
             RirTerm::Return(Some(operand)) => {
-                let value = self.operand(function, operand);
+                let value = self.value_operand(function, operand);
                 if self.fallible_functions[function.id.index()] {
                     self.line(&format!("{indent}return Ok({value});"));
                 } else {
                     self.line(&format!("{indent}return {value};"));
                 }
             }
+            RirTerm::Break(id) => self.line(&format!("{indent}break {};", loop_label(*id))),
+            RirTerm::Continue(id) => self.line(&format!("{indent}continue {};", loop_label(*id))),
             RirTerm::Unreachable => self.line(&format!("{indent}unreachable!();")),
         }
     }
@@ -580,21 +610,33 @@ impl EmitCx<'_> {
 
     fn rvalue(&self, function: &RirFunction, value: &RirRValue) -> String {
         match value {
-            RirRValue::Use(operand) => self.operand(function, operand),
+            RirRValue::Use(operand) => self.value_operand(function, operand),
             RirRValue::Struct { ty, fields } => self.struct_literal(function, *ty, fields),
             RirRValue::Array { elems, .. } => format!(
                 "[{}]",
                 elems
                     .iter()
-                    .map(|elem| self.operand(function, elem))
+                    .map(|elem| self.value_operand(function, elem))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
             RirRValue::List { elems, .. } => format!(
-                "vec![{}]",
+                "anvyx_runtime::AnvList::from_elems([{}])",
                 elems
                     .iter()
-                    .map(|elem| self.operand(function, elem))
+                    .map(|elem| self.value_operand(function, elem))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            RirRValue::Map { entries, .. } => format!(
+                "anvyx_runtime::AnvMap::from_entries([{}])",
+                entries
+                    .iter()
+                    .map(|(key, value)| format!(
+                        "({}, {})",
+                        self.value_operand(function, key),
+                        self.value_operand(function, value)
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -629,15 +671,18 @@ impl EmitCx<'_> {
             },
             RirRValue::Stringify { value, source_ty } => {
                 match self.program.types[source_ty.index()] {
-                    RirType::String => self.operand(function, value),
-                    RirType::Int | RirType::Float | RirType::Bool => {
-                        format!("format!(\"{{}}\", {})", self.operand(function, value))
-                    }
+                    RirType::String => self.value_operand(function, value),
+                    RirType::Int | RirType::Float | RirType::Bool => format!(
+                        "anvyx_runtime::AnvString::from(format!(\"{{}}\", {}))",
+                        self.operand(function, value)
+                    ),
                     RirType::Struct(_) => self.stringify_struct(function, value, *source_ty),
                     RirType::Void
                     | RirType::Enum(_)
                     | RirType::Array { .. }
                     | RirType::List(_)
+                    | RirType::Map { .. }
+                    | RirType::Option(_)
                     | RirType::Slice(_) => {
                         unreachable!("verified structural stringify target gap")
                     }
@@ -649,7 +694,7 @@ impl EmitCx<'_> {
                 source_ty,
                 spec,
             } => format!(
-                "format!({}, {})",
+                "anvyx_runtime::AnvString::from(format!({}, {}))",
                 rust_string(&format_fragment(*spec)),
                 self.format_operand(function, value, *source_ty)
             ),
@@ -657,7 +702,7 @@ impl EmitCx<'_> {
             RirRValue::ListPush { list, value } => format!(
                 "{}.push({})",
                 self.place(function, list),
-                self.operand(function, value)
+                self.value_operand(function, value)
             ),
             RirRValue::SliceView {
                 source,
@@ -679,6 +724,28 @@ impl EmitCx<'_> {
                 inclusive,
                 ..
             } => self.list_slice(function, source, *start, *end, *inclusive),
+            RirRValue::MapGet { map, key, ty } => {
+                let RirType::Option(value_ty) = self.program.types[ty.index()] else {
+                    unreachable!("verified map get result")
+                };
+                format!(
+                    "{}.get(&{}).map(|value| {})",
+                    self.place(function, map),
+                    self.operand(function, key),
+                    self.value_from_ref(value_ty, "value")
+                )
+            }
+            RirRValue::MapInsert { map, key, value } => format!(
+                "{{ {}.insert({}, {}); }}",
+                self.place(function, map),
+                self.value_operand(function, key),
+                self.value_operand(function, value)
+            ),
+            RirRValue::MapRemove { map, key, .. } => format!(
+                "{}.remove(&{})",
+                self.place(function, map),
+                self.operand(function, key)
+            ),
         }
     }
 
@@ -703,7 +770,7 @@ impl EmitCx<'_> {
                         unreachable!("verified raw string enum value")
                     };
                     format!(
-                        "{}::{} => String::from({})",
+                        "{}::{} => anvyx_runtime::AnvString::from({})",
                         enm.symbol.as_str(),
                         variant.symbol.as_str(),
                         rust_string(raw)
@@ -756,8 +823,8 @@ impl EmitCx<'_> {
             unreachable!("verified list slice source")
         };
         format!(
-            "{{ let mut out = Vec::new(); for item in &{source_expr}[{range}] {{ out.push({}); }} out }}",
-            self.copy_from_ref(elem, "item")
+            "{{ let mut out = anvyx_runtime::AnvList::default(); for item in &{source_expr}[{range}] {{ out.push({}); }} out }}",
+            self.value_from_ref(elem, "item")
         )
     }
 
@@ -780,12 +847,12 @@ impl EmitCx<'_> {
                 RirOperand::Place(place) => {
                     rendered.push(format!(
                         "out.push_str({});",
-                        self.string_slice_expr(function, place)
+                        self.borrow_expr(function, place)
                     ));
                 }
             }
         }
-        rendered.push("out".into());
+        rendered.push("anvyx_runtime::AnvString::from(out)".into());
         rendered.push("}".into());
         rendered.join(" ")
     }
@@ -797,7 +864,7 @@ impl EmitCx<'_> {
         source_ty: RirTypeId,
     ) -> String {
         match (self.program.types[source_ty.index()], operand) {
-            (RirType::String, RirOperand::Place(place)) => self.string_slice_expr(function, place),
+            (RirType::String, RirOperand::Place(place)) => self.borrow_expr(function, place),
             (RirType::String, RirOperand::Const(id)) => {
                 let konst = &self.program.consts[id.index()];
                 match &konst.value {
@@ -837,6 +904,9 @@ impl EmitCx<'_> {
         call: String,
     ) -> String {
         match abi {
+            anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String) => {
+                format!("anvyx_runtime::AnvString::from({call})")
+            }
             anvyx_runtime::RustReturnAbi::Option(inner) => {
                 self.option_return_call(ret, inner, call)
             }
@@ -857,6 +927,9 @@ impl EmitCx<'_> {
         let none = &enm.variants[0];
         let some = &enm.variants[1];
         let value = match inner {
+            anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String) => {
+                "anvyx_runtime::AnvString::from(value)".to_string()
+            }
             anvyx_runtime::RustReturnAbi::Value(_) => "value".to_string(),
             _ => unreachable!("verified native option return inner"),
         };
@@ -878,8 +951,8 @@ impl EmitCx<'_> {
 
     fn call_arg(&self, function: &RirFunction, arg: &RirCallArg) -> String {
         match arg {
-            RirCallArg::Value(operand) => self.operand(function, operand),
-            RirCallArg::SharedBorrow(place) => self.shared_borrow_arg(function, place),
+            RirCallArg::Value(operand) => self.value_operand(function, operand),
+            RirCallArg::SharedBorrow(place) => self.borrow_expr(function, place),
             RirCallArg::SharedStringConst(id) => match &self.program.consts[id.index()].value {
                 RirConstValue::String(value) => rust_string(value),
                 _ => unreachable!("verified shared string const"),
@@ -888,22 +961,13 @@ impl EmitCx<'_> {
         }
     }
 
-    fn shared_borrow_arg(&self, function: &RirFunction, place: &RirPlace) -> String {
-        if matches!(self.program.types[place.ty.index()], RirType::String) {
-            self.string_slice_expr(function, place)
-        } else if self.borrowed_root_param(function, place) {
-            self.place(function, place)
-        } else {
-            format!("&{}", self.place(function, place))
-        }
-    }
-
-    fn string_slice_expr(&self, function: &RirFunction, place: &RirPlace) -> String {
-        if self.borrowed_root_param(function, place) {
-            self.place(function, place)
-        } else {
-            format!("{}.as_str()", self.place(function, place))
-        }
+    fn borrow_expr(&self, function: &RirFunction, place: &RirPlace) -> String {
+        RustRepPolicy::new(self.program)
+            .borrow_view(place.ty)
+            .render(
+                self.place(function, place),
+                self.borrowed_root_param(function, place),
+            )
     }
 
     fn borrowed_root_param(&self, function: &RirFunction, place: &RirPlace) -> bool {
@@ -912,6 +976,30 @@ impl EmitCx<'_> {
                 .params
                 .iter()
                 .any(|param| param.local == place.local && param.abi == RirParamAbi::SharedBorrow)
+    }
+
+    fn value_operand(&self, function: &RirFunction, operand: &RirOperand) -> String {
+        let RirOperand::Place(place) = operand else {
+            return self.operand(function, operand);
+        };
+        let policy = RustRepPolicy::new(self.program);
+        if policy.cow_value(place.ty) {
+            if self.borrowed_root_param(function, place)
+                && matches!(self.program.types[place.ty.index()], RirType::String)
+            {
+                return format!(
+                    "anvyx_runtime::AnvString::from({})",
+                    self.place(function, place)
+                );
+            }
+            return format!("{}.share()", self.place(function, place));
+        }
+        if matches!(self.program.types[place.ty.index()], RirType::Enum(_))
+            && policy.shareable_value(place.ty)
+        {
+            return self.copy_enum_expr(&self.place(function, place), place.ty);
+        }
+        self.operand(function, operand)
     }
 
     fn operand(&self, function: &RirFunction, operand: &RirOperand) -> String {
@@ -983,7 +1071,7 @@ impl EmitCx<'_> {
                 format!(
                     "{}: {}",
                     field.symbol.as_str(),
-                    self.operand(function, operand)
+                    self.value_operand(function, operand)
                 )
             })
             .collect::<Vec<_>>()
@@ -1011,7 +1099,7 @@ impl EmitCx<'_> {
                 path,
                 fields
                     .iter()
-                    .map(|field| self.operand(function, field))
+                    .map(|field| self.value_operand(function, field))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1024,7 +1112,7 @@ impl EmitCx<'_> {
                         format!(
                             "{}: {}",
                             field.symbol.as_str(),
-                            self.operand(function, operand)
+                            self.value_operand(function, operand)
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1105,7 +1193,7 @@ impl EmitCx<'_> {
                     .fields
                     .iter()
                     .zip(&vars)
-                    .map(|(field, var)| self.copy_from_ref(field.ty, var))
+                    .map(|(field, var)| self.value_from_ref(field.ty, var))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{path}({}) => {path}({values})", vars.join(", "))
@@ -1124,13 +1212,20 @@ impl EmitCx<'_> {
                         format!(
                             "{}: {}",
                             field.symbol.as_str(),
-                            self.copy_from_ref(field.ty, var)
+                            self.value_from_ref(field.ty, var)
                         )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{path} {{ {} }} => {path} {{ {values} }}", vars.join(", "))
             }
+        }
+    }
+
+    fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
+        match self.program.types[ty.index()] {
+            RirType::String | RirType::List(_) | RirType::Map { .. } => format!("{expr}.share()"),
+            _ => self.copy_from_ref(ty, expr),
         }
     }
 
@@ -1165,9 +1260,12 @@ impl EmitCx<'_> {
                 format!("match *{expr} {{}}")
             }
             RirType::Enum(_) => self.copy_enum_expr(expr, ty),
-            RirType::List(_) | RirType::Slice(_) | RirType::String | RirType::Void => {
-                unreachable!("verified copy enum payload")
-            }
+            RirType::List(_)
+            | RirType::Map { .. }
+            | RirType::Option(_)
+            | RirType::Slice(_)
+            | RirType::String
+            | RirType::Void => unreachable!("verified copy enum payload"),
         }
     }
 
@@ -1202,7 +1300,7 @@ impl EmitCx<'_> {
                         let RirOperand::Place(place) = value else {
                             unreachable!("verified stringify override place")
                         };
-                        self.shared_borrow_arg(function, place)
+                        self.borrow_expr(function, place)
                     }
                     RirParamSemantic::MutBorrow => unreachable!("verified stringify override mode"),
                 };
@@ -1240,37 +1338,25 @@ impl EmitCx<'_> {
                 }
             }
             RirConstValue::Bool(value) => value.to_string(),
-            RirConstValue::String(value) => format!("String::from({})", rust_string(value)),
+            RirConstValue::String(value) => {
+                format!("anvyx_runtime::AnvString::from({})", rust_string(value))
+            }
         }
     }
 
     fn param_ty(&self, ty: RirTypeId, abi: RirParamAbi) -> String {
         match abi {
             RirParamAbi::Value => self.ty(ty),
-            RirParamAbi::SharedBorrow
-                if matches!(self.program.types[ty.index()], RirType::String) =>
-            {
-                "&str".into()
-            }
-            RirParamAbi::SharedBorrow => format!("&{}", self.ty(ty)),
+            RirParamAbi::SharedBorrow => match RustRepPolicy::new(self.program).borrow_view(ty) {
+                RustBorrowView::Str => "&str".into(),
+                _ => format!("&{}", self.ty(ty)),
+            },
             RirParamAbi::MutBorrow => format!("&mut {}", self.ty(ty)),
-            RirParamAbi::PlaceHandle => self.ty(ty),
         }
     }
 
     fn ty(&self, ty: RirTypeId) -> String {
-        match self.program.types[ty.index()] {
-            RirType::Int => "i64".into(),
-            RirType::Float => "f64".into(),
-            RirType::Bool => "bool".into(),
-            RirType::String => "String".into(),
-            RirType::Void => "()".into(),
-            RirType::Struct(id) => self.program.structs[id.index()].symbol.as_str().into(),
-            RirType::Enum(id) => self.program.enums[id.index()].symbol.as_str().into(),
-            RirType::Array { elem, len } => format!("[{}; {}]", self.ty(elem), len),
-            RirType::List(elem) => format!("Vec<{}>", self.ty(elem)),
-            RirType::Slice(elem) => format!("&[{}]", self.ty(elem)),
-        }
+        RustRepPolicy::new(self.program).rust_ty(ty)
     }
 
     fn line(&mut self, text: &str) {
@@ -1370,6 +1456,10 @@ fn checked_index(index: &str, len: Option<u64>) -> String {
             format!("{{ let i = {index}; if i < 0 {{ panic!(\"negative index\"); }} i as usize }}")
         }
     }
+}
+
+fn loop_label(id: RirLoopId) -> String {
+    format!("'loop_{}", id.index())
 }
 
 fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) -> String {

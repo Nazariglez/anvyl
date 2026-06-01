@@ -9,6 +9,8 @@ use anvyx_frontend::{
     ast::{FormatKind, FormatSign, FormatSpec},
 };
 
+use super::rep_policy::AirRustRepPolicy;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustBackendProfile;
 
@@ -109,20 +111,7 @@ impl ProfileCx<'_> {
     }
 
     fn check_type(&mut self, id: TypeId) {
-        let ok = match self.program.type_arena.data(id) {
-            TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
-            TypeData::Enum(enm) => self.enum_decl_supported(*enm),
-            TypeData::Extern(ext) => self.extern_type_supported(*ext),
-            TypeData::Array { elem, .. } => !self.non_copy_type(*elem),
-            TypeData::List(elem) | TypeData::Slice(elem) => {
-                self.check_type_ref(ProfileSite::Type(id), *elem);
-                true
-            }
-            ty => type_is_slice1(ty),
-        };
-        if !ok {
-            self.push(ProfileSite::Type(id), ProfileErrorKind::UnsupportedType);
-        }
+        self.check_type_ref(ProfileSite::Type(id), id);
     }
 
     fn aggregate_decl_supported(&self, aggregate: AggregateId) -> bool {
@@ -258,15 +247,12 @@ impl ProfileCx<'_> {
                         self.check_air_block(function, else_block);
                     }
                 }
-                air::AirStmt::Loop(_) => self.push(site, ProfileErrorKind::UnsupportedTerminator),
+                air::AirStmt::Loop(loop_) => self.check_air_block(function, &loop_.body),
             }
         }
         if let air::AirTail::Return(Some(value)) = &body.tail {
             let site = ProfileSite::Terminator(function);
             self.check_operand(site, value);
-            if self.borrowed_string_param_operand(function, value) {
-                self.push(site, ProfileErrorKind::NonCopyValueRequired);
-            }
         }
     }
 
@@ -310,13 +296,17 @@ impl ProfileCx<'_> {
     }
 
     fn check_mutating_rvalue(&mut self, site: ProfileSite, function: FunctionId, value: &RValue) {
-        if let RValue::ListPush { list, .. } = value
-            && self
-                .program
-                .function(function)
-                .locals
-                .get(list.root.index())
-                .is_some_and(|local| local.mutability != Mutability::Mutable)
+        let place = match value {
+            RValue::ListPush { list, .. } => list,
+            RValue::MapInsert { map, .. } | RValue::MapRemove { map, .. } => map,
+            _ => return,
+        };
+        if self
+            .program
+            .function(function)
+            .locals
+            .get(place.root.index())
+            .is_some_and(|local| local.mutability != Mutability::Mutable)
         {
             self.push(site, ProfileErrorKind::UnsupportedRValue);
         }
@@ -326,7 +316,7 @@ impl ProfileCx<'_> {
         match value {
             RValue::Use(operand) => {
                 self.check_operand(site, operand);
-                if self.non_copy_value_operand(operand) {
+                if self.non_shareable_value_operand(operand) {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
@@ -351,11 +341,6 @@ impl ProfileCx<'_> {
             }
             RValue::Stringify { value, source_ty } => {
                 self.check_operand(site, value);
-                if matches!(value, Operand::Place(_))
-                    && matches!(self.program.type_arena.data(*source_ty), TypeData::String)
-                {
-                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                }
                 self.check_type_ref(site, *source_ty);
             }
             RValue::StringConcat { parts } => {
@@ -402,7 +387,7 @@ impl ProfileCx<'_> {
                 if self.operand_ty(value) != *elem {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                if self.non_copy_value_operand(value) {
+                if self.non_shareable_value_operand(value) {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
@@ -420,11 +405,48 @@ impl ProfileCx<'_> {
                 ty,
                 ..
             } => self.check_slice_rvalue(site, source, *start, *end, *ty, true),
+            RValue::MapGet { map, key, ty } | RValue::MapRemove { map, key, ty } => {
+                self.check_place(site, map);
+                self.check_operand(site, key);
+                self.check_type_ref(site, *ty);
+                let TypeData::Map {
+                    key: expected_key,
+                    value,
+                    ..
+                } = self.program.type_arena.data(map.ty)
+                else {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    return;
+                };
+                if self.operand_ty(key) != *expected_key {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
+                if !matches!(self.program.type_arena.data(*ty), TypeData::Optional(inner) if *inner == *value)
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
+            }
+            RValue::MapInsert { map, key, value } => {
+                self.check_place(site, map);
+                self.check_operand(site, key);
+                self.check_operand(site, value);
+                let TypeData::Map {
+                    key: expected_key,
+                    value: expected_value,
+                    ..
+                } = self.program.type_arena.data(map.ty)
+                else {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    return;
+                };
+                if self.operand_ty(key) != *expected_key
+                    || self.operand_ty(value) != *expected_value
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
+            }
             RValue::SharedRefEq { .. }
             | RValue::ListPop { .. }
-            | RValue::MapGet { .. }
-            | RValue::MapInsert { .. }
-            | RValue::MapRemove { .. }
             | RValue::MapEntryAt { .. }
             | RValue::MakeClosure { .. } => {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
@@ -454,7 +476,7 @@ impl ProfileCx<'_> {
                     if self.operand_ty(operand) != field.ty {
                         self.push(site, ProfileErrorKind::UnsupportedRValue);
                     }
-                    if self.non_copy_value_operand(operand) {
+                    if self.non_shareable_value_operand(operand) {
                         self.push(site, ProfileErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -473,7 +495,7 @@ impl ProfileCx<'_> {
                     if self.operand_ty(operand) != field.ty {
                         self.push(site, ProfileErrorKind::UnsupportedRValue);
                     }
-                    if self.non_copy_value_operand(operand) {
+                    if self.non_shareable_value_operand(operand) {
                         self.push(site, ProfileErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -502,7 +524,7 @@ impl ProfileCx<'_> {
                     if self.operand_ty(operand) != expected {
                         self.push(site, ProfileErrorKind::UnsupportedRValue);
                     }
-                    if self.non_copy_value_operand(operand) {
+                    if self.non_shareable_value_operand(operand) {
                         self.push(site, ProfileErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -520,7 +542,7 @@ impl ProfileCx<'_> {
                     if self.operand_ty(operand) != *elem {
                         self.push(site, ProfileErrorKind::UnsupportedRValue);
                     }
-                    if self.non_copy_value_operand(operand) {
+                    if self.non_shareable_value_operand(operand) {
                         self.push(site, ProfileErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -535,12 +557,29 @@ impl ProfileCx<'_> {
                     if self.operand_ty(operand) != *elem {
                         self.push(site, ProfileErrorKind::UnsupportedRValue);
                     }
-                    if self.non_copy_value_operand(operand) {
+                    if self.non_shareable_value_operand(operand) {
                         self.push(site, ProfileErrorKind::NonCopyValueRequired);
                     }
                 }
             }
-            AggregateCtor::Tuple | AggregateCtor::Map | AggregateCtor::DataRef(_) => {
+            AggregateCtor::Map => {
+                let TypeData::Map { key, value, .. } = self.program.type_arena.data(ty) else {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    return;
+                };
+                if !fields.len().is_multiple_of(2) {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
+                for entry in fields.chunks_exact(2) {
+                    for (operand, expected) in [(&entry[0], *key), (&entry[1], *value)] {
+                        self.check_operand(site, operand);
+                        if self.operand_ty(operand) != expected {
+                            self.push(site, ProfileErrorKind::UnsupportedRValue);
+                        }
+                    }
+                }
+            }
+            AggregateCtor::Tuple | AggregateCtor::DataRef(_) => {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
         }
@@ -580,7 +619,7 @@ impl ProfileCx<'_> {
                 TypeData::Slice(elem),
             ) if source_elem == elem => {}
             (true, TypeData::List(source_elem), TypeData::List(elem)) if source_elem == elem => {
-                if self.non_copy_type(*elem) {
+                if !self.policy().value_place_shareable(*elem) {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
@@ -609,7 +648,7 @@ impl ProfileCx<'_> {
         match arg {
             CallArg::Value(operand) => {
                 self.check_operand(site, operand);
-                if self.non_copy_value_operand(operand) {
+                if self.non_shareable_value_operand(operand) {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
@@ -617,32 +656,22 @@ impl ProfileCx<'_> {
             CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
                 self.check_place(site, place);
-                self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                if !self.supports_param_mode(place.ty, ParamMode::MutBorrow) {
+                    self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                }
             }
         }
     }
 
-    fn non_copy_value_operand(&self, operand: &Operand) -> bool {
-        matches!(operand, Operand::Place(place) if self.non_copy_type(place.ty))
-    }
-
-    fn borrowed_string_param_operand(&self, function: FunctionId, operand: &Operand) -> bool {
+    fn non_shareable_value_operand(&self, operand: &Operand) -> bool {
         let Operand::Place(place) = operand else {
             return false;
         };
-        matches!(self.program.type_arena.data(place.ty), TypeData::String)
-            && place.projection.is_empty()
-            && self
-                .program
-                .function(function)
-                .signature
-                .params
-                .iter()
-                .any(|param| param.local_id == place.root && param.mode == ParamMode::SharedBorrow)
+        self.non_copy_type(place.ty) && !self.policy().value_place_shareable(place.ty)
     }
 
     fn non_copy_type(&self, ty: TypeId) -> bool {
-        !super::rust_copyable_air_type(&self.classes, ty)
+        !self.policy().copyable(ty)
     }
 
     fn operand_ty(&self, operand: &Operand) -> TypeId {
@@ -653,30 +682,7 @@ impl ProfileCx<'_> {
     }
 
     fn supports_param_mode(&self, ty: TypeId, mode: ParamMode) -> bool {
-        match mode {
-            ParamMode::Value => matches!(
-                self.program.type_arena.data(ty),
-                TypeData::Int
-                    | TypeData::Float
-                    | TypeData::Bool
-                    | TypeData::Void
-                    | TypeData::Aggregate(_)
-                    | TypeData::Enum(_)
-                    | TypeData::Extern(_)
-                    | TypeData::Array { .. }
-                    | TypeData::List(_)
-            ),
-            ParamMode::SharedBorrow => matches!(
-                self.program.type_arena.data(ty),
-                TypeData::String
-                    | TypeData::Aggregate(_)
-                    | TypeData::Enum(_)
-                    | TypeData::Extern(_)
-                    | TypeData::Array { .. }
-                    | TypeData::List(_)
-            ),
-            ParamMode::MutBorrow => matches!(self.program.type_arena.data(ty), TypeData::Extern(_)),
-        }
+        self.policy().supports_param_mode(ty, mode)
     }
 
     fn check_operand(&mut self, site: ProfileSite, operand: &Operand) {
@@ -712,8 +718,21 @@ impl ProfileCx<'_> {
                 self.check_type_ref(site, *elem);
                 !self.non_copy_type(*elem)
             }
-            TypeData::List(elem) | TypeData::Slice(elem) => {
+            TypeData::List(elem) => {
                 self.check_type_ref(site, *elem);
+                self.policy().list_supported(ty)
+            }
+            TypeData::Slice(elem) => {
+                self.check_type_ref(site, *elem);
+                true
+            }
+            TypeData::Map { key, value, .. } => {
+                self.check_type_ref(site, *key);
+                self.check_type_ref(site, *value);
+                self.policy().map_supported(ty)
+            }
+            TypeData::Optional(inner) => {
+                self.check_type_ref(site, *inner);
                 true
             }
             ty => type_is_slice1(ty),
@@ -727,6 +746,10 @@ impl ProfileCx<'_> {
         if !const_is_slice1(self.program, id) {
             self.push(site, ProfileErrorKind::UnsupportedConst);
         }
+    }
+
+    fn policy(&self) -> AirRustRepPolicy<'_> {
+        AirRustRepPolicy::new(self.program, &self.classes)
     }
 
     fn push(&mut self, site: ProfileSite, kind: ProfileErrorKind) {

@@ -1,6 +1,7 @@
 pub mod cargo_job;
 pub mod emit;
 pub mod profile;
+pub mod rep_policy;
 pub mod rir;
 #[cfg(test)]
 mod source_job;
@@ -11,21 +12,22 @@ use anvyx_frontend::{
     air::{
         self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId, LocalId,
         LocalKind, Mutability, Operand, ParamMode, Place, Projection, RValue, TypeData, TypeId,
-        TypePassClass, TypePassClasses, VerifiedProgram,
+        TypePassClasses, VerifiedProgram,
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
-use anvyx_runtime::{RustAbiSupport, RustExternBinding, RustProviderSupport};
+use anvyx_runtime::{RustAbiSupport, RustExternBinding, RustPath, RustProviderSupport};
 
 use self::{
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
+    rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
         RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
         RirCtxPlan, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern,
         RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign,
         RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal,
-        RirLocalId, RirNativeExtern, RirOperand, RirParam, RirParamAbi, RirParamSemantic, RirPlace,
-        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirStmt,
+        RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand, RirParam, RirParamSemantic,
+        RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirStmt,
         RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
         RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
         RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
@@ -305,11 +307,17 @@ impl<'a> PlanCx<'a> {
                     len: *len as u64,
                 },
                 TypeData::List(elem) => RirType::List(self.type_map[elem]),
+                TypeData::Map { key, value, .. } if self.air_policy().map_supported(type_id) => {
+                    RirType::Map {
+                        key: self.type_map[key],
+                        value: self.type_map[value],
+                    }
+                }
+                TypeData::Optional(inner) => RirType::Option(self.type_map[inner]),
                 TypeData::Slice(elem) => RirType::Slice(self.type_map[elem]),
                 TypeData::Any
-                | TypeData::Optional(_)
-                | TypeData::Tuple(_)
                 | TypeData::Map { .. }
+                | TypeData::Tuple(_)
                 | TypeData::Function(_)
                 | TypeData::Dyn(_)
                 | TypeData::DataRef(_) => {
@@ -395,7 +403,7 @@ impl<'a> PlanCx<'a> {
             });
         }
         let strukt = &mut program.structs[struct_id.index()];
-        strukt.copyable = rust_copyable_air_type(&self.classes, type_id);
+        strukt.copyable = self.rust_copyable_air_type(type_id);
         strukt.fields = fields;
         Ok(())
     }
@@ -425,7 +433,7 @@ impl<'a> PlanCx<'a> {
                 sanitize(decl.name.as_str())
             )),
             display: RirSymbol::new(decl.name.as_str()),
-            native_path: Some(native_type_path(native)),
+            native_path: Some(native_path(&native.path)),
             native_key: Some(native.key.clone()),
             copyable: true,
             fields: vec![],
@@ -509,7 +517,7 @@ impl<'a> PlanCx<'a> {
                     let fields = types
                         .iter()
                         .enumerate()
-                        .map(|(index, ty)| self.enum_field(program, decl.core, type_id, *ty, index))
+                        .map(|(index, ty)| self.enum_field(type_id, *ty, index))
                         .collect::<Result<Vec<_>, _>>()?;
                     (RirVariantKind::Tuple, fields)
                 }
@@ -519,12 +527,10 @@ impl<'a> PlanCx<'a> {
                         .iter()
                         .enumerate()
                         .map(|(index, field)| {
-                            self.enum_field(program, decl.core, type_id, field.ty, index)
-                                .map(|mut rir| {
-                                    rir.symbol =
-                                        scoped_symbol(field.name.as_str(), &mut seen_fields);
-                                    rir
-                                })
+                            self.enum_field(type_id, field.ty, index).map(|mut rir| {
+                                rir.symbol = scoped_symbol(field.name.as_str(), &mut seen_fields);
+                                rir
+                            })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     (RirVariantKind::Struct, fields)
@@ -540,15 +546,13 @@ impl<'a> PlanCx<'a> {
             });
         }
         let rir = &mut program.enums[enum_id.index()];
-        rir.copyable = rust_copyable_air_type(&self.classes, type_id);
+        rir.copyable = self.rust_copyable_air_type(type_id);
         rir.variants = variants;
         Ok(())
     }
 
     fn enum_field(
         &self,
-        program: &RirProgram,
-        enum_core: Option<air::CoreEnumKind>,
         enum_ty: TypeId,
         ty: TypeId,
         index: usize,
@@ -560,8 +564,7 @@ impl<'a> PlanCx<'a> {
             ));
         };
         let recursive = ty == enum_ty;
-        let nested_enum = matches!(program.types[rir_ty.index()], RirType::Enum(_));
-        if recursive || (nested_enum && enum_core != Some(air::CoreEnumKind::Option)) {
+        if recursive {
             return Err(self.gap(
                 RustTargetGapSite::Type(ty),
                 RustTargetGapKind::UnsupportedType,
@@ -635,7 +638,7 @@ impl<'a> PlanCx<'a> {
                     function: self.function_map[&function],
                     mode: RirParamSemantic::SharedBorrow,
                 }),
-                ParamMode::Value if rust_copyable_air_type(&self.classes, ty) => {
+                ParamMode::Value if self.rust_copyable_air_type(ty) => {
                     Ok(RirStringifyReqKind::Override {
                         function: self.function_map[&function],
                         mode: RirParamSemantic::Value,
@@ -720,7 +723,7 @@ impl<'a> PlanCx<'a> {
             let air_id = ExternId::from_index(index);
             let decl = self.air.extern_decl(air_id);
             let id = RirExternId::from_index(program.externs.len());
-            let params = self.extern_params(decl);
+            let params = self.extern_params(program, decl);
             let kind = self.extern_kind(air_id, decl)?;
             program.externs.push(RirExtern {
                 id,
@@ -738,13 +741,18 @@ impl<'a> PlanCx<'a> {
         Ok(())
     }
 
-    fn extern_params(&self, decl: &air::ExternDecl) -> Vec<RirExternParam> {
+    fn extern_params(&self, program: &RirProgram, decl: &air::ExternDecl) -> Vec<RirExternParam> {
+        let policy = RustRepPolicy::new(program);
         decl.call_params()
             .into_iter()
-            .map(|param| RirExternParam {
-                ty: self.type_map[&param.ty],
-                semantic: rir::semantic_from_air(param.mode),
-                abi: abi_for(param.mode),
+            .map(|param| {
+                let ty = self.type_map[&param.ty];
+                let semantic = rir::semantic_from_air(param.mode);
+                RirExternParam {
+                    ty,
+                    semantic,
+                    abi: policy.param_abi(semantic),
+                }
             })
             .collect()
     }
@@ -768,7 +776,7 @@ impl<'a> PlanCx<'a> {
                 ));
             }
             return Ok(RirExternKind::Native(RirNativeExtern {
-                path: native_path(native),
+                path: native_path(&native.path),
                 abi: native.abi.clone(),
             }));
         }
@@ -860,15 +868,20 @@ impl<'a> PlanCx<'a> {
                 local.initialized = true;
             }
         }
+        let policy = RustRepPolicy::new(program);
         let params = function
             .signature
             .params
             .iter()
-            .map(|param| RirParam {
-                local: RirLocalId::from_index(param.local_id.index()),
-                ty: self.type_map[&param.ty],
-                semantic: rir::semantic_from_air(param.mode),
-                abi: abi_for(param.mode),
+            .map(|param| {
+                let ty = self.type_map[&param.ty];
+                let semantic = rir::semantic_from_air(param.mode);
+                RirParam {
+                    local: RirLocalId::from_index(param.local_id.index()),
+                    ty,
+                    semantic,
+                    abi: policy.param_abi(semantic),
+                }
             })
             .collect();
         let body = self.plan_air_block(air_id, &function.body.block)?;
@@ -903,7 +916,7 @@ impl<'a> PlanCx<'a> {
                 .iter()
                 .map(|stmt| self.plan_air_stmt(function, stmt))
                 .collect::<Result<Vec<_>, _>>()?,
-            term: self.plan_air_tail(function, &block.tail)?,
+            term: self.plan_air_tail(&block.tail),
         })
     }
 
@@ -931,6 +944,10 @@ impl<'a> PlanCx<'a> {
                     .map(|block| self.plan_air_block(function, block))
                     .transpose()?,
             })),
+            air::AirStmt::Loop(loop_) => Ok(RirStmt::Loop(RirLoop {
+                id: RirLoopId::from_index(loop_.id.index()),
+                body: self.plan_air_block(function, &loop_.body)?,
+            })),
             air::AirStmt::EnumMatch(match_) => Ok(RirStmt::EnumMatch(RirEnumMatch {
                 discr: self.plan_place(&match_.discr),
                 arms: match_
@@ -949,31 +966,19 @@ impl<'a> PlanCx<'a> {
                     .map(|block| self.plan_air_block(function, block))
                     .transpose()?,
             })),
-            air::AirStmt::Loop(_) => Err(self.gap(
-                RustTargetGapSite::Function(function),
-                RustTargetGapKind::UnsupportedTerminator,
-            )),
         }
     }
 
-    fn plan_air_tail(
-        &self,
-        function: FunctionId,
-        tail: &air::AirTail,
-    ) -> Result<RirTerm, RustPlanError> {
-        Ok(match tail {
+    fn plan_air_tail(&self, tail: &air::AirTail) -> RirTerm {
+        match tail {
             air::AirTail::None => RirTerm::None,
             air::AirTail::Return(value) => {
                 RirTerm::Return(value.as_ref().map(|value| self.plan_operand(value)))
             }
             air::AirTail::Unreachable => RirTerm::Unreachable,
-            air::AirTail::Break(_) | air::AirTail::Continue(_) => {
-                return Err(self.gap(
-                    RustTargetGapSite::Function(function),
-                    RustTargetGapKind::UnsupportedTerminator,
-                ));
-            }
-        })
+            air::AirTail::Break(id) => RirTerm::Break(RirLoopId::from_index(id.index())),
+            air::AirTail::Continue(id) => RirTerm::Continue(RirLoopId::from_index(id.index())),
+        }
     }
 
     fn plan_rvalue(
@@ -1047,11 +1052,23 @@ impl<'a> PlanCx<'a> {
                 inclusive: *inclusive,
                 ty: self.type_map[ty],
             }),
+            RValue::MapGet { map, key, ty } => Ok(RirRValue::MapGet {
+                map: self.plan_place(map),
+                key: self.plan_operand(key),
+                ty: self.type_map[ty],
+            }),
+            RValue::MapInsert { map, key, value } => Ok(RirRValue::MapInsert {
+                map: self.plan_place(map),
+                key: self.plan_operand(key),
+                value: self.plan_operand(value),
+            }),
+            RValue::MapRemove { map, key, ty } => Ok(RirRValue::MapRemove {
+                map: self.plan_place(map),
+                key: self.plan_operand(key),
+                ty: self.type_map[ty],
+            }),
             RValue::SharedRefEq { .. }
             | RValue::ListPop { .. }
-            | RValue::MapGet { .. }
-            | RValue::MapInsert { .. }
-            | RValue::MapRemove { .. }
             | RValue::MapEntryAt { .. }
             | RValue::MakeClosure { .. } => Err(self.gap(
                 RustTargetGapSite::Function(function),
@@ -1068,7 +1085,9 @@ impl<'a> PlanCx<'a> {
         let Operand::Place(place) = operand else {
             return Ok(RirRValue::Use(self.plan_operand(operand)));
         };
-        if !rust_copyable_air_type(&self.classes, place.ty) {
+        if !self.rust_copyable_air_type(place.ty)
+            && !self.air_policy().value_place_shareable(place.ty)
+        {
             return Err(self.gap(
                 RustTargetGapSite::Function(function),
                 RustTargetGapKind::NonCopyValueRequired,
@@ -1131,6 +1150,13 @@ impl<'a> PlanCx<'a> {
                 elems: fields
                     .iter()
                     .map(|field| self.plan_operand(field))
+                    .collect(),
+            }),
+            AggregateCtor::Map if fields.len().is_multiple_of(2) => Ok(RirRValue::Map {
+                ty: self.type_map[&ty],
+                entries: fields
+                    .chunks_exact(2)
+                    .map(|entry| (self.plan_operand(&entry[0]), self.plan_operand(&entry[1])))
                     .collect(),
             }),
             AggregateCtor::Tuple | AggregateCtor::Map | AggregateCtor::DataRef(_) => Err(self.gap(
@@ -1196,6 +1222,14 @@ impl<'a> PlanCx<'a> {
             Operand::Place(place) => place.ty,
             Operand::Const(id) => self.air.const_arena.get(*id).ty,
         }
+    }
+
+    fn rust_copyable_air_type(&self, ty: TypeId) -> bool {
+        self.air_policy().copyable(ty)
+    }
+
+    fn air_policy(&self) -> AirRustRepPolicy<'_> {
+        AirRustRepPolicy::new(self.air, &self.classes)
     }
 
     fn plan_place(&self, place: &Place) -> RirPlace {
@@ -1266,24 +1300,10 @@ fn rir_raw_enum_value(value: &air::RawEnumValue) -> RirRawEnumValue {
     }
 }
 
-fn native_type_path(binding: &anvyx_runtime::RustTypeBinding) -> Vec<String> {
-    let mut path = vec![binding.path.crate_name.clone()];
-    path.extend(binding.path.segments.clone());
-    path
-}
-
-fn native_path(binding: &RustExternBinding) -> Vec<String> {
-    let mut path = vec![binding.path.crate_name.clone()];
-    path.extend(binding.path.segments.clone());
-    path
-}
-
-fn abi_for(mode: ParamMode) -> RirParamAbi {
-    match mode {
-        ParamMode::Value => RirParamAbi::Value,
-        ParamMode::SharedBorrow => RirParamAbi::SharedBorrow,
-        ParamMode::MutBorrow => RirParamAbi::MutBorrow,
-    }
+fn native_path(path: &RustPath) -> Vec<String> {
+    let mut out = vec![path.crate_name.clone()];
+    out.extend(path.segments.clone());
+    out
 }
 
 fn function_symbol(
@@ -1327,6 +1347,12 @@ fn type_suffix(program: &RirProgram, ty: RirTypeId) -> String {
         RirType::String => "string".to_string(),
         RirType::Void => "void".to_string(),
         RirType::List(elem) => format!("list_{}", type_suffix(program, elem)),
+        RirType::Option(inner) => format!("option_{}", type_suffix(program, inner)),
+        RirType::Map { key, value } => format!(
+            "map_{}_{}",
+            type_suffix(program, key),
+            type_suffix(program, value)
+        ),
         RirType::Slice(elem) => format!("slice_{}", type_suffix(program, elem)),
         RirType::Array { elem, len } => format!("array_{}_{}", len, type_suffix(program, elem)),
         RirType::Struct(id) => named_type_suffix(ty.index(), &program.structs[id.index()].display),
@@ -1392,15 +1418,6 @@ fn local_symbol(index: usize, name: Option<&Ident>) -> RirSymbol {
         Some(name) => RirSymbol::new(format!("v{index}_{}", sanitize(name.as_str()))),
         None => RirSymbol::new(format!("v{index}")),
     }
-}
-
-fn rust_copyable_air_type(classes: &TypePassClasses, ty: TypeId) -> bool {
-    classes.get(ty).is_some_and(|class| {
-        matches!(
-            class,
-            TypePassClass::Immediate | TypePassClass::SmallCopyInline(_)
-        )
-    })
 }
 
 fn scoped_symbol(text: &str, seen: &mut Vec<String>) -> RirSymbol {

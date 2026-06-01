@@ -177,6 +177,21 @@ pub enum BadRValue {
         expected: TypeId,
         found: TypeId,
     },
+    CollectionCtorResultTypeMismatch {
+        ctor: AggregateCtor,
+        found: TypeId,
+    },
+    CollectionCtorFieldCountMismatch {
+        ctor: AggregateCtor,
+        expected: usize,
+        found: usize,
+    },
+    CollectionCtorFieldTypeMismatch {
+        ctor: AggregateCtor,
+        field: usize,
+        expected: TypeId,
+        found: TypeId,
+    },
     ExternCtorResultTypeMismatch {
         extern_id: ExternTypeId,
         found: TypeId,
@@ -1820,7 +1835,7 @@ fn verify_init_stmt(
         }
         cx.verify_type_ref(site.clone(), target.ty);
         if let Some(value_ty) = typing::rvalue_ty(cx.program, &cx.primitives, value)
-            && value_ty != target.ty
+            && !same_type(cx, value_ty, target.ty)
         {
             cx.push(
                 site.clone(),
@@ -1858,7 +1873,7 @@ fn verify_assign_stmt(
     verify_rvalue(cx, function_id, block_id, Some(index), value);
     if let (Some(expected), Some(found)) =
         (dst_ty, typing::rvalue_ty(cx.program, &cx.primitives, value))
-        && expected != found
+        && !same_type(cx, expected, found)
     {
         cx.push(
             site,
@@ -2081,10 +2096,10 @@ fn verify_rvalue(
                 AggregateCtor::EnumVariant { enum_id, variant } => {
                     verify_enum_ctor(cx, site.clone(), *enum_id, *variant, *ty, fields);
                 }
-                AggregateCtor::Tuple
-                | AggregateCtor::List
-                | AggregateCtor::Array
-                | AggregateCtor::Map => {}
+                AggregateCtor::Array => verify_array_ctor(cx, site.clone(), *ty, fields),
+                AggregateCtor::List => verify_list_ctor(cx, site.clone(), *ty, fields),
+                AggregateCtor::Map => verify_map_ctor(cx, site.clone(), *ty, fields),
+                AggregateCtor::Tuple => {}
             }
             for field in fields {
                 verify_operand(cx, function_id, block_id, stmt_index, field);
@@ -2133,6 +2148,7 @@ fn verify_rvalue(
         RValue::ListPush { list, value } => {
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
             verify_place(cx, function_id, block_id, stmt_index, list);
+            verify_mutating_place(cx, function_id, &site, list);
             verify_operand(cx, function_id, block_id, stmt_index, value);
             if let Some(expected_elem) = list_elem_ty(cx, list)
                 && let Some(value_ty) = operand_ty(cx, value)
@@ -2188,8 +2204,18 @@ fn verify_rvalue(
             verify_slice_index(cx, function_id, block_id, stmt_idx, "start", *start);
             verify_slice_index(cx, function_id, block_id, stmt_idx, "end", *end);
         }
-        RValue::MapGet { map, key, ty } | RValue::MapRemove { map, key, ty } => {
+        RValue::MapGet { map, key, ty } => {
             verify_place(cx, function_id, block_id, stmt_index, map);
+            verify_operand(cx, function_id, block_id, stmt_index, key);
+            cx.verify_type_ref(site.clone(), *ty);
+            if let Some((expected_key, expected_value)) = map_kv(cx, map) {
+                verify_map_key(cx, &site, key, expected_key);
+                verify_optional_map_value(cx, &site, *ty, expected_value);
+            }
+        }
+        RValue::MapRemove { map, key, ty } => {
+            verify_place(cx, function_id, block_id, stmt_index, map);
+            verify_mutating_place(cx, function_id, &site, map);
             verify_operand(cx, function_id, block_id, stmt_index, key);
             cx.verify_type_ref(site.clone(), *ty);
             if let Some((expected_key, expected_value)) = map_kv(cx, map) {
@@ -2200,6 +2226,7 @@ fn verify_rvalue(
         RValue::MapInsert { map, key, value } => {
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
             verify_place(cx, function_id, block_id, stmt_index, map);
+            verify_mutating_place(cx, function_id, &site, map);
             verify_operand(cx, function_id, block_id, stmt_index, key);
             verify_operand(cx, function_id, block_id, stmt_index, value);
             if let Some((expected_key, expected_value)) = map_kv(cx, map) {
@@ -2239,6 +2266,26 @@ fn verify_rvalue(
     }
 }
 
+fn verify_mutating_place(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    site: &VerifySite,
+    place: &Place,
+) {
+    if cx
+        .program
+        .function(function_id)
+        .locals
+        .get(place.root.index())
+        .is_some_and(|local| local.mutability == Mutability::Immutable)
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::AssignImmutableLocal(place.root)),
+        );
+    }
+}
+
 fn verify_map_key(cx: &mut VerifyCx<'_>, site: &VerifySite, key: &Operand, expected: TypeId) {
     if let Some(found) = operand_ty(cx, key)
         && found != expected
@@ -2248,6 +2295,24 @@ fn verify_map_key(cx: &mut VerifyCx<'_>, site: &VerifySite, key: &Operand, expec
             VerifyErrorKind::BadFunction(BadFunction::MapKeyTypeMismatch { expected, found }),
         );
     }
+}
+
+fn same_type(cx: &VerifyCx<'_>, lhs: TypeId, rhs: TypeId) -> bool {
+    lhs == rhs
+        || matches!(
+            (cx.type_data(lhs), cx.type_data(rhs)),
+            (Some(TypeData::Int), Some(TypeData::Int))
+                | (Some(TypeData::Float), Some(TypeData::Float))
+                | (Some(TypeData::Bool), Some(TypeData::Bool))
+                | (Some(TypeData::String), Some(TypeData::String))
+                | (Some(TypeData::Void), Some(TypeData::Void))
+        )
+        || match (cx.type_data(lhs), cx.type_data(rhs)) {
+            (Some(TypeData::Optional(lhs)), Some(TypeData::Optional(rhs))) => {
+                same_type(cx, *lhs, *rhs)
+            }
+            _ => false,
+        }
 }
 
 fn verify_map_value(cx: &mut VerifyCx<'_>, site: &VerifySite, value: &Operand, expected: TypeId) {
@@ -2267,8 +2332,7 @@ fn verify_optional_map_value(
     found: TypeId,
     expected_value: TypeId,
 ) {
-    let valid =
-        matches!(cx.type_data(found), Some(TypeData::Optional(inner)) if *inner == expected_value);
+    let valid = matches!(cx.type_data(found), Some(TypeData::Optional(inner)) if same_type(cx, *inner, expected_value));
     if !valid {
         cx.push(
             site.clone(),
@@ -2491,19 +2555,6 @@ fn verify_place(
                         }
                         current_ty = *elem;
                     }
-                    TypeData::Map { key, value, .. } => {
-                        if index_local.ty != *key {
-                            cx.push(
-                                site.clone(),
-                                VerifyErrorKind::BadPlace(BadPlace::IndexLocalTypeMismatch {
-                                    expected: *key,
-                                    found: index_local.ty,
-                                }),
-                            );
-                            return None;
-                        }
-                        current_ty = *value;
-                    }
                     _ => {
                         cx.push(
                             site.clone(),
@@ -2542,6 +2593,109 @@ fn valid_cast(cx: &VerifyCx<'_>, source: TypeId, target: TypeId) -> bool {
         return false;
     };
     cx.has_enum(*enum_id) && cx.program.raw_enum_raw_type(*enum_id) == Some(target)
+}
+
+fn verify_array_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+    let Some(TypeData::Array { elem, len }) = cx.type_data(ty).cloned() else {
+        push_collection_result_mismatch(cx, site, AggregateCtor::Array, ty);
+        return;
+    };
+    if fields.len() != len {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::CollectionCtorFieldCountMismatch {
+                ctor: AggregateCtor::Array,
+                expected: len,
+                found: fields.len(),
+            }),
+        );
+    }
+    verify_collection_fields(cx, &site, &AggregateCtor::Array, elem, fields);
+}
+
+fn verify_list_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+    let Some(TypeData::List(elem)) = cx.type_data(ty).cloned() else {
+        push_collection_result_mismatch(cx, site, AggregateCtor::List, ty);
+        return;
+    };
+    verify_collection_fields(cx, &site, &AggregateCtor::List, elem, fields);
+}
+
+fn verify_map_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+    let Some(TypeData::Map { key, value, .. }) = cx.type_data(ty).cloned() else {
+        push_collection_result_mismatch(cx, site, AggregateCtor::Map, ty);
+        return;
+    };
+    if !fields.len().is_multiple_of(2) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::CollectionCtorFieldCountMismatch {
+                ctor: AggregateCtor::Map,
+                expected: fields.len() + 1,
+                found: fields.len(),
+            }),
+        );
+    }
+    for (index, entry) in fields.chunks_exact(2).enumerate() {
+        let base = index * 2;
+        for (offset, expected) in [(0, key), (1, value)] {
+            verify_collection_field(
+                cx,
+                &site,
+                &AggregateCtor::Map,
+                base + offset,
+                &entry[offset],
+                expected,
+            );
+        }
+    }
+}
+
+fn verify_collection_fields(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    ctor: &AggregateCtor,
+    expected: TypeId,
+    fields: &[Operand],
+) {
+    for (field, operand) in fields.iter().enumerate() {
+        verify_collection_field(cx, site, ctor, field, operand, expected);
+    }
+}
+
+fn push_collection_result_mismatch(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    ctor: AggregateCtor,
+    found: TypeId,
+) {
+    cx.push(
+        site,
+        VerifyErrorKind::BadRValue(BadRValue::CollectionCtorResultTypeMismatch { ctor, found }),
+    );
+}
+
+fn verify_collection_field(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    ctor: &AggregateCtor,
+    field: usize,
+    operand: &Operand,
+    expected: TypeId,
+) {
+    if let Some(found) = operand_ty(cx, operand)
+        && found != expected
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::CollectionCtorFieldTypeMismatch {
+                ctor: ctor.clone(),
+                field,
+                expected,
+                found,
+            }),
+        );
+    }
 }
 
 fn verify_aggregate_ctor(
