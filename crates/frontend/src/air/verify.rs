@@ -224,6 +224,10 @@ pub enum BadRValue {
         expected: TypeId,
         found: TypeId,
     },
+    OptionalSomeTypeMismatch {
+        expected: TypeId,
+        found: TypeId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1694,6 +1698,7 @@ fn verify_air_rvalue_reads(
         RValue::Use(op)
         | RValue::Stringify { value: op, .. }
         | RValue::Unary { value: op, .. }
+        | RValue::OptionalSome { value: op, .. }
         | RValue::Cast { value: op, .. }
         | RValue::Format { value: op, .. } => {
             verify_air_operand_read(cx, function_id, index, op, state);
@@ -2053,6 +2058,27 @@ fn verify_rvalue(
             verify_operand(cx, function_id, block_id, stmt_index, lhs);
             verify_operand(cx, function_id, block_id, stmt_index, rhs);
             required_rvalue_primitive(cx, site, PrimitiveKind::Bool);
+        }
+        RValue::OptionalSome { value, ty } => {
+            verify_operand(cx, function_id, block_id, stmt_index, value);
+            cx.verify_type_ref(site.clone(), *ty);
+            match (cx.type_data(*ty), operand_ty(cx, value)) {
+                (Some(TypeData::Optional(inner)), Some(value_ty)) if *inner == value_ty => {}
+                (Some(TypeData::Optional(inner)), Some(value_ty)) => cx.push(
+                    site,
+                    VerifyErrorKind::BadRValue(BadRValue::OptionalSomeTypeMismatch {
+                        expected: *inner,
+                        found: value_ty,
+                    }),
+                ),
+                _ => cx.push(
+                    site,
+                    VerifyErrorKind::BadRValue(BadRValue::OptionalSomeTypeMismatch {
+                        expected: *ty,
+                        found: operand_ty(cx, value).unwrap_or(*ty),
+                    }),
+                ),
+            }
         }
         RValue::Cast { value: op, target } => {
             verify_operand(cx, function_id, block_id, stmt_index, op);

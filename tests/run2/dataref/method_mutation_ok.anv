@@ -1,0 +1,23 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 3
+
+dataref Counter {
+    value: int,
+
+    fn inc(var self) {
+        self.value += 1;
+    }
+
+    fn add_two(var self) {
+        self.inc();
+        self.inc();
+    }
+}
+
+fn main() {
+    var c = Counter { value: 1 };
+    c.add_two();
+    println(c.value);
+}

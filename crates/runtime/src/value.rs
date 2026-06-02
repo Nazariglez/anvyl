@@ -6,6 +6,8 @@ use std::{
 
 use ecow::{EcoString, EcoVec};
 
+use crate::{Trace, TraceDriver, Visitor};
+
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct AnvString {
     text: EcoString,
@@ -72,6 +74,12 @@ impl fmt::Display for AnvString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+// SAFETY: `AnvString` owns only `EcoString` text and cannot contain heap handles.
+unsafe impl<'cx> Trace<'cx> for AnvString {
+    #[inline]
+    fn trace<D: TraceDriver<'cx>>(&self, _visitor: &mut Visitor<'cx, '_, D>) {}
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -251,6 +259,7 @@ impl<T: fmt::Debug> fmt::Debug for AnvList<T> {
 #[cfg(test)]
 mod tests {
     use super::{AnvList, AnvMap, AnvString};
+    use crate::{Heap, Trace, TraceDriver, Visitor};
 
     #[test]
     fn anv_string_static_and_owned_construction() {
@@ -295,6 +304,35 @@ mod tests {
         let text = AnvString::from("ctx-free");
 
         assert_eq!(accepts_str(text.as_str()), 8);
+    }
+
+    #[test]
+    fn tracked_heap_payload_can_contain_anv_string() {
+        struct Payload {
+            text: AnvString,
+        }
+
+        unsafe impl<'cx> Trace<'cx> for Payload {
+            fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+                self.text.trace(visitor);
+            }
+        }
+
+        Heap::scope(|heap| {
+            let payload = heap.register_tracked::<Payload>();
+            let handle = heap.alloc(
+                payload,
+                Payload {
+                    text: AnvString::from("tracked"),
+                },
+            );
+
+            assert_eq!(heap.with(&handle, |payload| payload.text.as_str().len()), 7);
+            assert_eq!(heap.collect_all().collected, 0);
+            drop(handle);
+            assert_eq!(heap.collect_all().collected, 1);
+            assert_eq!(heap.stats().live, 0);
+        });
     }
 
     #[test]

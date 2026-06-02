@@ -4,12 +4,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const STALE_ARTIFACT_LOCK_AFTER: Duration = Duration::from_mins(30);
-
 pub use anvyx_backend::rust::cargo_job::RustCargoProfile;
 use anvyx_backend::rust::{
     cargo_job::{
-        self, LockFile, RustCargoBatchCase, RustCargoBatchOutput, RustCargoCrateIdentityInput,
+        self, RustCargoBatchCase, RustCargoBatchOutput, RustCargoCrateIdentityInput,
         RustCargoDependency, RustCargoDependencySource, RustCargoFailure, RustCargoMode,
         RustCargoName, RustCargoOutput, RustCargoPackageMetadata, RustCargoPackageName,
         RustCargoSuccess, host_executable_name,
@@ -353,27 +351,24 @@ fn clean_artifact_name(raw: &str) -> String {
 fn publish_artifact(source: &Path, artifact: &Path) -> Result<(), cargo_job::RustCargoError> {
     let dir = artifact.parent().expect("artifact path has parent");
     fs::create_dir_all(dir)?;
-    let _lock = LockFile::acquire_stale(
-        artifact.with_extension("lock"),
-        None,
-        STALE_ARTIFACT_LOCK_AFTER,
-    )?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let tmp = artifact.with_file_name(format!(
-        ".{}.{}.tmp",
-        artifact
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("artifact"),
-        stamp
-    ));
-    fs::copy(source, &tmp)?;
-    let _ = fs::remove_file(artifact);
-    fs::rename(tmp, artifact)?;
-    Ok(())
+    cargo_job::with_lock(artifact.with_extension("lock"), None, || {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = artifact.with_file_name(format!(
+            ".{}.{}.tmp",
+            artifact
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("artifact"),
+            stamp
+        ));
+        fs::copy(source, &tmp)?;
+        let _ = fs::remove_file(artifact);
+        fs::rename(tmp, artifact)?;
+        Ok(())
+    })
 }
 
 fn semantic_profile_name(profile: anvyx_lang2::Profile) -> &'static str {

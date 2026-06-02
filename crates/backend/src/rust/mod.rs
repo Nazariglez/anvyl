@@ -23,14 +23,15 @@ use self::{
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
         RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
-        RirCtxPlan, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern,
-        RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign,
-        RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand, RirParam, RirParamSemantic,
-        RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirStmt,
-        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm,
+        RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
+        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
+        RirIf, RirLocal, RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand, RirParam,
+        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue,
+        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram,
     },
 };
 
@@ -222,7 +223,67 @@ struct PlanCx<'a> {
     const_map: HashMap<ConstId, RirConstId>,
     function_map: HashMap<FunctionId, RirFunctionId>,
     extern_map: HashMap<ExternId, RirExternId>,
+    dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
+}
+
+struct PlannedRValue {
+    stmts: Vec<RirStmt>,
+    value: RirRValue,
+    post_stmts: Vec<RirStmt>,
+}
+
+impl PlannedRValue {
+    fn from_value(value: RirRValue) -> Self {
+        Self {
+            stmts: vec![],
+            value,
+            post_stmts: vec![],
+        }
+    }
+}
+
+struct PlannedOperand {
+    stmts: Vec<RirStmt>,
+    operand: RirOperand,
+}
+
+impl PlannedOperand {
+    fn from_operand(operand: RirOperand) -> Self {
+        Self {
+            stmts: vec![],
+            operand,
+        }
+    }
+}
+
+struct PlannedOperands {
+    stmts: Vec<RirStmt>,
+    operands: Vec<RirOperand>,
+}
+
+struct PlannedCallArg {
+    stmts: Vec<RirStmt>,
+    arg: RirCallArg,
+    post_stmts: Vec<RirStmt>,
+}
+
+struct DataRefSegment {
+    object: RirOperand,
+    dataref: RirDataRefId,
+    projections: Vec<RirProjection>,
+    ty: TypeId,
+    next_index: usize,
+}
+
+impl PlannedCallArg {
+    fn from_arg(arg: RirCallArg) -> Self {
+        Self {
+            stmts: vec![],
+            arg,
+            post_stmts: vec![],
+        }
+    }
 }
 
 impl<'a> PlanCx<'a> {
@@ -237,6 +298,7 @@ impl<'a> PlanCx<'a> {
             const_map: HashMap::new(),
             function_map: HashMap::new(),
             extern_map: HashMap::new(),
+            dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
         }
     }
@@ -257,7 +319,7 @@ impl<'a> PlanCx<'a> {
             ..RirProgram::default()
         };
         self.plan_types(&mut program)?;
-        self.plan_consts(&mut program)?;
+        self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
         self.plan_stringify_helpers(&mut program)?;
@@ -278,6 +340,7 @@ impl<'a> PlanCx<'a> {
         let mut aggregate_types = vec![];
         let mut extern_types = vec![];
         let mut enum_types = vec![];
+        let mut dataref_types = vec![];
         for (index, ty) in self.air.type_arena.iter().enumerate() {
             debug_assert_eq!(program.types.len(), index);
             let type_id = TypeId::from_index(index);
@@ -296,6 +359,11 @@ impl<'a> PlanCx<'a> {
                     let enum_id = self.reserve_enum(program, type_id, *enm);
                     enum_types.push((type_id, *enm, enum_id));
                     RirType::Enum(enum_id)
+                }
+                TypeData::DataRef(aggregate) => {
+                    let dataref_id = self.reserve_dataref(program, type_id, *aggregate)?;
+                    dataref_types.push((type_id, *aggregate, dataref_id));
+                    RirType::DataRef(dataref_id)
                 }
                 TypeData::Extern(ext) => {
                     let struct_id = self.reserve_extern_struct(program, type_id, *ext)?;
@@ -319,8 +387,7 @@ impl<'a> PlanCx<'a> {
                 | TypeData::Map { .. }
                 | TypeData::Tuple(_)
                 | TypeData::Function(_)
-                | TypeData::Dyn(_)
-                | TypeData::DataRef(_) => {
+                | TypeData::Dyn(_) => {
                     return Err(self.gap(
                         RustTargetGapSite::Type(type_id),
                         RustTargetGapKind::UnsupportedType,
@@ -334,6 +401,9 @@ impl<'a> PlanCx<'a> {
         }
         for (type_id, ext, struct_id) in extern_types {
             self.fill_extern_struct(program, type_id, ext, struct_id)?;
+        }
+        for (type_id, aggregate, dataref_id) in dataref_types {
+            self.fill_dataref(program, type_id, aggregate, dataref_id)?;
         }
         for (type_id, enm, enum_id) in enum_types {
             self.fill_enum(program, type_id, enm, enum_id)?;
@@ -390,7 +460,7 @@ impl<'a> PlanCx<'a> {
                     RustTargetGapKind::UnsupportedType,
                 ));
             };
-            if field.ty == type_id || matches!(program.types[ty.index()], RirType::Struct(_)) {
+            if field.ty == type_id {
                 return Err(self.gap(
                     RustTargetGapSite::Type(field.ty),
                     RustTargetGapKind::UnsupportedType,
@@ -402,9 +472,72 @@ impl<'a> PlanCx<'a> {
                 ty,
             });
         }
+        let copyable = self.rust_copyable_air_type(type_id)
+            && fields
+                .iter()
+                .all(|field| RustRepPolicy::new(program).copyable(field.ty));
         let strukt = &mut program.structs[struct_id.index()];
-        strukt.copyable = self.rust_copyable_air_type(type_id);
+        strukt.copyable = copyable;
         strukt.fields = fields;
+        Ok(())
+    }
+
+    fn reserve_dataref(
+        &mut self,
+        program: &mut RirProgram,
+        type_id: TypeId,
+        aggregate: air::AggregateId,
+    ) -> Result<RirDataRefId, RustPlanError> {
+        let decl = self.air.aggregate(aggregate);
+        if decl.kind != air::AggregateKind::DataRef {
+            return Err(self.gap(
+                RustTargetGapSite::Type(type_id),
+                RustTargetGapKind::UnsupportedType,
+            ));
+        }
+        let id = RirDataRefId::from_index(program.datarefs.len());
+        self.dataref_map.insert(aggregate, id);
+        let base = format!(
+            "{}T{}_{}",
+            self.config.symbol_prefix,
+            type_id.index(),
+            sanitize(decl.name.as_str())
+        );
+        program.datarefs.push(RirDataRef {
+            id,
+            air_id: aggregate,
+            symbol: RirSymbol::new(&base),
+            display: RirSymbol::new(decl.name.as_str()),
+            cycle_capable: decl.cycle_capable,
+            fields: vec![],
+        });
+        Ok(id)
+    }
+
+    fn fill_dataref(
+        &self,
+        program: &mut RirProgram,
+        _type_id: TypeId,
+        aggregate: air::AggregateId,
+        dataref_id: RirDataRefId,
+    ) -> Result<(), RustPlanError> {
+        let decl = self.air.aggregate(aggregate);
+        let mut seen = vec![];
+        let mut fields = vec![];
+        for (index, field) in decl.fields.iter().enumerate() {
+            let Some(&ty) = self.type_map.get(&field.ty) else {
+                return Err(self.gap(
+                    RustTargetGapSite::Type(field.ty),
+                    RustTargetGapKind::UnsupportedType,
+                ));
+            };
+            fields.push(RirField {
+                id: RirFieldId::from_index(index),
+                symbol: scoped_symbol(field.name.as_str(), &mut seen),
+                ty,
+            });
+        }
+        program.datarefs[dataref_id.index()].fields = fields;
         Ok(())
     }
 
@@ -691,7 +824,7 @@ impl<'a> PlanCx<'a> {
         Ok(id)
     }
 
-    fn plan_consts(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+    fn plan_consts(&mut self, program: &mut RirProgram) {
         for index in 0..self.air.const_arena.len() {
             let air_id = ConstId::from_index(index);
             let konst = self.air.const_arena.get(air_id);
@@ -701,12 +834,7 @@ impl<'a> PlanCx<'a> {
                 ConstValue::Float(value) => RirConstValue::Float(*value),
                 ConstValue::Bool(value) => RirConstValue::Bool(*value),
                 ConstValue::String(value) => RirConstValue::String(value.to_string()),
-                ConstValue::Nil => {
-                    return Err(self.gap(
-                        RustTargetGapSite::Const(air_id),
-                        RustTargetGapKind::UnsupportedConst,
-                    ));
-                }
+                ConstValue::Nil => RirConstValue::Nil,
             };
             program.consts.push(RirConst {
                 id,
@@ -715,7 +843,6 @@ impl<'a> PlanCx<'a> {
             });
             self.const_map.insert(air_id, id);
         }
-        Ok(())
     }
 
     fn plan_externs(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
@@ -884,7 +1011,7 @@ impl<'a> PlanCx<'a> {
                 }
             })
             .collect();
-        let body = self.plan_air_block(air_id, &function.body.block)?;
+        let body = self.plan_air_block(air_id, &function.body.block, &mut locals)?;
         Ok(RirFunction {
             id: self.function_map[&air_id],
             air_id: Some(air_id),
@@ -909,75 +1036,119 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         block: &air::AirBlock,
+        locals: &mut Vec<RirLocal>,
     ) -> Result<RirStructuredBlock, RustPlanError> {
-        Ok(RirStructuredBlock {
-            stmts: block
-                .stmts
-                .iter()
-                .map(|stmt| self.plan_air_stmt(function, stmt))
-                .collect::<Result<Vec<_>, _>>()?,
-            term: self.plan_air_tail(&block.tail),
-        })
+        let mut stmts = vec![];
+        for stmt in &block.stmts {
+            stmts.extend(self.plan_air_stmt(function, stmt, locals)?);
+        }
+        let (tail_stmts, term) = self.plan_air_tail(function, &block.tail, locals);
+        stmts.extend(tail_stmts);
+        Ok(RirStructuredBlock { stmts, term })
     }
 
     fn plan_air_stmt(
         &self,
         function: FunctionId,
         stmt: &air::AirStmt,
-    ) -> Result<RirStmt, RustPlanError> {
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<Vec<RirStmt>, RustPlanError> {
         match stmt {
-            air::AirStmt::Init { local, value } => Ok(RirStmt::Init {
-                local: RirLocalId::from_index(local.index()),
-                value: self.plan_rvalue(function, value)?,
-            }),
-            air::AirStmt::Assign { dst, value } => Ok(RirStmt::Assign {
-                dst: self.plan_place(dst),
-                value: self.plan_rvalue(function, value)?,
-            }),
-            air::AirStmt::Eval(value) => Ok(RirStmt::Eval(self.plan_rvalue(function, value)?)),
-            air::AirStmt::If(branch) => Ok(RirStmt::If(RirIf {
-                cond: self.plan_operand(&branch.cond),
-                then_block: self.plan_air_block(function, &branch.then_block)?,
-                else_block: branch
-                    .else_block
-                    .as_ref()
-                    .map(|block| self.plan_air_block(function, block))
-                    .transpose()?,
-            })),
-            air::AirStmt::Loop(loop_) => Ok(RirStmt::Loop(RirLoop {
+            air::AirStmt::Init { local, value } => {
+                let mut planned = self.plan_rvalue(function, value, locals)?;
+                let mut stmts = planned.stmts;
+                stmts.push(RirStmt::Init {
+                    local: RirLocalId::from_index(local.index()),
+                    value: planned.value,
+                });
+                stmts.append(&mut planned.post_stmts);
+                Ok(stmts)
+            }
+            air::AirStmt::Assign { dst, value } => {
+                let mut planned = self.plan_rvalue(function, value, locals)?;
+                let mut stmts = planned.stmts;
+                let value = if planned.post_stmts.is_empty() {
+                    planned.value
+                } else {
+                    let operand = self.rvalue_operand(planned.value, dst.ty, locals, &mut stmts);
+                    stmts.append(&mut planned.post_stmts);
+                    RirRValue::Use(operand)
+                };
+                self.lower_place_write(function, dst, value, locals, &mut stmts);
+                Ok(stmts)
+            }
+            air::AirStmt::Eval(value) => {
+                let mut planned = self.plan_rvalue(function, value, locals)?;
+                let mut stmts = planned.stmts;
+                stmts.push(RirStmt::Eval(planned.value));
+                stmts.append(&mut planned.post_stmts);
+                Ok(stmts)
+            }
+            air::AirStmt::If(branch) => {
+                let cond = self.plan_operand_read(function, &branch.cond, locals);
+                let mut stmts = cond.stmts;
+                stmts.push(RirStmt::If(RirIf {
+                    cond: cond.operand,
+                    then_block: self.plan_air_block(function, &branch.then_block, locals)?,
+                    else_block: branch
+                        .else_block
+                        .as_ref()
+                        .map(|block| self.plan_air_block(function, block, locals))
+                        .transpose()?,
+                }));
+                Ok(stmts)
+            }
+            air::AirStmt::Loop(loop_) => Ok(vec![RirStmt::Loop(RirLoop {
                 id: RirLoopId::from_index(loop_.id.index()),
-                body: self.plan_air_block(function, &loop_.body)?,
-            })),
-            air::AirStmt::EnumMatch(match_) => Ok(RirStmt::EnumMatch(RirEnumMatch {
-                discr: self.plan_place(&match_.discr),
-                arms: match_
-                    .arms
-                    .iter()
-                    .map(|arm| {
-                        Ok(RirEnumMatchArm {
-                            variant: RirVariantId::from_index(arm.variant.index()),
-                            block: self.plan_air_block(function, &arm.block)?,
+                body: self.plan_air_block(function, &loop_.body, locals)?,
+            })]),
+            air::AirStmt::EnumMatch(match_) => {
+                let discr = self.lower_place_read(function, &match_.discr, locals);
+                let RirOperand::Place(discr_place) = discr.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                let mut stmts = discr.stmts;
+                stmts.push(RirStmt::EnumMatch(RirEnumMatch {
+                    discr: discr_place,
+                    arms: match_
+                        .arms
+                        .iter()
+                        .map(|arm| {
+                            Ok(RirEnumMatchArm {
+                                variant: RirVariantId::from_index(arm.variant.index()),
+                                block: self.plan_air_block(function, &arm.block, locals)?,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, RustPlanError>>()?,
-                else_block: match_
-                    .else_block
-                    .as_ref()
-                    .map(|block| self.plan_air_block(function, block))
-                    .transpose()?,
-            })),
+                        .collect::<Result<Vec<_>, RustPlanError>>()?,
+                    else_block: match_
+                        .else_block
+                        .as_ref()
+                        .map(|block| self.plan_air_block(function, block, locals))
+                        .transpose()?,
+                }));
+                Ok(stmts)
+            }
         }
     }
 
-    fn plan_air_tail(&self, tail: &air::AirTail) -> RirTerm {
+    fn plan_air_tail(
+        &self,
+        function: FunctionId,
+        tail: &air::AirTail,
+        locals: &mut Vec<RirLocal>,
+    ) -> (Vec<RirStmt>, RirTerm) {
         match tail {
-            air::AirTail::None => RirTerm::None,
-            air::AirTail::Return(value) => {
-                RirTerm::Return(value.as_ref().map(|value| self.plan_operand(value)))
+            air::AirTail::None => (vec![], RirTerm::None),
+            air::AirTail::Return(Some(value)) => {
+                let planned = self.plan_operand_read(function, value, locals);
+                (planned.stmts, RirTerm::Return(Some(planned.operand)))
             }
-            air::AirTail::Unreachable => RirTerm::Unreachable,
-            air::AirTail::Break(id) => RirTerm::Break(RirLoopId::from_index(id.index())),
-            air::AirTail::Continue(id) => RirTerm::Continue(RirLoopId::from_index(id.index())),
+            air::AirTail::Return(None) => (vec![], RirTerm::Return(None)),
+            air::AirTail::Unreachable => (vec![], RirTerm::Unreachable),
+            air::AirTail::Break(id) => (vec![], RirTerm::Break(RirLoopId::from_index(id.index()))),
+            air::AirTail::Continue(id) => {
+                (vec![], RirTerm::Continue(RirLoopId::from_index(id.index())))
+            }
         }
     }
 
@@ -985,106 +1156,275 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         value: &RValue,
-    ) -> Result<RirRValue, RustPlanError> {
-        match value {
-            RValue::Use(operand) => self.plan_use(function, operand),
-            RValue::Unary { op, value, ty } => Ok(RirRValue::Unary {
-                op: *op,
-                value: self.plan_operand(value),
-                ty: self.type_map[ty],
-            }),
-            RValue::Binary { op, lhs, rhs, ty } => Ok(RirRValue::Binary {
-                op: *op,
-                lhs: self.plan_operand(lhs),
-                rhs: self.plan_operand(rhs),
-                ty: self.type_map[ty],
-            }),
-            RValue::Cast { value, target } => Ok(RirRValue::Cast {
-                value: self.plan_operand(value),
-                target: self.type_map[target],
-            }),
-            RValue::Call { callee, args } => self.plan_call(function, callee, args),
-            RValue::Stringify { value, source_ty } => Ok(RirRValue::Stringify {
-                value: self.plan_operand(value),
-                source_ty: self.type_map[source_ty],
-            }),
-            RValue::StringConcat { parts } => Ok(RirRValue::StringConcat {
-                parts: parts.iter().map(|part| self.plan_operand(part)).collect(),
-            }),
-            RValue::Format { value, spec } => Ok(RirRValue::Format {
-                value: self.plan_operand(value),
-                source_ty: self.type_map[&self.operand_ty(value)],
-                spec: rir_format_spec(*spec),
-            }),
-            RValue::Aggregate { kind, fields, ty } => {
-                self.plan_aggregate(function, kind, fields, *ty)
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedRValue, RustPlanError> {
+        let planned = match value {
+            RValue::Use(operand) => return self.plan_use(function, operand, locals),
+            RValue::Unary { op, value, ty } => {
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::Unary {
+                        op: *op,
+                        value: value.operand,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
             }
-            RValue::Len { source } => Ok(RirRValue::Len {
-                source: self.plan_place(source),
-            }),
-            RValue::ListPush { list, value } => Ok(RirRValue::ListPush {
-                list: self.plan_place(list),
-                value: self.plan_operand(value),
-            }),
+            RValue::Binary { op, lhs, rhs, ty } => {
+                let lhs = self.plan_operand_read(function, lhs, locals);
+                let rhs = self.plan_operand_read(function, rhs, locals);
+                let mut stmts = lhs.stmts;
+                stmts.extend(rhs.stmts);
+                PlannedRValue {
+                    stmts,
+                    value: RirRValue::Binary {
+                        op: *op,
+                        lhs: lhs.operand,
+                        rhs: rhs.operand,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::SharedRefEq { lhs, rhs, negated } => {
+                let lhs = self.plan_operand_read(function, lhs, locals);
+                let rhs = self.plan_operand_read(function, rhs, locals);
+                let mut stmts = lhs.stmts;
+                stmts.extend(rhs.stmts);
+                PlannedRValue {
+                    stmts,
+                    value: RirRValue::SharedRefEq {
+                        lhs: lhs.operand,
+                        rhs: rhs.operand,
+                        negated: *negated,
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::Cast { value, target } => {
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::Cast {
+                        value: value.operand,
+                        target: self.type_map[target],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::OptionalSome { value, ty } => {
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::OptionalSome {
+                        value: value.operand,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::Call { callee, args } => self.plan_call(function, callee, args, locals)?,
+            RValue::Stringify { value, source_ty } => {
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::Stringify {
+                        value: value.operand,
+                        source_ty: self.type_map[source_ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::StringConcat { parts } => {
+                let parts = self.plan_operands_read(function, parts, locals);
+                PlannedRValue {
+                    stmts: parts.stmts,
+                    value: RirRValue::StringConcat {
+                        parts: parts.operands,
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::Format { value, spec } => {
+                let source_ty = self.type_map[&self.operand_ty(value)];
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::Format {
+                        value: value.operand,
+                        source_ty,
+                        spec: rir_format_spec(*spec),
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::Aggregate { kind, fields, ty } => {
+                return self.plan_aggregate(function, kind, fields, *ty, locals);
+            }
+            RValue::Len { source } => {
+                let source = self.lower_place_read(function, source, locals);
+                let RirOperand::Place(source_place) = source.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                PlannedRValue {
+                    stmts: source.stmts,
+                    value: RirRValue::Len {
+                        source: source_place,
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::ListPush { list, value } => {
+                if self.place_crosses_dataref(function, list) {
+                    return Err(self.gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedPlaceProjection,
+                    ));
+                }
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::ListPush {
+                        list: self.plan_place(list),
+                        value: value.operand,
+                    },
+                    post_stmts: vec![],
+                }
+            }
             RValue::SliceView {
                 source,
                 start,
                 end,
                 inclusive,
                 ty,
-            } => Ok(RirRValue::SliceView {
-                source: self.plan_place(source),
-                start: RirLocalId::from_index(start.index()),
-                end: RirLocalId::from_index(end.index()),
-                inclusive: *inclusive,
-                ty: self.type_map[ty],
-            }),
+            } => {
+                let source = self.lower_place_read(function, source, locals);
+                let RirOperand::Place(source_place) = source.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                PlannedRValue {
+                    stmts: source.stmts,
+                    value: RirRValue::SliceView {
+                        source: source_place,
+                        start: RirLocalId::from_index(start.index()),
+                        end: RirLocalId::from_index(end.index()),
+                        inclusive: *inclusive,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
             RValue::ListSlice {
                 source,
                 start,
                 end,
                 inclusive,
                 ty,
-            } => Ok(RirRValue::ListSlice {
-                source: self.plan_place(source),
-                start: RirLocalId::from_index(start.index()),
-                end: RirLocalId::from_index(end.index()),
-                inclusive: *inclusive,
-                ty: self.type_map[ty],
-            }),
-            RValue::MapGet { map, key, ty } => Ok(RirRValue::MapGet {
-                map: self.plan_place(map),
-                key: self.plan_operand(key),
-                ty: self.type_map[ty],
-            }),
-            RValue::MapInsert { map, key, value } => Ok(RirRValue::MapInsert {
-                map: self.plan_place(map),
-                key: self.plan_operand(key),
-                value: self.plan_operand(value),
-            }),
-            RValue::MapRemove { map, key, ty } => Ok(RirRValue::MapRemove {
-                map: self.plan_place(map),
-                key: self.plan_operand(key),
-                ty: self.type_map[ty],
-            }),
-            RValue::SharedRefEq { .. }
-            | RValue::ListPop { .. }
-            | RValue::MapEntryAt { .. }
-            | RValue::MakeClosure { .. } => Err(self.gap(
-                RustTargetGapSite::Function(function),
-                RustTargetGapKind::UnsupportedRValue,
-            )),
-        }
+            } => {
+                let source = self.lower_place_read(function, source, locals);
+                let RirOperand::Place(source_place) = source.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                PlannedRValue {
+                    stmts: source.stmts,
+                    value: RirRValue::ListSlice {
+                        source: source_place,
+                        start: RirLocalId::from_index(start.index()),
+                        end: RirLocalId::from_index(end.index()),
+                        inclusive: *inclusive,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::MapGet { map, key, ty } => {
+                let map = self.lower_place_read(function, map, locals);
+                let key = self.plan_operand_read(function, key, locals);
+                let RirOperand::Place(map_place) = map.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                let mut stmts = map.stmts;
+                stmts.extend(key.stmts);
+                PlannedRValue {
+                    stmts,
+                    value: RirRValue::MapGet {
+                        map: map_place,
+                        key: key.operand,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::MapInsert { map, key, value } => {
+                if self.place_crosses_dataref(function, map) {
+                    return Err(self.gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedPlaceProjection,
+                    ));
+                }
+                let key = self.plan_operand_read(function, key, locals);
+                let value = self.plan_operand_read(function, value, locals);
+                let mut stmts = key.stmts;
+                stmts.extend(value.stmts);
+                PlannedRValue {
+                    stmts,
+                    value: RirRValue::MapInsert {
+                        map: self.plan_place(map),
+                        key: key.operand,
+                        value: value.operand,
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::MapRemove { map, key, ty } => {
+                if self.place_crosses_dataref(function, map) {
+                    return Err(self.gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedPlaceProjection,
+                    ));
+                }
+                let key = self.plan_operand_read(function, key, locals);
+                PlannedRValue {
+                    stmts: key.stmts,
+                    value: RirRValue::MapRemove {
+                        map: self.plan_place(map),
+                        key: key.operand,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::ListPop { .. } | RValue::MapEntryAt { .. } | RValue::MakeClosure { .. } => {
+                return Err(self.gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedRValue,
+                ));
+            }
+        };
+        Ok(planned)
     }
 
     fn plan_use(
         &self,
         function: FunctionId,
         operand: &Operand,
-    ) -> Result<RirRValue, RustPlanError> {
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedRValue, RustPlanError> {
         let Operand::Place(place) = operand else {
-            return Ok(RirRValue::Use(self.plan_operand(operand)));
+            return Ok(PlannedRValue::from_value(RirRValue::Use(
+                self.plan_operand(operand),
+            )));
         };
+        if self.place_crosses_dataref(function, place) {
+            let planned = self.lower_place_read(function, place, locals);
+            return Ok(PlannedRValue {
+                stmts: planned.stmts,
+                value: RirRValue::Use(planned.operand),
+                post_stmts: vec![],
+            });
+        }
         if !self.rust_copyable_air_type(place.ty)
             && !self.air_policy().value_place_shareable(place.ty)
         {
@@ -1094,10 +1434,12 @@ impl<'a> PlanCx<'a> {
             ));
         }
         let TypeData::Aggregate(aggregate) = self.air.type_arena.data(place.ty) else {
-            return Ok(RirRValue::Use(self.plan_operand(operand)));
+            return Ok(PlannedRValue::from_value(RirRValue::Use(
+                self.plan_operand(operand),
+            )));
         };
         let decl = self.air.aggregate(*aggregate);
-        Ok(RirRValue::Struct {
+        Ok(PlannedRValue::from_value(RirRValue::Struct {
             ty: self.type_map[&place.ty],
             fields: decl
                 .fields
@@ -1112,7 +1454,7 @@ impl<'a> PlanCx<'a> {
                     RirOperand::Place(self.plan_place(&field_place))
                 })
                 .collect(),
-        })
+        }))
     }
 
     fn plan_aggregate(
@@ -1121,49 +1463,51 @@ impl<'a> PlanCx<'a> {
         kind: &AggregateCtor,
         fields: &[Operand],
         ty: TypeId,
-    ) -> Result<RirRValue, RustPlanError> {
-        match kind {
-            AggregateCtor::Struct(_) | AggregateCtor::Extern(_) => Ok(RirRValue::Struct {
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedRValue, RustPlanError> {
+        let fields = self.plan_operands_read(function, fields, locals);
+        let value = match kind {
+            AggregateCtor::Struct(_) | AggregateCtor::Extern(_) => RirRValue::Struct {
                 ty: self.type_map[&ty],
-                fields: fields
-                    .iter()
-                    .map(|field| self.plan_operand(field))
-                    .collect(),
-            }),
-            AggregateCtor::EnumVariant { variant, .. } => Ok(RirRValue::EnumVariant {
+                fields: fields.operands,
+            },
+            AggregateCtor::EnumVariant { variant, .. } => RirRValue::EnumVariant {
                 ty: self.type_map[&ty],
                 variant: RirVariantId::from_index(variant.index()),
-                fields: fields
-                    .iter()
-                    .map(|field| self.plan_operand(field))
-                    .collect(),
-            }),
-            AggregateCtor::Array => Ok(RirRValue::Array {
+                fields: fields.operands,
+            },
+            AggregateCtor::Array => RirRValue::Array {
                 ty: self.type_map[&ty],
-                elems: fields
-                    .iter()
-                    .map(|field| self.plan_operand(field))
-                    .collect(),
-            }),
-            AggregateCtor::List => Ok(RirRValue::List {
+                elems: fields.operands,
+            },
+            AggregateCtor::List => RirRValue::List {
                 ty: self.type_map[&ty],
-                elems: fields
-                    .iter()
-                    .map(|field| self.plan_operand(field))
-                    .collect(),
-            }),
-            AggregateCtor::Map if fields.len().is_multiple_of(2) => Ok(RirRValue::Map {
+                elems: fields.operands,
+            },
+            AggregateCtor::Map if fields.operands.len().is_multiple_of(2) => RirRValue::Map {
                 ty: self.type_map[&ty],
                 entries: fields
+                    .operands
                     .chunks_exact(2)
-                    .map(|entry| (self.plan_operand(&entry[0]), self.plan_operand(&entry[1])))
+                    .map(|entry| (entry[0].clone(), entry[1].clone()))
                     .collect(),
-            }),
-            AggregateCtor::Tuple | AggregateCtor::Map | AggregateCtor::DataRef(_) => Err(self.gap(
-                RustTargetGapSite::Function(function),
-                RustTargetGapKind::UnsupportedRValue,
-            )),
-        }
+            },
+            AggregateCtor::DataRef(_) => RirRValue::DataRefAlloc {
+                ty: self.type_map[&ty],
+                fields: fields.operands,
+            },
+            AggregateCtor::Tuple | AggregateCtor::Map => {
+                return Err(self.gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedRValue,
+                ));
+            }
+        };
+        Ok(PlannedRValue {
+            stmts: fields.stmts,
+            value,
+            post_stmts: vec![],
+        })
     }
 
     fn plan_call(
@@ -1171,7 +1515,8 @@ impl<'a> PlanCx<'a> {
         function_id: FunctionId,
         callee: &Callee,
         args: &[CallArg],
-    ) -> Result<RirRValue, RustPlanError> {
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedRValue, RustPlanError> {
         let (target, ty) = match callee {
             Callee::Function(id) => {
                 let function = self.air.function(*id);
@@ -1194,19 +1539,111 @@ impl<'a> PlanCx<'a> {
                 ));
             }
         };
-        Ok(RirRValue::Call {
-            callee: target,
-            args: args.iter().map(|arg| self.plan_arg(arg)).collect(),
-            ty,
+        let mut stmts = vec![];
+        let mut post_stmts = vec![];
+        let mut planned_args = vec![];
+        for arg in args {
+            let planned = self.plan_arg(function_id, arg, locals);
+            stmts.extend(planned.stmts);
+            post_stmts.extend(planned.post_stmts);
+            planned_args.push(planned.arg);
+        }
+        Ok(PlannedRValue {
+            stmts,
+            value: RirRValue::Call {
+                callee: target,
+                args: planned_args,
+                ty,
+            },
+            post_stmts,
         })
     }
 
-    fn plan_arg(&self, arg: &CallArg) -> RirCallArg {
+    fn plan_arg(
+        &self,
+        function: FunctionId,
+        arg: &CallArg,
+        locals: &mut Vec<RirLocal>,
+    ) -> PlannedCallArg {
         match arg {
-            CallArg::Value(operand) => RirCallArg::Value(self.plan_operand(operand)),
-            CallArg::SharedBorrow(place) => RirCallArg::SharedBorrow(self.plan_place(place)),
-            CallArg::SharedStringConst(id) => RirCallArg::SharedStringConst(self.const_map[id]),
-            CallArg::MutBorrow(place) => RirCallArg::MutBorrow(self.plan_place(place)),
+            CallArg::Value(operand) => {
+                let planned = self.plan_operand_read(function, operand, locals);
+                PlannedCallArg {
+                    stmts: planned.stmts,
+                    arg: RirCallArg::Value(planned.operand),
+                    post_stmts: vec![],
+                }
+            }
+            CallArg::SharedBorrow(place) => {
+                let planned = self.lower_place_read(function, place, locals);
+                let RirOperand::Place(place) = planned.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                PlannedCallArg {
+                    stmts: planned.stmts,
+                    arg: RirCallArg::SharedBorrow(place),
+                    post_stmts: vec![],
+                }
+            }
+            CallArg::SharedStringConst(id) => {
+                PlannedCallArg::from_arg(RirCallArg::SharedStringConst(self.const_map[id]))
+            }
+            CallArg::MutBorrow(place) => {
+                if !self.place_crosses_dataref(function, place) {
+                    return PlannedCallArg::from_arg(RirCallArg::MutBorrow(self.plan_place(place)));
+                }
+                let planned = self.lower_place_read(function, place, locals);
+                let RirOperand::Place(temp_place) = planned.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                locals[temp_place.local.index()].mutable = true;
+                let mut post_stmts = vec![];
+                self.lower_place_write(
+                    function,
+                    place,
+                    RirRValue::Use(RirOperand::Place(temp_place.clone())),
+                    locals,
+                    &mut post_stmts,
+                );
+                PlannedCallArg {
+                    stmts: planned.stmts,
+                    arg: RirCallArg::MutBorrow(temp_place),
+                    post_stmts,
+                }
+            }
+        }
+    }
+
+    fn plan_operand_read(
+        &self,
+        function: FunctionId,
+        operand: &Operand,
+        locals: &mut Vec<RirLocal>,
+    ) -> PlannedOperand {
+        match operand {
+            Operand::Place(place) => self.lower_place_read(function, place, locals),
+            Operand::Const(id) => {
+                PlannedOperand::from_operand(RirOperand::Const(self.const_map[id]))
+            }
+        }
+    }
+
+    fn plan_operands_read(
+        &self,
+        function: FunctionId,
+        operands: &[Operand],
+        locals: &mut Vec<RirLocal>,
+    ) -> PlannedOperands {
+        let mut stmts = vec![];
+        let mut planned = vec![];
+        for operand in operands {
+            let next = self.plan_operand_read(function, operand, locals);
+            stmts.extend(next.stmts);
+            planned.push(next.operand);
+        }
+        PlannedOperands {
+            stmts,
+            operands: planned,
         }
     }
 
@@ -1214,6 +1651,229 @@ impl<'a> PlanCx<'a> {
         match operand {
             Operand::Place(place) => RirOperand::Place(self.plan_place(place)),
             Operand::Const(id) => RirOperand::Const(self.const_map[id]),
+        }
+    }
+
+    fn lower_place_read(
+        &self,
+        function: FunctionId,
+        place: &Place,
+        locals: &mut Vec<RirLocal>,
+    ) -> PlannedOperand {
+        if !self.place_crosses_dataref(function, place) {
+            return PlannedOperand::from_operand(RirOperand::Place(self.plan_place(place)));
+        }
+        let mut stmts = vec![];
+        let (mut current_ty, mut current_place) = self.root_place(function, place);
+        let mut index = 0;
+        while let Some(segment) =
+            self.next_dataref_segment(place, &mut index, &mut current_ty, &mut current_place)
+        {
+            index = segment.next_index;
+            current_ty = segment.ty;
+            current_place = self.read_dataref_segment(segment, locals, &mut stmts);
+        }
+        PlannedOperand {
+            stmts,
+            operand: RirOperand::Place(current_place),
+        }
+    }
+
+    fn lower_place_write(
+        &self,
+        function: FunctionId,
+        place: &Place,
+        value: RirRValue,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) {
+        if !self.place_crosses_dataref(function, place) {
+            stmts.push(RirStmt::Assign {
+                dst: self.plan_place(place),
+                value,
+            });
+            return;
+        }
+        let value = self.rvalue_operand(value, place.ty, locals, stmts);
+        let (mut current_ty, mut current_place) = self.root_place(function, place);
+        let mut index = 0;
+        while let Some(segment) =
+            self.next_dataref_segment(place, &mut index, &mut current_ty, &mut current_place)
+        {
+            if segment.next_index == place.projection.len() {
+                stmts.push(RirStmt::DataRefSet {
+                    object: segment.object,
+                    dataref: segment.dataref,
+                    projections: segment.projections,
+                    value,
+                });
+                return;
+            }
+            index = segment.next_index;
+            current_ty = segment.ty;
+            current_place = self.read_dataref_segment(segment, locals, stmts);
+        }
+        unreachable!("dataref-crossing write has a dataref segment")
+    }
+
+    fn root_place(&self, function: FunctionId, place: &Place) -> (TypeId, RirPlace) {
+        let ty = self.current_place_root_ty(function, place);
+        (
+            ty,
+            RirPlace {
+                local: RirLocalId::from_index(place.root.index()),
+                projections: vec![],
+                ty: self.type_map[&ty],
+            },
+        )
+    }
+
+    fn next_dataref_segment(
+        &self,
+        place: &Place,
+        index: &mut usize,
+        current_ty: &mut TypeId,
+        current_place: &mut RirPlace,
+    ) -> Option<DataRefSegment> {
+        while *index < place.projection.len() {
+            if let TypeData::DataRef(aggregate) = self.air.type_arena.data(*current_ty) {
+                let (projections, ty, next_index) =
+                    self.dataref_projection_segment(*current_ty, &place.projection, *index);
+                return Some(DataRefSegment {
+                    object: RirOperand::Place(current_place.clone()),
+                    dataref: self.dataref_map[aggregate],
+                    projections,
+                    ty,
+                    next_index,
+                });
+            }
+            let projection = &place.projection[*index];
+            *current_ty = self.projected_ty(*current_ty, projection);
+            current_place
+                .projections
+                .push(self.rir_projection(projection));
+            current_place.ty = self.type_map[&*current_ty];
+            *index += 1;
+        }
+        None
+    }
+
+    fn read_dataref_segment(
+        &self,
+        segment: DataRefSegment,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) -> RirPlace {
+        let local = self.alloc_temp(locals, segment.ty);
+        stmts.push(RirStmt::Init {
+            local,
+            value: RirRValue::DataRefGet {
+                object: segment.object,
+                dataref: segment.dataref,
+                projections: segment.projections,
+                ty: self.type_map[&segment.ty],
+            },
+        });
+        RirPlace {
+            local,
+            projections: vec![],
+            ty: self.type_map[&segment.ty],
+        }
+    }
+
+    fn rvalue_operand(
+        &self,
+        value: RirRValue,
+        ty: TypeId,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) -> RirOperand {
+        match value {
+            RirRValue::Use(operand) => operand,
+            value => {
+                let local = self.alloc_temp(locals, ty);
+                stmts.push(RirStmt::Init { local, value });
+                RirOperand::Place(RirPlace {
+                    local,
+                    projections: vec![],
+                    ty: self.type_map[&ty],
+                })
+            }
+        }
+    }
+
+    fn dataref_projection_segment(
+        &self,
+        dataref_ty: TypeId,
+        projections: &[Projection],
+        start: usize,
+    ) -> (Vec<RirProjection>, TypeId, usize) {
+        let mut current_ty = dataref_ty;
+        let mut index = start;
+        let mut segment = vec![];
+        while index < projections.len() {
+            let projection = &projections[index];
+            segment.push(self.rir_projection(projection));
+            current_ty = self.projected_ty(current_ty, projection);
+            index += 1;
+            if matches!(self.air.type_arena.data(current_ty), TypeData::DataRef(_))
+                && index < projections.len()
+            {
+                break;
+            }
+        }
+        (segment, current_ty, index)
+    }
+
+    fn place_crosses_dataref(&self, function: FunctionId, place: &Place) -> bool {
+        let mut ty = self.current_place_root_ty(function, place);
+        for projection in &place.projection {
+            if matches!(self.air.type_arena.data(ty), TypeData::DataRef(_)) {
+                return true;
+            }
+            ty = self.projected_ty(ty, projection);
+        }
+        false
+    }
+
+    fn current_place_root_ty(&self, function: FunctionId, place: &Place) -> TypeId {
+        self.air.function(function).locals[place.root.index()].ty
+    }
+
+    fn projected_ty(&self, ty: TypeId, projection: &Projection) -> TypeId {
+        match (self.air.type_arena.data(ty), projection) {
+            (
+                TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate),
+                Projection::Field(field),
+            ) => self.air.aggregate(*aggregate).fields[field.index()].ty,
+            (
+                TypeData::Array { elem, .. } | TypeData::List(elem) | TypeData::Slice(elem),
+                Projection::Index(_),
+            ) => *elem,
+            _ => ty,
+        }
+    }
+
+    fn alloc_temp(&self, locals: &mut Vec<RirLocal>, ty: TypeId) -> RirLocalId {
+        let index = locals.len();
+        let id = RirLocalId::from_index(index);
+        locals.push(RirLocal {
+            id,
+            ty: self.type_map[&ty],
+            mutable: false,
+            symbol: local_symbol(index, None),
+            initialized: false,
+        });
+        id
+    }
+
+    fn rir_projection(&self, projection: &Projection) -> RirProjection {
+        match projection {
+            Projection::Field(field) => RirProjection::Field(RirFieldId::from_index(field.index())),
+            Projection::Index(local) => RirProjection::Index(RirLocalId::from_index(local.index())),
+            Projection::TupleField(_) | Projection::VariantField { .. } => {
+                unreachable!("profile rejects unsupported projection")
+            }
         }
     }
 
@@ -1356,6 +2016,9 @@ fn type_suffix(program: &RirProgram, ty: RirTypeId) -> String {
         RirType::Slice(elem) => format!("slice_{}", type_suffix(program, elem)),
         RirType::Array { elem, len } => format!("array_{}_{}", len, type_suffix(program, elem)),
         RirType::Struct(id) => named_type_suffix(ty.index(), &program.structs[id.index()].display),
+        RirType::DataRef(id) => {
+            named_type_suffix(ty.index(), &program.datarefs[id.index()].display)
+        }
         RirType::Enum(id) => {
             let enm = &program.enums[id.index()];
             if enm.core == Some(RirCoreEnumKind::Option) {

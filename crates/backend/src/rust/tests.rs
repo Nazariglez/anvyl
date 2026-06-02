@@ -15,13 +15,14 @@ use super::{
     profile::{ProfileErrorKind, RustBackendProfile, RustBackendProfileError},
     rir::{
         self, RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
-        RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId, RirExternKind,
-        RirExternParam, RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction,
-        RirFunctionId, RirIf, RirLocal, RirLocalId, RirLoop, RirLoopId, RirOperand, RirParam,
-        RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirRValue, RirReturn, RirStmt,
-        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, RirVerifyErrorKind,
+        RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern,
+        RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatKind,
+        RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal, RirLocalId, RirLoop, RirLoopId,
+        RirOperand, RirParam, RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirProjection,
+        RirRValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirVerifyErrorKind,
     },
     source_job::{self, SourceJobStatus},
 };
@@ -267,6 +268,54 @@ fn profile_accepts_supported_format_rvalues() {
 }
 
 #[test]
+fn profile_rejects_dataref_list_payload_as_explicit_target_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let list = program.alloc_type(TypeData::List(int));
+    let module = program.alloc_module(root_module());
+    let aggregate = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("items"),
+            ty: list,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedModuleItem);
+}
+
+#[test]
+fn profile_rejects_dataref_tuple_payload_as_explicit_target_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let module = program.alloc_module(root_module());
+    let aggregate = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("field"),
+            ty: tuple,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedModuleItem);
+}
+
+#[test]
 fn profile_rejects_tuple_construction_as_explicit_target_gap() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -403,11 +452,161 @@ fn profile_accepts_plain_struct_declarations() {
 }
 
 #[test]
-fn profile_rejects_dataref_declarations() {
+fn profile_accepts_trace_safe_dataref_declarations() {
+    check(struct_decl_program(true));
+}
+
+#[test]
+fn profile_rejects_unsupported_dataref_payloads() {
     expect_reject(
-        struct_decl_program(true),
+        unsupported_dataref_payload_program(),
         ProfileErrorKind::UnsupportedModuleItem,
     );
+}
+
+#[test]
+fn profile_accepts_dataref_field_projections() {
+    check(dataref_field_projection_program());
+}
+
+#[test]
+fn plan_lowers_dataref_field_places_to_heap_ops() {
+    let program = dataref_field_projection_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let stmts = &plan.program().functions[0].body.stmts;
+
+    assert!(matches!(stmts[0], RirStmt::DataRefSet { .. }));
+    assert!(matches!(
+        stmts[1],
+        RirStmt::Init {
+            value: RirRValue::DataRefGet { .. },
+            ..
+        }
+    ));
+    assert!(matches!(stmts[2], RirStmt::Init { .. }));
+}
+
+#[test]
+fn plan_lowers_nested_dataref_field_read_to_separate_heap_ops() {
+    let program = nested_dataref_read_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let stmts = &plan.program().functions[0].body.stmts;
+
+    assert_eq!(
+        stmts
+            .iter()
+            .filter(|stmt| matches!(
+                stmt,
+                RirStmt::Init {
+                    value: RirRValue::DataRefGet { .. },
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn plan_lowers_dataref_field_len_and_shared_borrow_call_args() {
+    let program = dataref_string_field_consumers_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let stmts = &plan.program().functions[1].body.stmts;
+
+    assert!(matches!(
+        stmts[0],
+        RirStmt::Init {
+            value: RirRValue::DataRefGet { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        stmts[1],
+        RirStmt::Init {
+            value: RirRValue::Len { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        stmts[2],
+        RirStmt::Init {
+            value: RirRValue::DataRefGet { .. },
+            ..
+        }
+    ));
+    assert!(matches!(stmts[3], RirStmt::Eval(RirRValue::Call { .. })));
+}
+
+#[test]
+fn emit_dataref_get_uses_short_heap_borrow() {
+    let source = plan_source(nested_dataref_read_program()).into_string();
+
+    assert!(source.contains("ctx.heap().with(&v0, |storage| storage.child.clone())"));
+    assert!(source.contains("ctx.heap().with(&v2, |storage| storage.value)"));
+    assert!(!source.contains("|storage| anv_f"));
+}
+
+#[test]
+fn emit_dataref_set_uses_short_mut_heap_borrow() {
+    let source = plan_source(dataref_field_projection_program()).into_string();
+
+    assert!(source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value = 1; })"));
+    assert!(!source.contains("with_mut(&v0, |storage| { anv"));
+}
+
+#[test]
+fn plan_lowers_projected_mut_call_arg_with_postlude_writeback() {
+    let program = projected_mut_call_arg_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let stmts = &plan.program().functions[1].body.stmts;
+
+    assert!(matches!(
+        stmts[0],
+        RirStmt::Init {
+            value: RirRValue::DataRefGet { .. },
+            ..
+        }
+    ));
+    assert!(matches!(stmts[1], RirStmt::Eval(RirRValue::Call { .. })));
+    assert!(matches!(stmts[2], RirStmt::DataRefSet { .. }));
+}
+
+#[test]
+fn plan_lowers_multiple_projected_mut_call_args_in_source_order() {
+    let program = multi_projected_mut_call_arg_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let stmts = &plan.program().functions[1].body.stmts;
+
+    assert!(matches!(
+        stmts[0],
+        RirStmt::Init {
+            value: RirRValue::DataRefGet { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        stmts[1],
+        RirStmt::Init {
+            value: RirRValue::DataRefGet { .. },
+            ..
+        }
+    ));
+    assert!(matches!(stmts[2], RirStmt::Eval(RirRValue::Call { .. })));
+    assert!(matches!(stmts[3], RirStmt::DataRefSet { .. }));
+    assert!(matches!(stmts[4], RirStmt::DataRefSet { .. }));
+}
+
+#[test]
+fn emit_dataref_mut_borrow_root_rebinds_handle() {
+    let source = plan_source(dataref_root_rebind_program()).into_string();
+
+    assert!(source.contains("v0: &mut anvT2_Node<'cx>, v1: anvT2_Node<'cx>"));
+    assert!(source.contains("(*v0) = v1.clone();"));
 }
 
 #[test]
@@ -840,6 +1039,41 @@ fn source_job_compiles_and_runs_struct_construction_and_field_read() {
 }
 
 #[test]
+fn emit_renders_dataref_storage_and_handle_alias() {
+    let source =
+        emit::emit(&rir::verify(&dataref_metadata_rir()).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains("struct NodeStorage {"));
+    assert!(source.contains("value: i64"));
+    assert!(source.contains("type Node<'cx> = anvyx_runtime::Handle<'cx, NodeStorage>;"));
+    assert!(source.contains("NodeHeapType: anvyx_runtime::HeapType<'cx, NodeStorage>"));
+    assert!(source.contains("NodeHeapType: heap.register_tracked::<NodeStorage>()"));
+    assert!(source.contains("unsafe impl<'cx> anvyx_runtime::Trace<'cx> for NodeStorage"));
+    assert!(!source.contains("#[derive(anvyx_runtime::Trace)]"));
+    assert!(!source.contains("NodeStorage<'cx>"));
+}
+
+#[test]
+fn emit_renders_tracked_dataref_storage_with_context_lifetime() {
+    let mut program = dataref_metadata_rir();
+    let node = RirTypeId::from_index(1);
+    program.datarefs[0].fields.push(RirField {
+        id: RirFieldId::from_index(1),
+        symbol: RirSymbol::new("child"),
+        ty: node,
+    });
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains("#[derive(anvyx_runtime::Trace)]"));
+    assert!(source.contains("#[trace(crate = anvyx_runtime, ctx = 'cx)]"));
+    assert!(source.contains("struct NodeStorage<'cx>"));
+    assert!(source.contains("type Node<'cx> = anvyx_runtime::Handle<'cx, NodeStorage<'cx>>;"));
+    assert!(source.contains("NodeHeapType: anvyx_runtime::HeapType<'cx, NodeStorage<'cx>>"));
+    assert!(source.contains("NodeHeapType: heap.register_tracked::<NodeStorage<'cx>>()"));
+}
+
+#[test]
 fn emit_renders_plain_struct_declarations_without_impls() {
     let program = struct_decl_program(false);
     let source = plan_source(program).into_string();
@@ -1026,11 +1260,13 @@ fn plan_handles_non_topological_type_arena_refs() {
 fn rir_verify_rejects_noncopy_value_call_arg() {
     let int = RirTypeId::from_index(0);
     let void = RirTypeId::from_index(1);
-    let strukt = RirTypeId::from_index(2);
+    let slice = RirTypeId::from_index(2);
+    let strukt = RirTypeId::from_index(3);
     let program = RirProgram {
         types: vec![
             RirType::Int,
             RirType::Void,
+            RirType::Slice(int),
             RirType::Struct(RirStructId::from_index(0)),
         ],
         structs: vec![RirStruct {
@@ -1044,13 +1280,8 @@ fn rir_verify_rejects_noncopy_value_call_arg() {
             fields: vec![RirField {
                 id: RirFieldId::from_index(0),
                 symbol: RirSymbol::new("x"),
-                ty: int,
+                ty: slice,
             }],
-        }],
-        consts: vec![RirConst {
-            id: RirConstId::from_index(0),
-            ty: int,
-            value: RirConstValue::Int(1),
         }],
         functions: vec![
             RirFunction {
@@ -1087,27 +1318,18 @@ fn rir_verify_rejects_noncopy_value_call_arg() {
                     ty: strukt,
                     mutable: false,
                     symbol: RirSymbol::new("xs"),
-                    initialized: false,
+                    initialized: true,
                 }],
                 body: RirStructuredBlock {
-                    stmts: vec![
-                        RirStmt::Init {
+                    stmts: vec![RirStmt::Eval(RirRValue::Call {
+                        callee: RirCallTarget::Function(RirFunctionId::from_index(0)),
+                        args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
                             local: RirLocalId::from_index(0),
-                            value: RirRValue::Struct {
-                                ty: strukt,
-                                fields: vec![RirOperand::Const(RirConstId::from_index(0))],
-                            },
-                        },
-                        RirStmt::Eval(RirRValue::Call {
-                            callee: RirCallTarget::Function(RirFunctionId::from_index(0)),
-                            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
-                                local: RirLocalId::from_index(0),
-                                projections: vec![],
-                                ty: strukt,
-                            }))],
-                            ty: void,
-                        }),
-                    ],
+                            projections: vec![],
+                            ty: strukt,
+                        }))],
+                        ty: void,
+                    })],
                     term: RirTerm::Return(None),
                 },
             },
@@ -1200,7 +1422,7 @@ fn rir_verify_rejects_bad_struct_construction_and_projection() {
         RirStmt::Assign {
             dst: RirPlace {
                 local: RirLocalId::from_index(1),
-                projections: vec![rir::RirProjection::Field(RirFieldId::from_index(0))],
+                projections: vec![RirProjection::Field(RirFieldId::from_index(0))],
                 ty: RirTypeId::from_index(1),
             },
             value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
@@ -1253,7 +1475,7 @@ fn profile_accepts_string_value_params() {
 }
 
 #[test]
-fn profile_rejects_unsupported_param_modes() {
+fn profile_accepts_mut_borrow_string_param() {
     let mut program = Program::default();
     let string = program.alloc_type(TypeData::String);
     let void = program.alloc_type(TypeData::Void);
@@ -1279,7 +1501,7 @@ fn profile_rejects_unsupported_param_modes() {
     });
     program.module_mut(module).functions.push(func);
 
-    expect_reject(program, ProfileErrorKind::UnsupportedParamMode);
+    check(program);
 }
 
 #[test]
@@ -1853,7 +2075,7 @@ fn plan_preserves_semantic_param_and_call_modes() {
 }
 
 #[test]
-fn profile_rejects_mut_borrow_call_before_planning() {
+fn profile_accepts_mut_borrow_call() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
@@ -1908,7 +2130,7 @@ fn profile_rejects_mut_borrow_call_before_planning() {
         .extend([callee, caller]);
     program.entry = Some(caller);
 
-    expect_reject(program, ProfileErrorKind::UnsupportedParamMode);
+    check(program);
 }
 
 #[test]
@@ -2118,12 +2340,20 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
     let program = scalar_print_program();
     let source = plan_source(program).into_string();
 
+    assert!(source.contains("struct AnvTypes<'cx>"));
+    assert!(source.contains("fn register(heap: &mut anvyx_runtime::Heap<'cx>) -> Self"));
+    assert!(source.contains("struct AnvCtx<'cx, 'rt>"));
+    assert!(source.contains("fn runtime(&mut self) -> &mut anvyx_runtime::Ctx<'cx, 'rt>"));
+    assert!(source.contains("let types = AnvTypes::register(heap);"));
+    assert!(source.contains("let rt = anvyx_runtime::Ctx::new(heap);"));
+    assert!(source.contains("let mut ctx = AnvCtx::new(rt, types);"));
     assert!(source.contains("fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>)"));
-    assert!(
-        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, v0.as_str())")
-    );
+    assert!(source.contains(
+        "anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), v0.as_str())"
+    ));
+    assert!(!source.contains("type AnvCtx"));
+    assert_eq!(source.matches("anvyx_runtime::Ctx::new").count(), 1);
     assert!(!source.contains("fn anv_extern__println"));
-    assert!(!source.contains("impl "));
     assert!(!source.contains("trait "));
     assert!(!source.contains(".clone()"));
     assert!(!source.contains(".to_owned()"));
@@ -2303,7 +2533,7 @@ fn emit_wraps_native_string_returns() {
         emit::emit(&rir::verify(&native_string_return_program()).expect("RIR verify failed"))
             .into_string();
 
-    assert!(source.contains("anvyx_runtime::AnvString::from(host::string(ctx))"));
+    assert!(source.contains("anvyx_runtime::AnvString::from(host::string(ctx.runtime()))"));
 }
 
 #[test]
@@ -2313,7 +2543,7 @@ fn emit_propagates_fallible_native_calls() {
     assert!(source.contains(
         "fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
-    assert!(source.contains("host::fallible(ctx, 41)?;"));
+    assert!(source.contains("host::fallible(ctx.runtime(), 41)?;"));
     assert!(source.contains("fn main() -> Result<(), anvyx_runtime::RuntimeError>"));
     assert!(source.contains("let _ = anv_f0_main(&mut ctx)?;"));
     assert!(!source.contains(".unwrap()"));
@@ -2344,9 +2574,9 @@ fn source_job_compiles_fallible_non_void_entry() {
 fn emit_borrows_string_literal_call_arg_without_owned_temp() {
     let source = plan_source(borrow_string_literal_program()).into_string();
 
-    assert!(
-        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, \"ready\");")
-    );
+    assert!(source.contains(
+        "anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), \"ready\");"
+    ));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -2356,18 +2586,26 @@ fn emit_forwards_borrowed_string_param_as_str_without_double_borrow() {
     let source = plan_source(shared_string_forward_program()).into_string();
 
     assert!(source.contains(": &str"));
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, v0);"));
-    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, &v0);"));
     assert!(
-        !source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx, v0.as_str());")
+        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), v0);")
     );
+    assert!(
+        !source
+            .contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), &v0);")
+    );
+    assert!(!source.contains(
+        "anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), v0.as_str());"
+    ));
 }
 
 #[test]
 fn emit_borrows_string_constant_for_native_string_param() {
     let source = plan_source(native_str_len_const_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx, \"abc\")"));
+    assert!(
+        source
+            .contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx.runtime(), \"abc\")")
+    );
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -2376,8 +2614,14 @@ fn emit_borrows_string_constant_for_native_string_param() {
 fn emit_borrows_string_local_for_native_string_param() {
     let source = plan_source(native_str_len_local_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx, v0.as_str())"));
-    assert!(!source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx, &v0)"));
+    assert!(
+        source.contains(
+            "anvyx_core2::__anvyx_native::core_string::str_len(ctx.runtime(), v0.as_str())"
+        )
+    );
+    assert!(
+        !source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx.runtime(), &v0)")
+    );
 }
 
 #[test]
@@ -2704,6 +2948,183 @@ fn rir_verify_rejects_return_type_mismatch() {
 }
 
 #[test]
+fn rir_verify_accepts_dataref_type_metadata() {
+    let program = dataref_metadata_rir();
+
+    rir::verify(&program).expect("dataref metadata should verify");
+}
+
+#[test]
+fn rir_verify_rejects_bad_dataref_type_id() {
+    let mut program = dataref_metadata_rir();
+    program.types[1] = RirType::DataRef(RirDataRefId::from_index(1));
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_bad_dataref_table_id() {
+    let mut program = dataref_metadata_rir();
+    program.datarefs[0].id = RirDataRefId::from_index(1);
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_duplicate_dataref_symbols() {
+    let mut program = dataref_metadata_rir();
+    program.datarefs.push(RirDataRef {
+        id: RirDataRefId::from_index(1),
+        air_id: air::AggregateId::from_index(1),
+        symbol: RirSymbol::new("NodeStorage"),
+        display: RirSymbol::new("Other"),
+        cycle_capable: false,
+        fields: vec![],
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::DuplicateSymbol);
+}
+
+#[test]
+fn rir_verify_rejects_bad_dataref_field_id() {
+    let mut program = dataref_metadata_rir();
+    program.datarefs[0].fields[0].id = RirFieldId::from_index(1);
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_bad_dataref_field_type() {
+    let mut program = dataref_metadata_rir();
+    program.datarefs[0].fields[0].ty = RirTypeId::from_index(9);
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_accepts_dataref_get_set_projection_ops() {
+    let program = dataref_access_rir(vec![
+        RirStmt::Init {
+            local: RirLocalId::from_index(2),
+            value: RirRValue::DataRefGet {
+                object: RirOperand::Place(dataref_access_place(0, 1)),
+                dataref: RirDataRefId::from_index(0),
+                projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
+                ty: RirTypeId::from_index(0),
+            },
+        },
+        RirStmt::DataRefSet {
+            object: RirOperand::Place(dataref_access_place(0, 1)),
+            dataref: RirDataRefId::from_index(0),
+            projections: vec![
+                RirProjection::Field(RirFieldId::from_index(0)),
+                RirProjection::Field(RirFieldId::from_index(0)),
+            ],
+            value: RirOperand::Const(RirConstId::from_index(0)),
+        },
+        RirStmt::DataRefSet {
+            object: RirOperand::Place(dataref_access_place(0, 1)),
+            dataref: RirDataRefId::from_index(0),
+            projections: vec![
+                RirProjection::Field(RirFieldId::from_index(4)),
+                RirProjection::Index(RirLocalId::from_index(1)),
+            ],
+            value: RirOperand::Const(RirConstId::from_index(0)),
+        },
+    ]);
+
+    rir::verify(&program).expect("dataref access ops should verify");
+}
+
+#[test]
+fn rir_verify_rejects_dataref_get_bad_object_type() {
+    let mut program = dataref_access_rir(vec![RirStmt::Init {
+        local: RirLocalId::from_index(2),
+        value: RirRValue::DataRefGet {
+            object: RirOperand::Const(RirConstId::from_index(0)),
+            dataref: RirDataRefId::from_index(0),
+            projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
+            ty: RirTypeId::from_index(0),
+        },
+    }]);
+    program.functions[0].ret.ty = RirTypeId::from_index(0);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_dataref_get_bad_dataref_id() {
+    let program = dataref_access_rir(vec![RirStmt::Init {
+        local: RirLocalId::from_index(2),
+        value: RirRValue::DataRefGet {
+            object: RirOperand::Place(dataref_access_place(0, 1)),
+            dataref: RirDataRefId::from_index(1),
+            projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
+            ty: RirTypeId::from_index(0),
+        },
+    }]);
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_dataref_get_bad_field_id() {
+    let program = dataref_access_rir(vec![RirStmt::Init {
+        local: RirLocalId::from_index(2),
+        value: RirRValue::DataRefGet {
+            object: RirOperand::Place(dataref_access_place(0, 1)),
+            dataref: RirDataRefId::from_index(0),
+            projections: vec![RirProjection::Field(RirFieldId::from_index(9))],
+            ty: RirTypeId::from_index(0),
+        },
+    }]);
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_dataref_get_final_type_mismatch() {
+    let program = dataref_access_rir(vec![RirStmt::Eval(RirRValue::DataRefGet {
+        object: RirOperand::Place(dataref_access_place(0, 1)),
+        dataref: RirDataRefId::from_index(0),
+        projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
+        ty: RirTypeId::from_index(5),
+    })]);
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_verify_rejects_dataref_get_nested_dataref_crossing() {
+    let program = dataref_access_rir(vec![RirStmt::Init {
+        local: RirLocalId::from_index(2),
+        value: RirRValue::DataRefGet {
+            object: RirOperand::Place(dataref_access_place(0, 1)),
+            dataref: RirDataRefId::from_index(0),
+            projections: vec![
+                RirProjection::Field(RirFieldId::from_index(3)),
+                RirProjection::Field(RirFieldId::from_index(2)),
+            ],
+            ty: RirTypeId::from_index(0),
+        },
+    }]);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_dataref_set_value_mismatch() {
+    let program = dataref_access_rir(vec![RirStmt::DataRefSet {
+        object: RirOperand::Place(dataref_access_place(0, 1)),
+        dataref: RirDataRefId::from_index(0),
+        projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
+        value: RirOperand::Const(RirConstId::from_index(1)),
+    }]);
+
+    assert_rir_type_error(program);
+}
+
+#[test]
 fn rir_verify_accepts_string_value_abi() {
     let mut program = empty_rir_function(RirType::String);
     program.types.push(RirType::Void);
@@ -2909,28 +3330,198 @@ fn rir_verify_rejects_param_init_and_reinit() {
 }
 
 #[test]
-fn rir_verify_rejects_unsupported_mut_borrow_abi() {
-    let mut program = empty_rir_function(RirType::Int);
+fn rir_verify_accepts_mut_borrow_abi() {
+    let mut program = empty_rir_function(RirType::Void);
+    program.consts.clear();
+    program.types.push(RirType::Int);
     program.functions[0].locals.push(RirLocal {
         id: RirLocalId::from_index(0),
-        ty: RirTypeId::from_index(0),
+        ty: RirTypeId::from_index(1),
         mutable: true,
         symbol: RirSymbol::new("p"),
         initialized: true,
     });
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
-        ty: RirTypeId::from_index(0),
+        ty: RirTypeId::from_index(1),
         semantic: RirParamSemantic::MutBorrow,
         abi: RirParamAbi::MutBorrow,
     });
 
-    assert_rir_error(program, RirVerifyErrorKind::UnsupportedAbi);
+    rir::verify(&program).expect("RIR rejected mut borrow ABI");
 }
 
 fn assert_rir_error(program: RirProgram, kind: RirVerifyErrorKind) {
     let errors = rir::verify(&program).expect_err("verified invalid RIR");
     assert!(errors.iter().any(|error| error.kind == kind));
+}
+
+fn assert_rir_type_error(program: RirProgram) {
+    let errors = rir::verify(&program).expect_err("verified invalid RIR");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, RirVerifyErrorKind::TypeMismatch { .. })),
+        "missing expected type mismatch: {errors:?}"
+    );
+}
+
+fn dataref_metadata_rir() -> RirProgram {
+    let int = RirTypeId::from_index(0);
+    let node = RirTypeId::from_index(1);
+    let aggregate = air::AggregateId::from_index(0);
+    let mut program = RirProgram {
+        types: vec![RirType::Int, RirType::DataRef(RirDataRefId::from_index(0))],
+        datarefs: vec![RirDataRef {
+            id: RirDataRefId::from_index(0),
+            air_id: aggregate,
+            symbol: RirSymbol::new("Node"),
+            display: RirSymbol::new("Node"),
+            cycle_capable: true,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("value"),
+                ty: int,
+            }],
+        }],
+        ..RirProgram::default()
+    };
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(0),
+        air_id: None,
+        symbol: RirSymbol::new("main"),
+        params: vec![],
+        ret: RirReturn { ty: node },
+        locals: vec![],
+        body: RirStructuredBlock {
+            stmts: vec![],
+            term: RirTerm::Unreachable,
+        },
+    });
+    program
+}
+
+fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
+    let int = RirTypeId::from_index(0);
+    let node = RirTypeId::from_index(1);
+    let point = RirTypeId::from_index(2);
+    let array = RirTypeId::from_index(3);
+    let void = RirTypeId::from_index(4);
+    let bool_ty = RirTypeId::from_index(5);
+    let mut program = RirProgram {
+        types: vec![
+            RirType::Int,
+            RirType::DataRef(RirDataRefId::from_index(0)),
+            RirType::Struct(RirStructId::from_index(0)),
+            RirType::Array { elem: int, len: 2 },
+            RirType::Void,
+            RirType::Bool,
+        ],
+        structs: vec![RirStruct {
+            id: RirStructId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("Point"),
+            display: RirSymbol::new("Point"),
+            native_path: None,
+            native_key: None,
+            copyable: true,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("x"),
+                ty: int,
+            }],
+        }],
+        datarefs: vec![RirDataRef {
+            id: RirDataRefId::from_index(0),
+            air_id: air::AggregateId::from_index(0),
+            symbol: RirSymbol::new("Node"),
+            display: RirSymbol::new("Node"),
+            cycle_capable: true,
+            fields: vec![
+                RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("point"),
+                    ty: point,
+                },
+                RirField {
+                    id: RirFieldId::from_index(1),
+                    symbol: RirSymbol::new("items"),
+                    ty: array,
+                },
+                RirField {
+                    id: RirFieldId::from_index(2),
+                    symbol: RirSymbol::new("value"),
+                    ty: int,
+                },
+                RirField {
+                    id: RirFieldId::from_index(3),
+                    symbol: RirSymbol::new("child"),
+                    ty: node,
+                },
+                RirField {
+                    id: RirFieldId::from_index(4),
+                    symbol: RirSymbol::new("more"),
+                    ty: array,
+                },
+            ],
+        }],
+        consts: vec![
+            RirConst {
+                id: RirConstId::from_index(0),
+                ty: int,
+                value: RirConstValue::Int(1),
+            },
+            RirConst {
+                id: RirConstId::from_index(1),
+                ty: bool_ty,
+                value: RirConstValue::Bool(true),
+            },
+        ],
+        ..RirProgram::default()
+    };
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(0),
+        air_id: None,
+        symbol: RirSymbol::new("main"),
+        params: vec![],
+        ret: RirReturn { ty: void },
+        locals: vec![
+            RirLocal {
+                id: RirLocalId::from_index(0),
+                ty: node,
+                mutable: true,
+                symbol: RirSymbol::new("node"),
+                initialized: true,
+            },
+            RirLocal {
+                id: RirLocalId::from_index(1),
+                ty: int,
+                mutable: false,
+                symbol: RirSymbol::new("index"),
+                initialized: true,
+            },
+            RirLocal {
+                id: RirLocalId::from_index(2),
+                ty: int,
+                mutable: false,
+                symbol: RirSymbol::new("out"),
+                initialized: false,
+            },
+        ],
+        body: RirStructuredBlock {
+            stmts,
+            term: RirTerm::Return(None),
+        },
+    });
+    program
+}
+
+fn dataref_access_place(local: usize, ty: usize) -> RirPlace {
+    RirPlace {
+        local: RirLocalId::from_index(local),
+        projections: vec![],
+        ty: RirTypeId::from_index(ty),
+    }
 }
 
 fn enum_match_rir(
@@ -3050,6 +3641,375 @@ fn struct_decl_program(dataref: bool) -> Program {
         TypeData::Aggregate(aggregate)
     });
     program
+}
+
+fn unsupported_dataref_payload_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let list = program.alloc_type(TypeData::List(int));
+    let module = program.alloc_module(root_module());
+    let aggregate = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Bad"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("items"),
+            ty: list,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+    program.alloc_type(TypeData::DataRef(aggregate));
+    program
+}
+
+fn dataref_field_projection_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let aggregate = dataref_decl(&mut program, module, int);
+    let node = program.alloc_type(TypeData::DataRef(aggregate));
+    let one = program.const_arena.alloc(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let arg = air::LocalId::from_index(0);
+    let out = air::LocalId::from_index(1);
+    let value = Place {
+        root: arg,
+        projection: vec![Projection::Field(air::FieldId::from_index(0))],
+        ty: int,
+    };
+    let main = program.alloc_function(Function {
+        name: Ident::new("update"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("node", node, ParamMode::Value, arg)], int),
+        locals: vec![
+            Local {
+                name: None,
+                ty: node,
+                mutability: Mutability::Mutable,
+                kind: LocalKind::Arg,
+            },
+            local(int, LocalKind::Temp),
+        ],
+        body: structured_body(
+            vec![
+                Statement::Assign {
+                    dst: value.clone(),
+                    value: RValue::Use(Operand::Const(one)),
+                },
+                Statement::Init {
+                    local: out,
+                    value: RValue::Use(Operand::Place(value)),
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(place(out, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program
+}
+
+fn nested_dataref_read_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let aggregate = dataref_decl(&mut program, module, int);
+    let node = program.alloc_type(TypeData::DataRef(aggregate));
+    program.aggregate_mut(aggregate).fields.push(FieldDecl {
+        name: Ident::new("child"),
+        ty: node,
+    });
+    let root = air::LocalId::from_index(0);
+    let out = air::LocalId::from_index(1);
+    let nested = Place {
+        root,
+        projection: vec![
+            Projection::Field(air::FieldId::from_index(1)),
+            Projection::Field(air::FieldId::from_index(0)),
+        ],
+        ty: int,
+    };
+    let main = program.alloc_function(Function {
+        name: Ident::new("nested"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("node", node, ParamMode::Value, root)], int),
+        locals: vec![local(node, LocalKind::Arg), local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: out,
+                value: RValue::Use(Operand::Place(nested)),
+            }],
+            air::AirTail::Return(Some(Operand::Place(place(out, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program
+}
+
+fn dataref_string_field_consumers_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let string = program.alloc_type(TypeData::String);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let aggregate = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Named"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("label"),
+            ty: string,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+    let named = program.alloc_type(TypeData::DataRef(aggregate));
+    let arg = air::LocalId::from_index(0);
+    let consume = program.alloc_function(Function {
+        name: Ident::new("consume"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("label", string, ParamMode::SharedBorrow, arg)],
+            void,
+        ),
+        locals: vec![local(string, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let node = air::LocalId::from_index(0);
+    let len = air::LocalId::from_index(1);
+    let label = Place {
+        root: node,
+        projection: vec![Projection::Field(air::FieldId::from_index(0))],
+        ty: string,
+    };
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("node", named, ParamMode::Value, node)], int),
+        locals: vec![local(named, LocalKind::Arg), local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: len,
+                    value: RValue::Len {
+                        source: label.clone(),
+                    },
+                },
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(consume),
+                    args: vec![CallArg::SharedBorrow(label)],
+                }),
+            ],
+            air::AirTail::Return(Some(Operand::Place(place(len, int)))),
+        ),
+    });
+    program.module_mut(module).functions.extend([consume, main]);
+    program
+}
+
+fn multi_projected_mut_call_arg_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let aggregate = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Pair"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![
+            FieldDecl {
+                name: Ident::new("a"),
+                ty: int,
+            },
+            FieldDecl {
+                name: Ident::new("b"),
+                ty: int,
+            },
+        ],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+    let pair = program.alloc_type(TypeData::DataRef(aggregate));
+    let a = air::LocalId::from_index(0);
+    let b = air::LocalId::from_index(1);
+    let swap = program.alloc_function(Function {
+        name: Ident::new("swap"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![
+                param("a", int, ParamMode::MutBorrow, a),
+                param("b", int, ParamMode::MutBorrow, b),
+            ],
+            void,
+        ),
+        locals: vec![
+            mut_local(int, LocalKind::Arg),
+            mut_local(int, LocalKind::Arg),
+        ],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let pair_local = air::LocalId::from_index(0);
+    let field_a = Place {
+        root: pair_local,
+        projection: vec![Projection::Field(air::FieldId::from_index(0))],
+        ty: int,
+    };
+    let field_b = Place {
+        root: pair_local,
+        projection: vec![Projection::Field(air::FieldId::from_index(1))],
+        ty: int,
+    };
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("pair", pair, ParamMode::Value, pair_local)],
+            void,
+        ),
+        locals: vec![local(pair, LocalKind::Arg)],
+        body: structured_body(
+            vec![Statement::Eval(RValue::Call {
+                callee: Callee::Function(swap),
+                args: vec![CallArg::MutBorrow(field_a), CallArg::MutBorrow(field_b)],
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.extend([swap, main]);
+    program
+}
+
+fn dataref_root_rebind_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let aggregate = dataref_decl(&mut program, module, int);
+    let node = program.alloc_type(TypeData::DataRef(aggregate));
+    let target = air::LocalId::from_index(0);
+    let other = air::LocalId::from_index(1);
+    let replace = program.alloc_function(Function {
+        name: Ident::new("replace"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![
+                param("target", node, ParamMode::MutBorrow, target),
+                param("other", node, ParamMode::Value, other),
+            ],
+            void,
+        ),
+        locals: vec![mut_local(node, LocalKind::Arg), local(node, LocalKind::Arg)],
+        body: structured_body(
+            vec![Statement::Assign {
+                dst: place(target, node),
+                value: RValue::Use(Operand::Place(place(other, node))),
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(replace);
+    program
+}
+
+fn projected_mut_call_arg_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let aggregate = dataref_decl(&mut program, module, int);
+    let node = program.alloc_type(TypeData::DataRef(aggregate));
+    let arg = air::LocalId::from_index(0);
+    let bump = program.alloc_function(Function {
+        name: Ident::new("bump"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("value", int, ParamMode::MutBorrow, arg)], void),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let node_local = air::LocalId::from_index(0);
+    let field = Place {
+        root: node_local,
+        projection: vec![Projection::Field(air::FieldId::from_index(0))],
+        ty: int,
+    };
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("node", node, ParamMode::Value, node_local)],
+            void,
+        ),
+        locals: vec![local(node, LocalKind::Arg)],
+        body: structured_body(
+            vec![Statement::Eval(RValue::Call {
+                callee: Callee::Function(bump),
+                args: vec![CallArg::MutBorrow(field)],
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.extend([bump, main]);
+    program
+}
+
+fn dataref_decl(
+    program: &mut Program,
+    module: air::ModuleId,
+    int: air::TypeId,
+) -> air::AggregateId {
+    let aggregate = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("value"),
+            ty: int,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+    aggregate
 }
 
 fn struct_method_program() -> Program {
@@ -3991,7 +4951,7 @@ mod enums {
         let text = source.as_str();
 
         assert!(text.contains("match &v0"));
-        assert!(text.contains("Text(f0) => anvT2_Message::Text(f0.share())"));
+        assert!(text.contains("Text(f0) => anvT2_Message::Text((*(f0)).share())"));
         assert!(!text.contains(".clone()"));
         assert!(!text.contains(".to_owned()"));
 
@@ -4523,7 +5483,7 @@ mod arrays {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("Point { x: *&v1[0].x }]"));
+        assert!(source.as_str().contains("Point { x: *(&(&v1[0]).x) }]"));
         assert!(!source.as_str().contains("clone"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success);
@@ -4603,7 +5563,7 @@ mod arrays {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("match &&v1[0]"));
+        assert!(source.as_str().contains("match &v1[0]"));
         assert!(!source.as_str().contains("clone"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success);
@@ -4748,7 +5708,7 @@ mod arrays {
                 stmts: vec![],
                 term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
                     local: RirLocalId::from_index(0),
-                    projections: vec![rir::RirProjection::Index(RirLocalId::from_index(1))],
+                    projections: vec![RirProjection::Index(RirLocalId::from_index(1))],
                     ty: int,
                 }))),
             },
@@ -5345,7 +6305,7 @@ mod slices {
         program.set_entry(main);
 
         let source = plan_source(program).into_string();
-        assert!(source.contains("item.share()"));
+        assert!(source.contains("(*(item)).share()"));
     }
 }
 
@@ -5770,39 +6730,43 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
     let string = RirTypeId::from_index(0);
     let option = RirTypeId::from_index(1);
     program.types.push(RirType::String);
-    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
-    program.enums.push(RirEnum {
-        id: RirEnumId::from_index(0),
-        air_id: None,
-        core,
-        repr: rir::RirEnumRepr::Adt,
-        raw_type: None,
-        symbol: RirSymbol::new("OptionString"),
-        display: RirSymbol::new("Option"),
-        copyable: false,
-        variants: vec![
-            RirVariant {
-                id: RirVariantId::from_index(0),
-                symbol: RirSymbol::new("None"),
-                display: RirSymbol::new("None"),
-                kind: RirVariantKind::Unit,
-                raw_value: None,
-                fields: vec![],
-            },
-            RirVariant {
-                id: RirVariantId::from_index(1),
-                symbol: RirSymbol::new("Some"),
-                display: RirSymbol::new("Some"),
-                kind: RirVariantKind::Tuple,
-                raw_value: None,
-                fields: vec![RirField {
-                    id: RirFieldId::from_index(0),
-                    symbol: RirSymbol::new("f0"),
-                    ty: string,
-                }],
-            },
-        ],
-    });
+    if core.is_some() {
+        program.types.push(RirType::Option(string));
+    } else {
+        program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+        program.enums.push(RirEnum {
+            id: RirEnumId::from_index(0),
+            air_id: None,
+            core,
+            repr: rir::RirEnumRepr::Adt,
+            raw_type: None,
+            symbol: RirSymbol::new("OptionString"),
+            display: RirSymbol::new("Option"),
+            copyable: false,
+            variants: vec![
+                RirVariant {
+                    id: RirVariantId::from_index(0),
+                    symbol: RirSymbol::new("None"),
+                    display: RirSymbol::new("None"),
+                    kind: RirVariantKind::Unit,
+                    raw_value: None,
+                    fields: vec![],
+                },
+                RirVariant {
+                    id: RirVariantId::from_index(1),
+                    symbol: RirSymbol::new("Some"),
+                    display: RirSymbol::new("Some"),
+                    kind: RirVariantKind::Tuple,
+                    raw_value: None,
+                    fields: vec![RirField {
+                        id: RirFieldId::from_index(0),
+                        symbol: RirSymbol::new("f0"),
+                        ty: string,
+                    }],
+                },
+            ],
+        });
+    }
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("substring"),

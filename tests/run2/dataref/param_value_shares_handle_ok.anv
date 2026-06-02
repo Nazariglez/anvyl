@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 12
+
+dataref Box {
+    value: int,
+}
+
+fn set_value(b: Box) {
+    var alias = b;
+    alias.value = 12;
+}
+
+fn main() {
+    let b = Box { value: 1 };
+    set_value(b);
+    println(b.value);
+}

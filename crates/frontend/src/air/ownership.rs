@@ -382,6 +382,7 @@ impl ParamUseAnalyzer<'_> {
             RValue::Use(operand) => self.observe_operand(operand, context),
             RValue::Unary { value, .. }
             | RValue::Cast { value, .. }
+            | RValue::OptionalSome { value, .. }
             | RValue::Stringify { value, .. }
             | RValue::Format { value, .. } => self.observe_operand(value, ValueContext::Read),
             RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {

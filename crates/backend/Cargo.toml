@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anvyx-frontend = { path = "../frontend" }
 anvyx-runtime = { path = "../runtime" }
+fd-lock = "4.0"
 sha2 = "0.10"
 
 [dev-dependencies]

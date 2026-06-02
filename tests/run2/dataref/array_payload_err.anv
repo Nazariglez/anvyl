@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @skip: array dataref payload needs user-facing target gap
+
+dataref Item {
+    value: int,
+}
+
+dataref Pair {
+    items: [Item; 2],
+}
+
+fn main() {
+    let a = Item { value: 1 };
+    let b = Item { value: 2 };
+    let pair = Pair { items: [a, b] };
+    println(pair.items[0].value);
+}

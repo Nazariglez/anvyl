@@ -1,8 +1,8 @@
 use std::{
     error::Error,
-    fmt::{self, Write},
+    fmt::{self, Write as FmtWrite},
     fs,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -338,65 +338,66 @@ pub fn execute(job: &RustCargoJob) -> Result<RustCargoOutput, RustCargoError> {
     validate_package(&job.package)?;
 
     let layout = RustCargoLayout::new(job.cache_root.clone(), job.crate_identity.clone());
-    let _lock = LockFile::acquire(layout.lock_path(), None)?;
-    write_single_package(job, &layout)?;
+    with_lock(layout.lock_path(), None, || {
+        write_single_package(job, &layout)?;
 
-    let cargo = Command::new("cargo")
-        .arg("build")
-        .args(job.profile.build_args())
-        .arg("--manifest-path")
-        .arg(layout.manifest_path())
-        .arg("--target-dir")
-        .arg(layout.target_dir())
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                RustCargoError::CargoUnavailable
-            } else {
-                RustCargoError::Io(error)
-            }
-        })?;
+        let cargo = Command::new("cargo")
+            .arg("build")
+            .args(job.profile.build_args())
+            .arg("--manifest-path")
+            .arg(layout.manifest_path())
+            .arg("--target-dir")
+            .arg(layout.target_dir())
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    RustCargoError::CargoUnavailable
+                } else {
+                    RustCargoError::Io(error)
+                }
+            })?;
 
-    if !cargo.status.success() {
-        return Ok(RustCargoOutput::CargoFailed(failure(
-            &layout,
-            cargo.status.code(),
-            cargo.stdout,
-            cargo.stderr,
-        )));
-    }
+        if !cargo.status.success() {
+            return Ok(RustCargoOutput::CargoFailed(failure(
+                &layout,
+                cargo.status.code(),
+                cargo.stdout,
+                cargo.stderr,
+            )));
+        }
 
-    let binary_path = layout.binary_path(job.profile, &job.package.binary_name);
-    if !binary_path.exists() {
-        return Err(RustCargoError::BinaryMissing(binary_path));
-    }
+        let binary_path = layout.binary_path(job.profile, &job.package.binary_name);
+        if !binary_path.exists() {
+            return Err(RustCargoError::BinaryMissing(binary_path));
+        }
 
-    match job.mode {
-        RustCargoMode::Build => Ok(RustCargoOutput::Success(success(
-            &layout,
-            binary_path,
-            cargo.stdout,
-            cargo.stderr,
-        ))),
-        RustCargoMode::Run => {
-            let run = Command::new(&binary_path).output()?;
-            if !run.status.success() {
-                return Ok(RustCargoOutput::RunFailed(failure(
-                    &layout,
-                    run.status.code(),
-                    run.stdout,
-                    run.stderr,
-                )));
-            }
-            Ok(RustCargoOutput::Success(success(
+        match job.mode {
+            RustCargoMode::Build => Ok(RustCargoOutput::Success(success(
                 &layout,
                 binary_path,
-                run.stdout,
-                run.stderr,
-            )))
+                cargo.stdout,
+                cargo.stderr,
+            ))),
+            RustCargoMode::Run => {
+                let run = Command::new(&binary_path).output()?;
+                if !run.status.success() {
+                    return Ok(RustCargoOutput::RunFailed(failure(
+                        &layout,
+                        run.status.code(),
+                        run.stdout,
+                        run.stderr,
+                    )));
+                }
+                Ok(RustCargoOutput::Success(success(
+                    &layout,
+                    binary_path,
+                    run.stdout,
+                    run.stderr,
+                )))
+            }
         }
-    }
+    })
 }
 
 pub fn execute_batch_with_timeout(
@@ -407,41 +408,42 @@ pub fn execute_batch_with_timeout(
     validate_batch_cases(&job.cases)?;
     let started = Instant::now();
     let layout = RustCargoLayout::new(job.cache_root.clone(), job.crate_identity.clone());
-    let _lock = LockFile::acquire(layout.lock_path(), timeout)?;
-    write_batch_package(job, &layout)?;
+    with_lock(layout.lock_path(), timeout, || {
+        write_batch_package(job, &layout)?;
 
-    let mut cargo = Command::new("cargo");
-    cargo
-        .arg("build")
-        .args(job.profile.build_args())
-        .arg("--manifest-path")
-        .arg(layout.manifest_path())
-        .arg("--target-dir")
-        .arg(layout.target_dir())
-        .env_remove("CARGO_TARGET_DIR");
-    let cargo = command_output(cargo, remaining_timeout(started, timeout)?)?;
+        let mut cargo = Command::new("cargo");
+        cargo
+            .arg("build")
+            .args(job.profile.build_args())
+            .arg("--manifest-path")
+            .arg(layout.manifest_path())
+            .arg("--target-dir")
+            .arg(layout.target_dir())
+            .env_remove("CARGO_TARGET_DIR");
+        let cargo = command_output(cargo, remaining_timeout(started, timeout)?)?;
 
-    if !cargo.status.success() {
-        return Ok(RustCargoBatchOutput::CargoFailed(failure(
-            &layout,
-            cargo.status.code(),
-            cargo.stdout,
-            cargo.stderr,
-        )));
-    }
-
-    let mut binaries = vec![];
-    for case in &job.cases {
-        let path = layout.binary_path(job.profile, &case.name);
-        if !path.exists() {
-            return Err(RustCargoError::BinaryMissing(path));
+        if !cargo.status.success() {
+            return Ok(RustCargoBatchOutput::CargoFailed(failure(
+                &layout,
+                cargo.status.code(),
+                cargo.stdout,
+                cargo.stderr,
+            )));
         }
-        binaries.push((case.name.clone(), path));
-    }
 
-    Ok(RustCargoBatchOutput::Success(RustCargoBatchSuccess {
-        binaries,
-    }))
+        let mut binaries = vec![];
+        for case in &job.cases {
+            let path = layout.binary_path(job.profile, &case.name);
+            if !path.exists() {
+                return Err(RustCargoError::BinaryMissing(path));
+            }
+            binaries.push((case.name.clone(), path));
+        }
+
+        Ok(RustCargoBatchOutput::Success(RustCargoBatchSuccess {
+            binaries,
+        }))
+    })
 }
 
 fn write_single_package(
@@ -684,30 +686,56 @@ fn command_output(
             RustCargoError::Io(error)
         }
     })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RustCargoError::Io(std::io::Error::other("missing child stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RustCargoError::Io(std::io::Error::other("missing child stderr")))?;
+    let stdout_reader = spawn_output_reader(stdout);
+    let stderr_reader = spawn_output_reader(stderr);
+
     let start = Instant::now();
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait()? {
-            let mut stdout = vec![];
-            let mut stderr = vec![];
-            if let Some(mut out) = child.stdout.take() {
-                let _ = out.read_to_end(&mut stdout);
-            }
-            if let Some(mut err) = child.stderr.take() {
-                let _ = err.read_to_end(&mut stderr);
-            }
-            return Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            });
+            break status;
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = join_output_reader(stdout_reader);
+            let _ = join_output_reader(stderr_reader);
             return Err(RustCargoError::Timeout);
         }
         thread::sleep(LOCK_POLL);
-    }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: join_output_reader(stdout_reader)?,
+        stderr: join_output_reader(stderr_reader)?,
+    })
+}
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    mut reader: R,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = vec![];
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_output_reader(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, RustCargoError> {
+    reader
+        .join()
+        .map_err(|_| RustCargoError::Io(std::io::Error::other("output reader thread panicked")))?
+        .map_err(RustCargoError::Io)
 }
 
 fn success(
@@ -743,61 +771,39 @@ fn failure(
 }
 
 const LOCK_POLL: Duration = Duration::from_millis(25);
-const STALE_LOCK_AFTER: Duration = Duration::from_mins(30);
 
-pub struct LockFile {
+pub fn with_lock<T>(
     path: PathBuf,
-    _file: File,
-}
+    timeout: Option<Duration>,
+    f: impl FnOnce() -> Result<T, RustCargoError>,
+) -> Result<T, RustCargoError> {
+    let dir = path.parent().expect("lock path has parent");
+    fs::create_dir_all(dir)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    let mut lock = fd_lock::RwLock::new(file);
 
-impl LockFile {
-    fn acquire(path: PathBuf, timeout: Option<Duration>) -> Result<Self, RustCargoError> {
-        Self::acquire_stale(path, timeout, STALE_LOCK_AFTER)
-    }
-
-    pub fn acquire_stale(
-        path: PathBuf,
-        timeout: Option<Duration>,
-        stale_after: Duration,
-    ) -> Result<Self, RustCargoError> {
-        let dir = path.parent().expect("lock path has parent");
-        fs::create_dir_all(dir)?;
-        let started = Instant::now();
-        loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok(Self { path, _file: file }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if remove_stale_lock(&path, stale_after)? {
-                        continue;
-                    }
-                    if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-                        return Err(RustCargoError::LockTimeout(path));
-                    }
-                    thread::sleep(LOCK_POLL);
-                }
-                Err(error) => return Err(RustCargoError::Io(error)),
-            }
-        }
-    }
-}
-
-fn remove_stale_lock(path: &Path, stale_after: Duration) -> Result<bool, RustCargoError> {
-    let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
-        return Ok(false);
+    let Some(timeout) = timeout else {
+        let _guard = lock.write().map_err(RustCargoError::Io)?;
+        return f();
     };
-    if modified.elapsed().unwrap_or_default() < stale_after {
-        return Ok(false);
-    }
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(RustCargoError::Io(error)),
-    }
-}
 
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+    let started = Instant::now();
+    loop {
+        match lock.try_write() {
+            Ok(_guard) => return f(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= timeout {
+                    return Err(RustCargoError::LockTimeout(path));
+                }
+                thread::sleep(LOCK_POLL);
+            }
+            Err(error) => return Err(RustCargoError::Io(error)),
+        }
     }
 }
 
@@ -1402,6 +1408,64 @@ mod tests {
         assert!(matches!(
             validate_package(&package),
             Err(RustCargoError::InvalidJob(_))
+        ));
+    }
+
+    #[test]
+    fn existing_lock_file_does_not_block_after_guard_drops() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("job.lock");
+        fs::write(&path, "stale sentinel\n").unwrap();
+
+        with_lock(path.clone(), Some(Duration::ZERO), || Ok(())).unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn live_lock_times_out_second_acquisition() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("job.lock");
+
+        with_lock(path.clone(), Some(Duration::from_millis(250)), || {
+            assert!(matches!(
+                with_lock(path.clone(), Some(Duration::ZERO), || Ok(())),
+                Err(RustCargoError::LockTimeout(_))
+            ));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_drains_piped_streams_while_child_runs() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "i=0; \
+             while [ \"$i\" -lt 4096 ]; do \
+                 printf '0123456789abcdef0123456789abcdef\\n'; \
+                 printf 'fedcba9876543210fedcba9876543210\\n' >&2; \
+                 i=$((i + 1)); \
+             done",
+        );
+
+        let output = command_output(command, Some(Duration::from_secs(5))).unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 100_000);
+        assert!(output.stderr.len() > 100_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_times_out_long_running_child() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 10");
+
+        assert!(matches!(
+            command_output(command, Some(Duration::from_millis(50))),
+            Err(RustCargoError::Timeout)
         ));
     }
 

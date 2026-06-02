@@ -117,20 +117,65 @@ impl ProfileCx<'_> {
     fn aggregate_decl_supported(&self, aggregate: AggregateId) -> bool {
         let decl = self.program.aggregate(aggregate);
         decl.kind == AggregateKind::Struct
-            && decl.fields.iter().all(|field| {
-                matches!(
-                    self.program.type_arena.data(field.ty),
-                    TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String
-                )
-            })
+            && decl
+                .fields
+                .iter()
+                .all(|field| self.inline_payload_supported(field.ty))
+    }
+
+    fn dataref_decl_supported(&self, aggregate: AggregateId) -> bool {
+        let decl = self.program.aggregate(aggregate);
+        decl.kind == AggregateKind::DataRef
+            && decl
+                .fields
+                .iter()
+                .all(|field| self.dataref_payload_supported(field.ty))
+    }
+
+    fn inline_payload_supported(&self, ty: TypeId) -> bool {
+        match self.program.type_arena.data(ty) {
+            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
+            TypeData::DataRef(_) => true,
+            TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
+            TypeData::Enum(enm) => self.enum_decl_supported(*enm),
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.inline_payload_supported(*inner)
+            }
+            _ => false,
+        }
+    }
+
+    fn dataref_payload_supported(&self, ty: TypeId) -> bool {
+        match self.program.type_arena.data(ty) {
+            TypeData::DataRef(_) => true,
+            TypeData::Optional(inner) => self.dataref_payload_supported(*inner),
+            TypeData::Aggregate(aggregate) => self
+                .program
+                .aggregate(*aggregate)
+                .fields
+                .iter()
+                .all(|field| self.dataref_payload_supported(field.ty)),
+            TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().all(|variant| {
+                variant_field_tys(variant).all(|ty| self.dataref_payload_supported(ty))
+            }),
+            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::Tuple(_)
+            | TypeData::Array { .. }
+            | TypeData::List(_)
+            | TypeData::Map { .. }
+            | TypeData::Slice(_)
+            | TypeData::Extern(_)
+            | TypeData::Function(_)
+            | TypeData::Dyn(_) => false,
+        }
     }
 
     fn enum_decl_supported(&self, enm: EnumId) -> bool {
         let decl = self.program.enum_decl(enm);
         decl.variants.iter().all(|variant| {
-            variant_field_tys(variant)
-                .into_iter()
-                .all(|ty| self.enum_field_supported(decl.core, ty))
+            variant_field_tys(variant).all(|ty| self.enum_field_supported(decl.core, ty))
         })
     }
 
@@ -138,7 +183,15 @@ impl ProfileCx<'_> {
         match self.program.type_arena.data(ty) {
             TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
             TypeData::Enum(_) if core == Some(air::CoreEnumKind::Option) => true,
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
+            TypeData::Enum(enm) => self.enum_decl_supported(*enm),
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.inline_payload_supported(*inner)
+            }
+            TypeData::DataRef(_)
+            | TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String => true,
             _ => false,
         }
     }
@@ -163,7 +216,11 @@ impl ProfileCx<'_> {
     fn check_module(&mut self, index: usize, module: &Module) {
         for aggregate in &module.aggregates {
             let decl = self.program.aggregate(*aggregate);
-            if decl.kind != AggregateKind::Struct {
+            let supported = match decl.kind {
+                AggregateKind::Struct => self.aggregate_decl_supported(*aggregate),
+                AggregateKind::DataRef => self.dataref_decl_supported(*aggregate),
+            };
+            if !supported {
                 self.push(
                     ProfileSite::Module(index),
                     ProfileErrorKind::UnsupportedModuleItem,
@@ -339,6 +396,10 @@ impl ProfileCx<'_> {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *target);
             }
+            RValue::OptionalSome { value, ty } => {
+                self.check_operand(site, value);
+                self.check_type_ref(site, *ty);
+            }
             RValue::Stringify { value, source_ty } => {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *source_ty);
@@ -379,6 +440,9 @@ impl ProfileCx<'_> {
             }
             RValue::ListPush { list, value } => {
                 self.check_place(site, list);
+                if self.place_crosses_dataref(site, list) {
+                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                }
                 let TypeData::List(elem) = self.program.type_arena.data(list.ty) else {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
@@ -407,6 +471,11 @@ impl ProfileCx<'_> {
             } => self.check_slice_rvalue(site, source, *start, *end, *ty, true),
             RValue::MapGet { map, key, ty } | RValue::MapRemove { map, key, ty } => {
                 self.check_place(site, map);
+                if matches!(value, RValue::MapRemove { .. })
+                    && self.place_crosses_dataref(site, map)
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                }
                 self.check_operand(site, key);
                 self.check_type_ref(site, *ty);
                 let TypeData::Map {
@@ -428,6 +497,9 @@ impl ProfileCx<'_> {
             }
             RValue::MapInsert { map, key, value } => {
                 self.check_place(site, map);
+                if self.place_crosses_dataref(site, map) {
+                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                }
                 self.check_operand(site, key);
                 self.check_operand(site, value);
                 let TypeData::Map {
@@ -445,10 +517,18 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
             }
-            RValue::SharedRefEq { .. }
-            | RValue::ListPop { .. }
-            | RValue::MapEntryAt { .. }
-            | RValue::MakeClosure { .. } => {
+            RValue::SharedRefEq { lhs, rhs, .. } => {
+                self.check_operand(site, lhs);
+                self.check_operand(site, rhs);
+                let lhs_ty = self.operand_ty(lhs);
+                let rhs_ty = self.operand_ty(rhs);
+                if lhs_ty != rhs_ty
+                    || !matches!(self.program.type_arena.data(lhs_ty), TypeData::DataRef(_))
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
+            }
+            RValue::ListPop { .. } | RValue::MapEntryAt { .. } | RValue::MakeClosure { .. } => {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
         }
@@ -462,13 +542,23 @@ impl ProfileCx<'_> {
         ty: TypeId,
     ) {
         match kind {
-            AggregateCtor::Struct(aggregate) => {
-                if !matches!(self.program.type_arena.data(ty), TypeData::Aggregate(id) if id == aggregate)
-                {
+            AggregateCtor::Struct(aggregate) | AggregateCtor::DataRef(aggregate) => {
+                let (expected_kind, type_matches) = match kind {
+                    AggregateCtor::Struct(_) => (
+                        AggregateKind::Struct,
+                        matches!(self.program.type_arena.data(ty), TypeData::Aggregate(id) if id == aggregate),
+                    ),
+                    AggregateCtor::DataRef(_) => (
+                        AggregateKind::DataRef,
+                        matches!(self.program.type_arena.data(ty), TypeData::DataRef(id) if id == aggregate),
+                    ),
+                    _ => unreachable!(),
+                };
+                if !type_matches {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
                 let decl = self.program.aggregate(*aggregate);
-                if decl.fields.len() != fields.len() {
+                if decl.kind != expected_kind || decl.fields.len() != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
                 for (field, operand) in decl.fields.iter().zip(fields) {
@@ -515,11 +605,10 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
                 };
-                let variant_fields = variant_field_tys(variant);
-                if variant_fields.len() != fields.len() {
+                if variant_field_count(variant) != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                for (expected, operand) in variant_fields.into_iter().zip(fields) {
+                for (expected, operand) in variant_field_tys(variant).zip(fields) {
                     self.check_operand(site, operand);
                     if self.operand_ty(operand) != expected {
                         self.push(site, ProfileErrorKind::UnsupportedRValue);
@@ -579,7 +668,7 @@ impl ProfileCx<'_> {
                     }
                 }
             }
-            AggregateCtor::Tuple | AggregateCtor::DataRef(_) => {
+            AggregateCtor::Tuple => {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
         }
@@ -628,7 +717,7 @@ impl ProfileCx<'_> {
     }
 
     fn current_local(&self, site: ProfileSite, local: LocalId) -> Option<&Local> {
-        let ProfileSite::Statement(function, _) = site else {
+        let (ProfileSite::Statement(function, _) | ProfileSite::Terminator(function)) = site else {
             return None;
         };
         self.program.function(function).locals.get(local.index())
@@ -703,6 +792,45 @@ impl ProfileCx<'_> {
         self.check_type_ref(site, place.ty);
     }
 
+    fn place_crosses_dataref(&self, site: ProfileSite, place: &Place) -> bool {
+        let Some(local) = self.current_local(site, place.root) else {
+            return false;
+        };
+        let mut ty = local.ty;
+        for projection in &place.projection {
+            if matches!(self.program.type_arena.data(ty), TypeData::DataRef(_)) {
+                return true;
+            }
+            let Some(next) = self.projected_ty(ty, projection) else {
+                return false;
+            };
+            ty = next;
+        }
+        false
+    }
+
+    fn projected_ty(&self, ty: TypeId, projection: &Projection) -> Option<TypeId> {
+        match (self.program.type_arena.data(ty), projection) {
+            (
+                TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate),
+                Projection::Field(field),
+            ) => self
+                .program
+                .aggregate(*aggregate)
+                .fields
+                .get(field.index())
+                .map(|field| field.ty),
+            (
+                TypeData::Array { elem, .. } | TypeData::List(elem) | TypeData::Slice(elem),
+                Projection::Index(_),
+            ) => Some(*elem),
+            (TypeData::Tuple(fields), Projection::TupleField(field)) => {
+                fields.get(usize::from(*field)).copied()
+            }
+            _ => None,
+        }
+    }
+
     fn check_extern(&mut self, id: ExternId, decl: &ExternDecl) {
         if decl.binding.is_none() {
             self.push(ProfileSite::Extern(id), ProfileErrorKind::UnsupportedExtern);
@@ -712,6 +840,7 @@ impl ProfileCx<'_> {
     fn check_type_ref(&mut self, site: ProfileSite, ty: TypeId) {
         let ok = match self.program.type_arena.data(ty) {
             TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
+            TypeData::DataRef(aggregate) => self.dataref_decl_supported(*aggregate),
             TypeData::Enum(enm) => self.enum_decl_supported(*enm),
             TypeData::Extern(ext) => self.extern_type_supported(*ext),
             TypeData::Array { elem, .. } => {
@@ -757,11 +886,26 @@ impl ProfileCx<'_> {
     }
 }
 
-fn variant_field_tys(variant: &VariantDecl) -> Vec<TypeId> {
+fn variant_field_tys(variant: &VariantDecl) -> impl Iterator<Item = TypeId> + '_ {
+    let tuple = match &variant.shape {
+        VariantShape::Tuple(fields) => fields.as_slice(),
+        _ => &[],
+    };
+    let strukt = match &variant.shape {
+        VariantShape::Struct(fields) => fields.as_slice(),
+        _ => &[],
+    };
+    tuple
+        .iter()
+        .copied()
+        .chain(strukt.iter().map(|field| field.ty))
+}
+
+fn variant_field_count(variant: &VariantDecl) -> usize {
     match &variant.shape {
-        VariantShape::Unit => vec![],
-        VariantShape::Tuple(fields) => fields.clone(),
-        VariantShape::Struct(fields) => fields.iter().map(|field| field.ty).collect(),
+        VariantShape::Unit => 0,
+        VariantShape::Tuple(fields) => fields.len(),
+        VariantShape::Struct(fields) => fields.len(),
     }
 }
 
@@ -808,5 +952,6 @@ fn const_is_slice1(program: &Program, id: ConstId) -> bool {
             | (TypeData::Float, ConstValue::Float(_))
             | (TypeData::Bool, ConstValue::Bool(_))
             | (TypeData::String, ConstValue::String(_))
+            | (TypeData::Optional(_), ConstValue::Nil)
     )
 }

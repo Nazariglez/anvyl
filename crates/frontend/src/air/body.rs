@@ -169,6 +169,10 @@ pub enum RValue {
         rhs: Operand,
         negated: bool,
     },
+    OptionalSome {
+        value: Operand,
+        ty: TypeId,
+    },
     Cast {
         value: Operand,
         target: TypeId,

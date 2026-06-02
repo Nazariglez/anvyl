@@ -1,0 +1,21 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: needs optional chaining
+// @match-begin
+// 7
+// 7
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn main() {
+    let node = Node { value: 7 };
+    let maybe: Node? = node;
+    let first: Node? = maybe;
+    let second: Node? = first;
+    println(node.value);
+    println(second?.value);
+}

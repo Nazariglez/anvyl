@@ -327,6 +327,17 @@ impl TypeLowerer {
         if decls.aggregate(&key).is_some() {
             return self.lower_aggregate_nominal(program, ty, &mut env, decls, &key);
         }
+        if enum_core_kind(decls, &key) == Some(CoreEnumKind::Option) {
+            let args = self.nominal_type_args(program, ty, env.reborrow())?;
+            let [inner] = args.as_slice() else {
+                return Err(LowerError::UnsupportedType {
+                    ty: Box::new(ty.clone()),
+                });
+            };
+            let id = program.alloc_type(TypeData::Optional(*inner));
+            self.cache.insert(ty.clone(), id);
+            return Ok(id);
+        }
         if decls.enum_schema(&key).is_some() {
             return self.lower_enum_nominal(program, ty, &mut env, decls, &key);
         }
@@ -1529,7 +1540,11 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 let ty = self.cx.lower_ty(&ty)?;
                 let init = match self.lower_binding_string_init(&binding.node.value)? {
                     Some(value) => value,
-                    None => RValue::Use(self.lower_value(&binding.node.value)?),
+                    None => RValue::Use(self.lower_value_of_type(
+                        &binding.node.value,
+                        ty,
+                        &binding.node.value,
+                    )?),
                 };
                 let local = self.push_local(
                     Some(name),
@@ -1560,8 +1575,16 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         requires_mut: bool,
     ) -> Result<Place, LowerError> {
         let fact = if requires_mut {
-            self.local_use(expr, LocalUseMode::VarArgument)
-                .or_else(|_| self.local_use(expr, LocalUseMode::MutBorrow))?
+            match self
+                .local_use(expr, LocalUseMode::VarArgument)
+                .or_else(|_| self.local_use(expr, LocalUseMode::MutBorrow))
+            {
+                Ok(fact) => fact,
+                Err(LowerError::MissingLocalUse { .. }) => {
+                    return self.lower_mut_place_from_read_fact(expr);
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             match self.local_use(expr, LocalUseMode::Borrow) {
                 Ok(fact) => fact,
@@ -1577,6 +1600,68 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         }
         self.lower_projected_place(expr, self.local_place(local))
+    }
+
+    fn lower_mut_place_from_read_fact(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        let root = projection_root(expr).unwrap_or(expr);
+        if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
+            let local = self.local(fact.local)?;
+            if self.function.locals[local.index()].mutability != AirMutability::Mutable {
+                return Err(unsupported_expr(expr));
+            }
+            return self.lower_projected_place(expr, self.local_place(local));
+        }
+        self.lower_self_mut_place_arg(expr)
+            .or_else(|_| self.lower_unique_named_mut_place_arg(expr))
+    }
+
+    fn lower_unique_named_mut_place_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        let root = projection_root(expr).unwrap_or(expr);
+        let ExprKind::Ident(name) = &root.node.kind else {
+            return Err(unsupported_expr(expr));
+        };
+        let mut matches = self
+            .function
+            .locals
+            .iter()
+            .enumerate()
+            .filter(|(_, local)| local.name == Some(*name));
+        let Some((index, local)) = matches.next() else {
+            return Err(unsupported_expr(expr));
+        };
+        if matches.next().is_some() || local.mutability != AirMutability::Mutable {
+            return Err(unsupported_expr(expr));
+        }
+        if self.cx.lower_ty(&self.lower_expr_ty(root.node.id)?)? != local.ty {
+            return Err(unsupported_expr(expr));
+        }
+        self.lower_projected_place(
+            expr,
+            Place {
+                root: LocalId::from_index(index),
+                projection: vec![],
+                ty: local.ty,
+            },
+        )
+    }
+
+    fn lower_self_mut_place_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        let root = projection_root(expr).unwrap_or(expr);
+        if !matches!(&root.node.kind, ExprKind::Ident(name) if name.as_str() == "self") {
+            return Err(LowerError::MissingLocalUse {
+                body: Box::new(self.body.clone()),
+                expr_id: expr.node.id,
+            });
+        }
+        let Some(param) = self.function.signature.params.iter().find(|param| {
+            param.role == ParamRole::Receiver || param.name == Some(Ident::new("self"))
+        }) else {
+            return Err(unsupported_expr(expr));
+        };
+        if self.function.locals[param.local_id.index()].mutability != AirMutability::Mutable {
+            return Err(unsupported_expr(expr));
+        }
+        self.lower_projected_place(expr, self.local_place(param.local_id))
     }
 
     fn lower_shared_projected_place_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
@@ -1669,11 +1754,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         field_name: Ident,
     ) -> Result<Place, LowerError> {
         let (index, ty) = match self.cx.program.type_data(place.ty) {
-            TypeData::Aggregate(aggregate) => {
+            TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate) => {
                 let decl = self.cx.program.aggregate(*aggregate);
-                if decl.kind != AggregateKind::Struct {
-                    return Err(unsupported_expr(expr));
-                }
                 let Some((index, field)) = decl
                     .fields
                     .iter()
@@ -1935,6 +2017,11 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 if binary.node.op == BinaryOp::Add && result_ty == Type::String {
                     return self.lower_string_concat(expr);
                 }
+                if matches!(binary.node.op, BinaryOp::Eq | BinaryOp::NotEq)
+                    && let Some(value) = self.lower_dataref_eq(expr, binary, &result_ty)?
+                {
+                    return Ok(value);
+                }
                 self.require_builtin_scalar(expr)?;
                 let lhs = self.lower_value(&binary.node.left)?;
                 let rhs = self.lower_value(&binary.node.right)?;
@@ -1972,6 +2059,39 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::Cast(cast) => self.lower_cast_expr(expr, cast),
             _ => Err(unsupported_expr(expr)),
         }
+    }
+
+    fn lower_dataref_eq(
+        &mut self,
+        expr: &ExprNode,
+        binary: &ast::BinaryNode,
+        result_ty: &Type,
+    ) -> Result<Option<Operand>, LowerError> {
+        if *result_ty != Type::Bool {
+            return Ok(None);
+        }
+        let lhs_ty = self
+            .cx
+            .lower_ty(&self.lower_expr_ty(binary.node.left.node.id)?)?;
+        let rhs_ty = self
+            .cx
+            .lower_ty(&self.lower_expr_ty(binary.node.right.node.id)?)?;
+        if lhs_ty != rhs_ty || !matches!(self.cx.program.type_data(lhs_ty), TypeData::DataRef(_)) {
+            return Ok(None);
+        }
+        let lhs = self.lower_value(&binary.node.left)?;
+        let rhs = self.lower_value(&binary.node.right)?;
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        self.emit_typed_temp(
+            bool_ty,
+            RValue::SharedRefEq {
+                lhs,
+                rhs,
+                negated: binary.node.op == BinaryOp::NotEq,
+            },
+        )
+        .map(Some)
+        .map_err(|_| unsupported_expr(expr))
     }
 
     fn lower_cast_expr(
@@ -2017,7 +2137,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let ty = self.lower_expr_ty(expr.node.id)?;
         let ty_id = self.cx.lower_ty(&ty)?;
         match self.cx.program.type_data(ty_id) {
-            TypeData::Aggregate(aggregate) => {
+            TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate) => {
                 self.lower_struct_aggregate_literal(expr, literal, *aggregate, ty_id)
             }
             TypeData::Enum(enum_id) => {
@@ -2063,11 +2183,40 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         expected: TypeId,
         err: &ExprNode,
     ) -> Result<Operand, LowerError> {
+        if matches!(expr.node.kind, ExprKind::Lit(Lit::Nil))
+            && matches!(self.cx.program.type_data(expected), TypeData::Optional(_))
+        {
+            return Ok(Operand::Const(self.cx.program.alloc_const(ConstData {
+                ty: expected,
+                value: ConstValue::Nil,
+            })));
+        }
         let value = self.lower_value(expr)?;
-        if self.operand_ty(&value) != expected {
+        if self.operand_ty(&value) == expected {
+            return Ok(value);
+        }
+        self.wrap_optional_value(value, expected, err)
+    }
+
+    fn wrap_optional_value(
+        &mut self,
+        value: Operand,
+        expected: TypeId,
+        err: &ExprNode,
+    ) -> Result<Operand, LowerError> {
+        let TypeData::Optional(inner) = self.cx.program.type_data(expected) else {
+            return Err(unsupported_expr(err));
+        };
+        if self.operand_ty(&value) != *inner {
             return Err(unsupported_expr(err));
         }
-        Ok(value)
+        self.emit_typed_temp(
+            expected,
+            RValue::OptionalSome {
+                value,
+                ty: expected,
+            },
+        )
     }
 
     fn lower_index_value(
@@ -2190,30 +2339,33 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         ty_id: TypeId,
     ) -> Result<Operand, LowerError> {
         let decl = self.cx.program.aggregate(aggregate);
-        if decl.kind != AggregateKind::Struct || decl.fields.len() != literal.node.fields.len() {
+        if !matches!(decl.kind, AggregateKind::Struct | AggregateKind::DataRef)
+            || decl.fields.len() != literal.node.fields.len()
+        {
             return Err(unsupported_expr(expr));
         }
+        let kind = match decl.kind {
+            AggregateKind::Struct => AggregateCtor::Struct(aggregate),
+            AggregateKind::DataRef => AggregateCtor::DataRef(aggregate),
+        };
         let mut values = HashMap::new();
         for (name, field_expr) in &literal.node.fields {
             if values.contains_key(name) {
                 return Err(unsupported_expr(expr));
             }
-            values.insert(*name, self.lower_value(field_expr)?);
+            values.insert(*name, field_expr);
         }
         let mut fields = vec![];
         for field in self.cx.program.aggregate(aggregate).fields.clone() {
-            let Some(value) = values.remove(&field.name) else {
+            let Some(field_expr) = values.remove(&field.name) else {
                 return Err(unsupported_expr(expr));
             };
-            if self.operand_type(&value) != self.air_type(field.ty) {
-                return Err(unsupported_expr(expr));
-            }
-            fields.push(value);
+            fields.push(self.lower_value_of_type(field_expr, field.ty, expr)?);
         }
         self.emit_typed_temp(
             ty_id,
             RValue::Aggregate {
-                kind: AggregateCtor::Struct(aggregate),
+                kind,
                 fields,
                 ty: ty_id,
             },
@@ -2858,6 +3010,21 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             };
             let ty = self.lower_expr_ty(expr.node.id)?;
             let ty_id = self.cx.lower_ty(&ty)?;
+            if let TypeData::Optional(inner) = self.cx.program.type_data(ty_id) {
+                return match (target.id.name.as_str(), call.node.args.as_slice()) {
+                    ("Some", [value]) => {
+                        let value = self.lower_value_of_type(value, *inner, expr)?;
+                        Ok(RValue::OptionalSome { value, ty: ty_id })
+                    }
+                    ("None", []) => Ok(RValue::Use(Operand::Const(self.cx.program.alloc_const(
+                        ConstData {
+                            ty: ty_id,
+                            value: ConstValue::Nil,
+                        },
+                    )))),
+                    _ => Err(unsupported_expr(expr)),
+                };
+            }
             let enum_id = match self.cx.program.type_data(ty_id) {
                 TypeData::Enum(enum_id) => *enum_id,
                 _ => return Err(unsupported_expr(expr)),
@@ -3196,8 +3363,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn lower_lit(&mut self, expr: &ExprNode, lit: &Lit) -> Result<Operand, LowerError> {
         let ty = self.lower_expr_ty(expr.node.id)?;
         let ty_id = self.cx.lower_ty(&ty)?;
-        let Some(value) = Self::literal_const_value(lit, &ty) else {
-            return Err(unsupported_expr(expr));
+        let value = match (lit, self.cx.program.type_data(ty_id)) {
+            (Lit::Nil, TypeData::Optional(_)) => ConstValue::Nil,
+            _ => Self::literal_const_value(lit, &ty).ok_or_else(|| unsupported_expr(expr))?,
         };
         Ok(Operand::Const(
             self.cx.program.alloc_const(ConstData { ty: ty_id, value }),
@@ -3212,6 +3380,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             (Lit::String(value), Type::String) => {
                 Some(ConstValue::String(value.clone().into_boxed_str()))
             }
+            (Lit::Nil, Type::Optional { .. }) => Some(ConstValue::Nil),
             _ => None,
         }
     }
@@ -3260,7 +3429,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 }
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
                 let dst = self.lower_place(&assign.node.target, &fact)?;
-                let value = self.lower_value(&assign.node.value)?;
+                let value =
+                    self.lower_value_of_type(&assign.node.value, dst.ty, &assign.node.value)?;
                 self.emit_assign(dst, RValue::Use(value))
             }
             op => {
@@ -4916,7 +5086,7 @@ mod tests {
     }
 
     #[test]
-    fn reachable_string_extension_optional_return_lowers_to_core_option() {
+    fn reachable_string_extension_optional_return_lowers_to_optional_type() {
         let air = lower_full_core_entry(
             "fn main() { let x = \"abc\".substring(0, 1); }",
             "main",
@@ -4927,14 +5097,14 @@ mod tests {
         assert!(function_names(&air).contains(&"substring"));
         assert!(extern_names(&air).contains(&"str_substring"));
         assert!(
-            air.enums
+            air.type_arena
                 .iter()
-                .any(|decl| decl.name == Ident::new("Option"))
+                .any(|ty| matches!(ty, TypeData::Optional(_)))
         );
     }
 
     #[test]
-    fn reachable_core_option_constructor_lowers_to_enum_variant() {
+    fn reachable_core_option_constructor_lowers_to_optional_some() {
         let air = lower_full_core_entry(
             "fn main() { let x: Option<int> = Option.Some(1); }",
             "main",
@@ -4946,10 +5116,7 @@ mod tests {
             matches!(
                 statement,
                 AirStmt::Init {
-                    value: RValue::Aggregate {
-                        kind: AggregateCtor::EnumVariant { .. },
-                        ..
-                    },
+                    value: RValue::OptionalSome { .. },
                     ..
                 }
             )

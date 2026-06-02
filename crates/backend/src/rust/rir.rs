@@ -33,6 +33,7 @@ rir_id!(RirConstId);
 rir_id!(RirLocalId);
 rir_id!(RirLoopId);
 rir_id!(RirStructId);
+rir_id!(RirDataRefId);
 rir_id!(RirEnumId);
 rir_id!(RirVariantId);
 rir_id!(RirFieldId);
@@ -59,6 +60,7 @@ pub struct RirProgram {
     pub externs: Vec<RirExtern>,
     pub types: Vec<RirType>,
     pub structs: Vec<RirStruct>,
+    pub datarefs: Vec<RirDataRef>,
     pub enums: Vec<RirEnum>,
     pub stringify_reqs: Vec<RirStringifyReq>,
     pub stringify_helpers: Vec<RirStringifyHelper>,
@@ -83,6 +85,26 @@ pub struct RirField {
     pub id: RirFieldId,
     pub symbol: RirSymbol,
     pub ty: RirTypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirDataRef {
+    pub id: RirDataRefId,
+    pub air_id: air::AggregateId,
+    pub symbol: RirSymbol,
+    pub display: RirSymbol,
+    pub cycle_capable: bool,
+    pub fields: Vec<RirField>,
+}
+
+impl RirDataRef {
+    pub fn storage_symbol(&self) -> String {
+        format!("{}Storage", self.symbol.as_str())
+    }
+
+    pub fn heap_type_symbol(&self) -> String {
+        format!("{}HeapType", self.symbol.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,8 +240,20 @@ pub struct RirLocal {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RirStmt {
-    Init { local: RirLocalId, value: RirRValue },
-    Assign { dst: RirPlace, value: RirRValue },
+    Init {
+        local: RirLocalId,
+        value: RirRValue,
+    },
+    Assign {
+        dst: RirPlace,
+        value: RirRValue,
+    },
+    DataRefSet {
+        object: RirOperand,
+        dataref: RirDataRefId,
+        projections: Vec<RirProjection>,
+        value: RirOperand,
+    },
     Eval(RirRValue),
     If(RirIf),
     Loop(RirLoop),
@@ -265,6 +299,16 @@ pub enum RirRValue {
         ty: RirTypeId,
         fields: Vec<RirOperand>,
     },
+    DataRefAlloc {
+        ty: RirTypeId,
+        fields: Vec<RirOperand>,
+    },
+    DataRefGet {
+        object: RirOperand,
+        dataref: RirDataRefId,
+        projections: Vec<RirProjection>,
+        ty: RirTypeId,
+    },
     Array {
         ty: RirTypeId,
         elems: Vec<RirOperand>,
@@ -293,9 +337,18 @@ pub enum RirRValue {
         rhs: RirOperand,
         ty: RirTypeId,
     },
+    SharedRefEq {
+        lhs: RirOperand,
+        rhs: RirOperand,
+        negated: bool,
+    },
     Cast {
         value: RirOperand,
         target: RirTypeId,
+    },
+    OptionalSome {
+        value: RirOperand,
+        ty: RirTypeId,
     },
     Call {
         callee: RirCallTarget,
@@ -449,6 +502,7 @@ pub enum RirType {
     String,
     Void,
     Struct(RirStructId),
+    DataRef(RirDataRefId),
     Enum(RirEnumId),
     Array { elem: RirTypeId, len: u64 },
     List(RirTypeId),
@@ -470,6 +524,7 @@ pub enum RirConstValue {
     Float(f64),
     Bool(bool),
     String(String),
+    Nil,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -675,38 +730,13 @@ fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &Exter
 }
 
 fn rir_type_matches_option(program: &RirProgram, id: RirTypeId, inner: &RustReturnAbi) -> bool {
-    let Some(RirType::Enum(enum_id)) = program.types.get(id.index()) else {
-        return false;
-    };
-    let Some(payload) = rir_option_payload_ty(program, *enum_id) else {
+    let Some(RirType::Option(payload)) = program.types.get(id.index()) else {
         return false;
     };
     match inner {
-        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, payload, ty),
+        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, *payload, ty),
         RustReturnAbi::Void | RustReturnAbi::Option(_) | RustReturnAbi::List(_) => false,
     }
-}
-
-fn rir_option_payload_ty(program: &RirProgram, enum_id: RirEnumId) -> Option<RirTypeId> {
-    let enm = program.enums.get(enum_id.index())?;
-    if enm.core != Some(RirCoreEnumKind::Option) {
-        return None;
-    }
-    let [none, some] = enm.variants.as_slice() else {
-        return None;
-    };
-    if none.display.as_str() != "None"
-        || none.kind != RirVariantKind::Unit
-        || !none.fields.is_empty()
-        || some.display.as_str() != "Some"
-        || some.kind != RirVariantKind::Tuple
-    {
-        return None;
-    }
-    let [field] = some.fields.as_slice() else {
-        return None;
-    };
-    Some(field.ty)
 }
 
 impl VerifyCx<'_> {
@@ -722,6 +752,7 @@ impl VerifyCx<'_> {
             self.check_type_id(site, RirTypeId::from_index(index));
             match ty {
                 RirType::Struct(id) => self.check_struct_id(site, *id),
+                RirType::DataRef(id) => self.check_dataref_id(site, *id),
                 RirType::Enum(id) => self.check_enum_id(site, *id),
                 RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => {
                     self.check_type_id(site, *elem);
@@ -735,6 +766,7 @@ impl VerifyCx<'_> {
             }
         }
         self.check_structs();
+        self.check_datarefs();
         self.check_enums();
         self.check_stringify_helpers();
         for (index, konst) in self.program.consts.iter().enumerate() {
@@ -788,6 +820,48 @@ impl VerifyCx<'_> {
                 self.check_type_id(site, field.ty);
                 if strukt.copyable && !self.inherently_copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+                }
+            }
+        }
+    }
+
+    fn check_datarefs(&mut self) {
+        let mut symbols = Vec::new();
+        for (index, dataref) in self.program.datarefs.iter().enumerate() {
+            let id = RirDataRefId::from_index(index);
+            let site = RirVerifySite::Type(RirTypeId::from_index(index));
+            if dataref.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            let storage_symbol = dataref.storage_symbol();
+            let heap_type_symbol = dataref.heap_type_symbol();
+            for symbol in [
+                dataref.symbol.as_str(),
+                storage_symbol.as_str(),
+                heap_type_symbol.as_str(),
+            ] {
+                if symbol.is_empty() || symbols.iter().any(|seen| seen == symbol) {
+                    self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+                }
+                symbols.push(symbol.to_owned());
+            }
+            if dataref.display.as_str().is_empty() {
+                self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+            }
+            let mut field_symbols = Vec::new();
+            for (field_index, field) in dataref.fields.iter().enumerate() {
+                if field.id != RirFieldId::from_index(field_index) {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                }
+                if field.symbol.as_str().is_empty()
+                    || field_symbols.iter().any(|symbol| symbol == &field.symbol)
+                {
+                    self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+                }
+                field_symbols.push(field.symbol.clone());
+                self.check_type_id(site, field.ty);
+                if matches!(self.ty(field.ty), Some(RirType::Void | RirType::Slice(_))) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
             }
         }
@@ -850,6 +924,29 @@ impl VerifyCx<'_> {
                 }
             }
         }
+    }
+
+    fn check_construct_fields(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        ty: RirTypeId,
+        expected: &[RirField],
+        found: &[RirOperand],
+    ) -> RirTypeId {
+        if found.len() != expected.len() {
+            self.push(
+                site,
+                RirVerifyErrorKind::FieldCount {
+                    expected: expected.len(),
+                    found: found.len(),
+                },
+            );
+        }
+        for (field, operand) in expected.iter().zip(found) {
+            self.check_value_operand_ty(site, function, operand, field.ty);
+        }
+        ty
     }
 
     fn check_raw_enum(&mut self, site: RirVerifySite, enm: &RirEnum) {
@@ -1021,6 +1118,7 @@ impl VerifyCx<'_> {
                 | (Some(RirType::Float), RirConstValue::Float(_))
                 | (Some(RirType::Bool), RirConstValue::Bool(_))
                 | (Some(RirType::String), RirConstValue::String(_))
+                | (Some(RirType::Option(_)), RirConstValue::Nil)
         );
         if !ok {
             self.push(
@@ -1161,6 +1259,18 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
                 self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+            }
+            RirStmt::DataRefSet {
+                object,
+                dataref,
+                projections,
+                value,
+            } => {
+                if let Some(ty) =
+                    self.check_dataref_access(site, function, object, *dataref, projections)
+                {
+                    self.check_value_operand_ty(site, function, value, ty);
+                }
             }
             RirStmt::Eval(value) => {
                 self.check_rvalue(function_id, function, index, value, None);
@@ -1311,7 +1421,10 @@ impl VerifyCx<'_> {
                 }
             }
             RirStmt::Loop(_) => true,
-            RirStmt::Init { .. } | RirStmt::Assign { .. } | RirStmt::Eval(_) => true,
+            RirStmt::Init { .. }
+            | RirStmt::Assign { .. }
+            | RirStmt::DataRefSet { .. }
+            | RirStmt::Eval(_) => true,
         }
     }
 
@@ -1377,17 +1490,39 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::BadId);
                     return;
                 };
-                if fields.len() != strukt.fields.len() {
+                Some(self.check_construct_fields(site, function, *ty, &strukt.fields, fields))
+            }
+            RirRValue::DataRefAlloc { ty, fields } => {
+                self.check_type_id(site, *ty);
+                let Some(RirType::DataRef(dataref_id)) = self.ty(*ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                let Some(dataref) = self.program.datarefs.get(dataref_id.index()).cloned() else {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                    return;
+                };
+                Some(self.check_construct_fields(site, function, *ty, &dataref.fields, fields))
+            }
+            RirRValue::DataRefGet {
+                object,
+                dataref,
+                projections,
+                ty,
+            } => {
+                self.check_type_id(site, *ty);
+                let found =
+                    self.check_dataref_access(site, function, object, *dataref, projections);
+                if let Some(found) = found
+                    && found != *ty
+                {
                     self.push(
                         site,
-                        RirVerifyErrorKind::FieldCount {
-                            expected: strukt.fields.len(),
-                            found: fields.len(),
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: found,
+                            found: *ty,
                         },
                     );
-                }
-                for (field, operand) in strukt.fields.iter().zip(fields) {
-                    self.check_value_operand_ty(site, function, operand, field.ty);
                 }
                 Some(*ty)
             }
@@ -1474,6 +1609,16 @@ impl VerifyCx<'_> {
                 }
                 Some(*ty)
             }
+            RirRValue::SharedRefEq { lhs, rhs, .. } => {
+                let lhs_ty = self.operand_ty(site, function, lhs);
+                let rhs_ty = self.operand_ty(site, function, rhs);
+                if lhs_ty != rhs_ty
+                    || !matches!(lhs_ty.and_then(|ty| self.ty(ty)), Some(RirType::DataRef(_)))
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+                self.type_id(RirType::Bool)
+            }
             RirRValue::Binary { op, lhs, rhs, ty } => {
                 let lhs_ty = self.operand_ty(site, function, lhs);
                 let rhs_ty = self.operand_ty(site, function, rhs);
@@ -1490,6 +1635,15 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 Some(*target)
+            }
+            RirRValue::OptionalSome { value, ty } => {
+                let value_ty = self.operand_ty(site, function, value);
+                self.check_type_id(site, *ty);
+                match (self.ty(*ty), value_ty) {
+                    (Some(RirType::Option(inner)), Some(value_ty)) if inner == value_ty => {}
+                    _ => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
+                }
+                Some(*ty)
             }
             RirRValue::Stringify { value, source_ty } => {
                 let value_ty = self.operand_ty(site, function, value);
@@ -1893,6 +2047,7 @@ impl VerifyCx<'_> {
             }
             Some(
                 RirType::Void
+                | RirType::DataRef(_)
                 | RirType::Enum(_)
                 | RirType::Array { .. }
                 | RirType::List(_)
@@ -1912,6 +2067,7 @@ impl VerifyCx<'_> {
             RirType::Int | RirType::Float | RirType::Bool | RirType::String => {}
             RirType::Void
             | RirType::Struct(_)
+            | RirType::DataRef(_)
             | RirType::Enum(_)
             | RirType::Array { .. }
             | RirType::List(_)
@@ -2021,6 +2177,95 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn check_dataref_access(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        object: &RirOperand,
+        dataref_id: RirDataRefId,
+        projections: &[RirProjection],
+    ) -> Option<RirTypeId> {
+        let object_ty = self.value_operand_ty(site, function, object);
+        if object_ty.and_then(|ty| self.ty(ty)) != Some(RirType::DataRef(dataref_id)) {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        }
+        self.check_dataref_id(site, dataref_id);
+        let dataref = self.program.datarefs.get(dataref_id.index())?.clone();
+        self.check_storage_projection(site, function, &dataref.fields, projections)
+    }
+
+    fn check_storage_projection(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        fields: &[RirField],
+        projections: &[RirProjection],
+    ) -> Option<RirTypeId> {
+        let Some((first, rest)) = projections.split_first() else {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            return None;
+        };
+        let RirProjection::Field(field_id) = first else {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            return None;
+        };
+        let Some(field) = fields.get(field_id.index()) else {
+            self.push(site, RirVerifyErrorKind::BadId);
+            return None;
+        };
+        let mut current = field.ty;
+        for (index, projection) in rest.iter().enumerate() {
+            if matches!(self.ty(current), Some(RirType::DataRef(_))) {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                return None;
+            }
+            match projection {
+                RirProjection::Field(field_id) => {
+                    let Some(RirType::Struct(struct_id)) = self.ty(current) else {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        return None;
+                    };
+                    let Some(strukt) = self.program.structs.get(struct_id.index()) else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                        return None;
+                    };
+                    let Some(field) = strukt.fields.get(field_id.index()) else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                        return None;
+                    };
+                    current = field.ty;
+                }
+                RirProjection::Index(local) => {
+                    let Some(RirType::Array { elem, .. }) = self.ty(current) else {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        return None;
+                    };
+                    let Some(index_local) = function.locals.get(local.index()) else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                        return None;
+                    };
+                    if self.ty(index_local.ty) != Some(RirType::Int) {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    }
+                    if !self
+                        .initialized
+                        .get(local.index())
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        self.push(site, RirVerifyErrorKind::UninitializedLocal(*local));
+                    }
+                    current = elem;
+                }
+            }
+            if index + 1 < rest.len() && matches!(self.ty(current), Some(RirType::DataRef(_))) {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                return None;
+            }
+        }
+        Some(current)
+    }
+
     fn check_place(&mut self, site: RirVerifySite, function: &RirFunction, place: &RirPlace) {
         self.check_local_id(site, function, place.local);
         self.check_type_id(site, place.ty);
@@ -2113,6 +2358,12 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn check_dataref_id(&mut self, site: RirVerifySite, id: RirDataRefId) {
+        if id.index() >= self.program.datarefs.len() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
     fn check_enum_id(&mut self, site: RirVerifySite, id: RirEnumId) {
         if id.index() >= self.program.enums.len() {
             self.push(site, RirVerifyErrorKind::BadId);
@@ -2164,7 +2415,13 @@ impl VerifyCx<'_> {
             }),
             Some(RirType::Array { elem, .. }) => self.inherently_copyable_type(elem),
             Some(RirType::Option(inner)) => self.inherently_copyable_type(inner),
-            Some(RirType::List(_) | RirType::Map { .. } | RirType::Slice(_) | RirType::String)
+            Some(
+                RirType::DataRef(_)
+                | RirType::List(_)
+                | RirType::Map { .. }
+                | RirType::Slice(_)
+                | RirType::String,
+            )
             | None => false,
         }
     }

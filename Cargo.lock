@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "anvyx-frontend",
  "anvyx-runtime",
+ "fd-lock",
  "sha2",
  "tempfile",
 ]

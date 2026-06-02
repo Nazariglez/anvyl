@@ -223,6 +223,7 @@ pub(crate) fn rvalue_ty(
         RValue::Unary { ty, .. }
         | RValue::Binary { ty, .. }
         | RValue::Aggregate { ty, .. }
+        | RValue::OptionalSome { ty, .. }
         | RValue::ListPop { ty, .. }
         | RValue::ListSlice { ty, .. }
         | RValue::MapGet { ty, .. }

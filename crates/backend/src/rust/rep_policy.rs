@@ -13,6 +13,7 @@ pub enum RustValueRep {
     InlineEnum,
     RawIntEnum,
     RawStringEnum,
+    HeapHandle,
     CowString,
     CowList,
     CowMap,
@@ -55,6 +56,9 @@ impl<'a> AirRustRepPolicy<'a> {
         if let TypeData::Optional(inner) = self.program.type_arena.data(ty) {
             return self.copyable(*inner);
         }
+        if matches!(self.program.type_arena.data(ty), TypeData::DataRef(_)) {
+            return false;
+        }
         self.classes.get(ty).is_some_and(|class| {
             matches!(
                 class,
@@ -76,8 +80,16 @@ impl<'a> AirRustRepPolicy<'a> {
 
     fn shareable_value(self, ty: TypeId) -> bool {
         match self.program.type_arena.data(ty) {
-            TypeData::String | TypeData::List(_) | TypeData::Map { .. } => true,
-            TypeData::Optional(_) => false,
+            TypeData::String | TypeData::DataRef(_) | TypeData::List(_) | TypeData::Map { .. } => {
+                true
+            }
+            TypeData::Optional(inner) => self.value_place_shareable(*inner),
+            TypeData::Aggregate(id) => self
+                .program
+                .aggregate(*id)
+                .fields
+                .iter()
+                .all(|field| self.value_place_shareable(field.ty)),
             TypeData::Enum(id) => self.enum_shareable(*id),
             _ => false,
         }
@@ -124,6 +136,7 @@ impl<'a> AirRustRepPolicy<'a> {
                     | TypeData::Void
                     | TypeData::String
                     | TypeData::Aggregate(_)
+                    | TypeData::DataRef(_)
                     | TypeData::Enum(_)
                     | TypeData::Extern(_)
                     | TypeData::Array { .. }
@@ -134,6 +147,7 @@ impl<'a> AirRustRepPolicy<'a> {
                 self.program.type_arena.data(ty),
                 TypeData::String
                     | TypeData::Aggregate(_)
+                    | TypeData::DataRef(_)
                     | TypeData::Enum(_)
                     | TypeData::Extern(_)
                     | TypeData::Array { .. }
@@ -142,7 +156,17 @@ impl<'a> AirRustRepPolicy<'a> {
             ),
             ParamMode::MutBorrow => matches!(
                 self.program.type_arena.data(ty),
-                TypeData::Extern(_) | TypeData::List(_) | TypeData::Map { .. }
+                TypeData::Int
+                    | TypeData::Float
+                    | TypeData::Bool
+                    | TypeData::String
+                    | TypeData::Aggregate(_)
+                    | TypeData::DataRef(_)
+                    | TypeData::Enum(_)
+                    | TypeData::Extern(_)
+                    | TypeData::Array { .. }
+                    | TypeData::List(_)
+                    | TypeData::Map { .. }
             ),
         }
     }
@@ -170,6 +194,7 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Option(_) => RustValueRep::InlineEnum,
             RirType::Slice(_) => RustValueRep::Opaque,
             RirType::Struct(_) => RustValueRep::InlineStruct,
+            RirType::DataRef(_) => RustValueRep::HeapHandle,
             RirType::Enum(id) => self.enum_rep(id),
         }
     }
@@ -202,8 +227,16 @@ impl<'a> RustRepPolicy<'a> {
     pub fn shareable_value(self, ty: RirTypeId) -> bool {
         self.copyable(ty)
             || match self.ty(ty) {
-                RirType::String | RirType::List(_) | RirType::Map { .. } => true,
-                RirType::Option(_) => false,
+                RirType::String | RirType::DataRef(_) | RirType::List(_) | RirType::Map { .. } => {
+                    true
+                }
+                RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
+                    self.shareable_value(inner)
+                }
+                RirType::Struct(id) => self.program.structs[id.index()]
+                    .fields
+                    .iter()
+                    .all(|field| self.shareable_value(field.ty)),
                 RirType::Enum(id) => {
                     self.program.enums[id.index()]
                         .variants
@@ -235,8 +268,17 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Bool => "bool".into(),
             RirType::String => "anvyx_runtime::AnvString".into(),
             RirType::Void => "()".into(),
-            RirType::Struct(id) => self.program.structs[id.index()].symbol.as_str().into(),
-            RirType::Enum(id) => self.program.enums[id.index()].symbol.as_str().into(),
+            RirType::Struct(id) => self.named_ty(
+                self.program.structs[id.index()].symbol.as_str(),
+                self.type_cx_dependent(ty),
+            ),
+            RirType::DataRef(id) => {
+                format!("{}<'cx>", self.program.datarefs[id.index()].symbol.as_str())
+            }
+            RirType::Enum(id) => self.named_ty(
+                self.program.enums[id.index()].symbol.as_str(),
+                self.type_cx_dependent(ty),
+            ),
             RirType::Array { elem, len } => format!("[{}; {len}]", self.rust_ty(elem)),
             RirType::List(elem) => format!("anvyx_runtime::AnvList<{}>", self.rust_ty(elem)),
             RirType::Map { key, value } => format!(
@@ -249,10 +291,48 @@ impl<'a> RustRepPolicy<'a> {
         }
     }
 
+    pub fn type_cx_dependent(self, ty: RirTypeId) -> bool {
+        match self.ty(ty) {
+            RirType::DataRef(_) => true,
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } | RirType::List(inner) => {
+                self.type_cx_dependent(inner)
+            }
+            RirType::Map { key, value } => {
+                self.type_cx_dependent(key) || self.type_cx_dependent(value)
+            }
+            RirType::Struct(id) => self.program.structs[id.index()]
+                .fields
+                .iter()
+                .any(|field| self.type_cx_dependent(field.ty)),
+            RirType::Enum(id) => self.program.enums[id.index()]
+                .variants
+                .iter()
+                .any(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .any(|field| self.type_cx_dependent(field.ty))
+                }),
+            _ => false,
+        }
+    }
+
+    fn named_ty(self, symbol: &str, cx_dependent: bool) -> String {
+        if cx_dependent {
+            format!("{symbol}<'cx>")
+        } else {
+            symbol.into()
+        }
+    }
+
     pub fn copyable(self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
             RirType::Int | RirType::Float | RirType::Bool | RirType::Void => true,
-            RirType::String | RirType::List(_) | RirType::Map { .. } | RirType::Slice(_) => false,
+            RirType::String
+            | RirType::DataRef(_)
+            | RirType::List(_)
+            | RirType::Map { .. }
+            | RirType::Slice(_) => false,
             RirType::Option(inner) => self.copyable(inner),
             RirType::Array { elem, .. } => self.copyable(elem),
             RirType::Struct(id) => self.program.structs[id.index()].copyable,
@@ -270,6 +350,7 @@ impl<'a> RustRepPolicy<'a> {
                     | RirType::Void
                     | RirType::String
                     | RirType::Struct(_)
+                    | RirType::DataRef(_)
                     | RirType::Enum(_)
                     | RirType::Array { .. }
                     | RirType::List(_)
@@ -279,16 +360,25 @@ impl<'a> RustRepPolicy<'a> {
                 ty,
                 RirType::String
                     | RirType::Struct(_)
+                    | RirType::DataRef(_)
                     | RirType::Enum(_)
                     | RirType::Array { .. }
                     | RirType::List(_)
                     | RirType::Map { .. }
             ),
-            RirParamSemantic::MutBorrow => match ty {
-                RirType::List(_) | RirType::Map { .. } => true,
-                RirType::Struct(id) => self.program.structs[id.index()].native_path.is_some(),
-                _ => false,
-            },
+            RirParamSemantic::MutBorrow => matches!(
+                ty,
+                RirType::Int
+                    | RirType::Float
+                    | RirType::Bool
+                    | RirType::String
+                    | RirType::Struct(_)
+                    | RirType::DataRef(_)
+                    | RirType::Enum(_)
+                    | RirType::Array { .. }
+                    | RirType::List(_)
+                    | RirType::Map { .. }
+            ),
         }
     }
 
@@ -314,10 +404,16 @@ impl<'a> RustRepPolicy<'a> {
 
 #[cfg(test)]
 mod tests {
-    use anvyx_frontend::air::{ParamMode, Program, TypeData, TypePassClasses};
+    use anvyx_frontend::{
+        air::{self, FieldDecl, ParamMode, Program, TypeData, TypePassClasses},
+        ast::Ident,
+    };
 
     use super::{AirRustRepPolicy, RustBorrowView, RustRepPolicy, RustValueRep};
-    use crate::rust::rir::{RirProgram, RirType, RirTypeId};
+    use crate::rust::rir::{
+        RirDataRef, RirDataRefId, RirField, RirFieldId, RirProgram, RirStruct, RirStructId,
+        RirSymbol, RirType, RirTypeId,
+    };
 
     #[test]
     fn policy_classifies_current_storage_reps() {
@@ -363,5 +459,144 @@ mod tests {
 
         assert_eq!(policy.borrow_view(string), RustBorrowView::Str);
         assert!(policy.cow_value(string));
+    }
+
+    #[test]
+    fn policy_shares_structs_with_shareable_fields() {
+        let mut program = RirProgram::default();
+        let string = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::String);
+        let label = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::Struct(RirStructId::from_index(0)));
+        program.structs.push(RirStruct {
+            id: RirStructId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("Label"),
+            display: RirSymbol::new("Label"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("text"),
+                ty: string,
+            }],
+        });
+        let policy = RustRepPolicy::new(&program);
+
+        assert!(!policy.copyable(label));
+        assert!(policy.shareable_value(label));
+    }
+
+    #[test]
+    fn policy_treats_datarefs_as_shared_handles_not_copy_payloads() {
+        let mut program = RirProgram::default();
+        let int = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Int);
+        let node = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::DataRef(RirDataRefId::from_index(0)));
+        program.datarefs.push(RirDataRef {
+            id: RirDataRefId::from_index(0),
+            air_id: air::AggregateId::from_index(0),
+            symbol: RirSymbol::new("Node"),
+            display: RirSymbol::new("Node"),
+            cycle_capable: true,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("value"),
+                ty: int,
+            }],
+        });
+        let maybe_node = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Option(node));
+        let policy = RustRepPolicy::new(&program);
+
+        assert_eq!(policy.value_rep(node), RustValueRep::HeapHandle);
+        assert!(!policy.copyable(node));
+        assert!(policy.shareable_value(node));
+        assert!(policy.supports_param(node, crate::rust::rir::RirParamSemantic::Value));
+        assert!(policy.supports_param(node, crate::rust::rir::RirParamSemantic::SharedBorrow));
+        assert!(policy.supports_param(node, crate::rust::rir::RirParamSemantic::MutBorrow));
+        assert_eq!(policy.borrow_view(node), RustBorrowView::Ref);
+        assert_eq!(policy.rust_ty(node), "Node<'cx>");
+        assert!(!policy.cow_value(node));
+        assert!(!policy.copyable(maybe_node));
+        assert!(policy.shareable_value(maybe_node));
+    }
+
+    #[test]
+    fn air_policy_shares_aggregates_with_shareable_fields() {
+        let mut program = Program::default();
+        let string = program.alloc_type(TypeData::String);
+        let module = program.alloc_module(air::Module {
+            path: vec![],
+            functions: vec![],
+            aggregates: vec![],
+            enums: vec![],
+            extern_types: vec![],
+            externs: vec![],
+        });
+        let aggregate = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Label"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("text"),
+                ty: string,
+            }],
+            cycle_capable: false,
+            stringify_override: None,
+        });
+        let label = program.alloc_type(TypeData::Aggregate(aggregate));
+        let classes = TypePassClasses::analyze(&program);
+        let policy = AirRustRepPolicy::new(&program, &classes);
+
+        assert!(!policy.copyable(label));
+        assert!(policy.value_place_shareable(label));
+    }
+
+    #[test]
+    fn air_policy_treats_datarefs_as_shared_handles_not_copy_payloads() {
+        let mut program = Program::default();
+        let int = program.alloc_type(TypeData::Int);
+        let module = program.alloc_module(air::Module {
+            path: vec![],
+            functions: vec![],
+            aggregates: vec![],
+            enums: vec![],
+            extern_types: vec![],
+            externs: vec![],
+        });
+        let aggregate = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Node"),
+            module,
+            kind: air::AggregateKind::DataRef,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("value"),
+                ty: int,
+            }],
+            cycle_capable: true,
+            stringify_override: None,
+        });
+        let node = program.alloc_type(TypeData::DataRef(aggregate));
+        let maybe_node = program.alloc_type(TypeData::Optional(node));
+        let classes = TypePassClasses::analyze(&program);
+        let policy = AirRustRepPolicy::new(&program, &classes);
+
+        assert!(!policy.copyable(node));
+        assert!(policy.value_place_shareable(node));
+        assert!(policy.supports_param_mode(node, ParamMode::Value));
+        assert!(policy.supports_param_mode(node, ParamMode::SharedBorrow));
+        assert!(policy.supports_param_mode(node, ParamMode::MutBorrow));
+        assert!(!policy.copyable(maybe_node));
+        assert!(policy.value_place_shareable(maybe_node));
     }
 }
