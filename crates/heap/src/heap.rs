@@ -709,12 +709,12 @@ impl<'cx> Heap<'cx> {
         (TARGET_SLOT_PAGE_BYTES / slot_size).clamp(1, MAX_SLOT_PAGE_SLOTS)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn with<T: 'cx, R>(&self, handle: &Handle<'cx, T>, f: impl FnOnce(&T) -> R) -> R {
         self.try_with(handle, f).expect("invalid heap handle")
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn with_mut<T: 'cx, R>(
         &mut self,
         handle: &Handle<'cx, T>,
@@ -723,7 +723,7 @@ impl<'cx> Heap<'cx> {
         self.try_with_mut(handle, f).expect("invalid heap handle")
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn try_with<T: 'cx, R>(
         &self,
         handle: &Handle<'cx, T>,
@@ -735,7 +735,7 @@ impl<'cx> Heap<'cx> {
         Ok(f(value))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn try_with_mut<T: 'cx, R>(
         &mut self,
         handle: &Handle<'cx, T>,
