@@ -1,12 +1,12 @@
 use anvyx_runtime::function;
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn _println(message: &str) {
     println!("{message}");
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn _assert(condition: bool, message: &str) {
     assert!(condition, "{message}");

@@ -1,24 +1,24 @@
 use anvyx_runtime::function;
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn int_abs(x: i64) -> i64 {
     x.abs()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn int_min(a: i64, b: i64) -> i64 {
     a.min(b)
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn int_max(a: i64, b: i64) -> i64 {
     a.max(b)
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn int_clamp(x: i64, lo: i64, hi: i64) -> i64 {
     x.clamp(lo, hi)

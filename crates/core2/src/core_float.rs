@@ -1,138 +1,138 @@
 use anvyx_runtime::function;
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_sin(x: f64) -> f64 {
     x.sin()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_cos(x: f64) -> f64 {
     x.cos()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_tan(x: f64) -> f64 {
     x.tan()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_asin(x: f64) -> f64 {
     x.asin()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_acos(x: f64) -> f64 {
     x.acos()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_atan(x: f64) -> f64 {
     x.atan()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_atan2(y: f64, x: f64) -> f64 {
     y.atan2(x)
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_floor(x: f64) -> f64 {
     x.floor()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_ceil(x: f64) -> f64 {
     x.ceil()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_round(x: f64) -> f64 {
     x.round()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_trunc(x: f64) -> f64 {
     x.trunc()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_sqrt(x: f64) -> f64 {
     x.sqrt()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_cbrt(x: f64) -> f64 {
     x.cbrt()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_pow(x: f64, exp: f64) -> f64 {
     x.powf(exp)
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_exp(x: f64) -> f64 {
     x.exp()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_ln(x: f64) -> f64 {
     x.ln()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_abs(x: f64) -> f64 {
     x.abs()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_min(a: f64, b: f64) -> f64 {
     a.min(b)
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_max(a: f64, b: f64) -> f64 {
     a.max(b)
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_clamp(x: f64, lo: f64, hi: f64) -> f64 {
     x.clamp(lo, hi)
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_lerp(x: f64, target: f64, t: f64) -> f64 {
     x + (target - x) * t
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_to_radians(x: f64) -> f64 {
     x.to_radians()
 }
 
-#[inline(always)]
+#[inline]
 #[function]
 pub fn float_to_degrees(x: f64) -> f64 {
     x.to_degrees()
