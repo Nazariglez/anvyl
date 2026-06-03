@@ -8,13 +8,13 @@ pub use anvyx_backend::rust::cargo_job::RustCargoProfile;
 use anvyx_backend::rust::{
     cargo_job::{
         self, RustCargoBatchCase, RustCargoBatchOutput, RustCargoCrateIdentityInput,
-        RustCargoDependency, RustCargoDependencySource, RustCargoFailure, RustCargoMode,
-        RustCargoName, RustCargoOutput, RustCargoPackageMetadata, RustCargoPackageName,
-        RustCargoSuccess, host_executable_name,
+        RustCargoDependency, RustCargoDependencySource, RustCargoEvent, RustCargoFailure,
+        RustCargoMode, RustCargoName, RustCargoOutput, RustCargoPackageMetadata,
+        RustCargoPackageName, RustCargoSuccess, host_executable_name,
     },
     emit::RustSource,
 };
-use anvyx_lang2::{AirBuildError, FrontendConfig};
+use anvyx_lang2::{AirBuildError, AirBuildOutput, DiagnosticReport, FrontendConfig};
 use anvyx_runtime::{RustProviderCargo, RustProviderSupport, validate_rust_provider_support};
 
 use crate::check::{air_error_ref, build_air_path_typed};
@@ -25,6 +25,15 @@ pub struct CleanRustRunInput {
     pub frontend: FrontendConfig,
     pub cargo_profile: RustCargoProfile,
     pub cache_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CleanRustEvent {
+    Checking { file: PathBuf },
+    Checked { report: DiagnosticReport },
+    GeneratingRust,
+    CompilingRust,
+    Running { file: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +120,13 @@ pub struct CleanRustBuildOutput {
 }
 
 pub fn run_clean_rust(input: CleanRustRunInput) -> Result<CleanRustRunOutput, CleanRustError> {
+    run_clean_rust_with_events(input, |_| {})
+}
+
+pub fn run_clean_rust_with_events(
+    input: CleanRustRunInput,
+    mut events: impl FnMut(CleanRustEvent),
+) -> Result<CleanRustRunOutput, CleanRustError> {
     let cache_root = input
         .cache_root
         .unwrap_or_else(|| default_run_cache_root(&input.file));
@@ -120,6 +136,7 @@ pub fn run_clean_rust(input: CleanRustRunInput) -> Result<CleanRustRunOutput, Cl
         cache_root,
         input.cargo_profile,
         RustCargoMode::Run,
+        &mut events,
     )?;
 
     Ok(CleanRustRunOutput {
@@ -151,7 +168,7 @@ pub fn build_clean_rust_batch(input: CleanRustBatchInput) -> Result<CleanRustBat
         let file = case.file;
         let emitted =
             emit_source(file.clone(), case.frontend, &native).map_err(|error| error.to_string())?;
-        native_providers.extend(emitted.native_providers.clone());
+        native_providers.extend(emitted.native_providers);
         emitted_cases.push((index, file, profile, emitted.source));
     }
 
@@ -206,6 +223,13 @@ pub fn build_clean_rust_batch(input: CleanRustBatchInput) -> Result<CleanRustBat
 pub fn build_clean_rust(
     input: CleanRustBuildInput,
 ) -> Result<CleanRustBuildOutput, CleanRustError> {
+    build_clean_rust_with_events(input, |_| {})
+}
+
+pub fn build_clean_rust_with_events(
+    input: CleanRustBuildInput,
+    mut events: impl FnMut(CleanRustEvent),
+) -> Result<CleanRustBuildOutput, CleanRustError> {
     let cache_root = input
         .cache_root
         .unwrap_or_else(|| default_cache_root_for(&input.project_root));
@@ -215,6 +239,7 @@ pub fn build_clean_rust(
         cache_root,
         input.cargo_profile,
         RustCargoMode::Build,
+        &mut events,
     )?;
     let project_name = clean_artifact_name(&input.project_name);
     let artifact = public_artifact_path(&input.output_root, input.cargo_profile, &project_name);
@@ -234,11 +259,12 @@ fn execute_clean_rust(
     cache_root: PathBuf,
     cargo_profile: RustCargoProfile,
     mode: RustCargoMode,
+    events: &mut impl FnMut(CleanRustEvent),
 ) -> Result<RustCargoSuccess, CleanRustError> {
     let semantic_profile = semantic_profile_name(frontend.context.profile);
     let native = native_provider_context_for_file(&file)?;
     let metadata = cargo_metadata_for_file(&file)?;
-    let emitted = emit_source(file.clone(), frontend, &native)?;
+    let emitted = emit_source_with_events(file.clone(), frontend, &native, events)?;
     let dependencies = native_provider_dependencies(&emitted.native_providers)?;
     let seed = stable_file_seed(&file)?;
     let crate_identity = cargo_job::single_program_crate_identity(&RustCargoCrateIdentityInput {
@@ -258,7 +284,12 @@ fn execute_clean_rust(
         Some(crate_identity),
     );
 
-    match cargo_job::execute(&job).map_err(CleanRustError::Cargo)? {
+    match cargo_job::execute_with_events(&job, |event| match event {
+        RustCargoEvent::Compiling => events(CleanRustEvent::CompilingRust),
+        RustCargoEvent::Running => events(CleanRustEvent::Running { file: file.clone() }),
+    })
+    .map_err(CleanRustError::Cargo)?
+    {
         RustCargoOutput::Success(output) => Ok(output),
         RustCargoOutput::CargoFailed(output) => Err(CleanRustError::CargoBuild(output)),
         RustCargoOutput::RunFailed(output) => Err(CleanRustError::Run(output)),
@@ -414,6 +445,16 @@ fn emit_source(
     frontend: FrontendConfig,
     native: &NativeProviderContext,
 ) -> Result<EmittedRustSource, CleanRustError> {
+    emit_source_with_events(file, frontend, native, &mut |_| {})
+}
+
+fn emit_source_with_events(
+    file: PathBuf,
+    frontend: FrontendConfig,
+    native: &NativeProviderContext,
+    events: &mut impl FnMut(CleanRustEvent),
+) -> Result<EmittedRustSource, CleanRustError> {
+    events(CleanRustEvent::Checking { file: file.clone() });
     let output = match &native.manifest {
         Some(manifest) => crate::check::build_air_path_with_loaded_native_providers_typed(
             &file,
@@ -424,9 +465,12 @@ fn emit_source(
         None => build_air_path_typed(&file, frontend),
     }
     .map_err(CleanRustError::Air)?;
-    let native_providers = used_native_provider_supports(&output.air, &native.supports);
+    let AirBuildOutput { report, air } = output;
+    events(CleanRustEvent::Checked { report });
+    let native_providers = used_native_provider_supports(&air, &native.supports);
+    events(CleanRustEvent::GeneratingRust);
     let plan = anvyx_backend::rust::plan(
-        &output.air.as_verified(),
+        &air.as_verified(),
         anvyx_backend::rust::RustPlanConfig {
             native_providers: native_providers.clone(),
             ..anvyx_backend::rust::RustPlanConfig::default()
@@ -684,6 +728,66 @@ mod tests {
     }
 
     #[test]
+    fn emit_source_reports_pre_cargo_event_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("main.anv");
+        fs::write(&file, "import helper;\n\nfn main() {}\n").unwrap();
+        fs::write(temp.path().join("helper.anv"), "pub fn f() {}\n").unwrap();
+        let mut events = vec![];
+        let mut checked_has_warnings = false;
+
+        emit_source_with_events(
+            file,
+            FrontendConfig::default(),
+            &system_native_context(),
+            &mut |event| {
+                if let CleanRustEvent::Checked { report } = &event {
+                    checked_has_warnings = report.has_warnings();
+                }
+                events.push(clean_rust_event_name(&event));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events, ["checking", "checked", "generating"]);
+        assert!(checked_has_warnings);
+    }
+
+    #[test]
+    fn emit_source_reports_only_checking_before_frontend_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("main.anv");
+        fs::write(&file, "fn main() { } }\n").unwrap();
+        let mut events = vec![];
+
+        let error = match emit_source_with_events(
+            file,
+            FrontendConfig::default(),
+            &system_native_context(),
+            &mut |event| events.push(clean_rust_event_name(&event)),
+        ) {
+            Ok(_) => panic!("malformed source should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            CleanRustError::Air(AirBuildError::Diagnostic(_))
+        ));
+        assert_eq!(events, ["checking"]);
+    }
+
+    fn clean_rust_event_name(event: &CleanRustEvent) -> &'static str {
+        match event {
+            CleanRustEvent::Checking { .. } => "checking",
+            CleanRustEvent::Checked { .. } => "checked",
+            CleanRustEvent::GeneratingRust => "generating",
+            CleanRustEvent::CompilingRust => "compiling",
+            CleanRustEvent::Running { .. } => "running",
+        }
+    }
+
+    #[test]
     fn native_provider_support_matches_descriptors() {
         validate_rust_provider_support(
             &anvyx_core2::provider_descriptors(),
@@ -859,23 +963,45 @@ mod tests {
         let file = temp.path().join("main.anv");
         fs::write(&file, "fn main() { println(42); }\n").unwrap();
 
-        let output = run_clean_rust(CleanRustRunInput {
-            file,
-            frontend: FrontendConfig::default(),
-            cargo_profile: RustCargoProfile::Dev,
-            cache_root: Some(temp.path().join("cache")),
-        })
+        let mut events = vec![];
+        let output = run_clean_rust_with_events(
+            CleanRustRunInput {
+                file,
+                frontend: FrontendConfig::default(),
+                cargo_profile: RustCargoProfile::Dev,
+                cache_root: Some(temp.path().join("cache")),
+            },
+            |event| events.push(clean_rust_event_name(&event)),
+        )
         .unwrap();
 
+        assert_eq!(
+            events,
+            ["checking", "checked", "generating", "compiling", "running"]
+        );
         assert_eq!(output.stdout, "42\n");
     }
 
     #[test]
     fn clean_build_copies_debug_artifact() {
         let temp = tempfile::tempdir().unwrap();
+        let mut events = vec![];
 
-        let output = build(temp.path(), RustCargoProfile::Dev);
+        let output = build_clean_rust_with_events(
+            CleanRustBuildInput {
+                file: write_project(temp.path(), "demo"),
+                project_root: temp.path().to_path_buf(),
+                project_name: "demo".to_string(),
+                frontend: FrontendConfig::default(),
+                cargo_profile: RustCargoProfile::Dev,
+                cache_root: None,
+                output_root: temp.path().join("build"),
+            },
+            |event| events.push(clean_rust_event_name(&event)),
+        )
+        .unwrap();
 
+        assert_eq!(events, ["checking", "checked", "generating", "compiling"]);
         assert_eq!(
             output.artifact,
             temp.path()

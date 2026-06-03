@@ -1,6 +1,7 @@
 mod build;
 mod check;
 mod clean;
+mod clean_rust;
 mod fmt;
 mod init;
 mod lsp;
@@ -173,8 +174,6 @@ fn run(cli: Cli) -> Result<(), String> {
                 let manifest = check_manifest(file.as_deref())?;
                 let path = resolve_entry(file, manifest.as_ref())?;
                 let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
-                progress::status("Checking", &format!("{}...", path.display()));
-                progress::status("Running", &format!("{}...", path.display()));
                 run::new_frontend_cmd(
                     &path,
                     lint_config,
@@ -308,21 +307,18 @@ fn run(cli: Cli) -> Result<(), String> {
                     .entry
                     .as_deref()
                     .ok_or("project.entry is required for clean build")?;
-                let path = cwd.join(entry);
+                let path = PathBuf::from(entry);
                 let compilation_ctx = build_compilation_ctx(release, &feature, &cfg)?;
                 let lint_config = resolve_lint_config(Some(&manifest), &[])?;
-                progress::status("Checking", &format!("{}...", path.display()));
-                progress::status("Building", &format!("{}...", path.display()));
-                let output = anvyx_project::rust::build_clean_rust(CleanRustBuildInput {
+                let output = clean_rust::build(CleanRustBuildInput {
                     file: path,
                     project_root: cwd.clone(),
                     project_name,
                     frontend: check::new_frontend_config(lint_config, &compilation_ctx),
                     cargo_profile: RustCargoProfile::from_release(release),
                     cache_root: None,
-                    output_root: cwd.join("build"),
-                })
-                .map_err(|error| error.to_string())?;
+                    output_root: PathBuf::from("build"),
+                })?;
                 progress::status("Finished", &format!("{}", output.artifact.display()));
                 return Ok(());
             }

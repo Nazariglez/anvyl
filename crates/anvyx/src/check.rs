@@ -92,7 +92,7 @@ fn emit_check_output(
     format: CheckOutputFormat,
     warnings_are_errors: bool,
 ) -> Result<(), String> {
-    emit_report(&output.report, format, warnings_are_errors)?;
+    emit_diagnostic_report(&output.report, format, warnings_are_errors)?;
     if output.has_errors() {
         return Err(output.summary().to_string());
     }
@@ -135,7 +135,7 @@ fn new_frontend_context(ctx: &CompilationContext) -> FrontendCompilationContext 
     }
 }
 
-fn emit_report(
+fn emit_diagnostic_report(
     report: &DiagnosticReport,
     format: CheckOutputFormat,
     warnings_are_errors: bool,
@@ -145,6 +145,10 @@ fn emit_report(
         CheckOutputFormat::Json => println!("{}", render_json_report(report, warnings_are_errors)?),
     }
     Ok(())
+}
+
+pub(crate) fn emit_text_diagnostic_report(report: &DiagnosticReport) {
+    emit_text_report(report, false);
 }
 
 const WARN_AS_ERROR_NOTE: &str = "warning promoted to error by --warn-as-error";

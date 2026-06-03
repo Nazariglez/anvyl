@@ -14,13 +14,12 @@ pub fn new_frontend_cmd(
     ctx: &CompilationContext,
     cargo_profile: RustCargoProfile,
 ) -> Result<(), String> {
-    let output = anvyx_project::rust::run_clean_rust(CleanRustRunInput {
+    let output = crate::clean_rust::run(CleanRustRunInput {
         file: file.to_path_buf(),
         frontend: crate::check::new_frontend_config(lint, ctx),
         cargo_profile,
         cache_root: None,
-    })
-    .map_err(|error| error.to_string())?;
+    })?;
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     Ok(())

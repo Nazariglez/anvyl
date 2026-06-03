@@ -1,6 +1,8 @@
 // @mode: check
 // @expect: error
-// @contains: infinite size
+// @contains: recursive value type 'Node' has infinite size
+// @contains: use `dataref` for shared nodes
+// @contains: `[T]` / `[K: V]` for indirect value containers
 
 struct Node { child: Node }
 

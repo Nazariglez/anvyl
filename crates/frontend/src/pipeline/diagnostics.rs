@@ -737,7 +737,7 @@ pub(super) fn diagnose_type_error(
             "refutable pattern is not allowed in for binding".to_string()
         }
         TypeError::InfiniteSize { name, .. } => {
-            format!("type '{name}' has infinite size")
+            format!("recursive value type '{name}' has infinite size")
         }
         TypeError::NotEquatable { ty, .. } => format!("type '{}' is not equatable", render_surface_type(ty, type_ctx)),
         TypeError::UnsupportedPattern { pattern, .. } => format!("Unsupported pattern: {pattern}"),
@@ -1039,6 +1039,9 @@ pub(super) fn diagnose_type_error(
         TypeError::NonEscapingCallbackEscapes {
             help: Some(help), ..
         } => diagnostic.with_help(help.clone()),
+        TypeError::InfiniteSize { .. } => diagnostic.with_help(
+            "use `dataref` for shared nodes, or `[T]` / `[K: V]` for indirect value containers",
+        ),
         _ => diagnostic,
     };
     match span {

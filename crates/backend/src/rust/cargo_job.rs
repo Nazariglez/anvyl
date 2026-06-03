@@ -63,6 +63,12 @@ pub enum RustCargoMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustCargoEvent {
+    Compiling,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustCargoProfile {
     Dev,
     Release,
@@ -335,12 +341,20 @@ pub fn batch_job_with_dependencies(
 }
 
 pub fn execute(job: &RustCargoJob) -> Result<RustCargoOutput, RustCargoError> {
+    execute_with_events(job, |_| {})
+}
+
+pub fn execute_with_events(
+    job: &RustCargoJob,
+    mut events: impl FnMut(RustCargoEvent),
+) -> Result<RustCargoOutput, RustCargoError> {
     validate_package(&job.package)?;
 
     let layout = RustCargoLayout::new(job.cache_root.clone(), job.crate_identity.clone());
     with_lock(layout.lock_path(), None, || {
         write_single_package(job, &layout)?;
 
+        events(RustCargoEvent::Compiling);
         let cargo = Command::new("cargo")
             .arg("build")
             .args(job.profile.build_args())
@@ -380,6 +394,7 @@ pub fn execute(job: &RustCargoJob) -> Result<RustCargoOutput, RustCargoError> {
                 cargo.stderr,
             ))),
             RustCargoMode::Run => {
+                events(RustCargoEvent::Running);
                 let run = Command::new(&binary_path).output()?;
                 if !run.status.success() {
                     return Ok(RustCargoOutput::RunFailed(failure(
@@ -1480,11 +1495,13 @@ mod tests {
             "debug",
         );
 
-        let output = execute(&job).unwrap();
+        let mut events = vec![];
+        let output = execute_with_events(&job, |event| events.push(event)).unwrap();
         let RustCargoOutput::Success(output) = output else {
             panic!("expected success: {output:?}");
         };
 
+        assert_eq!(events, [RustCargoEvent::Compiling, RustCargoEvent::Running]);
         assert_eq!(output.stdout, "ok\n");
         assert!(output.manifest_path.exists());
         assert!(output.source_path.exists());
@@ -1663,9 +1680,13 @@ mod tests {
             "debug",
         );
 
-        let RustCargoOutput::Success(first) = execute(&job).unwrap() else {
+        let mut events = vec![];
+        let RustCargoOutput::Success(first) =
+            execute_with_events(&job, |event| events.push(event)).unwrap()
+        else {
             panic!("expected first build success");
         };
+        assert_eq!(events, [RustCargoEvent::Compiling]);
         let manifest_time = fs::metadata(&first.manifest_path)
             .unwrap()
             .modified()
