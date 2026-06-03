@@ -1,0 +1,6 @@
+[project]
+name = "native_only_game"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "../host" }

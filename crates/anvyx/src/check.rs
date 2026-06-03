@@ -39,22 +39,18 @@ pub fn render_lint_list() -> String {
     lines.join("\n")
 }
 
-pub fn cmd(
-    file: &Path,
-    extern_meta: &HashMap<String, String>,
-    lint: LintConfig,
-    ctx: &CompilationContext,
-) -> Result<(), String> {
+pub fn cmd(file: &Path, lint: LintConfig, ctx: &CompilationContext) -> Result<(), String> {
     let program = fs::read_to_string(file).map_err(|e| format!("Failed to read file: {e}"))?;
     let file_path = file.to_string_lossy().to_string();
     let (std_sources, _) = collect_std();
     let (core_prelude, core_sources, _) = collect_core();
+    let metadata = HashMap::new();
 
     let _ast = anvyx_lang::generate_ast_with_std(
         &program,
         &file_path,
         &core_prelude,
-        extern_meta,
+        &metadata,
         &std_sources,
         &core_sources,
         lint,
@@ -401,7 +397,7 @@ mod tests {
     use anvyx_lang2::CheckFileInput;
 
     use super::*;
-    use crate::manifest::{DependencyEntry, ExternEntry, Manifest, Project};
+    use crate::manifest::{DependencyEntry, Manifest, Project};
 
     fn check_new_frontend(file: &Path) -> Result<(), String> {
         new_frontend_cmd(
@@ -582,7 +578,6 @@ mod tests {
                 entry: Some("main.anv".to_string()),
             },
             dependencies: HashMap::new(),
-            externs: HashMap::new(),
             lint: std::collections::BTreeMap::default(),
         }
     }
@@ -1044,7 +1039,7 @@ mod tests {
 
             #[test]
             fn accepts_lint_flags() {
-                assert!(plain_manifest().externs.is_empty());
+                assert!(plain_manifest().lint.is_empty());
             }
 
             #[test]
@@ -1055,26 +1050,6 @@ mod tests {
                     .insert("internal_access".to_string(), "error".to_string());
 
                 assert_eq!(manifest.lint["internal_access"], "error");
-            }
-
-            #[test]
-            fn manifest_externs() {
-                let mut manifest = plain_manifest();
-                manifest.externs.insert(
-                    "engine".to_string(),
-                    ExternEntry {
-                        path: "externs/engine".to_string(),
-                    },
-                );
-
-                assert!(manifest.has_externs());
-            }
-
-            #[test]
-            fn accepts_plain_manifest() {
-                let manifest = plain_manifest();
-
-                assert!(!manifest.has_externs());
             }
 
             #[test]

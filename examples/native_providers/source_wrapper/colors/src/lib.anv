@@ -1,0 +1,5 @@
+import ext:colors_native { ping };
+
+pub fn mix() -> int {
+    ping()
+}

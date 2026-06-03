@@ -172,8 +172,7 @@ pub(crate) fn is_batch_eligible(plan: &TestPlan) -> bool {
 
 fn case_blocks_batch(file: &Path) -> bool {
     match anvyx_project::manifest::find_nearest_manifest(file) {
-        Ok(Some(path)) => anvyx_project::manifest::parse_manifest_file(&path)
-            .map_or(true, |manifest| manifest.has_externs()),
+        Ok(Some(path)) => anvyx_project::manifest::parse_manifest_file(&path).is_err(),
         Ok(None) => false,
         Err(_) => true,
     }
@@ -460,13 +459,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_externs_and_errors_are_not_batch_eligible() {
+    fn stale_externs_and_native_dependencies_do_not_block_batch_eligibility() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("test.anv");
         fs::write(&file, "fn main() {}\n").unwrap();
         fs::write(
             temp.path().join("anvyx.toml"),
-            "[project]\nentry = \"test.anv\"\n\n[externs.engine]\npath = \"provider\"\n",
+            "[project]\nentry = \"test.anv\"\n\n[externs.engine]\npath = \"missing\"\n",
         )
         .unwrap();
         let plan = plan_file(
@@ -475,7 +474,49 @@ mod tests {
             true,
             Some("rust"),
         );
-        assert!(!is_batch_eligible(&plan));
+        assert!(is_batch_eligible(&plan));
+
+        fs::create_dir_all(temp.path().join("provider/src")).unwrap();
+        fs::write(
+            temp.path().join("provider/anvyx.toml"),
+            "[project]\nname = \"host\"\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("provider/Cargo.toml"),
+            format!(
+                "[package]\nname = \"native-host\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = \"{}\" }}\n",
+                Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("runtime").display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("provider/src/lib.rs"),
+            r#"use anvyx_runtime::function;
+
+#[function]
+pub fn ping() -> i64 { 1 }
+
+anvyx_runtime::builtin_module! {
+    name: "host",
+    source: "",
+    exports: [ping],
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("anvyx.toml"),
+            "[project]\nentry = \"test.anv\"\n\n[dependencies]\nhost = { path = \"provider\" }\n",
+        )
+        .unwrap();
+        let plan = plan_file(
+            &file,
+            "// @mode: run\n// @expect: success\n",
+            true,
+            Some("rust"),
+        );
+        assert!(is_batch_eligible(&plan));
 
         fs::write(
             temp.path().join("anvyx.toml"),

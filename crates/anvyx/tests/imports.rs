@@ -12,6 +12,43 @@ fn anvyx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_anvyx"))
 }
 
+fn runtime_path() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("runtime")
+        .display()
+        .to_string()
+}
+
+fn write_provider_crate(root: &Path, package: &str, module: &str) {
+    write(
+        root,
+        &format!("{package}/Cargo.toml"),
+        &format!(
+            "[package]\nname = \"native\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = \"{}\" }}\n",
+            runtime_path()
+        ),
+    );
+    write(
+        root,
+        &format!("{package}/src/lib.rs"),
+        &format!(
+            r#"use anvyx_runtime::function;
+
+#[function]
+pub fn ping() -> i64 {{ 1 }}
+
+anvyx_runtime::builtin_module! {{
+    name: "{module}",
+    source: "",
+    exports: [ping],
+}}
+"#
+        ),
+    );
+}
+
 fn assert_in_order(text: &str, needles: &[&str]) {
     let mut rest = text;
     for needle in needles {
@@ -75,6 +112,116 @@ fn package_import_smoke() {
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn native_only_dependency_check_smoke() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    write(
+        root,
+        "game/anvyx.toml",
+        "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\nhost = { path = \"../host\" }\n",
+    );
+    write(root, "host/anvyx.toml", "[project]\nname = \"host\"\n");
+    write(
+        root,
+        "game/src/main.anv",
+        "import pkg:host.audio { ping };\nfn main() { let x: int = ping(); }\n",
+    );
+    write_provider_crate(root, "host", "audio");
+
+    let output = anvyx()
+        .current_dir(root.join("game"))
+        .args(["check", "--new-frontend"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn source_native_dependency_check_smoke() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    write(
+        root,
+        "game/anvyx.toml",
+        "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\ncolors = { path = \"../colors\" }\n",
+    );
+    write(
+        root,
+        "colors/anvyx.toml",
+        "[project]\nentry = \"src/lib.anv\"\n",
+    );
+    write(
+        root,
+        "game/src/main.anv",
+        "import pkg:colors { mix };\nfn main() { let x: int = mix(); }\n",
+    );
+    write(
+        root,
+        "colors/src/lib.anv",
+        "import ext:colors_native { ping };\npub fn mix() -> int { ping() }\n",
+    );
+    write_provider_crate(root, "colors", "colors_native");
+
+    let output = anvyx()
+        .current_dir(root.join("game"))
+        .args(["check", "--new-frontend"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn source_native_provider_direct_consumer_import_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    write(
+        root,
+        "game/anvyx.toml",
+        "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\ncolors = { path = \"../colors\" }\n",
+    );
+    write(
+        root,
+        "colors/anvyx.toml",
+        "[project]\nentry = \"src/lib.anv\"\n",
+    );
+    write(
+        root,
+        "game/src/main.anv",
+        "import pkg:colors.colors_native { ping };\nfn main() { let x: int = ping(); }\n",
+    );
+    write(root, "colors/src/lib.anv", "pub fn mix() -> int { 1 }\n");
+    write_provider_crate(root, "colors", "colors_native");
+
+    let output = anvyx()
+        .current_dir(root.join("game"))
+        .args(["check", "--new-frontend"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Unknown member 'colors_native'"),
+        "stderr:\n{stderr}"
     );
 }
 

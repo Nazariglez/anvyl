@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @lint: unused=allow
+// @match: 25
+
+import pkg:host.host { marker, Vec2 };
+
+fn main() {
+    let v = Vec2 { x: 3.0, y: 4.0 };
+    assert(v.len2() == 25.0);
+    println(25);
+}

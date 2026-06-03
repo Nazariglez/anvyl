@@ -8,6 +8,7 @@ edition.workspace = true
 anvyx-backend = { path = "../backend" }
 anvyx-lang2 = { path = "../lang2" }
 anvyx-core2 = { path = "../core2" }
+anvyx-externs = { path = "../externs" }
 anvyx-runtime = { path = "../runtime" }
 anvyx-stdlib2 = { path = "../stdlib2" }
 serde = { version = "1", features = ["derive"] }

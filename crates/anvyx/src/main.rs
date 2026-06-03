@@ -10,10 +10,7 @@ mod progress;
 mod run;
 mod std_support;
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anvyx_lang::{CompilationContext, LintConfig as LegacyLintConfig, Profile};
 use anvyx_lang2::{LintConfig, LintId, LintLevel, expand_group, find_lint};
@@ -173,7 +170,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 let manifest = check_manifest(file.as_deref())?;
                 let path = resolve_entry(file, manifest.as_ref())?;
-                let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
+                let lint_config = manifest::lint_config(manifest.as_ref(), &lint)?;
                 run::new_frontend_cmd(
                     &path,
                     lint_config,
@@ -186,27 +183,9 @@ fn run(cli: Cli) -> Result<(), String> {
             let manifest = manifest::parse_manifest()?;
             let path = resolve_entry(file, manifest.as_ref())?;
             let legacy_lint = resolve_legacy_lint_config(manifest.as_ref(), &lint)?;
-            let has_externs = manifest.as_ref().is_some_and(Manifest::has_externs);
-            if has_externs {
-                let manifest = manifest.as_ref().unwrap();
-                let ctx = prepare_externs(manifest)?;
-
-                progress::status("Checking", &format!("{}...", path.display()));
-                progress::status("Running", &format!("{}...", path.display()));
-                build::execute_runner(
-                    &ctx.cwd,
-                    &path,
-                    &backend,
-                    release,
-                    legacy_lint,
-                    &feature,
-                    &cfg,
-                )?;
-            } else {
-                progress::status("Checking", &format!("{}...", path.display()));
-                progress::status("Running", &format!("{}...", path.display()));
-                run::cmd(&path, &backend, legacy_lint, &compilation_ctx)?;
-            }
+            progress::status("Checking", &format!("{}...", path.display()));
+            progress::status("Running", &format!("{}...", path.display()));
+            run::cmd(&path, &backend, legacy_lint, &compilation_ctx)?;
         }
         Command::Check {
             file,
@@ -226,7 +205,7 @@ fn run(cli: Cli) -> Result<(), String> {
             if new_frontend {
                 let manifest = check_manifest(file.as_deref())?;
                 let path = resolve_entry(file, manifest.as_ref())?;
-                let lint_config = resolve_lint_config(manifest.as_ref(), &lint)?;
+                let lint_config = manifest::lint_config(manifest.as_ref(), &lint)?;
                 let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
                 progress::status("Checking", &format!("{}...", path.display()));
                 check::new_frontend_cmd(
@@ -254,17 +233,8 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             let compilation_ctx = build_compilation_ctx(false, &feature, &cfg)?;
 
-            let has_externs = manifest.as_ref().is_some_and(Manifest::has_externs);
-            let extern_meta = if has_externs {
-                let manifest = manifest.as_ref().unwrap();
-                let ctx = prepare_externs(manifest)?;
-                ctx.metadata
-            } else {
-                HashMap::new()
-            };
-
             progress::status("Checking", &format!("{}...", path.display()));
-            check::cmd(&path, &extern_meta, legacy_lint, &compilation_ctx)?;
+            check::cmd(&path, legacy_lint, &compilation_ctx)?;
             progress::status(
                 "Finished",
                 &format!("{} checked successfully", path.display()),
@@ -309,7 +279,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     .ok_or("project.entry is required for clean build")?;
                 let path = PathBuf::from(entry);
                 let compilation_ctx = build_compilation_ctx(release, &feature, &cfg)?;
-                let lint_config = resolve_lint_config(Some(&manifest), &[])?;
+                let lint_config = manifest::lint_config(Some(&manifest), &[] as &[&str])?;
                 let output = clean_rust::build(CleanRustBuildInput {
                     file: path,
                     project_root: cwd.clone(),
@@ -325,10 +295,6 @@ fn run(cli: Cli) -> Result<(), String> {
 
             if let Some(backend) = backend {
                 return Err(format!("--backend {backend} requires --new-frontend"));
-            }
-
-            if manifest.has_externs() {
-                prepare_externs(&manifest)?;
             }
 
             let runner_dir = build::generate_build_runner_crate(&cwd, &manifest, release)?;
@@ -372,44 +338,12 @@ fn resolve_entry(file: Option<PathBuf>, manifest: Option<&Manifest>) -> Result<P
     }
 }
 
-struct ExternContext {
-    cwd: PathBuf,
-    metadata: HashMap<String, String>,
-}
-
-fn prepare_externs(manifest: &Manifest) -> Result<ExternContext, String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("Failed to get current directory: {e}"))?;
-
-    for name in manifest.externs.keys() {
-        progress::status("Loading", &format!("extern {name}..."));
-    }
-    let runner_dir = build::generate_runner_crate(&cwd, manifest)?;
-
-    let spinner = progress::start_spinner("Compiling", "externs...");
-    build::build_runner(&runner_dir)?;
-    progress::finish_spinner(&spinner);
-
-    progress::status("Resolving", "extern types...");
-    build::extract_metadata(&cwd)?;
-
-    let metadata = build::read_metadata(&cwd, manifest)?;
-    Ok(ExternContext { cwd, metadata })
-}
-
-fn resolve_lint_config(
-    manifest: Option<&Manifest>,
-    lint_overrides: &[String],
-) -> Result<LintConfig, String> {
-    manifest::lint_config(manifest, lint_overrides)
-}
-
 fn resolve_legacy_lint_config(
     manifest: Option<&Manifest>,
     lint_overrides: &[String],
 ) -> Result<LegacyLintConfig, String> {
     reject_unsupported_legacy_lints(manifest, lint_overrides)?;
-    let config = resolve_lint_config(manifest, lint_overrides)?;
+    let config = manifest::lint_config(manifest, lint_overrides)?;
     Ok(legacy_lint_config(&config))
 }
 
@@ -621,8 +555,7 @@ mod tests {
                 version: None,
                 entry: Some("main.anv".to_string()),
             },
-            dependencies: HashMap::default(),
-            externs: HashMap::default(),
+            dependencies: std::collections::HashMap::default(),
             lint: lints
                 .iter()
                 .map(|(name, level)| ((*name).to_string(), (*level).to_string()))
@@ -634,7 +567,7 @@ mod tests {
     fn lint_config_applies_manifest_values() {
         let manifest = manifest_with_lints(&[("deprecated", "allow"), ("api", "error")]);
 
-        let config = resolve_lint_config(Some(&manifest), &[]).unwrap();
+        let config = manifest::lint_config(Some(&manifest), &[] as &[&str]).unwrap();
 
         assert_eq!(config.level(LintId::InternalAccess), LintLevel::Error);
         assert_eq!(config.level(LintId::Deprecated), LintLevel::Allow);
@@ -648,7 +581,7 @@ mod tests {
     fn lint_config_applies_cli_overrides_after_manifest() {
         let manifest = manifest_with_lints(&[("api", "error")]);
 
-        let config = resolve_lint_config(
+        let config = manifest::lint_config(
             Some(&manifest),
             &[
                 "deprecated=allow".to_string(),
@@ -675,7 +608,7 @@ mod tests {
         std::fs::write(&file, "fn main() {}\n").unwrap();
 
         let manifest = check_manifest(Some(&file)).unwrap().unwrap();
-        let config = resolve_lint_config(Some(&manifest), &[]).unwrap();
+        let config = manifest::lint_config(Some(&manifest), &[] as &[&str]).unwrap();
 
         assert_eq!(
             config.level(LintId::PublicInferredDynContract),
@@ -685,7 +618,7 @@ mod tests {
 
     #[test]
     fn lint_config_rejects_unknown_lints() {
-        let error = resolve_lint_config(None, &["unused_variable=warn".to_string()]).unwrap_err();
+        let error = manifest::lint_config(None, &["unused_variable=warn".to_string()]).unwrap_err();
 
         assert!(
             error.contains("unknown lint or group 'unused_variable'"),
@@ -698,7 +631,7 @@ mod tests {
     fn manifest_lints_reject_warn_as_error_policy() {
         for name in ["warn_as_error", "warnings_as_errors"] {
             let manifest = manifest_with_lints(&[(name, "warn")]);
-            let error = resolve_lint_config(Some(&manifest), &[]).unwrap_err();
+            let error = manifest::lint_config(Some(&manifest), &[] as &[&str]).unwrap_err();
 
             assert!(
                 error.contains(&format!("unknown lint or group '{name}'")),

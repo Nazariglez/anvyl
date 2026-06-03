@@ -953,13 +953,13 @@ mod tests {
     }
 
     #[test]
-    fn check_open_document_publishes_invalid_extern_manifest() {
+    fn check_open_document_publishes_invalid_dependency_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("game");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("anvyx.toml"),
-            "[project]\nentry = \"src/main.anv\"\n\n[externs.engine]\npath = \"externs/engine\"\n",
+            "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\nengine = { path = \"native/engine\" }\n",
         )
         .unwrap();
         let path = root.join("src/main.anv");
@@ -978,7 +978,7 @@ mod tests {
         assert!(
             publishes[0].diagnostics[0]
                 .message
-                .contains("extern provider `engine` path does not exist")
+                .contains("directory containing anvyx.toml")
         );
     }
 

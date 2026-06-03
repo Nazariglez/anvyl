@@ -15,9 +15,9 @@ use anvyx_backend::rust::{
     emit::RustSource,
 };
 use anvyx_lang2::{AirBuildError, AirBuildOutput, DiagnosticReport, FrontendConfig};
-use anvyx_runtime::{RustProviderCargo, RustProviderSupport, validate_rust_provider_support};
+use anvyx_runtime::{RustProviderSupport, validate_rust_provider_support};
 
-use crate::check::{air_error_ref, build_air_path_typed};
+use crate::check::{air_error_ref, build_air_path_typed, build_air_path_with_graph_typed};
 
 #[derive(Debug, Clone)]
 pub struct CleanRustRunInput {
@@ -148,11 +148,6 @@ pub fn run_clean_rust_with_events(
 pub fn build_clean_rust_batch(input: CleanRustBatchInput) -> Result<CleanRustBatchOutput, String> {
     let cargo_profile = input.cargo_profile;
     let cache_root = input.cache_root.unwrap_or_else(default_cache_root);
-    reject_manifest_provider_batch_cases(&input.cases)?;
-    let native = NativeProviderContext {
-        supports: system_native_provider_supports().map_err(|error| error.to_string())?,
-        manifest: None,
-    };
     let mut emitted_cases = vec![];
     let mut native_providers = vec![];
     let mut semantic_profile = None;
@@ -166,6 +161,7 @@ pub fn build_clean_rust_batch(input: CleanRustBatchInput) -> Result<CleanRustBat
             Some(_) => {}
         }
         let file = case.file;
+        let native = native_provider_context_for_file(&file).map_err(|error| error.to_string())?;
         let emitted =
             emit_source(file.clone(), case.frontend, &native).map_err(|error| error.to_string())?;
         native_providers.extend(emitted.native_providers);
@@ -365,7 +361,7 @@ fn public_artifact_path(
         .join(host_executable_name(project_name))
 }
 
-fn clean_artifact_name(raw: &str) -> String {
+pub fn clean_artifact_name(raw: &str) -> String {
     let name = raw
         .to_lowercase()
         .chars()
@@ -409,22 +405,6 @@ fn semantic_profile_name(profile: anvyx_lang2::Profile) -> &'static str {
     }
 }
 
-fn reject_manifest_provider_batch_cases(cases: &[CleanRustBatchCase]) -> Result<(), String> {
-    for case in cases {
-        let Some(path) = crate::manifest::find_nearest_manifest(&case.file)? else {
-            continue;
-        };
-        let manifest = crate::manifest::parse_manifest_file(&path)?;
-        if manifest.has_externs() {
-            return Err(format!(
-                "clean Rust batch does not support manifest extern providers: {}",
-                case.file.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
 struct EmittedRustSource {
     source: RustSource,
     native_providers: Vec<RustProviderSupport>,
@@ -432,12 +412,7 @@ struct EmittedRustSource {
 
 struct NativeProviderContext {
     supports: Vec<RustProviderSupport>,
-    manifest: Option<ManifestNativeProviderContext>,
-}
-
-struct ManifestNativeProviderContext {
-    path: PathBuf,
-    load: crate::manifest::NativeProviderLoad,
+    graph: Option<crate::manifest::PackageGraph>,
 }
 
 fn emit_source(
@@ -455,13 +430,8 @@ fn emit_source_with_events(
     events: &mut impl FnMut(CleanRustEvent),
 ) -> Result<EmittedRustSource, CleanRustError> {
     events(CleanRustEvent::Checking { file: file.clone() });
-    let output = match &native.manifest {
-        Some(manifest) => crate::check::build_air_path_with_loaded_native_providers_typed(
-            &file,
-            frontend,
-            &manifest.path,
-            &manifest.load,
-        ),
+    let output = match &native.graph {
+        Some(graph) => build_air_path_with_graph_typed(&file, frontend, graph),
         None => build_air_path_typed(&file, frontend),
     }
     .map_err(CleanRustError::Air)?;
@@ -485,32 +455,24 @@ fn emit_source_with_events(
 
 fn native_provider_context_for_file(file: &Path) -> Result<NativeProviderContext, CleanRustError> {
     let mut supports = system_native_provider_supports()?;
-    let manifest = manifest_native_provider_context(file)?;
-    if let Some(manifest) = &manifest {
-        supports.extend(manifest_native_provider_supports(
-            &manifest.path,
-            &manifest.load,
-        )?);
+    let graph = load_provider_graph(file)?;
+    if let Some(graph) = &graph {
+        supports.extend(graph.rust_provider_supports());
     }
-    Ok(NativeProviderContext { supports, manifest })
+    Ok(NativeProviderContext { supports, graph })
 }
 
-fn manifest_native_provider_context(
+fn load_provider_graph(
     file: &Path,
-) -> Result<Option<ManifestNativeProviderContext>, CleanRustError> {
+) -> Result<Option<crate::manifest::PackageGraph>, CleanRustError> {
     let Some(manifest_path) =
         crate::manifest::find_nearest_manifest(file).map_err(CleanRustError::Dependency)?
     else {
         return Ok(None);
     };
-    let manifest =
-        crate::manifest::parse_manifest_file(&manifest_path).map_err(CleanRustError::Dependency)?;
-    let load = crate::manifest::load_native_providers(&manifest_path, &manifest)
-        .map_err(CleanRustError::Dependency)?;
-    Ok(Some(ManifestNativeProviderContext {
-        path: manifest_path,
-        load,
-    }))
+    crate::manifest::load_package_graph(&manifest_path)
+        .map(Some)
+        .map_err(CleanRustError::Dependency)
 }
 
 fn system_native_provider_supports() -> Result<Vec<RustProviderSupport>, CleanRustError> {
@@ -521,52 +483,6 @@ fn system_native_provider_supports() -> Result<Vec<RustProviderSupport>, CleanRu
     let supports = anvyx_core2::rust_provider_supports()
         .into_iter()
         .chain(anvyx_stdlib2::rust_provider_supports())
-        .collect::<Vec<_>>();
-    validate_rust_provider_support(&descriptors, &supports).map_err(CleanRustError::Dependency)?;
-    Ok(supports)
-}
-
-fn manifest_native_provider_supports(
-    manifest_path: &Path,
-    load: &crate::manifest::NativeProviderLoad,
-) -> Result<Vec<RustProviderSupport>, CleanRustError> {
-    if load.providers.is_empty() {
-        return Ok(vec![]);
-    }
-    let graph =
-        crate::manifest::load_package_graph(manifest_path).map_err(CleanRustError::Dependency)?;
-    let package = graph.root().id.to_string();
-    let descriptors = load
-        .providers
-        .iter()
-        .map(|provider| provider.descriptor.clone())
-        .collect::<Vec<_>>();
-    let supports = load
-        .providers
-        .iter()
-        .map(|provider| {
-            let mut modules = provider.supports.clone();
-            for module in &mut modules {
-                for ty in &mut module.types {
-                    ty.path.crate_name.clone_from(&provider.cargo_alias);
-                }
-                for binding in &mut module.bindings {
-                    binding.path.crate_name.clone_from(&provider.cargo_alias);
-                }
-            }
-            RustProviderSupport {
-                package: package.clone(),
-                provider: provider.descriptor.provider.clone(),
-                cargo: RustProviderCargo {
-                    manifest_key: provider.cargo_alias.clone(),
-                    package: Some(provider.cargo_package.clone()),
-                    path: Some(provider.crate_root.clone()),
-                    features: vec![],
-                    default_features: true,
-                },
-                modules,
-            }
-        })
         .collect::<Vec<_>>();
     validate_rust_provider_support(&descriptors, &supports).map_err(CleanRustError::Dependency)?;
     Ok(supports)
@@ -707,6 +623,85 @@ mod tests {
         file
     }
 
+    fn write_provider_crate(root: &Path, package: &str, cargo_name: &str, module: &str) {
+        let dir = root.join(package);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{cargo_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = \"{}\" }}\n",
+                workspace_crate_path("runtime").display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/lib.rs"),
+            format!(
+                r#"use anvyx_runtime::function;
+
+#[function]
+pub fn ping() -> i64 {{ 1 }}
+
+anvyx_runtime::builtin_module! {{
+    name: "{module}",
+    source: "",
+    exports: [ping],
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_native_dependency_project(root: &Path, main: &str) -> PathBuf {
+        write_native_dependency_project_with_cargo(root, main, "native-host")
+    }
+
+    fn write_native_dependency_project_with_cargo(
+        root: &Path,
+        main: &str,
+        cargo_name: &str,
+    ) -> PathBuf {
+        let game = root.join("game");
+        fs::create_dir_all(game.join("src")).unwrap();
+        fs::write(
+            game.join("anvyx.toml"),
+            "[project]\nname = \"game\"\nentry = \"src/main.anv\"\n\n[dependencies]\nhost = { path = \"../host\" }\n",
+        )
+        .unwrap();
+        let file = game.join("src/main.anv");
+        fs::write(&file, main).unwrap();
+        fs::create_dir_all(root.join("host")).unwrap();
+        fs::write(root.join("host/anvyx.toml"), "[project]\nname = \"host\"\n").unwrap();
+        write_provider_crate(root, "host", cargo_name, "host");
+        file
+    }
+
+    fn write_source_native_wrapper_project(root: &Path, main: &str) -> PathBuf {
+        let game = root.join("game");
+        fs::create_dir_all(game.join("src")).unwrap();
+        fs::create_dir_all(root.join("colors/src")).unwrap();
+        fs::write(
+            game.join("anvyx.toml"),
+            "[project]\nname = \"game\"\nentry = \"src/main.anv\"\n\n[dependencies]\ncolors = { path = \"../colors\" }\n",
+        )
+        .unwrap();
+        let file = game.join("src/main.anv");
+        fs::write(&file, main).unwrap();
+        fs::write(
+            root.join("colors/anvyx.toml"),
+            "[project]\nname = \"colors\"\nentry = \"src/lib.anv\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("colors/src/lib.anv"),
+            "import ext:colors_native { ping };\npub fn mix() -> int { ping() }\n",
+        )
+        .unwrap();
+        write_provider_crate(root, "colors", "native-colors", "colors_native");
+        file
+    }
+
     fn build(root: &Path, profile: RustCargoProfile) -> CleanRustBuildOutput {
         build_clean_rust(CleanRustBuildInput {
             file: write_project(root, "demo"),
@@ -723,7 +718,7 @@ mod tests {
     fn system_native_context() -> NativeProviderContext {
         NativeProviderContext {
             supports: system_native_provider_supports().unwrap(),
-            manifest: None,
+            graph: None,
         }
     }
 
@@ -760,14 +755,13 @@ mod tests {
         fs::write(&file, "fn main() { } }\n").unwrap();
         let mut events = vec![];
 
-        let error = match emit_source_with_events(
+        let Err(error) = emit_source_with_events(
             file,
             FrontendConfig::default(),
             &system_native_context(),
             &mut |event| events.push(clean_rust_event_name(&event)),
-        ) {
-            Ok(_) => panic!("malformed source should fail"),
-            Err(error) => error,
+        ) else {
+            panic!("malformed source should fail");
         };
 
         assert!(matches!(
@@ -859,6 +853,67 @@ mod tests {
                 .any(|name| name == "case_0" || name == "case_1")
         );
         assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn batch_builds_mixed_source_and_native_dependency_cases() {
+        let source = tempfile::tempdir().unwrap();
+        let source_file = source.path().join("main.anv");
+        fs::write(&source_file, "fn main() { println(1); }\n").unwrap();
+
+        let native = tempfile::tempdir().unwrap();
+        let native_file = write_native_dependency_project(
+            native.path(),
+            "import pkg:host.host { ping }; fn main() { println(ping()); }\n",
+        );
+
+        let output = build_clean_rust_batch(CleanRustBatchInput {
+            cases: [source_file, native_file]
+                .into_iter()
+                .map(|file| CleanRustBatchCase {
+                    file,
+                    frontend: FrontendConfig::default(),
+                })
+                .collect(),
+            cargo_profile: RustCargoProfile::Dev,
+            cache_root: Some(native.path().join("cache")),
+            timeout: Some(Duration::from_mins(1)),
+        })
+        .unwrap();
+
+        assert_eq!(output.binaries.len(), 2);
+    }
+
+    #[test]
+    fn batch_native_provider_aliases_do_not_collide_across_graphs() {
+        let first = tempfile::tempdir().unwrap();
+        let first_file = write_native_dependency_project_with_cargo(
+            first.path(),
+            "import pkg:host.host { ping }; fn main() { println(ping()); }\n",
+            "native-host-a",
+        );
+        let second = tempfile::tempdir().unwrap();
+        let second_file = write_native_dependency_project_with_cargo(
+            second.path(),
+            "import pkg:host.host { ping }; fn main() { println(ping()); }\n",
+            "native-host-b",
+        );
+
+        let output = build_clean_rust_batch(CleanRustBatchInput {
+            cases: [first_file, second_file]
+                .into_iter()
+                .map(|file| CleanRustBatchCase {
+                    file,
+                    frontend: FrontendConfig::default(),
+                })
+                .collect(),
+            cargo_profile: RustCargoProfile::Dev,
+            cache_root: Some(first.path().join("cache")),
+            timeout: Some(Duration::from_mins(1)),
+        })
+        .unwrap();
+
+        assert_eq!(output.binaries.len(), 2);
     }
 
     #[test]
@@ -1020,17 +1075,17 @@ mod tests {
     }
 
     #[test]
-    fn manifest_provider_cargo_uses_local_path_dependency() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("project crate lives below workspace root");
-        let project = root.join("tests/run2/externs/local_provider");
+    fn native_dependency_provider_cargo_uses_local_path_dependency() {
         let temp = tempfile::tempdir().unwrap();
+        let file = write_native_dependency_project(
+            temp.path(),
+            "import pkg:host.host { ping }; fn main() { println(ping()); }\n",
+        );
+
         let output = build_clean_rust(CleanRustBuildInput {
-            file: project.join("src/main.anv"),
-            project_root: project.clone(),
-            project_name: "local_provider_game".to_string(),
+            file,
+            project_root: temp.path().join("game"),
+            project_name: "native_provider_game".to_string(),
             frontend: FrontendConfig::default(),
             cargo_profile: RustCargoProfile::Dev,
             cache_root: Some(temp.path().join("cache")),
@@ -1039,9 +1094,88 @@ mod tests {
         .unwrap();
         let manifest = fs::read_to_string(output.generated_manifest).unwrap();
 
-        assert!(manifest.contains("anvyx_provider_host"));
-        assert!(manifest.contains("package = \"anvyx-test-host\""));
-        assert!(manifest.contains("local_provider/provider"));
+        assert!(manifest.contains("anvyx_provider_host_"));
+        assert!(manifest.contains("package = \"native-host\""));
+        assert!(manifest.contains(&temp.path().join("host").display().to_string()));
+    }
+
+    #[test]
+    fn native_dependency_provider_support_matches_air_binding_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = write_native_dependency_project(
+            temp.path(),
+            "import pkg:host.host { ping }; fn main() { let x: int = ping(); }\n",
+        );
+        let manifest = crate::manifest::find_nearest_manifest(&file)
+            .unwrap()
+            .unwrap();
+        let graph = crate::manifest::load_package_graph(&manifest).unwrap();
+        let air = build_air_path_with_graph_typed(&file, FrontendConfig::default(), &graph)
+            .unwrap()
+            .air;
+        let used = used_native_provider_keys(&air);
+        let supports = graph.rust_provider_supports();
+
+        assert!(used.iter().all(|key| {
+            supports
+                .iter()
+                .any(|support| (support.package.clone(), support.provider.name.clone()) == *key)
+        }));
+    }
+
+    #[test]
+    fn source_native_provider_dependency_is_emitted_only_when_used() {
+        let unused = tempfile::tempdir().unwrap();
+        let unused_file = write_source_native_wrapper_project(unused.path(), "fn main() {}\n");
+        let unused_output = build_clean_rust(CleanRustBuildInput {
+            file: unused_file,
+            project_root: unused.path().join("game"),
+            project_name: "unused".to_string(),
+            frontend: FrontendConfig::default(),
+            cargo_profile: RustCargoProfile::Dev,
+            cache_root: Some(unused.path().join("cache")),
+            output_root: unused.path().join("build"),
+        })
+        .unwrap();
+        let unused_manifest = fs::read_to_string(unused_output.generated_manifest).unwrap();
+        assert!(!unused_manifest.contains("native-colors"));
+
+        let used = tempfile::tempdir().unwrap();
+        let used_file = write_source_native_wrapper_project(
+            used.path(),
+            "import pkg:colors { mix }; fn main() { println(mix()); }\n",
+        );
+        let used_output = build_clean_rust(CleanRustBuildInput {
+            file: used_file,
+            project_root: used.path().join("game"),
+            project_name: "used".to_string(),
+            frontend: FrontendConfig::default(),
+            cargo_profile: RustCargoProfile::Dev,
+            cache_root: Some(used.path().join("cache")),
+            output_root: used.path().join("build"),
+        })
+        .unwrap();
+        let used_manifest = fs::read_to_string(used_output.generated_manifest).unwrap();
+        assert!(used_manifest.contains("native-colors"));
+    }
+
+    #[test]
+    fn clean_run_calls_native_dependency_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = write_native_dependency_project(
+            temp.path(),
+            "import pkg:host.host { ping }; fn main() { println(ping()); }\n",
+        );
+
+        let output = run_clean_rust(CleanRustRunInput {
+            file,
+            frontend: FrontendConfig::default(),
+            cargo_profile: RustCargoProfile::Dev,
+            cache_root: Some(temp.path().join("cache")),
+        })
+        .unwrap();
+
+        assert_eq!(output.stdout, "1\n");
     }
 
     #[test]

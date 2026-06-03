@@ -214,6 +214,7 @@ version = "0.1.0"
 dependencies = [
  "anvyx-backend",
  "anvyx-core2",
+ "anvyx-externs",
  "anvyx-lang2",
  "anvyx-runtime",
  "anvyx-stdlib2",

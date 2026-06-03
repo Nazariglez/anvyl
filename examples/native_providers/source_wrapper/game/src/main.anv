@@ -1,0 +1,5 @@
+import pkg:colors { mix };
+
+fn main() {
+    println(mix());
+}

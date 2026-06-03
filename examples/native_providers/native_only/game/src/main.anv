@@ -1,0 +1,5 @@
+import pkg:host.host { ping };
+
+fn main() {
+    println(ping());
+}

@@ -24,14 +24,41 @@ anvyx_runtime::builtin_module! {
 }
 ```
 
-Project manifest:
+Provider package `anvyx.toml`:
 
 ```toml
-[externs.host]
-path = "provider"
+[project]
+name = "host"
 ```
 
-Anvyx source:
+Provider package `Cargo.toml`:
+
+```toml
+[package]
+name = "host-native"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anvyx-runtime = { path = "/path/to/anvyx/crates/runtime" }
+```
+
+Adjust the path for your workspace layout.
+
+Root package manifest:
+
+```toml
+[dependencies]
+host = { path = "../host" }
+```
+
+Anvyx source in the root package imports native-only dependency modules with `pkg:`:
+
+```anvyx
+import pkg:host.host { host_add, host_len };
+```
+
+Anvyx source inside a source+native provider package imports its own provider modules with `ext:`:
 
 ```anvyx
 import ext:host { host_add, host_len };

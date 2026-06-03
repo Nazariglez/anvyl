@@ -5,11 +5,11 @@ use std::{
 
 use anvyx_lang2::{
     AirBuildError, AirBuildOutput, CheckFileInput, CheckOutput, CheckPackageInput, FrontendConfig,
-    PackageId as FrontendPackageId, PackageSource, SourceOverride,
+    PackageSource, SourceOverride,
 };
 
 use crate::{
-    manifest::{Manifest, PackageGraph, PackageId},
+    manifest::{Manifest, PackageGraph, package_frontend_id},
     source_bundle,
 };
 
@@ -20,17 +20,14 @@ pub(crate) fn build_air_path_typed(
     build_air_path_with_source_overrides_typed(file, vec![], config)
 }
 
-pub(crate) fn build_air_path_with_loaded_native_providers_typed(
+pub(crate) fn build_air_path_with_graph_typed(
     file: &Path,
     config: FrontendConfig,
-    manifest_path: &Path,
-    native_providers: &crate::manifest::NativeProviderLoad,
+    graph: &PackageGraph,
 ) -> Result<AirBuildOutput, AirBuildError<anvyx_lang2::CheckError>> {
-    let graph = crate::manifest::load_package_graph(manifest_path)
-        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
-    let input = package_check_input_with_overrides(&graph, file, vec![])
+    let input = package_check_input_with_overrides(graph, file, vec![])
         .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?
-        .with_package_externs(native_provider_externs(&graph, native_providers))
+        .with_package_externs(graph.package_externs())
         .with_config(config);
     anvyx_lang2::build_air_package(input)
 }
@@ -91,19 +88,17 @@ fn build_air_loaded_path_typed(
     config: FrontendConfig,
     manifest: Option<(PathBuf, Manifest)>,
 ) -> Result<AirBuildOutput, AirBuildError<anvyx_lang2::CheckError>> {
-    let Some((path, manifest)) = manifest else {
+    let Some((path, _manifest)) = manifest else {
         let input = standalone_check_input_with_overrides(file, source_overrides)
             .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?
             .with_config(config);
         return anvyx_lang2::build_air_file(input);
     };
-    let native_providers = crate::manifest::load_native_providers(&path, &manifest)
-        .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
     let graph = crate::manifest::load_package_graph(&path)
         .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?;
     let input = package_check_input_with_overrides(&graph, file, source_overrides)
         .map_err(|error| AirBuildError::Fatal(anvyx_lang2::CheckError::InvalidInput(error)))?
-        .with_package_externs(native_provider_externs(&graph, &native_providers))
+        .with_package_externs(graph.package_externs())
         .with_config(config);
     anvyx_lang2::build_air_package(input)
 }
@@ -122,15 +117,14 @@ fn check_loaded_path(
     config: FrontendConfig,
     manifest: Option<(PathBuf, Manifest)>,
 ) -> Result<CheckOutput, String> {
-    let Some((path, manifest)) = manifest else {
+    let Some((path, _manifest)) = manifest else {
         let input =
             standalone_check_input_with_overrides(file, source_overrides)?.with_config(config);
         return anvyx_lang2::check_file(input).map_err(|error| error.to_string());
     };
-    let native_providers = crate::manifest::load_native_providers(&path, &manifest)?;
     let graph = crate::manifest::load_package_graph(&path)?;
     let input = package_check_input_with_overrides(&graph, file, source_overrides)?
-        .with_package_externs(native_provider_externs(&graph, &native_providers))
+        .with_package_externs(graph.package_externs())
         .with_config(config);
     anvyx_lang2::check_package(input).map_err(|error| error.to_string())
 }
@@ -148,7 +142,7 @@ pub fn standalone_check_input_with_overrides(
 
 pub fn package_check_input(graph: &PackageGraph, file: &Path) -> Result<CheckPackageInput, String> {
     CheckPackageInput::new(
-        frontend_package_id(&graph.root().id),
+        package_frontend_id(&graph.root().id),
         file.to_path_buf(),
         package_sources(graph)?,
         source_bundle()?,
@@ -164,21 +158,6 @@ pub fn package_check_input_with_overrides(
     Ok(package_check_input(graph, file)?.with_source_overrides(source_overrides))
 }
 
-fn native_provider_externs(
-    graph: &PackageGraph,
-    providers: &crate::manifest::NativeProviderLoad,
-) -> Vec<(FrontendPackageId, Vec<anvyx_runtime::ProviderDescriptor>)> {
-    let descriptors = providers
-        .providers
-        .iter()
-        .map(|provider| provider.descriptor.clone())
-        .collect::<Vec<_>>();
-    if descriptors.is_empty() {
-        return vec![];
-    }
-    vec![(frontend_package_id(&graph.root().id), descriptors)]
-}
-
 fn package_sources(graph: &PackageGraph) -> Result<Vec<PackageSource>, String> {
     graph
         .packages()
@@ -187,18 +166,18 @@ fn package_sources(graph: &PackageGraph) -> Result<Vec<PackageSource>, String> {
             let dependencies = package
                 .dependencies
                 .iter()
-                .map(|(alias, id)| (alias.clone(), frontend_package_id(id)))
+                .map(|(alias, id)| (alias.clone(), package_frontend_id(id)))
                 .collect::<HashMap<_, _>>();
             match &package.source {
                 Some(source) => PackageSource::new(
-                    frontend_package_id(&package.id),
+                    package_frontend_id(&package.id),
                     source.entry.clone(),
                     source.source_root.clone(),
                     dependencies,
                 )
                 .map_err(|error| error.to_string()),
                 None => Ok(PackageSource::native_only(
-                    frontend_package_id(&package.id),
+                    package_frontend_id(&package.id),
                     dependencies,
                 )),
             }
@@ -206,13 +185,11 @@ fn package_sources(graph: &PackageGraph) -> Result<Vec<PackageSource>, String> {
         .collect()
 }
 
-fn frontend_package_id(id: &PackageId) -> FrontendPackageId {
-    FrontendPackageId::new(id.manifest_path().display().to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{fmt::Write, fs};
+    use std::{fmt::Write, fs, path::Path};
+
+    use anvyx_lang2::{CheckPhase, CheckStatus};
 
     use super::*;
 
@@ -230,17 +207,32 @@ mod tests {
 
     impl PackageFixture {
         fn write_package(&self, package: &str, deps: &[(&str, &str)]) {
+            self.write_source_package(package, "fn main() {}\n", deps);
+        }
+
+        fn write_source_package(&self, package: &str, source: &str, deps: &[(&str, &str)]) {
             let dir = self.root.path().join(package);
             fs::create_dir_all(dir.join("src")).unwrap();
-            let mut manifest = "[project]\nentry = \"src/main.anv\"\n".to_string();
-            if !deps.is_empty() {
-                manifest.push_str("\n[dependencies]\n");
-                for (alias, path) in deps {
-                    writeln!(manifest, "{alias} = {{ path = \"{path}\" }}").unwrap();
-                }
+            fs::write(
+                dir.join("anvyx.toml"),
+                source_manifest(Some("src/main.anv"), deps),
+            )
+            .unwrap();
+            fs::write(dir.join("src/main.anv"), source).unwrap();
+        }
+
+        fn write_native_package(&self, package: &str, module: &str, source: Option<&str>) {
+            let dir = self.root.path().join(package);
+            fs::create_dir_all(dir.join("src")).unwrap();
+            fs::write(
+                dir.join("anvyx.toml"),
+                source_manifest(source.map(|_| "src/main.anv"), &[]),
+            )
+            .unwrap();
+            if let Some(source) = source {
+                fs::write(dir.join("src/main.anv"), source).unwrap();
             }
-            fs::write(dir.join("anvyx.toml"), manifest).unwrap();
-            fs::write(dir.join("src/main.anv"), "fn main() {}\n").unwrap();
+            write_provider_crate(&dir, module);
         }
 
         fn manifest(&self, package: &str) -> PathBuf {
@@ -250,6 +242,155 @@ mod tests {
         fn entry(&self, package: &str) -> PathBuf {
             self.root.path().join(package).join("src/main.anv")
         }
+    }
+
+    fn source_manifest(entry: Option<&str>, deps: &[(&str, &str)]) -> String {
+        let mut manifest = "[project]\n".to_string();
+        if let Some(entry) = entry {
+            writeln!(manifest, "entry = \"{entry}\"").unwrap();
+        }
+        if !deps.is_empty() {
+            manifest.push_str("\n[dependencies]\n");
+            for (alias, path) in deps {
+                writeln!(manifest, "{alias} = {{ path = \"{path}\" }}").unwrap();
+            }
+        }
+        manifest
+    }
+
+    fn quoted_path(path: &Path) -> String {
+        format!("\"{}\"", path.display())
+    }
+
+    fn check_succeeds(file: &Path) {
+        let output = check_path(file, FrontendConfig::default()).unwrap();
+        assert_eq!(output.status, CheckStatus::Passed, "{}", output.summary());
+    }
+
+    fn check_fails(file: &Path, phase: CheckPhase, message: &str) {
+        let output = check_path(file, FrontendConfig::default()).unwrap();
+        assert_eq!(
+            output.status,
+            CheckStatus::Failed { phase },
+            "{}",
+            output.summary()
+        );
+        let messages = output
+            .report
+            .diagnostics()
+            .iter()
+            .map(anvyx_lang2::Diagnostic::message)
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|diagnostic| diagnostic.contains(message)),
+            "expected diagnostic containing {message:?}, got {messages:?}"
+        );
+    }
+
+    fn write_provider_crate(dir: &Path, module: &str) {
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"native\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = {} }}\n",
+                quoted_path(&Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("runtime"))
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/lib.rs"),
+            format!(
+                r#"use anvyx_runtime::function;
+
+#[function]
+pub fn ping() -> i64 {{ 1 }}
+
+anvyx_runtime::builtin_module! {{
+    name: "{module}",
+    source: "",
+    exports: [ping],
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn root_source_native_package_can_import_own_provider() {
+        let fixture = PackageFixture::default();
+        fixture.write_native_package(
+            "game",
+            "host",
+            Some("import ext:host { ping }; fn main() { let x: int = ping(); }"),
+        );
+
+        check_succeeds(&fixture.entry("game"));
+    }
+
+    #[test]
+    fn native_only_dependency_imports_provider_through_pkg_module() {
+        let fixture = PackageFixture::default();
+        fixture.write_source_package(
+            "game",
+            "import pkg:host.host { ping }; fn main() { let x: int = ping(); }",
+            &[("host", "../host")],
+        );
+        fixture.write_native_package("host", "host", None);
+
+        check_succeeds(&fixture.entry("game"));
+    }
+
+    #[test]
+    fn native_only_dependency_root_import_fails() {
+        let fixture = PackageFixture::default();
+        fixture.write_source_package(
+            "game",
+            "import pkg:host; fn main() {}",
+            &[("host", "../host")],
+        );
+        fixture.write_native_package("host", "host", None);
+
+        check_fails(
+            &fixture.entry("game"),
+            CheckPhase::Resolve,
+            "has no source root",
+        );
+    }
+
+    #[test]
+    fn source_native_dependency_uses_internal_ext_and_exports_source_api() {
+        let fixture = PackageFixture::default();
+        fixture.write_source_package(
+            "game",
+            "import pkg:colors { mix }; fn main() { let x: int = mix(); }",
+            &[("colors", "../colors")],
+        );
+        fixture.write_native_package(
+            "colors",
+            "host",
+            Some("import ext:host { ping }; pub fn mix() -> int { ping() }"),
+        );
+
+        check_succeeds(&fixture.entry("game"));
+    }
+
+    #[test]
+    fn source_native_dependency_provider_is_hidden_from_consumer() {
+        let fixture = PackageFixture::default();
+        fixture.write_source_package(
+            "game",
+            "import pkg:colors.host { ping }; fn main() { let x: int = ping(); }",
+            &[("colors", "../colors")],
+        );
+        fixture.write_native_package("colors", "host", Some("pub fn mix() -> int { 1 }"));
+
+        check_fails(
+            &fixture.entry("game"),
+            CheckPhase::Type,
+            "Unknown member 'host'",
+        );
     }
 
     #[test]
