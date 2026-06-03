@@ -92,6 +92,10 @@ pub(super) enum PostfixStep<'a> {
         node: &'a CallNode,
         id: ExprId,
     },
+    Index {
+        node: &'a IndexNode,
+        id: ExprId,
+    },
 }
 
 pub(super) struct PostfixChain<'a> {
@@ -125,6 +129,7 @@ impl ReceiverUse {
             access: self.access,
             facts: self.facts.clone(),
             identity: self.identity.clone(),
+            root_local: self.identity.root_local(),
             root_name: self.root_name,
             global: self.global.clone(),
         }
@@ -154,6 +159,14 @@ pub(super) fn collect_postfix_chain(expr: &ExprNode) -> Option<PostfixChain<'_>>
     Some(PostfixChain { base, steps })
 }
 
+pub(super) fn chain_has_safe(chain: &PostfixChain<'_>) -> bool {
+    chain.steps.iter().any(|step| match step {
+        PostfixStep::Field { node, .. } => node.node.safe,
+        PostfixStep::Call { node, .. } => node.node.safe,
+        PostfixStep::Index { node, .. } => node.node.safe,
+    })
+}
+
 fn collect_steps(expr: &ExprNode) -> Option<(&ExprNode, Vec<PostfixStep<'_>>)> {
     match &expr.node.kind {
         ExprKind::Field(field) => {
@@ -168,6 +181,14 @@ fn collect_steps(expr: &ExprNode) -> Option<(&ExprNode, Vec<PostfixStep<'_>>)> {
             let (base, mut steps) = collect_steps_or_base(&call.node.func);
             steps.push(PostfixStep::Call {
                 node: call,
+                id: expr.node.id,
+            });
+            Some((base, steps))
+        }
+        ExprKind::Index(index) => {
+            let (base, mut steps) = collect_steps_or_base(&index.node.target);
+            steps.push(PostfixStep::Index {
+                node: index,
                 id: expr.node.id,
             });
             Some((base, steps))
@@ -315,6 +336,16 @@ pub(super) fn check_postfix_chain_place(
                     Subject::Value(value)
                 }
             }
+            PostfixStep::Index { node, id } => {
+                if node.node.safe {
+                    subject = safe_subject(&subject, node.node.target.node.id, node.span, tc);
+                    optional_chain = true;
+                }
+                let subject = apply_index(&subject, node, *id, optional_chain, tc);
+                let ty = chain_type(&subject, optional_chain, node.span, tc);
+                tc.set_type(*id, ty, node.span);
+                subject
+            }
         };
     }
 
@@ -395,6 +426,10 @@ fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> 
                 for arg in &node.node.args {
                     check_expr_checked(arg, tc);
                 }
+                tc.set_type(*id, Type::Infer, node.span);
+            }
+            PostfixStep::Index { node, id } => {
+                check_expr_checked(&node.node.index, tc);
                 tc.set_type(*id, Type::Infer, node.span);
             }
         }
@@ -520,6 +555,37 @@ fn apply_field(
         }
         Subject::Error => Subject::Error,
     }
+}
+
+fn apply_index(
+    subject: &Subject,
+    node: &IndexNode,
+    id: ExprId,
+    optional_chain: bool,
+    tc: &mut TypeChecker,
+) -> Subject {
+    let Subject::Value(target) = subject else {
+        let target = checked_type(subject_type(subject), tc);
+        check_index_access_inner(node, &target, tc);
+        return Subject::Error;
+    };
+
+    place::record_value_read(node.node.target.node.id, target, tc);
+    tc.closure.copy_place_identity(node.node.target.node.id, id);
+    let indexed = check_index_access_inner(node, &target.checked, tc);
+    let mut checked = checked_type(indexed.read_ty, tc);
+    checked.contains_extern_any = indexed.contains_extern_any;
+
+    let value = target.projected(
+        checked,
+        place::projected_field_access(target.access),
+        target.facts.clone(),
+        target.identity.clone().index(),
+    );
+    if !optional_chain {
+        tc.record_expr_place(id, &value);
+    }
+    Subject::Value(value)
 }
 
 fn field_access_on_non_aggregate(
@@ -1671,11 +1737,13 @@ impl CheckedCall {
         let Some(source) = self.source.filter(|_| self.returns_place) else {
             return PlaceValue::not_place(self.checked);
         };
+        let root_local = source.identity.root_local();
         PlaceValue {
             checked: self.checked,
             access: source.access,
             facts: source.facts,
             identity: source.identity.returned_place(),
+            root_local,
             root_name: source.root_name,
             global: source.global.as_ref().map(place::GlobalPlace::projected),
         }
@@ -2570,59 +2638,12 @@ impl CheckedIndex {
     }
 }
 
-pub(super) fn check_index_expr(
-    expr: &ExprNode,
-    node: &IndexNode,
-    tc: &mut TypeChecker,
-) -> CheckedType {
-    let target = check_expr_checked(&node.node.target, tc);
-    tc.closure
-        .copy_place_identity(node.node.target.node.id, expr.node.id);
-    let indexed = check_index_access(node, &target, tc);
-    let mut checked = checked_from_type(expr, indexed.read_ty, tc);
-    checked.contains_extern_any = indexed.contains_extern_any;
-    if let Some(target_value) = tc.expr_place(node.node.target.node.id) {
-        let value = target_value.projected(
-            checked.clone(),
-            place::projected_field_access(target_value.access),
-            target_value.facts.clone(),
-            target_value.identity.clone().index(),
-        );
-        tc.record_expr_place(expr.node.id, &value);
-    }
-    checked
-}
-
 pub(super) fn check_index_access(
     node: &IndexNode,
     target: &CheckedType,
     tc: &mut TypeChecker,
 ) -> CheckedIndex {
-    if node.node.safe || has_safe_postfix(&node.node.target) {
-        let inner = tc.optional_chain_inner_type(&target.ty, node.span);
-        let inner_target = CheckedType {
-            ty: inner,
-            handle: target.handle.clone(),
-            contains_extern_any: target.contains_extern_any,
-        };
-        let indexed = check_index_access_inner(node, &inner_target, tc);
-        return CheckedIndex {
-            read_ty: tc.optional_chain_result_type(indexed.read_ty, node.span),
-            write_ty: Type::Infer,
-            contains_extern_any: indexed.contains_extern_any,
-        };
-    }
-
     check_index_access_inner(node, target, tc)
-}
-
-fn has_safe_postfix(expr: &ExprNode) -> bool {
-    match &expr.node.kind {
-        ExprKind::Field(field) => field.node.safe || has_safe_postfix(&field.node.target),
-        ExprKind::Call(call) => call.node.safe || has_safe_postfix(&call.node.func),
-        ExprKind::Index(index) => index.node.safe || has_safe_postfix(&index.node.target),
-        _ => false,
-    }
 }
 
 fn check_index_access_inner(

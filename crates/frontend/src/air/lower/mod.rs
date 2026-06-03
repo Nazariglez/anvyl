@@ -4,9 +4,9 @@ use anvyx_externs::ParamFlow;
 
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
-    AirIf, AirLoop, AirLoopId, AirStmt, AirTail, CallArg, Callee, ConstData, ConstId, ConstValue,
-    CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl,
-    ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
+    AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, ConstData,
+    ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl,
+    ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
     ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
     FunctionSpecialization, Local, LocalId, LocalKind, Module, ModuleId,
@@ -245,7 +245,10 @@ impl TypeLowerer {
             Type::String => TypeData::String,
             Type::Void => TypeData::Void,
             Type::Optional { inner } => {
-                TypeData::Optional(self.lower_with_env(program, inner, env)?)
+                let inner = self.lower_with_env(program, inner, env)?;
+                let id = optional_ty(program, inner);
+                self.cache.insert(ty.clone(), id);
+                return Ok(id);
             }
             Type::Tuple(elems) => TypeData::Tuple(
                 elems
@@ -334,7 +337,7 @@ impl TypeLowerer {
                     ty: Box::new(ty.clone()),
                 });
             };
-            let id = program.alloc_type(TypeData::Optional(*inner));
+            let id = optional_ty(program, *inner);
             self.cache.insert(ty.clone(), id);
             return Ok(id);
         }
@@ -733,6 +736,18 @@ fn ensure_module(
     id
 }
 
+fn optional_ty(program: &mut Program, inner: TypeId) -> TypeId {
+    let existing = program
+        .type_arena
+        .iter()
+        .enumerate()
+        .find_map(|(index, ty)| match ty {
+            TypeData::Optional(found) if *found == inner => Some(TypeId::from_index(index)),
+            _ => None,
+        });
+    existing.unwrap_or_else(|| program.alloc_type(TypeData::Optional(inner)))
+}
+
 impl TypeLowerEnv<'_, '_> {
     fn reborrow(&mut self) -> TypeLowerEnv<'_, '_> {
         TypeLowerEnv {
@@ -772,6 +787,10 @@ impl LowerCx {
             ),
             _ => self.types.lower(&mut self.program, ty),
         }
+    }
+
+    fn optional_ty(&mut self, inner: TypeId) -> TypeId {
+        optional_ty(&mut self.program, inner)
     }
 
     fn set_entry(&mut self, root: &CallableInstanceKey) -> Result<(), LowerError> {
@@ -1282,7 +1301,7 @@ struct FunctionLowerer<'cx, 'facts> {
     function_id: FunctionId,
     source: SourceId,
     function: Function,
-    locals: HashMap<SemanticLocalId, LocalId>,
+    locals: HashMap<SemanticLocalId, Place>,
     block: AirBlock,
     terminated: bool,
     next_loop: u32,
@@ -1299,6 +1318,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         locals: HashMap<SemanticLocalId, LocalId>,
     ) -> Self {
         let function = cx.program.function(function_id).clone();
+        let locals = locals
+            .into_iter()
+            .map(|(semantic, local)| (semantic, function_local_place(&function, local)))
+            .collect();
         Self {
             cx,
             body: source.body.clone(),
@@ -1351,7 +1374,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
 
     fn lower_return_operand(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
         match self.function.signature.return_mode {
-            ReturnMode::Value(_) => self.lower_value(expr),
+            ReturnMode::Value(expected) => self.lower_value_to(expr, expected, expr),
             ReturnMode::Place(_) => self.lower_place_arg(expr, true).map(Operand::Place),
         }
     }
@@ -1400,11 +1423,267 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         Ok(())
     }
 
+    fn lower_if_let_effect(&mut self, if_let: &ast::IfLetNode) -> Result<(), LowerError> {
+        let alias = if_let.node.head == ast::PatternHead::Var;
+        let subject =
+            self.lower_optional_pattern_subject(&if_let.node.value, &if_let.node.value, alias)?;
+        match classify_optional_pattern(&if_let.node.pattern)? {
+            OptionalPattern::Some(pattern) => {
+                let mode = optional_payload_mode(pattern, alias);
+                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+                self.emit_optional_match_with_payload_ref(
+                    subject,
+                    payload,
+                    mode.payload_ref(),
+                    |this, payload| {
+                        this.lower_optional_payload_binding(pattern, payload, alias)?;
+                        this.lower_block_effect(&if_let.node.then_block)
+                    },
+                    |this| this.lower_optional_else_effect(if_let.node.else_block.as_ref()),
+                )
+            }
+            OptionalPattern::None => self.emit_optional_match(
+                subject,
+                None,
+                |this, _| this.lower_optional_else_effect(if_let.node.else_block.as_ref()),
+                |this| this.lower_block_effect(&if_let.node.then_block),
+            ),
+        }
+    }
+
+    fn lower_if_let_value(
+        &mut self,
+        expr: &ExprNode,
+        if_let: &ast::IfLetNode,
+    ) -> Result<Operand, LowerError> {
+        let Some(else_block) = &if_let.node.else_block else {
+            return Err(unsupported_expr(expr));
+        };
+        let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+        let result = self.temp(result_ty);
+        let alias = if_let.node.head == ast::PatternHead::Var;
+        let subject = self.lower_optional_pattern_subject(&if_let.node.value, expr, alias)?;
+        match classify_optional_pattern(&if_let.node.pattern)? {
+            OptionalPattern::Some(pattern) => {
+                let mode = optional_payload_mode(pattern, alias);
+                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+                self.emit_optional_match_with_payload_ref(
+                    subject,
+                    payload,
+                    mode.payload_ref(),
+                    |this, payload| {
+                        this.lower_optional_payload_binding(pattern, payload, alias)?;
+                        this.lower_if_let_result(&if_let.node.then_block, result, result_ty, expr)
+                    },
+                    |this| this.lower_if_let_result(else_block, result, result_ty, expr),
+                )?;
+            }
+            OptionalPattern::None => {
+                self.emit_optional_match(
+                    subject,
+                    None,
+                    |this, _| this.lower_if_let_result(else_block, result, result_ty, expr),
+                    |this| {
+                        this.lower_if_let_result(&if_let.node.then_block, result, result_ty, expr)
+                    },
+                )?;
+            }
+        }
+        if self.terminated {
+            return self.dummy_operand(self.function.signature.return_type());
+        }
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_let_else(&mut self, let_else: &ast::LetElse) -> Result<(), LowerError> {
+        let alias = let_else.head == ast::PatternHead::Var;
+        let subject =
+            self.lower_optional_pattern_subject(&let_else.value, &let_else.value, alias)?;
+        let pattern = classify_optional_pattern(&let_else.pattern)?;
+        let mode = match pattern {
+            OptionalPattern::Some(pattern) => optional_payload_mode(pattern, alias),
+            OptionalPattern::None => PayloadMode::None,
+        };
+        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+        let some_block = match pattern {
+            OptionalPattern::Some(pattern) => self.with_nested_block(|this| {
+                this.lower_optional_payload_binding(pattern, payload, alias)
+            })?,
+            OptionalPattern::None => self.lower_let_else_fallback(&let_else.fallback)?,
+        };
+        let none_block = match pattern {
+            OptionalPattern::Some(_) => self.lower_let_else_fallback(&let_else.fallback)?,
+            OptionalPattern::None => self.with_nested_block(|_| Ok(()))?,
+        };
+        let fallback_block = match pattern {
+            OptionalPattern::Some(_) => &none_block,
+            OptionalPattern::None => &some_block,
+        };
+        if air_block_falls_through(fallback_block) {
+            return Err(unsupported_pattern_stmt(&let_else.pattern));
+        }
+        self.push_optional_match(
+            subject,
+            payload,
+            mode.payload_ref(),
+            mode.payload_ref(),
+            some_block,
+            none_block,
+        )?;
+        Ok(())
+    }
+
+    fn lower_optional_else_effect(
+        &mut self,
+        else_block: Option<&BlockNode>,
+    ) -> Result<(), LowerError> {
+        if let Some(block) = else_block {
+            self.lower_block_effect(block)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn lower_if_let_result(
+        &mut self,
+        block: &BlockNode,
+        result: LocalId,
+        result_ty: TypeId,
+        owner: &ExprNode,
+    ) -> Result<(), LowerError> {
+        if let Some(value) = self.lower_block_branch_value(block, result_ty, owner)? {
+            self.emit_init(result, RValue::Use(value))?;
+        }
+        Ok(())
+    }
+
+    fn lower_let_else_fallback(
+        &mut self,
+        fallback: &ast::LetElseFallbackNode,
+    ) -> Result<AirBlock, LowerError> {
+        self.with_nested_block(|this| match &fallback.node {
+            ast::LetElseFallback::Block(block) => this.lower_block_effect(block),
+            ast::LetElseFallback::Return(ret) => match &ret.node.value {
+                Some(value) => {
+                    let value = this.lower_return_operand(value)?;
+                    this.terminate(AirTail::Return(Some(value)))
+                }
+                None => this.terminate(AirTail::Return(None)),
+            },
+            ast::LetElseFallback::Break => {
+                this.lower_active_loop_tail(fallback.span, AirTail::Break)
+            }
+            ast::LetElseFallback::Continue => {
+                this.lower_active_loop_tail(fallback.span, AirTail::Continue)
+            }
+        })
+    }
+
+    fn lower_active_loop_tail(
+        &mut self,
+        span: crate::span::Span,
+        tail: fn(AirLoopId) -> AirTail,
+    ) -> Result<(), LowerError> {
+        let Some(id) = self.active_loops.last().copied() else {
+            return Err(LowerError::UnsupportedStmt {
+                kind: "loop tail outside loop",
+                span: Some(self.source_span(span)),
+            });
+        };
+        self.terminate(tail(id))
+    }
+
+    fn lower_optional_payload_binding(
+        &mut self,
+        pattern: &ast::PatternNode,
+        payload: Option<LocalId>,
+        alias: bool,
+    ) -> Result<(), LowerError> {
+        if let Some(payload) = payload {
+            let payload = Operand::Place(self.local_place(payload));
+            self.lower_optional_payload_pattern(pattern, payload, alias)?;
+        }
+        Ok(())
+    }
+
+    fn lower_optional_payload_pattern(
+        &mut self,
+        pattern: &ast::PatternNode,
+        payload: Operand,
+        alias: bool,
+    ) -> Result<(), LowerError> {
+        match &pattern.node {
+            Pattern::Optional(inner) => self.lower_optional_payload_pattern(inner, payload, alias),
+            Pattern::Ident(_) if alias => self.lower_pattern_alias_binding(pattern, payload),
+            Pattern::Ident(_) => self.lower_pattern_binding(pattern, payload),
+            Pattern::Wildcard => Ok(()),
+            _ => Err(unsupported_pattern_stmt(pattern)),
+        }
+    }
+
+    fn pattern_binding_semantic(
+        &self,
+        pattern: &ast::PatternNode,
+    ) -> Result<SemanticLocalId, LowerError> {
+        let site = self.source_span(pattern.span);
+        if let Some(semantic) = self.facts.locals.binding_defs.get(&site).copied() {
+            return Ok(semantic);
+        }
+        Err(LowerError::MissingBindingDef {
+            body: Box::new(self.body.clone()),
+            span: site,
+        })
+    }
+
+    fn lower_pattern_binding(
+        &mut self,
+        pattern: &ast::PatternNode,
+        value: Operand,
+    ) -> Result<(), LowerError> {
+        let semantic = self.pattern_binding_semantic(pattern)?;
+        let def = self.local_def(semantic)?;
+        let name = def.name;
+        let mutable = def.mutable;
+        let source_ty = def.ty.clone();
+        if mutable {
+            return Err(unsupported_pattern_stmt(pattern));
+        }
+        let ty = self.cx.lower_ty(&source_ty)?;
+        let local = self.push_local(Some(name), ty, AirMutability::Immutable, LocalKind::User);
+        self.locals.insert(semantic, self.local_place(local));
+        self.emit_init(local, RValue::Use(value))
+    }
+
+    fn lower_pattern_alias_binding(
+        &mut self,
+        pattern: &ast::PatternNode,
+        value: Operand,
+    ) -> Result<(), LowerError> {
+        let name = pattern_ident(pattern)?;
+        let Operand::Place(place) = value else {
+            return Err(unsupported_pattern_stmt(pattern));
+        };
+        if place.projection.is_empty()
+            && self.function.locals[place.root.index()].kind == LocalKind::Temp
+        {
+            let local = &mut self.function.locals[place.root.index()];
+            local.name = Some(name);
+            local.mutability = AirMutability::Mutable;
+            local.kind = LocalKind::PatternBinding;
+        }
+        let semantic = self.pattern_binding_semantic(pattern)?;
+        self.locals.insert(semantic, place);
+        Ok(())
+    }
+
     fn lower_match_effect(
         &mut self,
         expr: &ExprNode,
         match_expr: &ast::MatchNode,
     ) -> Result<(), LowerError> {
+        if self.is_optional_expr(&match_expr.node.scrutinee)? {
+            return self.lower_optional_match_effect(expr, match_expr);
+        }
         let discr = self.lower_enum_match_discr(expr, &match_expr.node.scrutinee)?;
         let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
         let mut air_arms = vec![];
@@ -1443,6 +1722,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         match &stmt.node {
             Stmt::Expr(expr) => self.lower_effect(expr),
             Stmt::Binding(binding) => self.lower_binding(binding),
+            Stmt::LetElse(let_else) => self.lower_let_else(&let_else.node),
             Stmt::Return(ret) => match &ret.node.value {
                 Some(value) => {
                     let value = self.lower_return_operand(value)?;
@@ -1451,6 +1731,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 None => self.terminate(AirTail::Return(None)),
             },
             Stmt::While(while_) => self.lower_while(&while_.node),
+            Stmt::WhileLet(while_let) => self.lower_while_let(&while_let.node),
             Stmt::Break => self.lower_loop_tail(stmt, AirTail::Break),
             Stmt::Continue => self.lower_loop_tail(stmt, AirTail::Continue),
             _ => Err(LowerError::UnsupportedStmt {
@@ -1487,6 +1768,61 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             then_block,
             else_block: Some(else_block),
         }));
+        Ok(())
+    }
+
+    fn lower_while_let(&mut self, while_let: &ast::WhileLet) -> Result<(), LowerError> {
+        let id = self.alloc_loop();
+        self.active_loops.push(id);
+        let body = self.with_nested_block(|this| this.lower_while_let_body(id, while_let));
+        self.active_loops.pop();
+        let body = body?;
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::Loop(AirLoop { id, body }));
+        Ok(())
+    }
+
+    fn lower_while_let_body(
+        &mut self,
+        id: AirLoopId,
+        while_let: &ast::WhileLet,
+    ) -> Result<(), LowerError> {
+        let alias = while_let.head == ast::PatternHead::Var;
+        let subject =
+            self.lower_optional_pattern_subject(&while_let.value, &while_let.value, alias)?;
+        match classify_optional_pattern(&while_let.pattern)? {
+            OptionalPattern::Some(pattern) => {
+                let mode = optional_payload_mode(pattern, alias);
+                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+                self.emit_optional_match_with_payload_ref(
+                    subject,
+                    payload,
+                    mode.payload_ref(),
+                    |this, payload| {
+                        this.lower_optional_payload_binding(pattern, payload, alias)?;
+                        this.lower_loop_body_continue(id, &while_let.body)
+                    },
+                    |this| this.terminate(AirTail::Break(id)),
+                )
+            }
+            OptionalPattern::None => self.emit_optional_match(
+                subject,
+                None,
+                |this, _| this.terminate(AirTail::Break(id)),
+                |this| this.lower_loop_body_continue(id, &while_let.body),
+            ),
+        }
+    }
+
+    fn lower_loop_body_continue(
+        &mut self,
+        id: AirLoopId,
+        body: &BlockNode,
+    ) -> Result<(), LowerError> {
+        self.lower_block_effect(body)?;
+        if !self.terminated {
+            self.terminate(AirTail::Continue(id))?;
+        }
         Ok(())
     }
 
@@ -1540,7 +1876,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 let ty = self.cx.lower_ty(&ty)?;
                 let init = match self.lower_binding_string_init(&binding.node.value)? {
                     Some(value) => value,
-                    None => RValue::Use(self.lower_value_of_type(
+                    None => RValue::Use(self.lower_value_to(
                         &binding.node.value,
                         ty,
                         &binding.node.value,
@@ -1556,7 +1892,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     },
                     LocalKind::User,
                 );
-                self.locals.insert(semantic, local);
+                self.locals.insert(semantic, self.local_place(local));
                 self.emit_init(local, init)
             }
             Pattern::Wildcard if binding.node.mutability == AstMutability::Immutable => {
@@ -1594,22 +1930,23 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 },
             }
         };
-        let local = self.local(fact.local)?;
-        if requires_mut && self.function.locals[local.index()].mutability != AirMutability::Mutable
+        let root = self.binding_place(fact.local)?;
+        if requires_mut
+            && self.function.locals[root.root.index()].mutability != AirMutability::Mutable
         {
             return Err(unsupported_expr(expr));
         }
-        self.lower_projected_place(expr, self.local_place(local))
+        self.lower_projected_place(expr, root)
     }
 
     fn lower_mut_place_from_read_fact(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
         let root = projection_root(expr).unwrap_or(expr);
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
-            let local = self.local(fact.local)?;
-            if self.function.locals[local.index()].mutability != AirMutability::Mutable {
+            let root = self.binding_place(fact.local)?;
+            if self.function.locals[root.root.index()].mutability != AirMutability::Mutable {
                 return Err(unsupported_expr(expr));
             }
-            return self.lower_projected_place(expr, self.local_place(local));
+            return self.lower_projected_place(expr, root);
         }
         self.lower_self_mut_place_arg(expr)
             .or_else(|_| self.lower_unique_named_mut_place_arg(expr))
@@ -1671,18 +2008,44 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let Ok(fact) = self.local_use(root, LocalUseMode::Read) else {
             return self.materialize_shared_borrow_arg(expr);
         };
-        let local = self.local(fact.local)?;
-        self.lower_projected_place(expr, self.local_place(local))
+        self.lower_projected_place(expr, self.binding_place(fact.local)?)
     }
 
-    fn lower_shared_call_arg(&mut self, expr: &ExprNode) -> Result<CallArg, LowerError> {
+    fn lower_shared_call_arg(
+        &mut self,
+        expr: &ExprNode,
+        ty: TypeId,
+    ) -> Result<CallArg, LowerError> {
+        if matches!(self.cx.program.type_data(ty), TypeData::Optional(_)) {
+            let value = self.lower_value_to(expr, ty, expr)?;
+            return self
+                .materialize_shared_operand(expr, value, ty)
+                .map(CallArg::SharedBorrow);
+        }
         if matches!(expr.node.kind, ExprKind::Lit(Lit::String(_))) {
             let Operand::Const(id) = self.lower_value(expr)? else {
                 unreachable!("string literal lowers to const")
             };
             return Ok(CallArg::SharedStringConst(id));
         }
-        self.lower_place_arg(expr, false).map(CallArg::SharedBorrow)
+        let place = self.lower_place_arg(expr, false)?;
+        if place.ty == ty {
+            Ok(CallArg::SharedBorrow(place))
+        } else {
+            Err(unsupported_expr(expr))
+        }
+    }
+
+    fn materialize_shared_operand(
+        &mut self,
+        expr: &ExprNode,
+        value: Operand,
+        ty: TypeId,
+    ) -> Result<Place, LowerError> {
+        match self.emit_typed_temp(ty, RValue::Use(value))? {
+            Operand::Place(place) => Ok(place),
+            Operand::Const(_) => Err(unsupported_expr(expr)),
+        }
     }
 
     fn const_is_string(&self, id: ConstId) -> bool {
@@ -1710,6 +2073,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         match &expr.node.kind {
             ExprKind::Ident(_) => Ok(root),
             ExprKind::Field(field) => {
+                if field.node.safe {
+                    return Err(unsupported_expr(expr));
+                }
                 let place = self.lower_projected_place(&field.node.target, root)?;
                 self.project_field(expr, place, field.node.field)
             }
@@ -1834,14 +2200,14 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         };
         let callee = self.extern_callee(expr.node.id, target)?;
-        let receiver_mode = match &self.cx.program.extern_decl(callee).member {
-            ExternMember::FieldGetter { receiver, .. } => receiver.mode,
+        let receiver = match &self.cx.program.extern_decl(callee).member {
+            ExternMember::FieldGetter { receiver, .. } => receiver.param_type(),
             _ => return Err(unsupported_expr(expr)),
         };
         let args = self.lower_call_args(
             expr.node.id,
             std::iter::once(field.node.target.as_ref()),
-            std::iter::once(receiver_mode),
+            std::iter::once(receiver),
         )?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
@@ -1859,22 +2225,15 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(target_expr));
         };
         let callee = self.extern_callee(target_expr.node.id, target)?;
-        let (receiver_mode, param_modes) = match &self.cx.program.extern_decl(callee).member {
-            ExternMember::FieldSetter { receiver, .. } => (
-                receiver.mode,
-                self.cx
-                    .program
-                    .extern_decl(callee)
-                    .params
-                    .iter()
-                    .map(|param| param.mode)
-                    .collect::<Vec<_>>(),
-            ),
-            _ => return Err(unsupported_expr(target_expr)),
-        };
+        if !matches!(
+            &self.cx.program.extern_decl(callee).member,
+            ExternMember::FieldSetter { .. }
+        ) {
+            return Err(unsupported_expr(target_expr));
+        }
+        let params = self.cx.program.extern_decl(callee).call_params();
         let exprs = std::iter::once(field.node.target.as_ref()).chain(std::iter::once(value_expr));
-        let modes = std::iter::once(receiver_mode).chain(param_modes);
-        let args = self.lower_call_args(target_expr.node.id, exprs, modes)?;
+        let args = self.lower_call_args(target_expr.node.id, exprs, params.into_iter())?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
             args,
@@ -1890,14 +2249,14 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         };
         let callee = self.extern_callee(expr.node.id, target)?;
-        let receiver_mode = match &self.cx.program.extern_decl(callee).member {
-            ExternMember::UnaryOperator { receiver, .. } => receiver.mode,
+        let receiver = match &self.cx.program.extern_decl(callee).member {
+            ExternMember::UnaryOperator { receiver, .. } => receiver.param_type(),
             _ => return Err(unsupported_expr(expr)),
         };
         let args = self.lower_call_args(
             expr.node.id,
             std::iter::once(unary.node.expr.as_ref()),
-            std::iter::once(receiver_mode),
+            std::iter::once(receiver),
         )?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
@@ -1914,33 +2273,18 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         };
         let callee = self.extern_callee(expr.node.id, target)?;
-        let (receiver_mode, self_on_right, param_modes) =
-            match &self.cx.program.extern_decl(callee).member {
-                ExternMember::BinaryOperator {
-                    receiver,
-                    self_on_right,
-                    ..
-                } => (
-                    receiver.mode,
-                    *self_on_right,
-                    self.cx
-                        .program
-                        .extern_decl(callee)
-                        .params
-                        .iter()
-                        .map(|param| param.mode)
-                        .collect::<Vec<_>>(),
-                ),
-                _ => return Err(unsupported_expr(expr)),
-            };
+        let self_on_right = match &self.cx.program.extern_decl(callee).member {
+            ExternMember::BinaryOperator { self_on_right, .. } => *self_on_right,
+            _ => return Err(unsupported_expr(expr)),
+        };
         let (receiver, operand) = if self_on_right {
             (&binary.node.right, &binary.node.left)
         } else {
             (&binary.node.left, &binary.node.right)
         };
         let exprs = std::iter::once(receiver.as_ref()).chain(std::iter::once(operand.as_ref()));
-        let modes = std::iter::once(receiver_mode).chain(param_modes);
-        let args = self.lower_call_args(expr.node.id, exprs, modes)?;
+        let params = self.cx.program.extern_decl(callee).call_params();
+        let args = self.lower_call_args(expr.node.id, exprs, params.into_iter())?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
             args,
@@ -1982,6 +2326,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.lower_lit(expr, lit),
             ExprKind::Ident(_) | ExprKind::Field(_) => {
+                if let Some(value) = self.lower_safe_field_chain(expr)? {
+                    return Ok(value);
+                }
                 if !self.facts.locals.uses.contains_key(&expr.node.id)
                     && let Some(value) = self.lower_qualified_unit_enum(expr)?
                 {
@@ -1991,9 +2338,15 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 let place = self.lower_place(expr, &fact)?;
                 Ok(Operand::Place(place))
             }
-            ExprKind::Index(index) => self.lower_index_value(expr, index),
+            ExprKind::Index(index) => {
+                if let Some(value) = self.lower_safe_field_chain(expr)? {
+                    return Ok(value);
+                }
+                self.lower_index_value(expr, index)
+            }
             ExprKind::Block(block) => self.lower_block_value(expr, block),
             ExprKind::If(if_expr) => self.lower_if_value(expr, if_expr),
+            ExprKind::IfLet(if_let) => self.lower_if_let_value(expr, if_let),
             ExprKind::Match(match_expr) => self.lower_match_value(expr, match_expr),
             ExprKind::Unary(unary) => {
                 self.require_builtin_scalar(expr)?;
@@ -2016,6 +2369,12 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 let result_ty = self.lower_expr_ty(expr.node.id)?;
                 if binary.node.op == BinaryOp::Add && result_ty == Type::String {
                     return self.lower_string_concat(expr);
+                }
+                if binary.node.op == BinaryOp::Coalesce {
+                    return self.lower_coalesce(expr, binary, &result_ty);
+                }
+                if let Some(value) = self.lower_nil_equality(expr, binary)? {
+                    return Ok(value);
                 }
                 if matches!(binary.node.op, BinaryOp::Eq | BinaryOp::NotEq)
                     && let Some(value) = self.lower_dataref_eq(expr, binary, &result_ty)?
@@ -2048,7 +2407,12 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     ty,
                 })
             }
-            ExprKind::Call(call) => self.lower_call_value(expr, call),
+            ExprKind::Call(call) => {
+                if let Some(value) = self.lower_safe_field_chain(expr)? {
+                    return Ok(value);
+                }
+                self.lower_call_value(expr, call)
+            }
             ExprKind::IntrinsicCall(call) => self.lower_intrinsic_value(expr, call),
             ExprKind::StringInterp(parts) => self.lower_string_interp(parts),
             ExprKind::StructLiteral(literal) => self.lower_struct_literal(expr, literal),
@@ -2057,6 +2421,200 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::MapLiteral(literal) => self.lower_map_literal(expr, literal),
             ExprKind::InferredEnum(inferred) => self.lower_inferred_enum(expr, inferred),
             ExprKind::Cast(cast) => self.lower_cast_expr(expr, cast),
+            _ => Err(unsupported_expr(expr)),
+        }
+    }
+
+    fn lower_safe_field_chain(&mut self, expr: &ExprNode) -> Result<Option<Operand>, LowerError> {
+        let Some((base, steps)) = collect_field_chain(expr) else {
+            return Ok(None);
+        };
+        if !steps.iter().any(chain_step_is_safe) {
+            return Ok(None);
+        }
+        let mut result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+        if !matches!(self.cx.program.type_data(result_ty), TypeData::Optional(_)) {
+            result_ty = self.cx.optional_ty(result_ty);
+        }
+        let result = self.temp(result_ty);
+        if let Some((
+            ChainStep::Call {
+                expr: call_expr,
+                node,
+            },
+            rest,
+        )) = steps.split_first()
+            && !node.node.safe
+        {
+            let value = self.lower_call_value(call_expr, node)?;
+            self.lower_field_chain_steps(value, rest, result, result_ty, expr)?;
+            return Ok(Some(Operand::Place(self.local_place(result))));
+        }
+        let base = self.lower_value(base)?;
+        self.lower_field_chain_steps(base, &steps, result, result_ty, expr)?;
+        Ok(Some(Operand::Place(self.local_place(result))))
+    }
+
+    fn lower_field_chain_steps(
+        &mut self,
+        current: Operand,
+        steps: &[ChainStep<'_>],
+        result: LocalId,
+        result_ty: TypeId,
+        site: &ExprNode,
+    ) -> Result<(), LowerError> {
+        let Some((step, rest)) = steps.split_first() else {
+            return self.emit_chain_result(current, result, result_ty, site);
+        };
+
+        match step {
+            ChainStep::Field { expr, node } if node.node.safe => {
+                let subject = self.optional_subject_from_operand(current, site)?;
+                let payload = self.temp(subject.inner_ty);
+                self.emit_optional_match(
+                    subject,
+                    Some(payload),
+                    |this, payload| {
+                        let payload =
+                            Operand::Place(this.local_place(payload.expect("payload local")));
+                        if let Some((
+                            ChainStep::Call {
+                                expr: call_expr,
+                                node: call,
+                            },
+                            call_rest,
+                        )) = rest.split_first()
+                            && !call.node.safe
+                            && call.node.func.node.id == expr.node.id
+                        {
+                            let value =
+                                this.lower_method_call_with_receiver(payload, call_expr, call)?;
+                            return this.lower_field_chain_steps(
+                                value, call_rest, result, result_ty, site,
+                            );
+                        }
+                        let place = this.place_from_operand(payload, expr)?;
+                        let place = this.project_field(expr, place, node.node.field)?;
+                        this.lower_field_chain_steps(
+                            Operand::Place(place),
+                            rest,
+                            result,
+                            result_ty,
+                            site,
+                        )
+                    },
+                    |this| {
+                        let none = this.optional_none(result_ty, site)?;
+                        this.emit_init(result, RValue::Use(none))
+                    },
+                )
+            }
+            ChainStep::Index { expr, node } if node.node.safe => {
+                let subject = self.optional_subject_from_operand(current, site)?;
+                let payload = self.temp(subject.inner_ty);
+                self.emit_optional_match(
+                    subject,
+                    Some(payload),
+                    |this, payload| {
+                        let payload =
+                            Operand::Place(this.local_place(payload.expect("payload local")));
+                        let value = this.lower_index_step(payload, expr, node)?;
+                        this.lower_field_chain_steps(value, rest, result, result_ty, site)
+                    },
+                    |this| {
+                        let none = this.optional_none(result_ty, site)?;
+                        this.emit_init(result, RValue::Use(none))
+                    },
+                )
+            }
+            ChainStep::Field { expr, node } => {
+                let place = self.place_from_operand(current, expr)?;
+                let place = self.project_field(expr, place, node.node.field)?;
+                self.lower_field_chain_steps(Operand::Place(place), rest, result, result_ty, site)
+            }
+            ChainStep::Index { expr, node } => {
+                let value = self.lower_index_step(current, expr, node)?;
+                self.lower_field_chain_steps(value, rest, result, result_ty, site)
+            }
+            ChainStep::Call { expr, node } if node.node.safe => {
+                let subject = self.optional_subject_from_operand(current, site)?;
+                self.emit_optional_match(
+                    subject,
+                    None,
+                    |this, _| {
+                        let value = this.lower_call_value(expr, node)?;
+                        this.lower_field_chain_steps(value, rest, result, result_ty, site)
+                    },
+                    |this| {
+                        let none = this.optional_none(result_ty, site)?;
+                        this.emit_init(result, RValue::Use(none))
+                    },
+                )
+            }
+            ChainStep::Call { expr, node } => {
+                let value = self.lower_call_value(expr, node)?;
+                self.lower_field_chain_steps(value, rest, result, result_ty, site)
+            }
+        }
+    }
+
+    fn emit_chain_result(
+        &mut self,
+        value: Operand,
+        result: LocalId,
+        result_ty: TypeId,
+        site: &ExprNode,
+    ) -> Result<(), LowerError> {
+        let value = if self.operand_ty(&value) == result_ty {
+            value
+        } else {
+            self.optional_some(value, result_ty, site)?
+        };
+        self.emit_init(result, RValue::Use(value))
+    }
+
+    fn place_from_operand(&mut self, value: Operand, site: &ExprNode) -> Result<Place, LowerError> {
+        match value {
+            Operand::Place(place) => Ok(place),
+            Operand::Const(_) => {
+                let ty = self.operand_ty(&value);
+                match self.emit_typed_temp(ty, RValue::Use(value))? {
+                    Operand::Place(place) => Ok(place),
+                    Operand::Const(_) => Err(unsupported_expr(site)),
+                }
+            }
+        }
+    }
+
+    fn lower_index_step(
+        &mut self,
+        current: Operand,
+        expr: &ExprNode,
+        index: &ast::IndexNode,
+    ) -> Result<Operand, LowerError> {
+        let mut target = self.place_from_operand(current, expr)?;
+        match self.cx.program.type_data(target.ty) {
+            TypeData::Map { key, value, .. } => {
+                let key_ty = *key;
+                let value_ty = *value;
+                let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
+                let ty = self.cx.optional_ty(value_ty);
+                self.emit_typed_temp(
+                    ty,
+                    RValue::MapGet {
+                        map: target,
+                        key,
+                        ty,
+                    },
+                )
+            }
+            TypeData::List(elem) | TypeData::Array { elem, .. } => {
+                let elem = *elem;
+                let index = self.lower_index_local(&index.node.index)?;
+                target.projection.push(crate::air::Projection::Index(index));
+                target.ty = elem;
+                Ok(Operand::Place(target))
+            }
             _ => Err(unsupported_expr(expr)),
         }
     }
@@ -2092,6 +2650,79 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         )
         .map(Some)
         .map_err(|_| unsupported_expr(expr))
+    }
+
+    fn lower_coalesce(
+        &mut self,
+        expr: &ExprNode,
+        binary: &ast::BinaryNode,
+        result_ty: &Type,
+    ) -> Result<Operand, LowerError> {
+        let result_ty = self.cx.lower_ty(result_ty)?;
+        let subject = self.lower_optional_subject(&binary.node.left, expr)?;
+        let inner_ty = subject.inner_ty;
+        let optional_ty = subject.optional_ty;
+        self.lower_optional_value(
+            subject,
+            result_ty,
+            expr,
+            |this, payload| {
+                let payload = Operand::Place(this.local_place(payload));
+                if result_ty == optional_ty {
+                    this.optional_some(payload, result_ty, expr).map(Some)
+                } else if result_ty == inner_ty {
+                    Ok(Some(payload))
+                } else {
+                    Err(unsupported_expr(expr))
+                }
+            },
+            |this| {
+                this.lower_value_to(&binary.node.right, result_ty, expr)
+                    .map(Some)
+            },
+        )
+    }
+
+    fn lower_nil_equality(
+        &mut self,
+        expr: &ExprNode,
+        binary: &ast::BinaryNode,
+    ) -> Result<Option<Operand>, LowerError> {
+        if !matches!(binary.node.op, BinaryOp::Eq | BinaryOp::NotEq) {
+            return Ok(None);
+        }
+        let left_nil = is_nil_lit(&binary.node.left);
+        let right_nil = is_nil_lit(&binary.node.right);
+        if left_nil == right_nil {
+            return Ok(None);
+        }
+
+        let subject_expr = if left_nil {
+            &binary.node.right
+        } else {
+            &binary.node.left
+        };
+        let subject = self.lower_optional_subject(subject_expr, expr)?;
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        let result = self.temp(bool_ty);
+        let some_value = binary.node.op == BinaryOp::NotEq;
+        let none_value = binary.node.op == BinaryOp::Eq;
+        let some_const = self.bool_const(bool_ty, some_value);
+        let none_const = self.bool_const(bool_ty, none_value);
+        self.emit_optional_match(
+            subject,
+            None,
+            |this, _| this.emit_init(result, RValue::Use(some_const)),
+            |this| this.emit_init(result, RValue::Use(none_const)),
+        )?;
+        Ok(Some(Operand::Place(self.local_place(result))))
+    }
+
+    fn bool_const(&mut self, ty: TypeId, value: bool) -> Operand {
+        Operand::Const(self.cx.program.alloc_const(ConstData {
+            ty,
+            value: ConstValue::Bool(value),
+        }))
     }
 
     fn lower_cast_expr(
@@ -2163,8 +2794,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let value_ty = self.cx.lower_ty(value)?;
         let mut fields = vec![];
         for (key_expr, value_expr) in &literal.node.entries {
-            fields.push(self.lower_value_of_type(key_expr, key_ty, expr)?);
-            fields.push(self.lower_value_of_type(value_expr, value_ty, expr)?);
+            fields.push(self.lower_value_to(key_expr, key_ty, expr)?);
+            fields.push(self.lower_value_to(value_expr, value_ty, expr)?);
         }
         let ty = self.cx.lower_ty(&ty)?;
         self.emit_typed_temp(
@@ -2177,46 +2808,183 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         )
     }
 
-    fn lower_value_of_type(
+    fn lower_value_to(
         &mut self,
         expr: &ExprNode,
         expected: TypeId,
-        err: &ExprNode,
+        site: &ExprNode,
     ) -> Result<Operand, LowerError> {
-        if matches!(expr.node.kind, ExprKind::Lit(Lit::Nil))
-            && matches!(self.cx.program.type_data(expected), TypeData::Optional(_))
-        {
-            return Ok(Operand::Const(self.cx.program.alloc_const(ConstData {
-                ty: expected,
-                value: ConstValue::Nil,
-            })));
+        if matches!(expr.node.kind, ExprKind::Lit(Lit::Nil)) {
+            return self.optional_none(expected, site);
         }
+
         let value = self.lower_value(expr)?;
         if self.operand_ty(&value) == expected {
             return Ok(value);
         }
-        self.wrap_optional_value(value, expected, err)
+        self.optional_some(value, expected, site)
     }
 
-    fn wrap_optional_value(
+    fn optional_none(&mut self, ty: TypeId, site: &ExprNode) -> Result<Operand, LowerError> {
+        if !matches!(self.cx.program.type_data(ty), TypeData::Optional(_)) {
+            return Err(unsupported_expr(site));
+        }
+        Ok(Operand::Const(self.cx.program.alloc_const(ConstData {
+            ty,
+            value: ConstValue::Nil,
+        })))
+    }
+
+    fn optional_some(
         &mut self,
         value: Operand,
-        expected: TypeId,
-        err: &ExprNode,
+        ty: TypeId,
+        site: &ExprNode,
     ) -> Result<Operand, LowerError> {
-        let TypeData::Optional(inner) = self.cx.program.type_data(expected) else {
-            return Err(unsupported_expr(err));
+        let TypeData::Optional(inner) = self.cx.program.type_data(ty) else {
+            return Err(unsupported_expr(site));
         };
         if self.operand_ty(&value) != *inner {
-            return Err(unsupported_expr(err));
+            return Err(unsupported_expr(site));
         }
-        self.emit_typed_temp(
-            expected,
-            RValue::OptionalSome {
-                value,
-                ty: expected,
+        self.emit_typed_temp(ty, RValue::OptionalSome { value, ty })
+    }
+
+    fn optional_subject_from_operand(
+        &mut self,
+        operand: Operand,
+        site: &ExprNode,
+    ) -> Result<OptionalSubject, LowerError> {
+        let optional_ty = self.operand_ty(&operand);
+        let TypeData::Optional(inner_ty) = self.cx.program.type_data(optional_ty) else {
+            return Err(unsupported_expr(site));
+        };
+        let inner_ty = *inner_ty;
+        let place = self.place_from_operand(operand, site)?;
+        Ok(OptionalSubject {
+            place,
+            optional_ty,
+            inner_ty,
+        })
+    }
+
+    fn lower_optional_subject(
+        &mut self,
+        expr: &ExprNode,
+        site: &ExprNode,
+    ) -> Result<OptionalSubject, LowerError> {
+        let operand = self.lower_value(expr)?;
+        self.optional_subject_from_operand(operand, site)
+    }
+
+    fn lower_optional_pattern_subject(
+        &mut self,
+        expr: &ExprNode,
+        site: &ExprNode,
+        alias: bool,
+    ) -> Result<OptionalSubject, LowerError> {
+        if !alias {
+            return self.lower_optional_subject(expr, site);
+        }
+        let fact = self.local_use(expr, LocalUseMode::MutBorrow)?;
+        let place = self.lower_place(expr, &fact)?;
+        let optional_ty = place.ty;
+        let TypeData::Optional(inner_ty) = self.cx.program.type_data(optional_ty) else {
+            return Err(unsupported_expr(site));
+        };
+        let inner_ty = *inner_ty;
+        Ok(OptionalSubject {
+            place: place.clone(),
+            optional_ty,
+            inner_ty,
+        })
+    }
+
+    fn emit_optional_match(
+        &mut self,
+        subject: OptionalSubject,
+        payload: Option<LocalId>,
+        some: impl FnOnce(&mut Self, Option<LocalId>) -> Result<(), LowerError>,
+        none: impl FnOnce(&mut Self) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        self.emit_optional_match_with_payload_ref(subject, payload, false, some, none)
+    }
+
+    fn emit_optional_match_with_payload_ref(
+        &mut self,
+        subject: OptionalSubject,
+        payload: Option<LocalId>,
+        payload_ref: bool,
+        some: impl FnOnce(&mut Self, Option<LocalId>) -> Result<(), LowerError>,
+        none: impl FnOnce(&mut Self) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        let some_block = self.with_nested_block(|this| some(this, payload))?;
+        let none_block = self.with_nested_block(none)?;
+        let (some_falls, none_falls) =
+            self.push_optional_match(subject, payload, payload_ref, false, some_block, none_block)?;
+        if !some_falls && !none_falls {
+            self.terminated = true;
+            self.block.tail = AirTail::Unreachable;
+        }
+        Ok(())
+    }
+
+    fn push_optional_match(
+        &mut self,
+        subject: OptionalSubject,
+        payload: Option<LocalId>,
+        payload_ref: bool,
+        payload_escapes: bool,
+        some_block: AirBlock,
+        none_block: AirBlock,
+    ) -> Result<(bool, bool), LowerError> {
+        let some_falls = air_block_falls_through(&some_block);
+        let none_falls = air_block_falls_through(&none_block);
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::OptionalMatch(AirOptionalMatch {
+                discr: subject.place,
+                payload,
+                payload_ref,
+                payload_escapes,
+                some_block,
+                none_block,
+            }));
+        Ok((some_falls, none_falls))
+    }
+
+    fn lower_optional_value(
+        &mut self,
+        subject: OptionalSubject,
+        result_ty: TypeId,
+        site: &ExprNode,
+        some: impl FnOnce(&mut Self, LocalId) -> Result<Option<Operand>, LowerError>,
+        none: impl FnOnce(&mut Self) -> Result<Option<Operand>, LowerError>,
+    ) -> Result<Operand, LowerError> {
+        let result = self.temp(result_ty);
+        let payload = self.temp(subject.inner_ty);
+        self.emit_optional_match(
+            subject,
+            Some(payload),
+            |this, payload| {
+                let payload = payload.expect("payload local");
+                if let Some(value) = some(this, payload)? {
+                    this.emit_init(result, RValue::Use(value))?;
+                }
+                Ok(())
             },
-        )
+            |this| {
+                if let Some(value) = none(this)? {
+                    this.emit_init(result, RValue::Use(value))?;
+                }
+                Ok(())
+            },
+        )?;
+        if self.terminated {
+            return Err(unsupported_expr(site));
+        }
+        Ok(Operand::Place(self.local_place(result)))
     }
 
     fn lower_index_value(
@@ -2232,23 +3000,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         };
         let key_ty = *key;
         let value_ty = *value;
-        let key = self.lower_value_of_type(&index.node.index, key_ty, expr)?;
-        let ty = self.optional_type(value_ty);
+        let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
+        let ty = self.cx.optional_ty(value_ty);
         self.emit_typed_temp(ty, RValue::MapGet { map, key, ty })
-    }
-
-    fn optional_type(&mut self, inner: TypeId) -> TypeId {
-        let existing =
-            self.cx
-                .program
-                .type_arena
-                .iter()
-                .enumerate()
-                .find_map(|(index, ty)| match ty {
-                    TypeData::Optional(found) if *found == inner => Some(TypeId::from_index(index)),
-                    _ => None,
-                });
-        existing.unwrap_or_else(|| self.cx.program.alloc_type(TypeData::Optional(inner)))
     }
 
     fn lower_map_index_assign(
@@ -2271,8 +3025,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         };
         let key_ty = *key;
         let value_ty = *value;
-        let key = self.lower_value_of_type(&index.node.index, key_ty, value_expr)?;
-        let value = self.lower_value_of_type(value_expr, value_ty, value_expr)?;
+        let key = self.lower_value_to(&index.node.index, key_ty, value_expr)?;
+        let value = self.lower_value_to(value_expr, value_ty, value_expr)?;
         Ok(Some(RValue::MapInsert { map, key, value }))
     }
 
@@ -2289,7 +3043,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         };
         let elem_ty = self.cx.lower_ty(elem)?;
-        let value = self.lower_value_of_type(&fill.node.value, elem_ty, expr)?;
+        let value = self.lower_value_to(&fill.node.value, elem_ty, expr)?;
         let ty = self.cx.lower_ty(&ty)?;
         self.emit_typed_temp(
             ty,
@@ -2325,7 +3079,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             .node
             .elements
             .iter()
-            .map(|element| self.lower_value_of_type(element, elem_ty, expr))
+            .map(|element| self.lower_value_to(element, elem_ty, expr))
             .collect::<Result<Vec<_>, _>>()?;
         let ty = self.cx.lower_ty(&ty)?;
         self.emit_typed_temp(ty, RValue::Aggregate { kind, fields, ty })
@@ -2360,7 +3114,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             let Some(field_expr) = values.remove(&field.name) else {
                 return Err(unsupported_expr(expr));
             };
-            fields.push(self.lower_value_of_type(field_expr, field.ty, expr)?);
+            fields.push(self.lower_value_to(field_expr, field.ty, expr)?);
         }
         self.emit_typed_temp(
             ty_id,
@@ -2428,17 +3182,14 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             if values.contains_key(name) {
                 return Err(unsupported_expr(expr));
             }
-            values.insert(*name, self.lower_value(field_expr)?);
+            values.insert(*name, field_expr);
         }
         let mut fields = vec![];
         for (name, ty) in expected {
-            let Some(value) = values.remove(&name) else {
+            let Some(field_expr) = values.remove(&name) else {
                 return Err(unsupported_expr(expr));
             };
-            if self.operand_type(&value) != self.air_type(ty) {
-                return Err(unsupported_expr(expr));
-            }
-            fields.push(value);
+            fields.push(self.lower_value_to(field_expr, ty, expr)?);
         }
         self.emit_enum_variant(ty_id, enum_id, variant, fields)
     }
@@ -2460,9 +3211,19 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         match &inferred.node.args {
             ast::InferredEnumArgs::Unit => self.emit_enum_variant(ty_id, enum_id, variant, vec![]),
             ast::InferredEnumArgs::Tuple(args) => {
+                let VariantShape::Tuple(expected) =
+                    &self.cx.program.enum_decl(enum_id).variants[variant.index()].shape
+                else {
+                    return Err(unsupported_expr(expr));
+                };
+                if expected.len() != args.len() {
+                    return Err(unsupported_expr(expr));
+                }
+                let expected = expected.clone();
                 let fields = args
                     .iter()
-                    .map(|arg| self.lower_value(arg))
+                    .zip(expected)
+                    .map(|(arg, ty)| self.lower_value_to(arg, ty, expr))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.emit_enum_variant(ty_id, enum_id, variant, fields)
             }
@@ -2479,17 +3240,14 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     if values.contains_key(name) {
                         return Err(unsupported_expr(expr));
                     }
-                    values.insert(*name, self.lower_value(field_expr)?);
+                    values.insert(*name, field_expr);
                 }
                 let mut fields = vec![];
                 for (name, ty) in expected {
-                    let Some(value) = values.remove(&name) else {
+                    let Some(field_expr) = values.remove(&name) else {
                         return Err(unsupported_expr(expr));
                     };
-                    if self.operand_type(&value) != self.air_type(ty) {
-                        return Err(unsupported_expr(expr));
-                    }
-                    fields.push(value);
+                    fields.push(self.lower_value_to(field_expr, ty, expr)?);
                 }
                 self.emit_enum_variant(ty_id, enum_id, variant, fields)
             }
@@ -2580,11 +3338,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         };
         let result_ty = match self.lower_expr_ty(expr.node.id)? {
-            ty @ (Type::Int | Type::Float | Type::Bool | Type::String) => {
-                Some(self.cx.lower_ty(&ty)?)
-            }
             Type::Void => None,
-            _ => return Err(unsupported_expr(expr)),
+            ty => Some(self.cx.lower_ty(&ty)?),
         };
         let result = result_ty.map(|ty| self.temp(ty));
         let cond = self.lower_if_cond(&if_expr.node.cond)?;
@@ -2613,6 +3368,11 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         expr: &ExprNode,
         match_expr: &ast::MatchNode,
     ) -> Result<Operand, LowerError> {
+        if self.is_optional_expr(&match_expr.node.scrutinee)? {
+            let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+            let result = self.temp(result_ty);
+            return self.lower_optional_match_value(expr, match_expr, result, result_ty);
+        }
         let result_ty = match self.lower_expr_ty(expr.node.id)? {
             ty @ (Type::Int | Type::Float | Type::Bool | Type::String) => self.cx.lower_ty(&ty)?,
             _ => return Err(unsupported_expr(expr)),
@@ -2645,6 +3405,165 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return self.dummy_operand(result_ty);
         }
         Ok(self.operand_place(result))
+    }
+
+    fn lower_optional_match_effect(
+        &mut self,
+        expr: &ExprNode,
+        match_expr: &ast::MatchNode,
+    ) -> Result<(), LowerError> {
+        let alias = match_expr.node.head == ast::PatternHead::Var;
+        let subject =
+            self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
+        let plan = optional_match_plan(expr, &match_expr.node.arms)?;
+        let mode = optional_match_payload_mode(&plan, alias);
+        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+        let (some_block, none_block) = self.lower_optional_match_blocks(
+            &plan,
+            subject.place.clone(),
+            alias,
+            payload,
+            OptionalMatchOutput::Effect,
+        )?;
+        let (some_falls, none_falls) = self.push_optional_match(
+            subject,
+            payload,
+            mode.payload_ref(),
+            false,
+            some_block,
+            none_block,
+        )?;
+        if !some_falls && !none_falls {
+            self.terminate(AirTail::Unreachable)?;
+        }
+        Ok(())
+    }
+
+    fn lower_optional_match_value(
+        &mut self,
+        expr: &ExprNode,
+        match_expr: &ast::MatchNode,
+        result: LocalId,
+        result_ty: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let alias = match_expr.node.head == ast::PatternHead::Var;
+        let subject =
+            self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
+        let plan = optional_match_plan(expr, &match_expr.node.arms)?;
+        let mode = optional_match_payload_mode(&plan, alias);
+        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+        let (some_block, none_block) = self.lower_optional_match_blocks(
+            &plan,
+            subject.place.clone(),
+            alias,
+            payload,
+            OptionalMatchOutput::Value { result, result_ty },
+        )?;
+        let (some_falls, none_falls) = self.push_optional_match(
+            subject,
+            payload,
+            mode.payload_ref(),
+            false,
+            some_block,
+            none_block,
+        )?;
+        if !some_falls && !none_falls {
+            self.terminate(AirTail::Unreachable)?;
+            return self.dummy_operand(self.function.signature.return_type());
+        }
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_optional_match_blocks(
+        &mut self,
+        plan: &OptionalMatchPlan<'_>,
+        subject: Place,
+        alias: bool,
+        payload: Option<LocalId>,
+        output: OptionalMatchOutput,
+    ) -> Result<(AirBlock, AirBlock), LowerError> {
+        let some_block = self.with_nested_block(|this| {
+            if let Some((pattern, body)) = plan.some {
+                if optional_plan_arm_is_default(plan, pattern, body) {
+                    this.lower_optional_default_binding(
+                        pattern,
+                        Operand::Place(subject.clone()),
+                        alias,
+                    )?;
+                } else {
+                    this.lower_optional_payload_binding(pattern, payload, alias)?;
+                }
+                this.lower_optional_match_body(body, output)
+            } else if let Some((pattern, body)) = plan.default {
+                this.lower_optional_default_binding(
+                    pattern,
+                    Operand::Place(subject.clone()),
+                    alias,
+                )?;
+                this.lower_optional_match_body(body, output)
+            } else {
+                this.terminate(AirTail::Unreachable)
+            }
+        })?;
+        let none_block = self.with_nested_block(|this| {
+            if let Some(body) = plan.none {
+                this.lower_optional_match_body(body, output)
+            } else if let Some((pattern, body)) = plan.default {
+                this.lower_optional_default_binding(pattern, Operand::Place(subject), alias)?;
+                this.lower_optional_match_body(body, output)
+            } else {
+                this.terminate(AirTail::Unreachable)
+            }
+        })?;
+        Ok((some_block, none_block))
+    }
+
+    fn lower_optional_match_body(
+        &mut self,
+        body: &ExprNode,
+        output: OptionalMatchOutput,
+    ) -> Result<(), LowerError> {
+        match output {
+            OptionalMatchOutput::Effect => self.lower_effect(body),
+            OptionalMatchOutput::Value { result, result_ty } => {
+                self.lower_match_result_body(body, result, result_ty)
+            }
+        }
+    }
+
+    fn lower_match_result_body(
+        &mut self,
+        body: &ExprNode,
+        result: LocalId,
+        result_ty: TypeId,
+    ) -> Result<(), LowerError> {
+        let value = self.lower_value_to(body, result_ty, body)?;
+        if !self.terminated {
+            self.emit_init(result, RValue::Use(value))?;
+        }
+        Ok(())
+    }
+
+    fn lower_optional_default_binding(
+        &mut self,
+        pattern: &ast::PatternNode,
+        subject: Operand,
+        alias: bool,
+    ) -> Result<(), LowerError> {
+        match &pattern.node {
+            Pattern::Wildcard => Ok(()),
+            Pattern::Ident(_) if alias => self.lower_pattern_alias_binding(pattern, subject),
+            Pattern::Ident(_) => self.lower_pattern_binding(pattern, subject),
+            _ => Err(unsupported_pattern_stmt(pattern)),
+        }
+    }
+
+    fn is_optional_expr(&mut self, expr: &ExprNode) -> Result<bool, LowerError> {
+        let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+        Ok(matches!(
+            self.cx.program.type_data(ty),
+            TypeData::Optional(_)
+        ))
     }
 
     fn lower_enum_match_discr(
@@ -2713,6 +3632,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn lower_block_branch_value(
         &mut self,
         block: &BlockNode,
+        expected: TypeId,
         owner: &ExprNode,
     ) -> Result<Option<Operand>, LowerError> {
         self.lower_stmts(&block.node.stmts)?;
@@ -2722,7 +3642,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let Some(tail) = &block.node.tail else {
             return Err(unsupported_expr(owner));
         };
-        self.lower_value(tail).map(Some)
+        self.lower_value_to(tail, expected, owner).map(Some)
     }
 
     fn lower_nested_effect(&mut self, block: &BlockNode) -> Result<AirBlock, LowerError> {
@@ -2740,10 +3660,11 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         result: Option<LocalId>,
     ) -> Result<AirBlock, LowerError> {
         self.with_nested_block(|this| {
-            if let Some(value) = this.lower_block_branch_value(block, owner)? {
-                let Some(result) = result else {
-                    return Err(unsupported_expr(owner));
-                };
+            let Some(result) = result else {
+                return this.lower_block_effect(block);
+            };
+            let expected = this.function.locals[result.index()].ty;
+            if let Some(value) = this.lower_block_branch_value(block, expected, owner)? {
                 this.emit_init(result, RValue::Use(value))?;
             }
             Ok(())
@@ -2756,7 +3677,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         result: LocalId,
     ) -> Result<AirBlock, LowerError> {
         self.with_nested_block(|this| {
-            let value = this.lower_value(expr)?;
+            let value = this.lower_value_to(expr, this.function.locals[result.index()].ty, expr)?;
             if !this.terminated {
                 this.emit_init(result, RValue::Use(value))?;
             }
@@ -2932,14 +3853,22 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         &mut self,
         expr_id: ExprId,
         exprs: impl Iterator<Item = &'a ExprNode>,
-        modes: impl Iterator<Item = ParamMode>,
+        params: impl Iterator<Item = ParamType>,
     ) -> Result<Vec<CallArg>, LowerError> {
         exprs
-            .zip(modes)
-            .map(|(expr, mode)| match mode {
-                ParamMode::Value => self.lower_value(expr).map(CallArg::Value),
-                ParamMode::SharedBorrow => self.lower_shared_call_arg(expr),
-                ParamMode::MutBorrow => self.lower_place_arg(expr, true).map(CallArg::MutBorrow),
+            .zip(params)
+            .map(|(expr, param)| match param.mode {
+                ParamMode::Value => self
+                    .lower_value_to(expr, param.ty, expr)
+                    .map(CallArg::Value),
+                ParamMode::SharedBorrow => self.lower_shared_call_arg(expr, param.ty),
+                ParamMode::MutBorrow => self.lower_place_arg(expr, true).and_then(|place| {
+                    if place.ty == param.ty {
+                        Ok(CallArg::MutBorrow(place))
+                    } else {
+                        Err(unsupported_expr(expr))
+                    }
+                }),
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| match err {
@@ -2961,6 +3890,92 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         }
         self.emit_temp(value)
+    }
+
+    fn lower_method_call_with_receiver(
+        &mut self,
+        receiver: Operand,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<Operand, LowerError> {
+        let target = self
+            .facts
+            .calls
+            .get(&expr.node.id)
+            .ok_or_else(|| unsupported_expr(expr))?;
+        if target.form != CallForm::Normal
+            || !matches!(
+                target.id.kind,
+                CallableKind::InstanceMethod | CallableKind::ExtendMethod(MethodSurface::Instance)
+            )
+        {
+            return Err(unsupported_expr(expr));
+        }
+        let body = BodyInstanceKey::Callable(CallableInstanceKey {
+            target: target.id.clone(),
+            args: target.args.clone(),
+        });
+        let Some(callee) = self.cx.maps.bodies.get(&body).copied() else {
+            return Err(LowerError::MissingLoweredCallee {
+                body: Box::new(body),
+            });
+        };
+        let params = self
+            .cx
+            .program
+            .function(callee)
+            .signature
+            .params
+            .iter()
+            .map(|param| ParamType {
+                ty: param.ty,
+                mode: param.mode,
+            })
+            .collect::<Vec<_>>();
+        let Some(receiver_param) = params.first().copied() else {
+            return Err(unsupported_expr(expr));
+        };
+        let mut args = vec![self.lower_operand_call_arg(receiver, receiver_param, expr)?];
+        args.extend(self.lower_call_args(
+            expr.node.id,
+            call.node.args.iter(),
+            params.iter().copied().skip(1).take(call.node.args.len()),
+        )?);
+        let defaults = self.lower_default_args(
+            expr.node.id,
+            args.len(),
+            params.len(),
+            params.iter().copied().skip(args.len()),
+        )?;
+        args.extend(defaults);
+        self.require_call_arity(expr.node.id, &Callee::Function(callee), args.len())?;
+        let value = RValue::Call {
+            callee: Callee::Function(callee),
+            args,
+        };
+        if self.lower_expr_ty(expr.node.id)? == Type::Void {
+            return Err(unsupported_expr(expr));
+        }
+        self.emit_temp(value)
+    }
+
+    fn lower_operand_call_arg(
+        &mut self,
+        value: Operand,
+        param: ParamType,
+        site: &ExprNode,
+    ) -> Result<CallArg, LowerError> {
+        match param.mode {
+            ParamMode::Value => {
+                let value = if self.operand_ty(&value) == param.ty {
+                    value
+                } else {
+                    self.optional_some(value, param.ty, site)?
+                };
+                Ok(CallArg::Value(value))
+            }
+            ParamMode::SharedBorrow | ParamMode::MutBorrow => Err(unsupported_expr(site)),
+        }
     }
 
     fn lower_call_rvalue(
@@ -3013,15 +4028,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             if let TypeData::Optional(inner) = self.cx.program.type_data(ty_id) {
                 return match (target.id.name.as_str(), call.node.args.as_slice()) {
                     ("Some", [value]) => {
-                        let value = self.lower_value_of_type(value, *inner, expr)?;
-                        Ok(RValue::OptionalSome { value, ty: ty_id })
+                        let value = self.lower_value_to(value, *inner, expr)?;
+                        Ok(RValue::Use(self.optional_some(value, ty_id, expr)?))
                     }
-                    ("None", []) => Ok(RValue::Use(Operand::Const(self.cx.program.alloc_const(
-                        ConstData {
-                            ty: ty_id,
-                            value: ConstValue::Nil,
-                        },
-                    )))),
+                    ("None", []) => Ok(RValue::Use(self.optional_none(ty_id, expr)?)),
                     _ => Err(unsupported_expr(expr)),
                 };
             }
@@ -3035,11 +4045,21 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             if self.cx.program.enum_decl(enum_id).name != key.name {
                 return Err(unsupported_expr(expr));
             }
+            let VariantShape::Tuple(expected) =
+                &self.cx.program.enum_decl(enum_id).variants[variant.index()].shape
+            else {
+                return Err(unsupported_expr(expr));
+            };
+            if expected.len() != call.node.args.len() {
+                return Err(unsupported_expr(expr));
+            }
+            let expected = expected.clone();
             let fields = call
                 .node
                 .args
                 .iter()
-                .map(|arg| self.lower_value(arg))
+                .zip(expected)
+                .map(|(arg, ty)| self.lower_value_to(arg, ty, expr))
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(RValue::Aggregate {
                 kind: AggregateCtor::EnumVariant { enum_id, variant },
@@ -3087,25 +4107,28 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         if provided > expected {
             self.require_call_arity(expr.node.id, &Callee::Function(callee), provided)?;
         }
-        let modes = self
+        let params = self
             .cx
             .program
             .function(callee)
             .signature
             .params
             .iter()
-            .map(|param| param.mode)
+            .map(|param| ParamType {
+                ty: param.ty,
+                mode: param.mode,
+            })
             .collect::<Vec<_>>();
         let mut args = self.lower_call_args(
             expr.node.id,
             arg_exprs.into_iter(),
-            modes.iter().copied().take(provided),
+            params.iter().copied().take(provided),
         )?;
         let defaults = self.lower_default_args(
             expr.node.id,
             provided,
             expected,
-            modes.iter().copied().skip(provided),
+            params.iter().copied().skip(provided),
         )?;
         args.extend(defaults);
         self.require_call_arity(expr.node.id, &Callee::Function(callee), args.len())?;
@@ -3131,7 +4154,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Ok(None);
         };
         self.require_mutable_place(expr, &list)?;
-        let value = self.lower_value_of_type(&call.node.args[0], *elem, expr)?;
+        let value = self.lower_value_to(&call.node.args[0], *elem, expr)?;
         Ok(Some(RValue::ListPush { list, value }))
     }
 
@@ -3153,8 +4176,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         self.require_mutable_place(expr, &map)?;
         let key_ty = *key;
         let value_ty = *value;
-        let key = self.lower_value_of_type(&call.node.args[0], key_ty, expr)?;
-        let value = self.lower_value_of_type(&call.node.args[1], value_ty, expr)?;
+        let key = self.lower_value_to(&call.node.args[0], key_ty, expr)?;
+        let value = self.lower_value_to(&call.node.args[1], value_ty, expr)?;
         Ok(Some(RValue::MapInsert { map, key, value }))
     }
 
@@ -3176,8 +4199,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         self.require_mutable_place(expr, &map)?;
         let key_ty = *key;
         let value_ty = *value;
-        let key = self.lower_value_of_type(&call.node.args[0], key_ty, expr)?;
-        let ty = self.optional_type(value_ty);
+        let key = self.lower_value_to(&call.node.args[0], key_ty, expr)?;
+        let ty = self.cx.optional_ty(value_ty);
         Ok(Some(RValue::MapRemove { map, key, ty }))
     }
 
@@ -3230,7 +4253,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         };
         let decl = self.cx.program.extern_decl(callee);
         let mut arg_exprs = vec![];
-        let mut modes = vec![];
+        let mut params = vec![];
         match &decl.member {
             ExternMember::FreeFunction
             | ExternMember::StaticMethod { .. }
@@ -3240,7 +4263,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     return Err(unsupported_expr(&call.node.func));
                 };
                 arg_exprs.push(field.node.target.as_ref());
-                modes.push(receiver.mode);
+                params.push(receiver.param_type());
             }
             ExternMember::FieldGetter { .. }
             | ExternMember::FieldSetter { .. }
@@ -3253,14 +4276,14 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             }
         }
         arg_exprs.extend(call.node.args.iter());
-        modes.extend(decl.params.iter().map(|param| param.mode));
-        if arg_exprs.len() != modes.len() {
+        params.extend(decl.params.iter().map(ExternParamDecl::param_type));
+        if arg_exprs.len() != params.len() {
             return Err(LowerError::UnsupportedExpr {
                 expr_id: expr.node.id,
                 kind: "Call",
             });
         }
-        let args = self.lower_call_args(expr.node.id, arg_exprs.into_iter(), modes.into_iter())?;
+        let args = self.lower_call_args(expr.node.id, arg_exprs.into_iter(), params.into_iter())?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
             args,
@@ -3293,7 +4316,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         call: ExprId,
         provided: usize,
         expected: usize,
-        modes: impl Iterator<Item = ParamMode>,
+        params: impl Iterator<Item = ParamType>,
     ) -> Result<Vec<CallArg>, LowerError> {
         if provided >= expected {
             return Ok(vec![]);
@@ -3315,15 +4338,15 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         defaults.sort_by_key(|fact| fact.param_index);
         defaults
             .iter()
-            .zip(modes)
-            .map(|(fact, mode)| self.lower_default_arg(fact, mode))
+            .zip(params)
+            .map(|(fact, param)| self.lower_default_arg(fact, param))
             .collect()
     }
 
     fn lower_default_arg(
         &mut self,
         fact: &DefaultArgFact,
-        mode: ParamMode,
+        param: ParamType,
     ) -> Result<CallArg, LowerError> {
         let error = || LowerError::UnsupportedDefaultArg {
             call: fact.call,
@@ -3340,21 +4363,46 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let ExprKind::Lit(lit) = &expr.node.kind else {
             return Err(error());
         };
-        let Some(value) = Self::literal_const_value(lit, &fact.ty) else {
-            return Err(error());
+        let operand = if matches!(lit, Lit::Nil) {
+            self.optional_none(param.ty, expr)?
+        } else {
+            let ty = match self.cx.program.type_data(param.ty) {
+                TypeData::Optional(inner) => *inner,
+                _ => param.ty,
+            };
+            let Some(value) = Self::literal_air_const_value(lit, self.cx.program.type_data(ty))
+            else {
+                return Err(error());
+            };
+            Operand::Const(self.cx.program.alloc_const(ConstData { ty, value }))
         };
-        let ty = self.cx.lower_ty(&fact.ty)?;
-        let operand = Operand::Const(self.cx.program.alloc_const(ConstData { ty, value }));
-        match mode {
-            ParamMode::Value => Ok(CallArg::Value(operand)),
+        match param.mode {
+            ParamMode::Value if self.operand_ty(&operand) == param.ty => {
+                Ok(CallArg::Value(operand))
+            }
+            ParamMode::Value => self
+                .optional_some(operand, param.ty, expr)
+                .map(CallArg::Value),
+            ParamMode::SharedBorrow
+                if matches!(self.cx.program.type_data(param.ty), TypeData::Optional(_)) =>
+            {
+                let operand = if self.operand_ty(&operand) == param.ty {
+                    operand
+                } else {
+                    self.optional_some(operand, param.ty, expr)?
+                };
+                self.materialize_shared_operand(expr, operand, param.ty)
+                    .map(CallArg::SharedBorrow)
+                    .map_err(|_| error())
+            }
             ParamMode::SharedBorrow => match operand {
                 Operand::Const(id) if self.const_is_string(id) => {
                     Ok(CallArg::SharedStringConst(id))
                 }
-                operand => match self.emit_typed_temp(ty, RValue::Use(operand))? {
-                    Operand::Place(place) => Ok(CallArg::SharedBorrow(place)),
-                    Operand::Const(_) => Err(error()),
-                },
+                operand => self
+                    .materialize_shared_operand(expr, operand, param.ty)
+                    .map(CallArg::SharedBorrow)
+                    .map_err(|_| error()),
             },
             ParamMode::MutBorrow => Err(error()),
         }
@@ -3363,10 +4411,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn lower_lit(&mut self, expr: &ExprNode, lit: &Lit) -> Result<Operand, LowerError> {
         let ty = self.lower_expr_ty(expr.node.id)?;
         let ty_id = self.cx.lower_ty(&ty)?;
-        let value = match (lit, self.cx.program.type_data(ty_id)) {
-            (Lit::Nil, TypeData::Optional(_)) => ConstValue::Nil,
-            _ => Self::literal_const_value(lit, &ty).ok_or_else(|| unsupported_expr(expr))?,
-        };
+        if matches!(lit, Lit::Nil) {
+            return self.optional_none(ty_id, expr);
+        }
+        let value = Self::literal_const_value(lit, &ty).ok_or_else(|| unsupported_expr(expr))?;
         Ok(Operand::Const(
             self.cx.program.alloc_const(ConstData { ty: ty_id, value }),
         ))
@@ -3380,7 +4428,18 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             (Lit::String(value), Type::String) => {
                 Some(ConstValue::String(value.clone().into_boxed_str()))
             }
-            (Lit::Nil, Type::Optional { .. }) => Some(ConstValue::Nil),
+            _ => None,
+        }
+    }
+
+    fn literal_air_const_value(lit: &Lit, ty: &TypeData) -> Option<ConstValue> {
+        match (lit, ty) {
+            (Lit::Int(value), TypeData::Int) => Some(ConstValue::Int(*value)),
+            (Lit::Float(value), TypeData::Float) => Some(ConstValue::Float(*value)),
+            (Lit::Bool(value), TypeData::Bool) => Some(ConstValue::Bool(*value)),
+            (Lit::String(value), TypeData::String) => {
+                Some(ConstValue::String(value.clone().into_boxed_str()))
+            }
             _ => None,
         }
     }
@@ -3390,6 +4449,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::Assign(assign) => self.lower_assign(expr, assign),
             ExprKind::Block(block) => self.lower_block_effect(block),
             ExprKind::If(if_expr) => self.lower_if_effect(if_expr),
+            ExprKind::IfLet(if_let) => self.lower_if_let_effect(if_let),
             ExprKind::Match(match_expr) => self.lower_match_effect(expr, match_expr),
             ExprKind::Call(call) => {
                 let value = self.lower_call_rvalue(expr, call)?;
@@ -3429,8 +4489,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 }
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
                 let dst = self.lower_place(&assign.node.target, &fact)?;
-                let value =
-                    self.lower_value_of_type(&assign.node.value, dst.ty, &assign.node.value)?;
+                let value = self.lower_value_to(&assign.node.value, dst.ty, &assign.node.value)?;
                 self.emit_assign(dst, RValue::Use(value))
             }
             op => {
@@ -3441,12 +4500,13 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 if binary == BinaryOp::Add && result_ty == Type::String {
                     let lhs = Operand::Place(dst.clone());
                     let rhs = self.lower_string_part(&assign.node.value)?;
-                    return self.emit_assign(
+                    self.emit_assign(
                         dst,
                         RValue::StringConcat {
                             parts: vec![lhs, rhs],
                         },
-                    );
+                    )?;
+                    return Ok(());
                 }
                 self.require_builtin_scalar(expr)?;
                 let lhs = Operand::Place(dst.clone());
@@ -3473,8 +4533,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn lower_place(&mut self, expr: &ExprNode, fact: &LocalUseFact) -> Result<Place, LowerError> {
-        let local = self.local(fact.local)?;
-        self.lower_projected_place(expr, self.local_place(local))
+        self.lower_projected_place(expr, self.binding_place(fact.local)?)
     }
 
     fn require_builtin_scalar(&self, expr: &ExprNode) -> Result<(), LowerError> {
@@ -3551,10 +4610,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             })
     }
 
-    fn local(&self, local: SemanticLocalId) -> Result<LocalId, LowerError> {
+    fn binding_place(&self, local: SemanticLocalId) -> Result<Place, LowerError> {
         self.locals
             .get(&local)
-            .copied()
+            .cloned()
             .ok_or_else(|| LowerError::MissingLocalDef {
                 body: Box::new(self.body.clone()),
                 local,
@@ -3583,11 +4642,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn local_place(&self, local: LocalId) -> Place {
-        Place {
-            root: local,
-            projection: vec![],
-            ty: self.function.locals[local.index()].ty,
-        }
+        function_local_place(&self.function, local)
     }
 
     fn operand_place(&self, local: LocalId) -> Operand {
@@ -3792,11 +4847,136 @@ fn origin_key(origin: Option<&ast::ModuleOrigin>) -> String {
     }
 }
 
+fn optional_match_payload_mode(plan: &OptionalMatchPlan<'_>, alias: bool) -> PayloadMode {
+    match plan.some {
+        Some((pattern, body)) if !optional_plan_arm_is_default(plan, pattern, body) => {
+            optional_payload_mode(pattern, alias)
+        }
+        _ => PayloadMode::None,
+    }
+}
+
+fn optional_payload_mode(pattern: &ast::PatternNode, alias: bool) -> PayloadMode {
+    match &pattern.node {
+        Pattern::Wildcard => PayloadMode::None,
+        Pattern::Optional(inner) => optional_payload_mode(inner, alias),
+        Pattern::Ident(_) if alias => PayloadMode::Alias,
+        _ => PayloadMode::Copy,
+    }
+}
+
+fn classify_optional_pattern(
+    pattern: &ast::PatternNode,
+) -> Result<OptionalPattern<'_>, LowerError> {
+    match &pattern.node {
+        Pattern::Optional(inner) => Ok(OptionalPattern::Some(inner)),
+        Pattern::InferredEnumTuple { variant, fields }
+        | Pattern::EnumTuple {
+            variant, fields, ..
+        } if *variant == Ident::new("Some") && fields.len() == 1 => {
+            Ok(OptionalPattern::Some(&fields[0]))
+        }
+        Pattern::Nil => Ok(OptionalPattern::None),
+        Pattern::InferredEnumUnit { variant } | Pattern::EnumUnit { variant, .. }
+            if *variant == Ident::new("None") =>
+        {
+            Ok(OptionalPattern::None)
+        }
+        _ => Err(unsupported_pattern_stmt(pattern)),
+    }
+}
+
+fn optional_match_plan<'a>(
+    owner: &ExprNode,
+    arms: &'a [ast::MatchArmNode],
+) -> Result<OptionalMatchPlan<'a>, LowerError> {
+    let mut plan = OptionalMatchPlan {
+        some: None,
+        none: None,
+        default: None,
+    };
+    for arm in arms {
+        if plan.default.is_some() {
+            continue;
+        }
+        let ast::MatchArmHead::Pattern(pattern) = &arm.node.head else {
+            return Err(unsupported_expr(owner));
+        };
+        match optional_arm(pattern, &arm.node.body)? {
+            OptionalArm::Some(pattern, body) => {
+                if plan.some.replace((pattern, body)).is_some() {
+                    return Err(unsupported_expr(owner));
+                }
+            }
+            OptionalArm::None(body) => {
+                if plan.none.replace(body).is_some() {
+                    return Err(unsupported_expr(owner));
+                }
+            }
+            OptionalArm::Default(pattern, body) => {
+                if plan.some.is_none() {
+                    plan.some = Some((pattern, body));
+                }
+                if plan.none.is_none() {
+                    plan.none = Some(body);
+                }
+                plan.default = Some((pattern, body));
+            }
+        }
+    }
+    if plan.default.is_none() && (plan.some.is_none() || plan.none.is_none()) {
+        return Err(unsupported_expr(owner));
+    }
+    Ok(plan)
+}
+
+fn optional_arm<'a>(
+    pattern: &'a ast::PatternNode,
+    body: &'a ExprNode,
+) -> Result<OptionalArm<'a>, LowerError> {
+    match &pattern.node {
+        Pattern::Wildcard | Pattern::Ident(_) => Ok(OptionalArm::Default(pattern, body)),
+        _ => match classify_optional_pattern(pattern)? {
+            OptionalPattern::Some(pattern) => Ok(OptionalArm::Some(pattern, body)),
+            OptionalPattern::None => Ok(OptionalArm::None(body)),
+        },
+    }
+}
+
+fn optional_plan_arm_is_default(
+    plan: &OptionalMatchPlan<'_>,
+    pattern: &ast::PatternNode,
+    body: &ExprNode,
+) -> bool {
+    plan.default.is_some_and(|(default_pattern, default_body)| {
+        std::ptr::eq(default_pattern, pattern) && std::ptr::eq(default_body, body)
+    })
+}
+
+fn pattern_ident(pattern: &ast::PatternNode) -> Result<Ident, LowerError> {
+    match &pattern.node {
+        Pattern::Ident(name) => Ok(*name),
+        Pattern::Optional(inner) => pattern_ident(inner),
+        _ => Err(unsupported_pattern_stmt(pattern)),
+    }
+}
+
 fn unsupported_expr(expr: &ExprNode) -> LowerError {
     LowerError::UnsupportedExpr {
         expr_id: expr.node.id,
         kind: expr.node.kind.variant_name(),
     }
+}
+
+fn unsupported_pattern_stmt(pattern: &ast::PatternNode) -> LowerError {
+    LowerError::UnsupportedStmt {
+        kind: pattern.node.variant_name(),
+        span: None,
+    }
+}
+
+fn is_nil_lit(expr: &ExprNode) -> bool {
+    matches!(expr.node.kind, ExprKind::Lit(Lit::Nil))
 }
 
 fn stmt_kind(stmt: &Stmt) -> &'static str {
@@ -4005,6 +5185,38 @@ pub(crate) fn lower_with_modules(
     verify(&cx.program).map_err(|errors| LowerError::Verify(errors.into_boxed_slice()))?;
     reject_any_types(&cx.program)?;
     Ok(cx.program)
+}
+
+fn collect_field_chain(expr: &ExprNode) -> Option<(&ExprNode, Vec<ChainStep<'_>>)> {
+    match &expr.node.kind {
+        ExprKind::Field(field) => {
+            let (base, mut steps) = collect_field_chain(&field.node.target)
+                .unwrap_or_else(|| (field.node.target.as_ref(), vec![]));
+            steps.push(ChainStep::Field { expr, node: field });
+            Some((base, steps))
+        }
+        ExprKind::Index(index) => {
+            let (base, mut steps) = collect_field_chain(&index.node.target)
+                .unwrap_or_else(|| (index.node.target.as_ref(), vec![]));
+            steps.push(ChainStep::Index { expr, node: index });
+            Some((base, steps))
+        }
+        ExprKind::Call(call) => {
+            let (base, mut steps) = collect_field_chain(&call.node.func)
+                .unwrap_or_else(|| (call.node.func.as_ref(), vec![]));
+            steps.push(ChainStep::Call { expr, node: call });
+            Some((base, steps))
+        }
+        _ => None,
+    }
+}
+
+fn chain_step_is_safe(step: &ChainStep<'_>) -> bool {
+    match step {
+        ChainStep::Field { node, .. } => node.node.safe,
+        ChainStep::Index { node, .. } => node.node.safe,
+        ChainStep::Call { node, .. } => node.node.safe,
+    }
 }
 
 fn projection_root(expr: &ExprNode) -> Option<&ExprNode> {
@@ -4228,6 +5440,76 @@ struct ReachableCallable<'a> {
 enum ReachableBodyFacts<'a> {
     Facts(&'a SemanticBodyFacts),
     Empty(Box<SemanticBodyFacts>),
+}
+
+struct OptionalSubject {
+    place: Place,
+    optional_ty: TypeId,
+    inner_ty: TypeId,
+}
+
+enum ChainStep<'a> {
+    Field {
+        expr: &'a ExprNode,
+        node: &'a ast::FieldAccessNode,
+    },
+    Index {
+        expr: &'a ExprNode,
+        node: &'a ast::IndexNode,
+    },
+    Call {
+        expr: &'a ExprNode,
+        node: &'a ast::CallNode,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum OptionalPattern<'a> {
+    Some(&'a ast::PatternNode),
+    None,
+}
+
+enum OptionalArm<'a> {
+    Some(&'a ast::PatternNode, &'a ExprNode),
+    None(&'a ExprNode),
+    Default(&'a ast::PatternNode, &'a ExprNode),
+}
+
+struct OptionalMatchPlan<'a> {
+    some: Option<(&'a ast::PatternNode, &'a ExprNode)>,
+    none: Option<&'a ExprNode>,
+    default: Option<(&'a ast::PatternNode, &'a ExprNode)>,
+}
+
+#[derive(Clone, Copy)]
+enum OptionalMatchOutput {
+    Effect,
+    Value { result: LocalId, result_ty: TypeId },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PayloadMode {
+    None,
+    Copy,
+    Alias,
+}
+
+impl PayloadMode {
+    fn needs_payload(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn payload_ref(self) -> bool {
+        matches!(self, Self::Alias)
+    }
+}
+
+fn function_local_place(function: &Function, local: LocalId) -> Place {
+    Place {
+        root: local,
+        projection: vec![],
+        ty: function.locals[local.index()].ty,
+    }
 }
 
 impl ReachableBodyFacts<'_> {
@@ -5121,6 +6403,63 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn optional_air_type_allocation_is_canonical() {
+        let mut cx = LowerCx::default();
+        let int_ty = cx.program.alloc_type(TypeData::Int);
+
+        let first = cx.optional_ty(int_ty);
+        let second = cx.optional_ty(int_ty);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            cx.program
+                .type_arena
+                .iter()
+                .filter(|ty| matches!(ty, TypeData::Optional(inner) if *inner == int_ty))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nil_constants_are_typed_as_optional() {
+        let air = lower_full_core_entry("fn main() { let x: int? = nil; }", "main", &[])
+            .expect("lower failed");
+
+        assert!(air.const_arena.iter().any(|data| {
+            matches!(data.value, ConstValue::Nil)
+                && matches!(air.type_data(data.ty), TypeData::Optional(_))
+        }));
+    }
+
+    #[test]
+    fn option_some_wraps_exact_inner_type() {
+        let air = lower_full_core_entry(
+            "fn main() { let x: Option<int> = Option.Some(1); }",
+            "main",
+            &[],
+        )
+        .expect("lower failed");
+
+        let mut found = false;
+        for statement in program_statements(&air) {
+            let AirStmt::Init {
+                value: RValue::OptionalSome { value, ty },
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let TypeData::Optional(inner) = air.type_data(ty) else {
+                panic!("OptionalSome result must be optional");
+            };
+            assert_eq!(test_operand_ty(&air, &value), *inner);
+            found = true;
+        }
+        assert!(found);
     }
 
     #[test]
@@ -6997,6 +8336,13 @@ fn main() {}
             .flat_map(|function| function_statements(function).collect::<Vec<_>>())
     }
 
+    fn test_operand_ty(program: &Program, operand: &Operand) -> TypeId {
+        match operand {
+            Operand::Place(place) => place.ty,
+            Operand::Const(id) => program.const_data(*id).ty,
+        }
+    }
+
     fn function_statements(function: &Function) -> impl Iterator<Item = AirStmt> + '_ {
         let mut statements = vec![];
         collect_block_statements(&function.body.block, &mut statements);
@@ -7030,6 +8376,10 @@ fn main() {}
                     }
                 }
                 AirStmt::Loop(loop_) => collect_block_statements(&loop_.body, statements),
+                AirStmt::OptionalMatch(match_) => {
+                    collect_block_statements(&match_.some_block, statements);
+                    collect_block_statements(&match_.none_block, statements);
+                }
             }
         }
     }

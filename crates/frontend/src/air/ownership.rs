@@ -368,6 +368,16 @@ impl ParamUseAnalyzer<'_> {
                     self.observe_air_block(block);
                 }
             }
+            AirStmt::OptionalMatch(match_) => {
+                let use_ = if match_.payload_ref {
+                    ParamUse::ReborrowMut
+                } else {
+                    ParamUse::ReadOnly
+                };
+                self.observe_place(&match_.discr, use_);
+                self.observe_air_block(&match_.some_block);
+                self.observe_air_block(&match_.none_block);
+            }
         }
     }
 
@@ -839,6 +849,23 @@ fn rewrite_air_block_call_args(
                     );
                 }
                 block.stmts.push(AirStmt::EnumMatch(match_));
+            }
+            AirStmt::OptionalMatch(mut match_) => {
+                rewrite_air_block_call_args(
+                    &mut match_.some_block,
+                    modes,
+                    function_type_modes,
+                    const_types,
+                    locals,
+                );
+                rewrite_air_block_call_args(
+                    &mut match_.none_block,
+                    modes,
+                    function_type_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::OptionalMatch(match_));
             }
         }
     }

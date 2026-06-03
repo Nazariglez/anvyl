@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let x: int? = 1;
+    let y: int? = nil;
+
+    let a: bool = x == nil;
+    let b: bool = x != nil;
+    let c: bool = nil == y;
+    let d: bool = nil != y;
+}

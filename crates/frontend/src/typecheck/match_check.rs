@@ -1,6 +1,6 @@
 use super::{
-    ActiveMutDowncastRoot, PatternBindMode, PatternContext, PlaceAccess, TypeChecker, TypeError,
-    downcast,
+    ActiveMutAliasRoot, MUT_DOWNCAST_ROOT_MESSAGE, PatternBindMode, PatternContext, PlaceAccess,
+    TypeChecker, TypeError, downcast,
     pattern::{self, PatternOutcome, PatternPlace},
 };
 use crate::{
@@ -125,7 +125,7 @@ pub(super) fn with_dynamic_arm<R>(
     };
     let body = check_body(tc);
     if locked {
-        tc.active_mut_downcast_roots.pop();
+        tc.active_mut_alias_roots.pop();
     }
     tc.pop_scope();
     body
@@ -157,9 +157,11 @@ fn define_downcast_binding(
         return false;
     };
     tc.define_downcast_alias_from_handle(name, &handle, alias.target(PlaceAccess::Mutable));
-    tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
+    tc.active_mut_alias_roots.push(ActiveMutAliasRoot {
         identity: alias.identity.clone(),
         allowed: name,
+        scope_depth: tc.scopes.len(),
+        message: MUT_DOWNCAST_ROOT_MESSAGE,
     });
     true
 }
@@ -179,6 +181,7 @@ fn define_fallback_binding(
             &source.handle,
             alias.target(alias.access),
             PatternContext::Match,
+            None,
         );
     } else {
         tc.define_pattern_binding_from_handle(name, &source.handle, false, None);

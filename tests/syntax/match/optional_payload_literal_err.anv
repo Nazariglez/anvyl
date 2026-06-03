@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: optional payload patterns only support identifiers and wildcards
+
+fn main() {
+    let value: int? = 1;
+    match value {
+        Option.Some(1) => 1,
+        _ => 0,
+    };
+}

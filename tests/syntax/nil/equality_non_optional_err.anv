@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched types
+
+fn main() {
+    let x = 1 == nil;
+}

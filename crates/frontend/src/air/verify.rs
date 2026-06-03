@@ -8,8 +8,8 @@ use super::{
     AggregateKind, ConstValue, EnumRepr, ExternMember, Function, LocalKind, Mutability, ParamMode,
     ParamRole, ParamType, Program, RawEnumValue, ReturnMode, TypeData, VariantShape,
     body::{
-        AggregateCtor, AirBlock, AirEnumMatch, AirIf, AirStmt, AirTail, CallArg, Callee, Operand,
-        Place, Projection, RValue,
+        AggregateCtor, AirBlock, AirEnumMatch, AirIf, AirOptionalMatch, AirStmt, AirTail, CallArg,
+        Callee, Operand, Place, Projection, RValue,
     },
     ids::*,
     typing::{self, PrimitiveTypes, supports_scalar_binary, supports_scalar_unary},
@@ -342,6 +342,12 @@ pub enum BadFunction {
     BreakOutsideLoop(AirLoopId),
     ContinueOutsideLoop(AirLoopId),
     MatchNotExhaustive(EnumId),
+    OptionalPayloadLocalAlreadyInitialized(LocalId),
+    OptionalPayloadLocalMustBeImmutable(LocalId),
+    OptionalPayloadRefDiscriminantMustBeMutable(LocalId),
+    OptionalPayloadEscapeRequiresPayload,
+    OptionalPayloadEscapeRequiresRef,
+    OptionalPayloadEscapeNoneMustDiverge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,6 +602,13 @@ impl LocalInit {
         if local.index() < self.definite.len() {
             self.definite[local.index()] = true;
             self.possible[local.index()] = true;
+        }
+    }
+
+    fn clear(&mut self, local: LocalId) {
+        if local.index() < self.definite.len() {
+            self.definite[local.index()] = false;
+            self.possible[local.index()] = false;
         }
     }
 
@@ -1528,6 +1541,9 @@ fn verify_air_stmt(
         AirStmt::EnumMatch(match_) => {
             verify_air_match(cx, function_id, index, match_, state, loops)
         }
+        AirStmt::OptionalMatch(match_) => {
+            verify_air_optional_match(cx, function_id, index, match_, state, loops)
+        }
     }
 }
 
@@ -1589,7 +1605,7 @@ fn verify_air_match(
     );
     let Some(expected_enum) = discr_ty.and_then(|ty| match cx.type_data(ty) {
         Some(TypeData::Enum(id)) if cx.has_enum(*id) => Some(*id),
-        Some(TypeData::Enum(_) | TypeData::Optional(_)) | None => None,
+        Some(TypeData::Enum(_)) | None => None,
         Some(_) => {
             cx.push(
                 site.clone(),
@@ -1636,6 +1652,138 @@ fn verify_air_match(
         );
     }
     LocalInit::join(fallthrough)
+}
+
+fn verify_air_optional_match(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    match_: &AirOptionalMatch,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    let site = VerifyCx::stmt_site(function_id, BlockId::from_index(0), index);
+    verify_air_place_read(cx, function_id, index, &match_.discr, state);
+    let discr_ty = verify_place(
+        cx,
+        function_id,
+        BlockId::from_index(0),
+        Some(index),
+        &match_.discr,
+    );
+    if match_.payload_ref {
+        let function = cx.program.function(function_id);
+        match function.locals.get(match_.discr.root.index()) {
+            Some(local) if local.mutability == Mutability::Mutable => {}
+            Some(_) => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(
+                    BadFunction::OptionalPayloadRefDiscriminantMustBeMutable(match_.discr.root),
+                ),
+            ),
+            None => {}
+        }
+    }
+    let inner = match discr_ty.and_then(|ty| cx.type_data(ty).map(|data| (ty, data))) {
+        Some((_, TypeData::Optional(inner))) => Some(*inner),
+        Some((ty, _)) => {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::SwitchDiscriminantMustBeEnum(ty)),
+            );
+            None
+        }
+        None => None,
+    };
+
+    let mut some_state = state.clone();
+    if let Some(payload) = match_.payload {
+        let function = cx.program.function(function_id);
+        match function.locals.get(payload.index()) {
+            Some(local) => {
+                if function
+                    .signature
+                    .params
+                    .iter()
+                    .any(|param| param.local_id == payload)
+                {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadStatement(BadStatement::InitParamLocal(payload)),
+                    );
+                }
+                if state.is_possible(payload) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(
+                            BadFunction::OptionalPayloadLocalAlreadyInitialized(payload),
+                        ),
+                    );
+                }
+                let expected_mutability = if match_.payload_ref {
+                    Mutability::Mutable
+                } else {
+                    Mutability::Immutable
+                };
+                if local.mutability != expected_mutability {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(
+                            BadFunction::OptionalPayloadLocalMustBeImmutable(payload),
+                        ),
+                    );
+                }
+                if let Some(inner) = inner
+                    && !same_type(cx, local.ty, inner)
+                {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadStatement(BadStatement::InitTypeMismatch {
+                            expected: inner,
+                            found: local.ty,
+                        }),
+                    );
+                }
+                some_state.init(payload);
+            }
+            None => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadReference(BadReference::InvalidLocal(payload)),
+            ),
+        }
+    }
+
+    if (match_.payload_ref || match_.payload_escapes) && match_.payload.is_none() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::OptionalPayloadEscapeRequiresPayload),
+        );
+    }
+    if match_.payload_escapes && !match_.payload_ref {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::OptionalPayloadEscapeRequiresRef),
+        );
+    }
+
+    let mut some_fallthrough =
+        verify_air_block(cx, function_id, &match_.some_block, &mut some_state, loops);
+    if match_.payload_ref
+        && !match_.payload_escapes
+        && let (Some(payload), Some(state)) = (match_.payload, &mut some_fallthrough)
+    {
+        state.clear(payload);
+    }
+    let mut none_state = state.clone();
+    let none_fallthrough =
+        verify_air_block(cx, function_id, &match_.none_block, &mut none_state, loops);
+    if match_.payload_escapes && none_fallthrough.is_some() {
+        cx.push(
+            site,
+            VerifyErrorKind::BadFunction(BadFunction::OptionalPayloadEscapeNoneMustDiverge),
+        );
+    }
+    LocalInit::join([some_fallthrough, none_fallthrough].into_iter().flatten())
 }
 
 fn verify_air_tail(

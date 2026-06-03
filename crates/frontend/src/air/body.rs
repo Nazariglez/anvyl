@@ -20,6 +20,7 @@ pub enum AirStmt {
     If(AirIf),
     Loop(AirLoop),
     EnumMatch(AirEnumMatch),
+    OptionalMatch(AirOptionalMatch),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -56,6 +57,16 @@ pub struct AirEnumMatch {
 pub struct AirEnumMatchArm {
     pub variant: VariantId,
     pub block: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirOptionalMatch {
+    pub discr: Place,
+    pub payload: Option<LocalId>,
+    pub payload_ref: bool,
+    pub payload_escapes: bool,
+    pub some_block: AirBlock,
+    pub none_block: AirBlock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,6 +311,10 @@ impl AirStmt {
                 if let Some(block) = &match_.else_block {
                     block.for_each_rvalue(f);
                 }
+            }
+            Self::OptionalMatch(match_) => {
+                match_.some_block.for_each_rvalue(f);
+                match_.none_block.for_each_rvalue(f);
             }
         }
     }

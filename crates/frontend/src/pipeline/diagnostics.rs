@@ -779,6 +779,9 @@ pub(super) fn diagnose_type_error(
         TypeError::NestedOptionalPattern { .. } => {
             "nested optional patterns are not supported".to_string()
         }
+        TypeError::UnsupportedOptionalPayloadPattern { .. } => {
+            "optional payload patterns only support identifiers and wildcards".to_string()
+        }
         TypeError::MatchArmTypeMismatch {
             expected, found, ..
         } => format!("match arm type mismatch: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx)),
@@ -1302,6 +1305,7 @@ fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
         | TypeError::OptionalPatternOnNonOptional { span, .. }
         | TypeError::OptionalChainingOnNonOptional { span, .. }
         | TypeError::NestedOptionalPattern { span, .. }
+        | TypeError::UnsupportedOptionalPayloadPattern { span, .. }
         | TypeError::RequiresUnwrappingPattern { span, .. }
         | TypeError::IrrefutableLetElse { span, .. }
         | TypeError::LetElseMustDiverge { span, .. }

@@ -459,6 +459,7 @@ pub(super) struct PlaceValue {
     pub(super) access: PlaceAccess,
     pub(super) facts: PlaceUseFacts,
     pub(super) identity: PlaceIdentity,
+    pub(super) root_local: Option<SemanticLocalId>,
     pub(super) root_name: Option<Ident>,
     pub(super) global: Option<GlobalPlace>,
 }
@@ -505,6 +506,7 @@ impl PlaceValue {
             access,
             facts,
             identity: PlaceIdentity::unknown(),
+            root_local: None,
             root_name: None,
             global: None,
         }
@@ -526,6 +528,7 @@ impl PlaceValue {
             access,
             facts,
             identity,
+            root_local: self.root_local,
             root_name: self.root_name,
             global: self.global.as_ref().map(GlobalPlace::projected),
         }
@@ -714,6 +717,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
                 let mut place = CheckedPlace::new(checked, access.access);
                 place.value.facts = access.facts;
                 place.value.identity = access.identity;
+                place.value.root_local = Some(value.info.type_id);
                 place.value.root_name = Some(*name);
                 place.accepts_extern_any = access.accepts_extern_any;
                 return place;
@@ -756,6 +760,16 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
 
     if let Some(place) = check_module_qualified_place(expr, tc) {
         return place;
+    }
+
+    if let Some(chain) = super::postfix::collect_postfix_chain(expr)
+        && super::postfix::chain_has_safe(&chain)
+    {
+        let value = super::postfix::check_postfix_chain_place(&chain, expr, None, false, tc);
+        return CheckedPlace {
+            accepts_extern_any: value.checked.contains_extern_any,
+            value,
+        };
     }
 
     if let ExprKind::Index(index) = &expr.node.kind {
@@ -861,7 +875,7 @@ fn record_direct_use(
     mode: LocalUseMode,
     tc: &mut TypeChecker,
 ) {
-    let Some(local) = value.identity.root_local() else {
+    let Some(local) = value.root_local.or_else(|| value.identity.root_local()) else {
         return;
     };
     if tc.has_recordable_semantic_local(local) {

@@ -682,3 +682,84 @@ fn multi_module() {
     assert_eq!(program.module(m1).path[0].as_str(), "b");
     assert_eq!(program.module(m1).functions[0], f1);
 }
+
+#[test]
+fn structured_optional_match_with_payload() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("optional_match", module, FunctionKind::Normal, int_ty);
+    let opt = fb.push_param("opt", opt_ty, ParamRole::Normal);
+    let payload = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let none = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    fb.push_block(AirTail::Return(Some(op_place(payload, int_ty))));
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::OptionalMatch(AirOptionalMatch {
+                discr: place(opt, opt_ty),
+                payload: Some(payload),
+                payload_ref: false,
+                payload_escapes: false,
+                some_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::None,
+                },
+                none_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(Some(op_const(none))),
+                },
+            })],
+            tail: AirTail::Return(Some(op_place(payload, int_ty))),
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}
+
+#[test]
+fn structured_optional_match_without_payload() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let mut fb = FunctionBuilder::new("optional_match", module, FunctionKind::Normal, int_ty);
+    let opt = fb.push_param("opt", opt_ty, ParamRole::Normal);
+    fb.push_block(AirTail::Unreachable);
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::OptionalMatch(AirOptionalMatch {
+                discr: place(opt, opt_ty),
+                payload: None,
+                payload_ref: false,
+                payload_escapes: false,
+                some_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(Some(op_const(one))),
+                },
+                none_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(Some(op_const(zero))),
+                },
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+
+    verify_structured_body(&program, func_id, &body).unwrap();
+}

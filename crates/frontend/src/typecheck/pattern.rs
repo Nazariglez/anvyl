@@ -1,5 +1,6 @@
 use super::{
-    ActiveMutDowncastRoot, CheckedType, TypeChecker, TypeError, TypeHandle,
+    ActiveMutAliasRoot, CheckedType, MUT_ALIAS_ROOT_MESSAGE, MUT_DOWNCAST_ROOT_MESSAGE,
+    TypeChecker, TypeError, TypeHandle,
     annotation::AccessPolicy,
     check_block_checked_with_hint, check_expected_value_expr, check_value_expr_checked_with_hint,
     checked_from_type, checked_void, closure, control_flow,
@@ -631,11 +632,23 @@ impl<'tc> PatternChecker<'tc> {
                         .cloned()
                         .collect();
                     let target = place::AliasTarget::merged(group, targets);
+                    if matches!(
+                        self.context,
+                        PatternContext::IfLet | PatternContext::WhileLet | PatternContext::Match
+                    ) {
+                        self.tc.active_mut_alias_roots.push(ActiveMutAliasRoot {
+                            identity: target.identity.clone(),
+                            allowed: name,
+                            scope_depth: self.tc.scopes.len(),
+                            message: MUT_ALIAS_ROOT_MESSAGE,
+                        });
+                    }
                     self.tc.define_alias_binding_from_handle(
                         name,
                         &binding.ty,
                         target,
                         self.context,
+                        Some(binding.span),
                     );
                 }
             }
@@ -731,6 +744,22 @@ impl<'tc> PatternChecker<'tc> {
             self.tc.push_error(TypeError::NestedOptionalPattern {
                 span: self.tc.error_span(inner.span),
             });
+            let recovery = input.project(
+                Type::Infer,
+                input.access,
+                input.facts.clone(),
+                input.accepts_extern_any,
+                |identity| identity,
+                self.tc,
+            );
+            self.check(inner, recovery);
+            return PatternCheckResult::empty(PatternOutcome::error());
+        }
+        if !optional_payload_pattern_supported(inner) {
+            self.tc
+                .push_error(TypeError::UnsupportedOptionalPayloadPattern {
+                    span: self.tc.error_span(inner.span),
+                });
             let recovery = input.project(
                 Type::Infer,
                 input.access,
@@ -1073,6 +1102,21 @@ impl<'tc> PatternChecker<'tc> {
                 bindings,
             };
         };
+        if self.tc.decls.semantic_option_key(&input.expected_ty) == Some(resolved.key.clone())
+            && variant == Ident::new("Some")
+            && fields.len() == 1
+            && !optional_payload_pattern_supported(&fields[0])
+        {
+            self.tc
+                .push_error(TypeError::UnsupportedOptionalPayloadPattern {
+                    span: self.tc.error_span(fields[0].span),
+                });
+            let bindings = self.check_tuple_fields_recovery(fields, input.access);
+            return PatternCheckResult {
+                outcome: PatternOutcome::error(),
+                bindings,
+            };
+        }
         if payloads.len() != fields.len() {
             self.tc.push_error(TypeError::WrongArgCount {
                 expected: payloads.len(),
@@ -1400,6 +1444,10 @@ pub(super) fn check_pattern_scrutinee(
     }
 }
 
+fn optional_payload_pattern_supported(pattern: &PatternNode) -> bool {
+    matches!(pattern.node, Pattern::Ident(_) | Pattern::Wildcard)
+}
+
 fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
     if let Some(annot_inner) = tc.decls.semantic_option_inner(annot) {
         let value_inner = tc.decls.semantic_option_inner(value).unwrap_or(value);
@@ -1594,9 +1642,11 @@ fn check_if_let_exact_downcast(
                     &handle,
                     alias.target(PlaceAccess::Mutable),
                 );
-                tc.active_mut_downcast_roots.push(ActiveMutDowncastRoot {
+                tc.active_mut_alias_roots.push(ActiveMutAliasRoot {
                     identity: alias.identity.clone(),
                     allowed: binding.name,
+                    scope_depth: tc.scopes.len(),
+                    message: MUT_DOWNCAST_ROOT_MESSAGE,
                 });
             }
             _ => {
@@ -1611,7 +1661,7 @@ fn check_if_let_exact_downcast(
 
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
         if binding.mutable && checked.source.valid_alias().is_some() {
-            tc.active_mut_downcast_roots.pop();
+            tc.active_mut_alias_roots.pop();
         }
         tc.pop_scope();
         then

@@ -8,13 +8,13 @@ pub(super) use support::{
 
 pub(super) use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
-    AirIf, AirLoop, AirLoopId, AirStmt, AirTail, BlockId, CallArg, Callee, ConstArena, ConstData,
-    ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember, ExternParamDecl,
-    ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId,
-    FunctionKind, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability, Operand, Param,
-    ParamMode, ParamRole, ParamType, Place, Program, Projection, RValue, RawEnumValue, ReturnMode,
-    Signature, SignatureType, TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape,
-    verify,
+    AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail, BlockId, CallArg, Callee,
+    ConstArena, ConstData, ConstId, ConstValue, EnumDecl, EnumId, ExternDecl, ExternMember,
+    ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function,
+    FunctionId, FunctionKind, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability, Operand,
+    Param, ParamMode, ParamRole, ParamType, Place, Program, Projection, RValue, RawEnumValue,
+    ReturnMode, Signature, SignatureType, TypeArena, TypeData, TypeId, VariantDecl, VariantId,
+    VariantShape, verify,
 };
 
 mod structure;

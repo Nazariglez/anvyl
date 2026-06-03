@@ -39,10 +39,7 @@ use self::{
         mode_for_head,
     },
     place::{AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts, check_place},
-    postfix::{
-        PostfixStep, check_index_expr, check_postfix_chain, check_tuple_index,
-        collect_postfix_chain,
-    },
+    postfix::{PostfixStep, check_postfix_chain, check_tuple_index, collect_postfix_chain},
     type_ops::type_contains_dyn_value,
     type_refs::LocalTypeScopes,
 };
@@ -465,6 +462,9 @@ pub(crate) enum TypeError {
         span: Option<SourceSpan>,
     },
     NestedOptionalPattern {
+        span: Option<SourceSpan>,
+    },
+    UnsupportedOptionalPayloadPattern {
         span: Option<SourceSpan>,
     },
     RequiresUnwrappingPattern {
@@ -902,6 +902,8 @@ impl LocalBindingKind {
                 | CaptureStorageOrigin::BorrowedParam
                 | CaptureStorageOrigin::ReadonlySelf
                 | CaptureStorageOrigin::VarSelf
+                | CaptureStorageOrigin::PatternAlias
+                | CaptureStorageOrigin::ForVarAlias
         )
     }
 
@@ -1070,10 +1072,16 @@ struct ScopeState {
     closure: ClosureScopeState,
 }
 
+const MUT_DOWNCAST_ROOT_MESSAGE: &str =
+    "dynamic root cannot be used while a mutable downcast binding is live";
+const MUT_ALIAS_ROOT_MESSAGE: &str = "place cannot be used while a mutable alias binding is live";
+
 #[derive(Clone)]
-struct ActiveMutDowncastRoot {
+struct ActiveMutAliasRoot {
     identity: PlaceIdentity,
     allowed: Ident,
+    scope_depth: usize,
+    message: &'static str,
 }
 
 struct TypeChecker {
@@ -1082,7 +1090,7 @@ struct TypeChecker {
     expr_places: HashMap<ExprId, place::PlaceValue>,
     closure: ClosureClassifier,
     global_types: HashMap<GlobalKey, SemanticLocalId>,
-    active_mut_downcast_roots: Vec<ActiveMutDowncastRoot>,
+    active_mut_alias_roots: Vec<ActiveMutAliasRoot>,
     dyn_infer_registered_modules: HashSet<ModuleScope>,
     dyn_infer: DynInference,
     used_imports: HashSet<ImportId>,
@@ -1131,7 +1139,7 @@ impl TypeChecker {
             expr_places: HashMap::new(),
             closure: ClosureClassifier::default(),
             global_types: HashMap::new(),
-            active_mut_downcast_roots: vec![],
+            active_mut_alias_roots: vec![],
             dyn_infer_registered_modules: HashSet::new(),
             dyn_infer: DynInference::default(),
             used_imports: HashSet::new(),
@@ -1374,6 +1382,8 @@ impl TypeChecker {
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.active_mut_alias_roots
+            .retain(|root| root.scope_depth <= self.scopes.len());
         self.closure.exit_scope(self.scopes.len());
         self.local_type_scopes.pop_scope();
     }
@@ -1500,14 +1510,21 @@ impl TypeChecker {
         handle: &TypeHandle,
         target: place::AliasTarget,
         context: PatternContext,
+        span: Option<Span>,
     ) {
-        self.define_shadowing_value_from_handle(
+        let Some(id) = self.define_shadowing_value_from_handle(
             name,
             handle,
             LocalBindingKind::pattern_alias(context),
             None,
             Some(target),
-        );
+        ) else {
+            return;
+        };
+        if let Some(span) = span {
+            self.record_local_def(id, name, Some(span), true, LocalDefKind::Binding);
+            self.record_binding_def(span, id);
+        }
     }
 
     fn define_downcast_alias_from_handle(
@@ -2074,14 +2091,13 @@ impl TypeChecker {
         let Some(root_name) = root_name else {
             return;
         };
-        if self
-            .active_mut_downcast_roots
+        if let Some(root) = self
+            .active_mut_alias_roots
             .iter()
-            .any(|root| root.allowed != root_name && root.identity.conflicts_with(identity))
+            .find(|root| root.allowed != root_name && root.identity.conflicts_with(identity))
         {
             self.push_error(TypeError::CompileError {
-                message: "dynamic root cannot be used while a mutable downcast binding is live"
-                    .to_string(),
+                message: root.message.to_string(),
                 span: self.error_span(span),
             });
         }
@@ -3874,13 +3890,12 @@ fn check_expr_checked_with_hint(
         }
         ExprKind::StructLiteral(lit) => check_struct_lit_hint(expr, lit, expected, tc),
         ExprKind::InferredEnum(node) => check_inferred_enum_hint(expr, node, expected, tc),
-        ExprKind::Field(_) | ExprKind::Call(_) => {
+        ExprKind::Field(_) | ExprKind::Call(_) | ExprKind::Index(_) => {
             let chain = collect_postfix_chain(expr).expect("postfix chain");
             check_postfix_chain(&chain, expr, expected.as_ref(), tc)
         }
         ExprKind::Tuple(elems) => check_tuple_checked_with_hint(expr, elems, expected, tc),
         ExprKind::TupleIndex(node) => check_tuple_index(expr, node, tc),
-        ExprKind::Index(node) => check_index_expr(expr, node, tc),
         ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected, tc),
         ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected, tc),
         ExprKind::IfLet(if_let_node) => {
@@ -4411,6 +4426,9 @@ fn check_binary(
     if bin.node.op == BinaryOp::Coalesce {
         return check_coalesce(&bin.node.left, &bin.node.right, bin.span, expected, tc);
     }
+    if let Some(checked) = check_nil_equality(expr_id, bin, tc) {
+        return checked;
+    }
 
     let left = check_expr_checked(&bin.node.left, tc);
     let right = check_expr_checked(&bin.node.right, tc);
@@ -4424,6 +4442,60 @@ fn check_binary(
         bin.span,
         tc,
     )
+}
+
+fn check_nil_equality(
+    expr_id: ExprId,
+    bin: &BinaryNode,
+    tc: &mut TypeChecker,
+) -> Option<CheckedType> {
+    if !matches!(bin.node.op, BinaryOp::Eq | BinaryOp::NotEq) {
+        return None;
+    }
+
+    let left_nil = is_nil_lit(&bin.node.left);
+    let right_nil = is_nil_lit(&bin.node.right);
+    if left_nil == right_nil {
+        return None;
+    }
+
+    let (value_expr, nil_expr) = if left_nil {
+        (&bin.node.right, &bin.node.left)
+    } else {
+        (&bin.node.left, &bin.node.right)
+    };
+
+    let value = check_expr_checked(value_expr, tc);
+    if tc.checked_is_poison(&value) {
+        check_expr_checked(nil_expr, tc);
+        return Some(checked_type(Type::Infer, tc));
+    }
+
+    if tc.decls.semantic_option_inner(&value.ty).is_some() {
+        check_value_expr_checked_with_hint(nil_expr, Some(value.handle), tc);
+        return Some(checked_type(Type::Bool, tc));
+    }
+    if matches!(value.ty, Type::Infer) {
+        check_expr_checked(nil_expr, tc);
+        return Some(checked_type(Type::Bool, tc));
+    }
+
+    let nil = check_expr_checked(nil_expr, tc);
+    let (left, right) = if left_nil { (nil, value) } else { (value, nil) };
+    Some(check_binary_checked(
+        expr_id,
+        bin.node.op,
+        &bin.node.left,
+        left,
+        &bin.node.right,
+        right,
+        bin.span,
+        tc,
+    ))
+}
+
+fn is_nil_lit(expr: &ExprNode) -> bool {
+    matches!(expr.node.kind, ExprKind::Lit(Lit::Nil))
 }
 
 fn check_coalesce(

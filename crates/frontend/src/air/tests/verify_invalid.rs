@@ -2439,3 +2439,194 @@ fn dataref_field_projection_out_of_range() {
             if id == dataref && field == FieldId::from_index(9)
     )));
 }
+
+#[test]
+fn optional_match_rejects_non_optional_discriminant_and_payload_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_optional_match", module, FunctionKind::Normal, int_ty);
+    let int = fb.push_param("value", int_ty, ParamRole::Normal);
+    let opt = fb.push_param("opt", opt_ty, ParamRole::Normal);
+    let bad_payload = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_unreachable());
+    let func_id = builder.alloc_function(fb.finish());
+    let block = |discr, discr_ty, payload| AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::OptionalMatch(AirOptionalMatch {
+                discr: place(discr, discr_ty),
+                payload,
+                payload_ref: false,
+                payload_escapes: false,
+                some_block: AirBlock::default(),
+                none_block: AirBlock::default(),
+            })],
+            tail: AirTail::None,
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &block(int, int_ty, None)).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::SwitchDiscriminantMustBeEnum(found)) if found == int_ty
+    )));
+
+    let errors = verify_structured_body(&program, func_id, &block(opt, opt_ty, Some(bad_payload)))
+        .unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::InitTypeMismatch { expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn optional_match_rejects_invalid_escaping_payload() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_optional_escape", module, FunctionKind::Normal, int_ty);
+    let opt = fb.push_param("opt", opt_ty, ParamRole::Normal);
+    let payload = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::PatternBinding);
+    fb.push_block(term_unreachable());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = |payload, payload_ref, none_tail| AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::OptionalMatch(AirOptionalMatch {
+                discr: place(opt, opt_ty),
+                payload,
+                payload_ref,
+                payload_escapes: true,
+                some_block: AirBlock::default(),
+                none_block: AirBlock {
+                    stmts: vec![],
+                    tail: none_tail,
+                },
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body(None, true, AirTail::Unreachable))
+        .unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::OptionalPayloadEscapeRequiresPayload)
+    )));
+
+    let errors = verify_structured_body(
+        &program,
+        func_id,
+        &body(Some(payload), false, AirTail::Unreachable),
+    )
+    .unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::OptionalPayloadEscapeRequiresRef)
+    )));
+
+    let errors =
+        verify_structured_body(&program, func_id, &body(Some(payload), true, AirTail::None))
+            .unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::OptionalPayloadEscapeNoneMustDiverge)
+    )));
+}
+
+#[test]
+fn optional_match_payload_is_not_initialized_in_none_branch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_optional_match", module, FunctionKind::Normal, int_ty);
+    let opt = fb.push_param("opt", opt_ty, ParamRole::Normal);
+    let payload = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_unreachable());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::OptionalMatch(AirOptionalMatch {
+                discr: place(opt, opt_ty),
+                payload: Some(payload),
+                payload_ref: false,
+                payload_escapes: false,
+                some_block: AirBlock::default(),
+                none_block: AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Return(Some(op_place(payload, int_ty))),
+                },
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(found)) if found == payload
+    )));
+}
+
+#[test]
+fn optional_match_rejects_reused_or_mutable_payload_local() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let module = test_module(&mut builder);
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let mut fb = FunctionBuilder::new("bad_optional_match", module, FunctionKind::Normal, int_ty);
+    let opt = fb.push_param("opt", opt_ty, ParamRole::Normal);
+    let reused = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let mutable = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::Temp);
+    fb.push_block(term_unreachable());
+    let func_id = builder.alloc_function(fb.finish());
+    let optional_match = |payload| {
+        AirStmt::OptionalMatch(AirOptionalMatch {
+            discr: place(opt, opt_ty),
+            payload: Some(payload),
+            payload_ref: false,
+            payload_escapes: false,
+            some_block: AirBlock::default(),
+            none_block: AirBlock::default(),
+        })
+    };
+    let reused_body = AirBody {
+        block: AirBlock {
+            stmts: vec![
+                stmt_init(reused, RValue::Use(op_const(zero))),
+                optional_match(reused),
+            ],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let mutable_body = AirBody {
+        block: AirBlock {
+            stmts: vec![optional_match(mutable)],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &reused_body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::OptionalPayloadLocalAlreadyInitialized(found)) if found == reused
+    )));
+
+    let errors = verify_structured_body(&program, func_id, &mutable_body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::OptionalPayloadLocalMustBeImmutable(found)) if found == mutable
+    )));
+}

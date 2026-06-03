@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success
+
+struct Item {
+    value: int,
+    next: int?,
+}
+
+struct Bag {
+    items: [Item; 2],
+    by_name: [string: Item],
+}
+
+fn main() {
+    let bag: Bag? = Bag {
+        items: [Item { value: 1, next: 2 }, Item { value: 3, next: nil }],
+        by_name: ["a": Item { value: 4, next: 5 }],
+    };
+
+    let a: int? = bag?.items[0].value;
+    let b: int? = bag?.items[0].next;
+
+    let map: [string: Item]? = ["a": Item { value: 4, next: 5 }];
+    let c: int? = map?["missing"]?.value;
+    let d: int? = bag?.by_name["a"]?.value;
+}
