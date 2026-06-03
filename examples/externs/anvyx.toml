@@ -1,7 +1,0 @@
-[project]
-name = "externs"
-entry = "src/main.anv"
-
-[externs]
-colors = { path = "./colors" }
-callbacks = { path = "./callbacks" }
