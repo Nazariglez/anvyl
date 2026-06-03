@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: ok
+
+struct Box { item: int? }
+enum Slot { Item(int?) }
+
+fn plain_return() -> int? { 1 }
+fn nil_return() -> int? { nil }
+fn main() {
+    let a: int? = plain_return();
+    let b: int? = nil_return();
+    let box = Box { item: 3 };
+    let slot = Slot.Item(4);
+    let branch: int? = if true { 5 } else { nil };
+    println("ok");
+}

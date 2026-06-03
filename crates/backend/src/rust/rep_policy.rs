@@ -71,6 +71,40 @@ impl<'a> AirRustRepPolicy<'a> {
         self.copyable(ty) || self.shareable_value(ty)
     }
 
+    pub fn value_from_ref_supported(self, ty: TypeId) -> bool {
+        match self.program.type_arena.data(ty) {
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::DataRef(_)
+            | TypeData::List(_)
+            | TypeData::Map { .. } => true,
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.value_from_ref_supported(*inner)
+            }
+            TypeData::Aggregate(id) => self
+                .program
+                .aggregate(*id)
+                .fields
+                .iter()
+                .all(|field| self.value_from_ref_supported(field.ty)),
+            TypeData::Enum(id) => self.enum_value_from_ref_supported(*id),
+            TypeData::Extern(id) => self
+                .program
+                .extern_type(*id)
+                .fields
+                .iter()
+                .all(|field| self.value_from_ref_supported(field.ty)),
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::Tuple(_)
+            | TypeData::Slice(_)
+            | TypeData::Function(_)
+            | TypeData::Dyn(_) => false,
+        }
+    }
+
     pub fn list_supported(self, ty: TypeId) -> bool {
         let TypeData::List(elem) = self.program.type_arena.data(ty) else {
             return false;
@@ -112,6 +146,23 @@ impl<'a> AirRustRepPolicy<'a> {
         })
     }
 
+    fn enum_value_from_ref_supported(self, id: air::EnumId) -> bool {
+        self.program.enum_decl(id).variants.iter().all(|variant| {
+            let fields: &[TypeId] = match &variant.shape {
+                VariantShape::Unit => &[],
+                VariantShape::Tuple(fields) => fields,
+                VariantShape::Struct(fields) => {
+                    return fields
+                        .iter()
+                        .all(|field| self.value_from_ref_supported(field.ty));
+                }
+            };
+            fields
+                .iter()
+                .all(|field| self.value_from_ref_supported(*field))
+        })
+    }
+
     pub fn map_supported(self, ty: TypeId) -> bool {
         let TypeData::Map { key, value, .. } = self.program.type_arena.data(ty) else {
             return false;
@@ -128,46 +179,66 @@ impl<'a> AirRustRepPolicy<'a> {
 
     pub fn supports_param_mode(self, ty: TypeId, mode: ParamMode) -> bool {
         match mode {
-            ParamMode::Value => matches!(
-                self.program.type_arena.data(ty),
+            ParamMode::Value => match self.program.type_arena.data(ty) {
+                TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
                 TypeData::Int
-                    | TypeData::Float
-                    | TypeData::Bool
-                    | TypeData::Void
-                    | TypeData::String
-                    | TypeData::Aggregate(_)
-                    | TypeData::DataRef(_)
-                    | TypeData::Enum(_)
-                    | TypeData::Extern(_)
-                    | TypeData::Array { .. }
-                    | TypeData::List(_)
-                    | TypeData::Map { .. }
-            ),
-            ParamMode::SharedBorrow => matches!(
-                self.program.type_arena.data(ty),
+                | TypeData::Float
+                | TypeData::Bool
+                | TypeData::Void
+                | TypeData::String
+                | TypeData::Aggregate(_)
+                | TypeData::DataRef(_)
+                | TypeData::Enum(_)
+                | TypeData::Extern(_)
+                | TypeData::Array { .. }
+                | TypeData::List(_)
+                | TypeData::Map { .. } => true,
+                TypeData::Any
+                | TypeData::Tuple(_)
+                | TypeData::Slice(_)
+                | TypeData::Function(_)
+                | TypeData::Dyn(_) => false,
+            },
+            ParamMode::SharedBorrow => match self.program.type_arena.data(ty) {
+                TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
                 TypeData::String
-                    | TypeData::Aggregate(_)
-                    | TypeData::DataRef(_)
-                    | TypeData::Enum(_)
-                    | TypeData::Extern(_)
-                    | TypeData::Array { .. }
-                    | TypeData::List(_)
-                    | TypeData::Map { .. }
-            ),
-            ParamMode::MutBorrow => matches!(
-                self.program.type_arena.data(ty),
+                | TypeData::Aggregate(_)
+                | TypeData::DataRef(_)
+                | TypeData::Enum(_)
+                | TypeData::Extern(_)
+                | TypeData::Array { .. }
+                | TypeData::List(_)
+                | TypeData::Map { .. } => true,
                 TypeData::Int
-                    | TypeData::Float
-                    | TypeData::Bool
-                    | TypeData::String
-                    | TypeData::Aggregate(_)
-                    | TypeData::DataRef(_)
-                    | TypeData::Enum(_)
-                    | TypeData::Extern(_)
-                    | TypeData::Array { .. }
-                    | TypeData::List(_)
-                    | TypeData::Map { .. }
-            ),
+                | TypeData::Float
+                | TypeData::Bool
+                | TypeData::Void
+                | TypeData::Any
+                | TypeData::Tuple(_)
+                | TypeData::Slice(_)
+                | TypeData::Function(_)
+                | TypeData::Dyn(_) => false,
+            },
+            ParamMode::MutBorrow => match self.program.type_arena.data(ty) {
+                TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
+                TypeData::Int
+                | TypeData::Float
+                | TypeData::Bool
+                | TypeData::String
+                | TypeData::Aggregate(_)
+                | TypeData::DataRef(_)
+                | TypeData::Enum(_)
+                | TypeData::Extern(_)
+                | TypeData::Array { .. }
+                | TypeData::List(_)
+                | TypeData::Map { .. } => true,
+                TypeData::Void
+                | TypeData::Any
+                | TypeData::Tuple(_)
+                | TypeData::Slice(_)
+                | TypeData::Function(_)
+                | TypeData::Dyn(_) => false,
+            },
         }
     }
 }
@@ -250,6 +321,35 @@ impl<'a> RustRepPolicy<'a> {
                 }
                 _ => false,
             }
+    }
+
+    pub fn value_from_ref_supported(self, ty: RirTypeId) -> bool {
+        match self.ty(ty) {
+            RirType::Int
+            | RirType::Float
+            | RirType::Bool
+            | RirType::String
+            | RirType::DataRef(_)
+            | RirType::List(_)
+            | RirType::Map { .. } => true,
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
+                self.value_from_ref_supported(inner)
+            }
+            RirType::Struct(id) => self.program.structs[id.index()]
+                .fields
+                .iter()
+                .all(|field| self.value_from_ref_supported(field.ty)),
+            RirType::Enum(id) => self.program.enums[id.index()]
+                .variants
+                .iter()
+                .all(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .all(|field| self.value_from_ref_supported(field.ty))
+                }),
+            RirType::Slice(_) | RirType::Void => false,
+        }
     }
 
     pub fn borrow_view(self, ty: RirTypeId) -> RustBorrowView {
@@ -342,43 +442,50 @@ impl<'a> RustRepPolicy<'a> {
 
     fn supports_type_semantic(self, ty: RirType, semantic: RirParamSemantic) -> bool {
         match semantic {
-            RirParamSemantic::Value => matches!(
-                ty,
+            RirParamSemantic::Value => match ty {
+                RirType::Option(inner) => self.supports_param(inner, semantic),
                 RirType::Int
-                    | RirType::Float
-                    | RirType::Bool
-                    | RirType::Void
-                    | RirType::String
-                    | RirType::Struct(_)
-                    | RirType::DataRef(_)
-                    | RirType::Enum(_)
-                    | RirType::Array { .. }
-                    | RirType::List(_)
-                    | RirType::Map { .. }
-            ),
-            RirParamSemantic::SharedBorrow => matches!(
-                ty,
+                | RirType::Float
+                | RirType::Bool
+                | RirType::Void
+                | RirType::String
+                | RirType::Struct(_)
+                | RirType::DataRef(_)
+                | RirType::Enum(_)
+                | RirType::Array { .. }
+                | RirType::List(_)
+                | RirType::Map { .. } => true,
+                RirType::Slice(_) => false,
+            },
+            RirParamSemantic::SharedBorrow => match ty {
+                RirType::Option(inner) => self.supports_param(inner, semantic),
                 RirType::String
-                    | RirType::Struct(_)
-                    | RirType::DataRef(_)
-                    | RirType::Enum(_)
-                    | RirType::Array { .. }
-                    | RirType::List(_)
-                    | RirType::Map { .. }
-            ),
-            RirParamSemantic::MutBorrow => matches!(
-                ty,
+                | RirType::Struct(_)
+                | RirType::DataRef(_)
+                | RirType::Enum(_)
+                | RirType::Array { .. }
+                | RirType::List(_)
+                | RirType::Map { .. } => true,
                 RirType::Int
-                    | RirType::Float
-                    | RirType::Bool
-                    | RirType::String
-                    | RirType::Struct(_)
-                    | RirType::DataRef(_)
-                    | RirType::Enum(_)
-                    | RirType::Array { .. }
-                    | RirType::List(_)
-                    | RirType::Map { .. }
-            ),
+                | RirType::Float
+                | RirType::Bool
+                | RirType::Void
+                | RirType::Slice(_) => false,
+            },
+            RirParamSemantic::MutBorrow => match ty {
+                RirType::Option(inner) => self.supports_param(inner, semantic),
+                RirType::Int
+                | RirType::Float
+                | RirType::Bool
+                | RirType::String
+                | RirType::Struct(_)
+                | RirType::DataRef(_)
+                | RirType::Enum(_)
+                | RirType::Array { .. }
+                | RirType::List(_)
+                | RirType::Map { .. } => true,
+                RirType::Void | RirType::Slice(_) => false,
+            },
         }
     }
 

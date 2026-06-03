@@ -1,0 +1,25 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// arg
+// 16
+// @match-end
+
+struct Caller {
+    value: int,
+
+    fn add(self, x: int) -> int {
+        self.value + x
+    }
+}
+
+fn arg() -> int {
+    println("arg");
+    6
+}
+
+fn main() {
+    let maybe: Caller? = Caller { value: 10 };
+    println(maybe?.add(arg()) ?? 0);
+}

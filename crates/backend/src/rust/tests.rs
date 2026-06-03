@@ -1,11 +1,11 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, AggregateCtor, AirBody, CallArg, Callee, ConstData, ConstValue, EnumDecl,
-        ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl,
-        FieldDecl, Function, FunctionKind, FunctionSpecialization, Local, LocalKind, Mutability,
-        Operand, Param, ParamMode, ParamRole, Place, Program, Projection, RValue, RawEnumValue,
-        Signature, TypeData, VariantDecl, VariantId, VariantShape,
+        self, AggregateCtor, AirBody, AirOptionalMatch, CallArg, Callee, ConstData, ConstValue,
+        EnumDecl, ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl, ExternRep,
+        ExternTypeDecl, FieldDecl, Function, FunctionKind, FunctionSpecialization, Local,
+        LocalKind, Mutability, Operand, Param, ParamMode, ParamRole, Place, Program, Projection,
+        RValue, RawEnumValue, Signature, TypeData, VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -18,11 +18,11 @@ use super::{
         RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern,
         RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatKind,
         RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLocal, RirLocalId, RirLoop, RirLoopId,
-        RirOperand, RirParam, RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirProjection,
-        RirRValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        RirVerifyErrorKind,
+        RirOperand, RirOptionMatch, RirParam, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
+        RirProjection, RirRValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
+        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
+        RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, RirVerifyErrorKind,
     },
     source_job::{self, SourceJobStatus},
 };
@@ -467,6 +467,22 @@ fn profile_rejects_unsupported_dataref_payloads() {
 #[test]
 fn profile_accepts_dataref_field_projections() {
     check(dataref_field_projection_program());
+}
+
+#[test]
+fn profile_rejects_payload_ref_through_dataref_projection() {
+    expect_reject(
+        dataref_optional_payload_ref_program(),
+        ProfileErrorKind::UnsupportedPlaceProjection,
+    );
+}
+
+#[test]
+fn profile_rejects_optional_payload_copy_from_void_ref() {
+    expect_reject(
+        optional_void_payload_copy_program(),
+        ProfileErrorKind::NonCopyValueRequired,
+    );
 }
 
 #[test]
@@ -1301,6 +1317,7 @@ fn rir_verify_rejects_noncopy_value_call_arg() {
                     mutable: false,
                     symbol: RirSymbol::new("xs"),
                     initialized: true,
+                    payload_ref: false,
                 }],
                 body: RirStructuredBlock {
                     stmts: vec![],
@@ -1319,6 +1336,7 @@ fn rir_verify_rejects_noncopy_value_call_arg() {
                     mutable: false,
                     symbol: RirSymbol::new("xs"),
                     initialized: true,
+                    payload_ref: false,
                 }],
                 body: RirStructuredBlock {
                     stmts: vec![RirStmt::Eval(RirRValue::Call {
@@ -1403,6 +1421,7 @@ fn rir_verify_rejects_bad_struct_construction_and_projection() {
         ty: RirTypeId::from_index(0),
         mutable: true,
         initialized: false,
+        payload_ref: false,
     });
     program.functions[0].locals.push(RirLocal {
         id: RirLocalId::from_index(1),
@@ -1410,6 +1429,7 @@ fn rir_verify_rejects_bad_struct_construction_and_projection() {
         ty: RirTypeId::from_index(1),
         mutable: true,
         initialized: false,
+        payload_ref: false,
     });
     program.functions[0].body.stmts = vec![
         RirStmt::Init {
@@ -2655,6 +2675,7 @@ fn rir_verify_rejects_return_from_uninitialized_local() {
         mutable: false,
         symbol: RirSymbol::new("v0"),
         initialized: false,
+        payload_ref: false,
     });
     program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace {
         local: RirLocalId::from_index(0),
@@ -2892,6 +2913,7 @@ fn rir_verify_rejects_bad_call_arg_mode() {
             mutable: false,
             symbol: RirSymbol::new("arg"),
             initialized: true,
+            payload_ref: false,
         }],
         body: RirStructuredBlock {
             stmts: vec![],
@@ -3136,6 +3158,7 @@ fn rir_verify_accepts_string_value_abi() {
         mutable: false,
         symbol: RirSymbol::new("s"),
         initialized: true,
+        payload_ref: false,
     });
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -3199,6 +3222,7 @@ fn rir_verify_rejects_supported_type_semantic_abi_mismatch() {
         mutable: false,
         symbol: RirSymbol::new("x"),
         initialized: true,
+        payload_ref: false,
     });
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -3314,6 +3338,7 @@ fn rir_verify_rejects_param_init_and_reinit() {
         mutable: false,
         symbol: RirSymbol::new("p"),
         initialized: true,
+        payload_ref: false,
     });
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -3340,6 +3365,7 @@ fn rir_verify_accepts_mut_borrow_abi() {
         mutable: true,
         symbol: RirSymbol::new("p"),
         initialized: true,
+        payload_ref: false,
     });
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -3492,6 +3518,7 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
                 mutable: true,
                 symbol: RirSymbol::new("node"),
                 initialized: true,
+                payload_ref: false,
             },
             RirLocal {
                 id: RirLocalId::from_index(1),
@@ -3499,6 +3526,7 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
                 mutable: false,
                 symbol: RirSymbol::new("index"),
                 initialized: true,
+                payload_ref: false,
             },
             RirLocal {
                 id: RirLocalId::from_index(2),
@@ -3506,6 +3534,7 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
                 mutable: false,
                 symbol: RirSymbol::new("out"),
                 initialized: false,
+                payload_ref: false,
             },
         ],
         body: RirStructuredBlock {
@@ -3564,6 +3593,7 @@ fn enum_match_rir(
         mutable: false,
         symbol: RirSymbol::new("v0"),
         initialized: true,
+        payload_ref: false,
     });
     program.functions[0].body = RirStructuredBlock {
         stmts: vec![RirStmt::EnumMatch(RirEnumMatch {
@@ -3711,6 +3741,89 @@ fn dataref_field_projection_program() -> Program {
                 },
             ],
             air::AirTail::Return(Some(Operand::Place(place(out, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program
+}
+
+fn dataref_optional_payload_ref_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let option = program.alloc_type(TypeData::Optional(int));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let aggregate = dataref_decl(&mut program, module, option);
+    let node = program.alloc_type(TypeData::DataRef(aggregate));
+    let arg = air::LocalId::from_index(0);
+    let payload = air::LocalId::from_index(1);
+    let discr = Place {
+        root: arg,
+        projection: vec![Projection::Field(air::FieldId::from_index(0))],
+        ty: option,
+    };
+    let main = program.alloc_function(Function {
+        name: Ident::new("update"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("node", node, ParamMode::Value, arg)], void),
+        locals: vec![
+            Local {
+                name: None,
+                ty: node,
+                mutability: Mutability::Mutable,
+                kind: LocalKind::Arg,
+            },
+            Local {
+                name: None,
+                ty: int,
+                mutability: Mutability::Mutable,
+                kind: LocalKind::PatternBinding,
+            },
+        ],
+        body: structured_body(
+            vec![Statement::OptionalMatch(AirOptionalMatch {
+                discr,
+                payload: Some(payload),
+                payload_ref: true,
+                payload_escapes: false,
+                some_block: air::AirBlock::default(),
+                none_block: air::AirBlock::default(),
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program
+}
+
+fn optional_void_payload_copy_program() -> Program {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let option = program.alloc_type(TypeData::Optional(void));
+    let module = program.alloc_module(root_module());
+    let arg = air::LocalId::from_index(0);
+    let payload = air::LocalId::from_index(1);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("value", option, ParamMode::Value, arg)], void),
+        locals: vec![local(option, LocalKind::Arg), local(void, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::OptionalMatch(AirOptionalMatch {
+                discr: place(arg, option),
+                payload: Some(payload),
+                payload_ref: false,
+                payload_escapes: false,
+                some_block: air::AirBlock::default(),
+                none_block: air::AirBlock::default(),
+            })],
+            air::AirTail::Return(None),
         ),
     });
     program.module_mut(module).functions.push(main);
@@ -5279,6 +5392,374 @@ mod enums {
     }
 }
 
+#[test]
+fn rir_option_match_verifies_and_emits_match_by_ref() {
+    let program = option_match_rir();
+    let verified = rir::verify(&program).expect("RIR verify failed");
+    let source = emit::emit(&verified).into_string();
+
+    assert!(source.contains("match &opt"));
+    assert!(source.contains("Some(__anv_option_payload)"));
+    assert!(source.contains("payload = *(__anv_option_payload);"));
+    assert!(!source.contains("__anv_option_payload = *(__anv_option_payload);"));
+    assert!(!source.contains("unwrap()"));
+}
+
+#[test]
+fn rir_option_match_rejects_bad_discriminant_payload_type_and_mutable_payload() {
+    let mut bad_discr = option_match_rir();
+    let int = RirTypeId::from_index(0);
+    if let RirStmt::OptionMatch(match_) = &mut bad_discr.functions[0].body.stmts[0] {
+        match_.discr.ty = int;
+    }
+    let errors = rir::verify(&bad_discr).expect_err("bad option discr should fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::UnsupportedRValueType)
+    );
+
+    let mut bad_payload = option_match_rir();
+    let option = RirTypeId::from_index(1);
+    bad_payload.types.push(RirType::Bool);
+    bad_payload.functions[0].locals[1].ty = RirTypeId::from_index(2);
+    if let RirStmt::OptionMatch(match_) = &mut bad_payload.functions[0].body.stmts[0] {
+        match_.discr.ty = option;
+    }
+    let errors = rir::verify(&bad_payload).expect_err("bad payload should fail");
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        RirVerifyErrorKind::TypeMismatch { expected, found }
+            if expected == int && found == RirTypeId::from_index(2)
+    )));
+
+    let mut mutable_payload = option_match_rir();
+    mutable_payload.functions[0].locals[1].mutable = true;
+    let errors = rir::verify(&mutable_payload).expect_err("mutable payload should fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::ImmutableAssign)
+    );
+}
+
+#[test]
+fn rir_optional_some_rejects_non_shareable_place_value() {
+    let mut program = option_match_rir();
+    let slice = RirTypeId::from_index(2);
+    let option = RirTypeId::from_index(1);
+    program.types.push(RirType::Slice(RirTypeId::from_index(0)));
+    program.types[1] = RirType::Option(slice);
+    program.functions[0].params[0].ty = option;
+    program.functions[0].locals[0].ty = option;
+    program.functions[0].locals[1].ty = slice;
+    program.functions[0].locals[1].initialized = true;
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::Eval(RirRValue::OptionalSome {
+            value: RirOperand::Place(RirPlace {
+                local: RirLocalId::from_index(1),
+                projections: vec![],
+                ty: slice,
+            }),
+            ty: option,
+        })],
+        term: RirTerm::Unreachable,
+    };
+    let errors = rir::verify(&program).expect_err("slice some should fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::NonCopyValueRequired)
+    );
+}
+
+#[test]
+fn rir_option_match_rejects_payload_copy_from_unowned_ref() {
+    let mut slice_payload = option_match_rir();
+    let slice = RirTypeId::from_index(2);
+    slice_payload
+        .types
+        .push(RirType::Slice(RirTypeId::from_index(0)));
+    slice_payload.types[1] = RirType::Option(slice);
+    slice_payload.functions[0].params[0].ty = RirTypeId::from_index(1);
+    slice_payload.functions[0].locals[0].ty = RirTypeId::from_index(1);
+    slice_payload.functions[0].locals[1].ty = slice;
+    if let RirStmt::OptionMatch(match_) = &mut slice_payload.functions[0].body.stmts[0] {
+        match_.discr.ty = RirTypeId::from_index(1);
+        match_.some_block.term = RirTerm::Unreachable;
+        match_.none_block.term = RirTerm::Unreachable;
+    }
+    let errors = rir::verify(&slice_payload).expect_err("slice payload should fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::NonCopyValueRequired)
+    );
+
+    let mut void_payload = option_match_rir();
+    let void = RirTypeId::from_index(2);
+    void_payload.types.push(RirType::Void);
+    void_payload.types[1] = RirType::Option(void);
+    void_payload.functions[0].params[0].ty = RirTypeId::from_index(1);
+    void_payload.functions[0].locals[0].ty = RirTypeId::from_index(1);
+    void_payload.functions[0].locals[1].ty = void;
+    if let RirStmt::OptionMatch(match_) = &mut void_payload.functions[0].body.stmts[0] {
+        match_.discr.ty = RirTypeId::from_index(1);
+        match_.some_block.term = RirTerm::Unreachable;
+        match_.none_block.term = RirTerm::Unreachable;
+    }
+    let errors = rir::verify(&void_payload).expect_err("void payload should fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::NonCopyValueRequired)
+    );
+}
+
+#[test]
+fn rir_option_match_rejects_invalid_escaping_payload() {
+    let mut missing_payload = option_match_rir();
+    if let RirStmt::OptionMatch(match_) = &mut missing_payload.functions[0].body.stmts[0] {
+        match_.payload = None;
+        match_.payload_ref = true;
+        match_.payload_escapes = true;
+    }
+    let errors = rir::verify(&missing_payload).expect_err("escaping payload requires payload");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload)
+    );
+
+    let mut non_ref = option_match_rir();
+    if let RirStmt::OptionMatch(match_) = &mut non_ref.functions[0].body.stmts[0] {
+        match_.payload_escapes = true;
+    }
+    let errors = rir::verify(&non_ref).expect_err("escaping payload requires ref");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::OptionPayloadEscapeRequiresRef)
+    );
+
+    let mut falling_none = option_match_rir();
+    falling_none.functions[0].locals[0].mutable = true;
+    falling_none.functions[0].locals[1].mutable = true;
+    falling_none.functions[0].locals[1].payload_ref = true;
+    if let RirStmt::OptionMatch(match_) = &mut falling_none.functions[0].body.stmts[0] {
+        match_.payload_ref = true;
+        match_.payload_escapes = true;
+        match_.none_block.term = RirTerm::None;
+    }
+    let errors = rir::verify(&falling_none).expect_err("escaping none branch must diverge");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::OptionPayloadEscapeNoneMustDiverge)
+    );
+}
+
+#[test]
+fn rir_option_match_rejects_invalid_payload_ref_shape() {
+    let mut local_mismatch = option_match_rir();
+    local_mismatch.functions[0].locals[0].mutable = true;
+    local_mismatch.functions[0].locals[1].mutable = true;
+    if let RirStmt::OptionMatch(match_) = &mut local_mismatch.functions[0].body.stmts[0] {
+        match_.payload_ref = true;
+    }
+    let errors = rir::verify(&local_mismatch).expect_err("payload_ref needs payload local flag");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::OptionPayloadRefLocalMismatch)
+    );
+
+    let mut immutable_discr = option_match_rir();
+    immutable_discr.functions[0].locals[1].mutable = true;
+    immutable_discr.functions[0].locals[1].payload_ref = true;
+    if let RirStmt::OptionMatch(match_) = &mut immutable_discr.functions[0].body.stmts[0] {
+        match_.payload_ref = true;
+    }
+    let errors = rir::verify(&immutable_discr).expect_err("payload_ref needs mutable discriminant");
+    assert!(errors.iter().any(|error| {
+        error.kind == RirVerifyErrorKind::OptionPayloadRefDiscriminantMustBeMutable
+    }));
+
+    let mut stray_payload_ref = option_match_rir();
+    stray_payload_ref.functions[0].locals[1].payload_ref = true;
+    let errors = rir::verify(&stray_payload_ref).expect_err("payload_ref needs option match owner");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::OptionPayloadRefWithoutOwner)
+    );
+
+    let mut normal_init_payload_ref = option_match_rir();
+    normal_init_payload_ref.functions[0].locals[0].mutable = true;
+    normal_init_payload_ref.functions[0].locals[1].mutable = true;
+    normal_init_payload_ref.functions[0].locals[1].payload_ref = true;
+    if let RirStmt::OptionMatch(match_) = &mut normal_init_payload_ref.functions[0].body.stmts[0] {
+        match_.payload_ref = true;
+    }
+    normal_init_payload_ref.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Init {
+            local: RirLocalId::from_index(1),
+            value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+        });
+    let errors = rir::verify(&normal_init_payload_ref)
+        .expect_err("payload_ref local must be initialized only by option match");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InitPayloadRefLocal)
+    );
+
+    let mut nested_scoped_ref_used_after_block = option_match_rir();
+    nested_scoped_ref_used_after_block.types.push(RirType::Bool);
+    nested_scoped_ref_used_after_block.consts.push(RirConst {
+        id: RirConstId::from_index(1),
+        ty: RirTypeId::from_index(2),
+        value: RirConstValue::Bool(true),
+    });
+    nested_scoped_ref_used_after_block.functions[0].locals[0].mutable = true;
+    nested_scoped_ref_used_after_block.functions[0].locals[1].mutable = true;
+    nested_scoped_ref_used_after_block.functions[0].locals[1].payload_ref = true;
+    let mut option_match = nested_scoped_ref_used_after_block.functions[0]
+        .body
+        .stmts
+        .remove(0);
+    if let RirStmt::OptionMatch(match_) = &mut option_match {
+        match_.payload_ref = true;
+        match_.payload_escapes = true;
+        match_.some_block.term = RirTerm::None;
+        match_.none_block.term = RirTerm::Unreachable;
+    }
+    nested_scoped_ref_used_after_block.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::If(RirIf {
+            cond: RirOperand::Const(RirConstId::from_index(1)),
+            then_block: RirStructuredBlock {
+                stmts: vec![option_match],
+                term: RirTerm::None,
+            },
+            else_block: None,
+        }));
+    nested_scoped_ref_used_after_block.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(1),
+            projections: vec![],
+            ty: RirTypeId::from_index(0),
+        }))));
+    let errors = rir::verify(&nested_scoped_ref_used_after_block)
+        .expect_err("payload_ref from nested block must not escape block scope");
+    assert!(errors.iter().any(|error| {
+        error.kind == RirVerifyErrorKind::UninitializedLocal(RirLocalId::from_index(1))
+    }));
+
+    let mut scoped_ref_used_after_match = option_match_rir();
+    scoped_ref_used_after_match.functions[0].locals[0].mutable = true;
+    scoped_ref_used_after_match.functions[0].locals[1].mutable = true;
+    scoped_ref_used_after_match.functions[0].locals[1].payload_ref = true;
+    if let RirStmt::OptionMatch(match_) =
+        &mut scoped_ref_used_after_match.functions[0].body.stmts[0]
+    {
+        match_.payload_ref = true;
+        match_.some_block.term = RirTerm::None;
+        match_.none_block.term = RirTerm::Unreachable;
+    }
+    scoped_ref_used_after_match.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(1),
+            projections: vec![],
+            ty: RirTypeId::from_index(0),
+        }))));
+    let errors = rir::verify(&scoped_ref_used_after_match)
+        .expect_err("non-escaping payload_ref must not outlive match arm");
+    assert!(errors.iter().any(|error| {
+        error.kind == RirVerifyErrorKind::UninitializedLocal(RirLocalId::from_index(1))
+    }));
+}
+
+fn option_match_rir() -> RirProgram {
+    let int = RirTypeId::from_index(0);
+    let option = RirTypeId::from_index(1);
+    let zero = RirConstId::from_index(0);
+    let opt = RirLocalId::from_index(0);
+    let payload = RirLocalId::from_index(1);
+    RirProgram {
+        types: vec![RirType::Int, RirType::Option(int)],
+        consts: vec![RirConst {
+            id: zero,
+            ty: int,
+            value: RirConstValue::Int(0),
+        }],
+        functions: vec![RirFunction {
+            id: RirFunctionId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("main"),
+            params: vec![RirParam {
+                local: opt,
+                ty: option,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+            }],
+            ret: RirReturn { ty: int },
+            locals: vec![
+                RirLocal {
+                    id: opt,
+                    ty: option,
+                    mutable: false,
+                    symbol: RirSymbol::new("opt"),
+                    initialized: true,
+                    payload_ref: false,
+                },
+                RirLocal {
+                    id: payload,
+                    ty: int,
+                    mutable: false,
+                    symbol: RirSymbol::new("payload"),
+                    initialized: false,
+                    payload_ref: false,
+                },
+            ],
+            body: RirStructuredBlock {
+                stmts: vec![RirStmt::OptionMatch(RirOptionMatch {
+                    discr: RirPlace {
+                        local: opt,
+                        projections: vec![],
+                        ty: option,
+                    },
+                    payload: Some(payload),
+                    payload_ref: false,
+                    payload_escapes: false,
+                    some_block: RirStructuredBlock {
+                        stmts: vec![],
+                        term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
+                            local: payload,
+                            projections: vec![],
+                            ty: int,
+                        }))),
+                    },
+                    none_block: RirStructuredBlock {
+                        stmts: vec![],
+                        term: RirTerm::Return(Some(RirOperand::Const(zero))),
+                    },
+                })],
+                term: RirTerm::Unreachable,
+            },
+        }],
+        entry: Some(RirFunctionId::from_index(0)),
+        ..RirProgram::default()
+    }
+}
+
 mod arrays {
     use super::*;
 
@@ -5695,6 +6176,7 @@ mod arrays {
                     mutable: false,
                     symbol: RirSymbol::new("a"),
                     initialized: true,
+                    payload_ref: false,
                 },
                 RirLocal {
                     id: RirLocalId::from_index(1),
@@ -5702,6 +6184,7 @@ mod arrays {
                     mutable: false,
                     symbol: RirSymbol::new("i"),
                     initialized: true,
+                    payload_ref: false,
                 },
             ],
             body: RirStructuredBlock {
@@ -6351,6 +6834,7 @@ fn rir_verifies_raw_enum_metadata_and_cast() {
             mutable: false,
             symbol: RirSymbol::new("state"),
             initialized: true,
+            payload_ref: false,
         }],
         body: RirStructuredBlock {
             stmts: vec![RirStmt::Eval(RirRValue::Cast {
@@ -6816,6 +7300,7 @@ fn native_string_return_program() -> RirProgram {
         mutable: false,
         symbol: RirSymbol::new("s"),
         initialized: false,
+        payload_ref: false,
     });
     program.functions[0].body.stmts.push(RirStmt::Init {
         local: RirLocalId::from_index(0),

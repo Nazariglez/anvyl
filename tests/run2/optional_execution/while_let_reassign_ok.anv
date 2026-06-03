@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 2
+// 1
+// @match-end
+
+fn main() {
+    var value: int? = 2;
+    while let v? = value {
+        println(v);
+        value = if v == 2 { 1 } else { nil };
+    }
+}

@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 8
+
+fn main() {
+    var opt: int? = 3;
+    var value? = opt else return;
+    value = 8;
+    println(opt ?? 0);
+}

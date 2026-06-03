@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @skip: clean rust enum tuple payload match lowering is not implemented
+// @expect: success
+// @match: 5
+
+enum Slot { Item(int?) }
+
+fn main() {
+    let slot = Slot.Item(5);
+    match slot {
+        Slot.Item(value) => println(value ?? 0),
+    }
+}

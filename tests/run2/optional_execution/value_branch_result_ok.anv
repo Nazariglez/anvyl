@@ -1,0 +1,10 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 8
+
+fn main() {
+    let flag = true;
+    let value: int? = if flag { 8 } else { nil };
+    println(value ?? 0);
+}

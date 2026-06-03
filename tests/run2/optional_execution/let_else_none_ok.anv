@@ -1,0 +1,10 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: none
+
+fn main() {
+    let value: int? = nil;
+    let nil = value else return;
+    println("none");
+}

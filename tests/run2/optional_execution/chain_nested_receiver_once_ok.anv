@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// make
+// 12
+// @match-end
+
+struct Inner { value: int }
+struct Outer { inner: Inner? }
+
+fn make() -> Outer? {
+    println("make");
+    Outer { inner: Inner { value: 12 } }
+}
+
+fn main() {
+    println(make()?.inner?.value ?? 0);
+}

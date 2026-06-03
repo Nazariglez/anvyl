@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// index
+// 15
+// @match-end
+
+fn index() -> int {
+    println("index");
+    0
+}
+
+fn main() {
+    let values: [int]? = [15];
+    println(values?[index()] ?? 0);
+}

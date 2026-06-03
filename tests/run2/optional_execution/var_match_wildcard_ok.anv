@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: seen
+
+fn main() {
+    var opt: int? = nil;
+    match var opt {
+        _ => println("seen"),
+    };
+}

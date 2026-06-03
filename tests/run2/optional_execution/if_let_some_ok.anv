@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 10
+
+fn main() {
+    let value: int? = 10;
+    if let v? = value {
+        println(v);
+    }
+}

@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 7
+
+fn show(x: int?) {
+    println(x ?? 0);
+}
+
+fn main() {
+    show(7);
+}

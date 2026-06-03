@@ -7,9 +7,9 @@ use super::{
     rir::{
         RirCallArg, RirCallTarget, RirConst, RirConstValue, RirEnum, RirEnumMatch, RirEnumRepr,
         RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
-        RirIf, RirLoop, RirLoopId, RirOperand, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
-        RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId,
-        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirIf, RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic,
+        RirPlace, RirProgram, RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -92,6 +92,10 @@ fn stmt_calls_fallible(program: &RirProgram, fallible: &[bool], stmt: &RirStmt) 
                     .is_some_and(|block| block_calls_fallible(program, fallible, block))
         }
         RirStmt::Loop(loop_) => block_calls_fallible(program, fallible, &loop_.body),
+        RirStmt::OptionMatch(match_) => {
+            block_calls_fallible(program, fallible, &match_.some_block)
+                || block_calls_fallible(program, fallible, &match_.none_block)
+        }
         RirStmt::EnumMatch(match_) => {
             match_
                 .arms
@@ -476,7 +480,7 @@ impl EmitCx<'_> {
         let predeclare = block.stmts.iter().any(|stmt| {
             matches!(
                 stmt,
-                RirStmt::If(_) | RirStmt::Loop(_) | RirStmt::EnumMatch(_)
+                RirStmt::If(_) | RirStmt::Loop(_) | RirStmt::EnumMatch(_) | RirStmt::OptionMatch(_)
             )
         });
         if predeclare {
@@ -508,7 +512,7 @@ impl EmitCx<'_> {
 
     fn emit_local_declarations(&mut self, function: &RirFunction) {
         for local in &function.locals {
-            if function.params.iter().any(|param| param.local == local.id) {
+            if local.payload_ref || function.params.iter().any(|param| param.local == local.id) {
                 continue;
             }
             self.line(&format!(
@@ -537,6 +541,9 @@ impl EmitCx<'_> {
                         .is_some_and(|block| self.block_uses_ctx(block))
             }
             RirStmt::Loop(loop_) => self.block_uses_ctx(&loop_.body),
+            RirStmt::OptionMatch(match_) => {
+                self.block_uses_ctx(&match_.some_block) || self.block_uses_ctx(&match_.none_block)
+            }
             RirStmt::EnumMatch(match_) => {
                 match_
                     .arms
@@ -642,6 +649,9 @@ impl EmitCx<'_> {
             RirStmt::If(branch) => self.emit_if(function, branch, indent, predeclared),
             RirStmt::Loop(loop_) => self.emit_loop(function, loop_, indent, predeclared),
             RirStmt::EnumMatch(match_) => self.emit_match(function, match_, indent, predeclared),
+            RirStmt::OptionMatch(match_) => {
+                self.emit_option_match(function, match_, indent, predeclared);
+            }
         }
     }
 
@@ -713,6 +723,89 @@ impl EmitCx<'_> {
             self.line(&format!("{indent}    }}"));
         }
         self.line(&format!("{indent}}}"));
+    }
+
+    fn emit_option_match(
+        &mut self,
+        function: &RirFunction,
+        match_: &RirOptionMatch,
+        indent: &str,
+        predeclared: bool,
+    ) {
+        let RirType::Option(inner) = self.program.types[match_.discr.ty.index()] else {
+            unreachable!("verified option match")
+        };
+        let borrow = if match_.payload_ref { "&mut " } else { "&" };
+        if match_.payload_escapes {
+            let payload = match_.payload.expect("escaping option payload local");
+            let local = &function.locals[payload.index()];
+            self.line(&format!(
+                "{indent}let Some({}) = {borrow}{} else {{",
+                local.symbol.as_str(),
+                self.place(function, &match_.discr)
+            ));
+            self.emit_structured_block(
+                function,
+                &match_.none_block,
+                &format!("{indent}    "),
+                predeclared,
+            );
+            self.line(&format!("{indent}}};"));
+            self.emit_structured_block(function, &match_.some_block, indent, predeclared);
+            return;
+        }
+        self.line(&format!(
+            "{indent}match {borrow}{} {{",
+            self.place(function, &match_.discr)
+        ));
+        let payload_ref = match match_.payload {
+            Some(payload) if match_.payload_ref => {
+                function.locals[payload.index()].symbol.as_str().to_string()
+            }
+            _ => self.fresh_option_payload_ref(function),
+        };
+        self.line(&format!("{indent}    Some({payload_ref}) => {{"));
+        if let Some(payload) = match_.payload
+            && !match_.payload_ref
+        {
+            let local = &function.locals[payload.index()];
+            self.line(&format!(
+                "{indent}        {} = {};",
+                local.symbol.as_str(),
+                self.value_from_ref(inner, &payload_ref)
+            ));
+        }
+        self.emit_structured_block(
+            function,
+            &match_.some_block,
+            &format!("{indent}        "),
+            predeclared,
+        );
+        self.line(&format!("{indent}    }}"));
+        self.line(&format!("{indent}    None => {{"));
+        self.emit_structured_block(
+            function,
+            &match_.none_block,
+            &format!("{indent}        "),
+            predeclared,
+        );
+        self.line(&format!("{indent}    }}"));
+        self.line(&format!("{indent}}}"));
+    }
+
+    fn fresh_option_payload_ref(&self, function: &RirFunction) -> String {
+        let base = "__anv_option_payload";
+        let mut candidate = base.to_string();
+        let mut index = 0;
+        while function
+            .locals
+            .iter()
+            .any(|local| local.symbol.as_str() == candidate)
+        {
+            index += 1;
+            candidate = format!("{base}_{index}");
+        }
+        candidate
     }
 
     fn emit_structured_block(
@@ -1186,7 +1279,9 @@ impl EmitCx<'_> {
 
     fn place(&self, function: &RirFunction, place: &RirPlace) -> String {
         let symbol = function.locals[place.local.index()].symbol.as_str();
-        let mut out = if self.mut_borrowed_root_param(function, place) {
+        let mut out = if self.mut_borrowed_root_param(function, place)
+            || function.locals[place.local.index()].payload_ref
+        {
             format!("(*{symbol})")
         } else {
             symbol.to_string()

@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 3
+
+fn main() {
+    var opt: int? = 1;
+    while var value? = opt {
+        value += 1;
+        if value == 3 {
+            break;
+        }
+    }
+    println(opt ?? 0);
+}

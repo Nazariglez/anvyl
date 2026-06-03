@@ -236,6 +236,7 @@ pub struct RirLocal {
     pub mutable: bool,
     pub symbol: RirSymbol,
     pub initialized: bool,
+    pub payload_ref: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,6 +259,7 @@ pub enum RirStmt {
     If(RirIf),
     Loop(RirLoop),
     EnumMatch(RirEnumMatch),
+    OptionMatch(RirOptionMatch),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -290,6 +292,16 @@ pub struct RirEnumMatch {
 pub struct RirEnumMatchArm {
     pub variant: RirVariantId,
     pub block: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RirOptionMatch {
+    pub discr: RirPlace,
+    pub payload: Option<RirLocalId>,
+    pub payload_ref: bool,
+    pub payload_escapes: bool,
+    pub some_block: RirStructuredBlock,
+    pub none_block: RirStructuredBlock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -571,6 +583,7 @@ pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVer
         errors: vec![],
         initialized: vec![],
         possibly_initialized: vec![],
+        payload_ref_owned: vec![],
         loops: vec![],
     };
     cx.check();
@@ -640,6 +653,13 @@ pub enum RirVerifyErrorKind {
     CallArgMode,
     DuplicateMatchArm,
     MatchNotExhaustive,
+    OptionPayloadEscapeRequiresPayload,
+    OptionPayloadEscapeRequiresRef,
+    OptionPayloadEscapeNoneMustDiverge,
+    OptionPayloadRefLocalMismatch,
+    OptionPayloadRefDiscriminantMustBeMutable,
+    OptionPayloadRefWithoutOwner,
+    InitPayloadRefLocal,
     BreakOutsideLoop(RirLoopId),
     ContinueOutsideLoop(RirLoopId),
 }
@@ -657,6 +677,7 @@ struct VerifyCx<'a> {
     errors: Vec<RirVerifyError>,
     initialized: Vec<bool>,
     possibly_initialized: Vec<bool>,
+    payload_ref_owned: Vec<bool>,
     loops: Vec<RirLoopId>,
 }
 
@@ -1189,12 +1210,14 @@ impl VerifyCx<'_> {
         }
         let previous_initialized = std::mem::take(&mut self.initialized);
         let previous_possible = std::mem::take(&mut self.possibly_initialized);
+        let previous_payload_ref_owned = std::mem::take(&mut self.payload_ref_owned);
         self.initialized = function
             .locals
             .iter()
             .map(|local| local.initialized)
             .collect();
         self.possibly_initialized.clone_from(&self.initialized);
+        self.payload_ref_owned = vec![false; function.locals.len()];
         for param in &function.params {
             if let Some(initialized) = self.initialized.get_mut(param.local.index()) {
                 *initialized = true;
@@ -1207,6 +1230,20 @@ impl VerifyCx<'_> {
             self.check_stmt(id, function, stmt_index, stmt);
         }
         self.check_term(id, function, &function.body.term);
+        for local in &function.locals {
+            if local.payload_ref
+                && !self
+                    .payload_ref_owned
+                    .get(local.id.index())
+                    .copied()
+                    .unwrap_or(false)
+            {
+                self.push(
+                    RirVerifySite::Local(id, local.id),
+                    RirVerifyErrorKind::OptionPayloadRefWithoutOwner,
+                );
+            }
+        }
         if self.structured_block_falls_through(&function.body)
             && !matches!(self.ty(function.ret.ty), Some(RirType::Void))
         {
@@ -1217,6 +1254,7 @@ impl VerifyCx<'_> {
         }
         self.initialized = previous_initialized;
         self.possibly_initialized = previous_possible;
+        self.payload_ref_owned = previous_payload_ref_owned;
     }
 
     fn check_stmt(
@@ -1232,6 +1270,13 @@ impl VerifyCx<'_> {
                 self.check_local_id(site, function, *local);
                 if function.params.iter().any(|param| param.local == *local) {
                     self.push(site, RirVerifyErrorKind::InitParamLocal);
+                }
+                if function
+                    .locals
+                    .get(local.index())
+                    .is_some_and(|local| local.payload_ref)
+                {
+                    self.push(site, RirVerifyErrorKind::InitPayloadRefLocal);
                 }
                 if self
                     .possibly_initialized
@@ -1296,6 +1341,7 @@ impl VerifyCx<'_> {
                     &branch.then_block,
                     entry_definite.clone(),
                     entry_possible.clone(),
+                    None,
                 );
                 let else_state = branch.else_block.as_ref().map_or(
                     Some((entry_definite.clone(), entry_possible.clone())),
@@ -1306,6 +1352,7 @@ impl VerifyCx<'_> {
                             else_block,
                             entry_definite.clone(),
                             entry_possible.clone(),
+                            None,
                         )
                     },
                 );
@@ -1319,6 +1366,7 @@ impl VerifyCx<'_> {
                     &loop_.body,
                     self.initialized.clone(),
                     self.possibly_initialized.clone(),
+                    None,
                 );
                 self.loops.pop();
             }
@@ -1352,6 +1400,7 @@ impl VerifyCx<'_> {
                         &arm.block,
                         entry_definite.clone(),
                         entry_possible.clone(),
+                        None,
                     ));
                 }
                 if let Some(else_block) = &match_.else_block {
@@ -1361,11 +1410,130 @@ impl VerifyCx<'_> {
                         else_block,
                         entry_definite.clone(),
                         entry_possible.clone(),
+                        None,
                     ));
                 } else if variant_count.is_some_and(|len| seen.len() < len) {
                     self.push(site, RirVerifyErrorKind::MatchNotExhaustive);
                 }
                 self.merge_structured_states(states);
+            }
+            RirStmt::OptionMatch(match_) => {
+                self.check_place(site, function, &match_.discr);
+                let inner = match self.ty(match_.discr.ty) {
+                    Some(RirType::Option(inner)) => Some(inner),
+                    _ => {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        None
+                    }
+                };
+                let entry_definite = self.initialized.clone();
+                let entry_possible = self.possibly_initialized.clone();
+                let mut some_definite = entry_definite.clone();
+                let mut some_possible = entry_possible.clone();
+                if (match_.payload_ref || match_.payload_escapes) && match_.payload.is_none() {
+                    self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload);
+                }
+                if match_.payload_escapes && !match_.payload_ref {
+                    self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresRef);
+                }
+                if match_.payload.is_some()
+                    && !match_.payload_ref
+                    && inner.is_some_and(|inner| {
+                        !RustRepPolicy::new(self.program).value_from_ref_supported(inner)
+                    })
+                {
+                    self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+                }
+                if let Some(payload) = match_.payload {
+                    if let Some(local) = function.locals.get(payload.index()) {
+                        if function.params.iter().any(|param| param.local == payload) {
+                            self.push(site, RirVerifyErrorKind::InitParamLocal);
+                        }
+                        if entry_possible
+                            .get(payload.index())
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            self.push(site, RirVerifyErrorKind::InitParamLocal);
+                        }
+                        if local.mutable != match_.payload_ref {
+                            self.push(site, RirVerifyErrorKind::ImmutableAssign);
+                        }
+                        if local.payload_ref != match_.payload_ref {
+                            self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
+                        }
+                        if match_.payload_ref
+                            && let Some(slot) = self.payload_ref_owned.get_mut(payload.index())
+                        {
+                            *slot = true;
+                        }
+                        if let Some(inner) = inner
+                            && local.ty != inner
+                        {
+                            self.push(
+                                site,
+                                RirVerifyErrorKind::TypeMismatch {
+                                    expected: inner,
+                                    found: local.ty,
+                                },
+                            );
+                        }
+                        if let Some(slot) = some_definite.get_mut(payload.index()) {
+                            *slot = true;
+                        }
+                        if let Some(slot) = some_possible.get_mut(payload.index()) {
+                            *slot = true;
+                        }
+                    } else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                    }
+                }
+                if match_.payload_ref
+                    && function
+                        .locals
+                        .get(match_.discr.local.index())
+                        .is_some_and(|local| !local.mutable)
+                {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::OptionPayloadRefDiscriminantMustBeMutable,
+                    );
+                }
+                let escaping_payload = (match_.payload_ref && match_.payload_escapes)
+                    .then_some(match_.payload)
+                    .flatten();
+                let mut some_state = self.check_structured_block(
+                    function_id,
+                    function,
+                    &match_.some_block,
+                    some_definite,
+                    some_possible,
+                    escaping_payload,
+                );
+                if match_.payload_ref
+                    && !match_.payload_escapes
+                    && let (Some(payload), Some((definite, possible))) =
+                        (match_.payload, &mut some_state)
+                {
+                    if let Some(slot) = definite.get_mut(payload.index()) {
+                        *slot = false;
+                    }
+                    if let Some(slot) = possible.get_mut(payload.index()) {
+                        *slot = false;
+                    }
+                }
+                let none_state = self.check_structured_block(
+                    function_id,
+                    function,
+                    &match_.none_block,
+                    entry_definite,
+                    entry_possible,
+                    None,
+                );
+                if match_.payload_escapes && none_state.is_some() {
+                    self.push(site, RirVerifyErrorKind::OptionPayloadEscapeNoneMustDiverge);
+                }
+                self.merge_structured_states([some_state, none_state]);
             }
         }
     }
@@ -1377,6 +1545,7 @@ impl VerifyCx<'_> {
         body: &RirStructuredBlock,
         definite: Vec<bool>,
         possible: Vec<bool>,
+        preserved_payload_ref: Option<RirLocalId>,
     ) -> Option<(Vec<bool>, Vec<bool>)> {
         let outer_definite = std::mem::replace(&mut self.initialized, definite);
         let outer_possible = std::mem::replace(&mut self.possibly_initialized, possible);
@@ -1385,8 +1554,21 @@ impl VerifyCx<'_> {
         }
         self.check_term(function_id, function, &body.term);
         let falls_through = self.structured_block_falls_through(body);
-        let result =
-            falls_through.then(|| (self.initialized.clone(), self.possibly_initialized.clone()));
+        let result = falls_through.then(|| {
+            let mut definite = self.initialized.clone();
+            let mut possible = self.possibly_initialized.clone();
+            for local in &function.locals {
+                if local.payload_ref && Some(local.id) != preserved_payload_ref {
+                    if let Some(slot) = definite.get_mut(local.id.index()) {
+                        *slot = false;
+                    }
+                    if let Some(slot) = possible.get_mut(local.id.index()) {
+                        *slot = false;
+                    }
+                }
+            }
+            (definite, possible)
+        });
         self.initialized = outer_definite;
         self.possibly_initialized = outer_possible;
         result
@@ -1419,6 +1601,10 @@ impl VerifyCx<'_> {
                     Some(block) => arm_falls || self.structured_block_falls_through(block),
                     None => arm_falls || !self.enum_match_is_exhaustive(match_),
                 }
+            }
+            RirStmt::OptionMatch(match_) => {
+                self.structured_block_falls_through(&match_.some_block)
+                    || self.structured_block_falls_through(&match_.none_block)
             }
             RirStmt::Loop(_) => true,
             RirStmt::Init { .. }
@@ -1637,7 +1823,7 @@ impl VerifyCx<'_> {
                 Some(*target)
             }
             RirRValue::OptionalSome { value, ty } => {
-                let value_ty = self.operand_ty(site, function, value);
+                let value_ty = self.value_operand_ty(site, function, value);
                 self.check_type_id(site, *ty);
                 match (self.ty(*ty), value_ty) {
                     (Some(RirType::Option(inner)), Some(value_ty)) if inner == value_ty => {}

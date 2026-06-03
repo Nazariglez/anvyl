@@ -304,6 +304,22 @@ impl ProfileCx<'_> {
                         self.check_air_block(function, else_block);
                     }
                 }
+                air::AirStmt::OptionalMatch(match_) => {
+                    self.check_place(site, &match_.discr);
+                    if match_.payload_ref && self.place_crosses_dataref(site, &match_.discr) {
+                        self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                    }
+                    if match_.payload.is_some()
+                        && !match_.payload_ref
+                        && let TypeData::Optional(inner) =
+                            self.program.type_arena.data(match_.discr.ty)
+                        && !self.policy().value_from_ref_supported(*inner)
+                    {
+                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
+                    }
+                    self.check_air_block(function, &match_.some_block);
+                    self.check_air_block(function, &match_.none_block);
+                }
                 air::AirStmt::Loop(loop_) => self.check_air_block(function, &loop_.body),
             }
         }
@@ -342,7 +358,7 @@ impl ProfileCx<'_> {
     fn check_local(&mut self, function: FunctionId, local: LocalId, data: &Local) {
         if !matches!(
             data.kind,
-            LocalKind::Arg | LocalKind::Temp | LocalKind::User
+            LocalKind::Arg | LocalKind::Temp | LocalKind::User | LocalKind::PatternBinding
         ) {
             self.push(
                 ProfileSite::Local(function, local),
@@ -399,6 +415,9 @@ impl ProfileCx<'_> {
             RValue::OptionalSome { value, ty } => {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *ty);
+                if self.non_shareable_value_operand(value) {
+                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
+                }
             }
             RValue::Stringify { value, source_ty } => {
                 self.check_operand(site, value);

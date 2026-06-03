@@ -26,12 +26,12 @@ use self::{
         RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm,
         RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
-        RirIf, RirLocal, RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand, RirParam,
-        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue,
-        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram,
+        RirIf, RirLocal, RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand,
+        RirOptionMatch, RirParam, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
+        RirRawEnumValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
+        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
+        RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -988,6 +988,7 @@ impl<'a> PlanCx<'a> {
                 mutable: local.mutability == Mutability::Mutable,
                 symbol: local_symbol(index, local.name.as_ref()),
                 initialized: local.kind == LocalKind::Arg,
+                payload_ref: false,
             })
             .collect::<Vec<_>>();
         for param in &function.signature.params {
@@ -1125,6 +1126,31 @@ impl<'a> PlanCx<'a> {
                         .as_ref()
                         .map(|block| self.plan_air_block(function, block, locals))
                         .transpose()?,
+                }));
+                Ok(stmts)
+            }
+            air::AirStmt::OptionalMatch(match_) => {
+                let discr = self.lower_place_read(function, &match_.discr, locals);
+                let RirOperand::Place(discr_place) = discr.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                let mut stmts = discr.stmts;
+                let payload = match_
+                    .payload
+                    .map(|payload| RirLocalId::from_index(payload.index()));
+                if match_.payload_ref
+                    && let Some(payload) = payload
+                    && let Some(local) = locals.get_mut(payload.index())
+                {
+                    local.payload_ref = true;
+                }
+                stmts.push(RirStmt::OptionMatch(RirOptionMatch {
+                    discr: discr_place,
+                    payload,
+                    payload_ref: match_.payload_ref,
+                    payload_escapes: match_.payload_escapes,
+                    some_block: self.plan_air_block(function, &match_.some_block, locals)?,
+                    none_block: self.plan_air_block(function, &match_.none_block, locals)?,
                 }));
                 Ok(stmts)
             }
@@ -1863,6 +1889,7 @@ impl<'a> PlanCx<'a> {
             mutable: false,
             symbol: local_symbol(index, None),
             initialized: false,
+            payload_ref: false,
         });
         id
     }

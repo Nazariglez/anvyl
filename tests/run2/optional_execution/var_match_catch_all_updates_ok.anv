@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: true
+
+fn main() {
+    var opt: int? = 2;
+    match var opt {
+        other => other = nil,
+    };
+    println(opt == nil);
+}
