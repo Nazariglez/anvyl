@@ -1990,25 +1990,43 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 expr_id: expr.node.id,
             });
         }
+        let place = self.self_place(expr)?;
+        if self.function.locals[place.root.index()].mutability != AirMutability::Mutable {
+            return Err(unsupported_expr(expr));
+        }
+        self.lower_projected_place(expr, place)
+    }
+
+    fn lower_shared_projected_place_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        if projection_root(expr).is_none() {
+            return self.materialize_shared_borrow_arg(expr);
+        }
+        self.lower_projected_read_place(expr)
+    }
+
+    fn lower_projected_read_place(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        let Some(root) = projection_root(expr) else {
+            return Err(unsupported_expr(expr));
+        };
+        if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
+            return self.lower_projected_place(expr, self.binding_place(fact.local)?);
+        }
+        if matches!(&root.node.kind, ExprKind::Ident(name) if name.as_str() == "self") {
+            return self.lower_projected_place(expr, self.self_place(expr)?);
+        }
+        Err(LowerError::MissingLocalUse {
+            body: Box::new(self.body.clone()),
+            expr_id: root.node.id,
+        })
+    }
+
+    fn self_place(&self, expr: &ExprNode) -> Result<Place, LowerError> {
         let Some(param) = self.function.signature.params.iter().find(|param| {
             param.role == ParamRole::Receiver || param.name == Some(Ident::new("self"))
         }) else {
             return Err(unsupported_expr(expr));
         };
-        if self.function.locals[param.local_id.index()].mutability != AirMutability::Mutable {
-            return Err(unsupported_expr(expr));
-        }
-        self.lower_projected_place(expr, self.local_place(param.local_id))
-    }
-
-    fn lower_shared_projected_place_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
-        let Some(root) = projection_root(expr) else {
-            return self.materialize_shared_borrow_arg(expr);
-        };
-        let Ok(fact) = self.local_use(root, LocalUseMode::Read) else {
-            return self.materialize_shared_borrow_arg(expr);
-        };
-        self.lower_projected_place(expr, self.binding_place(fact.local)?)
+        Ok(self.local_place(param.local_id))
     }
 
     fn lower_shared_call_arg(
@@ -2080,18 +2098,8 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 self.project_field(expr, place, field.node.field)
             }
             ExprKind::TupleIndex(tuple) => {
-                let mut place = self.lower_projected_place(&tuple.node.target, root)?;
-                let TypeData::Tuple(elems) = self.cx.program.type_data(place.ty) else {
-                    return Err(unsupported_expr(expr));
-                };
-                let Some(ty) = elems.get(tuple.node.index as usize).copied() else {
-                    return Err(unsupported_expr(expr));
-                };
-                place
-                    .projection
-                    .push(crate::air::Projection::TupleField(tuple.node.index as u16));
-                place.ty = ty;
-                Ok(place)
+                let place = self.lower_projected_place(&tuple.node.target, root)?;
+                self.project_tuple_index(expr, place, tuple.node.index)
             }
             ExprKind::Index(index) => {
                 if index.node.safe {
@@ -2111,6 +2119,36 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             }
             _ => Err(unsupported_expr(expr)),
         }
+    }
+
+    fn project_tuple_index(
+        &self,
+        expr: &ExprNode,
+        mut place: Place,
+        index: u32,
+    ) -> Result<Place, LowerError> {
+        let TypeData::Tuple(elems) = self.cx.program.type_data(place.ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        let Some(ty) = elems.get(index as usize).copied() else {
+            return Err(unsupported_expr(expr));
+        };
+        place
+            .projection
+            .push(crate::air::Projection::TupleField(index));
+        place.ty = ty;
+        Ok(place)
+    }
+
+    fn project_tuple_index_operand(
+        &mut self,
+        value: Operand,
+        expr: &ExprNode,
+        index: u32,
+    ) -> Result<Operand, LowerError> {
+        let place = self.place_from_operand(value, expr)?;
+        self.project_tuple_index(expr, place, index)
+            .map(Operand::Place)
     }
 
     fn project_field(
@@ -2334,9 +2372,23 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 {
                     return Ok(value);
                 }
-                let fact = self.local_use(expr, LocalUseMode::Read)?;
-                let place = self.lower_place(expr, &fact)?;
-                Ok(Operand::Place(place))
+                match self.local_use(expr, LocalUseMode::Read) {
+                    Ok(fact) => {
+                        let place = self.lower_place(expr, &fact)?;
+                        Ok(Operand::Place(place))
+                    }
+                    Err(LowerError::MissingLocalUse { .. }) => {
+                        self.lower_projected_read_place(expr).map(Operand::Place)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            ExprKind::TupleIndex(tuple) => {
+                if let Some(value) = self.lower_safe_field_chain(expr)? {
+                    return Ok(value);
+                }
+                let value = self.lower_value(&tuple.node.target)?;
+                self.project_tuple_index_operand(value, expr, tuple.node.index)
             }
             ExprKind::Index(index) => {
                 if let Some(value) = self.lower_safe_field_chain(expr)? {
@@ -2416,6 +2468,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::IntrinsicCall(call) => self.lower_intrinsic_value(expr, call),
             ExprKind::StringInterp(parts) => self.lower_string_interp(parts),
             ExprKind::StructLiteral(literal) => self.lower_struct_literal(expr, literal),
+            ExprKind::Tuple(elems) => self.lower_tuple_literal(expr, elems),
             ExprKind::ArrayLiteral(literal) => self.lower_array_literal(expr, literal),
             ExprKind::ArrayFill(fill) => self.lower_array_fill(expr, fill),
             ExprKind::MapLiteral(literal) => self.lower_map_literal(expr, literal),
@@ -2426,46 +2479,73 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn lower_safe_field_chain(&mut self, expr: &ExprNode) -> Result<Option<Operand>, LowerError> {
-        let Some((base, steps)) = collect_field_chain(expr) else {
+        let Some((base, steps)) = collect_safe_field_chain(expr) else {
             return Ok(None);
         };
-        if !steps.iter().any(chain_step_is_safe) {
-            return Ok(None);
-        }
         let mut result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         if !matches!(self.cx.program.type_data(result_ty), TypeData::Optional(_)) {
             result_ty = self.cx.optional_ty(result_ty);
         }
         let result = self.temp(result_ty);
-        if let Some((
-            ChainStep::Call {
-                expr: call_expr,
-                node,
-            },
-            rest,
-        )) = steps.split_first()
+        self.lower_collected_field_chain(
+            base,
+            &steps,
+            expr,
+            ChainMode::Value { result, result_ty },
+        )?;
+        Ok(Some(Operand::Place(self.local_place(result))))
+    }
+
+    fn lower_safe_field_chain_effect(&mut self, expr: &ExprNode) -> Result<bool, LowerError> {
+        let Some((base, steps)) = collect_safe_field_chain(expr) else {
+            return Ok(false);
+        };
+        self.lower_collected_field_chain(base, &steps, expr, ChainMode::Effect)?;
+        Ok(true)
+    }
+
+    fn lower_collected_field_chain<'a>(
+        &mut self,
+        base: &'a ExprNode,
+        steps: &'a [ChainStep<'a>],
+        expr: &ExprNode,
+        mode: ChainMode,
+    ) -> Result<(), LowerError> {
+        let (base, steps) = self.lower_field_chain_base(base, steps)?;
+        self.lower_field_chain_steps(base, steps, expr, mode)
+    }
+
+    fn lower_field_chain_base<'a>(
+        &mut self,
+        base: &ExprNode,
+        steps: &'a [ChainStep<'a>],
+    ) -> Result<(Operand, &'a [ChainStep<'a>]), LowerError> {
+        if let Some((ChainStep::Call { expr, node }, rest)) = steps.split_first()
             && !node.node.safe
         {
-            let value = self.lower_call_value(call_expr, node)?;
-            self.lower_field_chain_steps(value, rest, result, result_ty, expr)?;
-            return Ok(Some(Operand::Place(self.local_place(result))));
+            let base = self.lower_call_value(expr, node)?;
+            return Ok((base, rest));
         }
-        let base = self.lower_value(base)?;
-        self.lower_field_chain_steps(base, &steps, result, result_ty, expr)?;
-        Ok(Some(Operand::Place(self.local_place(result))))
+        self.lower_value(base).map(|base| (base, steps))
     }
 
     fn lower_field_chain_steps(
         &mut self,
         current: Operand,
         steps: &[ChainStep<'_>],
-        result: LocalId,
-        result_ty: TypeId,
         site: &ExprNode,
+        mode: ChainMode,
     ) -> Result<(), LowerError> {
         let Some((step, rest)) = steps.split_first() else {
-            return self.emit_chain_result(current, result, result_ty, site);
+            return self.finish_field_chain(current, site, mode);
         };
+
+        if let Some((call_expr, call, call_rest)) = field_call_step(step, rest)
+            && !chain_step_is_safe(step)
+        {
+            return self
+                .lower_field_chain_method_call(current, call_expr, call, call_rest, site, mode);
+        }
 
         match step {
             ChainStep::Field { expr, node } if node.node.safe => {
@@ -2477,36 +2557,16 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     |this, payload| {
                         let payload =
                             Operand::Place(this.local_place(payload.expect("payload local")));
-                        if let Some((
-                            ChainStep::Call {
-                                expr: call_expr,
-                                node: call,
-                            },
-                            call_rest,
-                        )) = rest.split_first()
-                            && !call.node.safe
-                            && call.node.func.node.id == expr.node.id
-                        {
-                            let value =
-                                this.lower_method_call_with_receiver(payload, call_expr, call)?;
-                            return this.lower_field_chain_steps(
-                                value, call_rest, result, result_ty, site,
+                        if let Some((call_expr, call, call_rest)) = field_call_step(step, rest) {
+                            return this.lower_field_chain_method_call(
+                                payload, call_expr, call, call_rest, site, mode,
                             );
                         }
                         let place = this.place_from_operand(payload, expr)?;
                         let place = this.project_field(expr, place, node.node.field)?;
-                        this.lower_field_chain_steps(
-                            Operand::Place(place),
-                            rest,
-                            result,
-                            result_ty,
-                            site,
-                        )
+                        this.lower_field_chain_steps(Operand::Place(place), rest, site, mode)
                     },
-                    |this| {
-                        let none = this.optional_none(result_ty, site)?;
-                        this.emit_init(result, RValue::Use(none))
-                    },
+                    |this| this.skip_field_chain(site, mode),
                 )
             }
             ChainStep::Index { expr, node } if node.node.safe => {
@@ -2519,42 +2579,92 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                         let payload =
                             Operand::Place(this.local_place(payload.expect("payload local")));
                         let value = this.lower_index_step(payload, expr, node)?;
-                        this.lower_field_chain_steps(value, rest, result, result_ty, site)
+                        this.lower_field_chain_steps(value, rest, site, mode)
                     },
-                    |this| {
-                        let none = this.optional_none(result_ty, site)?;
-                        this.emit_init(result, RValue::Use(none))
-                    },
+                    |this| this.skip_field_chain(site, mode),
                 )
-            }
-            ChainStep::Field { expr, node } => {
-                let place = self.place_from_operand(current, expr)?;
-                let place = self.project_field(expr, place, node.node.field)?;
-                self.lower_field_chain_steps(Operand::Place(place), rest, result, result_ty, site)
-            }
-            ChainStep::Index { expr, node } => {
-                let value = self.lower_index_step(current, expr, node)?;
-                self.lower_field_chain_steps(value, rest, result, result_ty, site)
             }
             ChainStep::Call { expr, node } if node.node.safe => {
                 let subject = self.optional_subject_from_operand(current, site)?;
                 self.emit_optional_match(
                     subject,
                     None,
-                    |this, _| {
-                        let value = this.lower_call_value(expr, node)?;
-                        this.lower_field_chain_steps(value, rest, result, result_ty, site)
-                    },
-                    |this| {
-                        let none = this.optional_none(result_ty, site)?;
-                        this.emit_init(result, RValue::Use(none))
-                    },
+                    |this, _| this.lower_field_chain_call(expr, node, rest, site, mode),
+                    |this| this.skip_field_chain(site, mode),
                 )
             }
-            ChainStep::Call { expr, node } => {
-                let value = self.lower_call_value(expr, node)?;
-                self.lower_field_chain_steps(value, rest, result, result_ty, site)
+            ChainStep::Field { expr, node } => {
+                let place = self.place_from_operand(current, expr)?;
+                let place = self.project_field(expr, place, node.node.field)?;
+                self.lower_field_chain_steps(Operand::Place(place), rest, site, mode)
             }
+            ChainStep::Index { expr, node } => {
+                let value = self.lower_index_step(current, expr, node)?;
+                self.lower_field_chain_steps(value, rest, site, mode)
+            }
+            ChainStep::TupleIndex { expr, node } => {
+                let value = self.project_tuple_index_operand(current, expr, node.node.index)?;
+                self.lower_field_chain_steps(value, rest, site, mode)
+            }
+            ChainStep::Call { expr, node } => {
+                self.lower_field_chain_call(expr, node, rest, site, mode)
+            }
+        }
+    }
+
+    fn lower_field_chain_call(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+        rest: &[ChainStep<'_>],
+        site: &ExprNode,
+        mode: ChainMode,
+    ) -> Result<(), LowerError> {
+        if matches!(mode, ChainMode::Effect) && rest.is_empty() {
+            let value = self.lower_call_rvalue(expr, call)?;
+            return self.emit_eval(value);
+        }
+        let value = self.lower_call_value(expr, call)?;
+        self.lower_field_chain_steps(value, rest, site, mode)
+    }
+
+    fn lower_field_chain_method_call(
+        &mut self,
+        receiver: Operand,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+        rest: &[ChainStep<'_>],
+        site: &ExprNode,
+        mode: ChainMode,
+    ) -> Result<(), LowerError> {
+        if matches!(mode, ChainMode::Effect) && rest.is_empty() {
+            return self.lower_method_call_effect_with_receiver(receiver, expr, call);
+        }
+        let value = self.lower_method_call_with_receiver(receiver, expr, call)?;
+        self.lower_field_chain_steps(value, rest, site, mode)
+    }
+
+    fn finish_field_chain(
+        &mut self,
+        value: Operand,
+        site: &ExprNode,
+        mode: ChainMode,
+    ) -> Result<(), LowerError> {
+        match mode {
+            ChainMode::Value { result, result_ty } => {
+                self.emit_chain_result(value, result, result_ty, site)
+            }
+            ChainMode::Effect => self.emit_eval(RValue::Use(value)),
+        }
+    }
+
+    fn skip_field_chain(&mut self, site: &ExprNode, mode: ChainMode) -> Result<(), LowerError> {
+        match mode {
+            ChainMode::Value { result, result_ty } => {
+                let none = self.optional_none(result_ty, site)?;
+                self.emit_init(result, RValue::Use(none))
+            }
+            ChainMode::Effect => Ok(()),
         }
     }
 
@@ -3050,6 +3160,38 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             RValue::Aggregate {
                 kind: AggregateCtor::Array,
                 fields: vec![value; *len],
+                ty,
+            },
+        )
+    }
+
+    fn lower_tuple_literal(
+        &mut self,
+        expr: &ExprNode,
+        elems: &[ExprNode],
+    ) -> Result<Operand, LowerError> {
+        let ty = self.lower_expr_ty(expr.node.id)?;
+        let Type::Tuple(expected) = &ty else {
+            return Err(unsupported_expr(expr));
+        };
+        if expected.len() != elems.len() {
+            return Err(unsupported_expr(expr));
+        }
+        let fields = elems
+            .iter()
+            .zip(expected)
+            .map(|(elem, ty)| {
+                self.cx
+                    .lower_ty(ty)
+                    .and_then(|ty| self.lower_value_to(elem, ty, expr))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ty = self.cx.lower_ty(&ty)?;
+        self.emit_typed_temp(
+            ty,
+            RValue::Aggregate {
+                kind: AggregateCtor::Tuple,
+                fields,
                 ty,
             },
         )
@@ -3898,6 +4040,29 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         expr: &ExprNode,
         call: &ast::CallNode,
     ) -> Result<Operand, LowerError> {
+        let value = self.lower_method_call_rvalue_with_receiver(receiver, expr, call)?;
+        if self.lower_expr_ty(expr.node.id)? == Type::Void {
+            return Err(unsupported_expr(expr));
+        }
+        self.emit_temp(value)
+    }
+
+    fn lower_method_call_effect_with_receiver(
+        &mut self,
+        receiver: Operand,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<(), LowerError> {
+        let value = self.lower_method_call_rvalue_with_receiver(receiver, expr, call)?;
+        self.emit_eval(value)
+    }
+
+    fn lower_method_call_rvalue_with_receiver(
+        &mut self,
+        receiver: Operand,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<RValue, LowerError> {
         let target = self
             .facts
             .calls
@@ -3949,14 +4114,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         )?;
         args.extend(defaults);
         self.require_call_arity(expr.node.id, &Callee::Function(callee), args.len())?;
-        let value = RValue::Call {
+        Ok(RValue::Call {
             callee: Callee::Function(callee),
             args,
-        };
-        if self.lower_expr_ty(expr.node.id)? == Type::Void {
-            return Err(unsupported_expr(expr));
-        }
-        self.emit_temp(value)
+        })
     }
 
     fn lower_operand_call_arg(
@@ -3974,7 +4135,26 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 };
                 Ok(CallArg::Value(value))
             }
-            ParamMode::SharedBorrow | ParamMode::MutBorrow => Err(unsupported_expr(site)),
+            ParamMode::SharedBorrow => {
+                if self.operand_ty(&value) != param.ty {
+                    return Err(unsupported_expr(site));
+                }
+                let place = match value {
+                    Operand::Place(place) => place,
+                    Operand::Const(id) => {
+                        self.materialize_shared_operand(site, Operand::Const(id), param.ty)?
+                    }
+                };
+                Ok(CallArg::SharedBorrow(place))
+            }
+            ParamMode::MutBorrow => {
+                let place = self.place_from_operand(value, site)?;
+                if place.ty != param.ty {
+                    return Err(unsupported_expr(site));
+                }
+                self.require_mutable_place(site, &place)?;
+                Ok(CallArg::MutBorrow(place))
+            }
         }
     }
 
@@ -4445,6 +4625,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn lower_effect(&mut self, expr: &ExprNode) -> Result<(), LowerError> {
+        if self.lower_safe_field_chain_effect(expr)? {
+            return Ok(());
+        }
         match &expr.node.kind {
             ExprKind::Assign(assign) => self.lower_assign(expr, assign),
             ExprKind::Block(block) => self.lower_block_effect(block),
@@ -5187,6 +5370,14 @@ pub(crate) fn lower_with_modules(
     Ok(cx.program)
 }
 
+fn collect_safe_field_chain(expr: &ExprNode) -> Option<(&ExprNode, Vec<ChainStep<'_>>)> {
+    let (base, steps) = collect_field_chain(expr)?;
+    steps
+        .iter()
+        .any(chain_step_is_safe)
+        .then_some((base, steps))
+}
+
 fn collect_field_chain(expr: &ExprNode) -> Option<(&ExprNode, Vec<ChainStep<'_>>)> {
     match &expr.node.kind {
         ExprKind::Field(field) => {
@@ -5199,6 +5390,12 @@ fn collect_field_chain(expr: &ExprNode) -> Option<(&ExprNode, Vec<ChainStep<'_>>
             let (base, mut steps) = collect_field_chain(&index.node.target)
                 .unwrap_or_else(|| (index.node.target.as_ref(), vec![]));
             steps.push(ChainStep::Index { expr, node: index });
+            Some((base, steps))
+        }
+        ExprKind::TupleIndex(tuple) => {
+            let (base, mut steps) = collect_field_chain(&tuple.node.target)
+                .unwrap_or_else(|| (tuple.node.target.as_ref(), vec![]));
+            steps.push(ChainStep::TupleIndex { expr, node: tuple });
             Some((base, steps))
         }
         ExprKind::Call(call) => {
@@ -5215,8 +5412,32 @@ fn chain_step_is_safe(step: &ChainStep<'_>) -> bool {
     match step {
         ChainStep::Field { node, .. } => node.node.safe,
         ChainStep::Index { node, .. } => node.node.safe,
+        ChainStep::TupleIndex { .. } => false,
         ChainStep::Call { node, .. } => node.node.safe,
     }
+}
+
+fn field_call_step<'a, 's>(
+    step: &'s ChainStep<'a>,
+    rest: &'s [ChainStep<'a>],
+) -> Option<(&'a ExprNode, &'a ast::CallNode, &'s [ChainStep<'a>])> {
+    let ChainStep::Field { expr, .. } = step else {
+        return None;
+    };
+    let Some((
+        ChainStep::Call {
+            expr: call_expr,
+            node: call,
+        },
+        call_rest,
+    )) = rest.split_first()
+    else {
+        return None;
+    };
+    if call.node.safe || call.node.func.node.id != expr.node.id {
+        return None;
+    }
+    Some((call_expr, call, call_rest))
 }
 
 fn projection_root(expr: &ExprNode) -> Option<&ExprNode> {
@@ -5457,10 +5678,20 @@ enum ChainStep<'a> {
         expr: &'a ExprNode,
         node: &'a ast::IndexNode,
     },
+    TupleIndex {
+        expr: &'a ExprNode,
+        node: &'a ast::TupleIndexNode,
+    },
     Call {
         expr: &'a ExprNode,
         node: &'a ast::CallNode,
     },
+}
+
+#[derive(Clone, Copy)]
+enum ChainMode {
+    Value { result: LocalId, result_ty: TypeId },
+    Effect,
 }
 
 #[derive(Clone, Copy)]

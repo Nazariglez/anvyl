@@ -360,7 +360,7 @@ pub enum BadPlace {
     },
     TupleFieldOutOfRange {
         ty: TypeId,
-        index: u16,
+        index: u32,
         len: usize,
     },
     TupleProjectionOnNonTuple(TypeId),
@@ -2273,7 +2273,7 @@ fn verify_rvalue(
                 AggregateCtor::Array => verify_array_ctor(cx, site.clone(), *ty, fields),
                 AggregateCtor::List => verify_list_ctor(cx, site.clone(), *ty, fields),
                 AggregateCtor::Map => verify_map_ctor(cx, site.clone(), *ty, fields),
-                AggregateCtor::Tuple => {}
+                AggregateCtor::Tuple => verify_tuple_ctor(cx, site.clone(), *ty, fields),
             }
             for field in fields {
                 verify_operand(cx, function_id, block_id, stmt_index, field);
@@ -2822,6 +2822,26 @@ fn verify_map_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: 
                 expected,
             );
         }
+    }
+}
+
+fn verify_tuple_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+    let Some(TypeData::Tuple(elems)) = cx.type_data(ty).cloned() else {
+        push_collection_result_mismatch(cx, site, AggregateCtor::Tuple, ty);
+        return;
+    };
+    if fields.len() != elems.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::CollectionCtorFieldCountMismatch {
+                ctor: AggregateCtor::Tuple,
+                expected: elems.len(),
+                found: fields.len(),
+            }),
+        );
+    }
+    for (field, (operand, expected)) in fields.iter().zip(elems).enumerate() {
+        verify_collection_field(cx, &site, &AggregateCtor::Tuple, field, operand, expected);
     }
 }
 

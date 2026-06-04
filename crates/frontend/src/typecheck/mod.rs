@@ -39,7 +39,7 @@ use self::{
         mode_for_head,
     },
     place::{AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts, check_place},
-    postfix::{PostfixStep, check_postfix_chain, check_tuple_index, collect_postfix_chain},
+    postfix::{PostfixStep, check_postfix_chain, collect_postfix_chain},
     type_ops::type_contains_dyn_value,
     type_refs::LocalTypeScopes,
 };
@@ -3890,12 +3890,11 @@ fn check_expr_checked_with_hint(
         }
         ExprKind::StructLiteral(lit) => check_struct_lit_hint(expr, lit, expected, tc),
         ExprKind::InferredEnum(node) => check_inferred_enum_hint(expr, node, expected, tc),
-        ExprKind::Field(_) | ExprKind::Call(_) | ExprKind::Index(_) => {
+        ExprKind::Field(_) | ExprKind::Call(_) | ExprKind::Index(_) | ExprKind::TupleIndex(_) => {
             let chain = collect_postfix_chain(expr).expect("postfix chain");
             check_postfix_chain(&chain, expr, expected.as_ref(), tc)
         }
         ExprKind::Tuple(elems) => check_tuple_checked_with_hint(expr, elems, expected, tc),
-        ExprKind::TupleIndex(node) => check_tuple_index(expr, node, tc),
         ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected, tc),
         ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected, tc),
         ExprKind::IfLet(if_let_node) => {

@@ -45,6 +45,33 @@ fn raw_enum_to_raw_cast_is_valid() {
 }
 
 #[test]
+fn tuple_ctor_shape_is_valid() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let void_ty = builder.void_ty();
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![int_ty, bool_ty]));
+    let module = test_module(&mut builder);
+
+    let mut fb = FunctionBuilder::new("tuple", module, FunctionKind::Normal, void_ty);
+    let lhs = fb.push_param("lhs", int_ty, ParamRole::Normal);
+    let rhs = fb.push_param("rhs", bool_ty, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Aggregate {
+            kind: AggregateCtor::Tuple,
+            fields: vec![op_place(lhs, int_ty), op_place(rhs, bool_ty)],
+            ty: tuple_ty,
+        }),
+    );
+    let func_id = builder.alloc_function(fb.finish());
+    builder.set_entry(func_id);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
 fn fn_return() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();

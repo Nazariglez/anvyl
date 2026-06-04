@@ -2213,6 +2213,89 @@ fn array_ctor_shape_is_verified() {
 }
 
 #[test]
+fn tuple_ctor_field_count_is_verified() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![int_ty, bool_ty]));
+    let module = test_module(&mut builder);
+
+    let errors = verify_void_entry(builder, "bad_tuple", module, void_ty, |fb, bb0| {
+        let p = fb.push_param("p", bool_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::Tuple,
+                fields: vec![op_place(p, bool_ty)],
+                ty: tuple_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CollectionCtorFieldCountMismatch {
+            ctor: AggregateCtor::Tuple,
+            expected: 2,
+            found: 1
+        })
+    )));
+}
+
+#[test]
+fn tuple_ctor_field_types_are_verified() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let bool_ty = builder.alloc_type(TypeData::Bool);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![int_ty, bool_ty]));
+    let module = test_module(&mut builder);
+
+    let errors = verify_void_entry(builder, "bad_tuple_field", module, void_ty, |fb, bb0| {
+        let lhs = fb.push_param("lhs", bool_ty, ParamRole::Normal);
+        let rhs = fb.push_param("rhs", bool_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::Tuple,
+                fields: vec![op_place(lhs, bool_ty), op_place(rhs, bool_ty)],
+                ty: tuple_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CollectionCtorFieldTypeMismatch { ctor: AggregateCtor::Tuple, field: 0, expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn tuple_ctor_result_type_is_verified() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+
+    let errors = verify_void_entry(builder, "bad_tuple_result", module, void_ty, |fb, bb0| {
+        let p = fb.push_param("p", int_ty, ParamRole::Normal);
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Aggregate {
+                kind: AggregateCtor::Tuple,
+                fields: vec![op_place(p, int_ty)],
+                ty: int_ty,
+            }),
+        );
+    });
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::CollectionCtorResultTypeMismatch { ctor: AggregateCtor::Tuple, found })
+            if found == int_ty
+    )));
+}
+
+#[test]
 fn list_ctor_shape_is_verified() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);

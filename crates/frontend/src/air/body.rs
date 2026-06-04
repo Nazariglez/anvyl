@@ -94,7 +94,7 @@ impl Place {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Projection {
     Field(FieldId),
-    TupleField(u16),
+    TupleField(u32),
     VariantField {
         enum_id: EnumId,
         variant: VariantId,

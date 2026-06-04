@@ -96,6 +96,10 @@ pub(super) enum PostfixStep<'a> {
         node: &'a IndexNode,
         id: ExprId,
     },
+    TupleIndex {
+        node: &'a TupleIndexNode,
+        id: ExprId,
+    },
 }
 
 pub(super) struct PostfixChain<'a> {
@@ -164,6 +168,7 @@ pub(super) fn chain_has_safe(chain: &PostfixChain<'_>) -> bool {
         PostfixStep::Field { node, .. } => node.node.safe,
         PostfixStep::Call { node, .. } => node.node.safe,
         PostfixStep::Index { node, .. } => node.node.safe,
+        PostfixStep::TupleIndex { .. } => false,
     })
 }
 
@@ -189,6 +194,14 @@ fn collect_steps(expr: &ExprNode) -> Option<(&ExprNode, Vec<PostfixStep<'_>>)> {
             let (base, mut steps) = collect_steps_or_base(&index.node.target);
             steps.push(PostfixStep::Index {
                 node: index,
+                id: expr.node.id,
+            });
+            Some((base, steps))
+        }
+        ExprKind::TupleIndex(tuple) => {
+            let (base, mut steps) = collect_steps_or_base(&tuple.node.target);
+            steps.push(PostfixStep::TupleIndex {
+                node: tuple,
                 id: expr.node.id,
             });
             Some((base, steps))
@@ -346,6 +359,12 @@ pub(super) fn check_postfix_chain_place(
                 tc.set_type(*id, ty, node.span);
                 subject
             }
+            PostfixStep::TupleIndex { node, id } => {
+                let subject = apply_tuple_index(&subject, node, *id, optional_chain, tc);
+                let ty = chain_type(&subject, optional_chain, node.span, tc);
+                tc.set_type(*id, ty, node.span);
+                subject
+            }
         };
     }
 
@@ -430,6 +449,9 @@ fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> 
             }
             PostfixStep::Index { node, id } => {
                 check_expr_checked(&node.node.index, tc);
+                tc.set_type(*id, Type::Infer, node.span);
+            }
+            PostfixStep::TupleIndex { node, id } => {
                 tc.set_type(*id, Type::Infer, node.span);
             }
         }
@@ -581,6 +603,60 @@ fn apply_index(
         place::projected_field_access(target.access),
         target.facts.clone(),
         target.identity.clone().index(),
+    );
+    if !optional_chain {
+        tc.record_expr_place(id, &value);
+    }
+    Subject::Value(value)
+}
+
+fn apply_tuple_index(
+    subject: &Subject,
+    node: &TupleIndexNode,
+    id: ExprId,
+    optional_chain: bool,
+    tc: &mut TypeChecker,
+) -> Subject {
+    let Subject::Value(target) = subject else {
+        let target = subject_type(subject);
+        if !matches!(target, Type::Infer) {
+            tc.push_error(TypeError::TupleIndexOnNonTuple {
+                ty: target,
+                index: node.node.index,
+                span: tc.error_span(node.span),
+            });
+        }
+        return Subject::Error;
+    };
+
+    place::record_value_read(node.node.target.node.id, target, tc);
+    tc.closure.copy_place_identity(node.node.target.node.id, id);
+    let Type::Tuple(elems) = &target.checked.ty else {
+        if !matches!(target.checked.ty, Type::Infer) {
+            tc.push_error(TypeError::TupleIndexOnNonTuple {
+                ty: target.checked.ty.clone(),
+                index: node.node.index,
+                span: tc.error_span(node.span),
+            });
+        }
+        return Subject::Value(PlaceValue::not_place(checked_type(Type::Infer, tc)));
+    };
+    let Some(elem) = elems.get(node.node.index as usize).cloned() else {
+        tc.push_error(TypeError::TupleIndexOutOfBounds {
+            index: node.node.index,
+            len: elems.len(),
+            span: tc.error_span(node.span),
+        });
+        return Subject::Value(PlaceValue::not_place(checked_type(Type::Infer, tc)));
+    };
+
+    let mut checked = checked_type(elem, tc);
+    checked.contains_extern_any = target.checked.contains_extern_any;
+    let value = target.projected(
+        checked,
+        place::projected_field_access(target.access),
+        target.facts.clone(),
+        target.identity.clone().tuple(node.node.index as usize),
     );
     if !optional_chain {
         tc.record_expr_place(id, &value);
@@ -2557,17 +2633,6 @@ fn check_args(
         })
         .collect::<Vec<_>>();
     check_source_args(args, &params, None, tc).failed
-}
-
-pub(super) fn check_tuple_index(
-    expr: &ExprNode,
-    node: &TupleIndexNode,
-    tc: &mut TypeChecker,
-) -> CheckedType {
-    let target = check_expr_checked(&node.node.target, tc);
-    tc.closure
-        .copy_place_identity(node.node.target.node.id, expr.node.id);
-    check_tuple_index_access(expr, node, &target, tc)
 }
 
 pub(super) fn check_tuple_index_access(
