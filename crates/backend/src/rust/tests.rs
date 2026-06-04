@@ -13,6 +13,7 @@ use anvyx_frontend::{
 use super::{
     RustPlanConfig, cargo_job, emit, plan,
     profile::{ProfileErrorKind, RustBackendProfile, RustBackendProfileError},
+    rep_policy::RustTracePlan,
     rir::{
         self, RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
         RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern,
@@ -21,8 +22,8 @@ use super::{
         RirOperand, RirOptionMatch, RirParam, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
         RirProjection, RirRValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
         RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
-        RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, RirVerifyErrorKind,
+        RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId,
+        RirVariant, RirVariantId, RirVariantKind, RirVerifyErrorKind,
     },
     source_job::{self, SourceJobStatus},
 };
@@ -292,7 +293,7 @@ fn profile_rejects_dataref_list_payload_as_explicit_target_gap() {
 }
 
 #[test]
-fn profile_rejects_dataref_tuple_payload_as_explicit_target_gap() {
+fn profile_accepts_dataref_tuple_payload() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
@@ -312,11 +313,96 @@ fn profile_rejects_dataref_tuple_payload_as_explicit_target_gap() {
     });
     program.module_mut(module).aggregates.push(aggregate);
 
+    check(program);
+}
+
+#[test]
+fn plan_marks_tuple_with_dataref_field_noncopy() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let child = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Child"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let child_ty = program.alloc_type(TypeData::DataRef(child));
+    let tuple_ty = program.alloc_type(TypeData::Tuple(vec![child_ty, int]));
+    let payload = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Payload"),
+        module,
+        kind: air::AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("pair"),
+            ty: tuple_ty,
+        }],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    let payload_ty = program.alloc_type(TypeData::Aggregate(payload));
+    program
+        .module_mut(module)
+        .aggregates
+        .extend([child, payload]);
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let RirType::Tuple(tuple) = plan.program().types[tuple_ty.index()] else {
+        panic!("tuple type not planned as tuple")
+    };
+    let RirType::Struct(payload) = plan.program().types[payload_ty.index()] else {
+        panic!("payload type not planned as struct")
+    };
+
+    assert!(!plan.program().tuples[tuple.index()].copyable);
+    assert!(!plan.program().structs[payload.index()].copyable);
+}
+
+#[test]
+fn profile_rejects_dataref_tuple_payload_with_unsupported_element() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
+    let tuple = program.alloc_type(TypeData::Tuple(vec![array, int]));
+    let module = program.alloc_module(root_module());
+    let aggregate = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("bad"),
+            ty: tuple,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+
     expect_reject(program, ProfileErrorKind::UnsupportedModuleItem);
 }
 
 #[test]
-fn profile_rejects_tuple_construction_as_explicit_target_gap() {
+fn emit_derives_trace_for_struct_payload_containing_tuple() {
+    let program = tracked_struct_tuple_payload_program();
+    check(program.clone());
+
+    let source = plan_source(program).into_string();
+
+    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime)]\nstruct anvT2_Payload"));
+    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime)]\nstruct anvT1_Tuple"));
+}
+
+#[test]
+fn profile_accepts_tuple_construction() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
@@ -348,9 +434,38 @@ fn profile_rejects_tuple_construction_as_explicit_target_gap() {
     });
     program.module_mut(module).functions.push(func);
 
-    let errors = profile_errors(program);
-    assert!(has_error(&errors, ProfileErrorKind::UnsupportedType));
-    assert!(has_error(&errors, ProfileErrorKind::UnsupportedRValue));
+    check(program);
+}
+
+#[test]
+fn plan_preserves_tuple_construction_and_projection() {
+    let program = tuple_projection_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = &plan.program().functions[0];
+
+    assert!(matches!(
+        function.body.stmts[0],
+        RirStmt::Init {
+            value: RirRValue::Tuple { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &function.body.term,
+        RirTerm::Return(Some(RirOperand::Place(RirPlace { projections, .. })))
+            if projections == &[RirProjection::TupleField(RirFieldId::from_index(0))]
+    ));
+}
+
+#[test]
+fn emit_renders_tuple_declaration_construction_and_projection() {
+    let source = plan_source(tuple_projection_program()).into_string();
+
+    assert!(source.contains("struct anvT1_Tuple"));
+    assert!(source.contains("_0: i64"));
+    assert!(source.contains("anvT1_Tuple { _0: 1 }"));
+    assert!(source.contains("return v0._0;"));
 }
 
 #[test]
@@ -385,7 +500,6 @@ fn profile_rejects_unsupported_format_source() {
 
     let errors = profile_errors(program);
     assert!(has_error(&errors, ProfileErrorKind::UnsupportedRValue));
-    assert!(has_error(&errors, ProfileErrorKind::UnsupportedType));
 }
 
 #[test]
@@ -1090,6 +1204,70 @@ fn emit_renders_tracked_dataref_storage_with_context_lifetime() {
 }
 
 #[test]
+fn trace_plan_marks_generated_payloads_from_tracked_storage() {
+    let mut program = dataref_metadata_rir();
+    let payload_ty = add_payload_struct(&mut program);
+    program.datarefs[0].fields.push(RirField {
+        id: RirFieldId::from_index(1),
+        symbol: RirSymbol::new("payload"),
+        ty: payload_ty,
+    });
+
+    let plan = RustTracePlan::build(&program);
+
+    assert!(plan.needs_struct_trace(RirStructId::from_index(0)));
+}
+
+#[test]
+fn trace_plan_marks_generated_fields_of_cx_dependent_roots() {
+    let mut program = dataref_metadata_rir();
+    let node = RirTypeId::from_index(1);
+    let payload = add_payload_struct(&mut program);
+    let tuple = RirTupleId::from_index(program.tuples.len());
+    program.types.push(RirType::Tuple(tuple));
+    program.tuples.push(RirTuple {
+        id: tuple,
+        symbol: RirSymbol::new("Tuple"),
+        display: RirSymbol::new("Tuple"),
+        copyable: false,
+        fields: vec![
+            RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("node"),
+                ty: node,
+            },
+            RirField {
+                id: RirFieldId::from_index(1),
+                symbol: RirSymbol::new("payload"),
+                ty: payload,
+            },
+        ],
+    });
+
+    let plan = RustTracePlan::build(&program);
+
+    assert!(plan.needs_tuple_trace(tuple));
+    assert!(plan.needs_struct_trace(RirStructId::from_index(0)));
+}
+
+#[test]
+fn emit_derives_trace_for_generated_payloads_from_tracked_storage() {
+    let mut program = dataref_metadata_rir();
+    let payload_ty = add_payload_struct(&mut program);
+    program.datarefs[0].fields.push(RirField {
+        id: RirFieldId::from_index(1),
+        symbol: RirSymbol::new("payload"),
+        ty: payload_ty,
+    });
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains(
+        "#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime)]\nstruct Payload"
+    ));
+}
+
+#[test]
 fn emit_renders_plain_struct_declarations_without_impls() {
     let program = struct_decl_program(false);
     let source = plan_source(program).into_string();
@@ -1270,6 +1448,159 @@ fn plan_handles_non_topological_type_arena_refs() {
             len: 1,
         }
     );
+}
+
+#[test]
+fn rir_verify_accepts_tuple_declaration_and_construction() {
+    let program = tuple_rir_program(RirRValue::Tuple {
+        ty: RirTypeId::from_index(3),
+        fields: vec![
+            RirOperand::Const(RirConstId::from_index(0)),
+            RirOperand::Const(RirConstId::from_index(1)),
+        ],
+    });
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_verify_rejects_bad_tuple_type_id() {
+    let mut program = empty_rir_function(RirType::Tuple(RirTupleId::from_index(99)));
+    program.types.push(RirType::Void);
+    program.functions[0].ret.ty = RirTypeId::from_index(1);
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_tuple_rvalue_with_non_tuple_type() {
+    let program = tuple_rir_program(RirRValue::Tuple {
+        ty: RirTypeId::from_index(0),
+        fields: vec![
+            RirOperand::Const(RirConstId::from_index(0)),
+            RirOperand::Const(RirConstId::from_index(1)),
+        ],
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_tuple_rvalue_arity_mismatch() {
+    let program = tuple_rir_program(RirRValue::Tuple {
+        ty: RirTypeId::from_index(3),
+        fields: vec![RirOperand::Const(RirConstId::from_index(0))],
+    });
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::FieldCount {
+            expected: 2,
+            found: 1,
+        },
+    );
+}
+
+#[test]
+fn rir_verify_rejects_tuple_rvalue_element_type_mismatch() {
+    let program = tuple_rir_program(RirRValue::Tuple {
+        ty: RirTypeId::from_index(3),
+        fields: vec![
+            RirOperand::Const(RirConstId::from_index(1)),
+            RirOperand::Const(RirConstId::from_index(1)),
+        ],
+    });
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_verify_rejects_bad_tuple_projection() {
+    let mut program = tuple_rir_program(valid_tuple_rvalue());
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(0),
+            projections: vec![RirProjection::TupleField(RirFieldId::from_index(2))],
+            ty: RirTypeId::from_index(0),
+        }))));
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_tuple_projection_on_non_tuple_place() {
+    let mut program = tuple_rir_program(valid_tuple_rvalue());
+    program.functions[0].locals.push(RirLocal {
+        id: RirLocalId::from_index(1),
+        ty: RirTypeId::from_index(0),
+        mutable: false,
+        symbol: RirSymbol::new("i"),
+        initialized: true,
+        payload_ref: false,
+    });
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(1),
+            projections: vec![RirProjection::TupleField(RirFieldId::from_index(0))],
+            ty: RirTypeId::from_index(0),
+        }))));
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_copyable_tuple_with_noncopy_field() {
+    let mut program = tuple_rir_program(valid_tuple_rvalue());
+    program.tuples[0].fields[0].ty = RirTypeId::from_index(4);
+    program.tuples[0].copyable = true;
+    program.types.push(RirType::String);
+
+    assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
+}
+
+#[test]
+fn rir_verify_rejects_copyable_tuple_with_falsely_copyable_struct_field() {
+    let int = RirTypeId::from_index(0);
+    let strukt = RirTypeId::from_index(1);
+    let program = RirProgram {
+        types: vec![
+            RirType::Int,
+            RirType::Struct(RirStructId::from_index(0)),
+            RirType::Tuple(RirTupleId::from_index(0)),
+        ],
+        structs: vec![RirStruct {
+            id: RirStructId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("Box"),
+            display: RirSymbol::new("Box"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("x"),
+                ty: int,
+            }],
+        }],
+        tuples: vec![RirTuple {
+            id: RirTupleId::from_index(0),
+            symbol: RirSymbol::new("Tuple"),
+            display: RirSymbol::new("(Box)"),
+            copyable: true,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("_0"),
+                ty: strukt,
+            }],
+        }],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
 }
 
 #[test]
@@ -1465,8 +1796,11 @@ fn rir_verify_rejects_bad_struct_construction_and_projection() {
 #[test]
 fn profile_rejects_deferred_types() {
     let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    program.alloc_type(TypeData::Tuple(vec![int]));
+    let void = program.alloc_type(TypeData::Void);
+    program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
 
     expect_reject(program, ProfileErrorKind::UnsupportedType);
 }
@@ -3392,6 +3726,102 @@ fn assert_rir_type_error(program: RirProgram) {
     );
 }
 
+fn tracked_struct_tuple_payload_program() -> Program {
+    let mut program = Program::default();
+    let bool_ty = program.alloc_type(TypeData::Bool);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![bool_ty, bool_ty]));
+    let module = program.alloc_module(root_module());
+    let payload_id = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Payload"),
+        module,
+        kind: air::AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("flags"),
+            ty: tuple,
+        }],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(payload_id);
+    let payload = program.alloc_type(TypeData::Aggregate(payload_id));
+    let node_id = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("payload"),
+            ty: payload,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(node_id);
+    program.alloc_type(TypeData::DataRef(node_id));
+    program
+}
+
+fn tuple_projection_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let one = program.const_arena.alloc(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let module = program.alloc_module(root_module());
+    let out = air::LocalId::from_index(0);
+    let mut first = place(out, int);
+    first.projection.push(Projection::TupleField(0));
+    let func = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![local(tuple, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: out,
+                value: RValue::Aggregate {
+                    kind: AggregateCtor::Tuple,
+                    fields: vec![Operand::Const(one)],
+                    ty: tuple,
+                },
+            }],
+            air::AirTail::Return(Some(Operand::Place(first))),
+        ),
+    });
+    program.module_mut(module).functions.push(func);
+    program.set_entry(func);
+    program
+}
+
+fn add_payload_struct(program: &mut RirProgram) -> RirTypeId {
+    let ty = RirTypeId::from_index(program.types.len());
+    let id = RirStructId::from_index(program.structs.len());
+    program.types.push(RirType::Struct(id));
+    program.structs.push(RirStruct {
+        id,
+        air_id: None,
+        symbol: RirSymbol::new("Payload"),
+        display: RirSymbol::new("Payload"),
+        native_path: None,
+        native_key: None,
+        copyable: true,
+        fields: vec![RirField {
+            id: RirFieldId::from_index(0),
+            symbol: RirSymbol::new("value"),
+            ty: RirTypeId::from_index(0),
+        }],
+    });
+    ty
+}
+
 fn dataref_metadata_rir() -> RirProgram {
     let int = RirTypeId::from_index(0);
     let node = RirTypeId::from_index(1);
@@ -3608,6 +4038,84 @@ fn enum_match_rir(
         term: RirTerm::Unreachable,
     };
     program
+}
+
+fn valid_tuple_rvalue() -> RirRValue {
+    RirRValue::Tuple {
+        ty: RirTypeId::from_index(3),
+        fields: vec![
+            RirOperand::Const(RirConstId::from_index(0)),
+            RirOperand::Const(RirConstId::from_index(1)),
+        ],
+    }
+}
+
+fn tuple_rir_program(value: RirRValue) -> RirProgram {
+    let int = RirTypeId::from_index(0);
+    let bool_ty = RirTypeId::from_index(1);
+    let void = RirTypeId::from_index(2);
+    let tuple = RirTypeId::from_index(3);
+    RirProgram {
+        types: vec![
+            RirType::Int,
+            RirType::Bool,
+            RirType::Void,
+            RirType::Tuple(RirTupleId::from_index(0)),
+        ],
+        tuples: vec![RirTuple {
+            id: RirTupleId::from_index(0),
+            symbol: RirSymbol::new("Tuple0"),
+            display: RirSymbol::new("(int, bool)"),
+            copyable: true,
+            fields: vec![
+                RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("_0"),
+                    ty: int,
+                },
+                RirField {
+                    id: RirFieldId::from_index(1),
+                    symbol: RirSymbol::new("_1"),
+                    ty: bool_ty,
+                },
+            ],
+        }],
+        functions: vec![RirFunction {
+            id: RirFunctionId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("f"),
+            params: vec![],
+            ret: RirReturn { ty: void },
+            locals: vec![RirLocal {
+                id: RirLocalId::from_index(0),
+                ty: tuple,
+                mutable: false,
+                symbol: RirSymbol::new("t"),
+                initialized: false,
+                payload_ref: false,
+            }],
+            body: RirStructuredBlock {
+                stmts: vec![RirStmt::Init {
+                    local: RirLocalId::from_index(0),
+                    value,
+                }],
+                term: RirTerm::Return(None),
+            },
+        }],
+        consts: vec![
+            RirConst {
+                id: RirConstId::from_index(0),
+                ty: int,
+                value: RirConstValue::Int(1),
+            },
+            RirConst {
+                id: RirConstId::from_index(1),
+                ty: bool_ty,
+                value: RirConstValue::Bool(true),
+            },
+        ],
+        ..RirProgram::default()
+    }
 }
 
 fn empty_rir_function(ret: RirType) -> RirProgram {

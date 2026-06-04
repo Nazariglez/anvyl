@@ -141,35 +141,15 @@ impl ProfileCx<'_> {
             TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
                 self.inline_payload_supported(*inner)
             }
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .all(|elem| self.inline_payload_supported(*elem)),
             _ => false,
         }
     }
 
     fn dataref_payload_supported(&self, ty: TypeId) -> bool {
-        match self.program.type_arena.data(ty) {
-            TypeData::DataRef(_) => true,
-            TypeData::Optional(inner) => self.dataref_payload_supported(*inner),
-            TypeData::Aggregate(aggregate) => self
-                .program
-                .aggregate(*aggregate)
-                .fields
-                .iter()
-                .all(|field| self.dataref_payload_supported(field.ty)),
-            TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().all(|variant| {
-                variant_field_tys(variant).all(|ty| self.dataref_payload_supported(ty))
-            }),
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
-            TypeData::Void
-            | TypeData::Any
-            | TypeData::Tuple(_)
-            | TypeData::Array { .. }
-            | TypeData::List(_)
-            | TypeData::Map { .. }
-            | TypeData::Slice(_)
-            | TypeData::Extern(_)
-            | TypeData::Function(_)
-            | TypeData::Dyn(_) => false,
-        }
+        self.policy().dataref_payload_supported(ty)
     }
 
     fn enum_decl_supported(&self, enm: EnumId) -> bool {
@@ -187,6 +167,9 @@ impl ProfileCx<'_> {
             TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
                 self.inline_payload_supported(*inner)
             }
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .all(|elem| self.enum_field_supported(core, *elem)),
             TypeData::DataRef(_)
             | TypeData::Int
             | TypeData::Float
@@ -580,15 +563,8 @@ impl ProfileCx<'_> {
                 if decl.kind != expected_kind || decl.fields.len() != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                for (field, operand) in decl.fields.iter().zip(fields) {
-                    self.check_operand(site, operand);
-                    if self.operand_ty(operand) != field.ty {
-                        self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    }
-                    if self.non_shareable_value_operand(operand) {
-                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                    }
-                }
+                let expected = decl.fields.iter().map(|field| field.ty).collect::<Vec<_>>();
+                self.check_value_fields(site, fields, expected);
             }
             AggregateCtor::Extern(ext) => {
                 if !matches!(self.program.type_arena.data(ty), TypeData::Extern(id) if id == ext) {
@@ -599,15 +575,8 @@ impl ProfileCx<'_> {
                 if decl.rep != air::ExternRep::Inline || decl.fields.len() != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                for (field, operand) in decl.fields.iter().zip(fields) {
-                    self.check_operand(site, operand);
-                    if self.operand_ty(operand) != field.ty {
-                        self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    }
-                    if self.non_shareable_value_operand(operand) {
-                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                    }
-                }
+                let expected = decl.fields.iter().map(|field| field.ty).collect::<Vec<_>>();
+                self.check_value_fields(site, fields, expected);
             }
             AggregateCtor::EnumVariant { enum_id, variant } => {
                 if !matches!(self.program.type_arena.data(ty), TypeData::Enum(id) if id == enum_id)
@@ -627,15 +596,8 @@ impl ProfileCx<'_> {
                 if variant_field_count(variant) != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                for (expected, operand) in variant_field_tys(variant).zip(fields) {
-                    self.check_operand(site, operand);
-                    if self.operand_ty(operand) != expected {
-                        self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    }
-                    if self.non_shareable_value_operand(operand) {
-                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                    }
-                }
+                let expected = variant_field_tys(variant).collect::<Vec<_>>();
+                self.check_value_fields(site, fields, expected);
             }
             AggregateCtor::Array => {
                 let TypeData::Array { elem, len } = self.program.type_arena.data(ty) else {
@@ -645,30 +607,14 @@ impl ProfileCx<'_> {
                 if *len != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                for operand in fields {
-                    self.check_operand(site, operand);
-                    if self.operand_ty(operand) != *elem {
-                        self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    }
-                    if self.non_shareable_value_operand(operand) {
-                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                    }
-                }
+                self.check_value_fields(site, fields, std::iter::repeat_n(*elem, fields.len()));
             }
             AggregateCtor::List => {
                 let TypeData::List(elem) = self.program.type_arena.data(ty) else {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
                 };
-                for operand in fields {
-                    self.check_operand(site, operand);
-                    if self.operand_ty(operand) != *elem {
-                        self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    }
-                    if self.non_shareable_value_operand(operand) {
-                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                    }
-                }
+                self.check_value_fields(site, fields, std::iter::repeat_n(*elem, fields.len()));
             }
             AggregateCtor::Map => {
                 let TypeData::Map { key, value, .. } = self.program.type_arena.data(ty) else {
@@ -688,7 +634,31 @@ impl ProfileCx<'_> {
                 }
             }
             AggregateCtor::Tuple => {
+                let TypeData::Tuple(elems) = self.program.type_arena.data(ty) else {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    return;
+                };
+                if elems.len() != fields.len() {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
+                self.check_value_fields(site, fields, elems.iter().copied());
+            }
+        }
+    }
+
+    fn check_value_fields(
+        &mut self,
+        site: ProfileSite,
+        fields: &[Operand],
+        expected: impl IntoIterator<Item = TypeId>,
+    ) {
+        for (operand, expected) in fields.iter().zip(expected) {
+            self.check_operand(site, operand);
+            if self.operand_ty(operand) != expected {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
+            }
+            if self.non_shareable_value_operand(operand) {
+                self.push(site, ProfileErrorKind::NonCopyValueRequired);
             }
         }
     }
@@ -801,11 +771,19 @@ impl ProfileCx<'_> {
     }
 
     fn check_place(&mut self, site: ProfileSite, place: &Place) {
-        if !place
-            .projection
-            .iter()
-            .all(|projection| matches!(projection, Projection::Field(_) | Projection::Index(_)))
-        {
+        let Some(local) = self.current_local(site, place.root) else {
+            self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+            return;
+        };
+        let mut ty = local.ty;
+        for projection in &place.projection {
+            let Some(next) = self.projected_ty(ty, projection) else {
+                self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                return;
+            };
+            ty = next;
+        }
+        if ty != place.ty {
             self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
         }
         self.check_type_ref(site, place.ty);
@@ -844,7 +822,7 @@ impl ProfileCx<'_> {
                 Projection::Index(_),
             ) => Some(*elem),
             (TypeData::Tuple(fields), Projection::TupleField(field)) => {
-                fields.get(usize::from(*field)).copied()
+                fields.get(*field as usize).copied()
             }
             _ => None,
         }
@@ -881,6 +859,12 @@ impl ProfileCx<'_> {
             }
             TypeData::Optional(inner) => {
                 self.check_type_ref(site, *inner);
+                true
+            }
+            TypeData::Tuple(elems) => {
+                for elem in elems {
+                    self.check_type_ref(site, *elem);
+                }
                 true
             }
             ty => type_is_slice1(ty),

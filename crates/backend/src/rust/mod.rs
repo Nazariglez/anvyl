@@ -30,8 +30,8 @@ use self::{
         RirOptionMatch, RirParam, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
         RirRawEnumValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
         RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
-        RirStructuredBlock, RirSymbol, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId,
+        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -225,6 +225,7 @@ struct PlanCx<'a> {
     extern_map: HashMap<ExternId, RirExternId>,
     dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
+    tuple_map: HashMap<Vec<RirTypeId>, RirTupleId>,
 }
 
 struct PlannedRValue {
@@ -300,6 +301,7 @@ impl<'a> PlanCx<'a> {
             extern_map: HashMap::new(),
             dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
+            tuple_map: HashMap::new(),
         }
     }
 
@@ -341,6 +343,7 @@ impl<'a> PlanCx<'a> {
         let mut extern_types = vec![];
         let mut enum_types = vec![];
         let mut dataref_types = vec![];
+        let mut tuple_types = vec![];
         for (index, ty) in self.air.type_arena.iter().enumerate() {
             debug_assert_eq!(program.types.len(), index);
             let type_id = TypeId::from_index(index);
@@ -382,12 +385,17 @@ impl<'a> PlanCx<'a> {
                     }
                 }
                 TypeData::Optional(inner) => RirType::Option(self.type_map[inner]),
+                TypeData::Tuple(elems) => {
+                    let fields = elems
+                        .iter()
+                        .map(|elem| self.type_map[elem])
+                        .collect::<Vec<_>>();
+                    let tuple_id = self.intern_tuple(program, type_id, fields);
+                    tuple_types.push((type_id, tuple_id));
+                    RirType::Tuple(tuple_id)
+                }
                 TypeData::Slice(elem) => RirType::Slice(self.type_map[elem]),
-                TypeData::Any
-                | TypeData::Map { .. }
-                | TypeData::Tuple(_)
-                | TypeData::Function(_)
-                | TypeData::Dyn(_) => {
+                TypeData::Any | TypeData::Map { .. } | TypeData::Function(_) | TypeData::Dyn(_) => {
                     return Err(self.gap(
                         RustTargetGapSite::Type(type_id),
                         RustTargetGapKind::UnsupportedType,
@@ -396,19 +404,67 @@ impl<'a> PlanCx<'a> {
             };
             program.types.push(rir);
         }
-        for (type_id, aggregate, struct_id) in aggregate_types {
+        for &(type_id, aggregate, struct_id) in &aggregate_types {
             self.fill_struct(program, type_id, aggregate, struct_id)?;
         }
-        for (type_id, ext, struct_id) in extern_types {
+        for &(type_id, ext, struct_id) in &extern_types {
             self.fill_extern_struct(program, type_id, ext, struct_id)?;
         }
-        for (type_id, aggregate, dataref_id) in dataref_types {
-            self.fill_dataref(program, type_id, aggregate, dataref_id)?;
+        for &(_, aggregate, dataref_id) in &dataref_types {
+            self.fill_dataref(program, aggregate, dataref_id)?;
         }
-        for (type_id, enm, enum_id) in enum_types {
+        for &(type_id, enm, enum_id) in &enum_types {
             self.fill_enum(program, type_id, enm, enum_id)?;
         }
+        let struct_types = aggregate_types
+            .iter()
+            .map(|(type_id, _, struct_id)| (*type_id, *struct_id))
+            .chain(
+                extern_types
+                    .iter()
+                    .map(|(type_id, _, struct_id)| (*type_id, *struct_id)),
+            )
+            .collect::<Vec<_>>();
+        let enum_types = enum_types
+            .iter()
+            .map(|(type_id, _, enum_id)| (*type_id, *enum_id))
+            .collect::<Vec<_>>();
+        self.finalize_copyable_flags(program, &struct_types, &enum_types, &tuple_types);
         Ok(())
+    }
+
+    fn intern_tuple(
+        &mut self,
+        program: &mut RirProgram,
+        type_id: TypeId,
+        fields: Vec<RirTypeId>,
+    ) -> RirTupleId {
+        if let Some(id) = self.tuple_map.get(&fields) {
+            return *id;
+        }
+        let id = RirTupleId::from_index(program.tuples.len());
+        let field_decls = fields
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| RirField {
+                id: RirFieldId::from_index(index),
+                symbol: RirSymbol::new(format!("_{index}")),
+                ty: *ty,
+            })
+            .collect();
+        program.tuples.push(RirTuple {
+            id,
+            symbol: RirSymbol::new(format!(
+                "{}T{}_Tuple",
+                self.config.symbol_prefix,
+                type_id.index()
+            )),
+            display: RirSymbol::new(format!("tuple{}", type_id.index())),
+            copyable: true,
+            fields: field_decls,
+        });
+        self.tuple_map.insert(fields, id);
+        id
     }
 
     fn reserve_struct(
@@ -472,13 +528,7 @@ impl<'a> PlanCx<'a> {
                 ty,
             });
         }
-        let copyable = self.rust_copyable_air_type(type_id)
-            && fields
-                .iter()
-                .all(|field| RustRepPolicy::new(program).copyable(field.ty));
-        let strukt = &mut program.structs[struct_id.index()];
-        strukt.copyable = copyable;
-        strukt.fields = fields;
+        program.structs[struct_id.index()].fields = fields;
         Ok(())
     }
 
@@ -517,7 +567,6 @@ impl<'a> PlanCx<'a> {
     fn fill_dataref(
         &self,
         program: &mut RirProgram,
-        _type_id: TypeId,
         aggregate: air::AggregateId,
         dataref_id: RirDataRefId,
     ) -> Result<(), RustPlanError> {
@@ -678,10 +727,62 @@ impl<'a> PlanCx<'a> {
                 fields,
             });
         }
-        let rir = &mut program.enums[enum_id.index()];
-        rir.copyable = self.rust_copyable_air_type(type_id);
-        rir.variants = variants;
+        program.enums[enum_id.index()].variants = variants;
         Ok(())
+    }
+
+    fn finalize_copyable_flags(
+        &self,
+        program: &mut RirProgram,
+        structs: &[(TypeId, RirStructId)],
+        enums: &[(TypeId, RirEnumId)],
+        tuples: &[(TypeId, RirTupleId)],
+    ) {
+        for &(type_id, id) in structs {
+            program.structs[id.index()].copyable = self.rust_copyable_air_type(type_id);
+        }
+        for &(type_id, id) in enums {
+            program.enums[id.index()].copyable = self.rust_copyable_air_type(type_id);
+        }
+        for &(type_id, id) in tuples {
+            program.tuples[id.index()].copyable = self.rust_copyable_air_type(type_id);
+        }
+
+        while self.refine_copyable_flags(program, structs, enums, tuples) {}
+    }
+
+    fn refine_copyable_flags(
+        &self,
+        program: &mut RirProgram,
+        structs: &[(TypeId, RirStructId)],
+        enums: &[(TypeId, RirEnumId)],
+        tuples: &[(TypeId, RirTupleId)],
+    ) -> bool {
+        let mut changed = false;
+        for &(type_id, id) in structs {
+            let copyable = self.rust_copyable_air_type(type_id)
+                && Self::fields_copyable(program, &program.structs[id.index()].fields);
+            changed |= set_if_changed(&mut program.structs[id.index()].copyable, copyable);
+        }
+        for &(type_id, id) in enums {
+            let copyable = self.rust_copyable_air_type(type_id)
+                && program.enums[id.index()]
+                    .variants
+                    .iter()
+                    .all(|variant| Self::fields_copyable(program, &variant.fields));
+            changed |= set_if_changed(&mut program.enums[id.index()].copyable, copyable);
+        }
+        for &(type_id, id) in tuples {
+            let copyable = self.rust_copyable_air_type(type_id)
+                && Self::fields_copyable(program, &program.tuples[id.index()].fields);
+            changed |= set_if_changed(&mut program.tuples[id.index()].copyable, copyable);
+        }
+        changed
+    }
+
+    fn fields_copyable(program: &RirProgram, fields: &[RirField]) -> bool {
+        let policy = RustRepPolicy::new(program);
+        fields.iter().all(|field| policy.copyable(field.ty))
     }
 
     fn enum_field(
@@ -1510,6 +1611,10 @@ impl<'a> PlanCx<'a> {
                 ty: self.type_map[&ty],
                 elems: fields.operands,
             },
+            AggregateCtor::Tuple => RirRValue::Tuple {
+                ty: self.type_map[&ty],
+                fields: fields.operands,
+            },
             AggregateCtor::Map if fields.operands.len().is_multiple_of(2) => RirRValue::Map {
                 ty: self.type_map[&ty],
                 entries: fields
@@ -1522,7 +1627,7 @@ impl<'a> PlanCx<'a> {
                 ty: self.type_map[&ty],
                 fields: fields.operands,
             },
-            AggregateCtor::Tuple | AggregateCtor::Map => {
+            AggregateCtor::Map => {
                 return Err(self.gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::UnsupportedRValue,
@@ -1876,6 +1981,7 @@ impl<'a> PlanCx<'a> {
                 TypeData::Array { elem, .. } | TypeData::List(elem) | TypeData::Slice(elem),
                 Projection::Index(_),
             ) => *elem,
+            (TypeData::Tuple(elems), Projection::TupleField(index)) => elems[*index as usize],
             _ => ty,
         }
     }
@@ -1898,7 +2004,10 @@ impl<'a> PlanCx<'a> {
         match projection {
             Projection::Field(field) => RirProjection::Field(RirFieldId::from_index(field.index())),
             Projection::Index(local) => RirProjection::Index(RirLocalId::from_index(local.index())),
-            Projection::TupleField(_) | Projection::VariantField { .. } => {
+            Projection::TupleField(index) => {
+                RirProjection::TupleField(RirFieldId::from_index(*index as usize))
+            }
+            Projection::VariantField { .. } => {
                 unreachable!("profile rejects unsupported projection")
             }
         }
@@ -1925,19 +2034,17 @@ impl<'a> PlanCx<'a> {
             projections: place
                 .projection
                 .iter()
-                .filter_map(|projection| match projection {
-                    Projection::Field(field) => {
-                        Some(RirProjection::Field(RirFieldId::from_index(field.index())))
-                    }
-                    Projection::Index(local) => {
-                        Some(RirProjection::Index(RirLocalId::from_index(local.index())))
-                    }
-                    Projection::TupleField(_) | Projection::VariantField { .. } => None,
-                })
+                .map(|projection| self.rir_projection(projection))
                 .collect(),
             ty: self.type_map[&place.ty],
         }
     }
+}
+
+fn set_if_changed(slot: &mut bool, value: bool) -> bool {
+    let changed = *slot != value;
+    *slot = value;
+    changed
 }
 
 fn rir_format_spec(spec: FormatSpec) -> RirFormatSpec {
@@ -2043,6 +2150,7 @@ fn type_suffix(program: &RirProgram, ty: RirTypeId) -> String {
         RirType::Slice(elem) => format!("slice_{}", type_suffix(program, elem)),
         RirType::Array { elem, len } => format!("array_{}_{}", len, type_suffix(program, elem)),
         RirType::Struct(id) => named_type_suffix(ty.index(), &program.structs[id.index()].display),
+        RirType::Tuple(id) => named_type_suffix(ty.index(), &program.tuples[id.index()].display),
         RirType::DataRef(id) => {
             named_type_suffix(ty.index(), &program.datarefs[id.index()].display)
         }

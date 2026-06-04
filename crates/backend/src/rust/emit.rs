@@ -3,7 +3,7 @@ use std::fmt::Write;
 use anvyx_frontend::ast::{BinaryOp, UnaryOp};
 
 use super::{
-    rep_policy::{RustBorrowView, RustRepPolicy},
+    rep_policy::{RustBorrowView, RustRepPolicy, RustTracePlan},
     rir::{
         RirCallArg, RirCallTarget, RirConst, RirConstValue, RirEnum, RirEnumMatch, RirEnumRepr,
         RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
@@ -36,6 +36,7 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
     let program = program.program();
     let mut cx = EmitCx {
         program,
+        trace_plan: RustTracePlan::build(program),
         fallible_functions: fallible_functions(program),
         out: String::new(),
     };
@@ -45,6 +46,7 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
 
 struct EmitCx<'a> {
     program: &'a RirProgram,
+    trace_plan: RustTracePlan,
     fallible_functions: Vec<bool>,
     out: String,
 }
@@ -134,6 +136,9 @@ impl EmitCx<'_> {
         for strukt in &self.program.structs {
             self.emit_struct(strukt);
         }
+        for tuple in &self.program.tuples {
+            self.emit_tuple(tuple);
+        }
         for enm in &self.program.enums {
             self.emit_enum(enm);
         }
@@ -164,8 +169,9 @@ impl EmitCx<'_> {
         self.line("impl<'cx> AnvTypes<'cx> {");
         self.line("    fn register(heap: &mut anvyx_runtime::Heap<'cx>) -> Self {");
         self.line("        Self {");
+        let policy = RustRepPolicy::new(self.program);
         for dataref in &self.program.datarefs {
-            let register = if dataref.cycle_capable || self.dataref_cx_dependent(dataref) {
+            let register = if policy.dataref_storage_tracked(dataref) {
                 "register_tracked"
             } else {
                 "register_untracked"
@@ -233,7 +239,8 @@ impl EmitCx<'_> {
 
     fn emit_dataref(&mut self, dataref: &super::rir::RirDataRef) {
         let storage = dataref.storage_symbol();
-        let cx_dependent = self.dataref_cx_dependent(dataref);
+        let policy = RustRepPolicy::new(self.program);
+        let cx_dependent = policy.dataref_cx_dependent(dataref);
         let storage_lifetime = if cx_dependent { "<'cx>" } else { "" };
         if cx_dependent {
             self.line("#[derive(anvyx_runtime::Trace)]");
@@ -249,7 +256,7 @@ impl EmitCx<'_> {
         }
         self.line("}");
         self.line("");
-        if dataref.cycle_capable && !cx_dependent {
+        if policy.dataref_storage_tracked(dataref) && !cx_dependent {
             self.line(&format!(
                 "unsafe impl<'cx> anvyx_runtime::Trace<'cx> for {storage} {{"
             ));
@@ -271,19 +278,11 @@ impl EmitCx<'_> {
 
     fn dataref_storage_ty(&self, dataref: &super::rir::RirDataRef) -> String {
         let storage = dataref.storage_symbol();
-        if self.dataref_cx_dependent(dataref) {
+        if RustRepPolicy::new(self.program).dataref_cx_dependent(dataref) {
             format!("{storage}<'cx>")
         } else {
             storage
         }
-    }
-
-    fn dataref_cx_dependent(&self, dataref: &super::rir::RirDataRef) -> bool {
-        let policy = RustRepPolicy::new(self.program);
-        dataref
-            .fields
-            .iter()
-            .any(|field| policy.type_cx_dependent(field.ty))
     }
 
     fn emit_struct(&mut self, strukt: &super::rir::RirStruct) {
@@ -296,16 +295,32 @@ impl EmitCx<'_> {
             self.line("");
             return;
         }
-        let cx_dependent = self.struct_cx_dependent(strukt);
-        if cx_dependent {
+        self.emit_record_struct(
+            strukt.symbol.as_str(),
+            &strukt.fields,
+            self.trace_plan.needs_struct_trace(strukt.id),
+        );
+    }
+
+    fn emit_tuple(&mut self, tuple: &super::rir::RirTuple) {
+        self.emit_record_struct(
+            tuple.symbol.as_str(),
+            &tuple.fields,
+            self.trace_plan.needs_tuple_trace(tuple.id),
+        );
+    }
+
+    fn emit_record_struct(&mut self, symbol: &str, fields: &[super::rir::RirField], trace: bool) {
+        let cx_dependent = self.fields_cx_dependent(fields);
+        if trace {
             self.line("#[derive(Clone, anvyx_runtime::Trace)]");
-            self.line("#[trace(crate = anvyx_runtime, ctx = 'cx)]");
+            self.emit_trace_attr(cx_dependent);
         } else {
             self.line("#[derive(Clone)]");
         }
         let lifetime = if cx_dependent { "<'cx>" } else { "" };
-        self.line(&format!("struct {}{lifetime} {{", strukt.symbol.as_str()));
-        for field in &strukt.fields {
+        self.line(&format!("struct {symbol}{lifetime} {{"));
+        for field in fields {
             self.line(&format!(
                 "    {}: {},",
                 field.symbol.as_str(),
@@ -318,9 +333,15 @@ impl EmitCx<'_> {
 
     fn emit_enum(&mut self, enm: &RirEnum) {
         let cx_dependent = self.enum_cx_dependent(enm);
-        if cx_dependent {
-            self.line("#[derive(Clone, anvyx_runtime::Trace)]");
-            self.line("#[trace(crate = anvyx_runtime, ctx = 'cx)]");
+        let needs_trace = self.trace_plan.needs_enum_trace(enm.id);
+        if needs_trace {
+            if enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty() {
+                self.line("#[derive(Clone, Copy, anvyx_runtime::Trace)]");
+                self.line("#[repr(i64)]");
+            } else {
+                self.line("#[derive(Clone, anvyx_runtime::Trace)]");
+            }
+            self.emit_trace_attr(cx_dependent);
         } else if enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty() {
             self.line("#[derive(Clone, Copy)]");
             self.line("#[repr(i64)]");
@@ -366,10 +387,17 @@ impl EmitCx<'_> {
         self.line("");
     }
 
-    fn struct_cx_dependent(&self, strukt: &super::rir::RirStruct) -> bool {
+    fn emit_trace_attr(&mut self, cx_dependent: bool) {
+        if cx_dependent {
+            self.line("#[trace(crate = anvyx_runtime, ctx = 'cx)]");
+        } else {
+            self.line("#[trace(crate = anvyx_runtime)]");
+        }
+    }
+
+    fn fields_cx_dependent(&self, fields: &[super::rir::RirField]) -> bool {
         let policy = RustRepPolicy::new(self.program);
-        strukt
-            .fields
+        fields
             .iter()
             .any(|field| policy.type_cx_dependent(field.ty))
     }
@@ -432,6 +460,7 @@ impl EmitCx<'_> {
                     ));
                 }
                 RirType::Void
+                | RirType::Tuple(_)
                 | RirType::DataRef(_)
                 | RirType::Enum(_)
                 | RirType::Array { .. }
@@ -586,6 +615,7 @@ impl EmitCx<'_> {
             | RirRValue::MapRemove { .. }
             | RirRValue::ListSlice { .. }
             | RirRValue::Struct { .. }
+            | RirRValue::Tuple { .. }
             | RirRValue::EnumVariant { .. } => false,
             RirRValue::DataRefAlloc { .. } | RirRValue::DataRefGet { .. } => true,
         }
@@ -863,6 +893,7 @@ impl EmitCx<'_> {
         match value {
             RirRValue::Use(operand) => self.value_operand(function, operand),
             RirRValue::Struct { ty, fields } => self.struct_literal(function, *ty, fields),
+            RirRValue::Tuple { ty, fields } => self.tuple_literal(function, *ty, fields),
             RirRValue::DataRefAlloc { ty, fields } => self.dataref_alloc(function, *ty, fields),
             RirRValue::DataRefGet {
                 object,
@@ -947,6 +978,7 @@ impl EmitCx<'_> {
                     ),
                     RirType::Struct(_) => self.stringify_struct(function, value, *source_ty),
                     RirType::Void
+                    | RirType::Tuple(_)
                     | RirType::DataRef(_)
                     | RirType::Enum(_)
                     | RirType::Array { .. }
@@ -1270,6 +1302,9 @@ impl EmitCx<'_> {
                 RirType::Enum(id) if self.program.enums[id.index()].copyable => {
                     self.copy_enum_place(function, place)
                 }
+                RirType::Tuple(id) if self.program.tuples[id.index()].copyable => {
+                    self.copy_tuple_place(function, place)
+                }
                 RirType::Array { .. } => self.copy_array_place(function, place),
                 _ => self.place(function, place),
             },
@@ -1294,6 +1329,15 @@ impl EmitCx<'_> {
                         unreachable!("verified field projection")
                     };
                     let field = &self.program.structs[struct_id.index()].fields[field_id.index()];
+                    out.push('.');
+                    out.push_str(field.symbol.as_str());
+                    ty = field.ty;
+                }
+                super::rir::RirProjection::TupleField(field_id) => {
+                    let RirType::Tuple(tuple_id) = self.program.types[ty.index()] else {
+                        unreachable!("verified tuple projection")
+                    };
+                    let field = &self.program.tuples[tuple_id.index()].fields[field_id.index()];
                     out.push('.');
                     out.push_str(field.symbol.as_str());
                     ty = field.ty;
@@ -1413,6 +1457,15 @@ impl EmitCx<'_> {
                     out.push_str(field.symbol.as_str());
                     ty = field.ty;
                 }
+                super::rir::RirProjection::TupleField(field_id) => {
+                    let RirType::Tuple(tuple_id) = self.program.types[ty.index()] else {
+                        unreachable!("verified storage tuple projection")
+                    };
+                    let field = &self.program.tuples[tuple_id.index()].fields[field_id.index()];
+                    out.push('.');
+                    out.push_str(field.symbol.as_str());
+                    ty = field.ty;
+                }
                 super::rir::RirProjection::Index(index) => {
                     let RirType::Array { elem, len } = self.program.types[ty.index()] else {
                         unreachable!("verified storage index projection")
@@ -1432,16 +1485,38 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         ty: RirTypeId,
-        fields: &[RirOperand],
+        operands: &[RirOperand],
     ) -> String {
         let RirType::Struct(struct_id) = self.program.types[ty.index()] else {
             unreachable!("verified struct literal type")
         };
         let strukt = &self.program.structs[struct_id.index()];
-        let fields = strukt
-            .fields
+        self.record_literal(function, strukt.symbol.as_str(), &strukt.fields, operands)
+    }
+
+    fn tuple_literal(
+        &self,
+        function: &RirFunction,
+        ty: RirTypeId,
+        operands: &[RirOperand],
+    ) -> String {
+        let RirType::Tuple(tuple_id) = self.program.types[ty.index()] else {
+            unreachable!("verified tuple literal type")
+        };
+        let tuple = &self.program.tuples[tuple_id.index()];
+        self.record_literal(function, tuple.symbol.as_str(), &tuple.fields, operands)
+    }
+
+    fn record_literal(
+        &self,
+        function: &RirFunction,
+        symbol: &str,
+        fields: &[super::rir::RirField],
+        operands: &[RirOperand],
+    ) -> String {
+        let fields = fields
             .iter()
-            .zip(fields)
+            .zip(operands)
             .map(|(field, operand)| {
                 format!(
                     "{}: {}",
@@ -1451,7 +1526,7 @@ impl EmitCx<'_> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{} {{ {} }}", strukt.symbol.as_str(), fields)
+        format!("{symbol} {{ {fields} }}")
     }
 
     fn enum_literal(
@@ -1502,14 +1577,42 @@ impl EmitCx<'_> {
             unreachable!("verified struct copy place")
         };
         let strukt = &self.program.structs[struct_id.index()];
-        let fields = strukt
-            .fields
+        self.copy_record_place(
+            function,
+            place,
+            strukt.symbol.as_str(),
+            &strukt.fields,
+            super::rir::RirProjection::Field,
+        )
+    }
+
+    fn copy_tuple_place(&self, function: &RirFunction, place: &RirPlace) -> String {
+        let RirType::Tuple(tuple_id) = self.program.types[place.ty.index()] else {
+            unreachable!("verified tuple copy place")
+        };
+        let tuple = &self.program.tuples[tuple_id.index()];
+        self.copy_record_place(
+            function,
+            place,
+            tuple.symbol.as_str(),
+            &tuple.fields,
+            super::rir::RirProjection::TupleField,
+        )
+    }
+
+    fn copy_record_place(
+        &self,
+        function: &RirFunction,
+        place: &RirPlace,
+        symbol: &str,
+        fields: &[super::rir::RirField],
+        projection: impl Fn(super::rir::RirFieldId) -> super::rir::RirProjection,
+    ) -> String {
+        let fields = fields
             .iter()
             .map(|field| {
                 let mut field_place = place.clone();
-                field_place
-                    .projections
-                    .push(super::rir::RirProjection::Field(field.id));
+                field_place.projections.push(projection(field.id));
                 field_place.ty = field.ty;
                 format!(
                     "{}: {}",
@@ -1519,7 +1622,7 @@ impl EmitCx<'_> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{} {{ {} }}", strukt.symbol.as_str(), fields)
+        format!("{symbol} {{ {fields} }}")
     }
 
     fn copy_array_place(&self, function: &RirFunction, place: &RirPlace) -> String {
@@ -1616,7 +1719,7 @@ impl EmitCx<'_> {
             RirType::Int | RirType::Float | RirType::Bool => expr.to_string(),
             RirType::String | RirType::List(_) | RirType::Map { .. } => format!("{expr}.share()"),
             RirType::DataRef(_) => format!("{expr}.clone()"),
-            RirType::Struct(_) | RirType::Array { .. } | RirType::Enum(_) => {
+            RirType::Struct(_) | RirType::Tuple(_) | RirType::Array { .. } | RirType::Enum(_) => {
                 self.copy_from_ref(ty, &format!("&{expr}"))
             }
             RirType::Option(_) => self.copy_from_ref(ty, &format!("&{expr}")),
@@ -1629,20 +1732,7 @@ impl EmitCx<'_> {
             RirType::Int | RirType::Float | RirType::Bool => format!("*({expr})"),
             RirType::Struct(id) => {
                 let strukt = &self.program.structs[id.index()];
-                let fields = strukt
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        let field_expr = format!("&({expr}).{}", field.symbol.as_str());
-                        format!(
-                            "{}: {}",
-                            field.symbol.as_str(),
-                            self.value_from_ref(field.ty, &field_expr)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{} {{ {} }}", strukt.symbol.as_str(), fields)
+                self.copy_record_from_ref(strukt.symbol.as_str(), &strukt.fields, expr)
             }
             RirType::Array { elem, len } => {
                 let elems = (0..len)
@@ -1650,6 +1740,10 @@ impl EmitCx<'_> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("[{elems}]")
+            }
+            RirType::Tuple(id) => {
+                let tuple = &self.program.tuples[id.index()];
+                self.copy_record_from_ref(tuple.symbol.as_str(), &tuple.fields, expr)
             }
             RirType::Enum(id) if self.program.enums[id.index()].variants.is_empty() => {
                 format!("match *({expr}) {{}}")
@@ -1665,6 +1759,27 @@ impl EmitCx<'_> {
             }
             RirType::Slice(_) | RirType::Void => unreachable!("verified copy enum payload"),
         }
+    }
+
+    fn copy_record_from_ref(
+        &self,
+        symbol: &str,
+        fields: &[super::rir::RirField],
+        expr: &str,
+    ) -> String {
+        let fields = fields
+            .iter()
+            .map(|field| {
+                let field_expr = format!("&({expr}).{}", field.symbol.as_str());
+                format!(
+                    "{}: {}",
+                    field.symbol.as_str(),
+                    self.value_from_ref(field.ty, &field_expr)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{symbol} {{ {fields} }}")
     }
 
     fn stringify_struct(

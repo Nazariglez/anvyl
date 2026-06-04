@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 4
+// 7
+// @match-end
+
+struct Payload {
+    coords: (int, int),
+}
+
+fn main() {
+    let payload = Payload { coords: (4, 7) };
+    let x = payload.coords.0;
+    let y = payload.coords.1;
+    println(x);
+    println(y);
+}

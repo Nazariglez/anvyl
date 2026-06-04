@@ -35,6 +35,7 @@ rir_id!(RirLoopId);
 rir_id!(RirStructId);
 rir_id!(RirDataRefId);
 rir_id!(RirEnumId);
+rir_id!(RirTupleId);
 rir_id!(RirVariantId);
 rir_id!(RirFieldId);
 rir_id!(RirStringifyHelperId);
@@ -62,6 +63,7 @@ pub struct RirProgram {
     pub structs: Vec<RirStruct>,
     pub datarefs: Vec<RirDataRef>,
     pub enums: Vec<RirEnum>,
+    pub tuples: Vec<RirTuple>,
     pub stringify_reqs: Vec<RirStringifyReq>,
     pub stringify_helpers: Vec<RirStringifyHelper>,
     pub consts: Vec<RirConst>,
@@ -85,6 +87,15 @@ pub struct RirField {
     pub id: RirFieldId,
     pub symbol: RirSymbol,
     pub ty: RirTypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirTuple {
+    pub id: RirTupleId,
+    pub symbol: RirSymbol,
+    pub display: RirSymbol,
+    pub copyable: bool,
+    pub fields: Vec<RirField>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +322,10 @@ pub enum RirRValue {
         ty: RirTypeId,
         fields: Vec<RirOperand>,
     },
+    Tuple {
+        ty: RirTypeId,
+        fields: Vec<RirOperand>,
+    },
     DataRefAlloc {
         ty: RirTypeId,
         fields: Vec<RirOperand>,
@@ -487,6 +502,7 @@ pub struct RirPlace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RirProjection {
     Field(RirFieldId),
+    TupleField(RirFieldId),
     Index(RirLocalId),
 }
 
@@ -516,6 +532,7 @@ pub enum RirType {
     Struct(RirStructId),
     DataRef(RirDataRefId),
     Enum(RirEnumId),
+    Tuple(RirTupleId),
     Array { elem: RirTypeId, len: u64 },
     List(RirTypeId),
     Map { key: RirTypeId, value: RirTypeId },
@@ -775,6 +792,7 @@ impl VerifyCx<'_> {
                 RirType::Struct(id) => self.check_struct_id(site, *id),
                 RirType::DataRef(id) => self.check_dataref_id(site, *id),
                 RirType::Enum(id) => self.check_enum_id(site, *id),
+                RirType::Tuple(id) => self.check_tuple_id(site, *id),
                 RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => {
                     self.check_type_id(site, *elem);
                 }
@@ -789,6 +807,7 @@ impl VerifyCx<'_> {
         self.check_structs();
         self.check_datarefs();
         self.check_enums();
+        self.check_tuples();
         self.check_stringify_helpers();
         for (index, konst) in self.program.consts.iter().enumerate() {
             let id = RirConstId::from_index(index);
@@ -839,7 +858,7 @@ impl VerifyCx<'_> {
                 }
                 field_symbols.push(field.symbol.clone());
                 self.check_type_id(site, field.ty);
-                if strukt.copyable && !self.inherently_copyable_type(field.ty) {
+                if strukt.copyable && !self.copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }
             }
@@ -942,6 +961,42 @@ impl VerifyCx<'_> {
                     if enm.copyable && !self.copyable_type(field.ty) {
                         self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                     }
+                }
+            }
+        }
+    }
+
+    fn check_tuples(&mut self) {
+        let mut symbols = Vec::new();
+        for (index, tuple) in self.program.tuples.iter().enumerate() {
+            let id = RirTupleId::from_index(index);
+            let site = RirVerifySite::Type(RirTypeId::from_index(index));
+            if tuple.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            if tuple.symbol.as_str().is_empty()
+                || symbols.iter().any(|symbol| symbol == &tuple.symbol)
+            {
+                self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+            }
+            symbols.push(tuple.symbol.clone());
+            if tuple.display.as_str().is_empty() {
+                self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+            }
+            let mut field_symbols = Vec::new();
+            for (field_index, field) in tuple.fields.iter().enumerate() {
+                if field.id != RirFieldId::from_index(field_index) {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                }
+                if field.symbol.as_str().is_empty()
+                    || field_symbols.iter().any(|symbol| symbol == &field.symbol)
+                {
+                    self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+                }
+                field_symbols.push(field.symbol.clone());
+                self.check_type_id(site, field.ty);
+                if tuple.copyable && !self.copyable_type(field.ty) {
+                    self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }
             }
         }
@@ -1678,6 +1733,18 @@ impl VerifyCx<'_> {
                 };
                 Some(self.check_construct_fields(site, function, *ty, &strukt.fields, fields))
             }
+            RirRValue::Tuple { ty, fields } => {
+                self.check_type_id(site, *ty);
+                let Some(RirType::Tuple(tuple_id)) = self.ty(*ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                let Some(tuple) = self.program.tuples.get(tuple_id.index()).cloned() else {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                    return;
+                };
+                Some(self.check_construct_fields(site, function, *ty, &tuple.fields, fields))
+            }
             RirRValue::DataRefAlloc { ty, fields } => {
                 self.check_type_id(site, *ty);
                 let Some(RirType::DataRef(dataref_id)) = self.ty(*ty) else {
@@ -2233,6 +2300,7 @@ impl VerifyCx<'_> {
             }
             Some(
                 RirType::Void
+                | RirType::Tuple(_)
                 | RirType::DataRef(_)
                 | RirType::Enum(_)
                 | RirType::Array { .. }
@@ -2253,6 +2321,7 @@ impl VerifyCx<'_> {
             RirType::Int | RirType::Float | RirType::Bool | RirType::String => {}
             RirType::Void
             | RirType::Struct(_)
+            | RirType::Tuple(_)
             | RirType::DataRef(_)
             | RirType::Enum(_)
             | RirType::Array { .. }
@@ -2421,6 +2490,21 @@ impl VerifyCx<'_> {
                     };
                     current = field.ty;
                 }
+                RirProjection::TupleField(index) => {
+                    let Some(RirType::Tuple(tuple_id)) = self.ty(current) else {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        return None;
+                    };
+                    let Some(tuple) = self.program.tuples.get(tuple_id.index()) else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                        return None;
+                    };
+                    let Some(field) = tuple.fields.get(index.index()) else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                        return None;
+                    };
+                    current = field.ty;
+                }
                 RirProjection::Index(local) => {
                     let Some(RirType::Array { elem, .. }) = self.ty(current) else {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -2471,6 +2555,21 @@ impl VerifyCx<'_> {
                         return;
                     };
                     let Some(field) = strukt.fields.get(field_id.index()) else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                        return;
+                    };
+                    current = field.ty;
+                }
+                RirProjection::TupleField(index) => {
+                    let Some(RirType::Tuple(tuple_id)) = self.ty(current) else {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        return;
+                    };
+                    let Some(tuple) = self.program.tuples.get(tuple_id.index()) else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                        return;
+                    };
+                    let Some(field) = tuple.fields.get(index.index()) else {
                         self.push(site, RirVerifyErrorKind::BadId);
                         return;
                     };
@@ -2556,6 +2655,12 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn check_tuple_id(&mut self, site: RirVerifySite, id: RirTupleId) {
+        if id.index() >= self.program.tuples.len() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
     fn check_stringify_helper_id(&mut self, site: RirVerifySite, id: RirStringifyHelperId) {
         if id.index() >= self.program.stringify_helpers.len() {
             self.push(site, RirVerifyErrorKind::BadId);
@@ -2572,6 +2677,9 @@ impl VerifyCx<'_> {
                 RustRepPolicy::new(self.program).copyable(ty) && self.inherently_copyable_type(ty)
             }
             Some(RirType::Enum(id)) if self.program.enums.get(id.index()).is_some() => {
+                RustRepPolicy::new(self.program).copyable(ty) && self.inherently_copyable_type(ty)
+            }
+            Some(RirType::Tuple(id)) if self.program.tuples.get(id.index()).is_some() => {
                 RustRepPolicy::new(self.program).copyable(ty) && self.inherently_copyable_type(ty)
             }
             Some(RirType::Array { .. }) => self.inherently_copyable_type(ty),
@@ -2598,6 +2706,12 @@ impl VerifyCx<'_> {
                         .iter()
                         .all(|field| self.inherently_copyable_type(field.ty))
                 })
+            }),
+            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
+                tuple
+                    .fields
+                    .iter()
+                    .all(|field| self.inherently_copyable_type(field.ty))
             }),
             Some(RirType::Array { elem, .. }) => self.inherently_copyable_type(elem),
             Some(RirType::Option(inner)) => self.inherently_copyable_type(inner),

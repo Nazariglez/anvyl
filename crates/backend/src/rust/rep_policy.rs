@@ -1,9 +1,14 @@
+use std::collections::BTreeSet;
+
 use anvyx_frontend::air::{
     self, ParamMode, Program as AirProgram, TypeData, TypeId, TypePassClass, TypePassClasses,
     VariantShape,
 };
 
-use super::rir::{RirEnumId, RirParamAbi, RirParamSemantic, RirProgram, RirType, RirTypeId};
+use super::rir::{
+    RirDataRef, RirEnumId, RirParamAbi, RirParamSemantic, RirProgram, RirStructId, RirTupleId,
+    RirType, RirTypeId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustValueRep {
@@ -83,6 +88,9 @@ impl<'a> AirRustRepPolicy<'a> {
             TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
                 self.value_from_ref_supported(*inner)
             }
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .all(|elem| self.value_from_ref_supported(*elem)),
             TypeData::Aggregate(id) => self
                 .program
                 .aggregate(*id)
@@ -98,8 +106,36 @@ impl<'a> AirRustRepPolicy<'a> {
                 .all(|field| self.value_from_ref_supported(field.ty)),
             TypeData::Void
             | TypeData::Any
-            | TypeData::Tuple(_)
             | TypeData::Slice(_)
+            | TypeData::Function(_)
+            | TypeData::Dyn(_) => false,
+        }
+    }
+
+    pub fn dataref_payload_supported(self, ty: TypeId) -> bool {
+        match self.program.type_arena.data(ty) {
+            TypeData::DataRef(_) => true,
+            TypeData::Optional(inner) => self.dataref_payload_supported(*inner),
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .all(|elem| self.dataref_payload_supported(*elem)),
+            TypeData::Aggregate(aggregate) => self
+                .program
+                .aggregate(*aggregate)
+                .fields
+                .iter()
+                .all(|field| self.dataref_payload_supported(field.ty)),
+            TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().all(|variant| {
+                Self::variant_field_tys(variant).all(|ty| self.dataref_payload_supported(ty))
+            }),
+            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::Array { .. }
+            | TypeData::List(_)
+            | TypeData::Map { .. }
+            | TypeData::Slice(_)
+            | TypeData::Extern(_)
             | TypeData::Function(_)
             | TypeData::Dyn(_) => false,
         }
@@ -118,6 +154,7 @@ impl<'a> AirRustRepPolicy<'a> {
                 true
             }
             TypeData::Optional(inner) => self.value_place_shareable(*inner),
+            TypeData::Tuple(elems) => elems.iter().all(|elem| self.value_place_shareable(*elem)),
             TypeData::Aggregate(id) => self
                 .program
                 .aggregate(*id)
@@ -126,6 +163,14 @@ impl<'a> AirRustRepPolicy<'a> {
                 .all(|field| self.value_place_shareable(field.ty)),
             TypeData::Enum(id) => self.enum_shareable(*id),
             _ => false,
+        }
+    }
+
+    fn variant_field_tys(variant: &air::VariantDecl) -> Box<dyn Iterator<Item = TypeId> + '_> {
+        match &variant.shape {
+            VariantShape::Unit => Box::new(std::iter::empty()),
+            VariantShape::Tuple(fields) => Box::new(fields.iter().copied()),
+            VariantShape::Struct(fields) => Box::new(fields.iter().map(|field| field.ty)),
         }
     }
 
@@ -181,6 +226,9 @@ impl<'a> AirRustRepPolicy<'a> {
         match mode {
             ParamMode::Value => match self.program.type_arena.data(ty) {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
+                TypeData::Tuple(elems) => elems
+                    .iter()
+                    .all(|elem| self.supports_param_mode(*elem, mode)),
                 TypeData::Int
                 | TypeData::Float
                 | TypeData::Bool
@@ -193,14 +241,13 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Array { .. }
                 | TypeData::List(_)
                 | TypeData::Map { .. } => true,
-                TypeData::Any
-                | TypeData::Tuple(_)
-                | TypeData::Slice(_)
-                | TypeData::Function(_)
-                | TypeData::Dyn(_) => false,
+                TypeData::Any | TypeData::Slice(_) | TypeData::Function(_) | TypeData::Dyn(_) => {
+                    false
+                }
             },
             ParamMode::SharedBorrow => match self.program.type_arena.data(ty) {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
+                TypeData::Tuple(_) => true,
                 TypeData::String
                 | TypeData::Aggregate(_)
                 | TypeData::DataRef(_)
@@ -214,13 +261,13 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Bool
                 | TypeData::Void
                 | TypeData::Any
-                | TypeData::Tuple(_)
                 | TypeData::Slice(_)
                 | TypeData::Function(_)
                 | TypeData::Dyn(_) => false,
             },
             ParamMode::MutBorrow => match self.program.type_arena.data(ty) {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
+                TypeData::Tuple(_) => true,
                 TypeData::Int
                 | TypeData::Float
                 | TypeData::Bool
@@ -234,7 +281,6 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Map { .. } => true,
                 TypeData::Void
                 | TypeData::Any
-                | TypeData::Tuple(_)
                 | TypeData::Slice(_)
                 | TypeData::Function(_)
                 | TypeData::Dyn(_) => false,
@@ -264,7 +310,7 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Map { .. } => RustValueRep::CowMap,
             RirType::Option(_) => RustValueRep::InlineEnum,
             RirType::Slice(_) => RustValueRep::Opaque,
-            RirType::Struct(_) => RustValueRep::InlineStruct,
+            RirType::Struct(_) | RirType::Tuple(_) => RustValueRep::InlineStruct,
             RirType::DataRef(_) => RustValueRep::HeapHandle,
             RirType::Enum(id) => self.enum_rep(id),
         }
@@ -308,6 +354,10 @@ impl<'a> RustRepPolicy<'a> {
                     .fields
                     .iter()
                     .all(|field| self.shareable_value(field.ty)),
+                RirType::Tuple(id) => self.program.tuples[id.index()]
+                    .fields
+                    .iter()
+                    .all(|field| self.shareable_value(field.ty)),
                 RirType::Enum(id) => {
                     self.program.enums[id.index()]
                         .variants
@@ -336,6 +386,10 @@ impl<'a> RustRepPolicy<'a> {
                 self.value_from_ref_supported(inner)
             }
             RirType::Struct(id) => self.program.structs[id.index()]
+                .fields
+                .iter()
+                .all(|field| self.value_from_ref_supported(field.ty)),
+            RirType::Tuple(id) => self.program.tuples[id.index()]
                 .fields
                 .iter()
                 .all(|field| self.value_from_ref_supported(field.ty)),
@@ -379,6 +433,10 @@ impl<'a> RustRepPolicy<'a> {
                 self.program.enums[id.index()].symbol.as_str(),
                 self.type_cx_dependent(ty),
             ),
+            RirType::Tuple(id) => self.named_ty(
+                self.program.tuples[id.index()].symbol.as_str(),
+                self.type_cx_dependent(ty),
+            ),
             RirType::Array { elem, len } => format!("[{}; {len}]", self.rust_ty(elem)),
             RirType::List(elem) => format!("anvyx_runtime::AnvList<{}>", self.rust_ty(elem)),
             RirType::Map { key, value } => format!(
@@ -391,6 +449,17 @@ impl<'a> RustRepPolicy<'a> {
         }
     }
 
+    pub fn dataref_cx_dependent(self, dataref: &RirDataRef) -> bool {
+        dataref
+            .fields
+            .iter()
+            .any(|field| self.type_cx_dependent(field.ty))
+    }
+
+    pub fn dataref_storage_tracked(self, dataref: &RirDataRef) -> bool {
+        dataref.cycle_capable || self.dataref_cx_dependent(dataref)
+    }
+
     pub fn type_cx_dependent(self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
             RirType::DataRef(_) => true,
@@ -401,6 +470,10 @@ impl<'a> RustRepPolicy<'a> {
                 self.type_cx_dependent(key) || self.type_cx_dependent(value)
             }
             RirType::Struct(id) => self.program.structs[id.index()]
+                .fields
+                .iter()
+                .any(|field| self.type_cx_dependent(field.ty)),
+            RirType::Tuple(id) => self.program.tuples[id.index()]
                 .fields
                 .iter()
                 .any(|field| self.type_cx_dependent(field.ty)),
@@ -437,6 +510,7 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Array { elem, .. } => self.copyable(elem),
             RirType::Struct(id) => self.program.structs[id.index()].copyable,
             RirType::Enum(id) => self.program.enums[id.index()].copyable,
+            RirType::Tuple(id) => self.program.tuples[id.index()].copyable,
         }
     }
 
@@ -455,12 +529,17 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Array { .. }
                 | RirType::List(_)
                 | RirType::Map { .. } => true,
+                RirType::Tuple(id) => self.program.tuples[id.index()]
+                    .fields
+                    .iter()
+                    .all(|field| self.supports_param(field.ty, semantic)),
                 RirType::Slice(_) => false,
             },
             RirParamSemantic::SharedBorrow => match ty {
                 RirType::Option(inner) => self.supports_param(inner, semantic),
                 RirType::String
                 | RirType::Struct(_)
+                | RirType::Tuple(_)
                 | RirType::DataRef(_)
                 | RirType::Enum(_)
                 | RirType::Array { .. }
@@ -479,6 +558,7 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Bool
                 | RirType::String
                 | RirType::Struct(_)
+                | RirType::Tuple(_)
                 | RirType::DataRef(_)
                 | RirType::Enum(_)
                 | RirType::Array { .. }
@@ -506,6 +586,97 @@ impl<'a> RustRepPolicy<'a> {
 
     fn ty_opt(self, ty: RirTypeId) -> Option<RirType> {
         self.program.types.get(ty.index()).copied()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct RustTracePlan {
+    structs: BTreeSet<RirStructId>,
+    enums: BTreeSet<RirEnumId>,
+    tuples: BTreeSet<RirTupleId>,
+    visited: BTreeSet<RirTypeId>,
+}
+
+impl RustTracePlan {
+    pub fn build(program: &RirProgram) -> Self {
+        let mut plan = Self::default();
+        let policy = RustRepPolicy::new(program);
+        for (index, ty) in program.types.iter().enumerate() {
+            let id = RirTypeId::from_index(index);
+            if matches!(
+                ty,
+                RirType::Struct(_) | RirType::Tuple(_) | RirType::Enum(_)
+            ) && policy.type_cx_dependent(id)
+            {
+                plan.mark_type(program, id);
+            }
+        }
+        for dataref in &program.datarefs {
+            if policy.dataref_storage_tracked(dataref) {
+                for field in &dataref.fields {
+                    plan.mark_type(program, field.ty);
+                }
+            }
+        }
+        plan
+    }
+
+    pub fn needs_struct_trace(&self, id: RirStructId) -> bool {
+        self.structs.contains(&id)
+    }
+
+    pub fn needs_enum_trace(&self, id: RirEnumId) -> bool {
+        self.enums.contains(&id)
+    }
+
+    pub fn needs_tuple_trace(&self, id: RirTupleId) -> bool {
+        self.tuples.contains(&id)
+    }
+
+    fn mark_type(&mut self, program: &RirProgram, ty: RirTypeId) {
+        if !self.visited.insert(ty) {
+            return;
+        }
+        match program.types[ty.index()] {
+            RirType::Option(inner) => self.mark_type(program, inner),
+            RirType::Struct(id) => {
+                let strukt = &program.structs[id.index()];
+                if strukt.native_path.is_some() {
+                    return;
+                }
+                self.structs.insert(id);
+                for field in &strukt.fields {
+                    self.mark_type(program, field.ty);
+                }
+            }
+            RirType::Tuple(id) => {
+                self.tuples.insert(id);
+                for field in &program.tuples[id.index()].fields {
+                    self.mark_type(program, field.ty);
+                }
+            }
+            RirType::Enum(id) => {
+                self.enums.insert(id);
+                for variant in &program.enums[id.index()].variants {
+                    for field in &variant.fields {
+                        self.mark_type(program, field.ty);
+                    }
+                }
+            }
+            RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => {
+                self.mark_type(program, elem);
+            }
+            RirType::Map { key, value } => {
+                self.mark_type(program, key);
+                self.mark_type(program, value);
+            }
+            RirType::Int
+            | RirType::Float
+            | RirType::Bool
+            | RirType::String
+            | RirType::Void
+            | RirType::DataRef(_) => {}
+        }
     }
 }
 

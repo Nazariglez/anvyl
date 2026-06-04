@@ -1,0 +1,16 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 1
+// 3
+// @match-end
+
+fn main() {
+    let pair = (1, 2);
+    let nested = (pair, 3);
+    let first = pair.0;
+    let second = nested.1;
+    println(first);
+    println(second);
+}

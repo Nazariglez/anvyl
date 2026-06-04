@@ -1,0 +1,24 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// payload
+// 3
+// @match-end
+
+struct Payload {
+    label: string,
+    count: int,
+}
+
+dataref Node {
+    inner: Node?,
+    payload: Payload,
+}
+
+fn main() {
+    let payload = Payload { label: "payload", count: 3 };
+    let node = Node { inner: nil, payload: payload };
+    println(node.payload.label);
+    println(node.payload.count);
+}
