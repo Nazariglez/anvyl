@@ -1,10 +1,16 @@
+mod analysis;
 pub mod cargo_job;
 pub mod emit;
+mod place;
 pub mod profile;
 pub mod rep_policy;
 pub mod rir;
 #[cfg(test)]
 mod source_job;
+mod syntax;
+mod target;
+mod value;
+mod write;
 
 use std::{collections::HashMap, error::Error, fmt};
 

@@ -1,3 +1,5 @@
+mod check;
+
 pub mod ctx;
 pub mod cycle_collector;
 pub mod error;
@@ -14,6 +16,7 @@ pub use anvyx_heap::{
     Visitor,
 };
 pub use anvyx_macros::{AnvyxInline, AnvyxRef, builtin_module, function, methods, module};
+pub use check::{checked_index, checked_range};
 pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::RuntimeError;

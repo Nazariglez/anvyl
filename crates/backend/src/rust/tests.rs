@@ -825,6 +825,80 @@ fn stringify_override_value_receiver_uses_copy_reconstruction() {
 }
 
 #[test]
+fn stringify_override_propagates_fallible_receiver_function() {
+    let mut program = struct_field_read_program();
+    let module = air::ModuleId::from_index(0);
+    let point = program.functions[0].locals[0].ty;
+    let string = program.functions[0].locals[1].ty;
+    let aggregate = match program.type_arena.data(point) {
+        TypeData::Aggregate(aggregate) => *aggregate,
+        _ => panic!("point type missing"),
+    };
+    let int = program.aggregate(aggregate).fields[0].ty;
+    let fallible = fallible_extern(&mut program, int);
+    let recv = air::LocalId::from_index(0);
+    let tmp = air::LocalId::from_index(1);
+    let arg = int_const(&mut program, int, 41);
+    let ok = program.const_arena.alloc(ConstData {
+        ty: string,
+        value: ConstValue::String("ok".into()),
+    });
+    let method = program.alloc_function(Function {
+        name: Ident::new("to_string"),
+        module,
+        kind: FunctionKind::Method,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![Param {
+                name: Some(Ident::new("self")),
+                ty: point,
+                mode: ParamMode::SharedBorrow,
+                role: ParamRole::Receiver,
+                local_id: recv,
+            }],
+            string,
+        ),
+        locals: vec![local(point, LocalKind::Arg), local(int, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: tmp,
+                value: RValue::Call {
+                    callee: Callee::Extern(fallible),
+                    args: vec![CallArg::Value(Operand::Const(arg))],
+                },
+            }],
+            air::AirTail::Return(Some(Operand::Const(ok))),
+        ),
+    });
+    program.aggregate_mut(aggregate).stringify_override = Some(method);
+    program.module_mut(module).functions.insert(0, method);
+    if let air::AirStmt::Init { value, .. } = &mut program.functions[0].body.block.stmts[1] {
+        *value = RValue::Stringify {
+            value: Operand::Place(place(air::LocalId::from_index(0), point)),
+            source_ty: point,
+        };
+    }
+
+    let source = plan_source(program);
+    let text = source.as_str();
+
+    assert!(
+        text.contains("Point_to_string<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>, v0: &anvT3_Point)")
+    );
+    assert!(text.contains("-> Result<anvyx_runtime::AnvString, anvyx_runtime::RuntimeError>"));
+    assert!(text.contains("host::fallible(ctx.runtime(), 41)?;"));
+    assert!(text.contains("Point_to_string(ctx, &v0)?"));
+    assert!(text.contains("fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(text.contains("-> Result<(), anvyx_runtime::RuntimeError>"));
+
+    let output = run_source(with_fallible_host(source));
+
+    assert_eq!(output.status, SourceJobStatus::Success);
+    assert_eq!(output.stdout, "ok\n");
+}
+
+#[test]
 fn stringify_override_noncopy_value_receiver_is_target_gap() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
@@ -2888,6 +2962,57 @@ fn emit_wraps_native_string_returns() {
             .into_string();
 
     assert!(source.contains("anvyx_runtime::AnvString::from(host::string(ctx.runtime()))"));
+}
+
+#[test]
+fn emit_wraps_native_option_string_returns() {
+    let mut program = native_option_return_program(Some(RirCoreEnumKind::Option));
+    let option = RirTypeId::from_index(1);
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(0),
+        air_id: None,
+        symbol: RirSymbol::new("f"),
+        params: vec![],
+        ret: RirReturn { ty: option },
+        locals: vec![RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: option,
+            mutable: false,
+            symbol: RirSymbol::new("v0"),
+            initialized: false,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock {
+            stmts: vec![RirStmt::Init {
+                local: RirLocalId::from_index(0),
+                value: RirRValue::Call {
+                    callee: RirCallTarget::Extern(RirExternId::from_index(0)),
+                    args: vec![],
+                    ty: option,
+                },
+            }],
+            term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
+                local: RirLocalId::from_index(0),
+                projections: vec![],
+                ty: option,
+            }))),
+        },
+    });
+
+    program.entry = Some(RirFunctionId::from_index(0));
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
+    let text = source.as_str();
+
+    assert!(text.contains("match host::substring(ctx.runtime())"));
+    assert!(text.contains("Some(value) => Some(anvyx_runtime::AnvString::from(value))"));
+
+    let source = emit::RustSource::new(format!(
+        "mod host {{ pub fn substring<'cx, 'rt>(_ctx: &mut anvyx_runtime::Ctx<'cx, 'rt>) -> Option<String> {{ Some(\"ok\".to_string()) }} }}\n{}",
+        source.into_string()
+    ));
+    let output = run_source(source);
+
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
 }
 
 #[test]
@@ -6331,11 +6456,14 @@ mod arrays {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("[1, 2]"));
-        assert!(!source.as_str().contains("Vec<"));
-        assert!(!source.as_str().contains("vec!"));
-        assert!(source.as_str().contains("negative index"));
-        assert!(source.as_str().contains(".len() as i64"));
+        let text = source.as_str();
+        assert!(text.contains("[1, 2]"));
+        assert!(!text.contains("Vec<"));
+        assert!(!text.contains("vec!"));
+        assert!(text.contains("v0[anvyx_runtime::checked_index(v1, 2)]"));
+        assert!(!text.contains("negative index"));
+        assert!(!text.contains("index out of bounds"));
+        assert!(text.contains(".len() as i64"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success);
     }
@@ -6615,6 +6743,62 @@ mod arrays {
     }
 
     #[test]
+    fn out_of_bounds_index_panics() {
+        let mut program = Program::default();
+        let int = program.alloc_type(TypeData::Int);
+        let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
+        let module = program.alloc_module(root_module());
+        let value = int_const(&mut program, int, 1);
+        let too_large = int_const(&mut program, int, 1);
+        let array_local = air::LocalId::from_index(0);
+        let index_local = air::LocalId::from_index(1);
+        let value_local = air::LocalId::from_index(2);
+        let mut indexed = place(array_local, int);
+        indexed.projection.push(Projection::Index(index_local));
+        let main = program.alloc_function(Function {
+            name: Ident::new("main"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(vec![], int),
+            locals: vec![
+                local(array, LocalKind::Temp),
+                local(int, LocalKind::Temp),
+                local(int, LocalKind::Temp),
+            ],
+            body: structured_body(
+                vec![
+                    Statement::Init {
+                        local: array_local,
+                        value: RValue::Aggregate {
+                            kind: AggregateCtor::Array,
+                            fields: vec![Operand::Const(value)],
+                            ty: array,
+                        },
+                    },
+                    Statement::Init {
+                        local: index_local,
+                        value: RValue::Use(Operand::Const(too_large)),
+                    },
+                    Statement::Init {
+                        local: value_local,
+                        value: RValue::Use(Operand::Place(indexed)),
+                    },
+                ],
+                air::AirTail::Return(Some(Operand::Place(place(value_local, int)))),
+            ),
+        });
+        program.module_mut(module).functions.push(main);
+        program.set_entry(main);
+
+        let source = plan_source(program);
+        let output = run_source(source);
+        assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
+        assert!(output.stderr.contains("index out of bounds"));
+    }
+
+    #[test]
     fn noncopy_array_value_copy_is_target_gap() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
@@ -6782,16 +6966,15 @@ mod lists {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(
-            source
-                .as_str()
-                .contains("anvyx_runtime::AnvList::from_elems([1])")
-        );
-        assert!(!source.as_str().contains("Vec<"));
-        assert!(!source.as_str().contains("vec!"));
-        assert!(source.as_str().contains(".push(2)"));
-        assert!(source.as_str().contains("negative index"));
-        assert!(source.as_str().contains(".len() as i64"));
+        let text = source.as_str();
+        assert!(text.contains("anvyx_runtime::AnvList::from_elems([1])"));
+        assert!(!text.contains("Vec<"));
+        assert!(!text.contains("vec!"));
+        assert!(text.contains(".push(2)"));
+        assert!(text.contains("v0[anvyx_runtime::checked_index(v1, v0.len())]"));
+        assert!(!text.contains("negative index"));
+        assert!(!text.contains("index out of bounds"));
+        assert!(text.contains(".len() as i64"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
@@ -7071,8 +7254,11 @@ mod slices {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("&[i64]"));
-        assert!(source.as_str().contains("range out of bounds"));
+        let text = source.as_str();
+        assert!(text.contains("&[i64]"));
+        assert!(text.contains("&v0[anvyx_runtime::checked_range(v1, v2, false, v0.len())]"));
+        assert!(!text.contains("negative range bound"));
+        assert!(!text.contains("range out of bounds"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
@@ -7150,8 +7336,13 @@ mod slices {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("for item in"));
-        assert!(!source.as_str().contains("clone"));
+        let text = source.as_str();
+        assert!(
+            text.contains("for item in &v0[anvyx_runtime::checked_range(v1, v2, true, v0.len())]")
+        );
+        assert!(!text.contains("negative range bound"));
+        assert!(!text.contains("range out of bounds"));
+        assert!(!text.contains("clone"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }

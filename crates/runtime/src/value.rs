@@ -113,11 +113,7 @@ impl<T> AnvList<T> {
     }
 
     pub fn checked_index(&self, index: i64) -> &T {
-        assert!(index >= 0, "negative list index {index}");
-        let index = usize::try_from(index).expect("non-negative list index must fit usize");
-        self.elems
-            .get(index)
-            .unwrap_or_else(|| panic!("list index {index} out of bounds for len {}", self.len()))
+        &self.elems[crate::check::checked_index(index, self.len())]
     }
 
     pub fn as_slice(&self) -> &[T] {
@@ -347,13 +343,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "negative list index -1")]
+    #[should_panic(expected = "negative index")]
     fn anv_list_rejects_negative_index() {
         AnvList::from_elems([1_i64]).checked_index(-1);
     }
 
     #[test]
-    #[should_panic(expected = "list index 1 out of bounds for len 1")]
+    #[should_panic(expected = "index out of bounds")]
     fn anv_list_rejects_out_of_bounds_index() {
         AnvList::from_elems([1_i64]).checked_index(1);
     }

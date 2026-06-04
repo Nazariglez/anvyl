@@ -5,9 +5,12 @@ use anvyx_frontend::air::{
     VariantShape,
 };
 
-use super::rir::{
-    RirDataRef, RirEnumId, RirParamAbi, RirParamSemantic, RirProgram, RirStructId, RirTupleId,
-    RirType, RirTypeId,
+use super::{
+    rir::{
+        RirDataRef, RirEnum, RirEnumId, RirField, RirParamAbi, RirParamSemantic, RirProgram,
+        RirStruct, RirStructId, RirTuple, RirTupleId, RirType, RirTypeId,
+    },
+    target,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,19 +34,6 @@ pub enum RustBorrowView {
     Str,
     Slice,
     TargetGap,
-}
-
-impl RustBorrowView {
-    pub fn render(self, value: String, borrowed_root: bool) -> String {
-        match self {
-            Self::Ref if borrowed_root => value,
-            Self::Ref => format!("&{value}"),
-            Self::Str | Self::Slice if borrowed_root => value,
-            Self::Str => format!("{value}.as_str()"),
-            Self::Slice => format!("&{value}"),
-            Self::TargetGap => value,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -415,12 +405,50 @@ impl<'a> RustRepPolicy<'a> {
         }
     }
 
+    pub fn param_ty(self, ty: RirTypeId, abi: RirParamAbi) -> String {
+        match abi {
+            RirParamAbi::Value => self.rust_ty(ty),
+            RirParamAbi::SharedBorrow => match self.borrow_view(ty) {
+                RustBorrowView::Str => "&str".into(),
+                _ => format!("&{}", self.rust_ty(ty)),
+            },
+            RirParamAbi::MutBorrow => format!("&mut {}", self.rust_ty(ty)),
+        }
+    }
+
+    pub fn dataref_storage_ty(self, dataref: &RirDataRef) -> String {
+        let storage = dataref.storage_symbol();
+        if self.dataref_cx_dependent(dataref) {
+            format!("{storage}<'cx>")
+        } else {
+            storage
+        }
+    }
+
+    pub fn fields_cx_dependent(self, fields: &[RirField]) -> bool {
+        fields.iter().any(|field| self.type_cx_dependent(field.ty))
+    }
+
+    pub fn struct_cx_dependent(self, strukt: &RirStruct) -> bool {
+        self.fields_cx_dependent(&strukt.fields)
+    }
+
+    pub fn tuple_cx_dependent(self, tuple: &RirTuple) -> bool {
+        self.fields_cx_dependent(&tuple.fields)
+    }
+
+    pub fn enum_cx_dependent(self, enm: &RirEnum) -> bool {
+        enm.variants
+            .iter()
+            .any(|variant| self.fields_cx_dependent(&variant.fields))
+    }
+
     pub fn rust_ty(self, ty: RirTypeId) -> String {
         match self.ty(ty) {
             RirType::Int => "i64".into(),
             RirType::Float => "f64".into(),
             RirType::Bool => "bool".into(),
-            RirType::String => "anvyx_runtime::AnvString".into(),
+            RirType::String => target::anv_string_ty(),
             RirType::Void => "()".into(),
             RirType::Struct(id) => self.named_ty(
                 self.program.structs[id.index()].symbol.as_str(),
@@ -438,12 +466,10 @@ impl<'a> RustRepPolicy<'a> {
                 self.type_cx_dependent(ty),
             ),
             RirType::Array { elem, len } => format!("[{}; {len}]", self.rust_ty(elem)),
-            RirType::List(elem) => format!("anvyx_runtime::AnvList<{}>", self.rust_ty(elem)),
-            RirType::Map { key, value } => format!(
-                "anvyx_runtime::AnvMap<{}, {}>",
-                self.rust_ty(key),
-                self.rust_ty(value)
-            ),
+            RirType::List(elem) => target::anv_list_ty(self.rust_ty(elem)),
+            RirType::Map { key, value } => {
+                target::anv_map_ty(self.rust_ty(key), self.rust_ty(value))
+            }
             RirType::Option(inner) => format!("Option<{}>", self.rust_ty(inner)),
             RirType::Slice(elem) => format!("&[{}]", self.rust_ty(elem)),
         }
