@@ -2,8 +2,8 @@ use anvyx_frontend::{
     air::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
         EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, Local, LocalId,
-        LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place, Program,
-        Projection, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
+        LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place, PlaceRoot,
+        Program, Projection, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
         VariantShape, VerifiedProgram,
     },
     ast::{FormatKind, FormatSign, FormatSpec},
@@ -63,12 +63,19 @@ pub enum ProfileErrorKind {
     UnsupportedReturnMode,
     UnsupportedLocalKind,
     UnsupportedPlaceProjection,
+    UnsupportedPlaceRoot,
     UnsupportedTerminator,
     UnsupportedRValue,
     UnsupportedCallee,
     UnsupportedExtern,
     UnsupportedExternMember,
     UnsupportedEntry,
+    UnsupportedLambdaType,
+    UnsupportedLambdaValue,
+    UnsupportedLambdaCall,
+    UnsupportedLambdaCapture,
+    UnsupportedLambdaCell,
+    UnsupportedLambdaExternBoundary,
     NonCopyValueRequired,
 }
 
@@ -76,6 +83,17 @@ struct ProfileCx<'a> {
     program: &'a Program,
     classes: TypePassClasses,
     errors: Vec<RustBackendProfileError>,
+}
+
+fn unsupported_place_root(root: PlaceRoot) -> ProfileErrorKind {
+    match root {
+        PlaceRoot::UpvalueCell(_) => ProfileErrorKind::UnsupportedLambdaCell,
+        PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
+            ProfileErrorKind::UnsupportedLambdaCapture
+        }
+        PlaceRoot::Global(_) => ProfileErrorKind::UnsupportedPlaceRoot,
+        PlaceRoot::Local(_) => unreachable!("local roots are supported"),
+    }
 }
 
 impl ProfileCx<'_> {
@@ -233,10 +251,11 @@ impl ProfileCx<'_> {
 
     fn check_function(&mut self, id: FunctionId, function: &Function) {
         if !matches!(function.kind, FunctionKind::Normal | FunctionKind::Method) {
-            self.push(
-                ProfileSite::Function(id),
-                ProfileErrorKind::UnsupportedFunctionKind,
-            );
+            let kind = match function.kind {
+                FunctionKind::Lambda(_) => ProfileErrorKind::UnsupportedLambdaValue,
+                _ => ProfileErrorKind::UnsupportedFunctionKind,
+            };
+            self.push(ProfileSite::Function(id), kind);
         }
         if matches!(function.signature.return_mode, ReturnMode::Place(_))
             || matches!(
@@ -360,11 +379,15 @@ impl ProfileCx<'_> {
             RValue::MapInsert { map, .. } | RValue::MapRemove { map, .. } => map,
             _ => return,
         };
+        let Some(root) = place.root.local() else {
+            self.push(site, unsupported_place_root(place.root));
+            return;
+        };
         if self
             .program
             .function(function)
             .locals
-            .get(place.root.index())
+            .get(root.index())
             .is_some_and(|local| local.mutability != Mutability::Mutable)
         {
             self.push(site, ProfileErrorKind::UnsupportedRValue);
@@ -373,6 +396,9 @@ impl ProfileCx<'_> {
 
     fn check_rvalue(&mut self, site: ProfileSite, value: &RValue) {
         match value {
+            RValue::FunctionRef { .. } => {
+                self.push(site, ProfileErrorKind::UnsupportedLambdaValue);
+            }
             RValue::Use(operand) => {
                 self.check_operand(site, operand);
                 if self.non_shareable_value_operand(operand) {
@@ -533,8 +559,33 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
             }
-            RValue::ListPop { .. } | RValue::MapEntryAt { .. } | RValue::MakeClosure { .. } => {
+            RValue::ListPop { list, .. } => {
+                self.check_place(site, list);
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
+            }
+            RValue::MapEntryAt { map, .. } => {
+                self.check_place(site, map);
+                self.push(site, ProfileErrorKind::UnsupportedRValue);
+            }
+            RValue::MakeLambda { captures, .. } => {
+                self.push(site, ProfileErrorKind::UnsupportedLambdaValue);
+                for capture in captures {
+                    match capture {
+                        air::LambdaCaptureArg::UpvalueCell { .. } => {
+                            self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
+                        }
+                        air::LambdaCaptureArg::ReadonlyLocal { value } => {
+                            self.check_operand(site, value);
+                            self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                        }
+                        air::LambdaCaptureArg::ScopedLocal { place }
+                        | air::LambdaCaptureArg::ScopedBorrow { place } => {
+                            self.check_place(site, place);
+                            self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                        }
+                        air::LambdaCaptureArg::NoRuntime => {}
+                    }
+                }
             }
         }
     }
@@ -727,8 +778,12 @@ impl ProfileCx<'_> {
         match callee {
             Callee::Function(_) => {}
             Callee::Extern(id) if self.program.extern_decl(*id).binding.is_some() => {}
-            Callee::Extern(_) | Callee::Closure(_) => {
+            Callee::Extern(_) => {
                 self.push(site, ProfileErrorKind::UnsupportedCallee);
+            }
+            Callee::Lambda(operand) => {
+                self.check_operand(site, operand);
+                self.push(site, ProfileErrorKind::UnsupportedLambdaCall);
             }
         }
     }
@@ -781,7 +836,11 @@ impl ProfileCx<'_> {
     }
 
     fn check_place(&mut self, site: ProfileSite, place: &Place) {
-        let Some(local) = self.current_local(site, place.root) else {
+        let Some(root) = place.root.local() else {
+            self.push(site, unsupported_place_root(place.root));
+            return;
+        };
+        let Some(local) = self.current_local(site, root) else {
             self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
             return;
         };
@@ -800,7 +859,10 @@ impl ProfileCx<'_> {
     }
 
     fn place_crosses_dataref(&self, site: ProfileSite, place: &Place) -> bool {
-        let Some(local) = self.current_local(site, place.root) else {
+        let Some(root) = place.root.local() else {
+            return false;
+        };
+        let Some(local) = self.current_local(site, root) else {
             return false;
         };
         let mut ty = local.ty;
@@ -842,6 +904,31 @@ impl ProfileCx<'_> {
         if decl.binding.is_none() {
             self.push(ProfileSite::Extern(id), ProfileErrorKind::UnsupportedExtern);
         }
+        if decl
+            .call_params()
+            .any(|param| self.type_contains_function(param.ty))
+            || self.type_contains_function(decl.return_type)
+        {
+            self.push(
+                ProfileSite::Extern(id),
+                ProfileErrorKind::UnsupportedLambdaExternBoundary,
+            );
+        }
+    }
+
+    fn type_contains_function(&self, ty: TypeId) -> bool {
+        match self.program.type_arena.data(ty) {
+            TypeData::Function(_) => true,
+            TypeData::Optional(inner)
+            | TypeData::Array { elem: inner, .. }
+            | TypeData::Slice(inner) => self.type_contains_function(*inner),
+            TypeData::List(elem) => self.type_contains_function(*elem),
+            TypeData::Map { key, value, .. } => {
+                self.type_contains_function(*key) || self.type_contains_function(*value)
+            }
+            TypeData::Tuple(elems) => elems.iter().any(|elem| self.type_contains_function(*elem)),
+            _ => false,
+        }
     }
 
     fn check_type_ref(&mut self, site: ProfileSite, ty: TypeId) {
@@ -875,6 +962,10 @@ impl ProfileCx<'_> {
                 for elem in elems {
                     self.check_type_ref(site, *elem);
                 }
+                true
+            }
+            TypeData::Function(_) => {
+                self.push(site, ProfileErrorKind::UnsupportedLambdaType);
                 true
             }
             ty => type_is_slice1(ty),

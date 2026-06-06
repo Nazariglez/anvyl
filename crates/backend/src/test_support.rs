@@ -1,5 +1,8 @@
 use anvyx_frontend::{
-    air::{self, AirBody, Local, LocalKind, Mutability, Param, ParamMode, ParamRole, Place},
+    air::{
+        self, AirBody, Local, LocalKind, Mutability, Param, ParamEscape, ParamMode, ParamRole,
+        Place, PlaceRoot,
+    },
     ast::Ident,
 };
 
@@ -14,6 +17,7 @@ pub(crate) fn param(name: &str, ty: air::TypeId, mode: ParamMode, local_id: air:
         name: Some(Ident::new(name)),
         ty,
         mode,
+        escape: ParamEscape::NonEscaping,
         role: ParamRole::Normal,
         local_id,
     }
@@ -22,6 +26,7 @@ pub(crate) fn param(name: &str, ty: air::TypeId, mode: ParamMode, local_id: air:
 pub(crate) fn local(ty: air::TypeId, mutability: Mutability, kind: LocalKind) -> Local {
     Local {
         name: None,
+        binding: None,
         ty,
         mutability,
         kind,
@@ -38,7 +43,7 @@ pub(crate) fn mutable_local(ty: air::TypeId, kind: LocalKind) -> Local {
 
 pub(crate) fn place(local: air::LocalId, ty: air::TypeId) -> Place {
     Place {
-        root: local,
+        root: PlaceRoot::Local(local),
         projection: vec![],
         ty,
     }

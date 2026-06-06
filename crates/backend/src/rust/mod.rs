@@ -151,6 +151,7 @@ pub enum RustTargetGapKind {
     UnsupportedReturnMode,
     UnsupportedLocalKind,
     UnsupportedPlaceProjection,
+    UnsupportedPlaceRoot,
     UnsupportedTerminator,
     UnsupportedRValue,
     UnsupportedCallee,
@@ -158,6 +159,12 @@ pub enum RustTargetGapKind {
     UnsupportedExternMember,
     UnsupportedEntry,
     UnsupportedRustAbi,
+    UnsupportedLambdaType,
+    UnsupportedLambdaValue,
+    UnsupportedLambdaCall,
+    UnsupportedLambdaCapture,
+    UnsupportedLambdaCell,
+    UnsupportedLambdaExternBoundary,
     NonCopyValueRequired,
     UnsupportedStructuralStringify,
     UnsupportedContextBorrowAcrossCall,
@@ -206,6 +213,7 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileErrorKind::UnsupportedPlaceProjection => {
                     RustTargetGapKind::UnsupportedPlaceProjection
                 }
+                ProfileErrorKind::UnsupportedPlaceRoot => RustTargetGapKind::UnsupportedPlaceRoot,
                 ProfileErrorKind::UnsupportedTerminator => RustTargetGapKind::UnsupportedTerminator,
                 ProfileErrorKind::UnsupportedRValue => RustTargetGapKind::UnsupportedRValue,
                 ProfileErrorKind::UnsupportedCallee => RustTargetGapKind::UnsupportedCallee,
@@ -214,6 +222,18 @@ impl From<RustBackendProfileError> for RustTargetGap {
                     RustTargetGapKind::UnsupportedExternMember
                 }
                 ProfileErrorKind::UnsupportedEntry => RustTargetGapKind::UnsupportedEntry,
+                ProfileErrorKind::UnsupportedLambdaType => RustTargetGapKind::UnsupportedLambdaType,
+                ProfileErrorKind::UnsupportedLambdaValue => {
+                    RustTargetGapKind::UnsupportedLambdaValue
+                }
+                ProfileErrorKind::UnsupportedLambdaCall => RustTargetGapKind::UnsupportedLambdaCall,
+                ProfileErrorKind::UnsupportedLambdaCapture => {
+                    RustTargetGapKind::UnsupportedLambdaCapture
+                }
+                ProfileErrorKind::UnsupportedLambdaCell => RustTargetGapKind::UnsupportedLambdaCell,
+                ProfileErrorKind::UnsupportedLambdaExternBoundary => {
+                    RustTargetGapKind::UnsupportedLambdaExternBoundary
+                }
                 ProfileErrorKind::NonCopyValueRequired => RustTargetGapKind::NonCopyValueRequired,
             },
         }
@@ -1531,7 +1551,13 @@ impl<'a> PlanCx<'a> {
                     post_stmts: vec![],
                 }
             }
-            RValue::ListPop { .. } | RValue::MapEntryAt { .. } | RValue::MakeClosure { .. } => {
+            RValue::FunctionRef { .. } | RValue::MakeLambda { .. } => {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedLambdaValue,
+                ));
+            }
+            RValue::ListPop { .. } | RValue::MapEntryAt { .. } => {
                 return Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::UnsupportedRValue,
@@ -1671,10 +1697,10 @@ impl<'a> PlanCx<'a> {
                     self.type_map[&ext.return_type],
                 )
             }
-            Callee::Closure(_) => {
+            Callee::Lambda(_) => {
                 return Err(Self::gap(
                     RustTargetGapSite::Function(function_id),
-                    RustTargetGapKind::UnsupportedCallee,
+                    RustTargetGapKind::UnsupportedLambdaCall,
                 ));
             }
         };
@@ -1860,7 +1886,7 @@ impl<'a> PlanCx<'a> {
         (
             ty,
             RirPlace {
-                local: RirLocalId::from_index(place.root.index()),
+                local: RirLocalId::from_index(local_place_root(place).index()),
                 projections: vec![],
                 ty: self.type_map[&ty],
             },
@@ -1976,7 +2002,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn current_place_root_ty(&self, function: FunctionId, place: &Place) -> TypeId {
-        self.air.function(function).locals[place.root.index()].ty
+        self.air.function(function).locals[local_place_root(place).index()].ty
     }
 
     fn projected_ty(&self, ty: TypeId, projection: &Projection) -> TypeId {
@@ -2037,11 +2063,18 @@ impl<'a> PlanCx<'a> {
 
     fn plan_place(&self, place: &Place) -> RirPlace {
         RirPlace {
-            local: RirLocalId::from_index(place.root.index()),
+            local: RirLocalId::from_index(local_place_root(place).index()),
             projections: place.projection.iter().map(Self::rir_projection).collect(),
             ty: self.type_map[&place.ty],
         }
     }
+}
+
+fn local_place_root(place: &Place) -> LocalId {
+    place
+        .root
+        .local()
+        .expect("Rust backend profile rejects non-local AIR place roots")
 }
 
 fn set_if_changed(slot: &mut bool, value: bool) -> bool {

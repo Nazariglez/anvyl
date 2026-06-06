@@ -1,18 +1,20 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, AggregateCtor, AirBody, AirOptionalMatch, CallArg, Callee, ConstData, ConstValue,
-        EnumDecl, ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl, ExternRep,
-        ExternTypeDecl, FieldDecl, Function, FunctionKind, FunctionSpecialization, Local,
-        LocalKind, Mutability, Operand, Param, ParamMode, ParamRole, Place, Program, Projection,
-        RValue, RawEnumValue, Signature, TypeData, VariantDecl, VariantId, VariantShape,
+        self, AggregateCtor, AirBody, AirOptionalMatch, BindingId, CallArg, Callee,
+        CaptureLocalSource, ConstData, ConstValue, EnumDecl, ExternBindingDecl, ExternDecl,
+        ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl, FieldDecl, Function, FunctionId,
+        FunctionKind, FunctionSpecialization, GlobalDecl, LambdaDecl, LambdaEscape, Local,
+        LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot,
+        Program, Projection, RValue, RawEnumValue, Signature, TypeData, UpvalueCellDecl,
+        VariantDecl, VariantId, VariantShape,
     },
-    ast::{BinaryOp, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
+    ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
 
 use super::{
     RustPlanConfig, cargo_job, emit, plan,
-    profile::{ProfileErrorKind, RustBackendProfile, RustBackendProfileError},
+    profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::RustTracePlan,
     rir::{
         self, RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
@@ -582,6 +584,151 @@ fn profile_accepts_dataref_field_projections() {
 }
 
 #[test]
+fn profile_rejects_non_local_place_roots() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let global = program.alloc_global(GlobalDecl {
+        name: Ident::new("g"),
+        module,
+        ty: int,
+        mutability: Mutability::Mutable,
+    });
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(
+            vec![],
+            air::AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Global(global),
+                projection: vec![],
+                ty: int,
+            }))),
+        ),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedPlaceRoot);
+}
+
+#[test]
+fn profile_rejects_upvalue_cell_roots_with_lambda_cell_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let cell = program.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner: FunctionId::from_index(0),
+        source_local: air::LocalId::from_index(0),
+        ty: int,
+    });
+    let init = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(0),
+    });
+    let mut source = mut_local(int, LocalKind::User);
+    source.binding = Some(BindingId::from_index(0));
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![source],
+        body: structured_body(
+            vec![Statement::Assign {
+                dst: Place {
+                    root: PlaceRoot::UpvalueCell(cell),
+                    projection: vec![],
+                    ty: int,
+                },
+                value: RValue::Use(Operand::Const(init)),
+            }],
+            air::AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::UpvalueCell(cell),
+                projection: vec![],
+                ty: int,
+            }))),
+        ),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedLambdaCell);
+}
+
+#[test]
+fn profile_rejects_upvalue_cell_in_unsupported_rvalue_with_lambda_cell_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let list = program.alloc_type(TypeData::List(int));
+    let optional_int = program.alloc_type(TypeData::Optional(int));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let cell = program.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner: FunctionId::from_index(0),
+        source_local: air::LocalId::from_index(0),
+        ty: list,
+    });
+    let mut source = mut_local(list, LocalKind::User);
+    source.binding = Some(BindingId::from_index(0));
+    let init = RValue::Aggregate {
+        kind: AggregateCtor::List,
+        fields: vec![],
+        ty: list,
+    };
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![source],
+        body: structured_body(
+            vec![
+                Statement::Assign {
+                    dst: Place {
+                        root: PlaceRoot::UpvalueCell(cell),
+                        projection: vec![],
+                        ty: list,
+                    },
+                    value: init,
+                },
+                Statement::Eval(RValue::ListPop {
+                    list: Place {
+                        root: PlaceRoot::UpvalueCell(cell),
+                        projection: vec![],
+                        ty: list,
+                    },
+                    ty: optional_int,
+                }),
+            ],
+            air::AirTail::Return(None),
+        ),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    let errors = profile_errors(program);
+    assert!(errors.iter().any(|error| {
+        error.kind == ProfileErrorKind::UnsupportedLambdaCell
+            && error.site == ProfileSite::Statement(id, 1)
+    }));
+}
+
+#[test]
 fn profile_rejects_payload_ref_through_dataref_projection() {
     expect_reject(
         dataref_optional_payload_ref_program(),
@@ -793,6 +940,7 @@ fn stringify_override_value_receiver_uses_copy_reconstruction() {
                 name: Some(Ident::new("self")),
                 ty: point,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
                 role: ParamRole::Receiver,
                 local_id: recv,
             }],
@@ -852,6 +1000,7 @@ fn stringify_override_propagates_fallible_receiver_function() {
                 name: Some(Ident::new("self")),
                 ty: point,
                 mode: ParamMode::SharedBorrow,
+                escape: ParamEscape::NonEscaping,
                 role: ParamRole::Receiver,
                 local_id: recv,
             }],
@@ -933,6 +1082,7 @@ fn stringify_override_noncopy_value_receiver_is_target_gap() {
                 name: Some(Ident::new("self")),
                 ty: named,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
                 role: ParamRole::Receiver,
                 local_id: recv,
             }],
@@ -1182,7 +1332,7 @@ fn source_job_compiles_and_runs_struct_copy_reconstruction() {
         ..
     } = &mut function.body.block.stmts[2]
     {
-        place.root = copied;
+        place.root = PlaceRoot::Local(copied);
     }
     let source = plan_source(program);
     let text = source.as_str();
@@ -1866,7 +2016,7 @@ fn rir_verify_rejects_bad_struct_construction_and_projection() {
 }
 
 #[test]
-fn profile_rejects_deferred_types() {
+fn profile_rejects_function_types() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
     program.alloc_type(TypeData::Function(air::SignatureType::new(
@@ -1874,7 +2024,27 @@ fn profile_rejects_deferred_types() {
         air::ReturnMode::Value(void),
     )));
 
-    expect_reject(program, ProfileErrorKind::UnsupportedType);
+    expect_reject(program, ProfileErrorKind::UnsupportedLambdaType);
+}
+
+#[test]
+fn plan_reports_named_lambda_type_gap() {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let Err(super::RustPlanError::TargetGaps(gaps)) = plan(&verified, RustPlanConfig::default())
+    else {
+        panic!("plan should report target gaps");
+    };
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.kind == super::RustTargetGapKind::UnsupportedLambdaType)
+    );
 }
 
 #[test]
@@ -1919,6 +2089,7 @@ fn profile_accepts_mut_borrow_string_param() {
         ),
         locals: vec![Local {
             name: None,
+            binding: None,
             ty: string,
             mutability: Mutability::Mutable,
             kind: LocalKind::Arg,
@@ -1963,10 +2134,49 @@ fn profile_rejects_deferred_function_kinds_and_param_roles() {
 }
 
 #[test]
-fn profile_rejects_closure_locals_and_rvalues() {
+fn profile_rejects_lambda_captures_and_values() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
+    let int = program.alloc_type(TypeData::Int);
+    let lambda_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
     let module = program.alloc_module(root_module());
+    let body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let owner = FunctionId::from_index(1);
+    let captured = air::LocalId::from_index(0);
+    let lambda = program.alloc_lambda(LambdaDecl {
+        source: ExprId(0),
+        module,
+        body,
+        owner,
+        signature: air::SignatureType::new(vec![], air::ReturnMode::Value(void)),
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![air::LambdaCaptureDecl::ScopedLocal {
+            binding: BindingId::from_index(0),
+            source: CaptureLocalSource {
+                owner,
+                local: captured,
+            },
+            ty: int,
+            mutability: Mutability::Immutable,
+        }],
+    });
+    program.function_mut(body).kind = FunctionKind::Lambda(lambda);
+    let one = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
     let func = program.alloc_function(Function {
         name: Ident::new("main"),
         module,
@@ -1975,36 +2185,59 @@ fn profile_rejects_closure_locals_and_rvalues() {
         specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![
-            local(void, LocalKind::Capture),
+            Local {
+                name: None,
+                binding: Some(BindingId::from_index(0)),
+                ty: int,
+                mutability: Mutability::Immutable,
+                kind: LocalKind::User,
+            },
             local(void, LocalKind::PatternBinding),
             local(void, LocalKind::Return),
         ],
         body: structured_body(
-            vec![Statement::Eval(RValue::MakeClosure {
-                func: air::FunctionId::from_index(0),
-                captures: vec![],
-                ty: void,
-            })],
+            vec![
+                Statement::Init {
+                    local: captured,
+                    value: RValue::Use(Operand::Const(one)),
+                },
+                Statement::Eval(RValue::MakeLambda {
+                    lambda,
+                    captures: vec![air::LambdaCaptureArg::ScopedLocal {
+                        place: Place {
+                            root: PlaceRoot::Local(captured),
+                            projection: vec![],
+                            ty: int,
+                        },
+                    }],
+                    ty: lambda_ty,
+                }),
+            ],
             air::AirTail::Return(None),
         ),
     });
-    program.module_mut(module).functions.push(func);
+    debug_assert_eq!(func, owner);
+    program.module_mut(module).functions.extend([body, func]);
 
     let errors = profile_errors(program);
+    assert!(has_error(
+        &errors,
+        ProfileErrorKind::UnsupportedLambdaCapture
+    ));
     assert!(has_error(&errors, ProfileErrorKind::UnsupportedLocalKind));
-    assert!(has_error(&errors, ProfileErrorKind::UnsupportedRValue));
+    assert!(has_error(&errors, ProfileErrorKind::UnsupportedLambdaValue));
 }
 
 #[test]
-fn profile_rejects_closure_callees() {
+fn profile_rejects_lambda_callees() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
-    let closure_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+    let lambda_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
         vec![],
         air::ReturnMode::Value(void),
     )));
     let module = program.alloc_module(root_module());
-    let closure_local = air::LocalId::from_index(0);
+    let lambda_local = air::LocalId::from_index(0);
     let func = program.alloc_function(Function {
         name: Ident::new("main"),
         module,
@@ -2012,13 +2245,13 @@ fn profile_rejects_closure_callees() {
         owner: None,
         specialization: None,
         signature: Signature::new(
-            vec![param("f", closure_ty, ParamMode::Value, closure_local)],
+            vec![param("f", lambda_ty, ParamMode::Value, lambda_local)],
             void,
         ),
-        locals: vec![local(closure_ty, LocalKind::Arg)],
+        locals: vec![local(lambda_ty, LocalKind::Arg)],
         body: structured_body(
             vec![Statement::Eval(RValue::Call {
-                callee: Callee::Closure(Operand::Place(place(closure_local, closure_ty))),
+                callee: Callee::Lambda(Operand::Place(place(lambda_local, lambda_ty))),
                 args: vec![],
             })],
             air::AirTail::Return(None),
@@ -2027,8 +2260,34 @@ fn profile_rejects_closure_callees() {
     program.module_mut(module).functions.push(func);
 
     let errors = profile_errors(program);
-    assert!(has_error(&errors, ProfileErrorKind::UnsupportedCallee));
-    assert!(has_error(&errors, ProfileErrorKind::UnsupportedType));
+    assert!(has_error(&errors, ProfileErrorKind::UnsupportedLambdaCall));
+    assert!(has_error(&errors, ProfileErrorKind::UnsupportedLambdaType));
+    assert!(!has_error(&errors, ProfileErrorKind::UnsupportedCallee));
+}
+
+#[test]
+fn profile_rejects_lambda_extern_boundaries() {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+    let ext = extern_in_module(
+        &mut program,
+        &["host"],
+        "retain",
+        vec![(function, ParamMode::Value)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[ext.index()].binding = Some(provider_binding("host", "retain"));
+
+    let errors = profile_errors(program);
+    assert!(has_error(
+        &errors,
+        ProfileErrorKind::UnsupportedLambdaExternBoundary
+    ));
 }
 
 #[test]
@@ -4341,7 +4600,7 @@ fn dataref_field_projection_program() -> Program {
     let arg = air::LocalId::from_index(0);
     let out = air::LocalId::from_index(1);
     let value = Place {
-        root: arg,
+        root: PlaceRoot::Local(arg),
         projection: vec![Projection::Field(air::FieldId::from_index(0))],
         ty: int,
     };
@@ -4355,6 +4614,7 @@ fn dataref_field_projection_program() -> Program {
         locals: vec![
             Local {
                 name: None,
+                binding: None,
                 ty: node,
                 mutability: Mutability::Mutable,
                 kind: LocalKind::Arg,
@@ -4390,7 +4650,7 @@ fn dataref_optional_payload_ref_program() -> Program {
     let arg = air::LocalId::from_index(0);
     let payload = air::LocalId::from_index(1);
     let discr = Place {
-        root: arg,
+        root: PlaceRoot::Local(arg),
         projection: vec![Projection::Field(air::FieldId::from_index(0))],
         ty: option,
     };
@@ -4404,12 +4664,14 @@ fn dataref_optional_payload_ref_program() -> Program {
         locals: vec![
             Local {
                 name: None,
+                binding: None,
                 ty: node,
                 mutability: Mutability::Mutable,
                 kind: LocalKind::Arg,
             },
             Local {
                 name: None,
+                binding: None,
                 ty: int,
                 mutability: Mutability::Mutable,
                 kind: LocalKind::PatternBinding,
@@ -4475,7 +4737,7 @@ fn nested_dataref_read_program() -> Program {
     let root = air::LocalId::from_index(0);
     let out = air::LocalId::from_index(1);
     let nested = Place {
-        root,
+        root: PlaceRoot::Local(root),
         projection: vec![
             Projection::Field(air::FieldId::from_index(1)),
             Projection::Field(air::FieldId::from_index(0)),
@@ -4540,7 +4802,7 @@ fn dataref_string_field_consumers_program() -> Program {
     let node = air::LocalId::from_index(0);
     let len = air::LocalId::from_index(1);
     let label = Place {
-        root: node,
+        root: PlaceRoot::Local(node),
         projection: vec![Projection::Field(air::FieldId::from_index(0))],
         ty: string,
     };
@@ -4621,12 +4883,12 @@ fn multi_projected_mut_call_arg_program() -> Program {
     });
     let pair_local = air::LocalId::from_index(0);
     let field_a = Place {
-        root: pair_local,
+        root: PlaceRoot::Local(pair_local),
         projection: vec![Projection::Field(air::FieldId::from_index(0))],
         ty: int,
     };
     let field_b = Place {
-        root: pair_local,
+        root: PlaceRoot::Local(pair_local),
         projection: vec![Projection::Field(air::FieldId::from_index(1))],
         ty: int,
     };
@@ -4708,7 +4970,7 @@ fn projected_mut_call_arg_program() -> Program {
     });
     let node_local = air::LocalId::from_index(0);
     let field = Place {
-        root: node_local,
+        root: PlaceRoot::Local(node_local),
         projection: vec![Projection::Field(air::FieldId::from_index(0))],
         ty: int,
     };
@@ -4790,6 +5052,7 @@ fn struct_method_program() -> Program {
                 name: Some(Ident::new("self")),
                 ty: point,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
                 role: ParamRole::Receiver,
                 local_id: recv,
             }],
@@ -4799,7 +5062,7 @@ fn struct_method_program() -> Program {
         body: structured_body(
             vec![],
             air::AirTail::Return(Some(Operand::Place(Place {
-                root: recv,
+                root: PlaceRoot::Local(recv),
                 projection: vec![Projection::Field(air::FieldId::from_index(0))],
                 ty: int,
             }))),
@@ -4926,7 +5189,7 @@ fn struct_field_read_program() -> Program {
                     local: text,
                     value: RValue::Stringify {
                         value: Operand::Place(Place {
-                            root: point_local,
+                            root: PlaceRoot::Local(point_local),
                             projection: vec![Projection::Field(air::FieldId::from_index(0))],
                             ty: int,
                         }),
@@ -5078,6 +5341,7 @@ fn format_program() -> Program {
         locals: vec![
             Local {
                 name: None,
+                binding: None,
                 ty: string,
                 mutability: Mutability::Mutable,
                 kind: LocalKind::Temp,
@@ -5225,6 +5489,7 @@ fn string_concat_program() -> Program {
         locals: vec![
             Local {
                 name: None,
+                binding: None,
                 ty: string,
                 mutability: Mutability::Mutable,
                 kind: LocalKind::User,
@@ -7816,6 +8081,7 @@ fn empty_raw_int_enum_cast_emits_impossible_match_without_repr() {
                 name: Some(Ident::new("value")),
                 ty: never,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
                 role: ParamRole::Normal,
                 local_id: arg,
             }],
@@ -8258,7 +8524,7 @@ fn returning_int_param_function(
     ty: air::TypeId,
     mode: ParamMode,
     ret: air::ConstId,
-) -> air::FunctionId {
+) -> FunctionId {
     let arg = air::LocalId::from_index(0);
     let ret_ty = program.const_arena.get(ret).ty;
     program.alloc_function(Function {
@@ -8359,7 +8625,11 @@ fn extern_in_module(
         member,
         params: params
             .into_iter()
-            .map(|(ty, mode)| ExternParamDecl { ty, mode })
+            .map(|(ty, mode)| ExternParamDecl {
+                ty,
+                mode,
+                escape: ParamEscape::NonEscaping,
+            })
             .collect(),
         return_type,
         binding: None,
