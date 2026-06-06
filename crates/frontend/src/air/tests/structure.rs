@@ -45,10 +45,12 @@ fn type_arena_all_variants() {
             ParamType {
                 ty: int_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
             },
             ParamType {
                 ty: bool_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
             },
         ],
         ReturnMode::Value(void_ty),
@@ -315,6 +317,7 @@ fn program_accessors() {
         params: vec![ExternParamDecl {
             ty: int_ty,
             mode: ParamMode::Value,
+            escape: ParamEscape::NonEscaping,
         }],
         return_type: int_ty,
         binding: None,

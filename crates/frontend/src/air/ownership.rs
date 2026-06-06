@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     AggregateKind, AirBlock, AirStmt, AirTail, CallArg, Callee, ConstId, Function, FunctionId,
-    LocalId, Operand, ParamMode, Place, PlaceReadLocal, Program, RValue, TypeData, TypeId,
-    VariantShape, typing,
+    LambdaCaptureArg, LocalId, Operand, ParamMode, Place, PlaceReadLocal, PlaceRoot, Program,
+    RValue, TypeData, TypeId, VariantShape, typing,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -402,21 +402,24 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_operand(lhs, ValueContext::Read);
                 self.observe_operand(rhs, ValueContext::Read);
             }
-            RValue::Aggregate { fields, .. }
-            | RValue::MakeClosure {
-                captures: fields, ..
-            } => {
+            RValue::Aggregate { fields, .. } => {
                 for field in fields {
                     self.observe_operand(field, ValueContext::Store);
                 }
             }
+            RValue::MakeLambda { captures, .. } => {
+                for capture in captures {
+                    self.observe_lambda_capture(capture);
+                }
+            }
+            RValue::FunctionRef { .. } => {}
             RValue::StringConcat { parts } => {
                 for part in parts {
                     self.observe_operand(part, ValueContext::Read);
                 }
             }
             RValue::Call { callee, args } => {
-                if let Callee::Closure(operand) = callee {
+                if let Callee::Lambda(operand) = callee {
                     self.observe_operand(operand, ValueContext::Read);
                 }
                 for (index, arg) in args.iter().enumerate() {
@@ -512,6 +515,18 @@ impl ParamUseAnalyzer<'_> {
             ValueContext::Store | ValueContext::CallValue => ParamUse::ValueRequired,
         };
         self.observe_place(place, use_);
+    }
+
+    fn observe_lambda_capture(&mut self, capture: &LambdaCaptureArg) {
+        match capture {
+            LambdaCaptureArg::NoRuntime | LambdaCaptureArg::UpvalueCell { .. } => {}
+            LambdaCaptureArg::ReadonlyLocal { value } => {
+                self.observe_operand(value, ValueContext::Store);
+            }
+            LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+                self.observe_place(place, ParamUse::ReborrowMut);
+            }
+        }
     }
 
     fn observe_place(&mut self, place: &Place, use_: ParamUse) {
@@ -705,6 +720,16 @@ fn apply_param_modes(program: &mut Program, modes: &[Vec<ParamMode>]) {
             param.mode = *mode;
         }
     }
+    let signatures = program
+        .functions
+        .iter()
+        .map(function_signature_type)
+        .collect::<Vec<_>>();
+    for lambda in &mut program.lambdas {
+        if let Some(signature) = signatures.get(lambda.body.index()) {
+            lambda.signature = signature.clone();
+        }
+    }
     let function_type_modes = collect_function_type_modes(program, modes);
     for (ty, modes) in function_type_modes {
         let TypeData::Function(sig) = program.type_arena.data_mut(ty) else {
@@ -715,6 +740,18 @@ fn apply_param_modes(program: &mut Program, modes: &[Vec<ParamMode>]) {
         }
     }
     rewrite_direct_call_args(program);
+}
+
+fn function_signature_type(function: &Function) -> super::SignatureType {
+    super::SignatureType {
+        params: function
+            .signature
+            .params
+            .iter()
+            .map(super::Param::param_type)
+            .collect(),
+        ret: function.signature.return_mode,
+    }
 }
 
 fn rewrite_direct_call_args(program: &mut Program) {
@@ -943,7 +980,7 @@ fn rewrite_value_call_args(
     };
     let expected = match callee {
         Callee::Function(callee) => modes.get(callee.index()),
-        Callee::Closure(operand) => {
+        Callee::Lambda(operand) => {
             typing::operand_ty_with(operand, |id| const_type(const_types, id))
                 .and_then(|ty| function_type_modes.get(&ty))
         }
@@ -979,6 +1016,7 @@ fn rewrite_call_args(
                 let local = LocalId::from_index(locals.len());
                 locals.push(super::Local {
                     name: None,
+                    binding: None,
                     ty,
                     mutability: super::Mutability::Immutable,
                     kind: super::LocalKind::Temp,
@@ -988,7 +1026,7 @@ fn rewrite_call_args(
                     value: RValue::Use(Operand::Const(*value)),
                 });
                 Some(CallArg::SharedBorrow(Place {
-                    root: local,
+                    root: PlaceRoot::Local(local),
                     projection: vec![],
                     ty,
                 }))
@@ -1033,12 +1071,20 @@ fn collect_function_type_modes(
         })
         .collect::<Vec<_>>();
     for function in &program.functions {
-        function.body.for_each_rvalue(&mut |value| {
-            if let RValue::MakeClosure { func, ty, .. } = value
-                && let Some(modes) = modes.get(func.index())
-            {
-                updates.push((*ty, modes.clone()));
+        function.body.for_each_rvalue(&mut |value| match value {
+            RValue::FunctionRef { function, ty } => {
+                if let Some(modes) = modes.get(function.index()) {
+                    updates.push((*ty, modes.clone()));
+                }
             }
+            RValue::MakeLambda { lambda, ty, .. } => {
+                if let Some(decl) = program.lambdas.get(lambda.index())
+                    && let Some(modes) = modes.get(decl.body.index())
+                {
+                    updates.push((*ty, modes.clone()));
+                }
+            }
+            _ => {}
         });
     }
     updates
@@ -1057,8 +1103,9 @@ mod tests {
         air::{
             AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CallArg, Callee, ConstData,
             ConstValue, DynContractData, EnumDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
-            FunctionKind, Local, LocalKind, MapOrder, Module, ModuleId, Mutability, Operand, Param,
-            ParamRole, Place, RValue, ReturnMode, Signature, VariantDecl,
+            FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, MapOrder, Module, ModuleId,
+            Mutability, Operand, Param, ParamEscape, ParamRole, Place, RValue, ReturnMode,
+            Signature, VariantDecl,
         },
         ast::Ident,
     };
@@ -1098,6 +1145,7 @@ mod tests {
                     name: Some(Ident::new("arg")),
                     ty,
                     mode: ParamMode::Value,
+                    escape: ParamEscape::NonEscaping,
                     role: ParamRole::Normal,
                     local_id: local,
                 }],
@@ -1105,6 +1153,7 @@ mod tests {
             },
             locals: vec![Local {
                 name: Some(Ident::new("arg")),
+                binding: None,
                 ty,
                 mutability: Mutability::Immutable,
                 kind: LocalKind::Arg,
@@ -1121,7 +1170,7 @@ mod tests {
 
     fn param_place(ty: TypeId) -> Place {
         Place {
-            root: LocalId::from_index(0),
+            root: PlaceRoot::Local(LocalId::from_index(0)),
             projection: vec![],
             ty,
         }
@@ -1184,6 +1233,7 @@ mod tests {
         );
         program.function_mut(function).locals.push(Local {
             name: Some(Ident::new("tmp")),
+            binding: None,
             ty: string,
             mutability: Mutability::Immutable,
             kind: LocalKind::Temp,
@@ -1317,6 +1367,7 @@ mod tests {
                         name: Some(Ident::new("xs")),
                         ty: list,
                         mode: ParamMode::SharedBorrow,
+                        escape: ParamEscape::NonEscaping,
                         role: ParamRole::Normal,
                         local_id: list_local,
                     },
@@ -1324,6 +1375,7 @@ mod tests {
                         name: Some(Ident::new("i")),
                         ty: int,
                         mode: ParamMode::Value,
+                        escape: ParamEscape::NonEscaping,
                         role: ParamRole::Normal,
                         local_id: index_local,
                     },
@@ -1333,12 +1385,14 @@ mod tests {
             locals: vec![
                 Local {
                     name: Some(Ident::new("xs")),
+                    binding: None,
                     ty: list,
                     mutability: Mutability::Immutable,
                     kind: LocalKind::Arg,
                 },
                 Local {
                     name: Some(Ident::new("i")),
+                    binding: None,
                     ty: int,
                     mutability: Mutability::Immutable,
                     kind: LocalKind::Arg,
@@ -1347,7 +1401,7 @@ mod tests {
             body: test_body(
                 vec![AirStmt::Eval(RValue::MapEntryAt {
                     map: Place {
-                        root: list_local,
+                        root: PlaceRoot::Local(list_local),
                         projection: vec![],
                         ty: list,
                     },
@@ -1365,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn param_use_closure_callee_operand_is_read() {
+    fn param_use_lambda_callee_operand_is_read() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let void = program.alloc_type(TypeData::Void);
@@ -1381,7 +1435,7 @@ mod tests {
             &mut program,
             func_ty,
             vec![AirStmt::Eval(RValue::Call {
-                callee: Callee::Closure(param_operand(func_ty)),
+                callee: Callee::Lambda(param_operand(func_ty)),
                 args: vec![CallArg::Value(Operand::Const(arg))],
             })],
             AirTail::Return(None),
@@ -1519,6 +1573,7 @@ mod tests {
         program.function_mut(function).signature.params[0].mode = ParamMode::MutBorrow;
         program.function_mut(function).locals.push(Local {
             name: Some(Ident::new("tmp")),
+            binding: None,
             ty: string,
             mutability: Mutability::Immutable,
             kind: LocalKind::Temp,
@@ -1677,18 +1732,19 @@ mod tests {
     }
 
     #[test]
-    fn finalize_rewrites_closure_call_args() {
+    fn finalize_rewrites_lambda_call_args() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
         let void = program.alloc_type(TypeData::Void);
-        let closure_ty = program.alloc_type(TypeData::Function(super::super::SignatureType {
+        let lambda_ty = program.alloc_type(TypeData::Function(super::super::SignatureType {
             params: vec![super::super::ParamType {
                 ty: string,
                 mode: ParamMode::SharedBorrow,
+                escape: ParamEscape::NonEscaping,
             }],
             ret: ReturnMode::Value(void),
         }));
-        let closure_local = LocalId::from_index(0);
+        let lambda_local = LocalId::from_index(0);
         let arg = program.alloc_const(ConstData {
             ty: string,
             value: ConstValue::String("x".into()),
@@ -1703,25 +1759,27 @@ mod tests {
             signature: Signature::new(
                 vec![Param {
                     name: Some(Ident::new("f")),
-                    ty: closure_ty,
+                    ty: lambda_ty,
                     mode: ParamMode::Value,
+                    escape: ParamEscape::NonEscaping,
                     role: ParamRole::Normal,
-                    local_id: closure_local,
+                    local_id: lambda_local,
                 }],
                 void,
             ),
             locals: vec![Local {
                 name: Some(Ident::new("f")),
-                ty: closure_ty,
+                binding: None,
+                ty: lambda_ty,
                 mutability: Mutability::Immutable,
                 kind: LocalKind::Arg,
             }],
             body: test_body(
                 vec![AirStmt::Eval(RValue::Call {
-                    callee: Callee::Closure(Operand::Place(Place {
-                        root: closure_local,
+                    callee: Callee::Lambda(Operand::Place(Place {
+                        root: PlaceRoot::Local(lambda_local),
                         projection: vec![],
-                        ty: closure_ty,
+                        ty: lambda_ty,
                     })),
                     args: vec![CallArg::Value(Operand::Const(arg))],
                 })],
@@ -1740,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_updates_closure_function_type_modes() {
+    fn finalize_updates_lambda_function_type_modes() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
         let void = program.alloc_type(TypeData::Void);
@@ -1753,10 +1811,80 @@ mod tests {
             })],
             AirTail::Return(None),
         );
-        let closure_ty = program.alloc_type(TypeData::Function(super::super::SignatureType {
+        let lambda_ty = program.alloc_type(TypeData::Function(super::super::SignatureType {
             params: vec![super::super::ParamType {
                 ty: string,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
+            }],
+            ret: ReturnMode::Value(void),
+        }));
+        let module = module(&mut program);
+        let lambda = program.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body: read,
+            owner: FunctionId::from_index(0),
+            signature: super::super::SignatureType {
+                params: vec![super::super::ParamType {
+                    ty: string,
+                    mode: ParamMode::Value,
+                    escape: ParamEscape::NonEscaping,
+                }],
+                ret: ReturnMode::Value(void),
+            },
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![],
+        });
+        program.function_mut(read).kind = FunctionKind::Lambda(lambda);
+        program.alloc_function(Function {
+            name: Ident::new("make"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(vec![], void),
+            locals: vec![],
+            body: test_body(
+                vec![AirStmt::Eval(RValue::MakeLambda {
+                    lambda,
+                    captures: vec![],
+                    ty: lambda_ty,
+                })],
+                AirTail::Return(None),
+            ),
+        });
+
+        finalize(&mut program).expect("ownership finalization failed");
+        let TypeData::Function(sig) = program.type_data(lambda_ty) else {
+            panic!("expected function type");
+        };
+        assert_eq!(sig.params[0].mode, ParamMode::SharedBorrow);
+        assert_eq!(
+            program.lambdas[lambda.index()].signature.params[0].mode,
+            ParamMode::SharedBorrow
+        );
+    }
+
+    #[test]
+    fn finalize_updates_function_ref_type_modes() {
+        let mut program = Program::default();
+        let string = program.alloc_type(TypeData::String);
+        let void = program.alloc_type(TypeData::Void);
+        let read = param_function(
+            &mut program,
+            string,
+            vec![AirStmt::Eval(RValue::Stringify {
+                value: param_operand(string),
+                source_ty: string,
+            })],
+            AirTail::Return(None),
+        );
+        let lambda_ty = program.alloc_type(TypeData::Function(super::super::SignatureType {
+            params: vec![super::super::ParamType {
+                ty: string,
+                mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
             }],
             ret: ReturnMode::Value(void),
         }));
@@ -1770,17 +1898,16 @@ mod tests {
             signature: Signature::new(vec![], void),
             locals: vec![],
             body: test_body(
-                vec![AirStmt::Eval(RValue::MakeClosure {
-                    func: read,
-                    captures: vec![],
-                    ty: closure_ty,
+                vec![AirStmt::Eval(RValue::FunctionRef {
+                    function: read,
+                    ty: lambda_ty,
                 })],
                 AirTail::Return(None),
             ),
         });
 
         finalize(&mut program).expect("ownership finalization failed");
-        let TypeData::Function(sig) = program.type_data(closure_ty) else {
+        let TypeData::Function(sig) = program.type_data(lambda_ty) else {
             panic!("expected function type");
         };
         assert_eq!(sig.params[0].mode, ParamMode::SharedBorrow);

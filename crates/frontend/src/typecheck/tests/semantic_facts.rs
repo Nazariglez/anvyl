@@ -1,7 +1,9 @@
 use super::support::{check, generic_body};
 use crate::{
-    ast::{ArrayLen, Ident, Type},
-    typecheck::{GenericArgs, LocalDefKind, LocalUseMode},
+    ast::{ArrayLen, EscapeMode, Ident, Type},
+    typecheck::{
+        BodyInstanceKey, FunctionValueKind, GenericArgs, LambdaBodyKey, LocalDefKind, LocalUseMode,
+    },
 };
 
 #[test]
@@ -79,9 +81,22 @@ fn function_facts_include_default_params() {
     assert_eq!(fact.params.len(), 2);
     assert_eq!(fact.params[0].name.as_str(), "a");
     assert_eq!(fact.params[0].ty, Type::Int);
+    assert_eq!(fact.params[0].escape, EscapeMode::NonEscaping);
     assert_eq!(fact.params[1].name.as_str(), "message");
     assert_eq!(fact.params[1].ty, Type::String);
     assert_eq!(fact.ret.ty, Type::Bool);
+}
+
+#[test]
+fn function_facts_preserve_param_escape() {
+    let result = check("fn f(cb: escaping fn()) {}").expect("typecheck failed");
+    let fact = result
+        .function_facts()
+        .iter()
+        .find(|fact| fact.name == Ident::new("f"))
+        .expect("missing function fact");
+
+    assert_eq!(fact.params[0].escape, EscapeMode::Escaping);
 }
 
 #[test]
@@ -112,6 +127,153 @@ fn explicit_default_param_records_no_default_arg() {
 }
 
 #[test]
+fn records_named_function_value_and_value_call() {
+    let result =
+        check("fn tick() {} fn main() { let f: fn() = tick; f(); }").expect("typecheck failed");
+
+    let body = result.expect_body(&result.function_body("main"));
+    assert!(
+        body.function_values
+            .values()
+            .any(|fact| matches!(fact.kind, FunctionValueKind::Named(_)))
+    );
+    let (&call_expr, call) = body
+        .function_value_calls
+        .iter()
+        .next()
+        .expect("missing function-value call fact");
+    assert_eq!(call_expr, call.expr);
+    assert_eq!(call.args.len(), 0);
+    assert!(matches!(call.sig, Type::Func { .. }));
+    assert!(body.function_values.contains_key(&call.callee));
+    assert!(!body.calls.contains_key(&call.expr));
+}
+
+#[test]
+fn records_lambda_function_value_and_call() {
+    let result = check("fn main() { let f: fn() = || {}; f(); }").expect("typecheck failed");
+
+    let body = result.expect_body(&result.function_body("main"));
+    assert!(body.function_values.values().any(|fact| {
+        matches!(fact.kind, FunctionValueKind::Lambda { lambda_expr } if lambda_expr == fact.expr)
+    }));
+    let call = body
+        .function_value_calls
+        .values()
+        .next()
+        .expect("missing function-value call fact");
+    assert!(body.function_values.contains_key(&call.callee));
+    assert!(!body.calls.contains_key(&call.expr));
+}
+
+#[test]
+fn direct_named_call_is_not_function_value_call() {
+    let result = check("fn tick() {} fn main() { tick(); }").expect("typecheck failed");
+
+    let body = result.expect_body(&result.function_body("main"));
+    assert_eq!(body.calls.len(), 1);
+    assert!(body.function_value_calls.is_empty());
+    assert!(body.function_values.is_empty());
+}
+
+#[test]
+fn function_value_call_preserves_parameter_escape_modes() {
+    let result = check(
+        r#"
+fn main(non: fn(fn()), esc: fn(escaping fn()), cb: escaping fn()) {
+    non(cb);
+    esc(cb);
+}
+"#,
+    )
+    .expect("typecheck failed");
+    let body = result.expect_body(&result.function_body("main"));
+    assert!(body.calls.is_empty());
+    assert_eq!(body.function_value_calls.len(), 2);
+    let mut escapes = body
+        .function_value_calls
+        .values()
+        .map(|fact| fact.args[0].escape)
+        .collect::<Vec<_>>();
+    escapes.sort_by_key(|escape| escape.is_escaping());
+
+    assert_eq!(escapes, vec![EscapeMode::NonEscaping, EscapeMode::Escaping]);
+}
+
+#[test]
+fn optional_function_call_has_unwrapped_callee_fact() {
+    let result = check(
+        r#"
+fn tick() {}
+fn main(cond: bool) {
+    let f: fn()? = if cond { tick } else { nil };
+    f?();
+}
+"#,
+    )
+    .expect("typecheck failed");
+    let body = result.expect_body(&result.function_body("main"));
+    let call = body
+        .function_value_calls
+        .values()
+        .next()
+        .expect("missing function-value call fact");
+
+    assert!(body.function_values.contains_key(&call.callee));
+    assert_eq!(body.function_values[&call.callee].ty, call.sig);
+    assert!(!body.calls.contains_key(&call.expr));
+}
+
+#[test]
+fn immediately_called_returned_function_has_callee_fact() {
+    let result = check("fn tick() {} fn make() -> fn() { tick } fn main() { make()(); }")
+        .expect("typecheck failed");
+    let body = result.expect_body(&result.function_body("main"));
+    let call = body
+        .function_value_calls
+        .values()
+        .next()
+        .expect("missing function-value call fact");
+
+    assert!(body.function_values.contains_key(&call.callee));
+    assert!(matches!(
+        body.function_values[&call.callee].kind,
+        FunctionValueKind::LocalOrPlace
+    ));
+    assert!(!body.calls.contains_key(&call.expr));
+}
+
+#[test]
+fn branch_joined_function_value_is_local_or_place_fact() {
+    let result = check(
+        r#"
+fn a() {}
+fn b() {}
+fn main(cond: bool) {
+    let f: fn() = if cond { a } else { b };
+    f();
+}
+"#,
+    )
+    .expect("typecheck failed");
+
+    let body = result.expect_body(&result.function_body("main"));
+    let call = body
+        .function_value_calls
+        .values()
+        .next()
+        .expect("missing function-value call fact");
+    assert!(matches!(
+        body.function_values
+            .get(&call.callee)
+            .expect("missing callee function-value fact")
+            .kind,
+        FunctionValueKind::LocalOrPlace
+    ));
+    assert!(!body.calls.contains_key(&call.expr));
+}
+
+#[test]
 fn records_stringify_fact() {
     let result = check("fn f() { let s: string = #stringify(1); }").expect("typecheck failed");
     let body = result.expect_body(&result.function_body("f"));
@@ -125,6 +287,13 @@ fn records_stringify_fact() {
     assert!(body.expr_types.contains_key(&call));
     assert_eq!(fact.source_ty, Type::Int);
     assert!(body.expr_types.contains_key(&fact.arg));
+}
+
+fn generic_args(type_args: Vec<Type>) -> GenericArgs {
+    GenericArgs {
+        type_args,
+        const_args: vec![],
+    }
 }
 
 #[test]
@@ -160,7 +329,16 @@ fn main() { f(1); f("x"); }
 fn records_stringify_inside_lambda() {
     let result =
         check("fn f() { let cb: fn() -> string = || #stringify(1); }").expect("typecheck failed");
-    let body = result.expect_body(&result.function_body("f"));
+    let lambda = result
+        .lambda_escapes()
+        .keys()
+        .next()
+        .copied()
+        .expect("missing lambda fact");
+    let body = result.expect_body(&BodyInstanceKey::Lambda(LambdaBodyKey {
+        expr: lambda,
+        specialization: GenericArgs::default(),
+    }));
 
     assert_eq!(body.stringifies.len(), 1);
     assert_eq!(
@@ -170,6 +348,59 @@ fn records_stringify_inside_lambda() {
             .expect("missing stringify fact")
             .source_ty,
         Type::Int
+    );
+}
+
+#[test]
+fn records_distinct_lambda_body_facts() {
+    let result = check("fn f() { let a: fn() -> int = || 1; let b: fn() -> int = || 2; }")
+        .expect("typecheck failed");
+    let lambda_bodies = result
+        .lambda_escapes()
+        .keys()
+        .map(|expr| {
+            result.expect_body(&BodyInstanceKey::Lambda(LambdaBodyKey {
+                expr: *expr,
+                specialization: GenericArgs::default(),
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(lambda_bodies.len(), 2);
+    assert!(lambda_bodies.iter().all(|body| !body.expr_types.is_empty()));
+}
+
+#[test]
+fn generic_lambda_body_records_specialized_facts() {
+    let result = check(
+        r#"
+fn f<T>(x: T) { let cb: fn() -> string = || #stringify(x); }
+fn main() { f(1); f("x"); }
+"#,
+    )
+    .expect("typecheck failed");
+    let lambda = result
+        .lambda_escapes()
+        .keys()
+        .next()
+        .copied()
+        .expect("missing lambda fact");
+    let int_body = result.expect_body(&BodyInstanceKey::Lambda(LambdaBodyKey {
+        expr: lambda,
+        specialization: generic_args(vec![Type::Int]),
+    }));
+    let string_body = result.expect_body(&BodyInstanceKey::Lambda(LambdaBodyKey {
+        expr: lambda,
+        specialization: generic_args(vec![Type::String]),
+    }));
+
+    assert_eq!(
+        int_body.stringifies.values().next().unwrap().source_ty,
+        Type::Int
+    );
+    assert_eq!(
+        string_body.stringifies.values().next().unwrap().source_ty,
+        Type::String
     );
 }
 

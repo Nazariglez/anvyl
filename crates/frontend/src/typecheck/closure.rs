@@ -4,10 +4,10 @@ use std::{
 };
 
 use super::{
-    BindingId, BindingMutability, BindingPromotionFact, CaptureAccess, CaptureStorage,
-    CaptureStorageOrigin, CheckedType, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind,
-    LambdaEscapeMap, LocalBindingKind, LocalValue, ReturnAccess, ReturnSpec, TypeChecker,
-    TypeError, TypecheckFacts,
+    BindingId, BindingMutability, BindingPromotionFact, BodyInstanceKey, CaptureAccess,
+    CaptureStorage, CaptureStorageOrigin, CheckedType, FunctionValueKind, LambdaBodyKey,
+    LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LambdaEscapeMap, LocalBindingKind,
+    LocalValue, ReturnAccess, ReturnSpec, TypeChecker, TypeError, TypecheckFacts,
     body::{
         CallableBody, CallableParamBinding, check_callable_body_frame, with_callable_body_scope,
     },
@@ -1195,18 +1195,24 @@ pub(super) fn check_lambda_expr(
                     ty,
                 })
                 .collect::<Vec<_>>();
-            tc.with_suppressed_local_facts(|tc| {
-                check_callable_body_frame(
-                    &bindings,
-                    expected_ret.as_ref(),
-                    ReturnAccess::Value,
-                    None,
-                    0,
-                    CallableBody::Expr(&lambda.node.body),
-                    lambda.span,
-                    tc,
-                )
-            })
+            tc.with_body_instance(
+                BodyInstanceKey::Lambda(LambdaBodyKey {
+                    expr: expr.node.id,
+                    specialization: tc.visible_generic_owner().args,
+                }),
+                |tc| {
+                    check_callable_body_frame(
+                        &bindings,
+                        expected_ret.as_ref(),
+                        ReturnAccess::Value,
+                        None,
+                        0,
+                        CallableBody::Expr(&lambda.node.body),
+                        lambda.span,
+                        tc,
+                    )
+                },
+            )
         },
         |tc| {
             tc.closure.exit_lambda();
@@ -1218,12 +1224,16 @@ pub(super) fn check_lambda_expr(
     let ret = expected_ret
         .or_else(|| inferred_ret.map(ReturnSpec::value))
         .unwrap_or_else(|| ReturnSpec::value(Type::Infer));
-    checked_from_type(
-        expr,
-        Type::Func {
-            params,
-            ret: Box::new(ret),
+    let ty = Type::Func {
+        params,
+        ret: Box::new(ret),
+    };
+    tc.record_function_value_expr(
+        expr.node.id,
+        &ty,
+        FunctionValueKind::Lambda {
+            lambda_expr: expr.node.id,
         },
-        tc,
-    )
+    );
+    checked_from_type(expr, ty, tc)
 }

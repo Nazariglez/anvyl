@@ -1133,6 +1133,12 @@ enum LocalSymbolLookup {
 }
 
 #[derive(Clone, Copy)]
+struct DefinedLocal {
+    binding_id: BindingId,
+    type_id: SemanticLocalId,
+}
+
+#[derive(Clone, Copy)]
 enum NameSubjectMode {
     Value,
     Place,
@@ -1353,7 +1359,6 @@ struct TypeChecker {
     generic_owner_frames: Vec<GenericOwnerFrame>,
     active_bodies: Vec<BodyInstanceKey>,
     local_def_bodies: HashMap<SemanticLocalId, BodyInstanceKey>,
-    suppressed_local_fact_bodies: Vec<BodyInstanceKey>,
     local_callables: HashMap<CallableId, LocalCallableInfo>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
     specializations: HashMap<CallableInstanceKey, SpecializationState>,
@@ -1402,7 +1407,6 @@ impl TypeChecker {
             generic_owner_frames: vec![],
             active_bodies: vec![],
             local_def_bodies: HashMap::new(),
-            suppressed_local_fact_bodies: vec![],
             local_callables: HashMap::new(),
             callable_templates: HashMap::new(),
             specializations: HashMap::new(),
@@ -1500,42 +1504,31 @@ impl TypeChecker {
         }
     }
 
-    fn with_suppressed_local_facts<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let body = self.current_body();
-        self.suppressed_local_fact_bodies.push(body.clone());
-        let ret = f(self);
-        let popped = self
-            .suppressed_local_fact_bodies
-            .pop()
-            .expect("local fact suppression underflow");
-        debug_assert_eq!(popped, body);
-        ret
-    }
-
     fn can_record_local_facts(&self) -> bool {
         let body = self.current_body();
-        if self.suppressed_local_fact_bodies.contains(&body) {
-            return false;
+        match body {
+            BodyInstanceKey::Lambda(_) => true,
+            BodyInstanceKey::Callable(key) => {
+                key.target.parent.is_none() && matches!(key.target.kind, CallableKind::Function)
+                    || matches!(
+                        (&key.target.parent, key.target.kind),
+                        (
+                            Some(CallableParent::Nominal(_)),
+                            CallableKind::InstanceMethod | CallableKind::StaticMethod,
+                        ) | (
+                            Some(CallableParent::Extend(_)),
+                            CallableKind::ExtendMethod(_),
+                        )
+                    )
+            }
+            BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => false,
         }
-        let BodyInstanceKey::Callable(key) = body else {
-            return false;
-        };
-        key.target.parent.is_none() && matches!(key.target.kind, CallableKind::Function)
-            || matches!(
-                (&key.target.parent, key.target.kind),
-                (
-                    Some(CallableParent::Nominal(_)),
-                    CallableKind::InstanceMethod | CallableKind::StaticMethod,
-                ) | (
-                    Some(CallableParent::Extend(_)),
-                    CallableKind::ExtendMethod(_),
-                )
-            )
     }
 
     fn record_local_def(
         &mut self,
         id: SemanticLocalId,
+        binding_id: Option<BindingId>,
         name: Ident,
         span: Option<Span>,
         mutable: bool,
@@ -1550,6 +1543,7 @@ impl TypeChecker {
             body.clone(),
             LocalDefFact {
                 id,
+                binding_id,
                 name,
                 span,
                 ty: Type::Infer,
@@ -1721,7 +1715,7 @@ impl TypeChecker {
         mutable: bool,
         span: Option<Span>,
     ) -> SemanticLocalId {
-        let id = self
+        let local = self
             .define_shadowing_value_from_handle(
                 name,
                 handle,
@@ -1731,10 +1725,17 @@ impl TypeChecker {
             )
             .expect("pattern binding requires an active local scope");
         if let Some(span) = span {
-            self.record_local_def(id, name, Some(span), mutable, LocalDefKind::Binding);
-            self.record_binding_def(span, id);
+            self.record_local_def(
+                local.type_id,
+                Some(local.binding_id),
+                name,
+                Some(span),
+                mutable,
+                LocalDefKind::Binding,
+            );
+            self.record_binding_def(span, local.type_id);
         }
-        id
+        local.type_id
     }
 
     fn define_alias_binding_from_handle(
@@ -1755,8 +1756,15 @@ impl TypeChecker {
             return;
         };
         if let Some(span) = span {
-            self.record_local_def(id, name, Some(span), true, LocalDefKind::Binding);
-            self.record_binding_def(span, id);
+            self.record_local_def(
+                id.type_id,
+                Some(id.binding_id),
+                name,
+                Some(span),
+                true,
+                LocalDefKind::Binding,
+            );
+            self.record_binding_def(span, id.type_id);
         }
     }
 
@@ -1785,7 +1793,7 @@ impl TypeChecker {
         ty: Type,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
-    ) -> Option<SemanticLocalId> {
+    ) -> Option<DefinedLocal> {
         self.define_value_with_alias(name, ty, kind, const_value, None)
     }
 
@@ -1796,7 +1804,7 @@ impl TypeChecker {
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
-    ) -> Option<SemanticLocalId> {
+    ) -> Option<DefinedLocal> {
         let binding_id = self.fresh_binding_id();
         let type_id = self.solver.alloc_local_type(&ty);
         let info = VarInfo::new(binding_id, type_id, kind)
@@ -1807,7 +1815,10 @@ impl TypeChecker {
             return None;
         }
         self.define_closure_binding(binding_id, name, type_id, kind);
-        Some(type_id)
+        Some(DefinedLocal {
+            binding_id,
+            type_id,
+        })
     }
 
     fn define_local_symbol(&mut self, name: Ident, symbol: LocalSymbol) -> bool {
@@ -1830,7 +1841,7 @@ impl TypeChecker {
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
-    ) -> Option<SemanticLocalId> {
+    ) -> Option<DefinedLocal> {
         let type_id = self.solver.alloc_local_type_from_handle(handle);
         self.define_shadowing_local(name, type_id, kind, const_value, alias)
     }
@@ -1842,7 +1853,7 @@ impl TypeChecker {
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
-    ) -> Option<SemanticLocalId> {
+    ) -> Option<DefinedLocal> {
         let binding_id = self.fresh_binding_id();
         let scope = self.scopes.last_mut()?;
         let info = VarInfo::new(binding_id, type_id, kind)
@@ -1850,7 +1861,10 @@ impl TypeChecker {
             .with_alias(alias);
         scope.insert(name, LocalSymbol::value(info));
         self.define_closure_binding(binding_id, name, type_id, kind);
-        Some(type_id)
+        Some(DefinedLocal {
+            binding_id,
+            type_id,
+        })
     }
 
     fn local_binding_id(&self, name: Ident) -> Option<BindingId> {
@@ -2135,6 +2149,45 @@ impl TypeChecker {
     fn record_call(&mut self, expr_id: ExprId, target: CallTarget) {
         let site = self.current_expr_site(expr_id);
         self.semantic_facts.record_call(site, target);
+    }
+
+    pub(super) fn record_function_value(&mut self, expr_id: ExprId, fact: FunctionValueFact) {
+        let site = self.current_expr_site(expr_id);
+        self.semantic_facts.record_function_value(site, fact);
+    }
+
+    pub(super) fn function_value_kind_for_callee(callee: &CallableRef) -> FunctionValueKind {
+        FunctionValueKind::Named(CallableInstanceKey {
+            target: callee.def.id.clone(),
+            args: callee.owner_args.clone(),
+        })
+    }
+
+    pub(super) fn record_function_value_expr(
+        &mut self,
+        expr_id: ExprId,
+        ty: &Type,
+        kind: FunctionValueKind,
+    ) {
+        if matches!(ty, Type::Func { .. }) {
+            self.record_function_value(
+                expr_id,
+                FunctionValueFact {
+                    expr: expr_id,
+                    ty: ty.clone(),
+                    kind,
+                },
+            );
+        }
+    }
+
+    pub(super) fn record_function_value_call(
+        &mut self,
+        expr_id: ExprId,
+        fact: FunctionValueCallFact,
+    ) {
+        let site = self.current_expr_site(expr_id);
+        self.semantic_facts.record_function_value_call(site, fact);
     }
 
     pub(super) fn record_default_args(
@@ -2903,6 +2956,7 @@ impl TypeChecker {
                 span: SourceSpan::from_byte_span(module.source, source.ty_span),
                 ty: sig.ty,
                 mutable: sig.mutable,
+                escape: sig.escape,
             })
             .collect();
         self.semantic_callable_fact(
@@ -2985,6 +3039,7 @@ impl TypeChecker {
                 span: SourceSpan::from_byte_span(module.source, span),
                 ty: receiver_ty.clone(),
                 mutable: matches!(receiver, Some(MethodReceiver::Var)),
+                escape: EscapeMode::NonEscaping,
             });
         }
         params.extend(source_params.iter().zip(param_types).map(|(source, sig)| {
@@ -2993,6 +3048,7 @@ impl TypeChecker {
                 span: SourceSpan::from_byte_span(module.source, source.ty_span),
                 ty: sig.ty,
                 mutable: sig.mutable,
+                escape: sig.escape,
             }
         }));
         self.semantic_callable_fact(module, callable, args, name, span, body_span, params, ret)
@@ -3819,6 +3875,7 @@ fn checked_from_checked(
 ) -> CheckedType {
     let handle = tc.set_type_from_handle(expr.node.id, expr.span, &checked.handle);
     let ty = tc.handle_type(&handle);
+    tc.record_function_value_expr(expr.node.id, &ty, FunctionValueKind::LocalOrPlace);
     checked.with_handle(ty, handle)
 }
 
@@ -3999,6 +4056,11 @@ fn check_expr_checked_with_hint(
                     tc.check_mut_downcast_root_use(Some(*name), &place.identity, expr.span);
                     let checked = place.checked.clone();
                     tc.record_expr_place(expr.node.id, &place);
+                    tc.record_function_value_expr(
+                        expr.node.id,
+                        &checked.ty,
+                        FunctionValueKind::LocalOrPlace,
+                    );
                     checked
                 }
                 ResolvedIdentSubject::Local(LocalSymbol::Callable(info), _) => {
@@ -4007,7 +4069,16 @@ fn check_expr_checked_with_hint(
                             tc.push_error(error);
                             checked_from_type(expr, Type::Infer, tc)
                         }
-                        None => checked_from_handle(expr, tc.local_handle(info.type_id), tc),
+                        None => {
+                            let checked =
+                                checked_from_handle(expr, tc.local_handle(info.type_id), tc);
+                            tc.record_function_value_expr(
+                                expr.node.id,
+                                &checked.ty,
+                                TypeChecker::function_value_kind_for_callee(&info.callee),
+                            );
+                            checked
+                        }
                     }
                 }
                 ResolvedIdentSubject::Blocked(error) => {
@@ -4045,7 +4116,20 @@ fn check_expr_checked_with_hint(
                             }
                             None => checked_from_type(expr, Type::Infer, tc),
                         },
-                        ValueDecl::Func(sig) => checked_from_type(expr, sig.ty, tc),
+                        ValueDecl::Func(sig) => {
+                            if let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
+                                module,
+                                name: value_name,
+                                decl: ValueDecl::Func(sig.clone()),
+                            }) {
+                                tc.record_function_value_expr(
+                                    expr.node.id,
+                                    &sig.ty,
+                                    TypeChecker::function_value_kind_for_callee(&callee),
+                                );
+                            }
+                            checked_from_type(expr, sig.ty, tc)
+                        }
                         ValueDecl::Global(_) => unreachable!("global handled above"),
                     }
                 }

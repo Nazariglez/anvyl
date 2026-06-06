@@ -98,10 +98,27 @@ pub enum ParamMode {
     MutBorrow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ParamEscape {
+    #[default]
+    NonEscaping,
+    Escaping,
+}
+
+impl From<crate::ast::EscapeMode> for ParamEscape {
+    fn from(value: crate::ast::EscapeMode) -> Self {
+        match value {
+            crate::ast::EscapeMode::NonEscaping => Self::NonEscaping,
+            crate::ast::EscapeMode::Escaping => Self::Escaping,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParamType {
     pub ty: TypeId,
     pub mode: ParamMode,
+    pub escape: ParamEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

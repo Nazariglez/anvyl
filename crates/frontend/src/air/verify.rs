@@ -5,11 +5,13 @@ use anvyx_externs::{
 
 pub use super::typing::PrimitiveKind;
 use super::{
-    AggregateKind, ConstValue, EnumRepr, ExternMember, ExternRep, Function, LocalKind, Mutability,
-    ParamMode, ParamRole, Program, RawEnumValue, ReturnMode, TypeData, VariantShape,
+    AggregateKind, CaptureLocalSource, ConstValue, EnumRepr, ExternMember, ExternRep, Function,
+    FunctionKind, LambdaCaptureDecl, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Param,
+    ParamEscape, ParamMode, ParamRole, Program, RawEnumValue, ReturnMode, SignatureType, TypeData,
+    VariantShape,
     body::{
         AggregateCtor, AirBlock, AirEnumMatch, AirIf, AirOptionalMatch, AirStmt, AirTail, CallArg,
-        Callee, Operand, Place, PlaceReadLocal, Projection, RValue,
+        Callee, LambdaCaptureArg, Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
     },
     ids::*,
     typing::{self, PrimitiveTypes},
@@ -40,6 +42,10 @@ pub enum VerifySite {
     Enum(EnumId),
     ExternType(ExternTypeId),
     Extern(ExternId),
+    Lambda(LambdaId),
+    ScopedBorrow(ScopedBorrowId),
+    UpvalueCell(UpvalueCellId),
+    Global(GlobalId),
     Function(FunctionId),
     Statement {
         function: FunctionId,
@@ -157,6 +163,23 @@ pub enum BadRValue {
     StringifyVoidSource {
         source: TypeId,
     },
+    FunctionValueTypeMismatch {
+        expected: SignatureType,
+        found: TypeId,
+    },
+    FunctionValueMustBeFunction(TypeId),
+    FunctionRefMustBeNamed(FunctionId),
+    MakeLambdaOwnerMismatch {
+        lambda: LambdaId,
+        expected: FunctionId,
+        found: FunctionId,
+    },
+    LambdaCaptureMismatch {
+        index: usize,
+    },
+    ReadonlyCaptureMustBeImmutableOwned {
+        index: usize,
+    },
     AggregateCtorResultTypeMismatch {
         aggregate: AggregateId,
         expected: AggregateKind,
@@ -239,9 +262,10 @@ pub enum BadStatement {
     InitParamLocal(LocalId),
     InitTypeMismatch { expected: TypeId, found: TypeId },
     AssignTypeMismatch { expected: TypeId, found: TypeId },
-    AssignImmutableLocal(LocalId),
     ReadUninitializedLocal(LocalId),
+    ReadUninitializedUpvalueCell(UpvalueCellId),
     AssignUninitializedLocal(LocalId),
+    AssignUninitializedUpvalueCell(UpvalueCellId),
     InitImmutableLocalTwice(LocalId),
 }
 
@@ -249,6 +273,8 @@ pub enum BadStatement {
 pub enum BadReference {
     InvalidEntry(FunctionId),
     InvalidFunction(FunctionId),
+    InvalidLambda(LambdaId),
+    InvalidLambdaCaptureSlot(LambdaCaptureSlotId),
     InvalidExtern(ExternId),
     InvalidExternType(ExternTypeId),
     InvalidAggregate(AggregateId),
@@ -256,6 +282,9 @@ pub enum BadReference {
     InvalidType(TypeId),
     InvalidConst(ConstId),
     InvalidLocal(LocalId),
+    InvalidScopedBorrow(ScopedBorrowId),
+    InvalidUpvalueCell(UpvalueCellId),
+    InvalidGlobal(GlobalId),
     InvalidField {
         aggregate: AggregateId,
         field: FieldId,
@@ -277,6 +306,15 @@ pub enum BadFunction {
         first: LocalId,
         second: LocalId,
     },
+    DuplicateLocalBinding {
+        binding: BindingId,
+        first: LocalId,
+        second: LocalId,
+    },
+    LocalBindingInvalidKind {
+        local: LocalId,
+        kind: LocalKind,
+    },
     IfCondMustBeBool(TypeId),
     SwitchDiscriminantMustBeEnum(TypeId),
     DuplicateSwitchArm(VariantId),
@@ -284,6 +322,7 @@ pub enum BadFunction {
         expected_enum: EnumId,
         variant: VariantId,
     },
+    EntryMustBeNamed(FunctionId),
     NonVoidFunctionMustReturnValue(TypeId),
     VoidFunctionMustReturnNone,
     ReturnedTypeMismatch {
@@ -301,6 +340,7 @@ pub enum BadFunction {
         found: TypeId,
     },
     StringifyOverrideReturnMustBeString(TypeId),
+    StringifyOverrideMustBeNamed(FunctionId),
     LenSourceMustBeCountable(TypeId),
     ListElementTypeMismatch {
         expected: TypeId,
@@ -353,14 +393,96 @@ pub enum BadFunction {
     MatchNotExhaustive(EnumId),
     OptionalPayloadLocalAlreadyInitialized(LocalId),
     OptionalPayloadLocalMustBeImmutable(LocalId),
-    OptionalPayloadRefDiscriminantMustBeMutable(LocalId),
     OptionalPayloadEscapeRequiresPayload,
     OptionalPayloadEscapeRequiresRef,
     OptionalPayloadEscapeNoneMustDiverge,
+    LambdaBodyKindMismatch {
+        lambda: LambdaId,
+        body: FunctionId,
+    },
+    LambdaBodySignatureMismatch {
+        lambda: LambdaId,
+        body: FunctionId,
+    },
+    LambdaBodyModuleMismatch {
+        lambda: LambdaId,
+        expected: ModuleId,
+        found: ModuleId,
+    },
+    EscapingLambdaScopedCapture {
+        lambda: LambdaId,
+    },
+    EscapingLambdaCapturesNonEscapingFunction {
+        lambda: LambdaId,
+        local: LocalId,
+    },
+    DuplicateLambdaCapture {
+        lambda: LambdaId,
+        binding: BindingId,
+        first: usize,
+        second: usize,
+    },
+    DuplicateLambdaCaptureSource {
+        lambda: LambdaId,
+        first: usize,
+        second: usize,
+    },
+    LambdaCaptureSourceMismatch {
+        lambda: LambdaId,
+        index: usize,
+    },
+    ReadonlyLambdaCaptureSourceMustBeImmutableOwned {
+        lambda: LambdaId,
+        index: usize,
+        local: LocalId,
+    },
+    LambdaCaptureCellNotAccessible {
+        lambda: LambdaId,
+        owner: FunctionId,
+        cell: UpvalueCellId,
+    },
+    DuplicateUpvalueCell {
+        owner: FunctionId,
+        binding: BindingId,
+        first: UpvalueCellId,
+        second: UpvalueCellId,
+    },
+    UpvalueCellSourceLocalMismatch {
+        cell: UpvalueCellId,
+        owner: FunctionId,
+        local: LocalId,
+    },
+    UpvalueCellSourceLocalTypeMismatch {
+        cell: UpvalueCellId,
+        expected: TypeId,
+        found: TypeId,
+    },
+    UpvalueCellSourceLocalMustBeOwnedBinding {
+        cell: UpvalueCellId,
+        local: LocalId,
+        kind: LocalKind,
+    },
+    UpvalueCellSourceLocalMustBeMutable {
+        cell: UpvalueCellId,
+        local: LocalId,
+    },
+    UpvalueCellSourceLocalBindingMismatch {
+        cell: UpvalueCellId,
+        expected: BindingId,
+        found: Option<BindingId>,
+    },
+    DuplicateUpvalueCellSourceLocal {
+        owner: FunctionId,
+        local: LocalId,
+        first: UpvalueCellId,
+        second: UpvalueCellId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadPlace {
+    UnsupportedRoot(PlaceRoot),
+    NoRuntimeLambdaCaptureRoot(LambdaCaptureSlotId),
     FieldProjectionOnNonAggregate(TypeId),
     FieldProjectionKindMismatch {
         aggregate: AggregateId,
@@ -388,11 +510,34 @@ pub enum BadPlace {
         expected: TypeId,
         found: TypeId,
     },
+    ImmutableRoot(PlaceRoot),
+    PromotedBindingBypassesCell {
+        binding: BindingId,
+        cell: UpvalueCellId,
+        local: LocalId,
+    },
+    UpvalueCellNotAccessible {
+        cell: UpvalueCellId,
+        function: FunctionId,
+    },
+    EscapingLambdaScopedBorrowRoot {
+        lambda: LambdaId,
+        root: ScopedBorrowId,
+    },
+    RawScopedBorrowCaptureBypass {
+        lambda: LambdaId,
+        root: ScopedBorrowId,
+    },
+    RawUpvalueCellCaptureBypass {
+        lambda: LambdaId,
+        root: UpvalueCellId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadCall {
-    ClosureCalleeMustBeFunction,
+    LambdaCalleeMustBeFunction,
+    FunctionCalleeMustBeNamed(FunctionId),
     ArityMismatch {
         expected: usize,
         found: usize,
@@ -406,6 +551,15 @@ pub enum BadCall {
         index: usize,
         expected: ParamMode,
         found: ParamMode,
+    },
+    ArgEscapeMismatch {
+        index: usize,
+        expected: ParamEscape,
+        found: ParamEscape,
+    },
+    ArgEscapeUnknown {
+        index: usize,
+        expected: ParamEscape,
     },
     ArgAliasConflict {
         first: usize,
@@ -430,7 +584,7 @@ pub(crate) fn verify_structured_body(
     body: &super::AirBody,
 ) -> Result<(), Vec<VerifyError>> {
     let mut cx = VerifyCx::new(program);
-    let mut state = LocalInit::new(program.function(function_id));
+    let mut state = LocalInit::new(program, program.function(function_id));
     verify_air_block(
         &mut cx,
         function_id,
@@ -536,6 +690,18 @@ impl<'a> VerifyCx<'a> {
         id.index() < self.program.modules.len()
     }
 
+    fn has_scoped_borrow(&self, id: ScopedBorrowId) -> bool {
+        id.index() < self.program.scoped_borrows.len()
+    }
+
+    fn has_upvalue_cell(&self, id: UpvalueCellId) -> bool {
+        id.index() < self.program.upvalue_cells.len()
+    }
+
+    fn has_global(&self, id: GlobalId) -> bool {
+        id.index() < self.program.globals.len()
+    }
+
     fn verify_module_ref(&mut self, site: VerifySite, module: ModuleId) {
         if !self.has_module(module) {
             self.push(
@@ -578,22 +744,74 @@ impl<'a> VerifyCx<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionValueCapability {
+    NonFunction,
+    Escaping,
+    NonEscaping,
+    Unknown,
+}
+
+impl FunctionValueCapability {
+    fn from_param_escape(escape: ParamEscape) -> Self {
+        match escape {
+            ParamEscape::Escaping => Self::Escaping,
+            ParamEscape::NonEscaping => Self::NonEscaping,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LocalInit {
     definite: Vec<bool>,
     possible: Vec<bool>,
+    local_escape: Vec<FunctionValueCapability>,
+    cell_definite: Vec<bool>,
 }
 
 impl LocalInit {
-    fn new(function: &Function) -> Self {
+    fn new(program: &Program, function: &Function) -> Self {
         let mut state = Self {
             definite: vec![false; function.locals.len()],
             possible: vec![false; function.locals.len()],
+            local_escape: function
+                .locals
+                .iter()
+                .map(|local| {
+                    if matches!(
+                        program.type_arena.get(local.ty),
+                        Some(TypeData::Function(_))
+                    ) {
+                        FunctionValueCapability::Unknown
+                    } else {
+                        FunctionValueCapability::NonFunction
+                    }
+                })
+                .collect(),
+            cell_definite: vec![false; program.upvalue_cells.len()],
         };
         for param in &function.signature.params {
             if param.local_id.index() < function.locals.len() {
                 state.definite[param.local_id.index()] = true;
                 state.possible[param.local_id.index()] = true;
+                if matches!(
+                    program.type_arena.get(param.ty),
+                    Some(TypeData::Function(_))
+                ) {
+                    state.local_escape[param.local_id.index()] =
+                        FunctionValueCapability::from_param_escape(param.escape);
+                }
+            }
+        }
+        if let FunctionKind::Lambda(lambda) = function.kind
+            && let Some(decl) = program.lambdas.get(lambda.index())
+        {
+            for capture in &decl.captures {
+                if let LambdaCaptureDecl::UpvalueCell { cell, .. } = capture
+                    && cell.index() < state.cell_definite.len()
+                {
+                    state.cell_definite[cell.index()] = true;
+                }
             }
         }
         state
@@ -614,6 +832,32 @@ impl LocalInit {
         }
     }
 
+    fn set_escape(&mut self, local: LocalId, escape: FunctionValueCapability) {
+        if local.index() < self.local_escape.len() {
+            self.local_escape[local.index()] = escape;
+        }
+    }
+
+    fn escape(&self, local: LocalId) -> FunctionValueCapability {
+        self.local_escape
+            .get(local.index())
+            .copied()
+            .unwrap_or(FunctionValueCapability::Unknown)
+    }
+
+    fn init_cell(&mut self, cell: UpvalueCellId) {
+        if cell.index() < self.cell_definite.len() {
+            self.cell_definite[cell.index()] = true;
+        }
+    }
+
+    fn cell_is_definite(&self, cell: UpvalueCellId) -> bool {
+        self.cell_definite
+            .get(cell.index())
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn clear(&mut self, local: LocalId) {
         if local.index() < self.definite.len() {
             self.definite[local.index()] = false;
@@ -631,19 +875,52 @@ impl LocalInit {
             for (left, right) in joined.possible.iter_mut().zip(state.possible) {
                 *left |= right;
             }
+            for (left, right) in joined.local_escape.iter_mut().zip(state.local_escape) {
+                *left = join_escape(*left, right);
+            }
+            for (left, right) in joined.cell_definite.iter_mut().zip(state.cell_definite) {
+                *left &= right;
+            }
         }
         Some(joined)
     }
 }
 
+fn join_escape(
+    left: FunctionValueCapability,
+    right: FunctionValueCapability,
+) -> FunctionValueCapability {
+    match (left, right) {
+        (FunctionValueCapability::Escaping, FunctionValueCapability::Escaping) => {
+            FunctionValueCapability::Escaping
+        }
+        (FunctionValueCapability::NonFunction, FunctionValueCapability::NonFunction) => {
+            FunctionValueCapability::NonFunction
+        }
+        (FunctionValueCapability::Unknown, _) | (_, FunctionValueCapability::Unknown) => {
+            FunctionValueCapability::Unknown
+        }
+        (
+            FunctionValueCapability::Escaping | FunctionValueCapability::NonEscaping,
+            FunctionValueCapability::Escaping | FunctionValueCapability::NonEscaping,
+        ) => FunctionValueCapability::NonEscaping,
+        _ => FunctionValueCapability::Unknown,
+    }
+}
+
 fn collect_errors(cx: &mut VerifyCx<'_>) {
-    if let Some(entry) = cx.program.entry
-        && !cx.has_function(entry)
-    {
-        cx.push(
-            VerifySite::Program,
-            VerifyErrorKind::BadReference(BadReference::InvalidEntry(entry)),
-        );
+    if let Some(entry) = cx.program.entry {
+        match cx.program.functions.get(entry.index()) {
+            Some(function) if matches!(function.kind, FunctionKind::Lambda(_)) => cx.push(
+                VerifySite::Program,
+                VerifyErrorKind::BadFunction(BadFunction::EntryMustBeNamed(entry)),
+            ),
+            Some(_) => {}
+            None => cx.push(
+                VerifySite::Program,
+                VerifyErrorKind::BadReference(BadReference::InvalidEntry(entry)),
+            ),
+        }
     }
 
     for duplicate in cx.primitives.duplicates().to_vec() {
@@ -679,6 +956,19 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     }
     for (id, _) in cx.program.externs.iter().enumerate() {
         verify_extern(cx, ExternId::from_index(id));
+    }
+    for (id, _) in cx.program.lambdas.iter().enumerate() {
+        verify_lambda(cx, LambdaId::from_index(id));
+    }
+    for (id, _) in cx.program.scoped_borrows.iter().enumerate() {
+        verify_scoped_borrow(cx, ScopedBorrowId::from_index(id));
+    }
+    for (id, _) in cx.program.upvalue_cells.iter().enumerate() {
+        verify_upvalue_cell(cx, UpvalueCellId::from_index(id));
+    }
+    verify_upvalue_cell_uniqueness(cx);
+    for (id, _) in cx.program.globals.iter().enumerate() {
+        verify_global(cx, GlobalId::from_index(id));
     }
     for (id, _) in cx.program.functions.iter().enumerate() {
         verify_function(cx, FunctionId::from_index(id));
@@ -770,6 +1060,518 @@ impl_module_ref!(AggregateId, InvalidAggregate, Aggregate);
 impl_module_ref!(EnumId, InvalidEnum, Enum);
 impl_module_ref!(ExternTypeId, InvalidExternType, ExternType);
 impl_module_ref!(ExternId, InvalidExtern, Extern);
+
+fn verify_lambda(cx: &mut VerifyCx<'_>, id: LambdaId) {
+    let decl = &cx.program.lambdas[id.index()];
+    let site = VerifySite::Lambda(id);
+    cx.verify_module_ref(site.clone(), decl.module);
+    cx.verify_type_ref(site.clone(), decl.signature.ret.ty());
+    if !cx.has_function(decl.owner) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidFunction(decl.owner)),
+        );
+    }
+    verify_signature_type(cx, site.clone(), &decl.signature);
+    match cx.program.functions.get(decl.body.index()) {
+        Some(function) if function.kind == FunctionKind::Lambda(id) => {
+            if function.module != decl.module {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::LambdaBodyModuleMismatch {
+                        lambda: id,
+                        expected: decl.module,
+                        found: function.module,
+                    }),
+                );
+            }
+            if function_signature_type(function) != decl.signature {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::LambdaBodySignatureMismatch {
+                        lambda: id,
+                        body: decl.body,
+                    }),
+                );
+            }
+        }
+        Some(_) => cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::LambdaBodyKindMismatch {
+                lambda: id,
+                body: decl.body,
+            }),
+        ),
+        None => cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidFunction(decl.body)),
+        ),
+    }
+    let mut bindings = std::collections::HashMap::new();
+    let mut sources = std::collections::HashMap::new();
+    for (index, capture) in decl.captures.iter().enumerate() {
+        let binding = lambda_capture_decl_binding(capture);
+        if let Some(first) = bindings.insert(binding, index) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateLambdaCapture {
+                    lambda: id,
+                    binding,
+                    first,
+                    second: index,
+                }),
+            );
+        }
+        if let Some(source) = lambda_capture_decl_source(capture)
+            && let Some(first) = sources.insert(source, index)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateLambdaCaptureSource {
+                    lambda: id,
+                    first,
+                    second: index,
+                }),
+            );
+        }
+        if decl.escape == LambdaEscape::Escaping
+            && matches!(
+                capture,
+                LambdaCaptureDecl::ScopedLocal { .. } | LambdaCaptureDecl::ScopedBorrow { .. }
+            )
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::EscapingLambdaScopedCapture {
+                    lambda: id,
+                }),
+            );
+        }
+        verify_lambda_capture_decl(cx, site.clone(), id, index, decl, capture);
+    }
+}
+
+fn lambda_capture_decl_binding(capture: &LambdaCaptureDecl) -> BindingId {
+    match capture {
+        LambdaCaptureDecl::NoRuntime { binding, .. }
+        | LambdaCaptureDecl::ReadonlyLocal { binding, .. }
+        | LambdaCaptureDecl::ScopedLocal { binding, .. }
+        | LambdaCaptureDecl::ScopedBorrow { binding, .. }
+        | LambdaCaptureDecl::UpvalueCell { binding, .. } => *binding,
+    }
+}
+
+fn lambda_capture_decl_ty(capture: &LambdaCaptureDecl) -> TypeId {
+    match capture {
+        LambdaCaptureDecl::NoRuntime { ty, .. }
+        | LambdaCaptureDecl::ReadonlyLocal { ty, .. }
+        | LambdaCaptureDecl::ScopedLocal { ty, .. }
+        | LambdaCaptureDecl::ScopedBorrow { ty, .. }
+        | LambdaCaptureDecl::UpvalueCell { ty, .. } => *ty,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum LambdaCaptureSourceKey {
+    Local(CaptureLocalSource),
+    ScopedBorrow(ScopedBorrowId),
+    UpvalueCell(UpvalueCellId),
+}
+
+fn lambda_capture_decl_source(capture: &LambdaCaptureDecl) -> Option<LambdaCaptureSourceKey> {
+    Some(match capture {
+        LambdaCaptureDecl::ReadonlyLocal { source, .. }
+        | LambdaCaptureDecl::ScopedLocal { source, .. } => LambdaCaptureSourceKey::Local(*source),
+        LambdaCaptureDecl::ScopedBorrow { borrow, .. } => {
+            LambdaCaptureSourceKey::ScopedBorrow(*borrow)
+        }
+        LambdaCaptureDecl::UpvalueCell { cell, .. } => LambdaCaptureSourceKey::UpvalueCell(*cell),
+        LambdaCaptureDecl::NoRuntime { .. } => return None,
+    })
+}
+
+fn lambda_capture_decl_mutability(capture: &LambdaCaptureDecl) -> Mutability {
+    match capture {
+        LambdaCaptureDecl::ScopedLocal { mutability, .. }
+        | LambdaCaptureDecl::ScopedBorrow { mutability, .. } => *mutability,
+        LambdaCaptureDecl::UpvalueCell { .. } => Mutability::Mutable,
+        LambdaCaptureDecl::NoRuntime { .. } | LambdaCaptureDecl::ReadonlyLocal { .. } => {
+            Mutability::Immutable
+        }
+    }
+}
+
+fn verify_lambda_capture_decl(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    lambda: LambdaId,
+    index: usize,
+    decl: &LambdaDecl,
+    capture: &LambdaCaptureDecl,
+) {
+    match capture {
+        LambdaCaptureDecl::NoRuntime { ty, .. } => cx.verify_type_ref(site, *ty),
+        LambdaCaptureDecl::ReadonlyLocal {
+            binding,
+            source,
+            ty,
+        } => {
+            cx.verify_type_ref(site.clone(), *ty);
+            verify_capture_local_source(
+                cx,
+                site.clone(),
+                lambda,
+                index,
+                decl.owner,
+                *binding,
+                *source,
+                *ty,
+                CaptureLocalAccess::Readonly,
+            );
+            if decl.escape == LambdaEscape::Escaping {
+                verify_escaping_function_capture(cx, site, lambda, *source, *ty);
+            }
+        }
+        LambdaCaptureDecl::ScopedLocal {
+            binding,
+            source,
+            ty,
+            mutability,
+        } => {
+            cx.verify_type_ref(site.clone(), *ty);
+            verify_capture_local_source(
+                cx,
+                site,
+                lambda,
+                index,
+                decl.owner,
+                *binding,
+                *source,
+                *ty,
+                CaptureLocalAccess::Scoped(*mutability),
+            );
+        }
+        LambdaCaptureDecl::ScopedBorrow {
+            borrow,
+            ty,
+            mutability,
+            ..
+        } => {
+            cx.verify_type_ref(site.clone(), *ty);
+            match cx.program.scoped_borrows.get(borrow.index()) {
+                Some(borrow_decl)
+                    if borrow_decl.ty == *ty && borrow_decl.mutability == *mutability => {}
+                Some(_) => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+                        lambda,
+                        index,
+                    }),
+                ),
+                None => cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidScopedBorrow(*borrow)),
+                ),
+            }
+        }
+        LambdaCaptureDecl::UpvalueCell { binding, cell, ty } => {
+            cx.verify_type_ref(site.clone(), *ty);
+            match cx.program.upvalue_cells.get(cell.index()) {
+                Some(cell_decl) if cell_decl.binding == *binding && cell_decl.ty == *ty => {
+                    if !function_can_access_upvalue_cell(cx.program, decl.owner, *cell) {
+                        cx.push(
+                            site,
+                            VerifyErrorKind::BadFunction(
+                                BadFunction::LambdaCaptureCellNotAccessible {
+                                    lambda,
+                                    owner: decl.owner,
+                                    cell: *cell,
+                                },
+                            ),
+                        );
+                    }
+                }
+                Some(_) => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+                        lambda,
+                        index,
+                    }),
+                ),
+                None => cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidUpvalueCell(*cell)),
+                ),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CaptureLocalAccess {
+    Readonly,
+    Scoped(Mutability),
+}
+
+fn verify_capture_local_source(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    lambda: LambdaId,
+    index: usize,
+    expected_owner: FunctionId,
+    binding: BindingId,
+    source: CaptureLocalSource,
+    ty: TypeId,
+    access: CaptureLocalAccess,
+) {
+    if source.owner != expected_owner {
+        cx.push(
+            site,
+            VerifyErrorKind::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+                lambda,
+                index,
+            }),
+        );
+        return;
+    }
+    match cx.program.functions.get(source.owner.index()) {
+        Some(function) => match function.locals.get(source.local.index()) {
+            Some(local) if local.binding == Some(binding) && local.ty == ty => {
+                verify_capture_local_access(
+                    cx,
+                    site,
+                    lambda,
+                    index,
+                    function,
+                    source.local,
+                    local,
+                    access,
+                );
+            }
+            Some(_) => cx.push(
+                site,
+                VerifyErrorKind::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+                    lambda,
+                    index,
+                }),
+            ),
+            None => cx.push(
+                site,
+                VerifyErrorKind::BadReference(BadReference::InvalidLocal(source.local)),
+            ),
+        },
+        None => cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidFunction(source.owner)),
+        ),
+    }
+}
+
+fn verify_capture_local_access(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    lambda: LambdaId,
+    index: usize,
+    function: &Function,
+    local_id: LocalId,
+    local: &Local,
+    access: CaptureLocalAccess,
+) {
+    match access {
+        CaptureLocalAccess::Readonly => {
+            if !readonly_local_source_is_valid(function, local_id, local) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(
+                        BadFunction::ReadonlyLambdaCaptureSourceMustBeImmutableOwned {
+                            lambda,
+                            index,
+                            local: local_id,
+                        },
+                    ),
+                );
+            }
+        }
+        CaptureLocalAccess::Scoped(mutability) => {
+            if local.mutability != mutability {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+                        lambda,
+                        index,
+                    }),
+                );
+            }
+        }
+    }
+}
+
+fn readonly_local_source_is_valid(function: &Function, local_id: LocalId, local: &Local) -> bool {
+    if local.mutability == Mutability::Mutable {
+        return false;
+    }
+    match local.kind {
+        LocalKind::User => true,
+        LocalKind::Arg => function
+            .signature
+            .params
+            .iter()
+            .find(|param| param.local_id == local_id)
+            .is_some_and(|param| param.mode == ParamMode::Value),
+        LocalKind::Return | LocalKind::Temp | LocalKind::PatternBinding => false,
+    }
+}
+
+fn verify_escaping_function_capture(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    lambda: LambdaId,
+    source: CaptureLocalSource,
+    ty: TypeId,
+) {
+    if !matches!(cx.type_data(ty), Some(TypeData::Function(_))) {
+        return;
+    }
+    let Some(function) = cx.program.functions.get(source.owner.index()) else {
+        return;
+    };
+    let Some(param) = function
+        .signature
+        .params
+        .iter()
+        .find(|param| param.local_id == source.local)
+    else {
+        return;
+    };
+    if param.escape == ParamEscape::NonEscaping {
+        cx.push(
+            site,
+            VerifyErrorKind::BadFunction(BadFunction::EscapingLambdaCapturesNonEscapingFunction {
+                lambda,
+                local: source.local,
+            }),
+        );
+    }
+}
+
+fn verify_signature_type(cx: &mut VerifyCx<'_>, site: VerifySite, sig: &SignatureType) {
+    for param in &sig.params {
+        cx.verify_type_ref(site.clone(), param.ty);
+    }
+    cx.verify_type_ref(site, sig.ret.ty());
+}
+
+fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
+    let decl = &cx.program.scoped_borrows[id.index()];
+    cx.verify_type_ref(VerifySite::ScopedBorrow(id), decl.ty);
+}
+
+fn verify_upvalue_cell(cx: &mut VerifyCx<'_>, id: UpvalueCellId) {
+    let decl = &cx.program.upvalue_cells[id.index()];
+    let site = VerifySite::UpvalueCell(id);
+    if !cx.has_function(decl.owner) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidFunction(decl.owner)),
+        );
+    }
+    let local = decl.source_local;
+    if let Some(function) = cx.program.functions.get(decl.owner.index()) {
+        match function.locals.get(local.index()) {
+            Some(source) => {
+                if source.ty != decl.ty {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(
+                            BadFunction::UpvalueCellSourceLocalTypeMismatch {
+                                cell: id,
+                                expected: decl.ty,
+                                found: source.ty,
+                            },
+                        ),
+                    );
+                }
+                if source.binding != Some(decl.binding) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(
+                            BadFunction::UpvalueCellSourceLocalBindingMismatch {
+                                cell: id,
+                                expected: decl.binding,
+                                found: source.binding,
+                            },
+                        ),
+                    );
+                }
+                if source.kind != LocalKind::User {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(
+                            BadFunction::UpvalueCellSourceLocalMustBeOwnedBinding {
+                                cell: id,
+                                local,
+                                kind: source.kind,
+                            },
+                        ),
+                    );
+                }
+                if source.mutability != Mutability::Mutable {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(
+                            BadFunction::UpvalueCellSourceLocalMustBeMutable { cell: id, local },
+                        ),
+                    );
+                }
+            }
+            None => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::UpvalueCellSourceLocalMismatch {
+                    cell: id,
+                    owner: decl.owner,
+                    local,
+                }),
+            ),
+        }
+    }
+    cx.verify_type_ref(site, decl.ty);
+}
+
+fn verify_upvalue_cell_uniqueness(cx: &mut VerifyCx<'_>) {
+    let mut bindings = std::collections::HashMap::new();
+    let mut locals = std::collections::HashMap::new();
+    for (index, decl) in cx.program.upvalue_cells.iter().enumerate() {
+        let id = UpvalueCellId::from_index(index);
+        if let Some(first) = bindings.insert((decl.owner, decl.binding), id) {
+            cx.push(
+                VerifySite::UpvalueCell(id),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateUpvalueCell {
+                    owner: decl.owner,
+                    binding: decl.binding,
+                    first,
+                    second: id,
+                }),
+            );
+        }
+        if let Some(first) = locals.insert((decl.owner, decl.source_local), id) {
+            cx.push(
+                VerifySite::UpvalueCell(id),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateUpvalueCellSourceLocal {
+                    owner: decl.owner,
+                    local: decl.source_local,
+                    first,
+                    second: id,
+                }),
+            );
+        }
+    }
+}
+
+fn verify_global(cx: &mut VerifyCx<'_>, id: GlobalId) {
+    let decl = &cx.program.globals[id.index()];
+    cx.verify_module_ref(VerifySite::Global(id), decl.module);
+    cx.verify_type_ref(VerifySite::Global(id), decl.ty);
+}
 
 fn verify_const(cx: &mut VerifyCx<'_>, id: ConstId) {
     let konst = cx.program.const_data(id);
@@ -888,6 +1690,14 @@ fn verify_aggregate(cx: &mut VerifyCx<'_>, id: AggregateId) {
             return;
         }
         let function = cx.program.function(function_id);
+        if matches!(function.kind, FunctionKind::Lambda(_)) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::StringifyOverrideMustBeNamed(
+                    function_id,
+                )),
+            );
+        }
         if function.module != agg.module {
             cx.push(
                 site.clone(),
@@ -1401,6 +2211,22 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
     let site = VerifySite::Function(id);
     cx.verify_module_ref(site.clone(), func.module);
     verify_decl_listed_once(cx, site.clone(), func.module, id, |m| &m.functions);
+    if let FunctionKind::Lambda(lambda) = func.kind {
+        match cx.program.lambdas.get(lambda.index()) {
+            Some(decl) if decl.body == id => {}
+            Some(decl) => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::LambdaBodyKindMismatch {
+                    lambda,
+                    body: decl.body,
+                }),
+            ),
+            None => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadReference(BadReference::InvalidLambda(lambda)),
+            ),
+        }
+    }
 
     let mut seen_locals = std::collections::HashSet::new();
     for (i, param) in func.signature.params.iter().enumerate() {
@@ -1460,8 +2286,34 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
         }
     }
 
-    for local in &func.locals {
+    let mut bindings = std::collections::HashMap::new();
+    for (index, local) in func.locals.iter().enumerate() {
         cx.verify_type_ref(site.clone(), local.ty);
+        if let Some(binding) = local.binding {
+            let id = LocalId::from_index(index);
+            if !matches!(
+                local.kind,
+                LocalKind::Arg | LocalKind::User | LocalKind::PatternBinding
+            ) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::LocalBindingInvalidKind {
+                        local: id,
+                        kind: local.kind,
+                    }),
+                );
+            }
+            if let Some(first) = bindings.insert(binding, id) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::DuplicateLocalBinding {
+                        binding,
+                        first,
+                        second: id,
+                    }),
+                );
+            }
+        }
     }
     if let Some(specialization) = &func.specialization {
         for ty in &specialization.type_args {
@@ -1471,7 +2323,7 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
 
     cx.verify_type_ref(site, func.signature.return_type());
 
-    let mut state = LocalInit::new(func);
+    let mut state = LocalInit::new(cx.program, func);
     if verify_air_block(cx, id, &func.body.block, &mut state, &mut Vec::new()).is_some()
         && !matches!(
             cx.type_data(func.signature.return_type()),
@@ -1517,6 +2369,7 @@ fn verify_air_stmt(
     match stmt {
         AirStmt::Init { local, value } => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
+            verify_promoted_local_not_initialized(cx, function_id, block_id, index, *local);
             verify_init_stmt(cx, function_id, block_id, index, *local, value);
             let function = cx.program.function(function_id);
             if let Some(local_decl) = function.locals.get(local.index()) {
@@ -1530,21 +2383,40 @@ fn verify_air_stmt(
                 }
                 let mut next = state.clone();
                 next.init(*local);
+                next.set_escape(
+                    *local,
+                    rvalue_function_escape(cx.program, function_id, &cx.primitives, value, state),
+                );
                 return Some(next);
             }
             Some(state.clone())
         }
         AirStmt::Assign { dst, value } => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
-            verify_air_place_read(cx, function_id, index, dst, state);
-            if !state.is_definite(dst.root) {
-                cx.push(
-                    VerifyCx::stmt_site(function_id, block_id, index),
-                    VerifyErrorKind::BadStatement(BadStatement::AssignUninitializedLocal(dst.root)),
-                );
-            }
+            verify_air_place_write(cx, function_id, index, dst, state);
             verify_assign_stmt(cx, function_id, block_id, index, dst, value);
-            Some(state.clone())
+            let mut next = state.clone();
+            if dst.projection.is_empty() {
+                match dst.root {
+                    PlaceRoot::Local(local) => {
+                        next.set_escape(
+                            local,
+                            rvalue_function_escape(
+                                cx.program,
+                                function_id,
+                                &cx.primitives,
+                                value,
+                                state,
+                            ),
+                        );
+                    }
+                    PlaceRoot::UpvalueCell(cell) => next.init_cell(cell),
+                    PlaceRoot::LambdaCapture(_)
+                    | PlaceRoot::ScopedBorrow(_)
+                    | PlaceRoot::Global(_) => {}
+                }
+            }
+            Some(next)
         }
         AirStmt::Eval(value) => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
@@ -1696,17 +2568,7 @@ fn verify_air_optional_match(
         &match_.discr,
     );
     if match_.payload_ref {
-        let function = cx.program.function(function_id);
-        match function.locals.get(match_.discr.root.index()) {
-            Some(local) if local.mutability == Mutability::Mutable => {}
-            Some(_) => cx.push(
-                site.clone(),
-                VerifyErrorKind::BadFunction(
-                    BadFunction::OptionalPayloadRefDiscriminantMustBeMutable(match_.discr.root),
-                ),
-            ),
-            None => {}
-        }
+        verify_mutable_place(cx, function_id, &site, &match_.discr);
     }
     let inner = match discr_ty {
         Some(ty) => match typing::optional_inner(cx.program, ty) {
@@ -1887,7 +2749,8 @@ fn verify_air_rvalue_reads(
             }
         }
         RValue::Call { callee, args } => {
-            if let Callee::Closure(op) = callee {
+            verify_call_escape_args(cx, function_id, index, callee, args, state);
+            if let Callee::Lambda(op) = callee {
                 verify_air_operand_read(cx, function_id, index, op, state);
             }
             for arg in args {
@@ -1934,10 +2797,32 @@ fn verify_air_rvalue_reads(
             verify_air_operand_read(cx, function_id, index, key, state);
             verify_air_operand_read(cx, function_id, index, value, state);
         }
-        RValue::MakeClosure { captures, .. } => {
+        RValue::FunctionRef { .. } => {}
+        RValue::MakeLambda { captures, .. } => {
             for capture in captures {
-                verify_air_operand_read(cx, function_id, index, capture, state);
+                verify_air_lambda_capture_read(cx, function_id, index, capture, state);
             }
+        }
+    }
+}
+
+fn verify_air_lambda_capture_read(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    capture: &LambdaCaptureArg,
+    state: &LocalInit,
+) {
+    match capture {
+        LambdaCaptureArg::NoRuntime => {}
+        LambdaCaptureArg::UpvalueCell { cell } => {
+            verify_air_cell_read(cx, function_id, index, *cell, state);
+        }
+        LambdaCaptureArg::ReadonlyLocal { value } => {
+            verify_air_operand_read(cx, function_id, index, value, state);
+        }
+        LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+            verify_air_place_read(cx, function_id, index, place, state);
         }
     }
 }
@@ -1967,6 +2852,33 @@ fn verify_air_place_read(
         };
         verify_air_local_read(cx, function_id, index, local, state);
     });
+    if let PlaceRoot::UpvalueCell(cell) = place.root {
+        verify_air_cell_read(cx, function_id, index, cell, state);
+    }
+}
+
+fn verify_air_place_write(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    place: &Place,
+    state: &LocalInit,
+) {
+    for projection in &place.projection {
+        if let Projection::Index(local) = projection {
+            verify_air_local_read(cx, function_id, index, *local, state);
+        }
+    }
+    match place.root {
+        PlaceRoot::Local(local) if !state.is_definite(local) => cx.push(
+            VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
+            VerifyErrorKind::BadStatement(BadStatement::AssignUninitializedLocal(local)),
+        ),
+        PlaceRoot::UpvalueCell(cell) if !place.projection.is_empty() => {
+            verify_air_cell_write(cx, function_id, index, cell, state);
+        }
+        _ => {}
+    }
 }
 
 fn verify_air_local_read(
@@ -1976,11 +2888,74 @@ fn verify_air_local_read(
     local: LocalId,
     state: &LocalInit,
 ) {
+    let site = VerifyCx::stmt_site(function_id, BlockId::from_index(0), index);
+    verify_promoted_local_not_used(cx, function_id, &site, local);
     if !state.is_definite(local) {
         cx.push(
-            VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
+            site,
             VerifyErrorKind::BadStatement(BadStatement::ReadUninitializedLocal(local)),
         );
+    }
+}
+
+fn verify_air_cell_read(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    cell: UpvalueCellId,
+    state: &LocalInit,
+) {
+    if !state.cell_is_definite(cell) {
+        cx.push(
+            VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
+            VerifyErrorKind::BadStatement(BadStatement::ReadUninitializedUpvalueCell(cell)),
+        );
+    }
+}
+
+fn verify_air_cell_write(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    cell: UpvalueCellId,
+    state: &LocalInit,
+) {
+    if !state.cell_is_definite(cell) {
+        cx.push(
+            VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
+            VerifyErrorKind::BadStatement(BadStatement::AssignUninitializedUpvalueCell(cell)),
+        );
+    }
+}
+
+fn verify_promoted_local_not_initialized(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    local: LocalId,
+) {
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    verify_promoted_local_not_used(cx, function_id, &site, local);
+}
+
+fn verify_promoted_local_not_used(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    site: &VerifySite,
+    local: LocalId,
+) {
+    for (cell_index, decl) in cx.program.upvalue_cells.iter().enumerate() {
+        if decl.owner == function_id && decl.source_local == local {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadPlace(BadPlace::PromotedBindingBypassesCell {
+                    binding: decl.binding,
+                    cell: UpvalueCellId::from_index(cell_index),
+                    local,
+                }),
+            );
+        }
     }
 }
 
@@ -2036,19 +3011,9 @@ fn verify_assign_stmt(
     dst: &Place,
     value: &RValue,
 ) {
-    let function = cx.program.function(function_id);
     let site = VerifyCx::stmt_site(function_id, block_id, index);
     let dst_ty = verify_place(cx, function_id, block_id, Some(index), dst);
-    if function
-        .locals
-        .get(dst.root.index())
-        .is_some_and(|local| local.mutability == Mutability::Immutable)
-    {
-        cx.push(
-            site.clone(),
-            VerifyErrorKind::BadStatement(BadStatement::AssignImmutableLocal(dst.root)),
-        );
-    }
+    verify_mutable_place(cx, function_id, &site, dst);
     verify_rvalue(cx, function_id, block_id, Some(index), value);
     if let (Some(expected), Some(found)) =
         (dst_ty, typing::rvalue_ty(cx.program, &cx.primitives, value))
@@ -2345,7 +3310,7 @@ fn verify_rvalue(
         RValue::ListPush { list, value } => {
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
             verify_place(cx, function_id, block_id, stmt_index, list);
-            verify_mutating_place(cx, function_id, &site, list);
+            verify_mutable_place(cx, function_id, &site, list);
             verify_operand(cx, function_id, block_id, stmt_index, value);
             if let Some(expected_elem) = typing::list_elem(cx.program, list.ty)
                 && let Some(value_ty) = typing::operand_ty(cx.program, value)
@@ -2412,7 +3377,7 @@ fn verify_rvalue(
         }
         RValue::MapRemove { map, key, ty } => {
             verify_place(cx, function_id, block_id, stmt_index, map);
-            verify_mutating_place(cx, function_id, &site, map);
+            verify_mutable_place(cx, function_id, &site, map);
             verify_operand(cx, function_id, block_id, stmt_index, key);
             cx.verify_type_ref(site.clone(), *ty);
             if let Some((expected_key, expected_value)) = typing::map_kv(cx.program, map.ty) {
@@ -2423,7 +3388,7 @@ fn verify_rvalue(
         RValue::MapInsert { map, key, value } => {
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
             verify_place(cx, function_id, block_id, stmt_index, map);
-            verify_mutating_place(cx, function_id, &site, map);
+            verify_mutable_place(cx, function_id, &site, map);
             verify_operand(cx, function_id, block_id, stmt_index, key);
             verify_operand(cx, function_id, block_id, stmt_index, value);
             if let Some((expected_key, expected_value)) = typing::map_kv(cx.program, map.ty) {
@@ -2462,37 +3427,253 @@ fn verify_rvalue(
             verify_slice_index(cx, function_id, block_id, stmt_idx, "end", *end);
             cx.verify_type_ref(site, *ty);
         }
-        RValue::MakeClosure { func, captures, ty } => {
-            if !cx.has_function(*func) {
+        RValue::FunctionRef { function, ty } => {
+            match cx.program.functions.get(function.index()) {
+                Some(function_decl) if matches!(function_decl.kind, FunctionKind::Lambda(_)) => {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadRValue(BadRValue::FunctionRefMustBeNamed(*function)),
+                    );
+                }
+                Some(_) => {}
+                None => cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadReference(BadReference::InvalidFunction(*function)),
+                ),
+            }
+            verify_function_value_type(cx, site, *function, *ty);
+        }
+        RValue::MakeLambda {
+            lambda,
+            captures,
+            ty,
+        } => {
+            if let Some(decl) = cx.program.lambdas.get(lambda.index()) {
+                if decl.owner != function_id {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadRValue(BadRValue::MakeLambdaOwnerMismatch {
+                            lambda: *lambda,
+                            expected: decl.owner,
+                            found: function_id,
+                        }),
+                    );
+                }
+                verify_lambda_value_type(cx, site.clone(), *lambda, *ty);
+                verify_lambda_captures(cx, &site, function_id, *lambda, captures);
+            } else {
                 cx.push(
                     site.clone(),
-                    VerifyErrorKind::BadReference(BadReference::InvalidFunction(*func)),
+                    VerifyErrorKind::BadReference(BadReference::InvalidLambda(*lambda)),
                 );
             }
             for cap in captures {
-                verify_operand(cx, function_id, block_id, stmt_index, cap);
+                verify_lambda_capture(cx, function_id, block_id, stmt_index, cap);
             }
             cx.verify_type_ref(site, *ty);
         }
     }
 }
 
-fn verify_mutating_place(
+fn verify_lambda_captures(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    function_id: FunctionId,
+    lambda: LambdaId,
+    captures: &[LambdaCaptureArg],
+) {
+    let Some(decl) = cx.program.lambdas.get(lambda.index()) else {
+        return;
+    };
+    if captures.len() != decl.captures.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::LambdaCaptureMismatch {
+                index: captures.len().min(decl.captures.len()),
+            }),
+        );
+    }
+    for (index, (decl_capture, capture)) in decl.captures.iter().zip(captures).enumerate() {
+        if !lambda_capture_matches(cx.program, function_id, decl_capture, capture) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadRValue(BadRValue::LambdaCaptureMismatch { index }),
+            );
+        }
+        if let LambdaCaptureArg::ReadonlyLocal { value } = capture
+            && !readonly_capture_is_immutable_owned(cx.program, function_id, value, None)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadRValue(BadRValue::ReadonlyCaptureMustBeImmutableOwned {
+                    index,
+                }),
+            );
+        }
+        if lambda_capture_decl_mutability(decl_capture) == Mutability::Mutable
+            && let Some(place) = lambda_capture_arg_place(capture)
+        {
+            verify_mutable_place(cx, function_id, site, place);
+        }
+    }
+}
+
+fn readonly_capture_is_immutable_owned(
+    program: &Program,
+    function_id: FunctionId,
+    value: &Operand,
+    expected_source: Option<CaptureLocalSource>,
+) -> bool {
+    let Operand::Place(place) = value else {
+        return false;
+    };
+    if !place.projection.is_empty() {
+        return false;
+    }
+    let PlaceRoot::Local(local) = place.root else {
+        return false;
+    };
+    if expected_source.is_some_and(|source| source.owner != function_id || source.local != local) {
+        return false;
+    }
+    let Some(function) = program.functions.get(function_id.index()) else {
+        return false;
+    };
+    let Some(decl) = function.locals.get(local.index()) else {
+        return false;
+    };
+    readonly_local_source_is_valid(function, local, decl)
+}
+
+fn place_is_exact_local(place: &Place, source: CaptureLocalSource, ty: TypeId) -> bool {
+    place.root == PlaceRoot::Local(source.local) && place.projection.is_empty() && place.ty == ty
+}
+
+fn place_is_exact_scoped_borrow(place: &Place, borrow: ScopedBorrowId, ty: TypeId) -> bool {
+    place.root == PlaceRoot::ScopedBorrow(borrow) && place.projection.is_empty() && place.ty == ty
+}
+
+fn lambda_capture_arg_place(capture: &LambdaCaptureArg) -> Option<&Place> {
+    match capture {
+        LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+            Some(place)
+        }
+        LambdaCaptureArg::NoRuntime
+        | LambdaCaptureArg::ReadonlyLocal { .. }
+        | LambdaCaptureArg::UpvalueCell { .. } => None,
+    }
+}
+
+fn lambda_capture_matches(
+    program: &Program,
+    function_id: FunctionId,
+    decl: &LambdaCaptureDecl,
+    capture: &LambdaCaptureArg,
+) -> bool {
+    match (decl, capture) {
+        (LambdaCaptureDecl::NoRuntime { .. }, LambdaCaptureArg::NoRuntime) => true,
+        (
+            LambdaCaptureDecl::ReadonlyLocal { source, ty, .. },
+            LambdaCaptureArg::ReadonlyLocal { value },
+        ) => {
+            typing::operand_ty(program, value) == Some(*ty)
+                && source.owner == function_id
+                && readonly_capture_is_immutable_owned(program, function_id, value, Some(*source))
+        }
+        (
+            LambdaCaptureDecl::ScopedLocal { source, ty, .. },
+            LambdaCaptureArg::ScopedLocal { place },
+        ) => source.owner == function_id && place_is_exact_local(place, *source, *ty),
+        (
+            LambdaCaptureDecl::ScopedBorrow { borrow, ty, .. },
+            LambdaCaptureArg::ScopedBorrow { place },
+        ) => place_is_exact_scoped_borrow(place, *borrow, *ty),
+        (
+            LambdaCaptureDecl::UpvalueCell { cell: expected, .. },
+            LambdaCaptureArg::UpvalueCell { cell },
+        ) => cell == expected,
+        _ => false,
+    }
+}
+
+fn verify_function_value_type(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    function: FunctionId,
+    ty: TypeId,
+) {
+    let expected = cx
+        .program
+        .functions
+        .get(function.index())
+        .map(function_signature_type);
+    verify_function_type(cx, site, expected.as_ref(), ty);
+}
+
+fn verify_lambda_value_type(cx: &mut VerifyCx<'_>, site: VerifySite, lambda: LambdaId, ty: TypeId) {
+    let expected = cx
+        .program
+        .lambdas
+        .get(lambda.index())
+        .map(|decl| &decl.signature);
+    verify_function_type(cx, site, expected, ty);
+}
+
+fn verify_function_type(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    expected: Option<&SignatureType>,
+    ty: TypeId,
+) {
+    cx.verify_type_ref(site.clone(), ty);
+    let Some(found) = cx.type_data(ty) else {
+        return;
+    };
+    let TypeData::Function(found) = found else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadRValue(BadRValue::FunctionValueMustBeFunction(ty)),
+        );
+        return;
+    };
+    if let Some(expected) = expected
+        && found != expected
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadRValue(BadRValue::FunctionValueTypeMismatch {
+                expected: expected.clone(),
+                found: ty,
+            }),
+        );
+    }
+}
+
+fn function_signature_type(function: &Function) -> SignatureType {
+    SignatureType {
+        params: function
+            .signature
+            .params
+            .iter()
+            .map(Param::param_type)
+            .collect(),
+        ret: function.signature.return_mode,
+    }
+}
+
+fn verify_mutable_place(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
     site: &VerifySite,
     place: &Place,
 ) {
-    if cx
-        .program
-        .function(function_id)
-        .locals
-        .get(place.root.index())
-        .is_some_and(|local| local.mutability == Mutability::Immutable)
-    {
+    if place_crosses_dataref(cx.program, function_id, place) {
+        return;
+    }
+    if place_mutability(cx.program, function_id, place.root) == Some(Mutability::Immutable) {
         cx.push(
             site.clone(),
-            VerifyErrorKind::BadStatement(BadStatement::AssignImmutableLocal(place.root)),
+            VerifyErrorKind::BadPlace(BadPlace::ImmutableRoot(place.root)),
         );
     }
 }
@@ -2557,6 +3738,41 @@ fn verify_optional_map_value(
     }
 }
 
+fn verify_lambda_capture(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    stmt_index: Option<usize>,
+    capture: &LambdaCaptureArg,
+) {
+    match capture {
+        LambdaCaptureArg::NoRuntime => {}
+        LambdaCaptureArg::ReadonlyLocal { value } => {
+            verify_operand(cx, function_id, block_id, stmt_index, value);
+        }
+        LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+            verify_place(cx, function_id, block_id, stmt_index, place);
+        }
+        LambdaCaptureArg::UpvalueCell { cell } => {
+            let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
+            if !cx.has_upvalue_cell(*cell) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidUpvalueCell(*cell)),
+                );
+            } else if !function_can_access_upvalue_cell(cx.program, function_id, *cell) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadPlace(BadPlace::UpvalueCellNotAccessible {
+                        cell: *cell,
+                        function: function_id,
+                    }),
+                );
+            }
+        }
+    }
+}
+
 fn verify_operand(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -2580,6 +3796,271 @@ fn verify_operand(
     }
 }
 
+fn verify_place_root(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    site: &VerifySite,
+    root: PlaceRoot,
+) -> Option<TypeId> {
+    match root {
+        PlaceRoot::Local(local) => match cx.program.function(function_id).locals.get(local.index())
+        {
+            Some(decl) => Some(decl.ty),
+            None => {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadReference(BadReference::InvalidLocal(local)),
+                );
+                None
+            }
+        },
+        PlaceRoot::LambdaCapture(slot) => {
+            let Some(lambda) = lambda_function(cx.program, function_id) else {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadPlace(BadPlace::UnsupportedRoot(root)),
+                );
+                return None;
+            };
+            match cx.program.lambdas.get(lambda.index()).and_then(|decl| {
+                decl.captures
+                    .get(slot.index())
+                    .map(|capture| (decl, capture))
+            }) {
+                Some((_, LambdaCaptureDecl::NoRuntime { .. })) => {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadPlace(BadPlace::NoRuntimeLambdaCaptureRoot(slot)),
+                    );
+                    None
+                }
+                Some((decl, capture)) => {
+                    if decl.escape == LambdaEscape::Escaping
+                        && matches!(
+                            capture,
+                            LambdaCaptureDecl::ScopedLocal { .. }
+                                | LambdaCaptureDecl::ScopedBorrow { .. }
+                        )
+                    {
+                        cx.push(
+                            site.clone(),
+                            VerifyErrorKind::BadFunction(
+                                BadFunction::EscapingLambdaScopedCapture { lambda },
+                            ),
+                        );
+                    }
+                    Some(lambda_capture_decl_ty(capture))
+                }
+                None => {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadReference(BadReference::InvalidLambdaCaptureSlot(slot)),
+                    );
+                    None
+                }
+            }
+        }
+        PlaceRoot::ScopedBorrow(id) => {
+            if !cx.has_scoped_borrow(id) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadReference(BadReference::InvalidScopedBorrow(id)),
+                );
+                return None;
+            }
+            if let Some(lambda) = lambda_function(cx.program, function_id) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadPlace(BadPlace::RawScopedBorrowCaptureBypass {
+                        lambda,
+                        root: id,
+                    }),
+                );
+                if cx
+                    .program
+                    .lambdas
+                    .get(lambda.index())
+                    .is_some_and(|decl| decl.escape == LambdaEscape::Escaping)
+                {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadPlace(BadPlace::EscapingLambdaScopedBorrowRoot {
+                            lambda,
+                            root: id,
+                        }),
+                    );
+                }
+            }
+            Some(cx.program.scoped_borrows[id.index()].ty)
+        }
+        PlaceRoot::UpvalueCell(id) => {
+            if !cx.has_upvalue_cell(id) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadReference(BadReference::InvalidUpvalueCell(id)),
+                );
+                return None;
+            }
+            if let Some(lambda) = lambda_function(cx.program, function_id)
+                && lambda_captures_upvalue_cell(cx.program, lambda, id)
+            {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadPlace(BadPlace::RawUpvalueCellCaptureBypass {
+                        lambda,
+                        root: id,
+                    }),
+                );
+            }
+            if !function_can_access_upvalue_cell(cx.program, function_id, id) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadPlace(BadPlace::UpvalueCellNotAccessible {
+                        cell: id,
+                        function: function_id,
+                    }),
+                );
+            }
+            Some(cx.program.upvalue_cells[id.index()].ty)
+        }
+        PlaceRoot::Global(id) => {
+            if cx.has_global(id) {
+                Some(cx.program.globals[id.index()].ty)
+            } else {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadReference(BadReference::InvalidGlobal(id)),
+                );
+                None
+            }
+        }
+    }
+}
+
+fn verify_promoted_binding_not_bypassed(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    site: &VerifySite,
+    root: PlaceRoot,
+) {
+    if let PlaceRoot::Local(local) = root {
+        verify_promoted_local_not_used(cx, function_id, site, local);
+    }
+}
+
+fn lambda_function(program: &Program, function_id: FunctionId) -> Option<LambdaId> {
+    let FunctionKind::Lambda(lambda) = program.functions.get(function_id.index())?.kind else {
+        return None;
+    };
+    Some(lambda)
+}
+
+fn function_can_access_upvalue_cell(
+    program: &Program,
+    function_id: FunctionId,
+    cell: UpvalueCellId,
+) -> bool {
+    if program
+        .upvalue_cells
+        .get(cell.index())
+        .is_some_and(|decl| decl.owner == function_id)
+    {
+        return true;
+    }
+    let Some(FunctionKind::Lambda(lambda)) =
+        program.functions.get(function_id.index()).map(|f| f.kind)
+    else {
+        return false;
+    };
+    lambda_captures_upvalue_cell(program, lambda, cell)
+}
+
+fn lambda_captures_upvalue_cell(program: &Program, lambda: LambdaId, cell: UpvalueCellId) -> bool {
+    program
+        .lambdas
+        .get(lambda.index())
+        .is_some_and(|decl| decl.captures.iter().any(|capture| {
+            matches!(capture, LambdaCaptureDecl::UpvalueCell { cell: captured, .. } if *captured == cell)
+        }))
+}
+
+fn place_mutability(
+    program: &Program,
+    function_id: FunctionId,
+    root: PlaceRoot,
+) -> Option<Mutability> {
+    match root {
+        PlaceRoot::Local(local) => program
+            .function(function_id)
+            .locals
+            .get(local.index())
+            .map(|decl| decl.mutability),
+        PlaceRoot::LambdaCapture(slot) => lambda_function(program, function_id)
+            .and_then(|lambda| program.lambdas.get(lambda.index()))
+            .and_then(|decl| decl.captures.get(slot.index()))
+            .map(lambda_capture_decl_mutability),
+        PlaceRoot::ScopedBorrow(id) => program
+            .scoped_borrows
+            .get(id.index())
+            .map(|decl| decl.mutability),
+        PlaceRoot::UpvalueCell(id) => program
+            .upvalue_cells
+            .get(id.index())
+            .map(|_| Mutability::Mutable),
+        PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.mutability),
+    }
+}
+
+fn place_crosses_dataref(program: &Program, function_id: FunctionId, place: &Place) -> bool {
+    let Some(mut ty) = place_root_ty(program, function_id, place.root) else {
+        return false;
+    };
+    for projection in &place.projection {
+        let Some(data) = program.type_arena.get(ty) else {
+            return false;
+        };
+        if matches!(data, TypeData::DataRef(_)) {
+            return true;
+        }
+        let Some(next) = projection_ty(program, ty, projection) else {
+            return false;
+        };
+        ty = next;
+    }
+    false
+}
+
+fn place_root_ty(program: &Program, function_id: FunctionId, root: PlaceRoot) -> Option<TypeId> {
+    match root {
+        PlaceRoot::Local(local) => program
+            .function(function_id)
+            .locals
+            .get(local.index())
+            .map(|decl| decl.ty),
+        PlaceRoot::LambdaCapture(slot) => lambda_function(program, function_id)
+            .and_then(|lambda| program.lambdas.get(lambda.index()))
+            .and_then(|decl| decl.captures.get(slot.index()))
+            .map(lambda_capture_decl_ty),
+        PlaceRoot::ScopedBorrow(id) => program.scoped_borrows.get(id.index()).map(|decl| decl.ty),
+        PlaceRoot::UpvalueCell(id) => program.upvalue_cells.get(id.index()).map(|decl| decl.ty),
+        PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.ty),
+    }
+}
+
+fn projection_ty(program: &Program, ty: TypeId, projection: &Projection) -> Option<TypeId> {
+    match projection {
+        Projection::Field(field) => typing::field_by_id(program, ty, *field),
+        Projection::TupleField(index) => match program.type_arena.get(ty) {
+            Some(TypeData::Tuple(elems)) => elems.get(*index as usize).copied(),
+            _ => None,
+        },
+        Projection::VariantField { variant, field, .. } => {
+            typing::enum_variant_field(program, ty, *variant, *field)
+        }
+        Projection::Index(_) => typing::index_elem(program, ty),
+    }
+}
+
 fn verify_place(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -2587,19 +4068,10 @@ fn verify_place(
     stmt_index: Option<usize>,
     place: &Place,
 ) -> Option<TypeId> {
-    let function = cx.program.function(function_id);
     let stmt_idx = stmt_index.unwrap_or(0);
     let site = VerifyCx::stmt_site(function_id, block_id, stmt_idx);
-
-    if place.root.index() >= function.locals.len() {
-        cx.push(
-            site,
-            VerifyErrorKind::BadReference(BadReference::InvalidLocal(place.root)),
-        );
-        return None;
-    }
-
-    let mut current_ty = function.locals[place.root.index()].ty;
+    let mut current_ty = verify_place_root(cx, function_id, &site, place.root)?;
+    verify_promoted_binding_not_bypassed(cx, function_id, &site, place.root);
     if !cx.has_type(current_ty) {
         cx.push(
             site.clone(),
@@ -2749,7 +4221,8 @@ fn verify_place(
                 }
             },
             Projection::Index(local) => {
-                let Some(index_local) = function.locals.get(local.index()) else {
+                let Some(index_local) = cx.program.function(function_id).locals.get(local.index())
+                else {
                     cx.push(
                         site.clone(),
                         VerifyErrorKind::BadReference(BadReference::InvalidLocal(*local)),
@@ -3148,7 +4621,7 @@ fn verify_call(
 ) {
     let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
 
-    if let Callee::Closure(op) = callee {
+    if let Callee::Lambda(op) = callee {
         verify_operand(cx, function_id, block_id, stmt_index, op);
     }
     for (arg_index, arg) in args.iter().enumerate() {
@@ -3156,13 +4629,23 @@ fn verify_call(
     }
 
     match callee {
-        Callee::Function(id) if !cx.has_function(*id) => {
-            cx.push(
-                site,
-                VerifyErrorKind::BadReference(BadReference::InvalidFunction(*id)),
-            );
-            return;
-        }
+        Callee::Function(id) => match cx.program.functions.get(id.index()) {
+            Some(function) if matches!(function.kind, FunctionKind::Lambda(_)) => {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadCall(BadCall::FunctionCalleeMustBeNamed(*id)),
+                );
+                return;
+            }
+            Some(_) => {}
+            None => {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidFunction(*id)),
+                );
+                return;
+            }
+        },
         Callee::Extern(id) if !cx.has_extern(*id) => {
             cx.push(
                 site,
@@ -3170,18 +4653,18 @@ fn verify_call(
             );
             return;
         }
-        Callee::Closure(op) => {
+        Callee::Lambda(op) => {
             if let Some(ty) = typing::operand_ty(cx.program, op)
                 && !matches!(cx.type_data(ty), Some(TypeData::Function(_)))
             {
                 cx.push(
                     site,
-                    VerifyErrorKind::BadCall(BadCall::ClosureCalleeMustBeFunction),
+                    VerifyErrorKind::BadCall(BadCall::LambdaCalleeMustBeFunction),
                 );
                 return;
             }
         }
-        _ => {}
+        Callee::Extern(_) => {}
     }
 
     verify_call_args(cx, &site, callee, args);
@@ -3197,8 +4680,13 @@ fn verify_call_arg(
 ) {
     match arg {
         CallArg::Value(op) => verify_operand(cx, function_id, block_id, stmt_index, op),
-        CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+        CallArg::SharedBorrow(place) => {
             verify_place(cx, function_id, block_id, stmt_index, place);
+        }
+        CallArg::MutBorrow(place) => {
+            let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
+            verify_place(cx, function_id, block_id, stmt_index, place);
+            verify_mutable_place(cx, function_id, &site, place);
         }
         CallArg::SharedStringConst(id) => {
             let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
@@ -3220,6 +4708,168 @@ fn verify_call_arg(
                 );
             }
         }
+    }
+}
+
+fn verify_call_escape_args(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    stmt_index: usize,
+    callee: &Callee,
+    args: &[CallArg],
+    state: &LocalInit,
+) {
+    let Some(params) = typing::callee_params(cx.program, callee) else {
+        return;
+    };
+    for (index, arg) in args.iter().enumerate() {
+        let Some(expected_param) = params.get(cx.program, index) else {
+            continue;
+        };
+        if expected_param.escape != ParamEscape::Escaping
+            || !matches!(cx.type_data(expected_param.ty), Some(TypeData::Function(_)))
+        {
+            continue;
+        }
+        match arg_function_escape(cx.program, function_id, arg, state) {
+            FunctionValueCapability::Escaping => {}
+            FunctionValueCapability::NonEscaping => cx.push(
+                VerifyCx::stmt_site(function_id, BlockId::from_index(0), stmt_index),
+                VerifyErrorKind::BadCall(BadCall::ArgEscapeMismatch {
+                    index,
+                    expected: ParamEscape::Escaping,
+                    found: ParamEscape::NonEscaping,
+                }),
+            ),
+            FunctionValueCapability::Unknown | FunctionValueCapability::NonFunction => cx.push(
+                VerifyCx::stmt_site(function_id, BlockId::from_index(0), stmt_index),
+                VerifyErrorKind::BadCall(BadCall::ArgEscapeUnknown {
+                    index,
+                    expected: ParamEscape::Escaping,
+                }),
+            ),
+        }
+    }
+}
+
+fn arg_function_escape(
+    program: &Program,
+    function_id: FunctionId,
+    arg: &CallArg,
+    state: &LocalInit,
+) -> FunctionValueCapability {
+    match arg {
+        CallArg::Value(operand) => operand_function_escape(program, function_id, operand, state),
+        CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+            type_function_capability(program, place.ty)
+        }
+        CallArg::SharedStringConst(_) => FunctionValueCapability::NonFunction,
+    }
+}
+
+fn operand_function_escape(
+    program: &Program,
+    function_id: FunctionId,
+    operand: &Operand,
+    state: &LocalInit,
+) -> FunctionValueCapability {
+    match operand {
+        Operand::Const(id) => program
+            .const_arena
+            .get_checked(*id)
+            .map_or(FunctionValueCapability::Unknown, |konst| {
+                type_function_capability(program, konst.ty)
+            }),
+        Operand::Place(place) if place.projection.is_empty() => match place.root {
+            PlaceRoot::Local(local) => state.escape(local),
+            PlaceRoot::LambdaCapture(slot) => {
+                lambda_capture_function_escape(program, function_id, slot)
+            }
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+                type_function_capability(program, place.ty)
+            }
+        },
+        Operand::Place(place) => type_function_capability(program, place.ty),
+    }
+}
+
+fn lambda_capture_function_escape(
+    program: &Program,
+    function_id: FunctionId,
+    slot: LambdaCaptureSlotId,
+) -> FunctionValueCapability {
+    let Some(lambda) = lambda_function(program, function_id) else {
+        return FunctionValueCapability::Unknown;
+    };
+    let Some(capture) = program
+        .lambdas
+        .get(lambda.index())
+        .and_then(|decl| decl.captures.get(slot.index()))
+    else {
+        return FunctionValueCapability::Unknown;
+    };
+    if !matches!(
+        program.type_arena.get(lambda_capture_decl_ty(capture)),
+        Some(TypeData::Function(_))
+    ) {
+        return FunctionValueCapability::NonFunction;
+    }
+    let source = match capture {
+        LambdaCaptureDecl::ReadonlyLocal { source, .. }
+        | LambdaCaptureDecl::ScopedLocal { source, .. } => *source,
+        LambdaCaptureDecl::NoRuntime { .. }
+        | LambdaCaptureDecl::ScopedBorrow { .. }
+        | LambdaCaptureDecl::UpvalueCell { .. } => return FunctionValueCapability::Unknown,
+    };
+    program
+        .functions
+        .get(source.owner.index())
+        .and_then(|function| {
+            function
+                .signature
+                .params
+                .iter()
+                .find(|param| param.local_id == source.local)
+        })
+        .map_or(FunctionValueCapability::Unknown, |param| {
+            FunctionValueCapability::from_param_escape(param.escape)
+        })
+}
+
+fn rvalue_function_escape(
+    program: &Program,
+    function_id: FunctionId,
+    primitives: &PrimitiveTypes,
+    value: &RValue,
+    state: &LocalInit,
+) -> FunctionValueCapability {
+    match value {
+        RValue::Use(operand) => operand_function_escape(program, function_id, operand, state),
+        RValue::FunctionRef { .. } => FunctionValueCapability::Escaping,
+        RValue::MakeLambda { lambda, .. } => {
+            program
+                .lambdas
+                .get(lambda.index())
+                .map_or(FunctionValueCapability::Unknown, |decl| {
+                    if decl.escape == LambdaEscape::Escaping {
+                        FunctionValueCapability::Escaping
+                    } else {
+                        FunctionValueCapability::NonEscaping
+                    }
+                })
+        }
+        _ => typing::rvalue_ty(program, primitives, value)
+            .map_or(FunctionValueCapability::Unknown, |ty| {
+                type_function_capability(program, ty)
+            }),
+    }
+}
+
+fn type_function_capability(program: &Program, ty: TypeId) -> FunctionValueCapability {
+    if matches!(program.type_arena.get(ty), Some(TypeData::Function(_))) {
+        FunctionValueCapability::Unknown
+    } else {
+        FunctionValueCapability::NonFunction
     }
 }
 

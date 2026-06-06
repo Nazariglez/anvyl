@@ -208,7 +208,7 @@ pub(crate) fn valid_cast(
 pub(crate) enum CalleeParams {
     Function(FunctionId),
     Extern(ExternId),
-    Closure(TypeId),
+    Lambda(TypeId),
 }
 
 impl CalleeParams {
@@ -222,7 +222,7 @@ impl CalleeParams {
                 .externs
                 .get(id.index())
                 .map(super::ExternDecl::call_arity),
-            Self::Closure(ty) => match program.type_arena.get(ty) {
+            Self::Lambda(ty) => match program.type_arena.get(ty) {
                 Some(TypeData::Function(sig)) => Some(sig.params.len()),
                 _ => None,
             },
@@ -240,9 +240,10 @@ impl CalleeParams {
                 .map(|param| super::ParamType {
                     ty: param.ty,
                     mode: param.mode,
+                    escape: param.escape,
                 }),
             Self::Extern(id) => program.externs.get(id.index())?.call_param(index),
-            Self::Closure(ty) => match program.type_arena.get(ty) {
+            Self::Lambda(ty) => match program.type_arena.get(ty) {
                 Some(TypeData::Function(sig)) => sig.params.get(index).copied(),
                 _ => None,
             },
@@ -260,10 +261,10 @@ pub(crate) fn callee_params(program: &Program, callee: &Callee) -> Option<Callee
             .externs
             .get(id.index())
             .map(|_| CalleeParams::Extern(*id)),
-        Callee::Closure(op) => {
+        Callee::Lambda(op) => {
             let ty = operand_ty(program, op)?;
             matches!(program.type_arena.get(ty), Some(TypeData::Function(_)))
-                .then_some(CalleeParams::Closure(ty))
+                .then_some(CalleeParams::Lambda(ty))
         }
     }
 }
@@ -275,7 +276,7 @@ pub(crate) fn callee_return_ty(program: &Program, callee: &Callee) -> Option<Typ
             .get(id.index())
             .map(|func| func.signature.return_type()),
         Callee::Extern(id) => program.externs.get(id.index()).map(|ext| ext.return_type),
-        Callee::Closure(op) => {
+        Callee::Lambda(op) => {
             let ty = operand_ty(program, op)?;
             match program.type_arena.get(ty) {
                 Some(TypeData::Function(sig)) => Some(sig.ret.ty()),
@@ -302,7 +303,8 @@ pub(crate) fn rvalue_ty(
         | RValue::MapRemove { ty, .. }
         | RValue::MapEntryAt { ty, .. }
         | RValue::SliceView { ty, .. }
-        | RValue::MakeClosure { ty, .. } => Some(*ty),
+        | RValue::FunctionRef { ty, .. }
+        | RValue::MakeLambda { ty, .. } => Some(*ty),
         RValue::Cast { target, .. } => Some(*target),
         RValue::Call { callee, .. } => callee_return_ty(program, callee),
         RValue::SharedRefEq { .. } => primitives.bool(),

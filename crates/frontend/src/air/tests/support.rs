@@ -1,11 +1,12 @@
 use super::super::{
     AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, ConstData, EnumDecl, EnumRepr, ExternDecl,
-    ExternTypeDecl, Function, FunctionKind, Local, LocalKind, Module, Mutability, Operand, Param,
-    ParamMode, ParamRole, Place, Program, RValue, RawEnumValue, Signature, TypeData, VariantDecl,
+    ExternTypeDecl, Function, FunctionKind, GlobalDecl, LambdaDecl, Local, LocalKind, Module,
+    Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot, Program,
+    RValue, RawEnumValue, ScopedBorrowDecl, Signature, TypeData, UpvalueCellDecl, VariantDecl,
     VariantShape,
     ids::{
-        AggregateId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FunctionId, LocalId,
-        ModuleId, TypeId,
+        AggregateId, BindingId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FunctionId,
+        GlobalId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId, UpvalueCellId,
     },
 };
 use crate::{
@@ -162,6 +163,22 @@ impl ProgramBuilder {
         self.program.alloc_function(func)
     }
 
+    pub fn alloc_lambda(&mut self, decl: LambdaDecl) -> LambdaId {
+        self.program.alloc_lambda(decl)
+    }
+
+    pub fn alloc_scoped_borrow(&mut self, decl: ScopedBorrowDecl) -> ScopedBorrowId {
+        self.program.alloc_scoped_borrow(decl)
+    }
+
+    pub fn alloc_upvalue_cell(&mut self, decl: UpvalueCellDecl) -> UpvalueCellId {
+        self.program.alloc_upvalue_cell(decl)
+    }
+
+    pub fn alloc_global(&mut self, decl: GlobalDecl) -> GlobalId {
+        self.program.alloc_global(decl)
+    }
+
     pub fn alloc_function(&mut self, func: Function) -> FunctionId {
         let module = func.module;
         let id = self.program.alloc_function(func);
@@ -181,6 +198,14 @@ impl ProgramBuilder {
 
     pub fn module_mut(&mut self, id: ModuleId) -> &mut Module {
         self.program.module_mut(id)
+    }
+
+    pub fn function_count(&self) -> usize {
+        self.program.functions.len()
+    }
+
+    pub fn lambda_count(&self) -> usize {
+        self.program.lambdas.len()
     }
 
     pub fn finish(self) -> Program {
@@ -232,10 +257,15 @@ impl FunctionBuilder {
             name: Some(Ident::new(name)),
             ty,
             mode,
+            escape: ParamEscape::NonEscaping,
             role,
             local_id,
         });
         local_id
+    }
+
+    pub fn set_param_escape(&mut self, index: usize, escape: ParamEscape) {
+        self.params[index].escape = escape;
     }
 
     pub fn push_local(
@@ -248,11 +278,16 @@ impl FunctionBuilder {
         let id = LocalId::from_index(self.locals.len());
         self.locals.push(Local {
             name: name.map(Ident::new),
+            binding: None,
             ty,
             mutability,
             kind,
         });
         id
+    }
+
+    pub fn bind_local(&mut self, local: LocalId, binding: BindingId) {
+        self.locals[local.index()].binding = Some(binding);
     }
 
     pub fn push_block(&mut self, tail: AirTail) -> BlockId {
@@ -324,7 +359,7 @@ pub fn term_unreachable() -> AirTail {
 
 pub fn place(local: LocalId, ty: TypeId) -> Place {
     Place {
-        root: local,
+        root: PlaceRoot::Local(local),
         projection: Vec::new(),
         ty,
     }

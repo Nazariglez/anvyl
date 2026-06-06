@@ -121,6 +121,7 @@ pub(super) struct GenericOwnerFrame {
 #[derive(Clone)]
 pub(crate) struct SpecializedBodyFacts {
     pub(crate) body: SemanticBodyFacts,
+    pub(crate) lambda_bodies: Vec<(BodyInstanceKey, SemanticBodyFacts)>,
     pub(crate) contract_witnesses: ContractWitnessMap,
     pub(crate) closure: TypecheckFacts,
 }
@@ -196,6 +197,7 @@ pub(super) fn check_with_specialization(
 ) -> Option<Type> {
     tc.solve_constraints();
     let old_witnesses = tc.semantic_facts.contract_witnesses.clone();
+    let old_bodies = tc.semantic_facts.bodies.clone();
     let old_closure = tc.closure_fact_snapshot();
     let old_dyn_infer = tc.dyn_infer.specialization_snapshot();
     tc.store_specialization(key.clone(), SpecializationState::InProgress);
@@ -203,6 +205,7 @@ pub(super) fn check_with_specialization(
     tc.push_const_subst(const_subst);
     tc.push_generic_context(owner_frame.generics.clone());
     tc.push_generic_owner_frame(owner_frame);
+    let specialization = key.args.clone();
     let body_key = BodyInstanceKey::Callable(key.clone());
     let inferred_ret = tc.with_body_instance(body_key.clone(), check_body);
     tc.solve_constraints();
@@ -215,6 +218,19 @@ pub(super) fn check_with_specialization(
         .body(&body_key)
         .cloned()
         .unwrap_or_default();
+    let lambda_bodies = tc
+        .semantic_facts
+        .bodies
+        .iter()
+        .filter_map(|(body, facts)| match body {
+            BodyInstanceKey::Lambda(key)
+                if key.specialization == specialization && old_bodies.get(body) != Some(facts) =>
+            {
+                Some((body.clone(), facts.clone()))
+            }
+            _ => None,
+        })
+        .collect();
     let contract_witnesses =
         super::semantic_use::map_delta(&old_witnesses, &tc.semantic_facts.contract_witnesses);
     let return_ty = inferred_ret.clone().unwrap_or(declared_ret);
@@ -223,6 +239,7 @@ pub(super) fn check_with_specialization(
         SpecializationState::Done(Box::new(SpecializedBody {
             facts: SpecializedBodyFacts {
                 body,
+                lambda_bodies,
                 contract_witnesses,
                 closure: tc.closure_fact_snapshot().delta_since(&old_closure),
             },
@@ -321,6 +338,10 @@ impl TypeChecker {
         facts.body.validate();
         self.semantic_facts
             .merge_body(BodyInstanceKey::Callable(key), facts.body);
+        for (body, lambda_facts) in facts.lambda_bodies {
+            lambda_facts.validate();
+            self.semantic_facts.merge_body(body, lambda_facts);
+        }
         self.semantic_facts
             .merge_witnesses(facts.contract_witnesses);
         self.closure.extend_facts(facts.closure);

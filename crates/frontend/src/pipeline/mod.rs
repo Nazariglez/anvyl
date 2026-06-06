@@ -230,6 +230,7 @@ pub fn build_air_packages<L: PackageSourceLoader>(
     roots: &AirRootConfig,
 ) -> Result<AirBuildOutput, AirBuildError<L::FatalError>> {
     let prepared = prepare_pipeline(input, config).map_err(air_build_stop)?;
+    let facts = prepared.semantic.validated_public_facts();
     let report =
         typecheck_success_report_ref(&prepared.sources, &prepared.lint, &prepared.semantic);
     if report.has_errors() {
@@ -242,6 +243,7 @@ pub fn build_air_packages<L: PackageSourceLoader>(
         &prepared.root.program,
         &prepared.resolved,
         &prepared.semantic.program,
+        facts,
         air::lower::AirLowerConfig {
             roots: air::lower::AirRoots {
                 entry: roots.entry.as_deref().map(|name| {

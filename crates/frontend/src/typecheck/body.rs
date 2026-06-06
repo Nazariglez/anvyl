@@ -1304,20 +1304,21 @@ pub(super) fn check_callable_body_frame(
 ) -> Option<Type> {
     for (index, param) in params.iter().enumerate() {
         let kind = LocalBindingKind::from_param(param.ty.mutable, &param.ty.ty);
-        let Some(type_id) = tc.define_value(param.name, param.ty.ty.clone(), kind, None) else {
+        let Some(local) = tc.define_value(param.name, param.ty.ty.clone(), kind, None) else {
             continue;
         };
         tc.record_local_def(
-            type_id,
+            local.type_id,
+            Some(local.binding_id),
             param.name,
             None,
             param.ty.mutable,
             LocalDefKind::Parameter,
         );
-        tc.record_param_def(param_start + index, type_id);
-        tc.mark_non_escaping_callback_param(param.name, type_id, param.ty, param.source_ty);
+        tc.record_param_def(param_start + index, local.type_id);
+        tc.mark_non_escaping_callback_param(param.name, local.type_id, param.ty, param.source_ty);
         if source.is_none() && param.ty.mutable {
-            source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
+            source = Some(PlaceIdentity::root(PlaceRoot::Local(local.type_id)));
         }
     }
     let return_mode = match expected_ret {
@@ -1360,18 +1361,19 @@ fn check_func_body(
                     MethodReceiver::Var => LocalBindingKind::borrowed_self(),
                     MethodReceiver::Value => LocalBindingKind::readonly_self(),
                 };
-                let type_id = tc.define_value(Ident::new("self"), self_ty.clone(), kind, None);
-                if let Some(type_id) = type_id {
+                let local = tc.define_value(Ident::new("self"), self_ty.clone(), kind, None);
+                if let Some(local) = local {
                     tc.record_local_def(
-                        type_id,
+                        local.type_id,
+                        Some(local.binding_id),
                         Ident::new("self"),
                         None,
                         matches!(receiver, MethodReceiver::Var),
                         LocalDefKind::Parameter,
                     );
-                    tc.record_param_def(0, type_id);
+                    tc.record_param_def(0, local.type_id);
                     if matches!(receiver, MethodReceiver::Var) {
-                        source = Some(PlaceIdentity::root(PlaceRoot::Local(type_id)));
+                        source = Some(PlaceIdentity::root(PlaceRoot::Local(local.type_id)));
                     }
                 }
                 1

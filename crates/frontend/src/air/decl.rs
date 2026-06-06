@@ -2,11 +2,13 @@
 use anvyx_externs::{ExternBindingKey, ExternEffects, ExternTypeKey, ProviderId};
 
 pub use super::body::AirBody;
-use super::ids::*;
-use crate::{
-    air::types::{BinaryOp, ConstValue, ParamMode, ParamType, ReturnMode, UnaryOp},
-    ast::Ident,
+use super::{
+    ids::*,
+    types::{
+        BinaryOp, ConstValue, ParamEscape, ParamMode, ParamType, ReturnMode, SignatureType, UnaryOp,
+    },
 };
+use crate::ast::{ExprId, Ident};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {
@@ -46,8 +48,61 @@ pub enum FunctionKind {
     Normal,
     Method,
     ExtendMethod,
-    Closure,
+    Lambda(LambdaId),
     Helper,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LambdaDecl {
+    pub source: ExprId,
+    pub module: ModuleId,
+    pub owner: FunctionId,
+    pub body: FunctionId,
+    pub signature: SignatureType,
+    pub escape: LambdaEscape,
+    pub captures: Vec<LambdaCaptureDecl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CaptureLocalSource {
+    pub owner: FunctionId,
+    pub local: LocalId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LambdaCaptureDecl {
+    NoRuntime {
+        binding: BindingId,
+        ty: TypeId,
+    },
+    ReadonlyLocal {
+        binding: BindingId,
+        source: CaptureLocalSource,
+        ty: TypeId,
+    },
+    ScopedLocal {
+        binding: BindingId,
+        source: CaptureLocalSource,
+        ty: TypeId,
+        mutability: Mutability,
+    },
+    ScopedBorrow {
+        binding: BindingId,
+        borrow: ScopedBorrowId,
+        ty: TypeId,
+        mutability: Mutability,
+    },
+    UpvalueCell {
+        binding: BindingId,
+        cell: UpvalueCellId,
+        ty: TypeId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LambdaEscape {
+    NonEscaping,
+    Escaping,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +133,7 @@ pub struct Param {
     pub name: Option<Ident>,
     pub ty: TypeId,
     pub mode: ParamMode,
+    pub escape: ParamEscape,
     pub role: ParamRole,
     pub local_id: LocalId,
 }
@@ -87,6 +143,7 @@ impl Param {
         ParamType {
             ty: self.ty,
             mode: self.mode,
+            escape: self.escape,
         }
     }
 }
@@ -95,12 +152,12 @@ impl Param {
 pub enum ParamRole {
     Normal,
     Receiver,
-    CaptureEnv,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Local {
     pub name: Option<Ident>,
+    pub binding: Option<BindingId>,
     pub ty: TypeId,
     pub mutability: Mutability,
     pub kind: LocalKind,
@@ -119,7 +176,28 @@ pub enum LocalKind {
     Temp,
     User,
     PatternBinding,
-    Capture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedBorrowDecl {
+    pub ty: TypeId,
+    pub mutability: Mutability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpvalueCellDecl {
+    pub binding: BindingId,
+    pub owner: FunctionId,
+    pub source_local: LocalId,
+    pub ty: TypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalDecl {
+    pub name: Ident,
+    pub module: ModuleId,
+    pub ty: TypeId,
+    pub mutability: Mutability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +297,7 @@ pub struct ExternTypeBindingDecl {
 pub struct ExternParamDecl {
     pub ty: TypeId,
     pub mode: ParamMode,
+    pub escape: ParamEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +344,7 @@ impl ExternParamDecl {
         ParamType {
             ty: self.ty,
             mode: self.mode,
+            escape: self.escape,
         }
     }
 }
@@ -274,6 +354,7 @@ impl ExternReceiverDecl {
         ParamType {
             ty: self.ty,
             mode: self.mode,
+            escape: ParamEscape::NonEscaping,
         }
     }
 }

@@ -1,9 +1,9 @@
 use anvyx_externs::ReceiverMode;
 
 use super::{
-    CallForm, CallTarget, CheckedType, ConstSubst, Exposure, ExternUseTarget, GenericArgs,
-    GenericParams, MemberAccessKind, MemberPathFact, MemberPathKind, PlaceAccess, TypeChecker,
-    TypeError, TypeSubst,
+    CallForm, CallTarget, CheckedType, ConstSubst, Exposure, ExternUseTarget, FunctionValueArgFact,
+    FunctionValueCallFact, FunctionValueKind, GenericArgs, GenericParams, MemberAccessKind,
+    MemberPathFact, MemberPathKind, PlaceAccess, TypeChecker, TypeError, TypeSubst,
     annotation::{AccessPolicyOutput, emit_access_policy},
     body::check_specialized_callable_body,
     check_arg_count, check_arg_range, check_expected_value_expr, check_expr_checked,
@@ -224,6 +224,11 @@ fn local_value_subject(
     tc: &mut TypeChecker,
 ) -> Subject {
     let (value, _) = tc.local_place_value(expr, name, value, None);
+    tc.record_function_value_expr(
+        expr.node.id,
+        &value.checked.ty,
+        FunctionValueKind::LocalOrPlace,
+    );
     Subject::Value(value)
 }
 
@@ -322,8 +327,7 @@ pub(super) fn check_postfix_chain_place(
                     field_expected.as_ref(),
                     tc,
                 );
-                let ty = chain_type(&subject, optional_chain, node.span, tc);
-                tc.set_type(*id, ty, node.span);
+                set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
                 subject
             }
             PostfixStep::Call { node, id } => {
@@ -335,13 +339,13 @@ pub(super) fn check_postfix_chain_place(
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
                 let value = apply_call(&subject, node, *id, call_expected, tc);
-                let ty = wrap_optional(value.checked.ty.clone(), optional_chain, node.span, tc);
-                tc.set_type(*id, ty, node.span);
-                if matches!(subject, Subject::Error) {
+                let next_subject = if matches!(subject, Subject::Error) {
                     Subject::Error
                 } else {
                     Subject::Value(value)
-                }
+                };
+                set_postfix_step_type(*id, &next_subject, optional_chain, node.span, tc);
+                next_subject
             }
             PostfixStep::Index { node, id } => {
                 if node.node.safe {
@@ -349,14 +353,12 @@ pub(super) fn check_postfix_chain_place(
                     optional_chain = true;
                 }
                 let subject = apply_index(&subject, node, *id, optional_chain, tc);
-                let ty = chain_type(&subject, optional_chain, node.span, tc);
-                tc.set_type(*id, ty, node.span);
+                set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
                 subject
             }
             PostfixStep::TupleIndex { node, id } => {
                 let subject = apply_tuple_index(&subject, node, *id, optional_chain, tc);
-                let ty = chain_type(&subject, optional_chain, node.span, tc);
-                tc.set_type(*id, ty, node.span);
+                set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
                 subject
             }
         };
@@ -387,10 +389,18 @@ pub(super) fn check_postfix_chain_place(
             let checked = checked_from_type(expr, ty, tc);
             return PlaceValue::not_place(checked);
         }
-        Subject::Callable { callee, .. } if callee.def.sig.ret.is_infer() => {
-            tc.push_error(TypeError::InferReturnValue {
-                span: tc.error_span(expr.span),
-            });
+        Subject::Callable { callee, .. } => {
+            if callee.def.sig.ret.is_infer() {
+                tc.push_error(TypeError::InferReturnValue {
+                    span: tc.error_span(expr.span),
+                });
+            }
+            let ty = func_type(&callee.def.sig.params, &callee.def.sig.ret);
+            tc.record_function_value_expr(
+                expr.node.id,
+                &ty,
+                TypeChecker::function_value_kind_for_callee(callee),
+            );
         }
         Subject::Value(value) => {
             tc.check_mut_downcast_root_use(value.root_name, &value.identity, expr.span);
@@ -419,6 +429,11 @@ pub(super) fn check_postfix_chain_place(
     } else {
         match subject {
             Subject::Value(mut value) => {
+                tc.record_function_value_expr(
+                    expr.node.id,
+                    &checked.ty,
+                    FunctionValueKind::LocalOrPlace,
+                );
                 value.checked = checked;
                 value
             }
@@ -427,6 +442,20 @@ pub(super) fn check_postfix_chain_place(
     };
     tc.record_expr_place(expr.node.id, &value);
     value
+}
+
+fn set_postfix_step_type(
+    id: ExprId,
+    subject: &Subject,
+    optional_chain: bool,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    let ty = chain_type(subject, optional_chain, span, tc);
+    tc.set_type(id, ty.clone(), span);
+    if matches!(subject, Subject::Value(_)) {
+        tc.record_function_value_expr(id, &ty, FunctionValueKind::LocalOrPlace);
+    }
 }
 
 fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> Type {
@@ -510,6 +539,7 @@ fn safe_subject(subject: &Subject, expr_id: ExprId, span: Span, tc: &mut TypeChe
         return Subject::Value(value.clone());
     }
     let inner = tc.optional_chain_inner_type(&value.checked.ty, span);
+    tc.record_function_value_expr(expr_id, &inner, FunctionValueKind::LocalOrPlace);
     let mut checked = checked_type(inner, tc);
     checked.contains_extern_any = value.checked.contains_extern_any;
     Subject::Value(PlaceValue::not_place(checked))
@@ -1398,7 +1428,7 @@ fn apply_call(
         Subject::Value(value) => {
             tc.check_mut_downcast_root_use(value.root_name, &value.identity, call.node.func.span);
             place::record_value_read(call.node.func.node.id, value, tc);
-            call_value(value.checked.ty.clone(), call, expected, tc).into_place_value()
+            call_value(value.checked.ty.clone(), call, call_id, expected, tc).into_place_value()
         }
         Subject::Module(_) | Subject::Type(_) => PlaceValue::not_place(checked_type(
             not_callable(subject_type(subject), call, tc),
@@ -1441,6 +1471,7 @@ fn check_source_receiver(
 fn call_value(
     callee_ty: Type,
     call: &CallNode,
+    call_id: ExprId,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedCall {
@@ -1465,6 +1496,29 @@ fn call_value(
             };
             let ret_handle = tc.type_handle(&ret.ty);
             let _ = constrain_expected_return(call.span, ret_handle.clone(), expected, tc);
+            if !args_check.failed {
+                let arg_facts = call
+                    .node
+                    .args
+                    .iter()
+                    .zip(&params)
+                    .map(|(arg, param)| FunctionValueArgFact {
+                        expr: arg.node.id,
+                        param_ty: tc.handle_type(&param.ty),
+                        mutable: param.mutable,
+                        escape: param.escape,
+                    })
+                    .collect();
+                tc.record_function_value_call(
+                    call_id,
+                    FunctionValueCallFact {
+                        expr: call_id,
+                        callee: call.node.func.node.id,
+                        sig: callee_ty.clone(),
+                        args: arg_facts,
+                    },
+                );
+            }
             CheckedCall {
                 checked: checked_type(ret.ty.clone(), tc),
                 returns_place: ret.is_place() && !args_check.failed,

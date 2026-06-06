@@ -16,8 +16,9 @@ use std::fmt::Write;
 pub use body::*;
 pub use decl::*;
 pub use ids::{
-    AggregateId, AirLoopId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FieldId, FunctionId,
-    LocalId, ModuleId, TypeId, VariantId,
+    AggregateId, AirLoopId, BindingId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FieldId,
+    FunctionId, GlobalId, LambdaCaptureSlotId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId,
+    UpvalueCellId, VariantId,
 };
 pub use ownership::*;
 pub use types::*;
@@ -54,6 +55,10 @@ pub struct Program {
     pub modules: Vec<Module>,
     pub entry: Option<FunctionId>,
     pub functions: Vec<Function>,
+    pub lambdas: Vec<LambdaDecl>,
+    pub scoped_borrows: Vec<ScopedBorrowDecl>,
+    pub upvalue_cells: Vec<UpvalueCellDecl>,
+    pub globals: Vec<GlobalDecl>,
     pub externs: Vec<ExternDecl>,
     pub extern_types: Vec<ExternTypeDecl>,
     pub aggregates: Vec<AggregateDecl>,
@@ -88,6 +93,30 @@ impl Program {
     pub fn alloc_function(&mut self, func: Function) -> FunctionId {
         let id = FunctionId::from_index(self.functions.len());
         self.functions.push(func);
+        id
+    }
+
+    pub fn alloc_lambda(&mut self, decl: LambdaDecl) -> LambdaId {
+        let id = LambdaId::from_index(self.lambdas.len());
+        self.lambdas.push(decl);
+        id
+    }
+
+    pub fn alloc_scoped_borrow(&mut self, decl: ScopedBorrowDecl) -> ScopedBorrowId {
+        let id = ScopedBorrowId::from_index(self.scoped_borrows.len());
+        self.scoped_borrows.push(decl);
+        id
+    }
+
+    pub fn alloc_upvalue_cell(&mut self, decl: UpvalueCellDecl) -> UpvalueCellId {
+        let id = UpvalueCellId::from_index(self.upvalue_cells.len());
+        self.upvalue_cells.push(decl);
+        id
+    }
+
+    pub fn alloc_global(&mut self, decl: GlobalDecl) -> GlobalId {
+        let id = GlobalId::from_index(self.globals.len());
+        self.globals.push(decl);
         id
     }
 
@@ -179,12 +208,17 @@ impl Program {
 
     fn render_param_type(&self, param: ParamType, mode: TypeRender) -> String {
         let ty = self.render_type(param.ty, mode);
-        match (mode, param.mode) {
+        let ty = match (mode, param.mode) {
             (_, ParamMode::Value) => ty,
             (TypeRender::Display, ParamMode::SharedBorrow) => format!("borrow {ty}"),
             (TypeRender::Display, ParamMode::MutBorrow) => format!("var {ty}"),
             (TypeRender::HelperKey, ParamMode::SharedBorrow) => format!("borrow_{ty}"),
             (TypeRender::HelperKey, ParamMode::MutBorrow) => format!("mut_{ty}"),
+        };
+        match (mode, param.escape) {
+            (_, ParamEscape::NonEscaping) => ty,
+            (TypeRender::Display, ParamEscape::Escaping) => format!("escaping {ty}"),
+            (TypeRender::HelperKey, ParamEscape::Escaping) => format!("escaping_{ty}"),
         }
     }
 

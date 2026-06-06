@@ -142,40 +142,27 @@ pub struct TypecheckFacts {
     pub(super) used_imports: std::collections::HashSet<ImportId>,
 }
 
+impl SemanticCheckOutput {
+    pub(crate) fn validated_public_facts(&self) -> &TypecheckFacts {
+        validate_semantic_facts(self);
+        &self.public_facts
+    }
+}
+
 impl TypecheckFacts {
     pub(crate) fn from_semantic(output: SemanticCheckOutput) -> Self {
-        output.program.facts.validate_finished();
-        output
-            .program
-            .declaration_facts
-            .validate_bodies(&output.program.facts);
-        output.program.declaration_facts.validate();
-        debug_assert!(output.source_types.values().all(|(span, _)| span.is_some()));
-        debug_assert_eq!(
-            output.program.declarations.import_records().len(),
-            output.public_facts.import_records.len()
-        );
-        debug_assert!(
-            output.program.externs.functions().all(|function| output
-                .program
-                .externs
-                .function(function.id)
-                == function)
-        );
+        validate_semantic_facts(&output);
         output.public_facts
     }
 
-    #[cfg(test)]
     pub(crate) fn lambda_escapes(&self) -> &LambdaEscapeMap {
         &self.lambda_escapes
     }
 
-    #[cfg(test)]
     pub(crate) fn lambda_captures(&self) -> &LambdaCaptureMap {
         &self.lambda_captures
     }
 
-    #[cfg(test)]
     pub(crate) fn binding_promotions(&self) -> &BindingPromotionMap {
         &self.binding_promotions
     }
@@ -229,6 +216,27 @@ impl TypecheckFacts {
             debug_assert_eq!(*binding_id, fact.binding_id);
         }
     }
+}
+
+fn validate_semantic_facts(output: &SemanticCheckOutput) {
+    output.program.facts.validate_finished();
+    output
+        .program
+        .declaration_facts
+        .validate_bodies(&output.program.facts);
+    output.program.declaration_facts.validate();
+    debug_assert!(output.source_types.values().all(|(span, _)| span.is_some()));
+    debug_assert_eq!(
+        output.program.declarations.import_records().len(),
+        output.public_facts.import_records.len()
+    );
+    debug_assert!(
+        output.program.externs.functions().all(|function| output
+            .program
+            .externs
+            .function(function.id)
+            == function)
+    );
 }
 
 fn is_system_import(import: &ImportRecord) -> bool {

@@ -4,15 +4,15 @@ use anvyx_externs::ParamFlow;
 
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
-    AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, ConstData,
-    ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl,
-    ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
-    ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
-    ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
-    FunctionSpecialization, Local, LocalId, LocalKind, Module, ModuleId,
-    Mutability as AirMutability, Operand, Param, ParamMode, ParamRole, ParamType, Place, Program,
-    RValue, RawEnumValue, ReturnMode, Signature, SignatureType, TypeData, TypeId, VariantDecl,
-    VariantShape, VerifyError, ownership,
+    AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId,
+    CallArg, Callee, ConstData, ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl,
+    EnumRepr, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember,
+    ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
+    ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, FieldDecl, FieldId, Function,
+    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, Local, LocalId, LocalKind,
+    Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode,
+    ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, Signature,
+    SignatureType, TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -27,13 +27,15 @@ use crate::{
     source::SourceId,
     span::SourceSpan,
     typecheck::{
-        BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind, CallableParent,
-        ConstTerm, DeclarationIndex, DefaultArgFact, EnumRepr as TcEnumRepr, ExtendId,
-        ExternUseTarget, GenericArgs, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode,
-        MemberPathKind, MethodMode, MethodSurface, ModuleScope, NominalKey,
-        RawEnumValue as TcRawEnumValue, SemanticBodyFacts, SemanticFunctionInstanceFact,
-        SemanticLocalId, SemanticProgram, VariantPayload, nominal_generic_args,
-        substitute_aggregate_member, type_has_unfinished_facts,
+        BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
+        CallableParent, CaptureStorageOrigin, ConstTerm, DeclarationIndex, DefaultArgFact,
+        EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, GenericArgs, LambdaBodyKey,
+        LambdaCaptureFact, LambdaEscapeFact, LocalDefFact, LocalDefKind, LocalUseFact,
+        LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope, NominalKey,
+        RawEnumValue as TcRawEnumValue, SemanticBodyFacts, SemanticFactMaps,
+        SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
+        VariantPayload, nominal_generic_args, substitute_aggregate_member,
+        type_has_unfinished_facts,
     },
 };
 
@@ -86,6 +88,18 @@ pub(crate) enum LowerError {
     },
     MissingSpecializedBodyFacts {
         body: Box<BodyInstanceKey>,
+    },
+    MissingTypecheckFacts,
+    MissingLambdaEscape {
+        expr_id: ExprId,
+    },
+    DuplicateBindingBridge {
+        body: Box<BodyInstanceKey>,
+        binding: BindingId,
+    },
+    MissingBindingBridge {
+        body: Box<BodyInstanceKey>,
+        binding: BindingId,
     },
     MissingGenericInstanceArgs {
         id: Box<CallableId>,
@@ -283,6 +297,7 @@ impl TypeLowerer {
                         Ok(ParamType {
                             ty,
                             mode: source_param_mode(param.mutable),
+                            escape: param.escape.into(),
                         })
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?,
@@ -545,6 +560,7 @@ impl TypeLowerer {
                         Ok(ExternParamDecl {
                             ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
                             mode: param_flow_mode(param.flow),
+                            escape: param.escape.into(),
                         })
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;
@@ -579,6 +595,7 @@ impl TypeLowerer {
                         Ok(ExternParamDecl {
                             ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
                             mode: param_flow_mode(param.flow),
+                            escape: param.escape.into(),
                         })
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;
@@ -611,6 +628,7 @@ impl TypeLowerer {
                             Ok(ExternParamDecl {
                                 ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
                                 mode: param_flow_mode(param.flow),
+                                escape: param.escape.into(),
                             })
                         })
                         .transpose()?,
@@ -778,15 +796,17 @@ struct LoweringMaps {
 }
 
 #[derive(Default)]
-struct LowerCx {
+struct LowerCx<'facts> {
     program: Program,
     types: TypeLowerer,
     maps: LoweringMaps,
     decls: Option<DeclarationIndex>,
     externs: Option<ExternCatalog>,
+    semantic_facts: Option<&'facts SemanticFactMaps>,
+    typecheck_facts: Option<&'facts TypecheckFacts>,
 }
 
-impl LowerCx {
+impl LowerCx<'_> {
     fn lower_ty(&mut self, ty: &Type) -> Result<TypeId, LowerError> {
         match (&self.decls, &self.externs) {
             (Some(decls), Some(externs)) => self.types.lower_source(
@@ -802,6 +822,35 @@ impl LowerCx {
 
     fn optional_ty(&mut self, inner: TypeId) -> TypeId {
         optional_ty(&mut self.program, inner)
+    }
+
+    fn lambda_escape_fact(&self, expr_id: ExprId) -> Result<&LambdaEscapeFact, LowerError> {
+        self.typecheck_facts
+            .ok_or(LowerError::MissingTypecheckFacts)?
+            .lambda_escapes()
+            .get(&expr_id)
+            .ok_or(LowerError::MissingLambdaEscape { expr_id })
+    }
+
+    fn lambda_body_facts(&self, key: LambdaBodyKey) -> Result<&SemanticBodyFacts, LowerError> {
+        let body = BodyInstanceKey::Lambda(key);
+        self.semantic_facts
+            .expect("AIR lowering requires semantic facts")
+            .body(&body)
+            .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
+                body: Box::new(body),
+            })
+    }
+
+    fn lambda_capture_facts(&self, expr_id: ExprId) -> Result<Vec<LambdaCaptureFact>, LowerError> {
+        Ok(self
+            .typecheck_facts
+            .ok_or(LowerError::MissingTypecheckFacts)?
+            .lambda_captures()
+            .values()
+            .filter(|capture| capture.lambda_id == expr_id)
+            .cloned()
+            .collect())
     }
 
     fn set_entry(&mut self, root: &CallableInstanceKey) -> Result<(), LowerError> {
@@ -937,6 +986,7 @@ impl LowerCx {
                 let params = vec![ExternParamDecl {
                     ty: self.lower_ty(&field_decl.ty.ty)?,
                     mode: ParamMode::Value,
+                    escape: ParamEscape::NonEscaping,
                 }];
                 let return_type = self.lower_ty(&Type::Void)?;
                 Ok(self.alloc_extern_in_module(
@@ -1096,6 +1146,7 @@ impl LowerCx {
                 Ok(ExternParamDecl {
                     ty: self.lower_ty(&param.ty.ty)?,
                     mode: param_flow_mode(param.flow),
+                    escape: param.escape.into(),
                 })
             })
             .collect()
@@ -1176,9 +1227,11 @@ impl LowerCx {
                 debug_assert_eq!(def.name, param_fact.name);
                 debug_assert_eq!(def.mutable, param_fact.mutable);
                 let ty = self.lower_ty(&param_fact.ty)?;
+                let escape = param_fact.escape.into();
                 let local_id = LocalId::from_index(locals.len());
                 locals.push(Local {
                     name: Some(param_fact.name),
+                    binding: def.binding_id.map(air_binding_id),
                     ty,
                     mutability: if param_fact.mutable {
                         AirMutability::Mutable
@@ -1193,6 +1246,7 @@ impl LowerCx {
                     name: Some(param_fact.name),
                     ty,
                     mode: source_param_mode(param_fact.mutable),
+                    escape,
                     role: if source.callable.is_instance_method() && index == 0 {
                         ParamRole::Receiver
                     } else {
@@ -1289,7 +1343,7 @@ impl LowerCx {
                 .remove(&source.body)
                 .expect("lowered function missing local map");
             let mut lowerer =
-                FunctionLowerer::new(self, functions, source, facts, function, locals);
+                FunctionLowerer::new(self, functions, source, facts, function, locals)?;
             lowerer.lower_body(source.callable.body())?;
         }
         Ok(())
@@ -1301,8 +1355,21 @@ type EnumMatchArms<'a> = (
     Option<&'a ExprNode>,
 );
 
-struct FunctionLowerer<'cx, 'facts> {
-    cx: &'cx mut LowerCx,
+#[derive(Clone)]
+enum LambdaCaptureSource {
+    Local(Place),
+    NoRuntime,
+    TargetGap(LambdaCaptureTargetGap),
+}
+
+#[derive(Clone)]
+struct LambdaCaptureTargetGap {
+    binding: BindingId,
+    origin: CaptureStorageOrigin,
+}
+
+struct FunctionLowerer<'cx, 'facts, 'tc> {
+    cx: &'cx mut LowerCx<'tc>,
     body: BodyInstanceKey,
     facts: &'facts SemanticBodyFacts,
     index: &'facts SourceProgramIndex<'facts>,
@@ -1310,27 +1377,29 @@ struct FunctionLowerer<'cx, 'facts> {
     source: SourceId,
     function: Function,
     locals: HashMap<SemanticLocalId, Place>,
+    capture_sources: HashMap<BindingId, LambdaCaptureSource>,
     block: AirBlock,
     terminated: bool,
     next_loop: u32,
     active_loops: Vec<AirLoopId>,
 }
 
-impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
+impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn new(
-        cx: &'cx mut LowerCx,
+        cx: &'cx mut LowerCx<'tc>,
         functions: &'facts ReachableCallables<'facts>,
         source: &ReachableCallable<'_>,
         facts: &'facts SemanticBodyFacts,
         function_id: FunctionId,
         locals: HashMap<SemanticLocalId, LocalId>,
-    ) -> Self {
+    ) -> Result<Self, LowerError> {
         let function = cx.program.function(function_id).clone();
+        let capture_sources = initial_capture_sources(&source.body, facts, &locals, &function)?;
         let locals = locals
             .into_iter()
             .map(|(semantic, local)| (semantic, function_local_place(&function, local)))
             .collect();
-        Self {
+        Ok(Self {
             cx,
             body: source.body.clone(),
             facts,
@@ -1339,10 +1408,63 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             source: source.source,
             function,
             locals,
+            capture_sources,
             block: AirBlock::default(),
             terminated: false,
             next_loop: 0,
             active_loops: vec![],
+        })
+    }
+
+    fn insert_capture_source(
+        &mut self,
+        semantic: SemanticLocalId,
+        place: Place,
+    ) -> Result<(), LowerError> {
+        let Some(binding) = self.local_def(semantic)?.binding_id else {
+            return Ok(());
+        };
+        if self
+            .capture_sources
+            .insert(binding, LambdaCaptureSource::Local(place))
+            .is_some()
+        {
+            return Err(LowerError::DuplicateBindingBridge {
+                body: Box::new(self.body.clone()),
+                binding,
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_capture_source(
+        &self,
+        capture: &LambdaCaptureFact,
+    ) -> Result<LambdaCaptureSource, LowerError> {
+        match capture.origin {
+            CaptureStorageOrigin::Const => return Ok(LambdaCaptureSource::NoRuntime),
+            origin if origin.is_borrowed_runtime() => {
+                return Ok(LambdaCaptureSource::TargetGap(LambdaCaptureTargetGap {
+                    binding: capture.binding_id,
+                    origin,
+                }));
+            }
+            _ => {}
+        }
+        self.capture_sources
+            .get(&capture.binding_id)
+            .cloned()
+            .ok_or_else(|| LowerError::MissingBindingBridge {
+                body: Box::new(self.body.clone()),
+                binding: capture.binding_id,
+            })
+    }
+
+    fn current_specialization(&self) -> GenericArgs {
+        match &self.body {
+            BodyInstanceKey::Callable(key) => key.args.clone(),
+            BodyInstanceKey::Lambda(key) => key.specialization.clone(),
+            BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => GenericArgs::default(),
         }
     }
 
@@ -1651,14 +1773,23 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let semantic = self.pattern_binding_semantic(pattern)?;
         let def = self.local_def(semantic)?;
         let name = def.name;
+        let binding = def.binding_id.map(air_binding_id);
         let mutable = def.mutable;
         let source_ty = def.ty.clone();
         if mutable {
             return Err(unsupported_pattern_stmt(pattern));
         }
         let ty = self.cx.lower_ty(&source_ty)?;
-        let local = self.push_local(Some(name), ty, AirMutability::Immutable, LocalKind::User);
-        self.locals.insert(semantic, self.local_place(local));
+        let local = self.push_local(
+            Some(name),
+            binding,
+            ty,
+            AirMutability::Immutable,
+            LocalKind::User,
+        );
+        let place = self.local_place(local);
+        self.locals.insert(semantic, place.clone());
+        self.insert_capture_source(semantic, place)?;
         self.emit_init(local, RValue::Use(value))
     }
 
@@ -1668,20 +1799,23 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         value: Operand,
     ) -> Result<(), LowerError> {
         let name = pattern_ident(pattern)?;
+        let semantic = self.pattern_binding_semantic(pattern)?;
+        let binding = self.local_def(semantic)?.binding_id.map(air_binding_id);
         let Operand::Place(place) = value else {
             return Err(unsupported_pattern_stmt(pattern));
         };
-        if place.projection.is_empty()
-            && self.function.locals[place.root.index()].kind == LocalKind::Temp
+        if let Some(root) = place.root.local()
+            && place.projection.is_empty()
+            && self.function.locals[root.index()].kind == LocalKind::Temp
         {
-            let local = &mut self.function.locals[place.root.index()];
+            let local = &mut self.function.locals[root.index()];
             local.name = Some(name);
+            local.binding = binding;
             local.mutability = AirMutability::Mutable;
             local.kind = LocalKind::PatternBinding;
         }
-        let semantic = self.pattern_binding_semantic(pattern)?;
-        self.locals.insert(semantic, place);
-        Ok(())
+        self.locals.insert(semantic, place.clone());
+        self.insert_capture_source(semantic, place)
     }
 
     fn lower_match_effect(
@@ -1879,6 +2013,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     })?;
                 let def = self.local_def(semantic)?;
                 let name = def.name;
+                let binding_id = def.binding_id.map(air_binding_id);
                 let mutable = def.mutable;
                 let ty = def.ty.clone();
                 let ty = self.cx.lower_ty(&ty)?;
@@ -1892,6 +2027,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                 };
                 let local = self.push_local(
                     Some(name),
+                    binding_id,
                     ty,
                     if mutable {
                         AirMutability::Mutable
@@ -1900,7 +2036,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
                     },
                     LocalKind::User,
                 );
-                self.locals.insert(semantic, self.local_place(local));
+                let place = self.local_place(local);
+                self.locals.insert(semantic, place.clone());
+                self.insert_capture_source(semantic, place)?;
                 self.emit_init(local, init)
             }
             Pattern::Wildcard if binding.node.mutability == AstMutability::Immutable => {
@@ -1939,8 +2077,11 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             }
         };
         let root = self.binding_place(fact.local)?;
+        let Some(root_local) = root.root.local() else {
+            return Err(unsupported_expr(expr));
+        };
         if requires_mut
-            && self.function.locals[root.root.index()].mutability != AirMutability::Mutable
+            && self.function.locals[root_local.index()].mutability != AirMutability::Mutable
         {
             return Err(unsupported_expr(expr));
         }
@@ -1951,7 +2092,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let root = projection_root(expr).unwrap_or(expr);
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
             let root = self.binding_place(fact.local)?;
-            if self.function.locals[root.root.index()].mutability != AirMutability::Mutable {
+            let Some(root_local) = root.root.local() else {
+                return Err(unsupported_expr(expr));
+            };
+            if self.function.locals[root_local.index()].mutability != AirMutability::Mutable {
                 return Err(unsupported_expr(expr));
             }
             return self.lower_projected_place(expr, root);
@@ -1983,7 +2127,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         self.lower_projected_place(
             expr,
             Place {
-                root: LocalId::from_index(index),
+                root: PlaceRoot::Local(LocalId::from_index(index)),
                 projection: vec![],
                 ty: local.ty,
             },
@@ -1999,7 +2143,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             });
         }
         let place = self.self_place(expr)?;
-        if self.function.locals[place.root.index()].mutability != AirMutability::Mutable {
+        let Some(root_local) = place.root.local() else {
+            return Err(unsupported_expr(expr));
+        };
+        if self.function.locals[root_local.index()].mutability != AirMutability::Mutable {
             return Err(unsupported_expr(expr));
         }
         self.lower_projected_place(expr, place)
@@ -2332,9 +2479,13 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let value = self.lower_value(expr)?;
         let ty = self.cx.lower_ty(&self.operand_type(&value))?;
         match value {
-            Operand::Place(place) if place.projection.is_empty() => Ok(place.root),
+            Operand::Place(place) if place.projection.is_empty() => {
+                place.root.local().ok_or_else(|| unsupported_expr(expr))
+            }
             value => match self.emit_typed_temp(ty, RValue::Use(value))? {
-                Operand::Place(place) if place.projection.is_empty() => Ok(place.root),
+                Operand::Place(place) if place.projection.is_empty() => {
+                    place.root.local().ok_or_else(|| unsupported_expr(expr))
+                }
                 _ => Err(unsupported_expr(expr)),
             },
         }
@@ -2459,6 +2610,30 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             ExprKind::MapLiteral(literal) => self.lower_map_literal(expr, literal),
             ExprKind::InferredEnum(inferred) => self.lower_inferred_enum(expr, inferred),
             ExprKind::Cast(cast) => self.lower_cast_expr(expr, cast),
+            ExprKind::Lambda(_) => {
+                self.cx.lambda_escape_fact(expr.node.id)?;
+                let _body = self.cx.lambda_body_facts(LambdaBodyKey {
+                    expr: expr.node.id,
+                    specialization: self.current_specialization(),
+                })?;
+                for capture in self.cx.lambda_capture_facts(expr.node.id)? {
+                    match self.resolve_capture_source(&capture)? {
+                        LambdaCaptureSource::Local(place) => {
+                            debug_assert_eq!(place.ty, self.cx.lower_ty(&capture.ty)?);
+                        }
+                        LambdaCaptureSource::NoRuntime => {}
+                        LambdaCaptureSource::TargetGap(gap) => {
+                            debug_assert_eq!(gap.binding, capture.binding_id);
+                            debug_assert_eq!(gap.origin, capture.origin);
+                            return Err(LowerError::UnsupportedExpr {
+                                expr_id: expr.node.id,
+                                kind: "LambdaCapture",
+                            });
+                        }
+                    }
+                }
+                Err(unsupported_expr(expr))
+            }
             _ => Err(unsupported_expr(expr)),
         }
     }
@@ -3089,7 +3264,10 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             }
             Err(_) => return Ok(None),
         };
-        if self.function.locals[map.root.index()].mutability != AirMutability::Mutable {
+        let Some(map_root) = map.root.local() else {
+            return Err(unsupported_expr(value_expr));
+        };
+        if self.function.locals[map_root.index()].mutability != AirMutability::Mutable {
             return Err(unsupported_expr(value_expr));
         }
         let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, map.ty) else {
@@ -4138,6 +4316,12 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             };
             return self.lower_extern_call(expr, call, *target);
         }
+        if self.facts.function_value_calls.contains_key(&expr.node.id) {
+            return Err(LowerError::UnsupportedExpr {
+                expr_id: expr.node.id,
+                kind: "FunctionValueCall",
+            });
+        }
 
         let target = self
             .facts
@@ -4315,7 +4499,9 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn require_mutable_place(&self, expr: &ExprNode, place: &Place) -> Result<(), LowerError> {
-        if self.function.locals[place.root.index()].mutability == AirMutability::Mutable {
+        if let Some(root) = place.root.local()
+            && self.function.locals[root.index()].mutability == AirMutability::Mutable
+        {
             return Ok(());
         }
         Err(unsupported_expr(expr))
@@ -4335,7 +4521,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
             return Err(unsupported_expr(expr));
         };
         Ok(Place {
-            root: LocalId::from_index(local),
+            root: PlaceRoot::Local(LocalId::from_index(local)),
             projection: vec![],
             ty: data.ty,
         })
@@ -4711,6 +4897,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     fn push_local(
         &mut self,
         name: Option<Ident>,
+        binding: Option<AirBindingId>,
         ty: TypeId,
         mutability: AirMutability,
         kind: LocalKind,
@@ -4718,6 +4905,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
         let id = LocalId::from_index(self.function.locals.len());
         self.function.locals.push(Local {
             name,
+            binding,
             ty,
             mutability,
             kind,
@@ -4726,7 +4914,7 @@ impl<'cx, 'facts> FunctionLowerer<'cx, 'facts> {
     }
 
     fn temp(&mut self, ty: TypeId) -> LocalId {
-        self.push_local(None, ty, AirMutability::Immutable, LocalKind::Temp)
+        self.push_local(None, None, ty, AirMutability::Immutable, LocalKind::Temp)
     }
 
     fn local_place(&self, local: LocalId) -> Place {
@@ -5133,6 +5321,10 @@ fn source_param_mode(mutable: bool) -> ParamMode {
     }
 }
 
+fn air_binding_id(binding: BindingId) -> AirBindingId {
+    AirBindingId::from_index(binding.0 as usize)
+}
+
 fn extern_use_requires_decl(externs: &ExternCatalog, target: ExternUseTarget) -> bool {
     match target {
         ExternUseTarget::FieldRead(field) | ExternUseTarget::FieldWrite(field) => {
@@ -5221,18 +5413,22 @@ pub(crate) fn lower_with_modules(
     root: &ast::Program,
     resolved: &ResolveResult,
     semantic: &SemanticProgram,
+    typecheck_facts: &TypecheckFacts,
     config: AirLowerConfig,
 ) -> Result<Program, LowerError> {
+    validate_lambda_fact_carrier(typecheck_facts);
     let index = SourceProgramIndex::new(root, resolved);
-    let facts = SemanticCallableFacts::new(semantic);
+    let callable_facts = SemanticCallableFacts::new(semantic);
     let AirLowerConfig { roots } = config;
     let entry = roots.entry.clone();
     let roots = roots.normalized();
-    validate_roots(&roots, &facts)?;
-    let functions = ReachableCallables::new(&index, semantic, &facts, roots)?;
+    validate_roots(&roots, &callable_facts)?;
+    let functions = ReachableCallables::new(&index, semantic, &callable_facts, roots)?;
     let mut cx = LowerCx {
         decls: Some(semantic.declarations.clone()),
         externs: Some(semantic.externs.clone()),
+        semantic_facts: Some(&semantic.facts),
+        typecheck_facts: Some(typecheck_facts),
         ..LowerCx::default()
     };
     cx.lower_function_shells(&index.modules, &functions)?;
@@ -5249,6 +5445,16 @@ pub(crate) fn lower_with_modules(
     verify(&cx.program).map_err(|errors| LowerError::Verify(errors.into_boxed_slice()))?;
     reject_any_types(&cx.program)?;
     Ok(cx.program)
+}
+
+fn validate_lambda_fact_carrier(facts: &TypecheckFacts) {
+    for ((lambda, binding), capture) in facts.lambda_captures() {
+        debug_assert_eq!(*lambda, capture.lambda_id);
+        debug_assert_eq!(*binding, capture.binding_id);
+    }
+    for (binding, promotion) in facts.binding_promotions() {
+        debug_assert_eq!(*binding, promotion.binding_id);
+    }
 }
 
 fn collect_safe_field_chain(expr: &ExprNode) -> Option<(&ExprNode, Vec<ChainStep<'_>>)> {
@@ -5618,10 +5824,38 @@ impl PayloadMode {
 
 fn function_local_place(function: &Function, local: LocalId) -> Place {
     Place {
-        root: local,
+        root: PlaceRoot::Local(local),
         projection: vec![],
         ty: function.locals[local.index()].ty,
     }
+}
+
+fn initial_capture_sources(
+    body: &BodyInstanceKey,
+    facts: &SemanticBodyFacts,
+    locals: &HashMap<SemanticLocalId, LocalId>,
+    function: &Function,
+) -> Result<HashMap<BindingId, LambdaCaptureSource>, LowerError> {
+    let mut bindings = HashMap::new();
+    for fact in facts.locals.defs.values() {
+        let Some(binding) = fact.binding_id else {
+            continue;
+        };
+        let Some(local) = locals.get(&fact.id).copied() else {
+            continue;
+        };
+        let place = function_local_place(function, local);
+        if bindings
+            .insert(binding, LambdaCaptureSource::Local(place))
+            .is_some()
+        {
+            return Err(LowerError::DuplicateBindingBridge {
+                body: Box::new(body.clone()),
+                binding,
+            });
+        }
+    }
+    Ok(bindings)
 }
 
 impl ReachableBodyFacts<'_> {
@@ -6185,6 +6419,7 @@ mod tests {
             &root,
             &resolved,
             &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig::default(),
         )
         .expect("lower failed");
@@ -6469,10 +6704,57 @@ mod tests {
                 ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
             ],
         );
-        let err = lower_checked_entry(&root, &resolved, &semantic.program, "main", &[])
+        let err = lower_checked_entry(&root, &resolved, &semantic, "main", &[])
             .expect_err("expected unsupported qualified extension call");
 
         assert!(matches!(err, LowerError::UnsupportedCallForm { .. }));
+    }
+
+    #[test]
+    fn function_value_call_uses_fact_before_unsupported_gap() {
+        let err = lower_root("fn main(f: fn() -> int) -> int { f() }", "main")
+            .expect_err("expected unsupported function-value call");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedExpr {
+                kind: "FunctionValueCall",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lowers_function_param_escape_contracts() {
+        let air = lower_root("fn main(cb: escaping fn()) {}", "main").expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert_eq!(main.signature.params[0].escape, ParamEscape::Escaping);
+    }
+
+    #[test]
+    fn function_type_escape_affects_type_identity_and_rendering() {
+        let air = lower_root("fn main(non: fn(fn()), esc: fn(escaping fn())) {}", "main")
+            .expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+        let non_ty = main.signature.params[0].ty;
+        let esc_ty = main.signature.params[1].ty;
+
+        assert_ne!(non_ty, esc_ty);
+        assert_ne!(air.type_helper_key(non_ty), air.type_helper_key(esc_ty));
+        assert!(air.type_display_name(esc_ty).contains("escaping fn"));
+        let TypeData::Function(esc_sig) = air.type_data(esc_ty) else {
+            panic!("expected function type");
+        };
+        assert_eq!(esc_sig.params[0].escape, ParamEscape::Escaping);
     }
 
     #[test]
@@ -6650,6 +6932,7 @@ mod tests {
             &root,
             &resolved,
             &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig {
                 roots: AirRoots {
                     entry: None,
@@ -6673,6 +6956,7 @@ mod tests {
             &root,
             &resolved,
             &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig {
                 roots: AirRoots {
                     entry: None,
@@ -6699,6 +6983,7 @@ mod tests {
             &root,
             &resolved,
             &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig {
                 roots: AirRoots {
                     entry: None,
@@ -6813,7 +7098,7 @@ mod tests {
     fn local_function_call_is_unsupported_callable_instance() {
         let source = "fn f() -> int { fn inner() -> int { 1 } inner() }";
         let (root, resolved, semantic) = checked(source);
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
             .expect_err("expected unsupported local function");
 
         assert!(matches!(
@@ -6925,7 +7210,7 @@ mod tests {
             },
         });
         semantic.program.facts.bodies.remove(&body);
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
             .expect_err("expected missing body facts");
 
         assert!(matches!(
@@ -6942,7 +7227,7 @@ mod tests {
             args: GenericArgs::default(),
         });
         semantic.program.facts.bodies.remove(&body);
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
+        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
             .expect_err("expected missing body facts");
 
         assert!(matches!(
@@ -6956,7 +7241,7 @@ mod tests {
         let source = "fn noop<T>() {} fn main() { noop<int>(); }";
         let (root, resolved, semantic) = checked(source);
 
-        lower_checked_roots(&root, &resolved, &semantic.program, &["main"]).expect("lower failed");
+        lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
     }
 
     #[test]
@@ -6996,7 +7281,7 @@ mod tests {
                 ret: ast::ReturnSpec::value(Type::Infer),
                 is_stringify_override: false,
             });
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["main"])
+        let err = lower_checked_roots(&root, &resolved, &semantic, &["main"])
             .expect_err("expected missing generic args");
 
         assert!(matches!(err, LowerError::MissingGenericInstanceArgs { .. }));
@@ -7262,8 +7547,8 @@ mod tests {
     fn single_root_allocates_only_reached_module() {
         let (root, resolved, semantic) =
             checked_with_modules("import util; fn main() {}", &[("util", "fn helper() {}")]);
-        let air = lower_checked_roots(&root, &resolved, &semantic.program, &["main"])
-            .expect("lower failed");
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
 
         assert_eq!(air.modules.len(), 1);
         assert_eq!(air.functions.len(), 1);
@@ -7336,8 +7621,7 @@ mod tests {
             "import ext:host { host_log }; fn f() { host_log(1); }",
             provider,
         );
-        let air =
-            lower_checked_roots(&root, &resolved, &semantic.program, &["f"]).expect("lower failed");
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
 
         assert!(
             air.modules[0]
@@ -7704,7 +7988,7 @@ mod tests {
                 ("a", "pub extend int { fn pick(self) -> int { 1 } }"),
             ],
         );
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["use_it"])
+        let err = lower_checked_roots(&root, &resolved, &semantic, &["use_it"])
             .expect_err("expected error");
 
         assert!(matches!(err, LowerError::UnsupportedCallForm { .. }));
@@ -7714,8 +7998,8 @@ mod tests {
     fn runtime_default_arg_is_unsupported() {
         let source = r#"fn fallback() -> string { "ok" } fn ok(message: string = fallback()) -> string { message } fn f() -> string { ok() }"#;
         let (root, resolved, semantic) = checked(source);
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
-            .expect_err("expected error");
+        let err =
+            lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect_err("expected error");
         assert!(matches!(err, LowerError::UnsupportedDefaultArg { .. }));
     }
 
@@ -7746,8 +8030,8 @@ mod tests {
                 ",
             )],
         );
-        let air = lower_checked_roots(&root, &resolved, &semantic.program, &["main"])
-            .expect("lower failed");
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
 
         assert_eq!(air.externs.len(), 1);
         assert_eq!(air.externs[0].name, Ident::new("_print_int"));
@@ -7849,8 +8133,7 @@ mod tests {
             "import ext:gfx { Sprite }; fn f(sprite: Sprite) { }",
             provider,
         );
-        let air =
-            lower_checked_roots(&root, &resolved, &semantic.program, &["f"]).expect("lower failed");
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
         let sprite = air.extern_type(crate::air::ExternTypeId::from_index(0));
         assert_eq!(sprite.fields[0].get_receiver.mode, ParamMode::SharedBorrow);
         assert_eq!(sprite.fields[0].set_receiver.mode, ParamMode::MutBorrow);
@@ -7894,8 +8177,7 @@ mod tests {
             "import ext:host { touch }; fn f(var x: int) { touch(x); }",
             provider,
         );
-        let air =
-            lower_checked_roots(&root, &resolved, &semantic.program, &["f"]).expect("lower failed");
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
         let ext = air.extern_decl(ExternId::from_index(0));
         assert_eq!(ext.params[0].mode, ParamMode::MutBorrow);
         assert!(program_statements(&air).any(|statement| {
@@ -8318,11 +8600,109 @@ fn main() {}
     fn rejects_function_value_read_as_unsupported() {
         let source = "fn g() -> int { 1 } fn f() -> void { g; }";
         let (root, resolved, semantic) = checked(source);
-        let err = lower_checked_roots(&root, &resolved, &semantic.program, &["f"])
-            .expect_err("expected error");
+        let err =
+            lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect_err("expected error");
         assert!(matches!(
             err,
             LowerError::UnsupportedExpr { kind: "Ident", .. }
+        ));
+    }
+
+    #[test]
+    fn local_facts_preserve_shadowed_binding_ids() {
+        let source = "fn f() { let x = 1; if true { let x = 2; x; } x; }";
+        let (_, _, semantic) = checked(source);
+        let body = BodyInstanceKey::Callable(root_function("f"));
+        let facts = semantic
+            .program
+            .facts
+            .body(&body)
+            .expect("body facts missing");
+        let x_bindings = facts
+            .locals
+            .defs
+            .values()
+            .filter(|fact| fact.name.as_str() == "x")
+            .map(|fact| {
+                fact.binding_id
+                    .expect("binding local should carry BindingId")
+            })
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(x_bindings.len(), 2);
+    }
+
+    #[test]
+    fn lambda_capture_binding_has_lowered_local_bridge() {
+        let source = "fn f() { let x = 1; || { x; }; }";
+        let (_, _, semantic) = checked(source);
+        let capture = semantic
+            .public_facts
+            .lambda_captures()
+            .values()
+            .next()
+            .expect("lambda capture fact missing");
+        let body = BodyInstanceKey::Callable(root_function("f"));
+        let facts = semantic
+            .program
+            .facts
+            .body(&body)
+            .expect("body facts missing");
+
+        assert!(
+            facts
+                .locals
+                .defs
+                .values()
+                .any(|fact| fact.binding_id == Some(capture.binding_id))
+        );
+    }
+
+    #[test]
+    fn borrowed_lambda_capture_reports_capture_gap() {
+        let source = "fn f(var x: int) { || { x = 1; }; }";
+        let (root, resolved, semantic) = checked(source);
+        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
+            .expect_err("expected unsupported borrowed capture");
+        assert!(
+            matches!(
+                err,
+                LowerError::UnsupportedExpr {
+                    kind: "LambdaCapture",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_value_lowering_uses_passed_typecheck_facts() {
+        let source = "fn f() { || {}; }";
+        let (root, resolved, semantic) = checked(source);
+        assert!(!semantic.public_facts.lambda_escapes().is_empty());
+
+        let missing = TypecheckFacts::default();
+        let err = lower_with_modules(
+            &root,
+            &resolved,
+            &semantic.program,
+            &missing,
+            AirLowerConfig {
+                roots: AirRoots {
+                    entry: None,
+                    callables: vec![root_function("f")],
+                },
+            },
+        )
+        .expect_err("expected missing lambda fact");
+        assert!(matches!(err, LowerError::MissingLambdaEscape { .. }));
+
+        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
+            .expect_err("expected unsupported lambda lowering");
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedExpr { kind: "Lambda", .. }
         ));
     }
 
@@ -8367,6 +8747,7 @@ fn main() {}
             &root,
             &resolved,
             &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig::default(),
         )
     }
@@ -8377,13 +8758,14 @@ fn main() {}
             &root,
             &resolved,
             &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig::default(),
         )
     }
 
     fn lower_full_core_root(source: &str, name: &str) -> Result<Program, LowerError> {
         let (root, resolved, semantic) = checked_with_full_core_shape(source);
-        lower_checked_roots(&root, &resolved, &semantic.program, &[name])
+        lower_checked_roots(&root, &resolved, &semantic, &[name])
     }
 
     fn lower_full_core_entry(
@@ -8392,20 +8774,21 @@ fn main() {}
         callables: &[&str],
     ) -> Result<Program, LowerError> {
         let (root, resolved, semantic) = checked_with_full_core_shape(source);
-        lower_checked_entry(&root, &resolved, &semantic.program, entry, callables)
+        lower_checked_entry(&root, &resolved, &semantic, entry, callables)
     }
 
     fn lower_checked_entry(
         root: &ast::Program,
         resolved: &ResolveResult,
-        semantic: &SemanticProgram,
+        semantic: &typecheck::SemanticCheckOutput,
         entry: &str,
         callables: &[&str],
     ) -> Result<Program, LowerError> {
         lower_with_modules(
             root,
             resolved,
-            semantic,
+            &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig {
                 roots: AirRoots {
                     entry: Some(root_function(entry)),
@@ -8421,20 +8804,21 @@ fn main() {}
 
     fn lower_roots(source: &str, names: &[&str]) -> Result<Program, LowerError> {
         let (root, resolved, semantic) = checked(source);
-        lower_checked_roots(&root, &resolved, &semantic.program, names)
+        lower_checked_roots(&root, &resolved, &semantic, names)
     }
 
     fn lower_checked_roots(
         root: &ast::Program,
         resolved: &ResolveResult,
-        semantic: &SemanticProgram,
+        semantic: &typecheck::SemanticCheckOutput,
         names: &[&str],
     ) -> Result<Program, LowerError> {
         let callables = names.iter().map(|name| root_function(name)).collect();
         lower_with_modules(
             root,
             resolved,
-            semantic,
+            &semantic.program,
+            &semantic.public_facts,
             AirLowerConfig {
                 roots: AirRoots {
                     entry: None,
@@ -8446,7 +8830,7 @@ fn main() {}
 
     fn lower_entry(source: &str, name: &str, callables: &[&str]) -> Result<Program, LowerError> {
         let (root, resolved, semantic) = checked(source);
-        lower_checked_entry(&root, &resolved, &semantic.program, name, callables)
+        lower_checked_entry(&root, &resolved, &semantic, name, callables)
     }
 
     fn function_names(program: &Program) -> Vec<&str> {

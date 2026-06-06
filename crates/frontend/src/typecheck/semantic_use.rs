@@ -17,6 +17,8 @@ use crate::{
 
 pub(crate) type SemanticExprTypeMap = HashMap<ExprId, SemanticExprType>;
 pub(crate) type CallMap = HashMap<ExprId, CallTarget>;
+pub(crate) type FunctionValueMap = HashMap<ExprId, FunctionValueFact>;
+pub(crate) type FunctionValueCallMap = HashMap<ExprId, FunctionValueCallFact>;
 pub(crate) type DefaultArgMap = HashMap<ExprId, Vec<DefaultArgFact>>;
 pub(crate) type ExternUseMap = HashMap<ExprId, Vec<ExternUseTarget>>;
 pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
@@ -44,6 +46,7 @@ pub(crate) struct LocalFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalDefFact {
     pub(crate) id: SemanticLocalId,
+    pub(crate) binding_id: Option<BindingId>,
     pub(crate) name: Ident,
     pub(crate) span: Option<SourceSpan>,
     pub(crate) ty: Type,
@@ -86,6 +89,7 @@ impl LocalFacts {
             };
             debug_assert_eq!(fact.kind, LocalDefKind::Binding);
             debug_assert_eq!(fact.span, Some(*span));
+            debug_assert!(fact.binding_id.is_some());
         }
         for id in self.param_defs.values() {
             let Some(fact) = self.defs.get(id) else {
@@ -93,6 +97,7 @@ impl LocalFacts {
                 continue;
             };
             debug_assert_eq!(fact.kind, LocalDefKind::Parameter);
+            debug_assert!(fact.binding_id.is_some());
         }
         for (expr_id, fact) in &self.uses {
             debug_assert_eq!(*expr_id, fact.expr_id);
@@ -140,6 +145,7 @@ pub(crate) struct SemanticParamSigFact {
     pub(crate) span: SourceSpan,
     pub(crate) ty: Type,
     pub(crate) mutable: bool,
+    pub(crate) escape: crate::ast::EscapeMode,
 }
 
 impl SemanticDeclarations {
@@ -156,7 +162,9 @@ impl SemanticDeclarations {
                     debug_assert_eq!(key.target, fact.id);
                     debug_assert_eq!(key.args, fact.args);
                 }
-                BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => {
+                BodyInstanceKey::Module(_)
+                | BodyInstanceKey::Lambda(_)
+                | BodyInstanceKey::CastFrom(_) => {
                     debug_assert!(false, "semantic function fact has non-callable body");
                 }
             }
@@ -259,7 +267,14 @@ pub(crate) struct CastFromInstanceKey {
 pub(crate) enum BodyInstanceKey {
     Module(ModuleScope),
     Callable(CallableInstanceKey),
+    Lambda(LambdaBodyKey),
     CastFrom(CastFromInstanceKey),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LambdaBodyKey {
+    pub(crate) expr: ExprId,
+    pub(crate) specialization: GenericArgs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -308,6 +323,8 @@ pub(crate) struct SemanticExprType {
 pub(crate) struct SemanticBodyFacts {
     pub(crate) expr_types: SemanticExprTypeMap,
     pub(crate) calls: CallMap,
+    pub(crate) function_values: FunctionValueMap,
+    pub(crate) function_value_calls: FunctionValueCallMap,
     pub(crate) default_args: DefaultArgMap,
     pub(crate) extern_uses: ExternUseMap,
     pub(crate) member_paths: MemberPathMap,
@@ -326,6 +343,8 @@ impl SemanticBodyFacts {
     fn merge_from(&mut self, facts: Self) {
         self.expr_types.extend(facts.expr_types);
         self.calls.extend(facts.calls);
+        self.function_values.extend(facts.function_values);
+        self.function_value_calls.extend(facts.function_value_calls);
         self.default_args.extend(facts.default_args);
         self.extern_uses.extend(facts.extern_uses);
         self.member_paths.extend(facts.member_paths);
@@ -343,6 +362,12 @@ impl SemanticBodyFacts {
     pub(crate) fn validate(&self) {
         for fact in self.expr_types.values() {
             debug_assert!(fact.span.is_some());
+        }
+        for (expr_id, fact) in &self.function_values {
+            debug_assert_eq!(*expr_id, fact.expr);
+        }
+        for (expr_id, fact) in &self.function_value_calls {
+            debug_assert_eq!(*expr_id, fact.expr);
         }
         for (expr_id, facts) in &self.default_args {
             let call = self.calls.get(expr_id);
@@ -391,6 +416,37 @@ impl SemanticBodyFacts {
             debug_assert!(fact.ty.is_some());
         }
         self.locals.validate_finished();
+        for fact in self.function_values.values() {
+            debug_assert!(matches!(fact.ty, Type::Func { .. }));
+            debug_assert!(!type_has_unfinished_facts(&fact.ty));
+            if let FunctionValueKind::Lambda { lambda_expr } = &fact.kind {
+                debug_assert_eq!(*lambda_expr, fact.expr);
+            }
+        }
+        for fact in self.function_value_calls.values() {
+            debug_assert!(!self.calls.contains_key(&fact.expr));
+            let Type::Func { params, ret } = &fact.sig else {
+                debug_assert!(false, "function-value call has non-function signature");
+                continue;
+            };
+            debug_assert!(!type_has_unfinished_facts(&fact.sig));
+            debug_assert!(!type_has_unfinished_facts(&ret.ty));
+            debug_assert_eq!(params.len(), fact.args.len());
+            for (arg, param) in fact.args.iter().zip(params) {
+                debug_assert_eq!(arg.param_ty, param.ty);
+                debug_assert_eq!(arg.mutable, param.mutable);
+                debug_assert_eq!(arg.escape, param.escape);
+                debug_assert!(self.expr_types.contains_key(&arg.expr));
+            }
+            let Some(callee_fact) = self.function_values.get(&fact.callee) else {
+                debug_assert!(
+                    false,
+                    "function-value call missing callee function-value fact"
+                );
+                continue;
+            };
+            debug_assert_eq!(callee_fact.ty, fact.sig);
+        }
         for fact in self.stringifies.values() {
             debug_assert!(!type_has_unfinished_facts(&fact.source_ty));
             let Some(arg) = self.expr_types.get(&fact.arg) else {
@@ -548,6 +604,26 @@ impl SemanticFactMaps {
 
     pub(crate) fn record_call(&mut self, site: SemanticExprSite, target: CallTarget) {
         self.body_mut(site.body).calls.insert(site.expr, target);
+    }
+
+    pub(crate) fn record_function_value(
+        &mut self,
+        site: SemanticExprSite,
+        fact: FunctionValueFact,
+    ) {
+        self.body_mut(site.body)
+            .function_values
+            .insert(site.expr, fact);
+    }
+
+    pub(crate) fn record_function_value_call(
+        &mut self,
+        site: SemanticExprSite,
+        fact: FunctionValueCallFact,
+    ) {
+        self.body_mut(site.body)
+            .function_value_calls
+            .insert(site.expr, fact);
     }
 
     pub(crate) fn record_default_arg(&mut self, body: BodyInstanceKey, fact: DefaultArgFact) {
@@ -806,6 +882,36 @@ pub(crate) struct CallTarget {
     pub(crate) id: CallableId,
     pub(crate) args: GenericArgs,
     pub(crate) form: CallForm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FunctionValueFact {
+    pub(crate) expr: ExprId,
+    pub(crate) ty: Type,
+    pub(crate) kind: FunctionValueKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FunctionValueKind {
+    Named(CallableInstanceKey),
+    Lambda { lambda_expr: ExprId },
+    LocalOrPlace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FunctionValueCallFact {
+    pub(crate) expr: ExprId,
+    pub(crate) callee: ExprId,
+    pub(crate) sig: Type,
+    pub(crate) args: Vec<FunctionValueArgFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FunctionValueArgFact {
+    pub(crate) expr: ExprId,
+    pub(crate) param_ty: Type,
+    pub(crate) mutable: bool,
+    pub(crate) escape: crate::ast::EscapeMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

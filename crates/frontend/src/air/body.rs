@@ -71,9 +71,30 @@ pub struct AirOptionalMatch {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Place {
-    pub root: LocalId,
+    pub root: PlaceRoot,
     pub projection: Vec<Projection>,
     pub ty: TypeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlaceRoot {
+    Local(LocalId),
+    LambdaCapture(LambdaCaptureSlotId),
+    ScopedBorrow(ScopedBorrowId),
+    UpvalueCell(UpvalueCellId),
+    Global(GlobalId),
+}
+
+impl PlaceRoot {
+    pub fn local(self) -> Option<LocalId> {
+        match self {
+            Self::Local(local) => Some(local),
+            Self::LambdaCapture(_)
+            | Self::ScopedBorrow(_)
+            | Self::UpvalueCell(_)
+            | Self::Global(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +105,9 @@ pub enum PlaceReadLocal {
 
 impl Place {
     pub(crate) fn for_each_read_local(&self, f: &mut impl FnMut(PlaceReadLocal)) {
-        f(PlaceReadLocal::Root(self.root));
+        if let PlaceRoot::Local(local) = self.root {
+            f(PlaceReadLocal::Root(local));
+        }
         for projection in &self.projection {
             if let Projection::Index(local) = projection {
                 f(PlaceReadLocal::Index(*local));
@@ -93,7 +116,7 @@ impl Place {
     }
 
     pub(crate) fn may_overlap(&self, other: &Self) -> bool {
-        if self.root != other.root {
+        if !place_roots_may_overlap(self.root, other.root) {
             return false;
         }
         for (left, right) in self.projection.iter().zip(&other.projection) {
@@ -116,6 +139,13 @@ pub enum Projection {
         field: u16,
     },
     Index(LocalId),
+}
+
+fn place_roots_may_overlap(left: PlaceRoot, right: PlaceRoot) -> bool {
+    match (left, right) {
+        (PlaceRoot::Local(left), PlaceRoot::Local(right)) => left == right,
+        _ => true,
+    }
 }
 
 fn projections_equal(left: &Projection, right: &Projection) -> bool {
@@ -174,6 +204,15 @@ impl CallArg {
             Self::Value(Operand::Const(_)) | Self::SharedStringConst(_) => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LambdaCaptureArg {
+    NoRuntime,
+    ReadonlyLocal { value: Operand },
+    ScopedLocal { place: Place },
+    ScopedBorrow { place: Place },
+    UpvalueCell { cell: UpvalueCellId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -268,9 +307,13 @@ pub enum RValue {
         inclusive: bool,
         ty: TypeId,
     },
-    MakeClosure {
-        func: FunctionId,
-        captures: Vec<Operand>,
+    FunctionRef {
+        function: FunctionId,
+        ty: TypeId,
+    },
+    MakeLambda {
+        lambda: LambdaId,
+        captures: Vec<LambdaCaptureArg>,
         ty: TypeId,
     },
 }
@@ -279,7 +322,7 @@ pub enum RValue {
 pub enum Callee {
     Function(FunctionId),
     Extern(ExternId),
-    Closure(Operand),
+    Lambda(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

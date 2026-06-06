@@ -1,6 +1,7 @@
 use verify::{
     BadCall, BadConst, BadExtern, BadFunction, BadModule, BadPlace, BadRValue, BadReference,
     BadStatement, BadType, ModuleItem, PrimitiveKind, VerifyError, VerifyErrorKind as EK,
+    VerifySite,
 };
 
 use super::{super::verify::verify_structured_body, *};
@@ -118,22 +119,22 @@ fn structured_branch_result_missing_on_one_path() {
 }
 
 #[test]
-fn closure_callee_read_must_be_initialized() {
+fn lambda_callee_read_must_be_initialized() {
     let mut builder = ProgramBuilder::default();
     let void_ty = builder.void_ty();
-    let closure_ty = builder.alloc_type(TypeData::Function(SignatureType {
+    let lambda_ty = builder.alloc_type(TypeData::Function(SignatureType {
         params: vec![],
         ret: ReturnMode::Value(void_ty),
     }));
     let module = test_module(&mut builder);
-    let mut fb = FunctionBuilder::new("bad_closure", module, FunctionKind::Normal, void_ty);
-    let closure = fb.push_local(None, closure_ty, Mutability::Immutable, LocalKind::User);
+    let mut fb = FunctionBuilder::new("bad_lambda", module, FunctionKind::Normal, void_ty);
+    let lambda = fb.push_local(None, lambda_ty, Mutability::Immutable, LocalKind::User);
     fb.push_block(term_return_void());
     let func_id = builder.alloc_function(fb.finish());
     let body = AirBody {
         block: AirBlock {
             stmts: vec![AirStmt::Eval(RValue::Call {
-                callee: Callee::Closure(op_place(closure, closure_ty)),
+                callee: Callee::Lambda(op_place(lambda, lambda_ty)),
                 args: vec![],
             })],
             tail: AirTail::Return(None),
@@ -144,7 +145,7 @@ fn closure_callee_read_must_be_initialized() {
     let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == closure
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == lambda
     )));
 }
 
@@ -831,10 +832,12 @@ fn call_arity_mismatch() {
             ExternParamDecl {
                 ty: int_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
             },
             ExternParamDecl {
                 ty: int_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
             },
         ],
         return_type: int_ty,
@@ -911,6 +914,7 @@ fn shared_string_const_invalid_id_does_not_panic() {
         params: vec![ExternParamDecl {
             ty: string_ty,
             mode: ParamMode::SharedBorrow,
+            escape: ParamEscape::NonEscaping,
         }],
         return_type: void_ty,
         binding: None,
@@ -952,10 +956,12 @@ fn call_arg_type_mismatch() {
             ExternParamDecl {
                 ty: int_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
             },
             ExternParamDecl {
                 ty: int_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
             },
         ],
         return_type: int_ty,
@@ -989,6 +995,253 @@ fn call_arg_type_mismatch() {
 }
 
 #[test]
+fn call_arg_function_escape_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+    let callback_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![],
+        ReturnMode::Value(void_ty),
+    )));
+    let non_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![ParamType {
+            ty: callback_ty,
+            mode: ParamMode::Value,
+            escape: ParamEscape::NonEscaping,
+        }],
+        ReturnMode::Value(void_ty),
+    )));
+    let esc_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![ParamType {
+            ty: callback_ty,
+            mode: ParamMode::Value,
+            escape: ParamEscape::Escaping,
+        }],
+        ReturnMode::Value(void_ty),
+    )));
+    let ext_id = builder.alloc_extern(ExternDecl {
+        name: Ident::new("accept"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![ExternParamDecl {
+            ty: esc_ty,
+            mode: ParamMode::Value,
+            escape: ParamEscape::NonEscaping,
+        }],
+        return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let mut fb = FunctionBuilder::new("arg_escape_bad", module, FunctionKind::Normal, void_ty);
+    let f = fb.push_param("f", non_ty, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Extern(ext_id),
+            args: vec![CallArg::Value(op_place(f, non_ty))],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::ArgTypeMismatch { index: 0, expected, found })
+            if expected == esc_ty && found == non_ty
+    )));
+}
+
+fn invalid_root_errors(root: PlaceRoot) -> Vec<VerifyError> {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_root", module, FunctionKind::Normal, int_ty);
+    fb.push_block(term_return(Operand::Place(Place {
+        root,
+        projection: vec![],
+        ty: int_ty,
+    })));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+    verify(&builder.finish()).unwrap_err()
+}
+
+#[test]
+fn non_local_call_arg_alias_is_conservative() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: int_ty,
+        mutability: Mutability::Mutable,
+    });
+    let ext_id = builder.alloc_extern(ExternDecl {
+        name: Ident::new("takes_borrows"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![
+            ExternParamDecl {
+                ty: int_ty,
+                mode: ParamMode::SharedBorrow,
+                escape: ParamEscape::NonEscaping,
+            },
+            ExternParamDecl {
+                ty: int_ty,
+                mode: ParamMode::MutBorrow,
+                escape: ParamEscape::NonEscaping,
+            },
+        ],
+        return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let mut fb = FunctionBuilder::new("alias", module, FunctionKind::Normal, void_ty);
+    let local = fb.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Extern(ext_id),
+            args: vec![
+                CallArg::SharedBorrow(Place {
+                    root: PlaceRoot::ScopedBorrow(scoped),
+                    projection: vec![],
+                    ty: int_ty,
+                }),
+                CallArg::MutBorrow(place(local, int_ty)),
+            ],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::ArgAliasConflict {
+            first: 0,
+            second: 1
+        })
+    )));
+}
+
+#[test]
+fn immutable_non_local_mut_borrow_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: int_ty,
+        mutability: Mutability::Immutable,
+    });
+    let ext_id = builder.alloc_extern(ExternDecl {
+        name: Ident::new("take_mut"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![ExternParamDecl {
+            ty: int_ty,
+            mode: ParamMode::MutBorrow,
+            escape: ParamEscape::NonEscaping,
+        }],
+        return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let mut fb = FunctionBuilder::new("imm_root", module, FunctionKind::Normal, void_ty);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Extern(ext_id),
+            args: vec![CallArg::MutBorrow(Place {
+                root: PlaceRoot::ScopedBorrow(scoped),
+                projection: vec![],
+                ty: int_ty,
+            })],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::ImmutableRoot(PlaceRoot::ScopedBorrow(id))) if id == scoped
+    )));
+}
+
+#[test]
+fn invalid_unused_root_decls_are_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let invalid_ty = TypeId::from_index(99);
+    let invalid_module = ModuleId::from_index(99);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: invalid_ty,
+        mutability: Mutability::Immutable,
+    });
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner: FunctionId::from_index(0),
+        source_local: LocalId::from_index(0),
+        ty: invalid_ty,
+    });
+    let global = builder.alloc_global(GlobalDecl {
+        name: Ident::new("g"),
+        module: invalid_module,
+        ty: invalid_ty,
+        mutability: Mutability::Immutable,
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.site,
+        VerifySite::ScopedBorrow(id) if id == scoped
+    ) && matches!(e.kind, EK::BadReference(BadReference::InvalidType(ty)) if ty == invalid_ty)));
+    assert!(errors.iter().any(|e| matches!(
+        e.site,
+        VerifySite::UpvalueCell(id) if id == cell
+    ) && matches!(e.kind, EK::BadReference(BadReference::InvalidType(ty)) if ty == invalid_ty)));
+    assert!(errors.iter().any(|e| matches!(
+        e.site,
+        VerifySite::Global(id) if id == global
+    ) && matches!(e.kind, EK::BadReference(BadReference::InvalidModule(module)) if module == invalid_module)));
+}
+
+#[test]
+fn invalid_scoped_borrow_root() {
+    let errors = invalid_root_errors(PlaceRoot::ScopedBorrow(ScopedBorrowId::from_index(0)));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidScopedBorrow(id)) if id == ScopedBorrowId::from_index(0)
+    )));
+}
+
+#[test]
+fn invalid_upvalue_cell_root() {
+    let errors = invalid_root_errors(PlaceRoot::UpvalueCell(UpvalueCellId::from_index(0)));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidUpvalueCell(id)) if id == UpvalueCellId::from_index(0)
+    )));
+}
+
+#[test]
+fn invalid_global_root() {
+    let errors = invalid_root_errors(PlaceRoot::Global(GlobalId::from_index(0)));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidGlobal(id)) if id == GlobalId::from_index(0)
+    )));
+}
+
+#[test]
 fn field_proj_non_aggregate() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -998,7 +1251,7 @@ fn field_proj_non_aggregate() {
     let mut fb = FunctionBuilder::new("field_on_int", module, FunctionKind::Normal, void_ty);
     let local_int = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
     let bad_place = Place {
-        root: local_int,
+        root: PlaceRoot::Local(local_int),
         projection: vec![Projection::Field(FieldId::from_index(0))],
         ty: int_ty,
     };
@@ -1026,7 +1279,7 @@ fn tuple_field_out_of_range() {
     let mut fb = FunctionBuilder::new("tuple_oob", module, FunctionKind::Normal, void_ty);
     let local_t = fb.push_local(None, tuple_ty, Mutability::Immutable, LocalKind::User);
     let bad_place = Place {
-        root: local_t,
+        root: PlaceRoot::Local(local_t),
         projection: vec![Projection::TupleField(99)],
         ty: int_ty,
     };
@@ -1053,7 +1306,7 @@ fn index_proj_non_indexable() {
     let local_int = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
     let idx_local = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
     let bad_place = Place {
-        root: local_int,
+        root: PlaceRoot::Local(local_int),
         projection: vec![Projection::Index(idx_local)],
         ty: int_ty,
     };
@@ -1070,7 +1323,7 @@ fn index_proj_non_indexable() {
 }
 
 #[test]
-fn closure_bad_fn() {
+fn lambda_bad_id() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
     let module = test_module(&mut builder);
@@ -1079,16 +1332,17 @@ fn closure_bad_fn() {
         vec![ParamType {
             ty: int_ty,
             mode: ParamMode::Value,
+            escape: ParamEscape::NonEscaping,
         }],
         ReturnMode::Value(int_ty),
     )));
 
-    let mut fb = FunctionBuilder::new("bad_closure", module, FunctionKind::Normal, int_ty);
+    let mut fb = FunctionBuilder::new("bad_lambda", module, FunctionKind::Normal, int_ty);
     let bb0 = fb.push_block(term_return_void());
     fb.add_statement(
         bb0,
-        stmt_eval(RValue::MakeClosure {
-            func: FunctionId::from_index(999),
+        stmt_eval(RValue::MakeLambda {
+            lambda: LambdaId::from_index(999),
             captures: vec![],
             ty: sig_type,
         }),
@@ -1099,7 +1353,1962 @@ fn closure_bad_fn() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadReference(BadReference::InvalidFunction(FunctionId(id))) if id == 999
+        EK::BadReference(BadReference::InvalidLambda(LambdaId(id))) if id == 999
+    )));
+}
+
+#[test]
+fn entry_must_not_be_lambda_body() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (_, body, _) = simple_lambda_program(&mut builder, module, int_ty, vec![]);
+    let mut owner = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    owner.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    builder.alloc_function(owner.finish());
+    builder.set_entry(body);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::EntryMustBeNamed(id)) if id == body
+    )));
+}
+
+#[test]
+fn lambda_decl_body_kind_and_capture_are_checked() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda = LambdaId::from_index(0);
+    let body_id = FunctionId::from_index(0);
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body: body_id,
+            owner: FunctionId::from_index(0),
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![LambdaCaptureDecl::UpvalueCell {
+                binding: BindingId::from_index(0),
+                cell: UpvalueCellId::from_index(99),
+                ty: int_ty,
+            }],
+        }),
+        lambda
+    );
+    let mut fb = FunctionBuilder::new("bad_lambda_body", module, FunctionKind::Normal, int_ty);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), body_id);
+    builder.set_entry(body_id);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::LambdaBodyKindMismatch { lambda: id, body })
+            if id == lambda && body == body_id
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidUpvalueCell(id)) if id == UpvalueCellId::from_index(99)
+    )));
+}
+
+fn simple_lambda_program(
+    builder: &mut ProgramBuilder,
+    module: ModuleId,
+    int_ty: TypeId,
+    captures: Vec<LambdaCaptureDecl>,
+) -> (LambdaId, FunctionId, TypeId) {
+    let lambda = LambdaId::from_index(builder.lambda_count());
+    let body = FunctionId::from_index(builder.function_count());
+    let owner = FunctionId::from_index(body.index() + 1);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig.clone()));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body,
+            owner,
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures,
+        }),
+        lambda
+    );
+    let mut fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), body);
+    (lambda, body, lambda_ty)
+}
+
+#[test]
+fn lambda_body_module_must_match_decl() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module_a = test_module(&mut builder);
+    let module_b = builder.alloc_module(empty_module("other"));
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module: module_a,
+            owner: FunctionId::from_index(0),
+            body,
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![],
+        }),
+        lambda
+    );
+    let mut fb = FunctionBuilder::new("lambda", module_b, FunctionKind::Lambda(lambda), int_ty);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), body);
+    builder.set_entry(body);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::LambdaBodyModuleMismatch {
+            lambda: id,
+            expected,
+            found,
+        }) if id == lambda && expected == module_a && found == module_b
+    )));
+}
+
+#[test]
+fn function_value_ty_must_be_function() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let mut target = FunctionBuilder::new("target", module, FunctionKind::Normal, int_ty);
+    target.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    let target = builder.alloc_function(target.finish());
+
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::FunctionRef {
+            function: target,
+            ty: int_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::FunctionValueMustBeFunction(ty)) if ty == int_ty
+    )));
+}
+
+#[test]
+fn make_lambda_ty_must_be_function() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (lambda, _, _) = simple_lambda_program(&mut builder, module, int_ty, vec![]);
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![],
+            ty: int_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::FunctionValueMustBeFunction(ty)) if ty == int_ty
+    )));
+}
+
+#[test]
+fn direct_function_call_rejects_lambda_body() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (_, body, _) = simple_lambda_program(&mut builder, module, int_ty, vec![]);
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(body),
+            args: vec![],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::FunctionCalleeMustBeNamed(id)) if id == body
+    )));
+}
+
+#[test]
+fn function_ref_rejects_lambda_body() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (_, body, lambda_ty) = simple_lambda_program(&mut builder, module, int_ty, vec![]);
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::FunctionRef {
+            function: body,
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::FunctionRefMustBeNamed(id)) if id == body
+    )));
+}
+
+#[test]
+fn make_lambda_captures_must_match_decl() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::NoRuntime {
+            binding: BindingId::from_index(0),
+            ty: int_ty,
+        }],
+    );
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::LambdaCaptureMismatch { index: 0 })
+    )));
+}
+
+#[test]
+fn make_lambda_must_be_created_by_decl_owner() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let owner = FunctionId::from_index(1);
+    let wrong_owner = FunctionId::from_index(2);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig.clone()));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            owner,
+            body,
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![],
+        }),
+        lambda
+    );
+    let mut body_fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    body_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(body_fb.finish()), body);
+    let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    owner_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(owner_fb.finish()), owner);
+    let mut wrong_fb = FunctionBuilder::new("wrong", module, FunctionKind::Normal, int_ty);
+    let bb0 = wrong_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    wrong_fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![],
+            ty: lambda_ty,
+        }),
+    );
+    assert_eq!(builder.alloc_function(wrong_fb.finish()), wrong_owner);
+    builder.set_entry(wrong_owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::MakeLambdaOwnerMismatch { lambda: lambda_found, expected, found: creator })
+            if lambda_found == lambda && expected == owner && creator == wrong_owner
+    )));
+}
+
+#[test]
+fn no_runtime_capture_slot_cannot_be_used_as_place_root() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let owner = FunctionId::from_index(1);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            owner,
+            body,
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![LambdaCaptureDecl::NoRuntime {
+                binding: BindingId::from_index(0),
+                ty: int_ty,
+            }],
+        }),
+        lambda
+    );
+    let mut body_fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    body_fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    assert_eq!(builder.alloc_function(body_fb.finish()), body);
+    let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    owner_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(owner_fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::NoRuntimeLambdaCaptureRoot(slot))
+            if slot == LambdaCaptureSlotId::from_index(0)
+    )));
+}
+
+#[test]
+fn make_lambda_capture_value_type_must_match_decl() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ReadonlyLocal {
+            binding,
+            ty: int_ty,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let bad = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                value: op_const(bad),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::LambdaCaptureMismatch { index: 0 })
+    )));
+}
+
+#[test]
+fn escaping_lambda_cannot_have_scoped_capture_decl() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body,
+            owner: FunctionId::from_index(0),
+            signature: sig,
+            escape: LambdaEscape::Escaping,
+            captures: vec![LambdaCaptureDecl::ScopedLocal {
+                binding: BindingId::from_index(0),
+                ty: int_ty,
+                mutability: Mutability::Immutable,
+                source: CaptureLocalSource {
+                    owner: FunctionId::from_index(0),
+                    local: LocalId::from_index(0),
+                },
+            }],
+        }),
+        lambda
+    );
+    let mut fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), body);
+    builder.set_entry(FunctionId::from_index(1));
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(
+        builder.alloc_function(main.finish()),
+        FunctionId::from_index(1)
+    );
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::EscapingLambdaScopedCapture { lambda: id }) if id == lambda
+    )));
+}
+
+#[test]
+fn escaping_lambda_body_cannot_use_scoped_borrow_root() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: int_ty,
+        mutability: Mutability::Immutable,
+    });
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body,
+            owner: FunctionId::from_index(0),
+            signature: sig,
+            escape: LambdaEscape::Escaping,
+            captures: vec![],
+        }),
+        lambda
+    );
+    let mut fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::ScopedBorrow(scoped),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    assert_eq!(builder.alloc_function(fb.finish()), body);
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::EscapingLambdaScopedBorrowRoot { lambda: id, root })
+            if id == lambda && root == scoped
+    )));
+}
+
+#[test]
+fn escaping_readonly_capture_must_not_use_scoped_borrow_root() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: int_ty,
+        mutability: Mutability::Immutable,
+    });
+    let binding = BindingId::from_index(0);
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig.clone()));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body,
+            owner: FunctionId::from_index(1),
+            signature: sig,
+            escape: LambdaEscape::Escaping,
+            captures: vec![LambdaCaptureDecl::ReadonlyLocal {
+                binding,
+                ty: int_ty,
+                source: CaptureLocalSource {
+                    owner: FunctionId::from_index(1),
+                    local: LocalId::from_index(0),
+                },
+            }],
+        }),
+        lambda
+    );
+    let mut body_fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    body_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(body_fb.finish()), body);
+
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                value: Operand::Place(Place {
+                    root: PlaceRoot::ScopedBorrow(scoped),
+                    projection: vec![],
+                    ty: int_ty,
+                }),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let main = builder.alloc_function(fb.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::ReadonlyCaptureMustBeImmutableOwned { index: 0 })
+    )));
+}
+
+#[test]
+fn escaping_readonly_capture_must_not_use_borrow_param() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig.clone()));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body,
+            owner: FunctionId::from_index(1),
+            signature: sig,
+            escape: LambdaEscape::Escaping,
+            captures: vec![LambdaCaptureDecl::ReadonlyLocal {
+                binding,
+                ty: int_ty,
+                source: CaptureLocalSource {
+                    owner: FunctionId::from_index(1),
+                    local: LocalId::from_index(0),
+                },
+            }],
+        }),
+        lambda
+    );
+    let mut body_fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    body_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(body_fb.finish()), body);
+
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let borrowed = fb.push_param_with_mode("x", int_ty, ParamMode::SharedBorrow, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                value: op_place(borrowed, int_ty),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let main = builder.alloc_function(fb.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::ReadonlyCaptureMustBeImmutableOwned { index: 0 })
+    )));
+}
+
+#[test]
+fn nonescaping_lambda_body_scoped_borrow_requires_capture_decl() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: int_ty,
+        mutability: Mutability::Immutable,
+    });
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body,
+            owner: FunctionId::from_index(0),
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![],
+        }),
+        lambda
+    );
+    let mut body_fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    body_fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::ScopedBorrow(scoped),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    assert_eq!(builder.alloc_function(body_fb.finish()), body);
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::RawScopedBorrowCaptureBypass { lambda: id, root })
+            if id == lambda && root == scoped
+    )));
+}
+
+#[test]
+fn lambda_capture_declarations_must_have_unique_bindings() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body,
+            owner: FunctionId::from_index(0),
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![
+                LambdaCaptureDecl::NoRuntime {
+                    binding,
+                    ty: int_ty,
+                },
+                LambdaCaptureDecl::ReadonlyLocal {
+                    binding,
+                    ty: int_ty,
+                    source: CaptureLocalSource {
+                        owner: FunctionId::from_index(0),
+                        local: LocalId::from_index(0),
+                    },
+                },
+            ],
+        }),
+        lambda
+    );
+    let mut body_fb = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    body_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(body_fb.finish()), body);
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::DuplicateLambdaCapture {
+            lambda: id,
+            binding: found_binding,
+            first: 0,
+            second: 1,
+        }) if id == lambda && found_binding == binding
+    )));
+}
+
+#[test]
+fn lambda_capture_declarations_must_have_unique_sources() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let borrow = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: int_ty,
+        mutability: Mutability::Immutable,
+    });
+    let (lambda, _, _) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![
+            LambdaCaptureDecl::ScopedBorrow {
+                binding: BindingId::from_index(0),
+                borrow,
+                ty: int_ty,
+                mutability: Mutability::Immutable,
+            },
+            LambdaCaptureDecl::ScopedBorrow {
+                binding: BindingId::from_index(1),
+                borrow,
+                ty: int_ty,
+                mutability: Mutability::Immutable,
+            },
+        ],
+    );
+    let owner = FunctionId::from_index(1);
+    let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    owner_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(owner_fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::DuplicateLambdaCaptureSource {
+            lambda: found,
+            first: 0,
+            second: 1,
+        }) if found == lambda
+    )));
+}
+
+#[test]
+fn make_lambda_scoped_capture_must_match_binding_identity() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let expected = BindingId::from_index(0);
+    let other = BindingId::from_index(1);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ScopedLocal {
+            binding: expected,
+            ty: int_ty,
+            mutability: Mutability::Immutable,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_param("x", int_ty, ParamRole::Normal);
+    fb.bind_local(local, other);
+    let bb0 = fb.push_block(term_return(op_place(local, int_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ScopedLocal {
+                place: place(local, int_ty),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+            lambda: found,
+            index: 0,
+        }) if found == lambda
+    )));
+}
+
+#[test]
+fn make_lambda_scoped_capture_must_match_scoped_borrow_owner() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        ty: int_ty,
+        mutability: Mutability::Immutable,
+    });
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ScopedLocal {
+            binding,
+            ty: int_ty,
+            mutability: Mutability::Immutable,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ScopedLocal {
+                place: Place {
+                    root: PlaceRoot::ScopedBorrow(scoped),
+                    projection: vec![],
+                    ty: int_ty,
+                },
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::LambdaCaptureMismatch { index: 0 })
+    )));
+}
+
+#[test]
+fn readonly_capture_must_match_binding_identity() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let expected = BindingId::from_index(0);
+    let other = BindingId::from_index(1);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ReadonlyLocal {
+            binding: expected,
+            ty: int_ty,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_param("x", int_ty, ParamRole::Normal);
+    fb.bind_local(local, other);
+    let bb0 = fb.push_block(term_return(op_place(local, int_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                value: op_place(local, int_ty),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+            lambda: found,
+            index: 0,
+        }) if found == lambda
+    )));
+}
+
+#[test]
+fn readonly_capture_must_not_use_const_operand() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ReadonlyLocal {
+            binding,
+            ty: int_ty,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let value = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(value)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                value: op_const(value),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::LambdaCaptureMismatch { index: 0 })
+    )));
+}
+
+#[test]
+fn readonly_capture_must_not_use_temp_local() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let source = LocalId::from_index(0);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ReadonlyLocal {
+            binding,
+            ty: int_ty,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: source,
+            },
+        }],
+    );
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    let temp = owner_fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    assert_eq!(temp, source);
+    owner_fb.bind_local(temp, binding);
+    let bb0 = owner_fb.push_block(term_return(op_const(zero)));
+    owner_fb.add_statement(bb0, stmt_init(temp, RValue::Use(op_const(zero))));
+    owner_fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                value: op_place(temp, int_ty),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let owner = builder.alloc_function(owner_fb.finish());
+    assert_eq!(owner, FunctionId::from_index(1));
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::ReadonlyLambdaCaptureSourceMustBeImmutableOwned {
+            lambda: found,
+            index: 0,
+            local,
+        }) if found == lambda && local == temp
+    )));
+}
+
+#[test]
+fn readonly_capture_must_not_snapshot_mutable_local() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ReadonlyLocal {
+            binding,
+            ty: int_ty,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(bb0, stmt_init(local, RValue::Use(op_const(zero))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                value: op_place(local, int_ty),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::ReadonlyCaptureMustBeImmutableOwned { index: 0 })
+    )));
+}
+
+#[test]
+fn make_lambda_scoped_capture_mutability_must_match_decl() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ScopedLocal {
+            binding,
+            ty: int_ty,
+            mutability: Mutability::Mutable,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_param("x", int_ty, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return(op_place(local, int_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ScopedLocal {
+                place: place(local, int_ty),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
+            lambda: found,
+            index: 0,
+        }) if found == lambda
+    )));
+}
+
+#[test]
+fn lambda_callee_must_have_function_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let value = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let bb0 = fb.push_block(term_return(op_const(value)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Lambda(op_const(value)),
+            args: vec![],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, EK::BadCall(BadCall::LambdaCalleeMustBeFunction)))
+    );
+}
+
+#[test]
+fn lambda_call_args_must_match_signature() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let lambda_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![ParamType {
+            ty: int_ty,
+            mode: ParamMode::MutBorrow,
+            escape: ParamEscape::NonEscaping,
+        }],
+        ReturnMode::Value(int_ty),
+    )));
+    let arg = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let callee = fb.push_param("f", lambda_ty, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return(op_const(arg)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Lambda(op_place(callee, lambda_ty)),
+            args: vec![CallArg::Value(op_const(arg))],
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::ArgModeMismatch {
+            index: 0,
+            expected: ParamMode::MutBorrow,
+            found: ParamMode::Value,
+        })
+    )));
+}
+
+#[test]
+fn escaping_function_param_rejects_nonescaping_lambda_value() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig.clone()));
+    let lambda = LambdaId::from_index(0);
+    let lambda_body = FunctionId::from_index(0);
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            body: lambda_body,
+            owner: FunctionId::from_index(0),
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![],
+        }),
+        lambda
+    );
+    let mut body = FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    body.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(body.finish()), lambda_body);
+
+    let callee = FunctionId::from_index(1);
+    let mut accept = FunctionBuilder::new("accept", module, FunctionKind::Normal, int_ty);
+    let param = accept.push_param("f", lambda_ty, ParamRole::Normal);
+    accept.set_param_escape(0, ParamEscape::Escaping);
+    accept.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(param, LocalId::from_index(0));
+    assert_eq!(builder.alloc_function(accept.finish()), callee);
+
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let local = main.push_local(Some("f"), lambda_ty, Mutability::Immutable, LocalKind::User);
+    let bb0 = main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    main.add_statement(
+        bb0,
+        stmt_init(
+            local,
+            RValue::MakeLambda {
+                lambda,
+                captures: vec![],
+                ty: lambda_ty,
+            },
+        ),
+    );
+    main.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![CallArg::Value(op_place(local, lambda_ty))],
+        }),
+    );
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::ArgEscapeMismatch {
+            index: 0,
+            expected: ParamEscape::Escaping,
+            found: ParamEscape::NonEscaping,
+        })
+    )));
+}
+
+#[test]
+fn escaping_function_param_rejects_unknown_function_value() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig));
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![lambda_ty]));
+
+    let callee = FunctionId::from_index(0);
+    let mut accept = FunctionBuilder::new("accept", module, FunctionKind::Normal, int_ty);
+    accept.push_param("f", lambda_ty, ParamRole::Normal);
+    accept.set_param_escape(0, ParamEscape::Escaping);
+    accept.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(accept.finish()), callee);
+
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let pair = main.push_param("pair", tuple_ty, ParamRole::Normal);
+    let bb0 = main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    main.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![CallArg::Value(Operand::Place(Place {
+                root: PlaceRoot::Local(pair),
+                projection: vec![Projection::TupleField(0)],
+                ty: lambda_ty,
+            }))],
+        }),
+    );
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadCall(BadCall::ArgEscapeUnknown {
+            index: 0,
+            expected: ParamEscape::Escaping,
+        })
+    )));
+}
+
+#[test]
+fn duplicate_upvalue_cell_for_binding_owner_is_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let binding = BindingId::from_index(0);
+    let owner = FunctionId::from_index(0);
+    let first = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding,
+        owner,
+        source_local: LocalId::from_index(0),
+        ty: int_ty,
+    });
+    let second = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding,
+        owner,
+        source_local: LocalId::from_index(0),
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::DuplicateUpvalueCell {
+            owner: found_owner,
+            binding: found_binding,
+            first: found_first,
+            second: found_second,
+        }) if found_owner == owner
+            && found_binding == binding
+            && found_first == first
+            && found_second == second
+    )));
+}
+
+#[test]
+fn duplicate_upvalue_cell_for_source_local_is_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let first = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let second = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(1),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::DuplicateUpvalueCellSourceLocal {
+            owner: found_owner,
+            local: found_local,
+            first: found_first,
+            second: found_second,
+        }) if found_owner == owner
+            && found_local == local
+            && found_first == first
+            && found_second == second
+    )));
+}
+
+#[test]
+fn promoted_binding_must_not_use_source_local_root() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let binding = BindingId::from_index(0);
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding,
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    fb.push_block(term_return(op_place(local, int_ty)));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::PromotedBindingBypassesCell {
+            binding: found_binding,
+            cell: found_cell,
+            local: found_local,
+        }) if found_binding == binding && found_cell == cell && found_local == local
+    )));
+}
+
+#[test]
+fn promoted_binding_must_not_be_initialized_as_local() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let binding = BindingId::from_index(0);
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding,
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    let bb0 = fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    fb.add_statement(
+        bb0,
+        stmt_init(
+            local,
+            RValue::Use(op_const(builder.alloc_const(ConstData {
+                ty: int_ty,
+                value: ConstValue::Int(0),
+            }))),
+        ),
+    );
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::PromotedBindingBypassesCell {
+            binding: found_binding,
+            cell: found_cell,
+            local: found_local,
+        }) if found_binding == binding && found_cell == cell && found_local == local
+    )));
+}
+
+#[test]
+fn upvalue_cell_read_requires_initialization() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::UpvalueCell(cell),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedUpvalueCell(found)) if found == cell
+    )));
+}
+
+#[test]
+fn lambda_body_must_not_use_raw_upvalue_cell_root_for_capture() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let owner = FunctionId::from_index(1);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding,
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            owner,
+            body,
+            signature: SignatureType::new(vec![], ReturnMode::Value(int_ty)),
+            escape: LambdaEscape::Escaping,
+            captures: vec![LambdaCaptureDecl::UpvalueCell {
+                binding,
+                cell,
+                ty: int_ty,
+            }],
+        }),
+        lambda
+    );
+    let mut lambda_body =
+        FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
+    lambda_body.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::UpvalueCell(cell),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    assert_eq!(builder.alloc_function(lambda_body.finish()), body);
+    let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        owner_fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    owner_fb.bind_local(local, binding);
+    owner_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(owner_fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::RawUpvalueCellCaptureBypass { lambda: found, root })
+            if found == lambda && root == cell
+    )));
+}
+
+#[test]
+fn upvalue_cell_cannot_be_used_from_unrelated_function() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let owner = FunctionId::from_index(0);
+    let other = FunctionId::from_index(1);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        owner_fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    owner_fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(owner_fb.finish()), owner);
+
+    let mut other_fb = FunctionBuilder::new("other", module, FunctionKind::Normal, int_ty);
+    other_fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::UpvalueCell(cell),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    assert_eq!(builder.alloc_function(other_fb.finish()), other);
+    builder.set_entry(other);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::UpvalueCellNotAccessible {
+            cell: found_cell,
+            function,
+        }) if found_cell == cell && function == other
+    )));
+}
+
+#[test]
+fn promoted_binding_must_not_use_source_local_as_index() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let array_ty = builder.alloc_type(TypeData::Array {
+        elem: int_ty,
+        len: 2,
+    });
+    let binding = BindingId::from_index(0);
+    let owner = FunctionId::from_index(0);
+    let index_local = LocalId::from_index(0);
+    let array_local = LocalId::from_index(1);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding,
+        owner,
+        source_local: index_local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(fb.push_param("i", int_ty, ParamRole::Normal), index_local);
+    assert_eq!(
+        fb.push_param("xs", array_ty, ParamRole::Normal),
+        array_local
+    );
+    fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::Local(array_local),
+        projection: vec![Projection::Index(index_local)],
+        ty: int_ty,
+    })));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::PromotedBindingBypassesCell {
+            binding: found_binding,
+            cell: found_cell,
+            local: found_local,
+        }) if found_binding == binding && found_cell == cell && found_local == index_local
+    )));
+}
+
+#[test]
+fn upvalue_cell_source_local_must_match_payload_type() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let string_ty = builder.string_ty();
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(Some("x"), string_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::UpvalueCellSourceLocalTypeMismatch {
+            cell: found_cell,
+            expected,
+            found,
+        }) if found_cell == cell && expected == int_ty && found == string_ty
+    )));
+}
+
+#[test]
+fn upvalue_cell_source_local_must_match_binding() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let expected = BindingId::from_index(0);
+    let other = BindingId::from_index(1);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: expected,
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User),
+        local
+    );
+    fb.bind_local(local, other);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::UpvalueCellSourceLocalBindingMismatch {
+            cell: found_cell,
+            expected: found_expected,
+            found,
+        }) if found_cell == cell && found_expected == expected && found == Some(other)
+    )));
+}
+
+#[test]
+fn upvalue_cell_source_local_must_be_owned_binding() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal),
+        local
+    );
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::UpvalueCellSourceLocalMustBeOwnedBinding {
+            cell: found_cell,
+            local: found_local,
+            kind: LocalKind::Arg,
+        }) if found_cell == cell && found_local == local
+    )));
+}
+
+#[test]
+fn upvalue_cell_source_local_must_not_be_pattern_alias() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(
+            Some("x"),
+            int_ty,
+            Mutability::Mutable,
+            LocalKind::PatternBinding
+        ),
+        local
+    );
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::UpvalueCellSourceLocalMustBeOwnedBinding {
+            cell: found_cell,
+            local: found_local,
+            kind: LocalKind::PatternBinding,
+        }) if found_cell == cell && found_local == local
+    )));
+}
+
+#[test]
+fn upvalue_cell_source_local_must_be_mutable() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let owner = FunctionId::from_index(0);
+    let local = LocalId::from_index(0);
+    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+        binding: BindingId::from_index(0),
+        owner,
+        source_local: local,
+        ty: int_ty,
+    });
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    assert_eq!(
+        fb.push_local(Some("x"), int_ty, Mutability::Immutable, LocalKind::User),
+        local
+    );
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::UpvalueCellSourceLocalMustBeMutable {
+            cell: found_cell,
+            local: found_local,
+        }) if found_cell == cell && found_local == local
+    )));
+}
+
+#[test]
+fn mutable_scoped_lambda_capture_requires_mutable_place() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let (lambda, _, lambda_ty) = simple_lambda_program(
+        &mut builder,
+        module,
+        int_ty,
+        vec![LambdaCaptureDecl::ScopedLocal {
+            binding,
+            ty: int_ty,
+            mutability: Mutability::Mutable,
+            source: CaptureLocalSource {
+                owner: FunctionId::from_index(1),
+                local: LocalId::from_index(0),
+            },
+        }],
+    );
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_param("x", int_ty, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return(op_place(local, int_ty)));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![LambdaCaptureArg::ScopedLocal {
+                place: place(local, int_ty),
+            }],
+            ty: lambda_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::ImmutableRoot(PlaceRoot::Local(id))) if id == local
     )));
 }
 
@@ -1221,7 +3430,10 @@ fn assign_immutable_local_rejected() {
     builder.set_entry(fid);
 
     let errors = verify(&builder.finish()).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadStatement(BadStatement::AssignImmutableLocal(local)) if local == imm)));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::ImmutableRoot(PlaceRoot::Local(local))) if local == imm
+    )));
 }
 
 #[test]
@@ -1301,7 +3513,7 @@ fn place_claimed_type_and_index_type_are_verified() {
     let list = fb.push_local(None, list_ty, Mutability::Immutable, LocalKind::User);
     let idx = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
     let bad_place = Place {
-        root: list,
+        root: PlaceRoot::Local(list),
         projection: vec![Projection::Index(idx)],
         ty: list_ty,
     };
@@ -1445,6 +3657,7 @@ fn function_param_local_must_match() {
                 name: Some(Ident::new("p")),
                 ty: int_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
                 role: ParamRole::Normal,
                 local_id: local,
             }],
@@ -1452,6 +3665,7 @@ fn function_param_local_must_match() {
         ),
         locals: vec![Local {
             name: Some(Ident::new("p")),
+            binding: None,
             ty: bool_ty,
             mutability: Mutability::Immutable,
             kind: LocalKind::User,
@@ -1780,6 +3994,61 @@ fn stringify_rejects_invalid_and_any_source_type() {
 }
 
 #[test]
+fn function_local_bindings_must_be_unique() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let first = fb.push_local(Some("a"), int_ty, Mutability::Immutable, LocalKind::User);
+    let second = fb.push_local(Some("b"), int_ty, Mutability::Immutable, LocalKind::User);
+    fb.bind_local(first, binding);
+    fb.bind_local(second, binding);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::DuplicateLocalBinding {
+            binding: found_binding,
+            first: found_first,
+            second: found_second,
+        }) if found_binding == binding && found_first == first && found_second == second
+    )));
+}
+
+#[test]
+fn local_binding_requires_binding_local_kind() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.bind_local(local, binding);
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::LocalBindingInvalidKind {
+            local: found_local,
+            kind: LocalKind::Temp,
+        }) if found_local == local
+    )));
+}
+
+#[test]
 fn aggregate_stringify_override_invalid_function() {
     let mut builder = ProgramBuilder::default();
     let module = test_module(&mut builder);
@@ -1840,6 +4109,51 @@ fn aggregate_stringify_override_module_mismatch() {
         e.kind,
         EK::BadFunction(BadFunction::StringifyOverrideModuleMismatch { expected, found })
             if expected == aggregate_module && found == function_module
+    )));
+}
+
+#[test]
+fn aggregate_stringify_override_must_not_be_lambda_body() {
+    let mut builder = ProgramBuilder::default();
+    let string_ty = builder.string_ty();
+    let module = test_module(&mut builder);
+    let aggregate = builder.alloc_aggregate(AggregateDecl {
+        name: Ident::new("S"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: Some(FunctionId::from_index(0)),
+    });
+    let aggregate_ty = builder.alloc_type(TypeData::Aggregate(aggregate));
+    let lambda = builder.alloc_lambda(LambdaDecl {
+        source: crate::ast::ExprId(0),
+        module,
+        body: FunctionId::from_index(0),
+        owner: FunctionId::from_index(0),
+        signature: SignatureType::new(vec![], ReturnMode::Value(string_ty)),
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![],
+    });
+    let mut fb = FunctionBuilder::new("to_string", module, FunctionKind::Lambda(lambda), string_ty);
+    fb.push_param("self", aggregate_ty, ParamRole::Receiver);
+    let string_const = builder.alloc_const(ConstData {
+        ty: string_ty,
+        value: ConstValue::String("S".into()),
+    });
+    fb.push_block(term_return(op_const(string_const)));
+    assert_eq!(
+        builder.alloc_function(fb.finish()),
+        FunctionId::from_index(0)
+    );
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::StringifyOverrideMustBeNamed(id))
+            if id == FunctionId::from_index(0)
     )));
 }
 
@@ -1928,6 +4242,7 @@ fn aggregate_stringify_override_wrong_shape() {
                 name: Some(Ident::new("self")),
                 ty: aggregate_ty,
                 mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
                 role: ParamRole::Receiver,
                 local_id: place_ret_self,
             }],
@@ -1936,12 +4251,14 @@ fn aggregate_stringify_override_wrong_shape() {
         locals: vec![
             Local {
                 name: Some(Ident::new("self")),
+                binding: None,
                 ty: aggregate_ty,
                 mutability: Mutability::Immutable,
                 kind: LocalKind::Arg,
             },
             Local {
                 name: Some(Ident::new("value")),
+                binding: None,
                 ty: string_ty,
                 mutability: Mutability::Mutable,
                 kind: LocalKind::User,
@@ -2192,7 +4509,7 @@ fn dataref_field_projection_reaches_field_type() {
         |fb, bb0| {
             let local = fb.push_local(None, dataref_ty, Mutability::Immutable, LocalKind::User);
             let bad_place = Place {
-                root: local,
+                root: PlaceRoot::Local(local),
                 projection: vec![Projection::Field(FieldId::from_index(0))],
                 ty: bool_ty,
             };
@@ -2542,7 +4859,7 @@ fn dataref_field_projection_kind_mismatch() {
     let errors = verify_void_entry(builder, "bad_dataref_field", module, void_ty, |fb, bb0| {
         let local = fb.push_local(None, dataref_ty, Mutability::Immutable, LocalKind::User);
         let bad_kind = Place {
-            root: local,
+            root: PlaceRoot::Local(local),
             projection: vec![Projection::Field(FieldId::from_index(0))],
             ty: int_ty,
         };
@@ -2576,7 +4893,7 @@ fn dataref_field_projection_out_of_range() {
     let errors = verify_void_entry(builder, "dataref_oob", module, void_ty, |fb, bb0| {
         let local = fb.push_local(None, dataref_ty, Mutability::Immutable, LocalKind::User);
         let bad_place = Place {
-            root: local,
+            root: PlaceRoot::Local(local),
             projection: vec![Projection::Field(FieldId::from_index(9))],
             ty: int_ty,
         };

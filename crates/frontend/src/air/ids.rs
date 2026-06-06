@@ -18,6 +18,9 @@ macro_rules! define_id {
 
 define_id!(ModuleId);
 define_id!(FunctionId);
+define_id!(LambdaId);
+define_id!(LambdaCaptureSlotId);
+define_id!(BindingId);
 define_id!(AggregateId);
 define_id!(EnumId);
 define_id!(ExternId);
@@ -25,6 +28,9 @@ define_id!(ExternTypeId);
 define_id!(TypeId);
 define_id!(ConstId);
 define_id!(LocalId);
+define_id!(ScopedBorrowId);
+define_id!(UpvalueCellId);
+define_id!(GlobalId);
 define_id!(BlockId);
 define_id!(AirLoopId);
 define_id!(FieldId);
