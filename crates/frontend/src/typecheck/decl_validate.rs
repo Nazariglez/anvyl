@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    CastConversionSchema, DeclError, DeclarationIndex, DynInference, EnumRepr, ExtendSchema,
-    GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams, MethodKey,
-    MethodSurface, ModuleScope, NominalKey, PendingRawEnum, RawEnumValue, TypeAliasDef,
+    CastConversionSchema, DeclError, DeclTypeUseKind, DeclarationIndex, DynInference, EnumRepr,
+    ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams,
+    MethodKey, MethodSurface, ModuleScope, NominalKey, PendingRawEnum, RawEnumValue, TypeAliasDef,
     TypeChecker, TypeError, VariantPayload, VerifiedRawEnumMetadata,
     const_eval::const_type,
     contracts,
@@ -169,18 +169,19 @@ pub(super) fn generic_param_type_error(
 }
 
 fn validate_dyn_infer_decls(
-    decls: &DeclarationIndex,
+    decls: &mut DeclarationIndex,
     module_sources: &HashMap<ModuleScope, SourceId>,
     errors: &mut Vec<TypeError>,
 ) {
-    decls.walk_canonical_type_uses(|site, ty| {
+    let _ = decls.fold_canonical_type_uses(|site, ty| {
         if site.kind.rejects_raw_dyn_hole() {
             let span = module_sources
                 .get(&site.module)
                 .copied()
                 .map(|source| SourceSpan::from_byte_span(source, site.span));
-            push_invalid_dyn_infer_decl(ty, span, errors);
+            push_invalid_dyn_infer_decl(&ty, span, errors);
         }
+        ty
     });
 }
 
@@ -827,6 +828,12 @@ impl TypeChecker {
         let mut decls = std::mem::take(&mut self.decls);
         let lookup = decls.clone();
         let generic_errors = decls.fold_canonical_type_uses(|site, ty| {
+            if matches!(
+                site.kind,
+                DeclTypeUseKind::ExternFunctionParam | DeclTypeUseKind::ExternFunctionReturn
+            ) {
+                return ty;
+            }
             self.current_module = site.module.clone();
             let span = site.span;
             let ty = self.finalize_decl_type(&lookup, site, ty);
@@ -843,7 +850,7 @@ impl TypeChecker {
         self.validate_raw_enum_declarations();
         decls = std::mem::take(&mut self.decls);
         contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.lint_events);
-        validate_dyn_infer_decls(&decls, &self.module_sources, &mut self.errors);
+        validate_dyn_infer_decls(&mut decls, &self.module_sources, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
         for error in decls.build_projection_edges() {
             self.push_error(TypeError::Decl(error));
@@ -1050,7 +1057,7 @@ impl TypeChecker {
     fn validate_final_decl_type_uses(&mut self, decls: &mut DeclarationIndex) {
         let validation = decls.clone();
         self.decls = validation.clone();
-        decls.walk_canonical_type_uses(|site, ty| {
+        let _ = decls.fold_canonical_type_uses(|site, ty| {
             self.current_module = site.module;
             self.push_generic_owner_frame(GenericOwnerFrame {
                 params: GenericParams {
@@ -1059,8 +1066,9 @@ impl TypeChecker {
                 },
                 ..GenericOwnerFrame::default()
             });
-            self.validate_nominal_uses_in(&validation, ty, site.span);
+            self.validate_nominal_uses_in(&validation, &ty, site.span);
             self.pop_generic_owner_frame();
+            ty
         });
     }
 }

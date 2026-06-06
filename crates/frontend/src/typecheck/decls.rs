@@ -1829,24 +1829,28 @@ impl DeclTypeUseKind {
     }
 }
 
+fn combined_type_params(owner: &[TypeParam], local: &[TypeParam]) -> Vec<TypeParam> {
+    owner.iter().chain(local).cloned().collect()
+}
+
 fn type_site(
-    module: ModuleScope,
+    module: &ModuleScope,
     span: Span,
-    generics: GenericTypeContext,
-    type_params: Vec<TypeParam>,
+    generics: &GenericTypeContext,
+    type_params: &[TypeParam],
     kind: DeclTypeUseKind,
 ) -> DeclTypeSite {
     DeclTypeSite {
-        module,
+        module: module.clone(),
         span,
-        generics,
-        type_params,
+        generics: generics.clone(),
+        type_params: type_params.to_vec(),
         kind,
     }
 }
 
-fn combined_type_params(owner: &[TypeParam], local: &[TypeParam]) -> Vec<TypeParam> {
-    owner.iter().chain(local).cloned().collect()
+fn bare_type_site(module: &ModuleScope, span: Span, kind: DeclTypeUseKind) -> DeclTypeSite {
+    type_site(module, span, &GenericTypeContext::default(), &[], kind)
 }
 
 pub(crate) fn map_generic_param_bounds<F>(params: &mut GenericParams, mut f: F)
@@ -1877,40 +1881,15 @@ fn map_generic_bounds<F>(
 {
     let type_params = params.type_params.clone();
     map_generic_param_bounds(params, |bound| {
-        let site = DeclTypeSite {
-            module: module.clone(),
+        let site = type_site(
+            module,
             span,
-            generics: generics.clone(),
-            type_params: type_params.clone(),
-            kind: DeclTypeUseKind::GenericBound,
-        };
+            generics,
+            &type_params,
+            DeclTypeUseKind::GenericBound,
+        );
         f(site, bound)
     });
-}
-
-fn walk_generic_bounds<F>(
-    module: &ModuleScope,
-    span: Span,
-    generics: &GenericTypeContext,
-    params: &GenericParams,
-    f: &mut F,
-) where
-    F: FnMut(DeclTypeSite, &Type),
-{
-    let type_params = params.type_params.clone();
-    for param in &params.type_params {
-        for bound in &param.bounds {
-            let ty = Type::Dyn(bound.clone());
-            let site = DeclTypeSite {
-                module: module.clone(),
-                span,
-                generics: generics.clone(),
-                type_params: type_params.clone(),
-                kind: DeclTypeUseKind::GenericBound,
-            };
-            f(site, &ty);
-        }
-    }
 }
 
 pub(crate) struct GenericContextError {
@@ -2034,12 +2013,8 @@ impl DeclarationIndex {
     {
         let mut errors = vec![];
 
-        let aggregate_keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
-        for key in aggregate_keys {
-            let Some(span) = self.type_span(&key) else {
-                continue;
-            };
-            let Some(schema) = self.aggregates.get_mut(&key) else {
+        for (key, schema) in &mut self.aggregates {
+            let Some(span) = self.type_spans.get(key).copied() else {
                 continue;
             };
             let owner_generics = generic_context(
@@ -2058,13 +2033,13 @@ impl DeclarationIndex {
             );
             let owner_type_params = schema.generics.type_params.clone();
             for field in schema.fields.values_mut() {
-                let site = DeclTypeSite {
-                    module: key.module.clone(),
+                let site = type_site(
+                    &key.module,
                     span,
-                    generics: owner_generics.clone(),
-                    type_params: owner_type_params.clone(),
-                    kind: DeclTypeUseKind::Field,
-                };
+                    &owner_generics,
+                    &owner_type_params,
+                    DeclTypeUseKind::Field,
+                );
                 field.ty = f(site, field.ty.clone());
             }
             for method in schema.methods.values_mut() {
@@ -2079,34 +2054,29 @@ impl DeclarationIndex {
                 map_generic_bounds(&key.module, span, &generics, &mut method.generics, &mut f);
                 let type_params =
                     combined_type_params(&owner_type_params, &method.generics.type_params);
-                let param_spans = method.param_spans.clone();
                 for (index, param) in method.params.iter_mut().enumerate() {
-                    let site = DeclTypeSite {
-                        module: key.module.clone(),
-                        span: param_spans.span_for(index, span),
-                        generics: generics.clone(),
-                        type_params: type_params.clone(),
-                        kind: DeclTypeUseKind::MethodParam,
-                    };
+                    let site = type_site(
+                        &key.module,
+                        method.param_spans.span_for(index, span),
+                        &generics,
+                        &type_params,
+                        DeclTypeUseKind::MethodParam,
+                    );
                     param.ty = f(site, param.ty.clone());
                 }
-                let site = DeclTypeSite {
-                    module: key.module.clone(),
+                let site = type_site(
+                    &key.module,
                     span,
-                    generics,
-                    type_params,
-                    kind: DeclTypeUseKind::MethodReturn,
-                };
+                    &generics,
+                    &type_params,
+                    DeclTypeUseKind::MethodReturn,
+                );
                 method.ret.ty = f(site, method.ret.ty.clone());
             }
         }
 
-        let enum_keys = self.enums.keys().cloned().collect::<Vec<_>>();
-        for key in enum_keys {
-            let Some(span) = self.type_span(&key) else {
-                continue;
-            };
-            let Some(schema) = self.enums.get_mut(&key) else {
+        for (key, schema) in &mut self.enums {
+            let Some(span) = self.type_spans.get(key).copied() else {
                 continue;
             };
             let generics = generic_context(
@@ -2123,25 +2093,25 @@ impl DeclarationIndex {
                     VariantPayload::Unit => {}
                     VariantPayload::Tuple(types) => {
                         for ty in types {
-                            let site = DeclTypeSite {
-                                module: key.module.clone(),
+                            let site = type_site(
+                                &key.module,
                                 span,
-                                generics: generics.clone(),
-                                type_params: type_params.clone(),
-                                kind: DeclTypeUseKind::EnumVariant,
-                            };
+                                &generics,
+                                &type_params,
+                                DeclTypeUseKind::EnumVariant,
+                            );
                             *ty = f(site, ty.clone());
                         }
                     }
                     VariantPayload::Struct(fields) => {
                         for field in fields.values_mut() {
-                            let site = DeclTypeSite {
-                                module: key.module.clone(),
+                            let site = type_site(
+                                &key.module,
                                 span,
-                                generics: generics.clone(),
-                                type_params: type_params.clone(),
-                                kind: DeclTypeUseKind::EnumVariant,
-                            };
+                                &generics,
+                                &type_params,
+                                DeclTypeUseKind::EnumVariant,
+                            );
                             field.ty = f(site, field.ty.clone());
                         }
                     }
@@ -2149,70 +2119,55 @@ impl DeclarationIndex {
             }
         }
 
-        let contract_keys = self.contracts.keys().cloned().collect::<Vec<_>>();
-        for key in contract_keys {
-            let Some(schema) = self.contracts.get_mut(&key) else {
-                continue;
-            };
+        for (key, schema) in &mut self.contracts {
             for req in &mut schema.direct_requirements {
                 let Some(span) = req.span else {
                     continue;
                 };
                 for (index, param) in req.params.iter_mut().enumerate() {
-                    let site = DeclTypeSite {
-                        module: key.module.clone(),
-                        span: req.param_spans.span_for(index, span.byte()),
-                        generics: GenericTypeContext::default(),
-                        type_params: vec![],
-                        kind: DeclTypeUseKind::ContractParam,
-                    };
+                    let site = bare_type_site(
+                        &key.module,
+                        req.param_spans.span_for(index, span.byte()),
+                        DeclTypeUseKind::ContractParam,
+                    );
                     param.ty = f(site, param.ty.clone());
                 }
-                let site = DeclTypeSite {
-                    module: key.module.clone(),
-                    span: span.byte(),
-                    generics: GenericTypeContext::default(),
-                    type_params: vec![],
-                    kind: DeclTypeUseKind::ContractReturn,
-                };
+                let site =
+                    bare_type_site(&key.module, span.byte(), DeclTypeUseKind::ContractReturn);
                 req.ret.ty = f(site, req.ret.ty.clone());
             }
         }
 
-        let alias_keys = self.type_aliases.keys().cloned().collect::<Vec<_>>();
-        for key in alias_keys {
-            let Some(schema) = self.type_aliases.get_mut(&key) else {
-                continue;
-            };
+        for schema in self.type_aliases.values_mut() {
+            let span = schema.def.span.byte();
             let generics = generic_context(
                 &schema.def.module,
                 &schema.def.generics.type_params,
                 &schema.def.generics.const_params,
-                schema.def.span.byte(),
+                span,
                 &mut errors,
             );
             schema.def.generic_context = generics.clone();
             map_generic_bounds(
                 &schema.def.module,
-                schema.def.span.byte(),
+                span,
                 &generics,
                 &mut schema.def.generics,
                 &mut f,
             );
-            let site = DeclTypeSite {
-                module: schema.def.module.clone(),
-                span: schema.def.span.byte(),
-                generics,
-                type_params: schema.def.generics.type_params.clone(),
-                kind: DeclTypeUseKind::AliasTarget,
-            };
+            let site = type_site(
+                &schema.def.module,
+                span,
+                &generics,
+                &schema.def.generics.type_params,
+                DeclTypeUseKind::AliasTarget,
+            );
             schema.def.aliased = f(site, schema.def.aliased.clone());
         }
 
-        for index in 0..self.extends.len() {
-            let origin = self.extends[index].origin.clone();
-            let span = self.extends[index].span.byte();
-            let extend = &mut self.extends[index];
+        for extend in &mut self.extends {
+            let origin = extend.origin.clone();
+            let span = extend.span.byte();
             let generics = generic_context(
                 &origin,
                 &extend.generics.type_params,
@@ -2222,13 +2177,13 @@ impl DeclarationIndex {
             );
             map_generic_bounds(&origin, span, &generics, &mut extend.generics, &mut f);
             let extend_type_params = extend.generics.type_params.clone();
-            let target_site = DeclTypeSite {
-                module: origin.clone(),
+            let target_site = type_site(
+                &origin,
                 span,
-                generics: generics.clone(),
-                type_params: extend_type_params.clone(),
-                kind: DeclTypeUseKind::ExtendTarget,
-            };
+                &generics,
+                &extend_type_params,
+                DeclTypeUseKind::ExtendTarget,
+            );
             extend.target = f(target_site, extend.target.clone());
             for method in extend.methods.values_mut() {
                 let method_generics = extend_generic_context(
@@ -2248,34 +2203,33 @@ impl DeclarationIndex {
                 );
                 let type_params =
                     combined_type_params(&extend_type_params, &method.generics.type_params);
-                let param_spans = method.param_spans.clone();
                 for (index, param) in method.params.iter_mut().enumerate() {
-                    let site = DeclTypeSite {
-                        module: origin.clone(),
-                        span: param_spans.span_for(index, span),
-                        generics: method_generics.clone(),
-                        type_params: type_params.clone(),
-                        kind: DeclTypeUseKind::MethodParam,
-                    };
+                    let site = type_site(
+                        &origin,
+                        method.param_spans.span_for(index, span),
+                        &method_generics,
+                        &type_params,
+                        DeclTypeUseKind::MethodParam,
+                    );
                     param.ty = f(site, param.ty.clone());
                 }
-                let site = DeclTypeSite {
-                    module: origin.clone(),
+                let site = type_site(
+                    &origin,
                     span,
-                    generics: method_generics,
-                    type_params,
-                    kind: DeclTypeUseKind::MethodReturn,
-                };
+                    &method_generics,
+                    &type_params,
+                    DeclTypeUseKind::MethodReturn,
+                );
                 method.ret.ty = f(site, method.ret.ty.clone());
             }
             for cast in &mut extend.cast_froms {
-                let site = DeclTypeSite {
-                    module: origin.clone(),
-                    span: cast.span.byte(),
-                    generics: generics.clone(),
-                    type_params: extend_type_params.clone(),
-                    kind: DeclTypeUseKind::CastReturn,
-                };
+                let site = type_site(
+                    &origin,
+                    cast.span.byte(),
+                    &generics,
+                    &extend_type_params,
+                    DeclTypeUseKind::CastReturn,
+                );
                 cast.param.ty = f(
                     DeclTypeSite {
                         span: cast.param_span,
@@ -2290,11 +2244,7 @@ impl DeclarationIndex {
             }
         }
 
-        let module_keys = self.modules.keys().cloned().collect::<Vec<_>>();
-        for module in module_keys {
-            let Some(decls) = self.modules.get_mut(&module) else {
-                continue;
-            };
+        for decls in self.modules.values_mut() {
             for value in decls.locals.values.values_mut() {
                 let Some(span) = self
                     .value_spans
@@ -2319,36 +2269,27 @@ impl DeclarationIndex {
                             &mut sig.generics,
                             &mut f,
                         );
-                        if sig.kind != CallableKind::ExternFunction {
-                            let site = DeclTypeSite {
-                                module: value.module.clone(),
-                                span,
-                                generics,
-                                type_params: sig.generics.type_params.clone(),
-                                kind: DeclTypeUseKind::FunctionReturn,
-                            };
-                            sig.ty =
-                                map_func_type_uses(site, sig.ty.clone(), &sig.param_spans, &mut f);
-                        }
+                        let kind = if sig.kind == CallableKind::ExternFunction {
+                            DeclTypeUseKind::ExternFunctionReturn
+                        } else {
+                            DeclTypeUseKind::FunctionReturn
+                        };
+                        let site = type_site(
+                            &value.module,
+                            span,
+                            &generics,
+                            &sig.generics.type_params,
+                            kind,
+                        );
+                        sig.ty =
+                            fold_func_type_uses(site, sig.ty.clone(), &sig.param_spans, &mut f);
                     }
                     ValueDecl::Const(sig) => {
-                        let site = DeclTypeSite {
-                            module: value.module.clone(),
-                            span,
-                            generics: GenericTypeContext::default(),
-                            type_params: vec![],
-                            kind: DeclTypeUseKind::Const,
-                        };
+                        let site = bare_type_site(&value.module, span, DeclTypeUseKind::Const);
                         sig.ty = f(site, sig.ty.clone());
                     }
                     ValueDecl::Global(sig) => {
-                        let site = DeclTypeSite {
-                            module: value.module.clone(),
-                            span,
-                            generics: GenericTypeContext::default(),
-                            type_params: vec![],
-                            kind: DeclTypeUseKind::Global,
-                        };
+                        let site = bare_type_site(&value.module, span, DeclTypeUseKind::Global);
                         sig.ty = f(site, sig.ty.clone());
                     }
                 }
@@ -2357,253 +2298,6 @@ impl DeclarationIndex {
 
         self.sync_value_projections();
         errors
-    }
-
-    pub(crate) fn walk_canonical_type_uses<F>(&self, mut f: F)
-    where
-        F: FnMut(DeclTypeSite, &Type),
-    {
-        for (key, schema) in &self.aggregates {
-            let Some(span) = self.type_span(key) else {
-                continue;
-            };
-            let owner_generics = generic_context_lossy(&schema.generics);
-            walk_generic_bounds(&key.module, span, &owner_generics, &schema.generics, &mut f);
-            let owner_type_params = schema.generics.type_params.clone();
-            for field in schema.fields.values() {
-                let site = type_site(
-                    key.module.clone(),
-                    span,
-                    owner_generics.clone(),
-                    owner_type_params.clone(),
-                    DeclTypeUseKind::Field,
-                );
-                f(site, &field.ty);
-            }
-            for method in schema.methods.values() {
-                let type_params =
-                    combined_type_params(&owner_type_params, &method.generics.type_params);
-                let generics = extend_generic_context_lossy(&owner_generics, &method.generics);
-                walk_generic_bounds(&key.module, span, &generics, &method.generics, &mut f);
-                walk_params(
-                    &key.module,
-                    span,
-                    &generics,
-                    &type_params,
-                    &method.params,
-                    &method.param_spans,
-                    DeclTypeUseKind::MethodParam,
-                    &mut f,
-                );
-                let site = type_site(
-                    key.module.clone(),
-                    span,
-                    generics,
-                    type_params,
-                    DeclTypeUseKind::MethodReturn,
-                );
-                f(site, &method.ret.ty);
-            }
-        }
-
-        for (key, schema) in &self.enums {
-            let Some(span) = self.type_span(key) else {
-                continue;
-            };
-            let generics = generic_context_lossy(&schema.generics);
-            walk_generic_bounds(&key.module, span, &generics, &schema.generics, &mut f);
-            let type_params = schema.generics.type_params.clone();
-            for variant in schema.variants.values() {
-                match &variant.payload {
-                    VariantPayload::Unit => {}
-                    VariantPayload::Tuple(types) => {
-                        for ty in types {
-                            let site = type_site(
-                                key.module.clone(),
-                                span,
-                                generics.clone(),
-                                type_params.clone(),
-                                DeclTypeUseKind::EnumVariant,
-                            );
-                            f(site, ty);
-                        }
-                    }
-                    VariantPayload::Struct(fields) => {
-                        for field in fields.values() {
-                            let site = type_site(
-                                key.module.clone(),
-                                span,
-                                generics.clone(),
-                                type_params.clone(),
-                                DeclTypeUseKind::EnumVariant,
-                            );
-                            f(site, &field.ty);
-                        }
-                    }
-                }
-            }
-        }
-
-        for (key, schema) in &self.contracts {
-            for req in &schema.direct_requirements {
-                let Some(span) = req.span else {
-                    continue;
-                };
-                for (index, param) in req.params.iter().enumerate() {
-                    let site = type_site(
-                        key.module.clone(),
-                        req.param_spans.span_for(index, span.byte()),
-                        GenericTypeContext::default(),
-                        vec![],
-                        DeclTypeUseKind::ContractParam,
-                    );
-                    f(site, &param.ty);
-                }
-                let site = type_site(
-                    key.module.clone(),
-                    span.byte(),
-                    GenericTypeContext::default(),
-                    vec![],
-                    DeclTypeUseKind::ContractReturn,
-                );
-                f(site, &req.ret.ty);
-            }
-        }
-
-        for schema in self.type_aliases.values() {
-            let generics = generic_context_lossy(&schema.def.generics);
-            walk_generic_bounds(
-                &schema.def.module,
-                schema.def.span.byte(),
-                &generics,
-                &schema.def.generics,
-                &mut f,
-            );
-            let site = type_site(
-                schema.def.module.clone(),
-                schema.def.span.byte(),
-                generics,
-                schema.def.generics.type_params.clone(),
-                DeclTypeUseKind::AliasTarget,
-            );
-            f(site, &schema.def.aliased);
-        }
-
-        for extend in &self.extends {
-            let span = extend.span.byte();
-            let generics = generic_context_lossy(&extend.generics);
-            walk_generic_bounds(&extend.origin, span, &generics, &extend.generics, &mut f);
-            let type_params = extend.generics.type_params.clone();
-            let site = type_site(
-                extend.origin.clone(),
-                span,
-                generics.clone(),
-                type_params.clone(),
-                DeclTypeUseKind::ExtendTarget,
-            );
-            f(site, &extend.target);
-            for method in extend.methods.values() {
-                let method_type_params =
-                    combined_type_params(&type_params, &method.generics.type_params);
-                let method_generics = extend_generic_context_lossy(&generics, &method.generics);
-                walk_generic_bounds(
-                    &extend.origin,
-                    span,
-                    &method_generics,
-                    &method.generics,
-                    &mut f,
-                );
-                walk_params(
-                    &extend.origin,
-                    span,
-                    &method_generics,
-                    &method_type_params,
-                    &method.params,
-                    &method.param_spans,
-                    DeclTypeUseKind::MethodParam,
-                    &mut f,
-                );
-                let site = type_site(
-                    extend.origin.clone(),
-                    span,
-                    method_generics,
-                    method_type_params,
-                    DeclTypeUseKind::MethodReturn,
-                );
-                f(site, &method.ret.ty);
-            }
-            for cast in &extend.cast_froms {
-                let site = type_site(
-                    extend.origin.clone(),
-                    cast.param_span,
-                    generics.clone(),
-                    type_params.clone(),
-                    DeclTypeUseKind::CastParam,
-                );
-                f(site, &cast.param.ty);
-                if let Some(ret) = &cast.ret {
-                    let site = type_site(
-                        extend.origin.clone(),
-                        cast.span.byte(),
-                        generics.clone(),
-                        type_params.clone(),
-                        DeclTypeUseKind::CastReturn,
-                    );
-                    f(site, &ret.ty);
-                }
-            }
-        }
-
-        for module in self.modules.values() {
-            for value in module.locals.values.values() {
-                let Some(span) = self
-                    .value_spans
-                    .get(&(value.module.clone(), value.name))
-                    .copied()
-                else {
-                    continue;
-                };
-                match &value.decl {
-                    ValueDecl::Func(sig) => {
-                        let generics = generic_context_lossy(&sig.generics);
-                        walk_generic_bounds(&value.module, span, &generics, &sig.generics, &mut f);
-                        let kind = if sig.kind == CallableKind::ExternFunction {
-                            DeclTypeUseKind::ExternFunctionParam
-                        } else {
-                            DeclTypeUseKind::FunctionParam
-                        };
-                        let site = type_site(
-                            value.module.clone(),
-                            span,
-                            generics,
-                            sig.generics.type_params.clone(),
-                            kind,
-                        );
-                        walk_func_type_uses(site, &sig.ty, &sig.param_spans, &mut f);
-                    }
-                    ValueDecl::Const(sig) => {
-                        let site = type_site(
-                            value.module.clone(),
-                            span,
-                            GenericTypeContext::default(),
-                            vec![],
-                            DeclTypeUseKind::Const,
-                        );
-                        f(site, &sig.ty);
-                    }
-                    ValueDecl::Global(sig) => {
-                        let site = type_site(
-                            value.module.clone(),
-                            span,
-                            GenericTypeContext::default(),
-                            vec![],
-                            DeclTypeUseKind::Global,
-                        );
-                        f(site, &sig.ty);
-                    }
-                }
-            }
-        }
     }
 
     pub(crate) fn embedded_fields(&self) -> impl Iterator<Item = EmbeddedFieldRef<'_>> {
@@ -4807,17 +4501,6 @@ fn extend_generic_context(
     })
 }
 
-fn generic_context_lossy(params: &GenericParams) -> GenericTypeContext {
-    generic_context_from_params(&params.type_params, &params.const_params, |_| {})
-}
-
-fn extend_generic_context_lossy(
-    owner: &GenericTypeContext,
-    params: &GenericParams,
-) -> GenericTypeContext {
-    extend_generic_context_with_params(owner, &params.type_params, &params.const_params, |_| {})
-}
-
 fn sync_namespace_values(
     namespace: &mut Namespace,
     locals: &HashMap<(ModuleScope, Ident), ValueDecl>,
@@ -4839,7 +4522,7 @@ pub(crate) fn generic_params(
     }
 }
 
-fn map_func_type_uses<F>(
+fn fold_func_type_uses<F>(
     site: DeclTypeSite,
     ty: Type,
     param_spans: &ParamTypeSpans,
@@ -4880,62 +4563,6 @@ where
         ret.ty.clone(),
     );
     Type::func(params, ret.with_ty(ret_ty))
-}
-
-fn walk_func_type_uses<F>(site: DeclTypeSite, ty: &Type, param_spans: &ParamTypeSpans, f: &mut F)
-where
-    F: FnMut(DeclTypeSite, &Type),
-{
-    let Type::Func { params, ret } = ty else {
-        f(site, ty);
-        return;
-    };
-    walk_params(
-        &site.module,
-        site.span,
-        &site.generics,
-        &site.type_params,
-        params,
-        param_spans,
-        site.kind,
-        f,
-    );
-    let ret_kind = match site.kind {
-        DeclTypeUseKind::ExternFunctionParam => DeclTypeUseKind::ExternFunctionReturn,
-        _ => DeclTypeUseKind::FunctionReturn,
-    };
-    f(
-        DeclTypeSite {
-            kind: ret_kind,
-            ..site
-        },
-        &ret.ty,
-    );
-}
-
-fn walk_params<F>(
-    module: &ModuleScope,
-    span: Span,
-    generics: &GenericTypeContext,
-    type_params: &[TypeParam],
-    params: &[FuncParam],
-    param_spans: &ParamTypeSpans,
-    kind: DeclTypeUseKind,
-    f: &mut F,
-) where
-    F: FnMut(DeclTypeSite, &Type),
-{
-    let type_params = type_params.to_vec();
-    for (index, param) in params.iter().enumerate() {
-        let site = type_site(
-            module.clone(),
-            param_spans.span_for(index, span),
-            generics.clone(),
-            type_params.clone(),
-            kind,
-        );
-        f(site, &param.ty);
-    }
 }
 
 fn method_schema(
