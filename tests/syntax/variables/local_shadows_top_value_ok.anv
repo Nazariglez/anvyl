@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+const item = 1;
+
+fn main() {
+    let item = true;
+    let selected: bool = item;
+}

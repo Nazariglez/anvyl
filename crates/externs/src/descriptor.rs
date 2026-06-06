@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ExternOperator, ModulePath, ProviderId};
@@ -116,6 +118,39 @@ pub enum ExternTypeExpr {
     Callback(ExternCallbackSignature),
 }
 
+impl fmt::Display for ExternTypeExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Void => f.write_str("void"),
+            Self::Bool => f.write_str("bool"),
+            Self::Int => f.write_str("int"),
+            Self::Float => f.write_str("float"),
+            Self::String => f.write_str("string"),
+            Self::Any => f.write_str("any"),
+            Self::List(inner) => write!(f, "[{inner}]"),
+            Self::Map(key, value) => write!(f, "[{key}: {value}]"),
+            Self::Option(inner) => write!(f, "{inner}?"),
+            Self::Named { module, name, args } => {
+                if let Some(module) = module {
+                    write!(f, "{module}.{name}")?;
+                } else {
+                    f.write_str(name)?;
+                }
+                if !args.is_empty() {
+                    let args = args
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, "<{args}>")?;
+                }
+                Ok(())
+            }
+            Self::Callback(_) => f.write_str("callback"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ExternRep {
     Shared,
@@ -181,114 +216,4 @@ pub enum CallbackEscape {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CallbackThread {
     SameThread,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{BinaryOp, ExternOperator};
-
-    fn module(segments: &[&str]) -> ModulePath {
-        ModulePath {
-            segments: segments
-                .iter()
-                .map(|segment| (*segment).to_string())
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn receiver_is_not_param_flow() {
-        let method = ExternMethodDescriptor {
-            name: "move".to_string(),
-            doc: None,
-            receiver: ReceiverMode::Mutable,
-            signature: ExternSignature {
-                params: vec![ExternParam {
-                    name: Some("dx".to_string()),
-                    ty: ExternTypeExpr::Float,
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                }],
-                ret: ExternTypeExpr::Void,
-            },
-            effects: ExternEffects::default(),
-        };
-
-        assert_eq!(method.receiver, ReceiverMode::Mutable);
-        assert_eq!(method.signature.params[0].flow, ParamFlow::Value);
-    }
-
-    #[test]
-    fn params_have_flow() {
-        let function = ExternFunctionDescriptor {
-            name: "mix".to_string(),
-            doc: None,
-            signature: ExternSignature {
-                params: vec![
-                    ExternParam {
-                        name: Some("a".to_string()),
-                        ty: ExternTypeExpr::Float,
-                        flow: ParamFlow::Value,
-                        escape: CallbackEscape::NonEscaping,
-                    },
-                    ExternParam {
-                        name: Some("b".to_string()),
-                        ty: ExternTypeExpr::Float,
-                        flow: ParamFlow::Borrow,
-                        escape: CallbackEscape::NonEscaping,
-                    },
-                    ExternParam {
-                        name: Some("out".to_string()),
-                        ty: ExternTypeExpr::Float,
-                        flow: ParamFlow::MutBorrow,
-                        escape: CallbackEscape::NonEscaping,
-                    },
-                ],
-                ret: ExternTypeExpr::Void,
-            },
-            effects: ExternEffects::default(),
-        };
-        let flows = function
-            .signature
-            .params
-            .iter()
-            .map(|param| param.flow)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            flows,
-            [ParamFlow::Value, ParamFlow::Borrow, ParamFlow::MutBorrow]
-        );
-    }
-
-    #[test]
-    fn operator_flow_is_operand_flow() {
-        let operator = ExternOperatorDescriptor {
-            op: ExternOperator::Binary {
-                op: BinaryOp::Add,
-                self_on_right: true,
-            },
-            receiver: ReceiverMode::Shared,
-            signature: ExternSignature {
-                params: vec![ExternParam {
-                    name: None,
-                    ty: ExternTypeExpr::Float,
-                    flow: ParamFlow::Borrow,
-                    escape: CallbackEscape::NonEscaping,
-                }],
-                ret: ExternTypeExpr::Float,
-            },
-            effects: ExternEffects::default(),
-        };
-
-        assert_eq!(operator.signature.params[0].flow, ParamFlow::Borrow);
-        assert_eq!(
-            operator.op,
-            ExternOperator::Binary {
-                op: BinaryOp::Add,
-                self_on_right: true,
-            }
-        );
-    }
 }

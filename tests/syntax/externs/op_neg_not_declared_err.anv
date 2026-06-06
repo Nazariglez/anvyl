@@ -3,7 +3,7 @@
 // @frontend: new
 // @contains: invalid operand
 
-extern type Vec2 {
+extern type Vec2 rep inline {
     x: float;
     y: float;
     init;

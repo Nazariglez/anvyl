@@ -1,7 +1,7 @@
 use std::collections::hash_map::Values;
 
 use crate::{
-    ast::{ContractRef, ExprId, Ident, NominalKind, Type},
+    ast::{ContractRef, ExprId, Ident, NominalKind, Type, TypeVisitor},
     diagnostic::DiagnosticTag,
     externs::{self, RawExterns, catalog::ExternCatalog},
     lint::{LintEvent, LintId},
@@ -16,7 +16,7 @@ use crate::{
         DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact, ExpectedProjectionMap,
         ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap,
         SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
-        decls::DeclarationIndex, type_ops::TypeVisitor,
+        decls::DeclarationIndex,
     },
 };
 
@@ -300,7 +300,8 @@ fn type_contains_dyn_hole(ty: &Type) -> bool {
 pub(crate) fn output(source: &str) -> typecheck::TypecheckOutput {
     let program = parse_program(source);
     let resolved = resolved_with_core_option(&program);
-    let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
+    let raw_externs =
+        externs::prepare_raw_externs(RawExterns::default(), &program, &resolved).unwrap();
     typecheck::check_with_modules(
         &program,
         &resolved,
@@ -312,7 +313,8 @@ pub(crate) fn output(source: &str) -> typecheck::TypecheckOutput {
 pub(crate) fn check(source: &str) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let program = parse_program(source);
     let resolved = resolved_with_core_option(&program);
-    let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
+    let raw_externs =
+        externs::prepare_raw_externs(RawExterns::default(), &program, &resolved).unwrap();
     check_with_raw_externs(&program, &resolved, raw_externs)
 }
 
@@ -357,7 +359,8 @@ pub(crate) fn check_named(
 ) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let root = parse_program(root_source);
     let resolved = resolved_modules_with_core_option(&root, modules);
-    let raw_externs = externs::collect_source_externs(&root, &resolved).unwrap();
+    let raw_externs =
+        externs::prepare_raw_externs(RawExterns::default(), &root, &resolved).unwrap();
     check_with_raw_externs(&root, &resolved, raw_externs)
 }
 

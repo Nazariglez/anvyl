@@ -3,8 +3,9 @@ use chumsky::{error::Rich, prelude::*};
 use super::{
     AnvParser, BoxedParser,
     common::{
-        TupleShapeResult, block_stmt, callable_param_type, field_name_ident, identifier, literal,
-        return_spec, validate_tuple_shape_raw,
+        TupleShapeResult, block_stmt, braces, brackets, callable_param_type, colon, comma_list,
+        field_name_ident, identifier, literal, nonempty_comma_list, parens,
+        parenthesized_tuple_parts, qualified_name, return_spec, validate_tuple_shape_raw,
     },
     new_expr_id,
     ops::{
@@ -269,70 +270,44 @@ fn match_arm<'src>(
 fn match_arm_list<'src>(
     arm: impl AnvParser<'src, ast::MatchArmNode>,
 ) -> BoxedParser<'src, Vec<ast::MatchArmNode>> {
-    arm.separated_by(select! { Token::Comma => () })
-        .allow_trailing()
-        .collect::<Vec<_>>()
-        .delimited_by(
-            select! { Token::Open(Delimiter::Brace) => () },
-            select! { Token::Close(Delimiter::Brace) => () },
-        )
-        .boxed()
+    braces(comma_list(arm)).boxed()
+}
+
+fn expr_field<'src>(
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, (ast::Ident, ast::ExprNode)> {
+    let field_with_expr = field_name_ident()
+        .then_ignore(colon())
+        .then(expr)
+        .map(|(name, value)| (name, value));
+
+    let field_shorthand = identifier().map_with(|name, e| {
+        let s = e.span();
+        let span = s.byte();
+        let expr_id = new_expr_id();
+        let ident_expr = ast::Expr::new(ast::ExprKind::Ident(name), expr_id);
+        let value = Spanned::new(ident_expr, span);
+        (name, value)
+    });
+
+    choice((field_with_expr, field_shorthand)).boxed()
 }
 
 fn struct_literal<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::ExprNode> {
-    let field_init = choice((
-        field_name_ident()
-            .then_ignore(select! { Token::Colon => () })
-            .then(expr)
-            .map(|(name, value)| (name, value)),
-        identifier().map_with(|name, e| {
-            let s = e.span();
-            let span = s.byte();
-            let expr_id = new_expr_id();
-            let ident_expr = ast::Expr::new(ast::ExprKind::Ident(name), expr_id);
-            let value = Spanned::new(ident_expr, span);
-            (name, value)
-        }),
-    ));
-
-    // parse qualified name like Enum.Variant or Struct
-    let qualified_name = identifier()
-        .then(
-            select! { Token::Dot => () }
-                .ignore_then(identifier())
-                .or_not(),
-        )
-        .map(|(first, second)| match second {
-            Some(name) => (Some(first), name), // is a enum variant
-            None => (None, first),             // struc
-        });
+    let field_init = expr_field(expr);
 
     let generic_args = select! { Token::Op(Op::LessThan) => () }
-        .ignore_then(
-            generic_arg(type_ident())
-                .separated_by(select! { Token::Comma => () })
-                .allow_trailing()
-                .collect::<Vec<_>>(),
-        )
+        .ignore_then(comma_list(generic_arg(type_ident())))
         .then_ignore(select! { Token::Op(Op::GreaterThan) => () })
         .then_ignore(select! { Token::Open(Delimiter::Brace) => () }.rewind())
         .or_not()
         .map(Option::unwrap_or_default);
 
-    qualified_name
+    qualified_name()
         .then(generic_args)
-        .then(
-            select! { Token::Open(Delimiter::Brace) => () }
-                .ignore_then(
-                    field_init
-                        .separated_by(select! { Token::Comma => () })
-                        .allow_trailing()
-                        .collect::<Vec<_>>(),
-                )
-                .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
-        )
+        .then(braces(comma_list(field_init)))
         .map_with(|(((qualifier, name), generic_args), fields), e| {
             let s = e.span();
             let span = s.byte();
@@ -357,19 +332,11 @@ fn struct_literal<'src>(
 fn array_literal<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::ExprNode> {
-    let open_bracket = select! { Token::Open(Delimiter::Bracket) => () };
-    let close_bracket = select! { Token::Close(Delimiter::Bracket) => () };
-    let comma = select! { Token::Comma => () };
     let semicolon = select! { Token::Semicolon => () };
-    let colon = select! { Token::Colon => () };
 
     // array fill literal [value; len]
-    let fill_literal = open_bracket
-        .ignore_then(expr.clone())
-        .then_ignore(semicolon)
-        .then(expr.clone())
-        .then_ignore(close_bracket)
-        .map_with(|(value, len), e| {
+    let fill_literal = brackets(expr.clone().then_ignore(semicolon).then(expr.clone())).map_with(
+        |(value, len), e| {
             let s = e.span();
             let span = s.byte();
             let fill_node = Spanned::new(
@@ -382,61 +349,42 @@ fn array_literal<'src>(
             let expr_id = new_expr_id();
             let expr = ast::Expr::new(ast::ExprKind::ArrayFill(fill_node), expr_id);
             Spanned::new(expr, span)
-        });
+        },
+    );
 
     // map entry 'key: value'
-    let map_entry = expr.clone().then_ignore(colon).then(expr.clone());
+    let map_entry = expr.clone().then_ignore(colon()).then(expr.clone());
 
     // non empty map literal [key: value, ...]
-    let map_literal = open_bracket
-        .ignore_then(
-            map_entry
-                .separated_by(comma)
-                .allow_trailing()
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
-        .then_ignore(close_bracket)
-        .map_with(|entries, e| {
-            let s = e.span();
-            let span = s.byte();
-            let lit_node = Spanned::new(ast::MapLiteral { entries }, span);
-            let expr_id = new_expr_id();
-            let expr = ast::Expr::new(ast::ExprKind::MapLiteral(lit_node), expr_id);
-            Spanned::new(expr, span)
-        });
+    let map_literal = brackets(nonempty_comma_list(map_entry)).map_with(|entries, e| {
+        let s = e.span();
+        let span = s.byte();
+        let lit_node = Spanned::new(ast::MapLiteral { entries }, span);
+        let expr_id = new_expr_id();
+        let expr = ast::Expr::new(ast::ExprKind::MapLiteral(lit_node), expr_id);
+        Spanned::new(expr, span)
+    });
 
     // empty map literal [:]
     // use a dummy nil literal to provide type context for the parser
-    let empty_map = open_bracket
-        .ignore_then(colon)
-        .ignore_then(close_bracket)
-        .to(ast::Lit::Nil)
-        .map_with(|_, e| {
-            let s = e.span();
-            let span = s.byte();
-            let lit_node = Spanned::new(ast::MapLiteral { entries: vec![] }, span);
-            let expr_id = new_expr_id();
-            let expr = ast::Expr::new(ast::ExprKind::MapLiteral(lit_node), expr_id);
-            Spanned::new(expr, span)
-        });
+    let empty_map = brackets(colon()).to(ast::Lit::Nil).map_with(|_, e| {
+        let s = e.span();
+        let span = s.byte();
+        let lit_node = Spanned::new(ast::MapLiteral { entries: vec![] }, span);
+        let expr_id = new_expr_id();
+        let expr = ast::Expr::new(ast::ExprKind::MapLiteral(lit_node), expr_id);
+        Spanned::new(expr, span)
+    });
 
     // array/list literal [elem, ...] or []
-    let element_list = open_bracket
-        .ignore_then(
-            expr.separated_by(comma)
-                .allow_trailing()
-                .collect::<Vec<_>>(),
-        )
-        .then_ignore(close_bracket)
-        .map_with(|elements, e| {
-            let s = e.span();
-            let span = s.byte();
-            let lit_node = Spanned::new(ast::ArrayLiteral { elements }, span);
-            let expr_id = new_expr_id();
-            let expr = ast::Expr::new(ast::ExprKind::ArrayLiteral(lit_node), expr_id);
-            Spanned::new(expr, span)
-        });
+    let element_list = brackets(comma_list(expr)).map_with(|elements, e| {
+        let s = e.span();
+        let span = s.byte();
+        let lit_node = Spanned::new(ast::ArrayLiteral { elements }, span);
+        let expr_id = new_expr_id();
+        let expr = ast::Expr::new(ast::ExprKind::ArrayLiteral(lit_node), expr_id);
+        Spanned::new(expr, span)
+    });
 
     // the order matters here, i need to put more specific patterns first
     // [v; n] -> [:] -> [k: v, ...] -> ([e, ...] or [])
@@ -705,19 +653,7 @@ fn inferred_enum_expr<'src>(
 ) -> BoxedParser<'src, ast::ExprNode> {
     let comma = select! { Token::Comma => () };
 
-    let field_init = choice((
-        field_name_ident()
-            .then_ignore(select! { Token::Colon => () })
-            .then(expr.clone()),
-        identifier().map_with(|name, e| {
-            let s = e.span();
-            let span = s.byte();
-            let expr_id = new_expr_id();
-            let ident_expr = ast::Expr::new(ast::ExprKind::Ident(name), expr_id);
-            let value = Spanned::new(ident_expr, span);
-            (name, value)
-        }),
-    ));
+    let field_init = expr_field(expr.clone());
 
     let tuple_args = select! { Token::Open(Delimiter::Parent) => () }
         .ignore_then(
@@ -894,35 +830,23 @@ impl TupleExprElem {
 fn grouped_or_tuple_expr<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::ExprNode> {
-    let comma = select! { Token::Comma => () };
-    let open_paren = select! { Token::Open(Delimiter::Parent) => () };
-    let close_paren = select! { Token::Close(Delimiter::Parent) => () };
-    let colon = select! { Token::Colon => () };
-
     let labelled_elem = identifier()
-        .then_ignore(colon)
+        .then_ignore(colon())
         .ignore_then(expr.clone())
         .map(TupleExprElem::Labelled);
 
     let pos_elem = expr.map(TupleExprElem::Pos);
     let elem = choice((labelled_elem, pos_elem));
 
-    let first_elem = elem.clone();
-    let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
-
-    open_paren
-        .ignore_then(first_elem.or_not())
-        .then(rest_elems)
-        .then(comma.or_not())
-        .then_ignore(close_paren)
-        .validate(|((first, rest), trailing_comma), e, emitter| {
+    parenthesized_tuple_parts(elem)
+        .validate(|parts, e, emitter| {
             let s = e.span();
             let span = s.byte();
             let expr_id = new_expr_id();
             let dummy_expr = || ast::Expr::new(ast::ExprKind::Lit(ast::Lit::Nil), expr_id);
 
-            let has_label = first.as_ref().is_some_and(TupleExprElem::is_labelled)
-                || rest.iter().any(TupleExprElem::is_labelled);
+            let has_label = parts.first.as_ref().is_some_and(TupleExprElem::is_labelled)
+                || parts.rest.iter().any(TupleExprElem::is_labelled);
 
             if has_label {
                 emitter.emit(Rich::custom(
@@ -932,10 +856,14 @@ fn grouped_or_tuple_expr<'src>(
                 return Spanned::new(dummy_expr(), span);
             }
 
-            let first = first.map(TupleExprElem::into_expr);
-            let rest = rest.into_iter().map(TupleExprElem::into_expr).collect();
+            let first = parts.first.map(TupleExprElem::into_expr);
+            let rest = parts
+                .rest
+                .into_iter()
+                .map(TupleExprElem::into_expr)
+                .collect();
 
-            match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
+            match validate_tuple_shape_raw(first, rest, parts.trailing_comma) {
                 TupleShapeResult::Empty => {
                     emitter.emit(Rich::custom(s, "empty tuples are not supported"));
                     Spanned::new(dummy_expr(), span)
@@ -963,24 +891,10 @@ fn grouped_or_tuple_expr<'src>(
 fn fn_call_args<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, Vec<ast::ExprNode>> {
-    select! {
-        Token::Open(Delimiter::Parent) => (),
-    }
-    .ignore_then(
-        expr.separated_by(select! {
-            Token::Comma => (),
-        })
-        .allow_trailing()
-        .collect::<Vec<_>>()
-        .or_not()
-        .map(Option::unwrap_or_default),
-    )
-    .then_ignore(select! {
-        Token::Close(Delimiter::Parent) => (),
-    })
-    .labelled("function call arguments")
-    .as_context()
-    .boxed()
+    parens(comma_list(expr))
+        .labelled("function call arguments")
+        .as_context()
+        .boxed()
 }
 
 fn call_generic_args<'src>() -> BoxedParser<'src, Vec<ast::GenericArg>> {
@@ -989,14 +903,7 @@ fn call_generic_args<'src>() -> BoxedParser<'src, Vec<ast::GenericArg>> {
     let generic_lookahead = select! {
         Token::Op(Op::LessThan) => (),
     }
-    .ignore_then(
-        generic_arg(type_ident())
-            .separated_by(select! {
-                Token::Comma => (),
-            })
-            .allow_trailing()
-            .collect::<Vec<_>>(),
-    )
+    .ignore_then(comma_list(generic_arg(type_ident())))
     .then_ignore(select! {
         Token::Op(Op::GreaterThan) => (),
     })
@@ -1008,14 +915,7 @@ fn call_generic_args<'src>() -> BoxedParser<'src, Vec<ast::GenericArg>> {
     let generic_list = select! {
         Token::Op(Op::LessThan) => (),
     }
-    .ignore_then(
-        generic_arg(type_ident())
-            .separated_by(select! {
-                Token::Comma => (),
-            })
-            .allow_trailing()
-            .collect::<Vec<_>>(),
-    )
+    .ignore_then(comma_list(generic_arg(type_ident())))
     .then_ignore(select! {
         Token::Op(Op::GreaterThan) => (),
     });

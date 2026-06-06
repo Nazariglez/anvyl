@@ -81,6 +81,26 @@ impl ModulePath {
     pub fn to_ast_path(&self) -> ast::ModulePath {
         Rc::from(self.0.clone())
     }
+
+    pub fn to_extern_path(&self) -> anvyx_externs::ModulePath {
+        anvyx_externs::ModulePath {
+            segments: self.0.clone(),
+        }
+    }
+
+    pub fn from_ast_path(path: &ast::ModulePath) -> Result<Self, ModulePathError> {
+        Self::new(path.iter().cloned().collect())
+    }
+
+    pub fn from_extern_path(path: &anvyx_externs::ModulePath) -> Result<Self, ModulePathError> {
+        Self::new(path.segments.clone())
+    }
+}
+
+impl fmt::Display for ModulePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&display_module_path(&self.0))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +196,17 @@ pub enum PackageModulePath {
     Named(ModulePath),
     Provider(ModulePath),
     Source(SourceFileId),
+}
+
+impl fmt::Display for PackageModulePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root => f.write_str("<root>"),
+            Self::Named(path) => write!(f, "{path}"),
+            Self::Provider(path) => write!(f, "ext:{path}"),
+            Self::Source(file) => render_source_file(f, file),
+        }
+    }
 }
 
 impl PackageModulePath {
@@ -286,6 +317,26 @@ impl ModuleId {
             .and_then(ModulePath::first_segment)
             .is_some_and(|s| ignored_roots.contains(s))
     }
+}
+
+impl fmt::Display for ModuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.package_context() {
+            Some(package) if package != &PackageId::synthetic_root() => {
+                write!(f, "{package}:{}", self.path)
+            }
+            _ => write!(f, "{}", self.path),
+        }
+    }
+}
+
+fn render_source_file(f: &mut fmt::Formatter<'_>, file: &SourceFileId) -> fmt::Result {
+    let name = file
+        .path()
+        .file_stem()
+        .unwrap_or_else(|| file.path().as_os_str())
+        .to_string_lossy();
+    f.write_str(&name)
 }
 
 #[derive(Debug, Clone)]

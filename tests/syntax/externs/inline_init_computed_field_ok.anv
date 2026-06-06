@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Point rep inline {
+    init;
+    computed len: int;
+    x: int;
+}
+
+fn main() {
+    let point = Point { x: 1 };
+}

@@ -2,7 +2,7 @@
 // @expect: success
 // @frontend: new
 
-extern type Point {
+extern type Point rep inline {
     init;
     x: float;
     y: float;

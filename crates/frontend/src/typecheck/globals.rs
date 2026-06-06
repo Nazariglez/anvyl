@@ -90,11 +90,7 @@ impl TypeChecker {
 
     pub(super) fn global_checked(&self, sig: &GlobalSig) -> CheckedType {
         let handle = self.global_handle(&sig.key);
-        CheckedType {
-            ty: self.handle_type(&handle),
-            handle,
-            contains_extern_any: false,
-        }
+        CheckedType::new(self.handle_type(&handle), handle)
     }
 
     pub(super) fn sync_global_types(&mut self) {

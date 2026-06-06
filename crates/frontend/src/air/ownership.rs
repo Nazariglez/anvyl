@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    AggregateKind, AirBlock, AirStmt, AirTail, CallArg, Callee, Function, FunctionId, LocalId,
-    Operand, ParamMode, Place, Program, Projection, RValue, TypeData, TypeId, VariantShape,
+    AggregateKind, AirBlock, AirStmt, AirTail, CallArg, Callee, ConstId, Function, FunctionId,
+    LocalId, Operand, ParamMode, Place, PlaceReadLocal, Program, RValue, TypeData, TypeId,
+    VariantShape, typing,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,6 +311,7 @@ fn analyze_param_uses_with_modes(
         .map(|(index, param)| (param.local_id, index))
         .collect();
     ParamUseAnalyzer {
+        program,
         classes,
         function,
         param_modes,
@@ -320,6 +322,7 @@ fn analyze_param_uses_with_modes(
 }
 
 struct ParamUseAnalyzer<'a> {
+    program: &'a Program,
     classes: &'a TypePassClasses,
     function: &'a Function,
     param_modes: Option<&'a [Vec<ParamMode>]>,
@@ -485,13 +488,18 @@ impl ParamUseAnalyzer<'_> {
     }
 
     fn callee_param_mode(&self, callee: &Callee, index: usize) -> Option<ParamMode> {
-        let Callee::Function(function) = callee else {
-            return None;
-        };
-        self.param_modes
-            .and_then(|modes| modes.get(function.index()))
-            .and_then(|modes| modes.get(index))
-            .copied()
+        if let Callee::Function(function) = callee
+            && let Some(mode) = self
+                .param_modes
+                .and_then(|modes| modes.get(function.index()))
+                .and_then(|modes| modes.get(index))
+                .copied()
+        {
+            return Some(mode);
+        }
+        typing::callee_params(self.program, callee)
+            .and_then(|params| params.get(self.program, index))
+            .map(|param| param.mode)
     }
 
     fn observe_operand(&mut self, operand: &Operand, context: ValueContext) {
@@ -507,12 +515,10 @@ impl ParamUseAnalyzer<'_> {
     }
 
     fn observe_place(&mut self, place: &Place, use_: ParamUse) {
-        for projection in &place.projection {
-            if let Projection::Index(local) = projection {
-                self.observe_local(*local, ParamUse::ReadOnly);
-            }
-        }
-        self.observe_local(place.root, use_);
+        place.for_each_read_local(&mut |local| match local {
+            PlaceReadLocal::Root(local) => self.observe_local(local, use_),
+            PlaceReadLocal::Index(local) => self.observe_local(local, ParamUse::ReadOnly),
+        });
     }
 
     fn observe_local(&mut self, local: LocalId, use_: ParamUse) {
@@ -741,6 +747,15 @@ fn rewrite_direct_call_args(program: &mut Program) {
             ))
         })
         .collect::<HashMap<_, _>>();
+    let extern_modes = program
+        .externs
+        .iter()
+        .map(|decl| {
+            decl.call_params()
+                .map(|param| param.mode)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let const_types = program
         .const_arena
         .iter()
@@ -752,6 +767,7 @@ fn rewrite_direct_call_args(program: &mut Program) {
             &mut function.body.block,
             &modes,
             &function_type_modes,
+            &extern_modes,
             &const_types,
             &mut function.locals,
         );
@@ -762,6 +778,7 @@ fn rewrite_air_block_call_args(
     block: &mut AirBlock,
     modes: &[Vec<ParamMode>],
     function_type_modes: &HashMap<TypeId, Vec<ParamMode>>,
+    extern_modes: &[Vec<ParamMode>],
     const_types: &[TypeId],
     locals: &mut Vec<super::Local>,
 ) {
@@ -774,6 +791,7 @@ fn rewrite_air_block_call_args(
                     value,
                     modes,
                     function_type_modes,
+                    extern_modes,
                     const_types,
                     locals,
                 );
@@ -785,6 +803,7 @@ fn rewrite_air_block_call_args(
                     value,
                     modes,
                     function_type_modes,
+                    extern_modes,
                     const_types,
                     locals,
                 );
@@ -796,6 +815,7 @@ fn rewrite_air_block_call_args(
                     value,
                     modes,
                     function_type_modes,
+                    extern_modes,
                     const_types,
                     locals,
                 );
@@ -805,6 +825,7 @@ fn rewrite_air_block_call_args(
                     &mut branch.then_block,
                     modes,
                     function_type_modes,
+                    extern_modes,
                     const_types,
                     locals,
                 );
@@ -813,6 +834,7 @@ fn rewrite_air_block_call_args(
                         else_block,
                         modes,
                         function_type_modes,
+                        extern_modes,
                         const_types,
                         locals,
                     );
@@ -824,6 +846,7 @@ fn rewrite_air_block_call_args(
                     &mut loop_.body,
                     modes,
                     function_type_modes,
+                    extern_modes,
                     const_types,
                     locals,
                 );
@@ -835,6 +858,7 @@ fn rewrite_air_block_call_args(
                         &mut arm.block,
                         modes,
                         function_type_modes,
+                        extern_modes,
                         const_types,
                         locals,
                     );
@@ -844,6 +868,7 @@ fn rewrite_air_block_call_args(
                         else_block,
                         modes,
                         function_type_modes,
+                        extern_modes,
                         const_types,
                         locals,
                     );
@@ -855,6 +880,7 @@ fn rewrite_air_block_call_args(
                     &mut match_.some_block,
                     modes,
                     function_type_modes,
+                    extern_modes,
                     const_types,
                     locals,
                 );
@@ -862,6 +888,7 @@ fn rewrite_air_block_call_args(
                     &mut match_.none_block,
                     modes,
                     function_type_modes,
+                    extern_modes,
                     const_types,
                     locals,
                 );
@@ -883,11 +910,18 @@ fn rewrite_air_value_stmt(
     mut value: RValue,
     modes: &[Vec<ParamMode>],
     function_type_modes: &HashMap<TypeId, Vec<ParamMode>>,
+    extern_modes: &[Vec<ParamMode>],
     const_types: &[TypeId],
     locals: &mut Vec<super::Local>,
 ) {
-    let prepended =
-        rewrite_value_call_args(&mut value, modes, function_type_modes, const_types, locals);
+    let prepended = rewrite_value_call_args(
+        &mut value,
+        modes,
+        function_type_modes,
+        extern_modes,
+        const_types,
+        locals,
+    );
     out.extend(prepended);
     out.push(match kind {
         AirStmtValue::Init(local) => AirStmt::Init { local, value },
@@ -900,6 +934,7 @@ fn rewrite_value_call_args(
     value: &mut RValue,
     modes: &[Vec<ParamMode>],
     function_type_modes: &HashMap<TypeId, Vec<ParamMode>>,
+    extern_modes: &[Vec<ParamMode>],
     const_types: &[TypeId],
     locals: &mut Vec<super::Local>,
 ) -> Vec<AirStmt> {
@@ -909,9 +944,10 @@ fn rewrite_value_call_args(
     let expected = match callee {
         Callee::Function(callee) => modes.get(callee.index()),
         Callee::Closure(operand) => {
-            operand_type(operand, const_types).and_then(|ty| function_type_modes.get(&ty))
+            typing::operand_ty_with(operand, |id| const_type(const_types, id))
+                .and_then(|ty| function_type_modes.get(&ty))
         }
-        Callee::Extern(_) => None,
+        Callee::Extern(callee) => extern_modes.get(callee.index()),
     };
     let Some(expected) = expected else {
         return vec![];
@@ -938,7 +974,8 @@ fn rewrite_call_args(
                 Some(CallArg::SharedBorrow(place.clone()))
             }
             (ParamMode::SharedBorrow, CallArg::Value(Operand::Const(value))) => {
-                let ty = const_types[value.index()];
+                let ty = const_type(const_types, *value)
+                    .expect("ownership const type snapshot should contain every AIR const");
                 let local = LocalId::from_index(locals.len());
                 locals.push(super::Local {
                     name: None,
@@ -969,11 +1006,8 @@ fn rewrite_call_args(
     prepended
 }
 
-fn operand_type(operand: &Operand, const_types: &[TypeId]) -> Option<TypeId> {
-    match operand {
-        Operand::Place(place) => Some(place.ty),
-        Operand::Const(value) => const_types.get(value.index()).copied(),
-    }
+fn const_type(const_types: &[TypeId], id: ConstId) -> Option<TypeId> {
+    const_types.get(id.index()).copied()
 }
 
 fn collect_function_type_modes(
@@ -1823,6 +1857,7 @@ mod tests {
             const_args: vec![],
             rep: ExternRep::Shared,
             has_init: false,
+            init_fields: vec![],
             fields: vec![],
             methods: vec![],
             statics: vec![],
@@ -1836,6 +1871,7 @@ mod tests {
             const_args: vec![],
             rep: ExternRep::Inline,
             has_init: false,
+            init_fields: vec![],
             fields: vec![],
             methods: vec![],
             statics: vec![],

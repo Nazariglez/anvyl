@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use crate::{descriptor::*, keys::*};
 
@@ -77,6 +77,32 @@ pub enum NameKind {
 pub enum TypeContext {
     Param,
     Nested,
+}
+
+impl fmt::Display for NameKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Provider => "provider",
+            Self::ModuleSegment => "module segment",
+            Self::Type => "type",
+            Self::Function => "function",
+            Self::Field => "field",
+            Self::FieldInit => "field initializer",
+            Self::Method => "method",
+            Self::Static => "static",
+            Self::Param => "parameter",
+            Self::NamedType => "named type",
+        })
+    }
+}
+
+impl fmt::Display for TypeContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Param => "parameter position",
+            Self::Nested => "nested type position",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,7 +406,7 @@ fn check_module_path(path: &ModulePath, errors: &mut Vec<ExternDescriptorError>)
 }
 
 fn check_name(kind: NameKind, name: &str, errors: &mut Vec<ExternDescriptorError>) {
-    if !is_valid_name(name) {
+    if !is_valid_extern_name(name) {
         errors.push(ExternDescriptorError::InvalidName {
             kind,
             name: name.to_string(),
@@ -388,14 +414,16 @@ fn check_name(kind: NameKind, name: &str, errors: &mut Vec<ExternDescriptorError
     }
 }
 
-fn is_valid_name(name: &str) -> bool {
+fn is_valid_extern_name(name: &str) -> bool {
+    is_identifier_shaped(name) && !name.starts_with("__")
+}
+
+fn is_identifier_shaped(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    (first.is_alphabetic() || first == '_')
-        && chars.all(|c| c.is_alphanumeric() || c == '_')
-        && !name.starts_with("__")
+    (first.is_alphabetic() || first == '_') && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+struct Token {
+    __id: int,
+}
+
+fn take(value: int) {}
+
+fn main() {
+    let token = Token { __id: 2 };
+    take(token.__id);
+}

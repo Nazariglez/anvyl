@@ -27,49 +27,25 @@ impl Printer<'_> {
                 self.write_fmt(name);
                 self.format_struct_pattern_args(fields, false);
             }
-            ast::Pattern::EnumUnit { qualifier, variant } => {
-                self.write_fmt(qualifier);
-                self.write(".");
-                self.write_fmt(variant);
-            }
-            ast::Pattern::EnumTuple {
+            ast::Pattern::Enum {
                 qualifier,
                 variant,
-                fields,
+                payload,
             } => {
-                self.write_fmt(qualifier);
+                if let Some(qualifier) = qualifier {
+                    self.write_fmt(qualifier);
+                }
                 self.write(".");
                 self.write_fmt(variant);
-                self.format_tuple_pattern_args(fields);
-            }
-            ast::Pattern::EnumStruct {
-                qualifier,
-                variant,
-                fields,
-                has_rest,
-            } => {
-                self.write_fmt(qualifier);
-                self.write(".");
-                self.write_fmt(variant);
-                self.format_struct_pattern_args(fields, *has_rest);
-            }
-            ast::Pattern::InferredEnumUnit { variant } => {
-                self.write(".");
-                self.write_fmt(variant);
-            }
-            ast::Pattern::InferredEnumTuple { variant, fields } => {
-                self.write(".");
-                self.write_fmt(variant);
-                self.format_tuple_pattern_args(fields);
-            }
-            ast::Pattern::InferredEnumStruct {
-                variant,
-                fields,
-                has_rest,
-            } => {
-                self.write(".");
-                self.write_fmt(variant);
-                self.format_struct_pattern_args(fields, *has_rest);
+                match payload {
+                    ast::EnumPatternPayload::Unit => {}
+                    ast::EnumPatternPayload::Tuple(fields) => {
+                        self.format_tuple_pattern_args(fields);
+                    }
+                    ast::EnumPatternPayload::Struct { fields, has_rest } => {
+                        self.format_struct_pattern_args(fields, *has_rest);
+                    }
+                }
             }
             ast::Pattern::Range {
                 start,

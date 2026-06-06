@@ -1,0 +1,27 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend int {
+    fn plus(self, amount: int = 1) -> int {
+        self + amount
+    }
+
+    fn fallback(value: int = 2) -> int {
+        value
+    }
+}
+
+extend string {
+    fn take(self, amount: int = 1) -> int {
+        amount
+    }
+}
+
+fn main() {
+    let a: int = 3.plus();
+    let b: int = 3.plus(4);
+    let c: int = int.fallback();
+    let d: int = int.fallback(5);
+    let e: int = "s".take();
+}

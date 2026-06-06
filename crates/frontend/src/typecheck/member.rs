@@ -1,9 +1,8 @@
 use super::{
     CallableRef, DeclarationIndex, Exposure, ExtendMethodMatch, ExtendMethodSchema, ExtendSchema,
     GenericArgs, GenericParams, MethodKey, MethodMode, MethodSurface, ModuleScope, PromotedAlias,
-    SurfaceSlot, TypeChecker,
+    ResolvedNominal, SurfaceSlot, TypeChecker,
     annotation::AccessPolicy,
-    decls::nominal_type,
     extend_target::{
         ExtendTargetPattern, MatchedTargetPattern, match_exact_target, most_specific_target_match,
         permits_receiver_conversion,
@@ -42,6 +41,18 @@ pub(super) struct PromotedFieldAccess {
 pub(super) enum PromotedFieldTarget {
     Aggregate(FieldAccess),
     Extern(ExternFieldAccess),
+}
+
+#[derive(Clone, Copy)]
+enum PromotedMemberKind {
+    Field,
+    Method,
+}
+
+struct PromotedMember {
+    alias: PromotedAlias,
+    origin_owner: Type,
+    origin_member: Ident,
 }
 
 pub(super) enum FieldResolution {
@@ -314,24 +325,22 @@ pub(super) fn resolve_field(
     receiver_access: PlaceAccess,
     tc: &mut TypeChecker,
 ) -> FieldResolution {
-    if let Some(owner) = tc.extern_type_id(receiver) {
-        let owner_ty = nominal_type(&tc.extern_type(owner).nominal);
-        return match resolve_extern_field(owner, name, receiver_access, tc) {
-            Some(field) => FieldResolution::Extern(field),
-            None => FieldResolution::Missing { ty: owner_ty },
-        };
-    }
-
-    let Some(key) = tc.decls.key_for_type(receiver) else {
+    let Some(nominal) = tc.resolve_nominal(receiver) else {
         return FieldResolution::NonAggregate {
             ty: receiver.clone(),
         };
     };
-    let Some(agg) = tc.decls.aggregate(&key) else {
-        return FieldResolution::Missing {
-            ty: receiver.clone(),
-        };
+    let owner_ty = nominal.surface_ty();
+    let ResolvedNominal::Aggregate(agg) = nominal else {
+        if let ResolvedNominal::Extern { id, .. } = nominal {
+            return match resolve_extern_field(id, name, receiver_access, tc) {
+                Some(field) => FieldResolution::Extern(field),
+                None => FieldResolution::Missing { ty: owner_ty },
+            };
+        }
+        return FieldResolution::Missing { ty: owner_ty };
     };
+    let key = &agg.key;
     let Some(field) = agg.fields.get(name) else {
         let has_static = agg.methods.contains_key(&MethodKey::static_(name));
         if let Some(promoted) = resolve_promoted_field(receiver, name, receiver_access, tc) {
@@ -350,7 +359,7 @@ pub(super) fn resolve_field(
     FieldResolution::Direct(FieldAccess {
         ty: super::substitute_aggregate_member(receiver, &agg.generics, &field.ty),
         policy: field.policy.clone(),
-        origin: key.module,
+        origin: key.module.clone(),
     })
 }
 
@@ -360,9 +369,8 @@ fn resolve_promoted_field(
     receiver_access: PlaceAccess,
     tc: &mut TypeChecker,
 ) -> Option<FieldResolution> {
-    let surface = tc.promoted_surface_for(receiver)?;
-    let alias = match single_promoted_alias(surface.fields.get(&name)?) {
-        Ok(alias) => alias,
+    let member = match resolve_promoted_member(receiver, name, PromotedMemberKind::Field, tc)? {
+        Ok(member) => member,
         Err(candidates) => {
             return Some(FieldResolution::AmbiguousPromoted {
                 ty: receiver.clone(),
@@ -371,8 +379,9 @@ fn resolve_promoted_field(
             });
         }
     };
-    let origin_owner = alias.origin.0.clone();
-    let origin_field = alias.origin_member;
+    let alias = member.alias;
+    let origin_owner = member.origin_owner;
+    let origin_field = member.origin_member;
     if let Some(owner) = tc.extern_type_id(&origin_owner) {
         let field = resolve_extern_field(owner, origin_field, receiver_access, tc)?;
         return Some(FieldResolution::Promoted(PromotedFieldAccess {
@@ -395,7 +404,7 @@ fn resolve_promoted_field(
         target: PromotedFieldTarget::Aggregate(FieldAccess {
             ty: super::substitute_aggregate_member(&origin_owner, &origin.generics, &field.ty),
             policy: field.policy.clone(),
-            origin: key.module,
+            origin: key.module.clone(),
         }),
     }))
 }
@@ -425,32 +434,32 @@ pub(super) fn resolve_method(
     let mut static_method_on_value = false;
     let mut aggregate_ty = None;
 
-    if let Some(owner) = tc.extern_type_id(receiver) {
-        let owner_ty = nominal_type(&tc.extern_type(owner).nominal);
-        aggregate_ty = Some(owner_ty.clone());
-        if let Some(method) = resolve_extern_method(owner, name, tc) {
-            return MethodResolution::Extern(Box::new(method));
-        }
-        static_method_on_value = tc.externs.static_method(owner, name).is_some();
-    }
-
-    if let Some(key) = tc.decls.key_for_type(receiver) {
-        aggregate_ty.get_or_insert_with(|| receiver.clone());
-        if let Some(agg) = tc.decls.aggregate(&key) {
-            if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
-                return MethodResolution::Direct(Box::new(MethodAccess {
-                    callee: tc.decls.callable_for_aggregate_method(
-                        agg,
-                        name,
-                        method,
-                        receiver.clone(),
-                    ),
-                    mode: method.mode,
-                    policy: method.policy.clone(),
-                    origin: key.module,
-                }));
+    if let Some(nominal) = tc.resolve_nominal(receiver) {
+        aggregate_ty = Some(nominal.surface_ty());
+        match nominal {
+            ResolvedNominal::Aggregate(agg) => {
+                if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
+                    return MethodResolution::Direct(Box::new(MethodAccess {
+                        callee: tc.decls.callable_for_aggregate_method(
+                            agg,
+                            name,
+                            method,
+                            receiver.clone(),
+                        ),
+                        mode: method.mode,
+                        policy: method.policy.clone(),
+                        origin: agg.key.module.clone(),
+                    }));
+                }
+                static_method_on_value |= agg.methods.contains_key(&MethodKey::static_(name));
             }
-            static_method_on_value |= agg.methods.contains_key(&MethodKey::static_(name));
+            ResolvedNominal::Extern { id, .. } => {
+                if let Some(method) = resolve_extern_method(id, name, tc) {
+                    return MethodResolution::Extern(Box::new(method));
+                }
+                static_method_on_value = tc.externs.static_method(id, name).is_some();
+            }
+            ResolvedNominal::Enum { .. } => {}
         }
     }
 
@@ -498,9 +507,8 @@ fn resolve_promoted_method(
     name: Ident,
     tc: &mut TypeChecker,
 ) -> Option<MethodResolution> {
-    let surface = tc.promoted_surface_for(receiver)?;
-    let alias = match single_promoted_alias(surface.methods.get(&name)?) {
-        Ok(alias) => alias,
+    let member = match resolve_promoted_member(receiver, name, PromotedMemberKind::Method, tc)? {
+        Ok(member) => member,
         Err(candidates) => {
             return Some(MethodResolution::AmbiguousPromoted {
                 ty: receiver.clone(),
@@ -509,8 +517,9 @@ fn resolve_promoted_method(
             });
         }
     };
-    let origin_owner = alias.origin.0.clone();
-    let origin_method = alias.origin_member;
+    let alias = member.alias;
+    let origin_owner = member.origin_owner;
+    let origin_method = member.origin_member;
     if let Some(owner) = tc.extern_type_id(&origin_owner) {
         let method = resolve_extern_method(owner, origin_method, tc)?;
         return Some(MethodResolution::Promoted(Box::new(PromotedMethodAccess {
@@ -539,9 +548,31 @@ fn resolve_promoted_method(
             ),
             mode: method.mode,
             policy: method.policy.clone(),
-            origin: key.module,
+            origin: key.module.clone(),
         })),
     })))
+}
+
+fn resolve_promoted_member(
+    receiver: &Type,
+    name: Ident,
+    kind: PromotedMemberKind,
+    tc: &mut TypeChecker,
+) -> Option<Result<PromotedMember, Vec<Vec<Ident>>>> {
+    let surface = tc.promoted_surface_for(receiver)?;
+    let slot = match kind {
+        PromotedMemberKind::Field => surface.fields.get(&name)?,
+        PromotedMemberKind::Method => surface.methods.get(&name)?,
+    };
+    let alias = match single_promoted_alias(slot) {
+        Ok(alias) => alias.clone(),
+        Err(candidates) => return Some(Err(candidates)),
+    };
+    Some(Ok(PromotedMember {
+        origin_owner: alias.origin.0.clone(),
+        origin_member: alias.origin_member,
+        alias,
+    }))
 }
 
 fn single_promoted_alias(

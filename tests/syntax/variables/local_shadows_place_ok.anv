@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Local {
+    x: int,
+}
+
+struct Global {
+    y: int,
+}
+
+lazy var item = Global { y: 0 };
+
+fn main() {
+    var item = Local { x: 1 };
+    item.x = 2;
+}

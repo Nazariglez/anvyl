@@ -317,7 +317,7 @@ impl<'a> PlanCx<'a> {
         })
     }
 
-    fn gap(&self, site: RustTargetGapSite, kind: RustTargetGapKind) -> RustPlanError {
+    fn gap(site: RustTargetGapSite, kind: RustTargetGapKind) -> RustPlanError {
         RustPlanError::TargetGaps(vec![RustTargetGap { site, kind }])
     }
 
@@ -402,7 +402,7 @@ impl<'a> PlanCx<'a> {
                 }
                 TypeData::Slice(elem) => RirType::Slice(self.type_map[elem]),
                 TypeData::Any | TypeData::Map { .. } | TypeData::Function(_) | TypeData::Dyn(_) => {
-                    return Err(self.gap(
+                    return Err(Self::gap(
                         RustTargetGapSite::Type(type_id),
                         RustTargetGapKind::UnsupportedType,
                     ));
@@ -481,7 +481,7 @@ impl<'a> PlanCx<'a> {
     ) -> Result<RirStructId, RustPlanError> {
         let decl = self.air.aggregate(aggregate);
         if decl.kind != air::AggregateKind::Struct {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Type(type_id),
                 RustTargetGapKind::UnsupportedType,
             ));
@@ -517,13 +517,13 @@ impl<'a> PlanCx<'a> {
         let mut fields = vec![];
         for (index, field) in decl.fields.iter().enumerate() {
             let Some(&ty) = self.type_map.get(&field.ty) else {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Type(field.ty),
                     RustTargetGapKind::UnsupportedType,
                 ));
             };
             if field.ty == type_id {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Type(field.ty),
                     RustTargetGapKind::UnsupportedType,
                 ));
@@ -546,7 +546,7 @@ impl<'a> PlanCx<'a> {
     ) -> Result<RirDataRefId, RustPlanError> {
         let decl = self.air.aggregate(aggregate);
         if decl.kind != air::AggregateKind::DataRef {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Type(type_id),
                 RustTargetGapKind::UnsupportedType,
             ));
@@ -581,7 +581,7 @@ impl<'a> PlanCx<'a> {
         let mut fields = vec![];
         for (index, field) in decl.fields.iter().enumerate() {
             let Some(&ty) = self.type_map.get(&field.ty) else {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Type(field.ty),
                     RustTargetGapKind::UnsupportedType,
                 ));
@@ -604,7 +604,7 @@ impl<'a> PlanCx<'a> {
     ) -> Result<RirStructId, RustPlanError> {
         let decl = self.air.extern_type(ext);
         if decl.rep != air::ExternRep::Inline {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Type(type_id),
                 RustTargetGapKind::UnsupportedType,
             ));
@@ -637,14 +637,17 @@ impl<'a> PlanCx<'a> {
         struct_id: RirStructId,
     ) -> Result<(), RustPlanError> {
         let decl = self.air.extern_type(ext);
+        let fields = match decl.constructor_fields() {
+            Some(fields) => fields.map(|(_, field)| field).collect::<Vec<_>>(),
+            None => decl.fields.iter().filter(|field| !field.computed).collect(),
+        };
         let mut seen = vec![];
-        let fields = decl
-            .fields
-            .iter()
+        let fields = fields
+            .into_iter()
             .enumerate()
             .map(|(index, field)| {
                 let Some(&ty) = self.type_map.get(&field.ty) else {
-                    return Err(self.gap(
+                    return Err(Self::gap(
                         RustTargetGapSite::Type(field.ty),
                         RustTargetGapKind::UnsupportedType,
                     ));
@@ -798,14 +801,14 @@ impl<'a> PlanCx<'a> {
         index: usize,
     ) -> Result<RirField, RustPlanError> {
         let Some(&rir_ty) = self.type_map.get(&ty) else {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Type(ty),
                 RustTargetGapKind::UnsupportedType,
             ));
         };
         let recursive = ty == enum_ty;
         if recursive {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Type(ty),
                 RustTargetGapKind::UnsupportedType,
             ));
@@ -843,7 +846,7 @@ impl<'a> PlanCx<'a> {
                 self.classify_aggregate_stringify(program, ty, *aggregate)?
             }
             _ => {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Type(ty),
                     RustTargetGapKind::UnsupportedStructuralStringify,
                 ));
@@ -868,7 +871,7 @@ impl<'a> PlanCx<'a> {
         if let Some(function) = decl.stringify_override {
             let override_fn = self.air.function(function);
             let Some(receiver) = override_fn.signature.params.first() else {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::UnsupportedStructuralStringify,
                 ));
@@ -884,7 +887,7 @@ impl<'a> PlanCx<'a> {
                         mode: RirParamSemantic::Value,
                     })
                 }
-                ParamMode::Value | ParamMode::MutBorrow => Err(self.gap(
+                ParamMode::Value | ParamMode::MutBorrow => Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::NonCopyValueRequired,
                 )),
@@ -910,7 +913,7 @@ impl<'a> PlanCx<'a> {
         }
         let decl = self.air.aggregate(aggregate);
         if decl.kind != air::AggregateKind::Struct {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Type(ty),
                 RustTargetGapKind::UnsupportedStructuralStringify,
             ));
@@ -978,7 +981,6 @@ impl<'a> PlanCx<'a> {
     fn extern_params(&self, program: &RirProgram, decl: &air::ExternDecl) -> Vec<RirExternParam> {
         let policy = RustRepPolicy::new(program);
         decl.call_params()
-            .into_iter()
             .map(|param| {
                 let ty = self.type_map[&param.ty];
                 let semantic = rir::semantic_from_air(param.mode);
@@ -998,13 +1000,13 @@ impl<'a> PlanCx<'a> {
     ) -> Result<RirExternKind, RustPlanError> {
         if let Some(binding) = &decl.binding {
             let native = self.native_binding(binding).ok_or_else(|| {
-                self.gap(
+                Self::gap(
                     RustTargetGapSite::Extern(air_id),
                     RustTargetGapKind::UnsupportedExtern,
                 )
             })?;
             if native.abi.support != RustAbiSupport::Direct {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Extern(air_id),
                     RustTargetGapKind::UnsupportedRustAbi,
                 ));
@@ -1015,7 +1017,7 @@ impl<'a> PlanCx<'a> {
             }));
         }
 
-        Err(self.gap(
+        Err(Self::gap(
             RustTargetGapSite::Extern(air_id),
             RustTargetGapKind::UnsupportedExtern,
         ))
@@ -1027,7 +1029,7 @@ impl<'a> PlanCx<'a> {
         decl: &air::ExternTypeDecl,
     ) -> Result<&anvyx_runtime::RustTypeBinding, RustPlanError> {
         let Some(binding) = &decl.binding else {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Type(type_id),
                 RustTargetGapKind::UnsupportedExtern,
             ));
@@ -1047,7 +1049,7 @@ impl<'a> PlanCx<'a> {
                     .find(|native| native.key == binding.key)
             })
             .ok_or_else(|| {
-                self.gap(
+                Self::gap(
                     RustTargetGapSite::Type(type_id),
                     RustTargetGapKind::UnsupportedExtern,
                 )
@@ -1411,7 +1413,7 @@ impl<'a> PlanCx<'a> {
             }
             RValue::ListPush { list, value } => {
                 if self.place_crosses_dataref(function, list) {
-                    return Err(self.gap(
+                    return Err(Self::gap(
                         RustTargetGapSite::Function(function),
                         RustTargetGapKind::UnsupportedPlaceProjection,
                     ));
@@ -1492,7 +1494,7 @@ impl<'a> PlanCx<'a> {
             }
             RValue::MapInsert { map, key, value } => {
                 if self.place_crosses_dataref(function, map) {
-                    return Err(self.gap(
+                    return Err(Self::gap(
                         RustTargetGapSite::Function(function),
                         RustTargetGapKind::UnsupportedPlaceProjection,
                     ));
@@ -1513,7 +1515,7 @@ impl<'a> PlanCx<'a> {
             }
             RValue::MapRemove { map, key, ty } => {
                 if self.place_crosses_dataref(function, map) {
-                    return Err(self.gap(
+                    return Err(Self::gap(
                         RustTargetGapSite::Function(function),
                         RustTargetGapKind::UnsupportedPlaceProjection,
                     ));
@@ -1530,7 +1532,7 @@ impl<'a> PlanCx<'a> {
                 }
             }
             RValue::ListPop { .. } | RValue::MapEntryAt { .. } | RValue::MakeClosure { .. } => {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::UnsupportedRValue,
                 ));
@@ -1561,7 +1563,7 @@ impl<'a> PlanCx<'a> {
         if !self.rust_copyable_air_type(place.ty)
             && !self.air_policy().value_place_shareable(place.ty)
         {
-            return Err(self.gap(
+            return Err(Self::gap(
                 RustTargetGapSite::Function(function),
                 RustTargetGapKind::NonCopyValueRequired,
             ));
@@ -1634,7 +1636,7 @@ impl<'a> PlanCx<'a> {
                 fields: fields.operands,
             },
             AggregateCtor::Map => {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::UnsupportedRValue,
                 ));
@@ -1670,7 +1672,7 @@ impl<'a> PlanCx<'a> {
                 )
             }
             Callee::Closure(_) => {
-                return Err(self.gap(
+                return Err(Self::gap(
                     RustTargetGapSite::Function(function_id),
                     RustTargetGapKind::UnsupportedCallee,
                 ));
@@ -1888,7 +1890,7 @@ impl<'a> PlanCx<'a> {
             *current_ty = self.projected_ty(*current_ty, projection);
             current_place
                 .projections
-                .push(self.rir_projection(projection));
+                .push(Self::rir_projection(projection));
             current_place.ty = self.type_map[&*current_ty];
             *index += 1;
         }
@@ -1950,7 +1952,7 @@ impl<'a> PlanCx<'a> {
         let mut segment = vec![];
         while index < projections.len() {
             let projection = &projections[index];
-            segment.push(self.rir_projection(projection));
+            segment.push(Self::rir_projection(projection));
             current_ty = self.projected_ty(current_ty, projection);
             index += 1;
             if matches!(self.air.type_arena.data(current_ty), TypeData::DataRef(_))
@@ -2006,7 +2008,7 @@ impl<'a> PlanCx<'a> {
         id
     }
 
-    fn rir_projection(&self, projection: &Projection) -> RirProjection {
+    fn rir_projection(projection: &Projection) -> RirProjection {
         match projection {
             Projection::Field(field) => RirProjection::Field(RirFieldId::from_index(field.index())),
             Projection::Index(local) => RirProjection::Index(RirLocalId::from_index(local.index())),
@@ -2020,10 +2022,9 @@ impl<'a> PlanCx<'a> {
     }
 
     fn operand_ty(&self, operand: &Operand) -> TypeId {
-        match operand {
-            Operand::Place(place) => place.ty,
-            Operand::Const(id) => self.air.const_arena.get(*id).ty,
-        }
+        self.air
+            .operand_ty(operand)
+            .expect("verified AIR operand const should exist")
     }
 
     fn rust_copyable_air_type(&self, ty: TypeId) -> bool {
@@ -2037,11 +2038,7 @@ impl<'a> PlanCx<'a> {
     fn plan_place(&self, place: &Place) -> RirPlace {
         RirPlace {
             local: RirLocalId::from_index(place.root.index()),
-            projections: place
-                .projection
-                .iter()
-                .map(|projection| self.rir_projection(projection))
-                .collect(),
+            projections: place.projection.iter().map(Self::rir_projection).collect(),
             ty: self.type_map[&place.ty],
         }
     }

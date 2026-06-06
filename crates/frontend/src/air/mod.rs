@@ -169,6 +169,10 @@ impl Program {
         self.render_type(ty, TypeRender::Display)
     }
 
+    pub fn operand_ty(&self, operand: &Operand) -> Option<TypeId> {
+        typing::operand_ty(self, operand)
+    }
+
     pub fn type_helper_key(&self, ty: TypeId) -> String {
         self.render_type(ty, TypeRender::HelperKey)
     }

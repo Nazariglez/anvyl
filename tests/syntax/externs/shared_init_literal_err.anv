@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: does not support struct literal construction
+
+extern type Handle rep shared {
+    init;
+    id: int;
+}
+
+fn main() {
+    let handle = Handle { id: 1 };
+}

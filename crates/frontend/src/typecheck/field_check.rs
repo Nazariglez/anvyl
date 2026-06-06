@@ -8,6 +8,7 @@ use super::{
 };
 use crate::{
     ast::{Ident, Type},
+    externs::catalog::ExternType,
     span::Span,
 };
 
@@ -29,10 +30,30 @@ pub(super) enum FieldOwner {
     Variant { key: NominalKey, variant: Ident },
 }
 
+pub(super) fn extern_field_schema(ty: &ExternType) -> NamedSchemas<FieldSchema> {
+    let mut schema = NamedSchemas::default();
+    for field in &ty.fields {
+        schema
+            .insert(
+                field.name,
+                FieldSchema {
+                    ty: field.ty.ty.clone(),
+                    default: None,
+                    policy: AccessPolicy::default(),
+                    span: None,
+                    embed: None,
+                },
+            )
+            .expect("extern fields are unique");
+    }
+    schema
+}
+
 #[derive(Clone, Copy)]
-pub(super) enum MissingFields {
+pub(super) enum MissingFields<'a> {
     None,
     RequireAll,
+    RequireOnly(&'a [Ident]),
     AllowDefaults,
     AllowRest { has_rest: bool },
 }
@@ -48,7 +69,7 @@ pub(super) fn check_named<T>(
     fields: &[(Ident, T)],
     schema: &NamedSchemas<FieldSchema>,
     owner: &FieldOwner,
-    missing: MissingFields,
+    missing: MissingFields<'_>,
     span: Option<Span>,
     field_span: impl Fn(&T) -> Span,
     tc: &mut TypeChecker,
@@ -69,7 +90,7 @@ pub(super) fn check(
     uses: &[FieldUse],
     schema: &NamedSchemas<FieldSchema>,
     owner: &FieldOwner,
-    missing: MissingFields,
+    missing: MissingFields<'_>,
     span: Option<Span>,
     tc: &mut TypeChecker,
 ) -> FieldShape {
@@ -103,16 +124,12 @@ pub(super) fn check(
         }
     }
 
-    if missing_fields_enabled(missing) {
+    if let Some(span) = span {
         for (name, field) in schema.iter() {
-            if seen.contains(&name) || missing_default_ok(missing, field) {
-                continue;
+            if !seen.contains(&name) && missing_required(missing, name, field) {
+                push_missing(owner, name, span, tc);
+                failed = true;
             }
-            let Some(span) = span else {
-                continue;
-            };
-            push_missing(owner, name, span, tc);
-            failed = true;
         }
     }
 
@@ -123,16 +140,14 @@ pub(super) fn check(
     }
 }
 
-fn missing_fields_enabled(missing: MissingFields) -> bool {
+fn missing_required(missing: MissingFields<'_>, name: Ident, field: &FieldSchema) -> bool {
     match missing {
         MissingFields::None => false,
-        MissingFields::RequireAll | MissingFields::AllowDefaults => true,
+        MissingFields::RequireAll => true,
+        MissingFields::RequireOnly(required) => required.contains(&name),
+        MissingFields::AllowDefaults => !field.has_default(),
         MissingFields::AllowRest { has_rest } => !has_rest,
     }
-}
-
-fn missing_default_ok(missing: MissingFields, field: &FieldSchema) -> bool {
-    matches!(missing, MissingFields::AllowDefaults) && field.has_default()
 }
 
 fn push_unknown(owner: &FieldOwner, name: Ident, span: Span, tc: &mut TypeChecker) {

@@ -1,6 +1,7 @@
 use super::{
-    ArityError, GenericArgs, GenericParams, TypeChecker, TypeError, const_term::ConstTerm,
-    infer::GenericSolverSeeds, type_ops::bare_type_name,
+    ArityError, GenericArgs, GenericParams, TypeChecker, TypeError,
+    const_term::ConstTerm,
+    infer::{GenericSolverSeeds, GenericSolverVars},
 };
 use crate::{
     ast::{ConstParamId, GenericArg, Type, TypeVarId},
@@ -14,7 +15,7 @@ pub(super) enum ExplicitGenericMode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-struct ExplicitGenericBindings {
+pub(super) struct ExplicitGenericBindings {
     type_args: Vec<(TypeVarId, Type)>,
     const_args: Vec<(ConstParamId, ConstTerm)>,
 }
@@ -34,6 +35,45 @@ pub(super) fn bind_exact_generic_args(
         &mut binder,
     )?;
     Some(materialize_exact(generics, &bindings))
+}
+
+pub(super) struct GenericSolveSession<'a> {
+    generics: &'a GenericParams,
+    vars: GenericSolverVars,
+    span: Span,
+}
+
+impl<'a> GenericSolveSession<'a> {
+    pub(super) fn new(
+        tc: &mut TypeChecker,
+        generics: &'a GenericParams,
+        seeds: &GenericSolverSeeds,
+        span: Span,
+    ) -> Self {
+        Self {
+            generics,
+            vars: tc
+                .solver
+                .generic_solver_vars(generics, seeds, tc.error_span(span)),
+            span,
+        }
+    }
+
+    pub(super) fn vars(&self) -> &GenericSolverVars {
+        &self.vars
+    }
+
+    pub(super) fn finish(&self, tc: &mut TypeChecker) -> Option<GenericArgs> {
+        let args = match tc.solver.finalize_generic_args(self.generics, &self.vars) {
+            Ok(args) => args,
+            Err(unbound) => {
+                tc.push_unbound_generic_errors(unbound, self.span);
+                return None;
+            }
+        };
+        tc.check_generic_bounds(self.generics, &args, self.span)
+            .then_some(args)
+    }
 }
 
 pub(super) fn bind_prefix_generic_seeds(
@@ -56,7 +96,10 @@ pub(super) fn bind_prefix_generic_seeds(
     })
 }
 
-fn materialize_exact(generics: &GenericParams, bindings: &ExplicitGenericBindings) -> GenericArgs {
+pub(super) fn materialize_exact(
+    generics: &GenericParams,
+    bindings: &ExplicitGenericBindings,
+) -> GenericArgs {
     GenericArgs {
         type_args: generics
             .type_params
@@ -87,7 +130,7 @@ fn const_binding(bindings: &ExplicitGenericBindings, id: ConstParamId) -> ConstT
         .expect("exact generic binder must bind every const parameter")
 }
 
-fn bind_explicit_generic_args(
+pub(super) fn bind_explicit_generic_args(
     generics: &GenericParams,
     args: &[GenericArg],
     span: Span,
@@ -120,10 +163,7 @@ fn bind_explicit_generic_args(
         }
 
         let const_index = index - type_len;
-        let term = explicit_const_term(arg).or_else(|| {
-            binder.push_kind_error("const", span);
-            None
-        })?;
+        let term = binder.const_term_arg(arg, span)?;
         let term = binder.eval_const_arg(term, span)?;
         bindings
             .const_args
@@ -135,15 +175,22 @@ fn bind_explicit_generic_args(
 fn explicit_const_term(arg: &GenericArg) -> Option<ConstTerm> {
     match arg {
         GenericArg::Const(arg) => Some(ConstTerm::from_arg(arg)),
-        GenericArg::Type(ty) => bare_type_name(ty).map(ConstTerm::Name),
+        GenericArg::Type(ty) => ty.bare_unresolved_name().map(ConstTerm::Name),
     }
 }
 
-trait ExplicitGenericBinder {
+pub(super) trait ExplicitGenericBinder {
     fn resolve_type_arg(&mut self, ty: &Type, span: Span) -> Option<Type>;
     fn eval_const_arg(&mut self, term: ConstTerm, span: Span) -> Option<ConstTerm>;
     fn push_arity_error(&mut self, expected: usize, found: usize, span: Span);
     fn push_kind_error(&mut self, expected: &'static str, span: Span);
+
+    fn const_term_arg(&mut self, arg: &GenericArg, span: Span) -> Option<ConstTerm> {
+        explicit_const_term(arg).or_else(|| {
+            self.push_kind_error("const", span);
+            None
+        })
+    }
 }
 
 struct TypeCheckerGenericBinder<'tc> {
@@ -357,7 +404,7 @@ mod tests {
         assert!(matches!(
             tc.errors.first(),
             Some(TypeError::UnknownConst { name, span: err_span })
-                if *name == ident("N") && err_span.map(|span| span.byte()) == Some(span())
+                if *name == ident("N") && err_span.map(crate::span::SourceSpan::byte) == Some(span())
         ));
     }
 
@@ -370,7 +417,7 @@ mod tests {
         assert!(matches!(
             tc.errors.first(),
             Some(TypeError::GenericArgKindMismatch { expected: "type", span: err_span })
-                if err_span.map(|span| span.byte()) == Some(span())
+                if err_span.map(crate::span::SourceSpan::byte) == Some(span())
         ));
     }
 
@@ -386,7 +433,7 @@ mod tests {
         assert!(matches!(
             tc.errors.first(),
             Some(TypeError::GenericArgKindMismatch { expected: "const", span: err_span })
-                if err_span.map(|span| span.byte()) == Some(span())
+                if err_span.map(crate::span::SourceSpan::byte) == Some(span())
         ));
     }
 

@@ -688,6 +688,7 @@ fn extern_member_receiver_mode_mismatch() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
+        init_fields: vec![],
         fields: vec![],
         methods: vec![],
         statics: vec![],
@@ -1505,6 +1506,7 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
+        init_fields: vec![],
         fields: vec![],
         methods: vec![],
         statics: vec![],
@@ -2097,6 +2099,70 @@ fn enum_struct_ctor_slot_type_mismatch() {
         EK::BadRValue(BadRValue::EnumCtorFieldTypeMismatch { enum_id: id, variant, field: 0, expected, found })
             if id == enum_id && variant == VariantId::from_index(0) && expected == int_ty && found == bool_ty
     )));
+}
+
+#[test]
+fn extern_ctor_requires_inline_init() {
+    for (name, rep, has_init, init_fields) in [
+        (
+            "shared",
+            ExternRep::Shared,
+            true,
+            vec![FieldId::from_index(0)],
+        ),
+        ("no_init", ExternRep::Inline, false, vec![]),
+    ] {
+        let mut builder = ProgramBuilder::default();
+        let ext_id = ExternTypeId::from_index(0);
+        let ext_ty = builder.alloc_type(TypeData::Extern(ext_id));
+        let int_ty = builder.int_ty();
+        let void_ty = builder.void_ty();
+        let module = test_module(&mut builder);
+        let id = builder.alloc_extern_type(ExternTypeDecl {
+            name: Ident::new("Handle"),
+            module,
+            binding: None,
+            type_args: vec![],
+            const_args: vec![],
+            rep,
+            has_init,
+            init_fields,
+            fields: vec![ExternFieldDecl {
+                name: Ident::new("id"),
+                ty: int_ty,
+                get_receiver: ExternReceiverDecl {
+                    ty: ext_ty,
+                    mode: ParamMode::SharedBorrow,
+                },
+                set_receiver: ExternReceiverDecl {
+                    ty: ext_ty,
+                    mode: ParamMode::MutBorrow,
+                },
+                computed: false,
+                readable: true,
+                writable: true,
+            }],
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+        });
+        assert_eq!(id, ext_id);
+
+        let errors = verify_void_entry(builder, name, module, void_ty, |fb, bb0| {
+            fb.add_statement(
+                bb0,
+                stmt_eval(RValue::Aggregate {
+                    kind: AggregateCtor::Extern(ext_id),
+                    fields: vec![],
+                    ty: ext_ty,
+                }),
+            );
+        });
+        assert!(errors.iter().any(|e| matches!(
+            e.kind,
+            EK::BadRValue(BadRValue::ExternCtorUnavailable { extern_id }) if extern_id == ext_id
+        )));
+    }
 }
 
 #[test]

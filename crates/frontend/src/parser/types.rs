@@ -2,10 +2,13 @@ use chumsky::{error::Rich, prelude::*};
 
 use super::{
     AnvParser, BoxedParser,
-    common::{TupleShapeResult, escaping_kw, escaping_type, identifier, validate_tuple_shape_raw},
+    common::{
+        TupleShapeResult, colon, escaping_kw, escaping_type, identifier, parenthesized_tuple_parts,
+        validate_tuple_shape_raw,
+    },
 };
 use crate::{
-    ast::{self, Type},
+    ast::{self, Type, TypeVisitor},
     lexer::{Delimiter, Keyword, LitToken, Op, Token},
 };
 
@@ -45,56 +48,21 @@ pub(super) fn type_subject_type_ident<'src>() -> BoxedParser<'src, Type> {
 }
 
 fn type_contains_slice(ty: &Type) -> bool {
-    match ty {
-        Type::Slice { .. } => true,
-        Type::Func { params, ret } => {
-            params.iter().any(|param| type_contains_slice(&param.ty))
-                || type_contains_slice(&ret.ty)
+    struct SliceVisitor;
+
+    impl TypeVisitor for SliceVisitor {
+        fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+            matches!(ty, Type::Slice { .. })
         }
-        Type::Tuple(elems) => elems.iter().any(type_contains_slice),
-        Type::Nominal(nominal) => nominal.type_args.iter().any(type_contains_slice),
-        Type::List { elem } | Type::Array { elem, .. } => type_contains_slice(elem),
-        Type::Optional { inner } => type_contains_slice(inner),
-        Type::Map { key, value } => type_contains_slice(key) || type_contains_slice(value),
-        Type::UnresolvedNominal { generic_args, .. } => {
-            generic_args.iter().any(generic_arg_contains_slice)
-        }
-        Type::Infer
-        | Type::InferReturn
-        | Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Var(_)
-        | Type::UnresolvedName(_) => false,
-        Type::Dyn(contract) => contract_ref_contains_slice(contract),
     }
+
+    SliceVisitor.visit_type(ty)
 }
 
 fn generic_arg_contains_slice(arg: &ast::GenericArg) -> bool {
     match arg {
         ast::GenericArg::Type(ty) => type_contains_slice(ty),
         ast::GenericArg::Const(_) => false,
-    }
-}
-
-fn contract_ref_contains_slice(contract: &ast::ContractRef) -> bool {
-    match contract {
-        ast::ContractRef::Anonymous(surface) => surface.requirements.iter().any(|requirement| {
-            requirement
-                .params
-                .iter()
-                .any(|param| type_contains_slice(&param.ty))
-                || type_contains_slice(&requirement.ret.ty)
-        }),
-        ast::ContractRef::Intersection(contracts) => {
-            contracts.iter().any(contract_ref_contains_slice)
-        }
-        ast::ContractRef::Named { .. } | ast::ContractRef::Infer | ast::ContractRef::Hole(_) => {
-            false
-        }
     }
 }
 
@@ -408,31 +376,19 @@ impl TupleTypeElem {
 }
 
 fn paren_or_tuple_type<'src>(type_parser: impl AnvParser<'src, Type>) -> BoxedParser<'src, Type> {
-    let comma = select! { Token::Comma => () };
-    let open_paren = select! { Token::Open(Delimiter::Parent) => () };
-    let close_paren = select! { Token::Close(Delimiter::Parent) => () };
-    let colon = select! { Token::Colon => () };
-
     let labelled_elem = identifier()
-        .then_ignore(colon)
+        .then_ignore(colon())
         .ignore_then(type_parser.clone())
         .map(TupleTypeElem::Labelled);
 
     let pos_elem = type_parser.map(TupleTypeElem::Pos);
     let elem = choice((labelled_elem, pos_elem));
 
-    let first_elem = elem.clone();
-    let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
-
-    open_paren
-        .ignore_then(first_elem.or_not())
-        .then(rest_elems)
-        .then(comma.or_not())
-        .then_ignore(close_paren)
-        .validate(|((first, rest), trailing_comma), e, emitter| {
+    parenthesized_tuple_parts(elem)
+        .validate(|parts, e, emitter| {
             let s = e.span();
-            let has_label = first.as_ref().is_some_and(TupleTypeElem::is_labelled)
-                || rest.iter().any(TupleTypeElem::is_labelled);
+            let has_label = parts.first.as_ref().is_some_and(TupleTypeElem::is_labelled)
+                || parts.rest.iter().any(TupleTypeElem::is_labelled);
 
             if has_label {
                 emitter.emit(Rich::custom(
@@ -442,10 +398,14 @@ fn paren_or_tuple_type<'src>(type_parser: impl AnvParser<'src, Type>) -> BoxedPa
                 return Type::Void;
             }
 
-            let first = first.map(TupleTypeElem::into_type);
-            let rest = rest.into_iter().map(TupleTypeElem::into_type).collect();
+            let first = parts.first.map(TupleTypeElem::into_type);
+            let rest = parts
+                .rest
+                .into_iter()
+                .map(TupleTypeElem::into_type)
+                .collect();
 
-            match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
+            match validate_tuple_shape_raw(first, rest, parts.trailing_comma) {
                 TupleShapeResult::Empty => {
                     emitter.emit(Rich::custom(s, "empty tuples are not supported"));
                     Type::Void

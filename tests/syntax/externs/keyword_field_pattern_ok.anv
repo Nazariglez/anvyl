@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Token rep inline {
+    init;
+    type: int;
+}
+
+fn main() {
+    let token = Token { type: 1 };
+    let Token { type: value } = token;
+    let out: int = value;
+}

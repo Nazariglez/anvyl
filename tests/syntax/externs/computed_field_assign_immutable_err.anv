@@ -3,7 +3,7 @@
 // @frontend: new
 // @contains: cannot assign to immutable value 'x'
 
-extern type Point {
+extern type Point rep inline {
     computed x: int;
     init;
 }

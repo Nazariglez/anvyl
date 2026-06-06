@@ -82,59 +82,68 @@ impl RawIdentityValidator {
         }
 
         for field in &ty.fields {
-            self.check_member(
-                RawExternMemberKey {
-                    owner: owner.clone(),
-                    selector: ExternMemberSelector::Field(field.decl.name.clone()),
-                },
+            self.check_member_site(
+                &owner,
+                ExternMemberSelector::Field(field.decl.name.clone()),
                 provenance,
-                member_site(field.site, ty.site),
+                field.site,
+                ty.site,
             );
         }
-
         if let Some(init) = &ty.init {
-            self.check_member(
-                RawExternMemberKey {
-                    owner: owner.clone(),
-                    selector: ExternMemberSelector::Init,
-                },
+            self.check_member_site(
+                &owner,
+                ExternMemberSelector::Init,
                 provenance,
-                member_site(init.site, ty.site),
+                init.site,
+                ty.site,
             );
         }
-
         for method in &ty.methods {
-            self.check_member(
-                RawExternMemberKey {
-                    owner: owner.clone(),
-                    selector: ExternMemberSelector::Method(method.decl.name.clone()),
-                },
+            self.check_member_site(
+                &owner,
+                ExternMemberSelector::Method(method.decl.name.clone()),
                 provenance,
-                member_site(method.site, ty.site),
+                method.site,
+                ty.site,
             );
         }
-
-        for static_method in &ty.statics {
-            self.check_member(
-                RawExternMemberKey {
-                    owner: owner.clone(),
-                    selector: ExternMemberSelector::Static(static_method.decl.name.clone()),
-                },
+        for method in &ty.statics {
+            self.check_member_site(
+                &owner,
+                ExternMemberSelector::Static(method.decl.name.clone()),
                 provenance,
-                member_site(static_method.site, ty.site),
+                method.site,
+                ty.site,
             );
         }
-
         for operator in &ty.operators {
-            self.check_member(
-                RawExternMemberKey {
-                    owner: owner.clone(),
-                    selector: ExternMemberSelector::Operator(operator.decl.op),
-                },
+            self.check_member_site(
+                &owner,
+                ExternMemberSelector::Operator(operator.decl.op),
                 provenance,
-                member_site(operator.site, ty.site),
+                operator.site,
+                ty.site,
             );
         }
+    }
+
+    fn check_member_site(
+        &mut self,
+        owner: &RawExternTypeKey,
+        selector: ExternMemberSelector,
+        provenance: &ExternProvenance,
+        member_site: RawExternSite,
+        owner_site: RawExternSite,
+    ) {
+        self.check_member(
+            RawExternMemberKey {
+                owner: owner.clone(),
+                selector,
+            },
+            provenance,
+            site_or_owner(member_site, owner_site),
+        );
     }
 
     fn check_member(
@@ -172,6 +181,6 @@ fn duplicate_identity(
     }
 }
 
-fn member_site(member: RawExternSite, owner: RawExternSite) -> RawExternSite {
-    if member.span.is_some() { member } else { owner }
+fn site_or_owner(site: RawExternSite, owner: RawExternSite) -> RawExternSite {
+    if site.span.is_some() { site } else { owner }
 }

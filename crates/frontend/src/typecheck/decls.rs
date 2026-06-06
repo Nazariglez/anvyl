@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::{
+    collections::{HashMap, HashSet, hash_map::Entry},
+    fmt,
+};
 
 use super::{
     CastFromInstanceKey, ConstSubst, DeprecatedUseKind, GenericArgs, GenericParams, TypeSubst,
@@ -10,7 +13,10 @@ use super::{
     generic_template_type, match_cast_conversion, substitute,
     surface::{dependent_embed_template_valid, projection_path_valid},
     type_ops::type_depends_on_generics,
-    type_refs::{GenericParamError, GenericTypeContext, TypeRefError, TypeRefResolver},
+    type_refs::{
+        GenericParamError, GenericTypeContext, TypeRefError, TypeRefResolver,
+        extend_generic_context_with_params, generic_context_from_params,
+    },
 };
 use crate::{
     ast::{
@@ -33,6 +39,16 @@ pub(crate) enum ModuleScope {
     Root,
     Named(ModulePath),
     Package(ModuleId),
+}
+
+impl fmt::Display for ModuleScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root => f.write_str("<root>"),
+            Self::Named(path) => write!(f, "{path}"),
+            Self::Package(module) => write!(f, "{module}"),
+        }
+    }
 }
 
 impl ModuleScope {
@@ -285,6 +301,15 @@ pub(crate) enum CallableKind {
     InstanceMethod,
     ExtendMethod(MethodSurface),
     EnumVariant,
+}
+
+impl CallableKind {
+    pub(crate) fn has_receiver_param(self) -> bool {
+        matches!(
+            self,
+            Self::InstanceMethod | Self::ExtendMethod(MethodSurface::Instance)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -670,6 +695,67 @@ pub(crate) enum DeclError {
         target: Type,
         span: Option<SourceSpan>,
     },
+}
+impl DeclError {
+    pub(crate) fn span(&self) -> Option<SourceSpan> {
+        match self {
+            DeclError::DuplicateValue { span, .. }
+            | DeclError::DuplicateType { span, .. }
+            | DeclError::MissingImportMember { span, .. }
+            | DeclError::PrivateImportMember { span, .. }
+            | DeclError::ImportConflict { span, .. }
+            | DeclError::DuplicateModuleBinding { span, .. }
+            | DeclError::DuplicateGenericParam { span, .. }
+            | DeclError::DuplicateAggregateMethod { span, .. }
+            | DeclError::DuplicateAggregateField { span, .. }
+            | DeclError::DuplicateEnumVariant { span, .. }
+            | DeclError::RawEnumInvalidBacking { span, .. }
+            | DeclError::RawEnumGenericParams { span, .. }
+            | DeclError::RawEnumValueWithoutBacking { span, .. }
+            | DeclError::RawEnumPayloadVariant { span, .. }
+            | DeclError::RawEnumMissingStringValue { span, .. }
+            | DeclError::RawEnumDuplicateValue { span, .. }
+            | DeclError::RawEnumIntOverflow { span, .. }
+            | DeclError::DuplicateVariantField { span, .. }
+            | DeclError::DuplicateContractRequirement { span, .. }
+            | DeclError::DuplicateExtendMethod { span, .. }
+            | DeclError::DuplicateCastFrom { span, .. }
+            | DeclError::PointlessCastFrom { span, .. }
+            | DeclError::CastFromReturnMismatch { span, .. }
+            | DeclError::UnsupportedExtendTarget { span, .. }
+            | DeclError::UnusedExtendTypeParam { span, .. }
+            | DeclError::UnusedExtendConstParam { span, .. }
+            | DeclError::UnusedAliasTypeParam { span, .. }
+            | DeclError::UnusedAliasConstParam { span, .. }
+            | DeclError::ExtendMethodConflict { span, .. }
+            | DeclError::ReexportConflict { span, .. }
+            | DeclError::UnknownType { span, .. }
+            | DeclError::UnknownAnnotation { span, .. }
+            | DeclError::InvalidAnnotationTarget { span, .. }
+            | DeclError::DuplicateAnnotation { span, .. }
+            | DeclError::InvalidAnnotationArgs { span, .. }
+            | DeclError::AsProjectionWithoutEmbed { span }
+            | DeclError::AsProjectionWithArgs { span }
+            | DeclError::InternalOnToString { span }
+            | DeclError::InvalidToStringMethod { span, .. }
+            | DeclError::EmptyEmbedSelector { span }
+            | DeclError::DuplicateEmbedSelector { span, .. }
+            | DeclError::EmbedSurfaceCycle { span, .. }
+            | DeclError::UnknownEmbedFieldSelector { span, .. }
+            | DeclError::EmbedFieldSelectorNamesMethod { span, .. }
+            | DeclError::AmbiguousEmbedFieldSelector { span, .. }
+            | DeclError::EmbedFieldConflictsWithDirect { span, .. }
+            | DeclError::DuplicateExplicitEmbedField { span, .. }
+            | DeclError::UnknownEmbedMethodSelector { span, .. }
+            | DeclError::EmbedMethodSelectorNamesField { span, .. }
+            | DeclError::EmbedMethodSelectorNamesStatic { span, .. }
+            | DeclError::EmbedMethodSelectorNamesToString { span }
+            | DeclError::AmbiguousEmbedMethodSelector { span, .. }
+            | DeclError::EmbedMethodConflictsWithDirect { span, .. }
+            | DeclError::DuplicateExplicitEmbedMethod { span, .. }
+            | DeclError::DuplicateProjectionTarget { span, .. } => *span,
+        }
+    }
 }
 
 fn module_id_for_scope(scope: &ModuleScope) -> ModuleId {
@@ -1237,6 +1323,10 @@ impl ImportScopeBuilder {
 }
 
 impl ImportScope {
+    fn binding_origin(&self, namespace: BindingNamespace, name: Ident) -> Option<ImportId> {
+        self.binding_origins.get(&(namespace, name)).cloned()
+    }
+
     fn activate_imported_origins(&mut self) {
         let mut origins = vec![];
         self.namespace.for_each_member(|name, member| {
@@ -1373,6 +1463,7 @@ pub(crate) struct CallableRef {
     pub(crate) def: CallableDef,
     pub(crate) receiver_ty: Option<Type>,
     pub(crate) owner_args: GenericArgs,
+    pub(crate) is_stringify_override: bool,
 }
 
 #[derive(Clone)]
@@ -1470,6 +1561,14 @@ pub(crate) struct AggregateSchema {
 }
 
 #[derive(Clone)]
+pub(crate) struct EmbeddedFieldRef<'a> {
+    pub(crate) owner: &'a NominalKey,
+    pub(crate) name: Ident,
+    pub(crate) field: &'a FieldSchema,
+    pub(crate) embed: &'a EmbedFieldSchema,
+}
+
+#[derive(Clone)]
 pub(crate) struct DependentEmbedTemplate {
     pub(crate) field_path: Vec<Ident>,
     pub(crate) target_ty: Type,
@@ -1555,8 +1654,8 @@ pub(crate) struct EmbedFieldSchema {
 
 #[derive(Clone)]
 pub(crate) struct MethodSchema {
-    pub(crate) generics: GenericParams,
     pub(crate) mode: MethodMode,
+    pub(crate) generics: GenericParams,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) param_spans: ParamTypeSpans,
     pub(crate) default_sites: Vec<Option<ParamDefaultSite>>,
@@ -1593,6 +1692,11 @@ pub(crate) enum EnumRepr {
 pub(crate) enum RawEnumValue {
     Int(i64),
     String(String),
+}
+
+pub(super) struct VerifiedRawEnumMetadata {
+    pub(super) repr: EnumRepr,
+    pub(super) values: Vec<(Ident, RawEnumValue)>,
 }
 
 #[derive(Clone)]
@@ -1656,16 +1760,7 @@ pub(crate) struct CastConversionSchema {
     pub(crate) span: SourceSpan,
 }
 
-#[derive(Clone)]
-pub(crate) struct ExtendMethodSchema {
-    pub(crate) mode: MethodMode,
-    pub(crate) generics: GenericParams,
-    pub(crate) params: Vec<FuncParam>,
-    pub(crate) param_spans: ParamTypeSpans,
-    pub(crate) required_params: usize,
-    pub(crate) ret: ReturnSpec,
-    pub(crate) policy: AccessPolicy,
-}
+pub(crate) type ExtendMethodSchema = MethodSchema;
 
 pub(crate) enum ExtendMethodMatch<'a> {
     Match {
@@ -1695,10 +1790,80 @@ pub(crate) struct DeclTypeSite {
     pub(crate) span: Span,
     pub(crate) generics: GenericTypeContext,
     pub(crate) type_params: Vec<TypeParam>,
+    pub(crate) kind: DeclTypeUseKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclTypeUseKind {
+    GenericBound,
+    Field,
+    MethodParam,
+    MethodReturn,
+    EnumVariant,
+    ContractParam,
+    ContractReturn,
+    AliasTarget,
+    ExtendTarget,
+    CastParam,
+    CastReturn,
+    FunctionParam,
+    FunctionReturn,
+    ExternFunctionParam,
+    ExternFunctionReturn,
+    Const,
+    Global,
+}
+
+impl DeclTypeUseKind {
+    pub(crate) fn rejects_raw_dyn_hole(self) -> bool {
+        matches!(
+            self,
+            Self::Field
+                | Self::EnumVariant
+                | Self::AliasTarget
+                | Self::Const
+                | Self::Global
+                | Self::ExternFunctionParam
+                | Self::ExternFunctionReturn
+        )
+    }
+}
+
+fn type_site(
+    module: ModuleScope,
+    span: Span,
+    generics: GenericTypeContext,
+    type_params: Vec<TypeParam>,
+    kind: DeclTypeUseKind,
+) -> DeclTypeSite {
+    DeclTypeSite {
+        module,
+        span,
+        generics,
+        type_params,
+        kind,
+    }
 }
 
 fn combined_type_params(owner: &[TypeParam], local: &[TypeParam]) -> Vec<TypeParam> {
     owner.iter().chain(local).cloned().collect()
+}
+
+pub(crate) fn map_generic_param_bounds<F>(params: &mut GenericParams, mut f: F)
+where
+    F: FnMut(Type) -> Type,
+{
+    for param in &mut params.type_params {
+        param.bounds = std::mem::take(&mut param.bounds)
+            .into_iter()
+            .filter_map(|bound| match f(Type::Dyn(bound)) {
+                Type::Dyn(bound) if !matches!(bound, ContractRef::Infer | ContractRef::Hole(_)) => {
+                    Some(bound)
+                }
+                _ => None,
+            })
+            .collect();
+    }
 }
 
 fn map_generic_bounds<F>(
@@ -1711,26 +1876,40 @@ fn map_generic_bounds<F>(
     F: FnMut(DeclTypeSite, Type) -> Type,
 {
     let type_params = params.type_params.clone();
-    for param in &mut params.type_params {
-        param.bounds = std::mem::take(&mut param.bounds)
-            .into_iter()
-            .filter_map(|bound| {
-                let site = DeclTypeSite {
-                    module: module.clone(),
-                    span,
-                    generics: generics.clone(),
-                    type_params: type_params.clone(),
-                };
-                match f(site, Type::Dyn(bound)) {
-                    Type::Dyn(bound)
-                        if !matches!(bound, ContractRef::Infer | ContractRef::Hole(_)) =>
-                    {
-                        Some(bound)
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
+    map_generic_param_bounds(params, |bound| {
+        let site = DeclTypeSite {
+            module: module.clone(),
+            span,
+            generics: generics.clone(),
+            type_params: type_params.clone(),
+            kind: DeclTypeUseKind::GenericBound,
+        };
+        f(site, bound)
+    });
+}
+
+fn walk_generic_bounds<F>(
+    module: &ModuleScope,
+    span: Span,
+    generics: &GenericTypeContext,
+    params: &GenericParams,
+    f: &mut F,
+) where
+    F: FnMut(DeclTypeSite, &Type),
+{
+    let type_params = params.type_params.clone();
+    for param in &params.type_params {
+        for bound in &param.bounds {
+            let ty = Type::Dyn(bound.clone());
+            let site = DeclTypeSite {
+                module: module.clone(),
+                span,
+                generics: generics.clone(),
+                type_params: type_params.clone(),
+                kind: DeclTypeUseKind::GenericBound,
+            };
+            f(site, &ty);
+        }
     }
 }
 
@@ -1849,7 +2028,7 @@ impl DeclarationIndex {
         self.sync_value_projections();
     }
 
-    pub(crate) fn map_canonical_type_uses<F>(&mut self, mut f: F) -> Vec<GenericContextError>
+    pub(crate) fn fold_canonical_type_uses<F>(&mut self, mut f: F) -> Vec<GenericContextError>
     where
         F: FnMut(DeclTypeSite, Type) -> Type,
     {
@@ -1864,7 +2043,7 @@ impl DeclarationIndex {
                 continue;
             };
             let owner_generics = generic_context(
-                key.module.clone(),
+                &key.module,
                 &schema.generics.type_params,
                 &schema.generics.const_params,
                 span,
@@ -1884,12 +2063,13 @@ impl DeclarationIndex {
                     span,
                     generics: owner_generics.clone(),
                     type_params: owner_type_params.clone(),
+                    kind: DeclTypeUseKind::Field,
                 };
                 field.ty = f(site, field.ty.clone());
             }
             for method in schema.methods.values_mut() {
                 let generics = extend_generic_context(
-                    key.module.clone(),
+                    &key.module,
                     &owner_generics,
                     &method.generics.type_params,
                     &method.generics.const_params,
@@ -1899,12 +2079,14 @@ impl DeclarationIndex {
                 map_generic_bounds(&key.module, span, &generics, &mut method.generics, &mut f);
                 let type_params =
                     combined_type_params(&owner_type_params, &method.generics.type_params);
+                let param_spans = method.param_spans.clone();
                 for (index, param) in method.params.iter_mut().enumerate() {
                     let site = DeclTypeSite {
                         module: key.module.clone(),
-                        span: method.param_spans.span_for(index, span),
+                        span: param_spans.span_for(index, span),
                         generics: generics.clone(),
                         type_params: type_params.clone(),
+                        kind: DeclTypeUseKind::MethodParam,
                     };
                     param.ty = f(site, param.ty.clone());
                 }
@@ -1913,6 +2095,7 @@ impl DeclarationIndex {
                     span,
                     generics,
                     type_params,
+                    kind: DeclTypeUseKind::MethodReturn,
                 };
                 method.ret.ty = f(site, method.ret.ty.clone());
             }
@@ -1927,7 +2110,7 @@ impl DeclarationIndex {
                 continue;
             };
             let generics = generic_context(
-                key.module.clone(),
+                &key.module,
                 &schema.generics.type_params,
                 &schema.generics.const_params,
                 span,
@@ -1945,6 +2128,7 @@ impl DeclarationIndex {
                                 span,
                                 generics: generics.clone(),
                                 type_params: type_params.clone(),
+                                kind: DeclTypeUseKind::EnumVariant,
                             };
                             *ty = f(site, ty.clone());
                         }
@@ -1956,6 +2140,7 @@ impl DeclarationIndex {
                                 span,
                                 generics: generics.clone(),
                                 type_params: type_params.clone(),
+                                kind: DeclTypeUseKind::EnumVariant,
                             };
                             field.ty = f(site, field.ty.clone());
                         }
@@ -1979,6 +2164,7 @@ impl DeclarationIndex {
                         span: req.param_spans.span_for(index, span.byte()),
                         generics: GenericTypeContext::default(),
                         type_params: vec![],
+                        kind: DeclTypeUseKind::ContractParam,
                     };
                     param.ty = f(site, param.ty.clone());
                 }
@@ -1987,6 +2173,7 @@ impl DeclarationIndex {
                     span: span.byte(),
                     generics: GenericTypeContext::default(),
                     type_params: vec![],
+                    kind: DeclTypeUseKind::ContractReturn,
                 };
                 req.ret.ty = f(site, req.ret.ty.clone());
             }
@@ -1998,7 +2185,7 @@ impl DeclarationIndex {
                 continue;
             };
             let generics = generic_context(
-                schema.def.module.clone(),
+                &schema.def.module,
                 &schema.def.generics.type_params,
                 &schema.def.generics.const_params,
                 schema.def.span.byte(),
@@ -2017,6 +2204,7 @@ impl DeclarationIndex {
                 span: schema.def.span.byte(),
                 generics,
                 type_params: schema.def.generics.type_params.clone(),
+                kind: DeclTypeUseKind::AliasTarget,
             };
             schema.def.aliased = f(site, schema.def.aliased.clone());
         }
@@ -2026,7 +2214,7 @@ impl DeclarationIndex {
             let span = self.extends[index].span.byte();
             let extend = &mut self.extends[index];
             let generics = generic_context(
-                origin.clone(),
+                &origin,
                 &extend.generics.type_params,
                 &extend.generics.const_params,
                 span,
@@ -2039,11 +2227,12 @@ impl DeclarationIndex {
                 span,
                 generics: generics.clone(),
                 type_params: extend_type_params.clone(),
+                kind: DeclTypeUseKind::ExtendTarget,
             };
             extend.target = f(target_site, extend.target.clone());
             for method in extend.methods.values_mut() {
                 let method_generics = extend_generic_context(
-                    origin.clone(),
+                    &origin,
                     &generics,
                     &method.generics.type_params,
                     &method.generics.const_params,
@@ -2059,12 +2248,14 @@ impl DeclarationIndex {
                 );
                 let type_params =
                     combined_type_params(&extend_type_params, &method.generics.type_params);
+                let param_spans = method.param_spans.clone();
                 for (index, param) in method.params.iter_mut().enumerate() {
                     let site = DeclTypeSite {
                         module: origin.clone(),
-                        span: method.param_spans.span_for(index, span),
+                        span: param_spans.span_for(index, span),
                         generics: method_generics.clone(),
                         type_params: type_params.clone(),
+                        kind: DeclTypeUseKind::MethodParam,
                     };
                     param.ty = f(site, param.ty.clone());
                 }
@@ -2073,6 +2264,7 @@ impl DeclarationIndex {
                     span,
                     generics: method_generics,
                     type_params,
+                    kind: DeclTypeUseKind::MethodReturn,
                 };
                 method.ret.ty = f(site, method.ret.ty.clone());
             }
@@ -2082,10 +2274,12 @@ impl DeclarationIndex {
                     span: cast.span.byte(),
                     generics: generics.clone(),
                     type_params: extend_type_params.clone(),
+                    kind: DeclTypeUseKind::CastReturn,
                 };
                 cast.param.ty = f(
                     DeclTypeSite {
                         span: cast.param_span,
+                        kind: DeclTypeUseKind::CastParam,
                         ..site.clone()
                     },
                     cast.param.ty.clone(),
@@ -2112,7 +2306,7 @@ impl DeclarationIndex {
                 match &mut value.decl {
                     ValueDecl::Func(sig) => {
                         let generics = generic_context(
-                            value.module.clone(),
+                            &value.module,
                             &sig.generics.type_params,
                             &sig.generics.const_params,
                             span,
@@ -2131,6 +2325,7 @@ impl DeclarationIndex {
                                 span,
                                 generics,
                                 type_params: sig.generics.type_params.clone(),
+                                kind: DeclTypeUseKind::FunctionReturn,
                             };
                             sig.ty =
                                 map_func_type_uses(site, sig.ty.clone(), &sig.param_spans, &mut f);
@@ -2142,6 +2337,7 @@ impl DeclarationIndex {
                             span,
                             generics: GenericTypeContext::default(),
                             type_params: vec![],
+                            kind: DeclTypeUseKind::Const,
                         };
                         sig.ty = f(site, sig.ty.clone());
                     }
@@ -2151,6 +2347,7 @@ impl DeclarationIndex {
                             span,
                             generics: GenericTypeContext::default(),
                             type_params: vec![],
+                            kind: DeclTypeUseKind::Global,
                         };
                         sig.ty = f(site, sig.ty.clone());
                     }
@@ -2162,36 +2359,291 @@ impl DeclarationIndex {
         errors
     }
 
+    pub(crate) fn walk_canonical_type_uses<F>(&self, mut f: F)
+    where
+        F: FnMut(DeclTypeSite, &Type),
+    {
+        for (key, schema) in &self.aggregates {
+            let Some(span) = self.type_span(key) else {
+                continue;
+            };
+            let owner_generics = generic_context_lossy(&schema.generics);
+            walk_generic_bounds(&key.module, span, &owner_generics, &schema.generics, &mut f);
+            let owner_type_params = schema.generics.type_params.clone();
+            for field in schema.fields.values() {
+                let site = type_site(
+                    key.module.clone(),
+                    span,
+                    owner_generics.clone(),
+                    owner_type_params.clone(),
+                    DeclTypeUseKind::Field,
+                );
+                f(site, &field.ty);
+            }
+            for method in schema.methods.values() {
+                let type_params =
+                    combined_type_params(&owner_type_params, &method.generics.type_params);
+                let generics = extend_generic_context_lossy(&owner_generics, &method.generics);
+                walk_generic_bounds(&key.module, span, &generics, &method.generics, &mut f);
+                walk_params(
+                    &key.module,
+                    span,
+                    &generics,
+                    &type_params,
+                    &method.params,
+                    &method.param_spans,
+                    DeclTypeUseKind::MethodParam,
+                    &mut f,
+                );
+                let site = type_site(
+                    key.module.clone(),
+                    span,
+                    generics,
+                    type_params,
+                    DeclTypeUseKind::MethodReturn,
+                );
+                f(site, &method.ret.ty);
+            }
+        }
+
+        for (key, schema) in &self.enums {
+            let Some(span) = self.type_span(key) else {
+                continue;
+            };
+            let generics = generic_context_lossy(&schema.generics);
+            walk_generic_bounds(&key.module, span, &generics, &schema.generics, &mut f);
+            let type_params = schema.generics.type_params.clone();
+            for variant in schema.variants.values() {
+                match &variant.payload {
+                    VariantPayload::Unit => {}
+                    VariantPayload::Tuple(types) => {
+                        for ty in types {
+                            let site = type_site(
+                                key.module.clone(),
+                                span,
+                                generics.clone(),
+                                type_params.clone(),
+                                DeclTypeUseKind::EnumVariant,
+                            );
+                            f(site, ty);
+                        }
+                    }
+                    VariantPayload::Struct(fields) => {
+                        for field in fields.values() {
+                            let site = type_site(
+                                key.module.clone(),
+                                span,
+                                generics.clone(),
+                                type_params.clone(),
+                                DeclTypeUseKind::EnumVariant,
+                            );
+                            f(site, &field.ty);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (key, schema) in &self.contracts {
+            for req in &schema.direct_requirements {
+                let Some(span) = req.span else {
+                    continue;
+                };
+                for (index, param) in req.params.iter().enumerate() {
+                    let site = type_site(
+                        key.module.clone(),
+                        req.param_spans.span_for(index, span.byte()),
+                        GenericTypeContext::default(),
+                        vec![],
+                        DeclTypeUseKind::ContractParam,
+                    );
+                    f(site, &param.ty);
+                }
+                let site = type_site(
+                    key.module.clone(),
+                    span.byte(),
+                    GenericTypeContext::default(),
+                    vec![],
+                    DeclTypeUseKind::ContractReturn,
+                );
+                f(site, &req.ret.ty);
+            }
+        }
+
+        for schema in self.type_aliases.values() {
+            let generics = generic_context_lossy(&schema.def.generics);
+            walk_generic_bounds(
+                &schema.def.module,
+                schema.def.span.byte(),
+                &generics,
+                &schema.def.generics,
+                &mut f,
+            );
+            let site = type_site(
+                schema.def.module.clone(),
+                schema.def.span.byte(),
+                generics,
+                schema.def.generics.type_params.clone(),
+                DeclTypeUseKind::AliasTarget,
+            );
+            f(site, &schema.def.aliased);
+        }
+
+        for extend in &self.extends {
+            let span = extend.span.byte();
+            let generics = generic_context_lossy(&extend.generics);
+            walk_generic_bounds(&extend.origin, span, &generics, &extend.generics, &mut f);
+            let type_params = extend.generics.type_params.clone();
+            let site = type_site(
+                extend.origin.clone(),
+                span,
+                generics.clone(),
+                type_params.clone(),
+                DeclTypeUseKind::ExtendTarget,
+            );
+            f(site, &extend.target);
+            for method in extend.methods.values() {
+                let method_type_params =
+                    combined_type_params(&type_params, &method.generics.type_params);
+                let method_generics = extend_generic_context_lossy(&generics, &method.generics);
+                walk_generic_bounds(
+                    &extend.origin,
+                    span,
+                    &method_generics,
+                    &method.generics,
+                    &mut f,
+                );
+                walk_params(
+                    &extend.origin,
+                    span,
+                    &method_generics,
+                    &method_type_params,
+                    &method.params,
+                    &method.param_spans,
+                    DeclTypeUseKind::MethodParam,
+                    &mut f,
+                );
+                let site = type_site(
+                    extend.origin.clone(),
+                    span,
+                    method_generics,
+                    method_type_params,
+                    DeclTypeUseKind::MethodReturn,
+                );
+                f(site, &method.ret.ty);
+            }
+            for cast in &extend.cast_froms {
+                let site = type_site(
+                    extend.origin.clone(),
+                    cast.param_span,
+                    generics.clone(),
+                    type_params.clone(),
+                    DeclTypeUseKind::CastParam,
+                );
+                f(site, &cast.param.ty);
+                if let Some(ret) = &cast.ret {
+                    let site = type_site(
+                        extend.origin.clone(),
+                        cast.span.byte(),
+                        generics.clone(),
+                        type_params.clone(),
+                        DeclTypeUseKind::CastReturn,
+                    );
+                    f(site, &ret.ty);
+                }
+            }
+        }
+
+        for module in self.modules.values() {
+            for value in module.locals.values.values() {
+                let Some(span) = self
+                    .value_spans
+                    .get(&(value.module.clone(), value.name))
+                    .copied()
+                else {
+                    continue;
+                };
+                match &value.decl {
+                    ValueDecl::Func(sig) => {
+                        let generics = generic_context_lossy(&sig.generics);
+                        walk_generic_bounds(&value.module, span, &generics, &sig.generics, &mut f);
+                        let kind = if sig.kind == CallableKind::ExternFunction {
+                            DeclTypeUseKind::ExternFunctionParam
+                        } else {
+                            DeclTypeUseKind::FunctionParam
+                        };
+                        let site = type_site(
+                            value.module.clone(),
+                            span,
+                            generics,
+                            sig.generics.type_params.clone(),
+                            kind,
+                        );
+                        walk_func_type_uses(site, &sig.ty, &sig.param_spans, &mut f);
+                    }
+                    ValueDecl::Const(sig) => {
+                        let site = type_site(
+                            value.module.clone(),
+                            span,
+                            GenericTypeContext::default(),
+                            vec![],
+                            DeclTypeUseKind::Const,
+                        );
+                        f(site, &sig.ty);
+                    }
+                    ValueDecl::Global(sig) => {
+                        let site = type_site(
+                            value.module.clone(),
+                            span,
+                            GenericTypeContext::default(),
+                            vec![],
+                            DeclTypeUseKind::Global,
+                        );
+                        f(site, &sig.ty);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn embedded_fields(&self) -> impl Iterator<Item = EmbeddedFieldRef<'_>> {
+        self.aggregates.iter().flat_map(|(owner, schema)| {
+            schema.fields.iter().filter_map(move |(name, field)| {
+                let embed = field.embed.as_ref()?;
+                Some(EmbeddedFieldRef {
+                    owner,
+                    name,
+                    field,
+                    embed,
+                })
+            })
+        })
+    }
+
     pub(crate) fn build_projection_edges(&mut self) -> Vec<DeclError> {
         let mut errors = vec![];
         let mut keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
         keys.sort_by_key(nominal_key_sort_key);
         for key in keys {
-            let Some(schema) = self.aggregates.get(&key) else {
-                continue;
-            };
             let mut projections = vec![];
             let mut seen = HashSet::new();
-            for (name, field) in schema.fields.iter() {
-                let Some(embed) = &field.embed else {
-                    continue;
-                };
-                if !embed.as_projection {
+            for field in self.embedded_fields().filter(|field| field.owner == &key) {
+                if !field.embed.as_projection {
                     continue;
                 }
-                let target_ty = field.ty.clone();
+                let target_ty = field.field.ty.clone();
                 let target = CanonicalTypeKey(target_ty.clone());
                 if !type_depends_on_generics(&target_ty) && !seen.insert(target) {
                     errors.push(DeclError::DuplicateProjectionTarget {
                         owner: key.clone(),
                         target: target_ty,
-                        span: field.span.or(Some(embed.span)),
+                        span: field.field.span.or(Some(field.embed.span)),
                     });
                     continue;
                 }
                 projections.push(ProjectionPath {
                     target_ty,
-                    field_path: vec![name],
+                    field_path: vec![field.name],
                 });
             }
             if let Some(schema) = self.aggregates.get_mut(&key) {
@@ -2431,22 +2883,7 @@ impl DeclarationIndex {
                         }
                         let mode = MethodMode::from_receiver(method.sig.receiver);
                         let method_key = MethodKey::new(method.sig.name, mode.surface());
-                        let schema = MethodSchema {
-                            generics: generic_params(
-                                &method.sig.type_params,
-                                &method.sig.const_params,
-                            ),
-                            mode,
-                            params: resolve_func_params(&method.sig.params),
-                            param_spans: ParamTypeSpans::from_params(&method.sig.params),
-                            default_sites: ParamDefaultSite::from_params(
-                                source,
-                                &method.sig.params,
-                            ),
-                            required_params: required_param_count(&method.sig.params),
-                            ret: method.sig.ret.clone(),
-                            policy,
-                        };
+                        let schema = method_schema(source, &method.sig, mode, policy);
                         match methods.entry(method_key) {
                             Entry::Occupied(entry) => {
                                 self.errors.push(DeclError::DuplicateAggregateMethod {
@@ -2784,15 +3221,7 @@ impl DeclarationIndex {
                         );
                         let mode = MethodMode::from_receiver(m.sig.receiver);
                         let key = MethodKey::new(m.sig.name, mode.surface());
-                        let schema = ExtendMethodSchema {
-                            mode,
-                            generics: generic_params(&m.sig.type_params, &m.sig.const_params),
-                            params: resolve_func_params(&m.sig.params),
-                            param_spans: ParamTypeSpans::from_params(&m.sig.params),
-                            required_params: required_param_count(&m.sig.params),
-                            ret: m.sig.ret.clone(),
-                            policy,
-                        };
+                        let schema = method_schema(source, &m.sig, mode, policy);
                         let surface = key.surface;
                         match methods.entry(key) {
                             Entry::Occupied(_) => {
@@ -2814,12 +3243,7 @@ impl DeclarationIndex {
                         .cast_froms
                         .iter()
                         .map(|cast| CastConversionSchema {
-                            param: FuncParam::new(
-                                cast.node.param.ty.clone(),
-                                matches!(cast.node.param.mutability, Mutability::Mutable),
-                                cast.node.param.cast_accept,
-                                cast.node.param.escape,
-                            ),
+                            param: cast.node.param.func_param(),
                             param_span: cast.node.param.ty_span,
                             ret: cast.node.ret.clone(),
                             span: SourceSpan::from_byte_span(source, cast.span),
@@ -3269,8 +3693,8 @@ impl DeclarationIndex {
         let Some(decls) = self.modules.get(module) else {
             return ModuleMemberLookup::Missing;
         };
-        if let Some(key) = decls.exports.ty(name) {
-            return ModuleMemberLookup::Found(key.clone());
+        if let Some(binding) = decls.exports.ty(name) {
+            return ModuleMemberLookup::Found(binding.clone());
         }
         if decls.locals.types.contains_key(&name)
             || decls.imports.namespace.types.contains_key(&name)
@@ -3316,11 +3740,8 @@ impl DeclarationIndex {
     ) -> Option<(ResolvedValue, Option<ImportId>)> {
         let imports = &self.modules.get(module)?.imports;
         Some((
-            imports.namespace.value(name).cloned()?,
-            imports
-                .binding_origins
-                .get(&(BindingNamespace::Value, name))
-                .cloned(),
+            imports.namespace.value(name)?.clone(),
+            imports.binding_origin(BindingNamespace::Value, name),
         ))
     }
 
@@ -3341,11 +3762,8 @@ impl DeclarationIndex {
     ) -> Option<(TypeBinding, Option<ImportId>)> {
         let imports = &self.modules.get(module)?.imports;
         Some((
-            imports.namespace.ty(name).cloned()?,
-            imports
-                .binding_origins
-                .get(&(BindingNamespace::Type, name))
-                .cloned(),
+            imports.namespace.ty(name)?.clone(),
+            imports.binding_origin(BindingNamespace::Type, name),
         ))
     }
 
@@ -3362,11 +3780,8 @@ impl DeclarationIndex {
     ) -> Option<(ModuleScope, Option<ImportId>)> {
         let imports = &self.modules.get(module)?.imports;
         Some((
-            imports.namespace.module(name).cloned()?,
-            imports
-                .binding_origins
-                .get(&(BindingNamespace::Module, name))
-                .cloned(),
+            imports.namespace.module(name)?.clone(),
+            imports.binding_origin(BindingNamespace::Module, name),
         ))
     }
 
@@ -3753,37 +4168,18 @@ impl DeclarationIndex {
     pub(super) fn install_raw_enum_metadata(
         &mut self,
         key: &NominalKey,
-        repr: EnumRepr,
-        values: Vec<(Ident, RawEnumValue)>,
+        metadata: VerifiedRawEnumMetadata,
     ) -> bool {
         let Some(schema) = self.enums.get_mut(key) else {
             return false;
         };
-        if repr == EnumRepr::Adt || values.len() != schema.variants.entries.len() {
-            return false;
-        }
-        let mut seen = HashSet::new();
-        for (name, raw) in &values {
-            let Some(variant) = schema.variants.get(*name) else {
-                return false;
-            };
-            let value_matches_repr = matches!(
-                (repr, raw),
-                (EnumRepr::RawInt, RawEnumValue::Int(_))
-                    | (EnumRepr::RawString, RawEnumValue::String(_))
-            );
-            if !value_matches_repr
-                || !matches!(variant.payload, VariantPayload::Unit)
-                || !seen.insert(raw)
-            {
-                return false;
-            }
-        }
-        schema.repr = repr;
+        debug_assert_ne!(metadata.repr, EnumRepr::Adt);
+        debug_assert_eq!(metadata.values.len(), schema.variants.entries.len());
+        schema.repr = metadata.repr;
         for variant in schema.variants.values_mut() {
             variant.raw_value = None;
         }
-        for (name, raw) in values {
+        for (name, raw) in metadata.values {
             if let Some(variant) = schema.variants.get_mut(name) {
                 variant.raw_value = Some(raw);
             }
@@ -3847,20 +4243,22 @@ impl DeclarationIndex {
         Some(nominal_type_with_args(&key, &[inner], &[]))
     }
 
-    pub(crate) fn semantic_option_parts<'a>(&self, ty: &'a Type) -> Option<(NominalKey, &'a Type)> {
-        let key = nominal_key_for_type(ty)?;
-        if key != self.core_option_key()? {
-            return None;
-        }
+    pub(crate) fn single_nominal_type_arg<'a>(ty: &'a Type, key: &NominalKey) -> Option<&'a Type> {
         let Type::Nominal(nominal) = ty else {
             return None;
         };
+        if nominal_key_for_type(ty)? != *key || !nominal.const_args.is_empty() {
+            return None;
+        }
         let [inner] = nominal.type_args.as_slice() else {
             return None;
         };
-        if !nominal.const_args.is_empty() {
-            return None;
-        }
+        Some(inner)
+    }
+
+    pub(crate) fn semantic_option_parts<'a>(&self, ty: &'a Type) -> Option<(NominalKey, &'a Type)> {
+        let key = self.core_option_key()?;
+        let inner = Self::single_nominal_type_arg(ty, &key)?;
         Some((key, inner))
     }
 
@@ -3891,14 +4289,8 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn core_range_inner<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
-        self.core_range_kind(ty)?;
-        let Type::Nominal(nominal) = ty else {
-            return None;
-        };
-        let [inner] = nominal.type_args.as_slice() else {
-            return None;
-        };
-        Some(inner)
+        let key = self.core_range_key(self.core_range_kind(ty)?)?;
+        Self::single_nominal_type_arg(ty, &key)
     }
 
     pub(crate) fn map_key_error(&self, ty: &Type) -> Option<MapKeyError> {
@@ -4164,6 +4556,7 @@ impl DeclarationIndex {
             },
             receiver_ty: None,
             owner_args: GenericArgs::default(),
+            is_stringify_override: false,
         })
     }
 
@@ -4237,6 +4630,8 @@ impl DeclarationIndex {
             },
             receiver_ty,
             owner_args: owner_ty.and_then(nominal_generic_args).unwrap_or_default(),
+            is_stringify_override: name == Ident::new("to_string")
+                && method.is_stringify_override(),
         }
     }
 
@@ -4276,14 +4671,7 @@ impl DeclarationIndex {
         let template_params = method
             .params
             .iter()
-            .map(|param| {
-                FuncParam::new(
-                    generic_template_type(&param.ty, &extend.generics),
-                    param.mutable,
-                    param.cast_accept,
-                    param.escape,
-                )
-            })
+            .map(|param| param.map_ty(|ty| generic_template_type(ty, &extend.generics)))
             .collect::<Vec<_>>();
         let template_ret = method
             .ret
@@ -4296,13 +4684,14 @@ impl DeclarationIndex {
                     owner_generics: extend.generics.clone(),
                     generics: method.generics.clone(),
                     params: substitute_func_params(&template_params, &type_subst, &const_subst),
-                    default_sites: vec![],
+                    default_sites: method.default_sites.clone(),
                     required_params: method.required_params,
                     ret: substitute_return_spec(&template_ret, &type_subst, &const_subst),
                 },
             },
             receiver_ty,
             owner_args,
+            is_stringify_override: false,
         }
     }
 }
@@ -4355,14 +4744,7 @@ fn substitute_func_params(
 ) -> Vec<FuncParam> {
     params
         .iter()
-        .map(|param| {
-            FuncParam::new(
-                substitute(&param.ty, type_subst, const_subst),
-                param.mutable,
-                param.cast_accept,
-                param.escape,
-            )
-        })
+        .map(|param| param.map_ty(|ty| substitute(ty, type_subst, const_subst)))
         .collect()
 }
 
@@ -4393,44 +4775,47 @@ impl DeclarationIndex {
 }
 
 fn generic_context(
-    module: ModuleScope,
+    module: &ModuleScope,
     type_params: &[TypeParam],
     const_params: &[ConstParam],
     span: Span,
     errors: &mut Vec<GenericContextError>,
 ) -> GenericTypeContext {
-    match GenericTypeContext::try_from_params(type_params, const_params) {
-        Ok(generics) => generics,
-        Err(error) => {
-            errors.push(GenericContextError {
-                module,
-                error,
-                span,
-            });
-            GenericTypeContext::default()
-        }
-    }
+    generic_context_from_params(type_params, const_params, |error| {
+        errors.push(GenericContextError {
+            module: module.clone(),
+            error,
+            span,
+        });
+    })
 }
 
 fn extend_generic_context(
-    module: ModuleScope,
+    module: &ModuleScope,
     owner: &GenericTypeContext,
     type_params: &[TypeParam],
     const_params: &[ConstParam],
     span: Span,
     errors: &mut Vec<GenericContextError>,
 ) -> GenericTypeContext {
-    match owner.try_with_shadowing_params(type_params, const_params) {
-        Ok(generics) => generics,
-        Err(error) => {
-            errors.push(GenericContextError {
-                module,
-                error,
-                span,
-            });
-            owner.clone()
-        }
-    }
+    extend_generic_context_with_params(owner, type_params, const_params, |error| {
+        errors.push(GenericContextError {
+            module: module.clone(),
+            error,
+            span,
+        });
+    })
+}
+
+fn generic_context_lossy(params: &GenericParams) -> GenericTypeContext {
+    generic_context_from_params(&params.type_params, &params.const_params, |_| {})
+}
+
+fn extend_generic_context_lossy(
+    owner: &GenericTypeContext,
+    params: &GenericParams,
+) -> GenericTypeContext {
+    extend_generic_context_with_params(owner, &params.type_params, &params.const_params, |_| {})
 }
 
 fn sync_namespace_values(
@@ -4466,27 +4851,109 @@ where
     let Type::Func { params, ret } = ty else {
         return f(site, ty);
     };
+    let param_kind = match site.kind {
+        DeclTypeUseKind::ExternFunctionReturn => DeclTypeUseKind::ExternFunctionParam,
+        _ => DeclTypeUseKind::FunctionParam,
+    };
+    let ret_kind = site.kind;
     let params = params
         .into_iter()
         .enumerate()
         .map(|(index, param)| {
             let span = param_spans.span_for(index, site.span);
-            FuncParam::new(
-                f(
-                    DeclTypeSite {
-                        span,
-                        ..site.clone()
-                    },
-                    param.ty,
-                ),
-                param.mutable,
-                param.cast_accept,
-                param.escape,
-            )
+            let ty = f(
+                DeclTypeSite {
+                    span,
+                    kind: param_kind,
+                    ..site.clone()
+                },
+                param.ty.clone(),
+            );
+            param.with_ty(ty)
         })
         .collect();
-    let ret_ty = f(site, ret.ty.clone());
+    let ret_ty = f(
+        DeclTypeSite {
+            kind: ret_kind,
+            ..site.clone()
+        },
+        ret.ty.clone(),
+    );
     Type::func(params, ret.with_ty(ret_ty))
+}
+
+fn walk_func_type_uses<F>(site: DeclTypeSite, ty: &Type, param_spans: &ParamTypeSpans, f: &mut F)
+where
+    F: FnMut(DeclTypeSite, &Type),
+{
+    let Type::Func { params, ret } = ty else {
+        f(site, ty);
+        return;
+    };
+    walk_params(
+        &site.module,
+        site.span,
+        &site.generics,
+        &site.type_params,
+        params,
+        param_spans,
+        site.kind,
+        f,
+    );
+    let ret_kind = match site.kind {
+        DeclTypeUseKind::ExternFunctionParam => DeclTypeUseKind::ExternFunctionReturn,
+        _ => DeclTypeUseKind::FunctionReturn,
+    };
+    f(
+        DeclTypeSite {
+            kind: ret_kind,
+            ..site
+        },
+        &ret.ty,
+    );
+}
+
+fn walk_params<F>(
+    module: &ModuleScope,
+    span: Span,
+    generics: &GenericTypeContext,
+    type_params: &[TypeParam],
+    params: &[FuncParam],
+    param_spans: &ParamTypeSpans,
+    kind: DeclTypeUseKind,
+    f: &mut F,
+) where
+    F: FnMut(DeclTypeSite, &Type),
+{
+    let type_params = type_params.to_vec();
+    for (index, param) in params.iter().enumerate() {
+        let site = type_site(
+            module.clone(),
+            param_spans.span_for(index, span),
+            generics.clone(),
+            type_params.clone(),
+            kind,
+        );
+        f(site, &param.ty);
+    }
+}
+
+fn method_schema(
+    source: SourceId,
+    sig: &MethodSig,
+    mode: MethodMode,
+    policy: AccessPolicy,
+) -> MethodSchema {
+    MethodSchema {
+        mode,
+        generics: generic_params(&sig.type_params, &sig.const_params),
+        params: resolve_func_params(&sig.params),
+        param_spans: ParamTypeSpans::from_params(&sig.params),
+        default_sites: ParamDefaultSite::from_params(source, &sig.params),
+        required_params: required_param_count(&sig.params),
+        ret: sig.ret.clone(),
+        policy,
+    }
 }
 
 pub(crate) fn func_type_from_params(params: &[Param], ret: &ReturnSpec) -> Type {
@@ -4494,17 +4961,7 @@ pub(crate) fn func_type_from_params(params: &[Param], ret: &ReturnSpec) -> Type 
 }
 
 pub(crate) fn resolve_func_params(params: &[Param]) -> Vec<FuncParam> {
-    params
-        .iter()
-        .map(|param| {
-            FuncParam::new(
-                param.ty.clone(),
-                matches!(param.mutability, Mutability::Mutable),
-                param.cast_accept,
-                param.escape,
-            )
-        })
-        .collect()
+    params.iter().map(Param::func_param).collect()
 }
 
 pub(crate) fn substitute_return_spec(

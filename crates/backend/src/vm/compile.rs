@@ -1,11 +1,9 @@
 use anvyx_frontend::air::{
-    CallArg, ExternId, FunctionId, Operand, ParamMode, Program, RValue, TypeId, TypePassClass,
+    CallArg, ExternId, FunctionId, ParamMode, Program, RValue, TypeId, TypePassClass,
     TypePassClasses, VerifiedProgram,
 };
 
-use super::vir::{
-    VirCall, VirCallArg, VirCallee, VirExtern, VirExternParam, VirFunction, VirParam, VirProgram,
-};
+use super::vir::{VirCall, VirExtern, VirFunction, VirParam, VirProgram};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmCompiler;
@@ -63,8 +61,7 @@ impl CompileCx<'_> {
                         }
                         VirParam {
                             local: param.local_id,
-                            ty: param.ty,
-                            mode: param.mode,
+                            param: param.param_type(),
                         }
                     })
                     .collect();
@@ -88,14 +85,7 @@ impl CompileCx<'_> {
             .enumerate()
             .map(|(index, decl)| VirExtern {
                 source: ExternId::from_index(index),
-                params: decl
-                    .call_params()
-                    .iter()
-                    .map(|param| VirExternParam {
-                        ty: param.ty,
-                        mode: param.mode,
-                    })
-                    .collect(),
+                params: decl.call_params().collect(),
                 ret: decl.return_type,
             })
             .collect();
@@ -110,31 +100,18 @@ impl CompileCx<'_> {
             .iter()
             .map(|arg| {
                 if let CallArg::Value(operand) = arg
-                    && let Some(ty) = self.operand_ty(operand)
+                    && let Some(ty) = self.program.operand_ty(operand)
                     && !self.is_cheap(ty)
                 {
                     self.push(function, VmCompileErrorKind::NonCheapValueArg);
                 }
-                VirCallArg::from(arg)
+                arg.clone()
             })
             .collect();
-        let callee = match callee {
-            anvyx_frontend::air::Callee::Function(id) => VirCallee::Function(*id),
-            anvyx_frontend::air::Callee::Extern(id) => VirCallee::Extern(*id),
-            anvyx_frontend::air::Callee::Closure(operand) => VirCallee::Closure(operand.clone()),
-        };
-        Some(VirCall { callee, args })
-    }
-
-    fn operand_ty(&self, operand: &Operand) -> Option<TypeId> {
-        match operand {
-            Operand::Place(place) => Some(place.ty),
-            Operand::Const(id) => self
-                .program
-                .const_arena
-                .get_checked(*id)
-                .map(|data| data.ty),
-        }
+        Some(VirCall {
+            callee: callee.clone(),
+            args,
+        })
     }
 
     fn is_cheap(&self, ty: TypeId) -> bool {

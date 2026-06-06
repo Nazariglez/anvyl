@@ -301,6 +301,7 @@ fn program_accessors() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
+        init_fields: vec![],
         fields: vec![],
         methods: vec![],
         statics: vec![],

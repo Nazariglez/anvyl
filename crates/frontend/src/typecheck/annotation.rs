@@ -1,7 +1,7 @@
 use std::{collections::HashSet, fmt};
 
 use super::{
-    MemberAccessKind, ModuleScope, NominalKey, NominalKind, TypeChecker, ValueDecl,
+    MemberAccessKind, ModuleScope, NominalKey, NominalKind, TypeChecker, ValueDecl, VarInfo,
     decls::DeclError, field_check, nominal_type, substitute_aggregate_member,
 };
 use crate::{
@@ -149,6 +149,18 @@ impl TypeChecker {
             return;
         };
         self.warn_deprecated(&sig.policy, DeprecatedUseKind::Const, name, span);
+    }
+
+    pub(super) fn warn_local_const_deprecated(&mut self, info: &VarInfo, name: Ident, span: Span) {
+        if info.local_const.is_some() || !info.kind.is_const() {
+            return;
+        }
+        let Some(value) = self.decls.local_value(&self.current_module, name) else {
+            return;
+        };
+        if matches!(value.decl, ValueDecl::Const(_)) {
+            self.warn_named_value_deprecated(&value.decl, name, span);
+        }
     }
 
     pub(super) fn warn_extern_type_deprecated(&mut self, key: &NominalKey, span: Span) {

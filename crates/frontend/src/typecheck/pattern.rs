@@ -1,9 +1,7 @@
 use super::{
     ActiveMutAliasRoot, CheckedType, MUT_ALIAS_ROOT_MESSAGE, MUT_DOWNCAST_ROOT_MESSAGE,
-    TypeChecker, TypeError, TypeHandle,
-    annotation::AccessPolicy,
-    check_block_checked_with_hint, check_expected_value_expr, check_value_expr_checked_with_hint,
-    checked_from_type, checked_void, closure, control_flow,
+    TypeChecker, TypeError, TypeHandle, check_block_checked_with_hint, check_expected_value_expr,
+    check_value_expr_checked_with_hint, checked_from_type, checked_void, closure, control_flow,
     decls::{FieldSchema, NamedSchemas, NominalKey, TypeBinding, nominal_type},
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
@@ -534,38 +532,29 @@ impl<'tc> PatternChecker<'tc> {
             Pattern::Struct { name, fields } => {
                 self.check_struct(*name, fields, pattern.span, input)
             }
-            Pattern::EnumUnit { qualifier, variant } => PatternCheckResult::empty(
-                self.check_enum_unit(Some(*qualifier), *variant, pattern.span, &input.expected_ty),
-            ),
-            Pattern::InferredEnumUnit { variant } => PatternCheckResult::empty(
-                self.check_enum_unit(None, *variant, pattern.span, &input.expected_ty),
-            ),
-            Pattern::EnumTuple {
+            Pattern::Enum {
                 qualifier,
                 variant,
-                fields,
-            } => self.check_enum_tuple(Some(*qualifier), *variant, fields, pattern.span, input),
-            Pattern::InferredEnumTuple { variant, fields } => {
-                self.check_enum_tuple(None, *variant, fields, pattern.span, input)
-            }
-            Pattern::EnumStruct {
-                qualifier,
-                variant,
-                fields,
-                has_rest,
-            } => self.check_enum_struct(
-                Some(*qualifier),
-                *variant,
-                fields,
-                *has_rest,
-                pattern.span,
-                input,
-            ),
-            Pattern::InferredEnumStruct {
-                variant,
-                fields,
-                has_rest,
-            } => self.check_enum_struct(None, *variant, fields, *has_rest, pattern.span, input),
+                payload,
+            } => match payload {
+                EnumPatternPayload::Unit => PatternCheckResult::empty(self.check_enum_unit(
+                    *qualifier,
+                    *variant,
+                    pattern.span,
+                    &input.expected_ty,
+                )),
+                EnumPatternPayload::Tuple(fields) => {
+                    self.check_enum_tuple(*qualifier, *variant, fields, pattern.span, input)
+                }
+                EnumPatternPayload::Struct { fields, has_rest } => self.check_enum_struct(
+                    *qualifier,
+                    *variant,
+                    fields,
+                    *has_rest,
+                    pattern.span,
+                    input,
+                ),
+            },
         }
     }
 
@@ -919,21 +908,7 @@ impl<'tc> PatternChecker<'tc> {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
                     return PatternCheckResult::empty(PatternOutcome::error());
                 };
-                let mut field_schema = NamedSchemas::default();
-                for field in &self.tc.extern_type(owner).fields {
-                    field_schema
-                        .insert(
-                            field.name,
-                            FieldSchema {
-                                ty: field.ty.ty.clone(),
-                                default: None,
-                                policy: AccessPolicy::default(),
-                                span: None,
-                                embed: None,
-                            },
-                        )
-                        .expect("extern fields are unique");
-                }
+                let field_schema = field_check::extern_field_schema(self.tc.extern_type(owner));
                 self.check_struct_fields(fields, nominal_type(&key), &field_schema, input)
             }
             NominalKind::Enum => PatternCheckResult::empty(self.unsupported_named("Struct", span)),

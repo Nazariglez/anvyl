@@ -708,53 +708,53 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
 
 fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     if let ExprKind::Ident(name) = &expr.node.kind {
-        match tc.lookup_local_value_checked(*name, expr.span) {
-            Ok(Some(value)) => {
-                let checked =
-                    super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
-                tc.record_local_read(expr.node.id, &value);
-                let access = tc.local_value_access(&value);
-                let mut place = CheckedPlace::new(checked, access.access);
-                place.value.facts = access.facts;
-                place.value.identity = access.identity;
-                place.value.root_local = Some(value.info.type_id);
-                place.value.root_name = Some(*name);
-                place.accepts_extern_any = access.accepts_extern_any;
-                return place;
+        match tc.resolve_ident_subject(*name, expr.span, super::NameSubjectMode::Place) {
+            super::ResolvedIdentSubject::Local(symbol, depth) => {
+                if let Some(error) = symbol.value_error(*name, tc.error_span(expr.span)) {
+                    tc.push_error(error);
+                    return CheckedPlace::new(
+                        super::checked_from_type(expr, Type::Infer, tc),
+                        PlaceAccess::NotPlace,
+                    );
+                }
+                let value = tc.local_value_from_info(symbol.value_view(), depth);
+                let (value, accepts_extern_any) = tc.local_place_value(expr, *name, &value, None);
+                return CheckedPlace {
+                    value,
+                    accepts_extern_any,
+                };
             }
-            Err(()) => {
+            super::ResolvedIdentSubject::Blocked(error) => {
+                tc.push_error(*error);
                 return CheckedPlace::new(
                     super::checked_from_type(expr, Type::Infer, tc),
                     PlaceAccess::NotPlace,
                 );
             }
-            Ok(None) => {}
-        }
-    }
-
-    if let ExprKind::Ident(name) = &expr.node.kind
-        && let Some((_, value_name, decl)) = tc.lookup_named_value(*name)
-    {
-        match decl {
-            ValueDecl::Const(sig) => {
-                tc.warn_named_const_deprecated(value_name, expr.span);
-                let checked = super::checked_from_type(expr, sig.ty.clone(), tc);
-                return CheckedPlace::new(checked, PlaceAccess::Const);
-            }
-            ValueDecl::Global(sig) => {
-                tc.warn_named_value_deprecated(
-                    &ValueDecl::Global(sig.clone()),
-                    value_name,
-                    expr.span,
-                );
-                let checked = super::checked_from_handle(expr, tc.global_handle(&sig.key), tc);
-                let value = global_value(&sig, checked);
-                return CheckedPlace {
-                    accepts_extern_any: value.checked.contains_extern_any,
-                    value,
-                };
-            }
-            ValueDecl::Func(_) => {}
+            super::ResolvedIdentSubject::Named(_, value_name, decl) => match decl {
+                ValueDecl::Const(sig) => {
+                    tc.warn_named_const_deprecated(value_name, expr.span);
+                    let checked = super::checked_from_type(expr, sig.ty.clone(), tc);
+                    return CheckedPlace::new(checked, PlaceAccess::Const);
+                }
+                ValueDecl::Global(sig) => {
+                    tc.warn_named_value_deprecated(
+                        &ValueDecl::Global(sig.clone()),
+                        value_name,
+                        expr.span,
+                    );
+                    let checked = super::checked_from_handle(expr, tc.global_handle(&sig.key), tc);
+                    let value = global_value(&sig, checked);
+                    return CheckedPlace {
+                        accepts_extern_any: value.checked.contains_extern_any,
+                        value,
+                    };
+                }
+                ValueDecl::Func(_) => {}
+            },
+            super::ResolvedIdentSubject::Missing
+            | super::ResolvedIdentSubject::Module(_)
+            | super::ResolvedIdentSubject::Type(_) => {}
         }
     }
 
@@ -869,6 +869,80 @@ fn check_module_qualified_place(expr: &ExprNode, tc: &mut TypeChecker) -> Option
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum PlaceUseKind {
+    Read,
+    Assign,
+    CompoundAssign,
+    VarArgument,
+    MutReceiver,
+    ImmutableBorrow,
+    MutableBorrow,
+}
+
+impl PlaceUseKind {
+    fn closure_effect(self) -> ClosurePlaceEffect {
+        match self {
+            Self::Read | Self::ImmutableBorrow => ClosurePlaceEffect::Read,
+            Self::Assign
+            | Self::CompoundAssign
+            | Self::VarArgument
+            | Self::MutReceiver
+            | Self::MutableBorrow => ClosurePlaceEffect::Mutable,
+        }
+    }
+
+    fn local_mode(self) -> Option<LocalUseMode> {
+        match self {
+            Self::Read => Some(LocalUseMode::Read),
+            Self::Assign => Some(LocalUseMode::Assign),
+            Self::CompoundAssign => Some(LocalUseMode::CompoundAssign),
+            Self::VarArgument => Some(LocalUseMode::VarArgument),
+            Self::MutReceiver => None,
+            Self::ImmutableBorrow => Some(LocalUseMode::Borrow),
+            Self::MutableBorrow => Some(LocalUseMode::MutBorrow),
+        }
+    }
+
+    fn global_mode(self, value: &PlaceValue) -> GlobalAccessMode {
+        match self {
+            Self::Read => GlobalAccessMode::Read,
+            Self::Assign if value.global.as_ref().is_some_and(|global| global.root) => {
+                GlobalAccessMode::RootAssign
+            }
+            Self::Assign => GlobalAccessMode::ProjectedAssign,
+            Self::CompoundAssign => GlobalAccessMode::CompoundAssign,
+            Self::VarArgument => GlobalAccessMode::VarArgument,
+            Self::MutReceiver => GlobalAccessMode::MutReceiver,
+            Self::ImmutableBorrow => GlobalAccessMode::ImmutableBorrow,
+            Self::MutableBorrow => GlobalAccessMode::MutableBorrow,
+        }
+    }
+
+    fn extern_effect(self) -> ExternPlaceEffect {
+        match self {
+            Self::Read | Self::ImmutableBorrow => ExternPlaceEffect::Read,
+            Self::Assign | Self::VarArgument | Self::MutReceiver | Self::MutableBorrow => {
+                ExternPlaceEffect::Write
+            }
+            Self::CompoundAssign => ExternPlaceEffect::ReadWrite,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClosurePlaceEffect {
+    Read,
+    Mutable,
+}
+
+#[derive(Clone, Copy)]
+enum ExternPlaceEffect {
+    Read,
+    Write,
+    ReadWrite,
+}
+
 fn record_direct_use(
     expr_id: ExprId,
     value: &PlaceValue,
@@ -883,68 +957,57 @@ fn record_direct_use(
     }
 }
 
+pub(super) fn record_place_use(
+    expr_id: ExprId,
+    value: &PlaceValue,
+    kind: PlaceUseKind,
+    tc: &mut TypeChecker,
+) {
+    match kind.closure_effect() {
+        ClosurePlaceEffect::Read => tc.closure.read_place(expr_id),
+        ClosurePlaceEffect::Mutable => tc.closure.mutably_use_place(expr_id),
+    }
+    record_place_global_access(expr_id, value, kind.global_mode(value), tc);
+    if let Some(mode) = kind.local_mode() {
+        record_direct_use(expr_id, value, mode, tc);
+    }
+    match kind.extern_effect() {
+        ExternPlaceEffect::Read => record_facts_read(expr_id, &value.facts, tc),
+        ExternPlaceEffect::Write => record_facts_write(expr_id, &value.facts, tc),
+        ExternPlaceEffect::ReadWrite => {
+            record_prefix_reads(expr_id, &value.facts, tc);
+            record_target_reads(expr_id, &value.facts, tc);
+            record_target_writes(expr_id, &value.facts, tc);
+        }
+    }
+}
+
 pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
-    let mode = if place
-        .value
-        .global
-        .as_ref()
-        .is_some_and(|global| global.root)
-    {
-        GlobalAccessMode::RootAssign
-    } else {
-        GlobalAccessMode::ProjectedAssign
-    };
-    record_place_global_access(expr_id, &place.value, mode, tc);
-    record_direct_use(expr_id, &place.value, LocalUseMode::Assign, tc);
-    record_value_write(expr_id, &place.value, tc);
+    record_place_use(expr_id, &place.value, PlaceUseKind::Assign, tc);
 }
 
 pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
-    tc.closure.mutably_use_place(expr_id);
-    record_place_global_access(expr_id, &place.value, GlobalAccessMode::CompoundAssign, tc);
-    record_direct_use(expr_id, &place.value, LocalUseMode::CompoundAssign, tc);
-    record_prefix_reads(expr_id, &place.value.facts, tc);
-    record_target_reads(expr_id, &place.value.facts, tc);
-    record_target_writes(expr_id, &place.value.facts, tc);
+    record_place_use(expr_id, &place.value, PlaceUseKind::CompoundAssign, tc);
 }
 
 pub(super) fn record_value_read(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
-    tc.closure.read_place(expr_id);
-    record_place_global_access(expr_id, value, GlobalAccessMode::Read, tc);
-    record_direct_use(expr_id, value, LocalUseMode::Read, tc);
-    record_facts_read(expr_id, &value.facts, tc);
+    record_place_use(expr_id, value, PlaceUseKind::Read, tc);
 }
 
 pub(super) fn record_var_argument(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
-    tc.closure.mutably_use_place(expr_id);
-    record_place_global_access(expr_id, value, GlobalAccessMode::VarArgument, tc);
-    record_direct_use(expr_id, value, LocalUseMode::VarArgument, tc);
-    record_facts_write(expr_id, &value.facts, tc);
+    record_place_use(expr_id, value, PlaceUseKind::VarArgument, tc);
 }
 
 pub(super) fn record_mut_receiver(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
-    tc.closure.mutably_use_place(expr_id);
-    record_place_global_access(expr_id, value, GlobalAccessMode::MutReceiver, tc);
-    record_facts_write(expr_id, &value.facts, tc);
+    record_place_use(expr_id, value, PlaceUseKind::MutReceiver, tc);
 }
 
 pub(super) fn record_immutable_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
-    tc.closure.read_place(expr_id);
-    record_place_global_access(expr_id, value, GlobalAccessMode::ImmutableBorrow, tc);
-    record_direct_use(expr_id, value, LocalUseMode::Borrow, tc);
-    record_facts_read(expr_id, &value.facts, tc);
+    record_place_use(expr_id, value, PlaceUseKind::ImmutableBorrow, tc);
 }
 
 pub(super) fn record_mut_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
-    tc.closure.mutably_use_place(expr_id);
-    record_place_global_access(expr_id, value, GlobalAccessMode::MutableBorrow, tc);
-    record_direct_use(expr_id, value, LocalUseMode::MutBorrow, tc);
-    record_facts_write(expr_id, &value.facts, tc);
-}
-
-pub(super) fn record_value_write(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
-    tc.closure.mutably_use_place(expr_id);
-    record_facts_write(expr_id, &value.facts, tc);
+    record_place_use(expr_id, value, PlaceUseKind::MutableBorrow, tc);
 }
 
 fn record_place_global_access(

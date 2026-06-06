@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable { fn update(var self); }
+struct Enemy { fn update(var self) {} }
+
+fn pick(var actor: dyn Updatable) -> var dyn Updatable {
+    match var actor as? {
+        Enemy(enemy) => enemy,
+        other => other,
+    }
+}
+
+fn main() {
+    var actor: dyn Updatable = Enemy {};
+    pick(actor) = Enemy {};
+}

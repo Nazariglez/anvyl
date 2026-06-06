@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'f' is non-escaping by default, but it escapes here
+// @frontend: new
+
+fn bad(f: fn(), cond: bool) -> fn() {
+    let g = if cond { f } else { || {} };
+    g
+}

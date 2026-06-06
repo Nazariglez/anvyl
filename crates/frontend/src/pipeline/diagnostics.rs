@@ -1,7 +1,4 @@
-use anvyx_externs::{
-    ExternDescriptorError, ExternOperator, ExternTypeExpr, ExternTypeKey,
-    ModulePath as ExternModulePath, NameKind, OperatorReturn, TypeContext,
-};
+use anvyx_externs::{ExternDescriptorError, ExternTypeKey};
 use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::{
@@ -20,7 +17,7 @@ use crate::{
         raw_module_scope,
     },
     lexer::{Delimiter, Op, Token},
-    resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveError, SourceFileId},
+    resolve::{ModuleId, PackageId, PackageModulePath, ResolveError},
     source::SourceId,
     span::SourceSpan,
     typecheck::{
@@ -130,10 +127,7 @@ pub(super) fn diagnose_conditional_error(source: SourceId, error: &ConditionalEr
 pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
     let (message, note) = match error {
         ResolveError::ModuleNotFound { module, .. } => (
-            format!(
-                "Cannot find module file for module '{}'",
-                render_module_id(module)
-            ),
+            format!("Cannot find module file for module '{module}'"),
             None,
         ),
         ResolveError::SourceImportNotFound {
@@ -142,29 +136,16 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
             candidate,
             ..
         } => (
-            format!(
-                "Cannot find source import '{}' from '{}'",
-                render_module_path(path),
-                importer
-            ),
+            format!("Cannot find source import '{path}' from '{importer}'"),
             candidate
                 .as_ref()
                 .map(|candidate| format!("looked for '{}'", candidate.display())),
         ),
         ResolveError::LoadFailed {
             module, message, ..
-        } => (
-            format!(
-                "Cannot load module '{}': {message}",
-                render_module_id(module)
-            ),
-            None,
-        ),
+        } => (format!("Cannot load module '{module}': {message}"), None),
         ResolveError::DuplicatePreloadedModule { module } => (
-            format!(
-                "module '{}' is preloaded more than once",
-                render_module_id(module)
-            ),
+            format!("module '{module}' is preloaded more than once"),
             None,
         ),
         ResolveError::UnknownDependency { alias, package, .. } => (
@@ -188,10 +169,7 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
         ResolveError::UnknownNativeProviderModule {
             package, module, ..
         } => (
-            format!(
-                "package '{package}' has no native provider module '{}'",
-                render_module_path(module)
-            ),
+            format!("package '{package}' has no native provider module '{module}'"),
             None,
         ),
         ResolveError::UnknownNativeDepProviderModule {
@@ -201,8 +179,7 @@ pub(super) fn diagnose_resolve_error(error: &ResolveError) -> Diagnostic {
             ..
         } => (
             format!(
-                "native-only dependency '{alias}' ({package}) has no native provider module '{}'",
-                render_module_path(module)
+                "native-only dependency '{alias}' ({package}) has no native provider module '{module}'"
             ),
             None,
         ),
@@ -258,11 +235,8 @@ pub(super) fn diagnose_extern_input_error(error: &ExternInputError) -> Diagnosti
             first,
             duplicate,
         } => format!(
-            "duplicate provider module '{}' in package '{}' declared by providers '{}' and '{}'",
-            render_extern_module_path(module),
-            package,
-            first.name,
-            duplicate.name
+            "duplicate provider module '{module}' in package '{}' declared by providers '{}' and '{}'",
+            package, first.name, duplicate.name
         ),
         ExternInputError::InvalidRawDescriptor { decl, scope, error } => format!(
             "invalid extern descriptor from {}: {}",
@@ -497,13 +471,13 @@ fn render_raw_member_key(key: &RawExternMemberKey) -> String {
 fn render_raw_scoped_name(scope: &RawExternScope, name: &str) -> String {
     match scope {
         RawExternScope::Module(module) if is_root_module_id(module) => name.to_string(),
-        RawExternScope::Module(module) => format!("{}.{name}", render_module_id(module)),
+        RawExternScope::Module(module) => format!("{module}.{name}"),
     }
 }
 
 fn render_raw_scope(scope: &RawExternScope) -> String {
     match scope {
-        RawExternScope::Module(module) => render_module_id(module),
+        RawExternScope::Module(module) => format!("{module}"),
     }
 }
 
@@ -522,9 +496,7 @@ fn render_extern_member_selector(selector: &anvyx_externs::ExternMemberSelector)
         | anvyx_externs::ExternMemberSelector::Method(name)
         | anvyx_externs::ExternMemberSelector::Static(name) => name.clone(),
         anvyx_externs::ExternMemberSelector::Init => "init".to_string(),
-        anvyx_externs::ExternMemberSelector::Operator(op) => {
-            render_extern_operator(*op).to_string()
-        }
+        anvyx_externs::ExternMemberSelector::Operator(op) => op.to_string(),
     }
 }
 
@@ -533,11 +505,49 @@ pub(super) fn diagnose_compile_warning(warning: &CompileWarning) -> Diagnostic {
         .with_primary_message(warning.span, "compile warning emitted here")
 }
 
+fn simple_type_error_message(error: &TypeError) -> Option<String> {
+    let message = match error {
+        TypeError::UndefinedVariable { name, .. } => format!("Unknown variable '{name}'"),
+        TypeError::ExternAnyEscape { .. } => {
+            "extern 'any' value cannot escape an extern boundary".to_string()
+        }
+        TypeError::AnyOutsideExternBoundary { .. } => {
+            "any is only allowed in extern boundary signatures".to_string()
+        }
+        TypeError::RecursiveInference { .. } => {
+            "recursive type inference is not allowed".to_string()
+        }
+        TypeError::CannotInferType { .. } => "Could not infer type".to_string(),
+        TypeError::CannotInferEnum { .. } => "cannot infer enum type".to_string(),
+        TypeError::InferReturnNonGeneric { .. } => {
+            "inferred return type is only allowed on generic callables".to_string()
+        }
+        TypeError::InferReturnExtern { .. } => {
+            "inferred return type is not allowed in extern declarations".to_string()
+        }
+        TypeError::InferReturnValue { .. } => {
+            "generic inferred-return callables cannot be used as values".to_string()
+        }
+        TypeError::InferReturnRecursive { .. } => {
+            "recursive inferred return type requires an explicit return type".to_string()
+        }
+        TypeError::CannotInferConst { .. } => "Could not infer const value".to_string(),
+        TypeError::AllNilArrayLiteral { .. } => {
+            "cannot infer element type for all-nil array literal".to_string()
+        }
+        TypeError::ArrayFillLengthNotConst { .. } => {
+            "array fill length must be a compile-time constant".to_string()
+        }
+        _ => return None,
+    };
+    Some(message)
+}
+
 pub(super) fn diagnose_type_error(
     error: &TypeError,
     type_ctx: &TypeDiagnosticContext,
 ) -> Diagnostic {
-    let span = type_error_span(error);
+    let span = error.span();
     if let Some((message, label)) = type_error_rich_message(error, type_ctx) {
         let diagnostic = Diagnostic::error(message);
         return match span {
@@ -545,11 +555,32 @@ pub(super) fn diagnose_type_error(
             None => Diagnostic::error(format!("{message}: {label}")),
         };
     }
+    if let Some(message) = simple_type_error_message(error) {
+        let diagnostic = Diagnostic::error(message);
+        return match span {
+            Some(span) => diagnostic.with_primary(span),
+            None => diagnostic,
+        };
+    }
 
     let diagnostic = Diagnostic::error(match error {
         TypeError::Decl(error) => render_decl_error(error, type_ctx),
         TypeError::ExternCatalog(error) => render_extern_catalog_error(error, type_ctx),
-        TypeError::UndefinedVariable { name, .. } => format!("Unknown variable '{name}'"),
+        TypeError::UndefinedVariable { .. }
+        | TypeError::ExternAnyEscape { .. }
+        | TypeError::AnyOutsideExternBoundary { .. }
+        | TypeError::RecursiveInference { .. }
+        | TypeError::CannotInferType { .. }
+        | TypeError::CannotInferEnum { .. }
+        | TypeError::InferReturnNonGeneric { .. }
+        | TypeError::InferReturnExtern { .. }
+        | TypeError::InferReturnValue { .. }
+        | TypeError::InferReturnRecursive { .. }
+        | TypeError::CannotInferConst { .. }
+        | TypeError::AllNilArrayLiteral { .. }
+        | TypeError::ArrayFillLengthNotConst { .. } => {
+            unreachable!("simple type diagnostic handled before message rendering")
+        },
         TypeError::TypeUsedAsValue { ty, .. } => {
             format!("type '{}' cannot be used as a value", render_surface_type(ty, type_ctx))
         }
@@ -563,12 +594,6 @@ pub(super) fn diagnose_type_error(
             render_const_diagnostic(expected),
             render_const_diagnostic(found)
         ),
-        TypeError::ExternAnyEscape { .. } => {
-            "extern 'any' value cannot escape an extern boundary".to_string()
-        }
-        TypeError::AnyOutsideExternBoundary { .. } => {
-            "any is only allowed in extern boundary signatures".to_string()
-        }
         TypeError::ContractUnsatisfied {
             ty,
             contract,
@@ -582,29 +607,12 @@ pub(super) fn diagnose_type_error(
             format!("cannot reassign borrowed dynamic parameter '{name}'")
         }
         TypeError::DynContainerConversion { kind, .. } => render_dyn_container_conversion(*kind),
-        TypeError::RecursiveInference { .. } => {
-            "recursive type inference is not allowed".to_string()
-        }
-        TypeError::CannotInferType { .. } => "Could not infer type".to_string(),
-        TypeError::CannotInferEnum { .. } => "cannot infer enum type".to_string(),
         TypeError::NamedFunctionCapture { name, .. } => {
             format!("named functions cannot capture local value '{name}'")
-        }
-        TypeError::InferReturnNonGeneric { .. } => {
-            "inferred return type is only allowed on generic callables".to_string()
-        }
-        TypeError::InferReturnExtern { .. } => {
-            "inferred return type is not allowed in extern declarations".to_string()
-        }
-        TypeError::InferReturnValue { .. } => {
-            "generic inferred-return callables cannot be used as values".to_string()
         }
         TypeError::InferReturnMismatch {
             expected, found, ..
         } => format!("inferred return type mismatch: expected '{}', found '{}'", render_surface_type(expected, type_ctx), render_surface_type(found, type_ctx)),
-        TypeError::InferReturnRecursive { .. } => {
-            "recursive inferred return type requires an explicit return type".to_string()
-        }
         TypeError::UnsupportedPlaceReturn { message, .. }
         | TypeError::ForIterationModifier { message, .. } => (*message).to_string(),
         TypeError::UnknownType {
@@ -613,13 +621,6 @@ pub(super) fn diagnose_type_error(
             "Unknown type '{}'",
             render_qualified_name(*qualifier, *name)
         ),
-        TypeError::CannotInferConst { .. } => "Could not infer const value".to_string(),
-        TypeError::AllNilArrayLiteral { .. } => {
-            "cannot infer element type for all-nil array literal".to_string()
-        }
-        TypeError::ArrayFillLengthNotConst { .. } => {
-            "array fill length must be a compile-time constant".to_string()
-        }
         TypeError::NotCallable { ty, .. } => format!("type '{}' is not callable", render_surface_type(ty, type_ctx)),
         TypeError::WrongArgCount {
             expected, found, ..
@@ -910,16 +911,10 @@ pub(super) fn diagnose_type_error(
         },
         TypeError::DuplicateMapKey { .. } => "duplicate key in map literal".to_string(),
         TypeError::UndefinedModuleMember { module, name, .. } => {
-            format!(
-                "Unknown member '{name}' in module '{}'",
-                render_module_scope(module)
-            )
+            format!("Unknown member '{name}' in module '{module}'")
         }
         TypeError::PrivateModuleMember { module, name, .. } => {
-            format!(
-                "member '{name}' in module '{}' is private",
-                render_module_scope(module)
-            )
+            format!("member '{name}' in module '{module}' is private")
         }
         TypeError::AmbiguousExtendMethod { receiver, name, .. } => {
             format!("ambiguous method '{name}' for type '{}'", render_surface_type(receiver, type_ctx))
@@ -1232,235 +1227,10 @@ fn condition_type_label(found: &Type, type_ctx: &TypeDiagnosticContext) -> Strin
     )
 }
 
-fn type_error_span(error: &TypeError) -> Option<SourceSpan> {
-    match error {
-        TypeError::Decl(error) => decl_error_span(error),
-        TypeError::ExternCatalog(error) => extern_catalog_error_span(error),
-        TypeError::UndefinedVariable { span, .. }
-        | TypeError::TypeMismatch { span, .. }
-        | TypeError::ConstMismatch { span, .. }
-        | TypeError::RecursiveInference { span, .. }
-        | TypeError::CannotInferType { span, .. }
-        | TypeError::CannotInferEnum { span, .. }
-        | TypeError::NamedFunctionCapture { span, .. }
-        | TypeError::AllNilArrayLiteral { span, .. }
-        | TypeError::ArrayFillLengthNotConst { span, .. }
-        | TypeError::InferReturnNonGeneric { span, .. }
-        | TypeError::InferReturnExtern { span, .. }
-        | TypeError::InferReturnValue { span, .. }
-        | TypeError::InferReturnMismatch { span, .. }
-        | TypeError::InferReturnRecursive { span, .. }
-        | TypeError::UnsupportedPlaceReturn { span, .. }
-        | TypeError::UnknownType { span, .. }
-        | TypeError::TypeUsedAsValue { span, .. }
-        | TypeError::CannotInferConst { span, .. }
-        | TypeError::NotCallable { span, .. }
-        | TypeError::WrongArgCount { span, .. }
-        | TypeError::WrongArgRange { span, .. }
-        | TypeError::LambdaParamCountMismatch { span, .. }
-        | TypeError::RequiredParamAfterDefault { span, .. }
-        | TypeError::EnumVariantArgCount { span, .. }
-        | TypeError::DuplicateName { span, .. }
-        | TypeError::ImmutableAssignment { span, .. }
-        | TypeError::ConstAssignment { span, .. }
-        | TypeError::VarArgNonLvalue { span, .. }
-        | TypeError::VarArgImmutableBinding { span, .. }
-        | TypeError::MutatingMethodImmutableReceiver { span, .. }
-        | TypeError::MutableAlias { span, .. }
-        | TypeError::InvalidFormatSpec { span, .. }
-        | TypeError::NonEscapingCallbackEscapes { span, .. }
-        | TypeError::BorrowedCaptureEscapes { span, .. }
-        | TypeError::RequiresMutablePlace { span, .. }
-        | TypeError::VarPatternRequiresMutablePlace { span, .. }
-        | TypeError::ForVarRequiresMutableIterable { span, .. }
-        | TypeError::ForMutableMapKey { span, .. }
-        | TypeError::ForMutableMapEntry { span, .. }
-        | TypeError::RefutableForPattern { span, .. }
-        | TypeError::InvalidOperand { span, .. }
-        | TypeError::MissingReturn { span, .. }
-        | TypeError::MatchArmTypeMismatch { span, .. }
-        | TypeError::IfWithoutElseValue { span, .. }
-        | TypeError::IfConditionNotBool { span, .. }
-        | TypeError::TernaryConditionNotBool { span, .. }
-        | TypeError::WhileConditionNotBool { span, .. }
-        | TypeError::BreakOutsideLoop { span, .. }
-        | TypeError::ContinueOutsideLoop { span, .. }
-        | TypeError::ReturnInsideDefer { span, .. }
-        | TypeError::BreakInsideDefer { span, .. }
-        | TypeError::ContinueInsideDefer { span, .. }
-        | TypeError::TryOnInvalidCarrier { span, .. }
-        | TypeError::TryOutsideCarrierFunction { span, .. }
-        | TypeError::TryResultErrorMismatch { span, .. }
-        | TypeError::TryInsideDefer { span, .. }
-        | TypeError::ForIterableNotSupported { span, .. }
-        | TypeError::ForIterationModifier { span, .. }
-        | TypeError::InfiniteSize { span, .. }
-        | TypeError::NotEquatable { span, .. }
-        | TypeError::UnsupportedPattern { span, .. }
-        | TypeError::TuplePatternArityMismatch { span, .. }
-        | TypeError::TuplePatternOnNonTuple { span, .. }
-        | TypeError::OrPatternBindingMismatch { span, .. }
-        | TypeError::OrPatternBindingTypeMismatch { span, .. }
-        | TypeError::EmptyMatch { span, .. }
-        | TypeError::NonExhaustiveMatch { span, .. }
-        | TypeError::UnsupportedMatchScrutinee { span, .. }
-        | TypeError::InvalidLiteralPattern { span, .. }
-        | TypeError::OptionalPatternOnNonOptional { span, .. }
-        | TypeError::OptionalChainingOnNonOptional { span, .. }
-        | TypeError::NestedOptionalPattern { span, .. }
-        | TypeError::UnsupportedOptionalPayloadPattern { span, .. }
-        | TypeError::RequiresUnwrappingPattern { span, .. }
-        | TypeError::IrrefutableLetElse { span, .. }
-        | TypeError::LetElseMustDiverge { span, .. }
-        | TypeError::MemberAccessOnNonAggregate { span, .. }
-        | TypeError::UnknownMember { span, .. }
-        | TypeError::AmbiguousPromotedField { span, .. }
-        | TypeError::AmbiguousPromotedMethod { span, .. }
-        | TypeError::PromotedFieldNotStored { span, .. }
-        | TypeError::AmbiguousProjection { span, .. }
-        | TypeError::MissingProjection { span, .. }
-        | TypeError::InstanceMethodOnType { span, .. }
-        | TypeError::StaticMethodOnValue { span, .. }
-        | TypeError::ReadonlyMethodMutation { span, .. }
-        | TypeError::UnknownIntrinsic { span, .. }
-        | TypeError::IntrinsicArgCount { span, .. }
-        | TypeError::IntrinsicExpectedIdent { span, .. }
-        | TypeError::IntrinsicExpectedString { span, .. }
-        | TypeError::UnknownIntrinsicValue { span, .. }
-        | TypeError::CompileError { span, .. }
-        | TypeError::MethodGenericShadow { span, .. }
-        | TypeError::TupleIndexOnNonTuple { span, .. }
-        | TypeError::TupleIndexOutOfBounds { span, .. }
-        | TypeError::IndexNotInt { span, .. }
-        | TypeError::IndexOnNonIndexable { span, .. }
-        | TypeError::RangeIndexNotInt { span, .. }
-        | TypeError::RangeIndexUnsupported { span, .. }
-        | TypeError::NonKeyableMapKey { span, .. }
-        | TypeError::DuplicateMapKey { span, .. }
-        | TypeError::UndefinedModuleMember { span, .. }
-        | TypeError::PrivateModuleMember { span, .. }
-        | TypeError::AmbiguousExtendMethod { span, .. }
-        | TypeError::DuplicateField { span, .. }
-        | TypeError::MissingField { span, .. }
-        | TypeError::UnknownVariantField { span, .. }
-        | TypeError::MissingVariantField { span, .. }
-        | TypeError::InvalidStructLiteral { span, .. }
-        | TypeError::UnknownStructLiteral { span, .. }
-        | TypeError::UnknownEnumVariant { span, .. }
-        | TypeError::EnumPatternTypeMismatch { span, .. }
-        | TypeError::EnumVariantShapeMismatch { span, .. }
-        | TypeError::UnboundGenericParam { span, .. }
-        | TypeError::UnknownConst { span, .. }
-        | TypeError::RuntimeGlobalInConstPosition { span, .. }
-        | TypeError::ConstCycle { span, .. }
-        | TypeError::NonConstExpression { span, .. }
-        | TypeError::InvalidDefaultExpression { span, .. }
-        | TypeError::DefaultReferencesParameter { span, .. }
-        | TypeError::DefaultReferencesSelf { span, .. }
-        | TypeError::DefaultReferencesField { span, .. }
-        | TypeError::VarParamDefault { span, .. }
-        | TypeError::ConstTypeMismatch { span, .. }
-        | TypeError::RawEnumExpectedIntValue { span, .. }
-        | TypeError::RawEnumExpectedStringValue { span, .. }
-        | TypeError::InvalidConstCast { span, .. }
-        | TypeError::InvalidCast { span, .. }
-        | TypeError::AmbiguousCast { span, .. }
-        | TypeError::RawEnumWrongRawCast { span, .. }
-        | TypeError::NonRawEnumRawCast { span, .. }
-        | TypeError::ConstDivisionByZero { span, .. }
-        | TypeError::ConstOverflow { span, .. }
-        | TypeError::ExpectedIntConst { span, .. }
-        | TypeError::NegativeArrayLength { span, .. }
-        | TypeError::GenericArgKindMismatch { span, .. }
-        | TypeError::ExternAnyEscape { span, .. }
-        | TypeError::AnyOutsideExternBoundary { span, .. }
-        | TypeError::ContractUnsatisfied { span, .. }
-        | TypeError::DynamicMethodMissing { span, .. }
-        | TypeError::BorrowedDynReassign { span, .. }
-        | TypeError::DynContainerConversion { span, .. }
-        | TypeError::DuplicateGenericParam { span, .. } => *span,
-        TypeError::GenericArity(_) => None,
-    }
-}
-
 fn render_raw_enum_value(value: &RawEnumValue) -> String {
     match value {
         RawEnumValue::Int(value) => value.to_string(),
         RawEnumValue::String(value) => format!("{value:?}"),
-    }
-}
-
-fn decl_error_span(error: &DeclError) -> Option<SourceSpan> {
-    match error {
-        DeclError::DuplicateValue { span, .. }
-        | DeclError::DuplicateType { span, .. }
-        | DeclError::MissingImportMember { span, .. }
-        | DeclError::PrivateImportMember { span, .. }
-        | DeclError::ImportConflict { span, .. }
-        | DeclError::DuplicateModuleBinding { span, .. }
-        | DeclError::DuplicateGenericParam { span, .. }
-        | DeclError::DuplicateAggregateMethod { span, .. }
-        | DeclError::DuplicateAggregateField { span, .. }
-        | DeclError::DuplicateEnumVariant { span, .. }
-        | DeclError::RawEnumInvalidBacking { span, .. }
-        | DeclError::RawEnumGenericParams { span, .. }
-        | DeclError::RawEnumValueWithoutBacking { span, .. }
-        | DeclError::RawEnumPayloadVariant { span, .. }
-        | DeclError::RawEnumMissingStringValue { span, .. }
-        | DeclError::RawEnumDuplicateValue { span, .. }
-        | DeclError::RawEnumIntOverflow { span, .. }
-        | DeclError::DuplicateVariantField { span, .. }
-        | DeclError::DuplicateContractRequirement { span, .. }
-        | DeclError::DuplicateExtendMethod { span, .. }
-        | DeclError::DuplicateCastFrom { span, .. }
-        | DeclError::PointlessCastFrom { span, .. }
-        | DeclError::CastFromReturnMismatch { span, .. }
-        | DeclError::UnsupportedExtendTarget { span, .. }
-        | DeclError::UnusedExtendTypeParam { span, .. }
-        | DeclError::UnusedExtendConstParam { span, .. }
-        | DeclError::UnusedAliasTypeParam { span, .. }
-        | DeclError::UnusedAliasConstParam { span, .. }
-        | DeclError::ExtendMethodConflict { span, .. }
-        | DeclError::ReexportConflict { span, .. }
-        | DeclError::UnknownType { span, .. }
-        | DeclError::UnknownAnnotation { span, .. }
-        | DeclError::InvalidAnnotationTarget { span, .. }
-        | DeclError::DuplicateAnnotation { span, .. }
-        | DeclError::InvalidAnnotationArgs { span, .. }
-        | DeclError::AsProjectionWithoutEmbed { span }
-        | DeclError::AsProjectionWithArgs { span }
-        | DeclError::InternalOnToString { span }
-        | DeclError::InvalidToStringMethod { span, .. }
-        | DeclError::EmptyEmbedSelector { span }
-        | DeclError::DuplicateEmbedSelector { span, .. }
-        | DeclError::EmbedSurfaceCycle { span, .. }
-        | DeclError::UnknownEmbedFieldSelector { span, .. }
-        | DeclError::EmbedFieldSelectorNamesMethod { span, .. }
-        | DeclError::AmbiguousEmbedFieldSelector { span, .. }
-        | DeclError::EmbedFieldConflictsWithDirect { span, .. }
-        | DeclError::DuplicateExplicitEmbedField { span, .. }
-        | DeclError::UnknownEmbedMethodSelector { span, .. }
-        | DeclError::EmbedMethodSelectorNamesField { span, .. }
-        | DeclError::EmbedMethodSelectorNamesStatic { span, .. }
-        | DeclError::EmbedMethodSelectorNamesToString { span }
-        | DeclError::AmbiguousEmbedMethodSelector { span, .. }
-        | DeclError::EmbedMethodConflictsWithDirect { span, .. }
-        | DeclError::DuplicateExplicitEmbedMethod { span, .. }
-        | DeclError::DuplicateProjectionTarget { span, .. } => *span,
-    }
-}
-
-fn extern_catalog_error_span(error: &ExternCatalogError) -> Option<SourceSpan> {
-    match error {
-        ExternCatalogError::UnknownType { site, .. }
-        | ExternCatalogError::PrivateType { site, .. }
-        | ExternCatalogError::GenericArity { site, .. }
-        | ExternCatalogError::GenericArgKindMismatch { site, .. }
-        | ExternCatalogError::InvalidType { site, .. }
-        | ExternCatalogError::UnknownInitField { site, .. }
-        | ExternCatalogError::ComputedInitField { site, .. }
-        | ExternCatalogError::UnsupportedInitParams { site, .. }
-        | ExternCatalogError::InvalidOperatorReturn { site, .. } => site.span,
     }
 }
 
@@ -1769,71 +1539,39 @@ fn render_extern_catalog_error(
     error: &ExternCatalogError,
     type_ctx: &TypeDiagnosticContext,
 ) -> String {
-    let (context, message) = match error {
-        ExternCatalogError::UnknownType {
-            context,
-            module,
-            name,
-            ..
-        } => {
+    let context = error.context();
+    let message = match error {
+        ExternCatalogError::UnknownType { module, name, .. } => {
             let ty = module.as_ref().map_or_else(
                 || name.to_string(),
                 |module| render_scoped_name(module, *name),
             );
-            (
-                context,
-                format!(
-                    "Unknown extern type '{ty}' in {}",
-                    render_extern_item(context)
-                ),
+            format!(
+                "Unknown extern type '{ty}' in {}",
+                render_extern_item(context)
             )
         }
-        ExternCatalogError::PrivateType {
-            context,
-            module,
-            name,
-            ..
-        } => (
-            context,
-            format!(
-                "extern type '{}' in {} is private",
-                render_scoped_name(module, *name),
-                render_extern_item(context)
-            ),
+        ExternCatalogError::PrivateType { module, name, .. } => format!(
+            "extern type '{}' in {} is private",
+            render_scoped_name(module, *name),
+            render_extern_item(context)
         ),
         ExternCatalogError::GenericArity {
-            context,
             name,
             expected,
             found,
             ..
-        } => (
-            context,
-            format!(
-                "wrong number of extern type arguments for '{name}' in {}: expected {expected}, found {found}",
-                render_extern_item(context)
-            ),
+        } => format!(
+            "wrong number of extern type arguments for '{name}' in {}: expected {expected}, found {found}",
+            render_extern_item(context)
         ),
-        ExternCatalogError::GenericArgKindMismatch {
-            context,
-            name,
-            expected,
-            ..
-        } => (
-            context,
-            format!(
-                "expected {expected} extern generic argument for '{name}' in {}",
-                render_extern_item(context)
-            ),
+        ExternCatalogError::GenericArgKindMismatch { name, expected, .. } => format!(
+            "expected {expected} extern generic argument for '{name}' in {}",
+            render_extern_item(context)
         ),
-        ExternCatalogError::InvalidType {
-            context,
-            ty,
-            reason,
-            ..
-        } => {
+        ExternCatalogError::InvalidType { ty, reason, .. } => {
             let item = render_extern_item(context);
-            let message = match reason {
+            match reason {
                 InvalidExternTypeReason::Unresolved => format!(
                     "unresolved extern type '{}' in {item}",
                     render_surface_type(ty, type_ctx)
@@ -1854,43 +1592,27 @@ fn render_extern_catalog_error(
                     "extern type '{}' requires the core Option type in {item}",
                     render_surface_type(ty, type_ctx)
                 ),
-            };
-            (context, message)
+            }
         }
-        ExternCatalogError::UnknownInitField { context, field, .. } => (
-            context,
-            format!(
-                "{} references unknown field '{field}'",
-                render_extern_item(context)
-            ),
+        ExternCatalogError::UnknownInitField { field, .. } => format!(
+            "{} references unknown field '{field}'",
+            render_extern_item(context)
         ),
-        ExternCatalogError::ComputedInitField { context, field, .. } => (
-            context,
-            format!(
-                "{} cannot initialize computed field '{field}'",
-                render_extern_item(context)
-            ),
+        ExternCatalogError::ComputedInitField { field, .. } => format!(
+            "{} cannot initialize computed field '{field}'",
+            render_extern_item(context)
         ),
-        ExternCatalogError::UnsupportedInitParams { context, count, .. } => (
-            context,
-            format!(
-                "{} does not support parameters: found {count} parameter(s)",
-                render_extern_item(context)
-            ),
+        ExternCatalogError::UnsupportedInitParams { count, .. } => format!(
+            "{} does not support parameters: found {count} parameter(s)",
+            render_extern_item(context)
         ),
         ExternCatalogError::InvalidOperatorReturn {
-            context,
-            found,
+            found, expected, ..
+        } => format!(
+            "invalid {}: expected {} return type, found '{}'",
+            render_extern_item(context),
             expected,
-            ..
-        } => (
-            context,
-            format!(
-                "invalid {}: expected {} return type, found '{}'",
-                render_extern_item(context),
-                render_operator_return(*expected),
-                render_surface_type(found, type_ctx)
-            ),
+            render_surface_type(found, type_ctx)
         ),
     };
     format!(
@@ -1933,7 +1655,7 @@ fn render_extern_item(context: &ExternCatalogContext) -> String {
         }
         ExternContextItem::Operator { ty, op } => {
             let owner = render_extern_context_name(context, *ty);
-            format!("extern operator {owner}.{}", render_extern_operator(*op))
+            format!("extern operator {owner}.{op}")
         }
     }
 }
@@ -1964,8 +1686,8 @@ fn is_source_extern_context(context: &ExternCatalogContext) -> bool {
 fn render_scoped_name(module: &ModuleScope, name: Ident) -> String {
     match module {
         ModuleScope::Root => name.to_string(),
-        ModuleScope::Named(path) => format!("{}.{name}", render_module_path(path)),
-        ModuleScope::Package(module) => format!("{}.{name}", render_module_id(module)),
+        ModuleScope::Named(path) => format!("{path}.{name}"),
+        ModuleScope::Package(module) => format!("{module}.{name}"),
     }
 }
 
@@ -2010,16 +1732,10 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
         DeclError::DuplicateValue { name, .. } => format!("value '{name}' is already declared"),
         DeclError::DuplicateType { name, .. } => format!("type '{name}' is already defined"),
         DeclError::MissingImportMember { imported, name, .. } => {
-            format!(
-                "Unknown member '{name}' in module '{}'",
-                render_module_scope(imported)
-            )
+            format!("Unknown member '{name}' in module '{imported}'")
         }
         DeclError::PrivateImportMember { imported, name, .. } => {
-            format!(
-                "member '{name}' in module '{}' is private",
-                render_module_scope(imported)
-            )
+            format!("member '{name}' in module '{imported}' is private")
         }
         DeclError::ImportConflict {
             name,
@@ -2285,7 +2001,7 @@ fn render_binding_origin(origin: &BindingOrigin) -> String {
         BindingOrigin::Import { source, .. }
         | BindingOrigin::Reexport { source, .. }
         | BindingOrigin::ImplicitImport { source } => {
-            format!("'{}'", render_module_scope(source))
+            format!("'{source}'")
         }
     }
 }
@@ -2313,20 +2029,18 @@ fn render_extern_descriptor_error(
 ) -> String {
     match error {
         ExternDescriptorError::InvalidName { kind, name } => {
-            format!("invalid {} name '{name}'", render_name_kind(*kind))
+            format!("invalid {kind} name '{name}'")
         }
         ExternDescriptorError::EmptyModulePath => "module path must not be empty".to_string(),
         ExternDescriptorError::DuplicateModule(path) => {
-            format!("duplicate module '{}'", render_extern_module_path(path))
+            format!("duplicate module '{path}'")
         }
-        ExternDescriptorError::DuplicateType { module, name } => format!(
-            "duplicate type '{name}' in module '{}'",
-            render_extern_module_path(module)
-        ),
-        ExternDescriptorError::DuplicateFunction { module, name } => format!(
-            "duplicate function '{name}' in module '{}'",
-            render_extern_module_path(module)
-        ),
+        ExternDescriptorError::DuplicateType { module, name } => {
+            format!("duplicate type '{name}' in module '{module}'")
+        }
+        ExternDescriptorError::DuplicateFunction { module, name } => {
+            format!("duplicate function '{name}' in module '{module}'")
+        }
         ExternDescriptorError::DuplicateField { ty, name } => format!(
             "duplicate field '{name}' on extern type '{}'",
             render_extern_type_key(ty, raw_scope)
@@ -2340,8 +2054,7 @@ fn render_extern_descriptor_error(
             render_extern_type_key(ty, raw_scope)
         ),
         ExternDescriptorError::DuplicateOperator { ty, op } => format!(
-            "duplicate operator '{}' on extern type '{}'",
-            render_extern_operator(*op),
+            "duplicate operator '{op}' on extern type '{}'",
             render_extern_type_key(ty, raw_scope)
         ),
         ExternDescriptorError::InvalidOperatorSignature {
@@ -2350,8 +2063,7 @@ fn render_extern_descriptor_error(
             expected_params,
             actual_params,
         } => format!(
-            "invalid operator '{}' on extern type '{}': expected {expected_params} parameter(s), found {actual_params}",
-            render_extern_operator(*op),
+            "invalid operator '{op}' on extern type '{}': expected {expected_params} parameter(s), found {actual_params}",
             render_extern_type_key(ty, raw_scope)
         ),
         ExternDescriptorError::InvalidOperatorReturn {
@@ -2360,11 +2072,8 @@ fn render_extern_descriptor_error(
             expected,
             actual,
         } => format!(
-            "invalid operator '{}' on extern type '{}': expected {} return type, found '{}'",
-            render_extern_operator(*op),
-            render_extern_type_key(ty, raw_scope),
-            render_operator_return(*expected),
-            render_extern_type_expr(actual)
+            "invalid operator '{op}' on extern type '{}': expected {expected} return type, found '{actual}'",
+            render_extern_type_key(ty, raw_scope)
         ),
         ExternDescriptorError::DuplicateFieldInit { ty, name } => format!(
             "duplicate init field '{name}' on extern type '{}'",
@@ -2375,158 +2084,24 @@ fn render_extern_descriptor_error(
             render_extern_type_key(ty, raw_scope)
         ),
         ExternDescriptorError::VoidType { context } => {
-            format!(
-                "void type is not allowed in {}",
-                render_type_context(*context)
-            )
+            format!("void type is not allowed in {context}")
         }
-    }
-}
-
-fn render_name_kind(kind: NameKind) -> &'static str {
-    match kind {
-        NameKind::Provider => "provider",
-        NameKind::ModuleSegment => "module segment",
-        NameKind::Type => "type",
-        NameKind::Function => "function",
-        NameKind::Field => "field",
-        NameKind::FieldInit => "field init",
-        NameKind::Method => "method",
-        NameKind::Static => "static method",
-        NameKind::Param => "parameter",
-        NameKind::NamedType => "named type",
-    }
-}
-
-fn render_operator_return(expected: OperatorReturn) -> &'static str {
-    match expected {
-        OperatorReturn::Bool => "bool",
-        OperatorReturn::NonVoid => "non-void",
-    }
-}
-
-fn render_type_context(context: TypeContext) -> &'static str {
-    match context {
-        TypeContext::Param => "parameter position",
-        TypeContext::Nested => "nested type position",
     }
 }
 
 fn render_extern_type_key(key: &ExternTypeKey, raw_scope: Option<&RawExternScope>) -> String {
     match raw_scope {
         Some(scope) => render_raw_scoped_name(scope, &key.name),
-        None => format!("{}.{}", render_extern_module_path(&key.module), key.name),
-    }
-}
-
-fn render_extern_module_path(path: &ExternModulePath) -> String {
-    path.segments.join(".")
-}
-
-fn render_extern_operator(op: ExternOperator) -> &'static str {
-    match op {
-        ExternOperator::Unary(anvyx_externs::UnaryOp::Neg) => "unary -",
-        ExternOperator::Binary { op, self_on_right } => match (op, self_on_right) {
-            (anvyx_externs::BinaryOp::Add, false) => "+",
-            (anvyx_externs::BinaryOp::Add, true) => "right +",
-            (anvyx_externs::BinaryOp::Sub, false) => "-",
-            (anvyx_externs::BinaryOp::Sub, true) => "right -",
-            (anvyx_externs::BinaryOp::Mul, false) => "*",
-            (anvyx_externs::BinaryOp::Mul, true) => "right *",
-            (anvyx_externs::BinaryOp::Div, false) => "/",
-            (anvyx_externs::BinaryOp::Div, true) => "right /",
-            (anvyx_externs::BinaryOp::Rem, false) => "%",
-            (anvyx_externs::BinaryOp::Rem, true) => "right %",
-            (anvyx_externs::BinaryOp::Eq, false) => "==",
-            (anvyx_externs::BinaryOp::Eq, true) => "right ==",
-            (anvyx_externs::BinaryOp::NotEq, false) => "!=",
-            (anvyx_externs::BinaryOp::NotEq, true) => "right !=",
-            (anvyx_externs::BinaryOp::LessThan, false) => "<",
-            (anvyx_externs::BinaryOp::LessThan, true) => "right <",
-            (anvyx_externs::BinaryOp::GreaterThan, false) => ">",
-            (anvyx_externs::BinaryOp::GreaterThan, true) => "right >",
-            (anvyx_externs::BinaryOp::LessThanEq, false) => "<=",
-            (anvyx_externs::BinaryOp::LessThanEq, true) => "right <=",
-            (anvyx_externs::BinaryOp::GreaterThanEq, false) => ">=",
-            (anvyx_externs::BinaryOp::GreaterThanEq, true) => "right >=",
-        },
-    }
-}
-
-fn render_extern_type_expr(ty: &ExternTypeExpr) -> String {
-    match ty {
-        ExternTypeExpr::Void => "void".to_string(),
-        ExternTypeExpr::Bool => "bool".to_string(),
-        ExternTypeExpr::Int => "int".to_string(),
-        ExternTypeExpr::Float => "float".to_string(),
-        ExternTypeExpr::String => "string".to_string(),
-        ExternTypeExpr::Any => "any".to_string(),
-        ExternTypeExpr::List(item) => format!("[{}]", render_extern_type_expr(item)),
-        ExternTypeExpr::Map(key, value) => format!(
-            "[{}: {}]",
-            render_extern_type_expr(key),
-            render_extern_type_expr(value)
-        ),
-        ExternTypeExpr::Option(item) => format!("{}?", render_extern_type_expr(item)),
-        ExternTypeExpr::Named { module, name, args } => {
-            let mut rendered = match module {
-                Some(module) => format!("{}.{}", render_extern_module_path(module), name),
-                None => name.clone(),
-            };
-            if !args.is_empty() {
-                let args = args
-                    .iter()
-                    .map(render_extern_type_expr)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                rendered.push('<');
-                rendered.push_str(&args);
-                rendered.push('>');
-            }
-            rendered
-        }
-        ExternTypeExpr::Callback(_) => "callback".to_string(),
-    }
-}
-
-fn render_module_path(path: &ModulePath) -> String {
-    path.segments().join(".")
-}
-
-fn render_source_file(file: &SourceFileId) -> String {
-    file.path()
-        .file_stem()
-        .unwrap_or_else(|| file.path().as_os_str())
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn render_module_id(module: &ModuleId) -> String {
-    let path = match module.path() {
-        PackageModulePath::Root => "<root>".to_string(),
-        PackageModulePath::Named(path) => render_module_path(path),
-        PackageModulePath::Provider(path) => format!("ext:{}", render_module_path(path)),
-        PackageModulePath::Source(file) => render_source_file(file),
-    };
-    match module.package_context() {
-        Some(package) if package != &PackageId::synthetic_root() => {
-            format!("{package}:{path}")
-        }
-        _ => path,
-    }
-}
-
-fn render_module_scope(scope: &ModuleScope) -> String {
-    match scope {
-        ModuleScope::Root => "<root>".to_string(),
-        ModuleScope::Named(path) => render_module_path(path),
-        ModuleScope::Package(module) => render_module_id(module),
+        None => format!("{}.{}", key.module, key.name),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use anvyx_externs::{BinaryOp, ExternMemberSelector, ProviderId};
+    use anvyx_externs::{
+        BinaryOp, ExternMemberSelector, ExternOperator, ExternTypeExpr,
+        ModulePath as ExternModulePath, OperatorReturn, ProviderId, TypeContext,
+    };
     use chumsky::error::{LabelError, RichPattern};
 
     use super::*;
@@ -2535,6 +2110,7 @@ mod tests {
         externs::RawExternSite,
         lexer::{Keyword, Token, TokenStream},
         parser,
+        resolve::SourceFileId,
         span::SourceSpan,
         test_support::{
             core_option_key, core_option_type, ident, module_path_segments, test_source_id,

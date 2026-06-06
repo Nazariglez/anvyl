@@ -82,6 +82,15 @@ pub struct Param {
     pub local_id: LocalId,
 }
 
+impl Param {
+    pub fn param_type(&self) -> ParamType {
+        ParamType {
+            ty: self.ty,
+            mode: self.mode,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamRole {
     Normal,
@@ -219,11 +228,22 @@ pub struct ExternReceiverDecl {
 }
 
 impl ExternDecl {
-    pub fn call_params(&self) -> Vec<ParamType> {
+    pub fn call_params(&self) -> impl Iterator<Item = ParamType> + '_ {
         self.receiver_param()
             .into_iter()
             .chain(self.params.iter().map(ExternParamDecl::param_type))
-            .collect()
+    }
+
+    pub fn call_arity(&self) -> usize {
+        self.params.len() + usize::from(self.receiver_param().is_some())
+    }
+
+    pub fn call_param(&self, index: usize) -> Option<ParamType> {
+        match self.receiver_param() {
+            Some(receiver) if index == 0 => Some(receiver),
+            Some(_) => self.params.get(index - 1).map(ExternParamDecl::param_type),
+            None => self.params.get(index).map(ExternParamDecl::param_type),
+        }
     }
 
     fn receiver_param(&self) -> Option<ParamType> {
@@ -302,10 +322,21 @@ pub struct ExternTypeDecl {
     pub const_args: Vec<String>,
     pub rep: ExternRep,
     pub has_init: bool,
+    pub init_fields: Vec<FieldId>,
     pub fields: Vec<ExternFieldDecl>,
     pub methods: Vec<ExternMethodDecl>,
     pub statics: Vec<ExternStaticDecl>,
     pub operators: Vec<ExternOpDecl>,
+}
+
+impl ExternTypeDecl {
+    pub fn constructor_fields(&self) -> Option<impl Iterator<Item = (FieldId, &ExternFieldDecl)>> {
+        self.has_init.then(|| {
+            self.init_fields
+                .iter()
+                .filter_map(|field| self.fields.get(field.index()).map(|decl| (*field, decl)))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

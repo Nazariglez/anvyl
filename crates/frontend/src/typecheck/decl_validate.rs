@@ -1,22 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    CallableKind, CastConversionSchema, DeclError, DeclarationIndex, DynInference, EnumRepr,
-    ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams,
-    MethodKey, MethodSurface, NominalKey, PendingRawEnum, RawEnumValue, TypeAliasDef, TypeChecker,
-    TypeError, ValueDecl, VariantPayload,
+    CastConversionSchema, DeclError, DeclarationIndex, DynInference, EnumRepr, ExtendSchema,
+    GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams, MethodKey,
+    MethodSurface, ModuleScope, NominalKey, PendingRawEnum, RawEnumValue, TypeAliasDef,
+    TypeChecker, TypeError, VariantPayload, VerifiedRawEnumMetadata,
     const_eval::const_type,
     contracts,
     extend_target::{ExtendTargetPattern, same_target_pattern, validate_constrained_target},
     same_extend_target,
-    type_ops::TypeVisitor,
     type_refs::GenericParamError,
 };
 use crate::{
     ast::{
         AggregateKind, ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef,
         EscapeMode, Func, FuncParam, Ident, MethodReceiver, MethodSig, Mutability, NominalKind,
-        Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId,
+        Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId, TypeVisitor,
     },
     source::SourceId,
     span::{SourceSpan, Span},
@@ -169,44 +168,20 @@ pub(super) fn generic_param_type_error(
     }
 }
 
-fn validate_dyn_infer_decls(decls: &DeclarationIndex, errors: &mut Vec<TypeError>) {
-    for (_key, aggregate) in decls.aggregates() {
-        for field in aggregate.fields.values() {
-            push_invalid_dyn_infer_decl(&field.ty, field.span, errors);
+fn validate_dyn_infer_decls(
+    decls: &DeclarationIndex,
+    module_sources: &HashMap<ModuleScope, SourceId>,
+    errors: &mut Vec<TypeError>,
+) {
+    decls.walk_canonical_type_uses(|site, ty| {
+        if site.kind.rejects_raw_dyn_hole() {
+            let span = module_sources
+                .get(&site.module)
+                .copied()
+                .map(|source| SourceSpan::from_byte_span(source, site.span));
+            push_invalid_dyn_infer_decl(ty, span, errors);
         }
-    }
-    for (_key, schema) in decls.enums() {
-        for variant in schema.variants.values() {
-            match &variant.payload {
-                VariantPayload::Unit => {}
-                VariantPayload::Tuple(types) => {
-                    for ty in types {
-                        push_invalid_dyn_infer_decl(ty, None, errors);
-                    }
-                }
-                VariantPayload::Struct(fields) => {
-                    for field in fields.values() {
-                        push_invalid_dyn_infer_decl(&field.ty, field.span, errors);
-                    }
-                }
-            }
-        }
-    }
-    for alias in decls.type_aliases() {
-        push_invalid_dyn_infer_decl(&alias.def.aliased, Some(alias.def.span), errors);
-    }
-    for value in decls.values() {
-        match &value.decl {
-            ValueDecl::Const(sig) => push_invalid_dyn_infer_decl(&sig.ty, None, errors),
-            ValueDecl::Global(sig) => {
-                push_invalid_dyn_infer_decl(&sig.ty, Some(sig.initializer_span), errors);
-            }
-            ValueDecl::Func(sig) if sig.kind == CallableKind::ExternFunction => {
-                push_invalid_dyn_infer_decl(&sig.ty, None, errors);
-            }
-            ValueDecl::Func(_) => {}
-        }
-    }
+    });
 }
 
 fn push_invalid_dyn_infer_decl(ty: &Type, span: Option<SourceSpan>, errors: &mut Vec<TypeError>) {
@@ -851,7 +826,7 @@ impl TypeChecker {
         let saved_module = self.current_module.clone();
         let mut decls = std::mem::take(&mut self.decls);
         let lookup = decls.clone();
-        let generic_errors = decls.map_canonical_type_uses(|site, ty| {
+        let generic_errors = decls.fold_canonical_type_uses(|site, ty| {
             self.current_module = site.module.clone();
             let span = site.span;
             let ty = self.finalize_decl_type(&lookup, site, ty);
@@ -868,7 +843,7 @@ impl TypeChecker {
         self.validate_raw_enum_declarations();
         decls = std::mem::take(&mut self.decls);
         contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.lint_events);
-        validate_dyn_infer_decls(&decls, &mut self.errors);
+        validate_dyn_infer_decls(&decls, &self.module_sources, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
         for error in decls.build_projection_edges() {
             self.push_error(TypeError::Decl(error));
@@ -961,11 +936,10 @@ impl TypeChecker {
             EnumRepr::RawInt => self.resolve_raw_int_values(key, pending, &mut valid),
             EnumRepr::RawString => self.resolve_raw_string_values(key, pending, &mut valid),
         };
-        if valid && !self.decls.install_raw_enum_metadata(key, repr, values) {
-            self.decls.sanitize_raw_enum(key);
-            return false;
-        }
         valid
+            && self
+                .decls
+                .install_raw_enum_metadata(key, VerifiedRawEnumMetadata { repr, values })
     }
 
     fn resolve_raw_int_values(
@@ -1076,7 +1050,7 @@ impl TypeChecker {
     fn validate_final_decl_type_uses(&mut self, decls: &mut DeclarationIndex) {
         let validation = decls.clone();
         self.decls = validation.clone();
-        let _ = decls.map_canonical_type_uses(|site, ty| {
+        decls.walk_canonical_type_uses(|site, ty| {
             self.current_module = site.module;
             self.push_generic_owner_frame(GenericOwnerFrame {
                 params: GenericParams {
@@ -1085,9 +1059,8 @@ impl TypeChecker {
                 },
                 ..GenericOwnerFrame::default()
             });
-            self.validate_nominal_uses_in(&validation, &ty, site.span);
+            self.validate_nominal_uses_in(&validation, ty, site.span);
             self.pop_generic_owner_frame();
-            ty
         });
     }
 }

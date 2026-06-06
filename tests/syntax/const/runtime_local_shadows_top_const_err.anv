@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: array fill length must be a compile-time constant
+
+const N = 1;
+
+fn main() {
+    let N = 2;
+    let xs = [0; N];
+}

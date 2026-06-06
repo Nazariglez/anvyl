@@ -14,13 +14,29 @@ pub enum LintLevel {
     Error,
 }
 
-impl fmt::Display for LintLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl LintLevel {
+    #[must_use]
+    pub fn config_name(self) -> &'static str {
+        match self {
             Self::Allow => "allow",
             Self::Warn => "warn",
             Self::Error => "error",
-        })
+        }
+    }
+
+    #[must_use]
+    pub fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Warn => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl fmt::Display for LintLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.config_name())
     }
 }
 
@@ -29,9 +45,9 @@ impl FromStr for LintLevel {
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         match text {
-            "allow" => Ok(Self::Allow),
-            "warn" => Ok(Self::Warn),
-            "error" => Ok(Self::Error),
+            text if text == Self::Allow.config_name() => Ok(Self::Allow),
+            text if text == Self::Warn.config_name() => Ok(Self::Warn),
+            text if text == Self::Error.config_name() => Ok(Self::Error),
             _ => Err(UnknownLintLevel),
         }
     }
@@ -215,7 +231,10 @@ impl fmt::Display for LintParseError {
             ),
             Self::UnknownLevel { level } => write!(
                 f,
-                "unknown lint level '{level}'. Available: allow, warn, error"
+                "unknown lint level '{level}'. Available: {}, {}, {}",
+                LintLevel::Allow.config_name(),
+                LintLevel::Warn.config_name(),
+                LintLevel::Error.config_name()
             ),
         }
     }

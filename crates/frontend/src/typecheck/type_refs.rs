@@ -12,12 +12,12 @@ use super::{
     },
     dyn_infer::DynInference,
     generic::{GenericArgs, GenericParams, substitute},
-    type_ops::{TypeVisitor, bare_type_name},
+    generic_bind::{ExplicitGenericBinder, bind_explicit_generic_args, materialize_exact},
 };
 use crate::{
     ast::{
         AnonymousContractRequirement, ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef,
-        FuncParam, GenericArg, Ident, Type, TypeParam, TypeVarId,
+        GenericArg, Ident, Type, TypeParam, TypeVarId, TypeVisitor,
     },
     span::{SourceSpan, Span},
 };
@@ -65,6 +65,41 @@ pub(crate) fn validate_generic_params(
 pub(crate) struct GenericTypeContext {
     type_params: HashMap<Ident, TypeVarId>,
     const_params: HashMap<Ident, ConstParamId>,
+}
+
+pub(crate) fn generic_context_from_params<F>(
+    type_params: &[TypeParam],
+    const_params: &[ConstParam],
+    mut push_error: F,
+) -> GenericTypeContext
+where
+    F: FnMut(GenericParamError),
+{
+    match GenericTypeContext::try_from_params(type_params, const_params) {
+        Ok(generics) => generics,
+        Err(error) => {
+            push_error(error);
+            GenericTypeContext::default()
+        }
+    }
+}
+
+pub(crate) fn extend_generic_context_with_params<F>(
+    owner: &GenericTypeContext,
+    type_params: &[TypeParam],
+    const_params: &[ConstParam],
+    mut push_error: F,
+) -> GenericTypeContext
+where
+    F: FnMut(GenericParamError),
+{
+    match owner.try_with_shadowing_params(type_params, const_params) {
+        Ok(generics) => generics,
+        Err(error) => {
+            push_error(error);
+            owner.clone()
+        }
+    }
 }
 
 impl GenericTypeContext {
@@ -861,12 +896,8 @@ impl<'a> TypeRefResolver<'a> {
                 params: params
                     .iter()
                     .map(|param| {
-                        Ok(FuncParam::new(
-                            self.finalize_inner(module, generics, &param.ty, state)?,
-                            param.mutable,
-                            param.cast_accept,
-                            param.escape,
-                        ))
+                        let ty = self.finalize_inner(module, generics, &param.ty, state)?;
+                        Ok(param.with_ty(ty))
                     })
                     .collect::<Result<_, _>>()?,
                 ret: Box::new(ret.with_ty(self.finalize_inner(module, generics, &ret.ty, state)?)),
@@ -1353,32 +1384,26 @@ impl<'a> TypeRefResolver<'a> {
         args: &[GenericArg],
         state: &mut FinalizeState,
     ) -> Result<GenericArgs, TypeRefError> {
-        let type_len = params.type_params.len();
-        let expected = type_len + params.const_params.len();
-        if args.len() != expected {
-            return Err(TypeRefError::GenericArity {
-                expected,
-                found: args.len(),
-            });
+        let mut binder = TypeRefGenericBinder {
+            resolver: self,
+            module,
+            generics,
+            state,
+            error: None,
+        };
+        let span = binder.state.site.unwrap_or_default();
+        match bind_explicit_generic_args(
+            params,
+            args,
+            span,
+            super::generic_bind::ExplicitGenericMode::Exact,
+            &mut binder,
+        ) {
+            Some(bindings) => Ok(materialize_exact(params, &bindings)),
+            None => Err(binder
+                .error
+                .expect("type-ref generic binder records every failure")),
         }
-
-        let mut type_args = Vec::with_capacity(type_len);
-        let mut const_args = Vec::with_capacity(params.const_params.len());
-        for (index, arg) in args.iter().enumerate() {
-            if index < type_len {
-                let GenericArg::Type(ty) = arg else {
-                    return Err(TypeRefError::GenericArgKindMismatch { expected: "type" });
-                };
-                type_args.push(self.finalize_inner(module, generics, ty, state)?);
-            } else {
-                let arg = self.finalize_generic_const_arg(module, generics, arg, state)?;
-                const_args.push(ConstTerm::from_arg(&arg));
-            }
-        }
-        Ok(GenericArgs {
-            type_args,
-            const_args,
-        })
     }
 
     fn finalize_generic_const_arg(
@@ -1390,7 +1415,7 @@ impl<'a> TypeRefResolver<'a> {
     ) -> Result<ConstArg, TypeRefError> {
         match arg {
             GenericArg::Const(arg) => finalize_const_arg(generics, arg),
-            GenericArg::Type(ty) => match bare_type_name(ty) {
+            GenericArg::Type(ty) => match ty.bare_unresolved_name() {
                 Some(name) => finalize_const_name_arg(generics, name),
                 None => {
                     let ty = self.finalize_inner(module, generics, ty, state)?;
@@ -1407,6 +1432,54 @@ impl<'a> TypeRefResolver<'a> {
                     }
                 }
             },
+        }
+    }
+}
+
+struct TypeRefGenericBinder<'a, 'state> {
+    resolver: &'a TypeRefResolver<'a>,
+    module: &'a ModuleScope,
+    generics: &'a GenericTypeContext,
+    state: &'state mut FinalizeState,
+    error: Option<TypeRefError>,
+}
+
+impl ExplicitGenericBinder for TypeRefGenericBinder<'_, '_> {
+    fn resolve_type_arg(&mut self, ty: &Type, _span: Span) -> Option<Type> {
+        match self
+            .resolver
+            .finalize_inner(self.module, self.generics, ty, self.state)
+        {
+            Ok(ty) => Some(ty),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
+
+    fn eval_const_arg(&mut self, term: ConstTerm, _span: Span) -> Option<ConstTerm> {
+        Some(term)
+    }
+
+    fn push_arity_error(&mut self, expected: usize, found: usize, _span: Span) {
+        self.error = Some(TypeRefError::GenericArity { expected, found });
+    }
+
+    fn push_kind_error(&mut self, expected: &'static str, _span: Span) {
+        self.error = Some(TypeRefError::GenericArgKindMismatch { expected });
+    }
+
+    fn const_term_arg(&mut self, arg: &GenericArg, _span: Span) -> Option<ConstTerm> {
+        match self
+            .resolver
+            .finalize_generic_const_arg(self.module, self.generics, arg, self.state)
+        {
+            Ok(arg) => Some(ConstTerm::from_arg(&arg)),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
         }
     }
 }

@@ -1,6 +1,9 @@
+mod type_walk;
+
 use std::fmt::Display;
 
 use internment::Intern;
+pub(crate) use type_walk::{TypeFolder, TypeVisitor};
 
 use crate::span::{Span, Spanned};
 
@@ -192,6 +195,16 @@ impl FuncParam {
             cast_accept: false,
             escape: EscapeMode::NonEscaping,
         }
+    }
+
+    #[must_use]
+    pub fn with_ty(&self, ty: Type) -> Self {
+        Self::new(ty, self.mutable, self.cast_accept, self.escape)
+    }
+
+    #[must_use]
+    pub fn map_ty(&self, f: impl FnOnce(&Type) -> Type) -> Self {
+        self.with_ty(f(&self.ty))
     }
 }
 
@@ -491,20 +504,38 @@ impl Type {
         }
     }
 
+    #[must_use]
+    pub fn bare_unresolved_name(&self) -> Option<Ident> {
+        match self {
+            Type::UnresolvedName(name) => Some(*name),
+            Type::UnresolvedNominal {
+                qualifier: None,
+                name,
+                generic_args,
+            } if generic_args.is_empty() => Some(*name),
+            _ => None,
+        }
+    }
+
     pub fn optional_syntax(inner: Type) -> Type {
         Type::Optional {
             inner: Box::new(inner),
         }
     }
 
-    #[inline]
-    pub fn is_str(&self) -> bool {
-        matches!(self, Type::String)
+    pub(crate) fn scalar_kind(&self) -> Option<ScalarKind> {
+        match self {
+            Self::Int => Some(ScalarKind::Int),
+            Self::Float => Some(ScalarKind::Float),
+            Self::Bool => Some(ScalarKind::Bool),
+            Self::String => Some(ScalarKind::String),
+            _ => None,
+        }
     }
 
     #[inline]
-    pub fn is_num(&self) -> bool {
-        matches!(self, Type::Int | Type::Float)
+    pub fn is_str(&self) -> bool {
+        matches!(self, Type::String)
     }
 
     #[inline]
@@ -525,11 +556,6 @@ impl Type {
     #[inline]
     pub fn is_float(&self) -> bool {
         matches!(self, Type::Float)
-    }
-
-    #[inline]
-    pub fn is_any(&self) -> bool {
-        matches!(self, Type::Any)
     }
 
     pub fn as_aggregate(&self) -> Option<AggregateTypeRef<'_>> {
@@ -724,6 +750,14 @@ impl Display for Type {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarKind {
+    Int,
+    Float,
+    Bool,
+    String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -764,6 +798,31 @@ impl BinaryOp {
             Self::Or => ExprPrecedence::LogicalOr,
         }
     }
+
+    pub fn scalar_result(self, lhs: ScalarKind, rhs: ScalarKind) -> Option<ScalarKind> {
+        use ScalarKind::{Bool, Float, Int, String};
+
+        match self {
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Rem
+                if lhs == rhs && matches!(lhs, Int | Float) =>
+            {
+                Some(lhs)
+            }
+            Self::LessThan | Self::GreaterThan | Self::LessThanEq | Self::GreaterThanEq
+                if lhs == rhs && matches!(lhs, Int | Float | String) =>
+            {
+                Some(Bool)
+            }
+            Self::Eq | Self::NotEq if lhs == rhs => Some(Bool),
+            Self::Xor | Self::BitAnd | Self::BitOr | Self::Shl | Self::Shr
+                if lhs == Int && rhs == Int =>
+            {
+                Some(Int)
+            }
+            Self::And | Self::Or if lhs == Bool && rhs == Bool => Some(Bool),
+            _ => None,
+        }
+    }
 }
 
 impl Display for BinaryOp {
@@ -797,6 +856,17 @@ pub enum UnaryOp {
     Neg,
     Not,
     BitNot,
+}
+
+impl UnaryOp {
+    pub fn scalar_result(self, value: ScalarKind) -> Option<ScalarKind> {
+        match (self, value) {
+            (Self::Neg, ScalarKind::Int | ScalarKind::Float)
+            | (Self::Not, ScalarKind::Bool)
+            | (Self::BitNot, ScalarKind::Int) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 impl Display for UnaryOp {
@@ -883,6 +953,29 @@ pub struct Param {
     pub ty_span: Span,
     pub default: Option<ExprNode>,
     pub cast_accept: bool,
+}
+
+impl Param {
+    #[must_use]
+    pub fn with_ty(self, ty: Type) -> Self {
+        Self { ty, ..self }
+    }
+
+    #[must_use]
+    pub fn map_ty(self, f: impl FnOnce(&Type) -> Type) -> Self {
+        let ty = f(&self.ty);
+        self.with_ty(ty)
+    }
+
+    #[must_use]
+    pub fn func_param(&self) -> FuncParam {
+        FuncParam::new(
+            self.ty.clone(),
+            matches!(self.mutability, Mutability::Mutable),
+            self.cast_accept,
+            self.escape,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1469,6 +1562,16 @@ pub enum PatternHead {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum EnumPatternPayload {
+    Unit,
+    Tuple(Vec<PatternNode>),
+    Struct {
+        fields: Vec<(Ident, PatternNode)>,
+        has_rest: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Ident(Ident),
     Tuple(Vec<PatternNode>),
@@ -1477,32 +1580,10 @@ pub enum Pattern {
         name: Ident,
         fields: Vec<(Ident, PatternNode)>,
     },
-    EnumUnit {
-        qualifier: Ident,
+    Enum {
+        qualifier: Option<Ident>,
         variant: Ident,
-    },
-    EnumTuple {
-        qualifier: Ident,
-        variant: Ident,
-        fields: Vec<PatternNode>,
-    },
-    EnumStruct {
-        qualifier: Ident,
-        variant: Ident,
-        fields: Vec<(Ident, PatternNode)>,
-        has_rest: bool,
-    },
-    InferredEnumUnit {
-        variant: Ident,
-    },
-    InferredEnumTuple {
-        variant: Ident,
-        fields: Vec<PatternNode>,
-    },
-    InferredEnumStruct {
-        variant: Ident,
-        fields: Vec<(Ident, PatternNode)>,
-        has_rest: bool,
+        payload: EnumPatternPayload,
     },
     Range {
         start: Option<Lit>,
@@ -1523,12 +1604,7 @@ impl Pattern {
             Self::Tuple(_) => "Tuple",
             Self::Wildcard => "Wildcard",
             Self::Struct { .. } => "Struct",
-            Self::EnumUnit { .. } => "EnumUnit",
-            Self::EnumTuple { .. } => "EnumTuple",
-            Self::EnumStruct { .. } => "EnumStruct",
-            Self::InferredEnumUnit { .. } => "InferredEnumUnit",
-            Self::InferredEnumTuple { .. } => "InferredEnumTuple",
-            Self::InferredEnumStruct { .. } => "InferredEnumStruct",
+            Self::Enum { .. } => "enum pattern",
             Self::Range { .. } => "range",
             Self::Lit(_) => "literal",
             Self::Rest => "..",

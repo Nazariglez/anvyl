@@ -12,12 +12,13 @@ use crate::{
     externs::{
         extern_module_path, extern_module_scope,
         raw::{
-            ExternProvenance, RawExternFunction, RawExternModule, RawExternOperator, RawExternSite,
-            RawExternStatic, RawExternType, RawExterns,
+            ExternProvenance, RawExternFunction, RawExternInit, RawExternModule, RawExternOperator,
+            RawExternSite, RawExternStatic, RawExternType, RawExterns,
         },
         raw_module_scope,
     },
     resolve::{ModuleId, ModulePath, PackageId},
+    span::SourceSpan,
     typecheck::{
         DeclarationIndex, GenericTypeContext, ModuleScope, NominalKey, TypeRefError,
         TypeRefResolver, type_closure_facts,
@@ -187,20 +188,10 @@ enum ExternCatalogVisit<'a> {
         position: TypePosition,
         site: RawExternSite,
     },
-    Init {
-        ty: &'a ExternType,
-        init: &'a ExternInit,
-    },
     OperatorReturn {
         context: ExternCatalogContext,
         operator: &'a ExternOperatorDecl,
     },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExternCatalogVisitOrder {
-    FunctionsFirst,
-    TypesFirst,
 }
 
 impl ExternCatalog {
@@ -221,25 +212,13 @@ impl ExternCatalog {
         &self,
         mut visit: impl FnMut(&ResolvedExternTy, RawExternSite),
     ) {
-        self.for_each_visit(ExternCatalogVisitOrder::FunctionsFirst, |item| {
+        let mut visit_item = |item| {
             if let ExternCatalogVisit::Ty { ty, site, .. } = item {
                 visit(ty, site);
             }
-        });
-    }
-
-    fn for_each_visit(
-        &self,
-        order: ExternCatalogVisitOrder,
-        mut visit: impl FnMut(ExternCatalogVisit<'_>),
-    ) {
-        if order == ExternCatalogVisitOrder::FunctionsFirst {
-            self.visit_functions(&mut visit);
-        }
-        self.visit_types(&mut visit);
-        if order == ExternCatalogVisitOrder::TypesFirst {
-            self.visit_functions(&mut visit);
-        }
+        };
+        self.visit_functions(&mut visit_item);
+        self.visit_types(&mut visit_item);
     }
 
     fn visit_functions<'a>(&'a self, visit: &mut impl FnMut(ExternCatalogVisit<'a>)) {
@@ -266,9 +245,6 @@ impl ExternCatalog {
                     position: TypePosition::Param,
                     site: field.site,
                 });
-            }
-            if let Some(init) = &ty.init {
-                visit(ExternCatalogVisit::Init { ty, init });
             }
             for method in &ty.methods {
                 visit_extern_signature_with_context(
@@ -512,10 +488,6 @@ impl ExternCatalog {
         Some((ExternStaticRef { owner, id }, &ty.statics[id.0]))
     }
 
-    pub(crate) fn init(&self, owner: ExternTypeId) -> Option<&ExternInit> {
-        self.ty(owner).init.as_ref()
-    }
-
     pub(crate) fn unary_operator(
         &self,
         owner: ExternTypeId,
@@ -579,9 +551,6 @@ fn debug_assert_consistent(catalog: &ExternCatalog) {
                     Some(static_method.id)
                 );
             }
-            if ty.init.is_some() {
-                debug_assert!(catalog.init(*id).is_some());
-            }
             for operator in &ty.operators {
                 let resolved = match operator.op {
                     ExternOperator::Unary(op) => catalog.unary_operator(*id, op),
@@ -628,7 +597,7 @@ pub(crate) struct ExternType {
     pub(crate) doc: Option<String>,
     pub(crate) rep: ExternRep,
     pub(crate) fields: Vec<ExternField>,
-    pub(crate) init: Option<ExternInit>,
+    pub(crate) init: Option<Vec<ExternFieldId>>,
     pub(crate) methods: Vec<ExternMethod>,
     pub(crate) statics: Vec<ExternStatic>,
     pub(crate) operators: Vec<ExternOperatorDecl>,
@@ -652,10 +621,15 @@ pub(crate) struct ExternField {
     pub(crate) doc: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExternInit {
-    pub(crate) field_init: Vec<Ident>,
-    pub(crate) site: RawExternSite,
+impl ExternType {
+    pub(crate) fn constructor_fields(
+        &self,
+    ) -> Option<impl Iterator<Item = (usize, &ExternField)> + '_> {
+        Some(self.init.as_ref()?.iter().map(|id| {
+            let index = id.0;
+            (index, &self.fields[index])
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -826,6 +800,36 @@ pub(crate) enum ExternCatalogError {
         expected: OperatorReturn,
         site: RawExternSite,
     },
+}
+
+impl ExternCatalogError {
+    pub(crate) fn context(&self) -> &ExternCatalogContext {
+        match self {
+            Self::UnknownType { context, .. }
+            | Self::PrivateType { context, .. }
+            | Self::GenericArity { context, .. }
+            | Self::GenericArgKindMismatch { context, .. }
+            | Self::InvalidType { context, .. }
+            | Self::UnknownInitField { context, .. }
+            | Self::ComputedInitField { context, .. }
+            | Self::UnsupportedInitParams { context, .. }
+            | Self::InvalidOperatorReturn { context, .. } => context,
+        }
+    }
+
+    pub(crate) fn span(&self) -> Option<SourceSpan> {
+        match self {
+            Self::UnknownType { site, .. }
+            | Self::PrivateType { site, .. }
+            | Self::GenericArity { site, .. }
+            | Self::GenericArgKindMismatch { site, .. }
+            | Self::InvalidType { site, .. }
+            | Self::UnknownInitField { site, .. }
+            | Self::ComputedInitField { site, .. }
+            | Self::UnsupportedInitParams { site, .. }
+            | Self::InvalidOperatorReturn { site, .. } => site.span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1076,15 +1080,13 @@ impl<'a> CatalogBuilder<'a> {
             let context = self.catalog.types[type_id.0].context.init();
             if !raw_init.decl.params.is_empty() {
                 self.errors.push(ExternCatalogError::UnsupportedInitParams {
-                    context,
+                    context: context.clone(),
                     count: raw_init.decl.params.len(),
                     site: raw_init.site,
                 });
             }
-            self.catalog.types[type_id.0].init = Some(ExternInit {
-                field_init: raw_init.decl.field_init.iter().map(Ident::new).collect(),
-                site: raw_init.site,
-            });
+            let fields = self.resolve_init_fields(type_id, raw_init, &context);
+            self.catalog.types[type_id.0].init = Some(fields);
         }
 
         for raw_method in &raw.methods {
@@ -1114,6 +1116,46 @@ impl<'a> CatalogBuilder<'a> {
         for raw_operator in &raw.operators {
             self.resolve_operator(type_id, scope, &owner, raw_operator);
         }
+    }
+
+    fn resolve_init_fields(
+        &mut self,
+        type_id: ExternTypeId,
+        raw_init: &RawExternInit,
+        context: &ExternCatalogContext,
+    ) -> Vec<ExternFieldId> {
+        let ty = &self.catalog.types[type_id.0];
+        if raw_init.decl.field_init.is_empty() {
+            return ty
+                .fields
+                .iter()
+                .filter(|field| !field.computed)
+                .map(|field| field.id)
+                .collect();
+        }
+
+        let mut fields = vec![];
+        for raw_name in &raw_init.decl.field_init {
+            let name = Ident::new(raw_name);
+            let Some(id) = ty.fields_by_name.get(&name).copied() else {
+                self.errors.push(ExternCatalogError::UnknownInitField {
+                    context: context.clone(),
+                    field: name,
+                    site: raw_init.site,
+                });
+                continue;
+            };
+            if ty.fields[id.0].computed {
+                self.errors.push(ExternCatalogError::ComputedInitField {
+                    context: context.clone(),
+                    field: name,
+                    site: raw_init.site,
+                });
+            } else {
+                fields.push(id);
+            }
+        }
+        fields
     }
 
     fn resolve_static(
@@ -1521,44 +1563,24 @@ fn provider_source_current_scope(scope: &ModuleScope) -> Option<ModuleScope> {
 
 fn validate_catalog(catalog: &ExternCatalog) -> Result<(), Vec<ExternCatalogError>> {
     let mut errors = vec![];
-    catalog.for_each_visit(ExternCatalogVisitOrder::TypesFirst, |item| match item {
+    let mut validate = |item| match item {
         ExternCatalogVisit::Ty {
             context,
             ty,
             position,
             site,
         } => validate_ty(&context, ty, position, site, &mut errors),
-        ExternCatalogVisit::Init { ty, init } => validate_init(ty, init, &mut errors),
         ExternCatalogVisit::OperatorReturn { context, operator } => {
             validate_operator_return(&context, operator, &mut errors);
         }
-    });
+    };
+    catalog.visit_types(&mut validate);
+    catalog.visit_functions(&mut validate);
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
-    }
-}
-
-fn validate_init(ty: &ExternType, init: &ExternInit, errors: &mut Vec<ExternCatalogError>) {
-    let context = ty.context.init();
-    for name in &init.field_init {
-        let Some(field) = ty.fields_by_name.get(name).map(|id| &ty.fields[id.0]) else {
-            errors.push(ExternCatalogError::UnknownInitField {
-                context: context.clone(),
-                field: *name,
-                site: init.site,
-            });
-            continue;
-        };
-        if field.computed {
-            errors.push(ExternCatalogError::ComputedInitField {
-                context: context.clone(),
-                field: *name,
-                site: init.site,
-            });
-        }
     }
 }
 
@@ -1848,13 +1870,10 @@ mod tests {
             self.catalog.types[owner.0].fields[field.0].ty = resolved_ty(ty);
         }
 
-        fn init(&mut self, owner: ExternTypeId, field_init: Vec<Ident>) {
+        fn init(&mut self, owner: ExternTypeId, fields: Vec<ExternFieldId>) {
             let ty = &mut self.catalog.types[owner.0];
             assert!(ty.init.is_none());
-            ty.init = Some(ExternInit {
-                field_init,
-                site: RawExternSite::default(),
-            });
+            ty.init = Some(fields);
         }
 
         fn method(&mut self, owner: ExternTypeId, name: Ident) -> ExternMethodId {
@@ -2158,10 +2177,6 @@ mod tests {
                 ret: unresolved_ty("FreeRet"),
             };
             catalog.types[owner.0].fields[field.0].ty = unresolved_ty("Field");
-            catalog.types[owner.0].init = Some(ExternInit {
-                field_init: vec![],
-                site: RawExternSite::default(),
-            });
             catalog.types[owner.0].methods[method.0].signature = ResolvedExternSignature {
                 params: vec![ResolvedExternParam {
                     name: None,
@@ -2509,7 +2524,7 @@ mod tests {
                 catalog.field(owner, ident("next")).unwrap().1.ty.ty,
                 self_ty
             );
-            assert!(catalog.init(owner).is_some());
+            assert!(catalog.ty(owner).constructor_fields().is_some());
             assert_eq!(
                 catalog
                     .method(owner, ident("same"))
@@ -3053,7 +3068,7 @@ mod tests {
             let field = builder.field(ty, name);
             let method = builder.method(ty, name);
             let static_method = builder.static_method(ty, name);
-            builder.init(ty, vec![name]);
+            builder.init(ty, vec![field]);
             let catalog = builder.finish();
 
             assert_eq!(
@@ -3072,7 +3087,15 @@ mod tests {
                     .map(|(static_ref, _)| static_ref.id),
                 Some(static_method)
             );
-            assert_eq!(catalog.init(ty).unwrap().field_init, vec![name]);
+            assert_eq!(
+                catalog
+                    .ty(ty)
+                    .constructor_fields()
+                    .unwrap()
+                    .map(|(_, field)| field.id)
+                    .collect::<Vec<_>>(),
+                vec![field]
+            );
         }
 
         #[test]
@@ -3145,7 +3168,7 @@ mod tests {
             assert_eq!(catalog.field(ty, ident("x")), None);
             assert_eq!(catalog.method(ty, ident("x")), None);
             assert_eq!(catalog.static_method(ty, ident("x")), None);
-            assert!(catalog.init(ty).is_none());
+            assert!(catalog.ty(ty).constructor_fields().is_none());
             assert_eq!(catalog.unary_operator(ty, UnaryOp::Neg), None);
             assert_eq!(catalog.binary_operator(ty, BinaryOp::Add, false), None);
         }

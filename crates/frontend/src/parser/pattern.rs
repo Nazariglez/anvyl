@@ -2,7 +2,10 @@ use chumsky::{error::Rich, prelude::*};
 
 use super::{
     AnvParser, BoxedParser,
-    common::{TupleShapeResult, identifier, literal, validate_tuple_shape_raw},
+    common::{
+        TupleShapeResult, colon, field_name_ident, identifier, literal, parenthesized_tuple_parts,
+        validate_tuple_shape_raw,
+    },
 };
 use crate::{
     ast,
@@ -183,17 +186,12 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
     .boxed()
 }
 
-fn struct_pattern<'src>(
+fn pattern_field<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
-) -> BoxedParser<'src, ast::PatternNode> {
-    let comma = select! { Token::Comma => () };
-    let colon = select! { Token::Colon => () };
-    let open_brace = select! { Token::Open(Delimiter::Brace) => () };
-    let close_brace = select! { Token::Close(Delimiter::Brace) => () };
-
-    let field_with_pattern = identifier()
-        .then_ignore(colon)
-        .then(pat.clone())
+) -> BoxedParser<'src, (ast::Ident, ast::PatternNode)> {
+    let field_with_pattern = field_name_ident()
+        .then_ignore(colon())
+        .then(pat)
         .map(|(name, p)| (name, p));
 
     let field_shorthand = identifier().map_with(|name, e| {
@@ -202,7 +200,17 @@ fn struct_pattern<'src>(
         (name, Spanned::new(ast::Pattern::Ident(name), span))
     });
 
-    let field = choice((field_with_pattern, field_shorthand));
+    choice((field_with_pattern, field_shorthand)).boxed()
+}
+
+fn struct_pattern<'src>(
+    pat: impl AnvParser<'src, ast::PatternNode>,
+) -> BoxedParser<'src, ast::PatternNode> {
+    let comma = select! { Token::Comma => () };
+    let open_brace = select! { Token::Open(Delimiter::Brace) => () };
+    let close_brace = select! { Token::Close(Delimiter::Brace) => () };
+
+    let field = pattern_field(pat);
 
     identifier()
         .then(
@@ -225,13 +233,6 @@ fn struct_pattern<'src>(
         .boxed()
 }
 
-#[derive(Clone)]
-enum EnumPatternKind {
-    Unit,
-    Tuple(Vec<ast::PatternNode>),
-    Struct(Vec<(ast::Ident, ast::PatternNode)>, bool),
-}
-
 fn enum_pattern<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, ast::PatternNode> {
@@ -243,26 +244,19 @@ fn enum_pattern<'src>(
         .then(choice((
             enum_tuple_payload(pat.clone()),
             enum_struct_payload(pat),
-            empty().to(EnumPatternKind::Unit),
+            empty().to(ast::EnumPatternPayload::Unit),
         )))
-        .map_with(|((qualifier, variant), kind), e| {
+        .map_with(|((qualifier, variant), payload), e| {
             let s = e.span();
             let span = s.byte();
-            let pattern = match kind {
-                EnumPatternKind::Unit => ast::Pattern::EnumUnit { qualifier, variant },
-                EnumPatternKind::Tuple(fields) => ast::Pattern::EnumTuple {
-                    qualifier,
+            Spanned::new(
+                ast::Pattern::Enum {
+                    qualifier: Some(qualifier),
                     variant,
-                    fields,
+                    payload,
                 },
-                EnumPatternKind::Struct(fields, has_rest) => ast::Pattern::EnumStruct {
-                    qualifier,
-                    variant,
-                    fields,
-                    has_rest,
-                },
-            };
-            Spanned::new(pattern, span)
+                span,
+            )
         })
         .labelled("enum pattern")
         .as_context()
@@ -278,23 +272,19 @@ fn inferred_enum_pattern<'src>(
         .then(choice((
             enum_tuple_payload(pat.clone()),
             enum_struct_payload(pat),
-            empty().to(EnumPatternKind::Unit),
+            empty().to(ast::EnumPatternPayload::Unit),
         )))
-        .map_with(|(variant, kind), e| {
+        .map_with(|(variant, payload), e| {
             let s = e.span();
             let span = s.byte();
-            let pattern = match kind {
-                EnumPatternKind::Unit => ast::Pattern::InferredEnumUnit { variant },
-                EnumPatternKind::Tuple(fields) => {
-                    ast::Pattern::InferredEnumTuple { variant, fields }
-                }
-                EnumPatternKind::Struct(fields, has_rest) => ast::Pattern::InferredEnumStruct {
+            Spanned::new(
+                ast::Pattern::Enum {
+                    qualifier: None,
                     variant,
-                    fields,
-                    has_rest,
+                    payload,
                 },
-            };
-            Spanned::new(pattern, span)
+                span,
+            )
         })
         .labelled("inferred enum pattern")
         .as_context()
@@ -303,7 +293,7 @@ fn inferred_enum_pattern<'src>(
 
 fn enum_tuple_payload<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
-) -> BoxedParser<'src, EnumPatternKind> {
+) -> BoxedParser<'src, ast::EnumPatternPayload> {
     let comma = select! { Token::Comma => () };
     let open_paren = select! { Token::Open(Delimiter::Parent) => () };
     let close_paren = select! { Token::Close(Delimiter::Parent) => () };
@@ -311,31 +301,19 @@ fn enum_tuple_payload<'src>(
     open_paren
         .ignore_then(pat.separated_by(comma).allow_trailing().collect::<Vec<_>>())
         .then_ignore(close_paren)
-        .map(EnumPatternKind::Tuple)
+        .map(ast::EnumPatternPayload::Tuple)
         .boxed()
 }
 
 fn enum_struct_payload<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
-) -> BoxedParser<'src, EnumPatternKind> {
+) -> BoxedParser<'src, ast::EnumPatternPayload> {
     let comma = select! { Token::Comma => () };
-    let colon = select! { Token::Colon => () };
     let open_brace = select! { Token::Open(Delimiter::Brace) => () };
     let close_brace = select! { Token::Close(Delimiter::Brace) => () };
     let rest = select! { Token::Range => () };
 
-    let field_with_pattern = identifier()
-        .then_ignore(colon)
-        .then(pat.clone())
-        .map(|(name, p)| (name, p));
-
-    let field_shorthand = identifier().map_with(|name, e| {
-        let s = e.span();
-        let span = s.byte();
-        (name, Spanned::new(ast::Pattern::Ident(name), span))
-    });
-
-    let field = choice((field_with_pattern, field_shorthand));
+    let field = pattern_field(pat);
 
     open_brace
         .ignore_then(
@@ -346,7 +324,10 @@ fn enum_struct_payload<'src>(
         )
         .then(rest.or_not())
         .then_ignore(close_brace)
-        .map(|(fields, rest_tok)| EnumPatternKind::Struct(fields, rest_tok.is_some()))
+        .map(|(fields, rest_tok)| ast::EnumPatternPayload::Struct {
+            fields,
+            has_rest: rest_tok.is_some(),
+        })
         .boxed()
 }
 
@@ -370,34 +351,25 @@ impl TuplePatternElem {
 fn tuple_pattern<'src>(
     pat: impl AnvParser<'src, ast::PatternNode>,
 ) -> BoxedParser<'src, ast::PatternNode> {
-    let comma = select! { Token::Comma => () };
-    let open_paren = select! { Token::Open(Delimiter::Parent) => () };
-    let close_paren = select! { Token::Close(Delimiter::Parent) => () };
-    let colon = select! { Token::Colon => () };
-
     let labelled_elem = identifier()
-        .then_ignore(colon)
+        .then_ignore(colon())
         .ignore_then(pat.clone())
         .map(TuplePatternElem::Labelled);
 
     let pos_elem = pat.map(TuplePatternElem::Pos);
     let elem = choice((labelled_elem, pos_elem));
 
-    let first_elem = elem.clone();
-    let rest_elems = comma.ignore_then(elem).repeated().collect::<Vec<_>>();
-
-    open_paren
-        .ignore_then(first_elem.or_not())
-        .then(rest_elems)
-        .then(comma.or_not())
-        .then_ignore(close_paren)
-        .validate(|((first, rest), trailing_comma), e, emitter| {
+    parenthesized_tuple_parts(elem)
+        .validate(|parts, e, emitter| {
             let s = e.span();
             let span = s.byte();
             let wildcard = || Spanned::new(ast::Pattern::Wildcard, span);
 
-            let has_label = first.as_ref().is_some_and(TuplePatternElem::is_labelled)
-                || rest.iter().any(TuplePatternElem::is_labelled);
+            let has_label = parts
+                .first
+                .as_ref()
+                .is_some_and(TuplePatternElem::is_labelled)
+                || parts.rest.iter().any(TuplePatternElem::is_labelled);
 
             if has_label {
                 emitter.emit(Rich::custom(
@@ -407,10 +379,14 @@ fn tuple_pattern<'src>(
                 return wildcard();
             }
 
-            let first = first.map(TuplePatternElem::into_pattern);
-            let rest = rest.into_iter().map(TuplePatternElem::into_pattern).collect();
+            let first = parts.first.map(TuplePatternElem::into_pattern);
+            let rest = parts
+                .rest
+                .into_iter()
+                .map(TuplePatternElem::into_pattern)
+                .collect();
 
-            match validate_tuple_shape_raw(first, rest, trailing_comma.is_some()) {
+            match validate_tuple_shape_raw(first, rest, parts.trailing_comma) {
                 TupleShapeResult::Empty => {
                     emitter.emit(Rich::custom(s, "empty tuple patterns are not supported"));
                     wildcard()

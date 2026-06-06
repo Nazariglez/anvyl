@@ -285,7 +285,7 @@ fn prepare_pipeline<L: PackageSourceLoader>(
     let packages = parse_package_inputs(&mut sources, input.packages, &context)?;
     let preloaded_modules = parse_package_modules(&mut sources, input.preloaded_modules, &context)?;
 
-    let mut raw_externs = externs::ingest_providers(extern_inputs)
+    let raw_externs = externs::ingest_providers(extern_inputs)
         .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
     let external_modules = externs::raw_extern_module_ids(&raw_externs);
 
@@ -326,12 +326,7 @@ fn prepare_pipeline<L: PackageSourceLoader>(
         }
     };
 
-    let source_externs = externs::collect_source_externs(&root.program, &resolved)
-        .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
-    raw_externs.append(source_externs);
-    externs::validate_raw_shapes(&raw_externs)
-        .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
-    externs::validate_raw_identities(&raw_externs)
+    let raw_externs = externs::prepare_raw_externs(raw_externs, &root.program, &resolved)
         .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
 
     let semantic = typecheck::check_semantic_with_modules(

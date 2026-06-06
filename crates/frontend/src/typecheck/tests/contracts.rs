@@ -22,7 +22,8 @@ fn contract(name: &str) -> ContractRef {
 fn checker(source: &str) -> crate::typecheck::TypeChecker {
     let program = parse_program(source);
     let resolved = empty_resolved();
-    let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
+    let raw_externs =
+        externs::prepare_raw_externs(externs::RawExterns::default(), &program, &resolved).unwrap();
     typechecker_for_modules(&program, &resolved, raw_externs, TypecheckConfig::default())
         .expect("typecheck failed")
 }
@@ -30,7 +31,8 @@ fn checker(source: &str) -> crate::typecheck::TypeChecker {
 fn checker_with_modules(source: &str, modules: &[(&str, &str)]) -> crate::typecheck::TypeChecker {
     let program = parse_program(source);
     let resolved = resolved_modules(&program, modules);
-    let raw_externs = externs::collect_source_externs(&program, &resolved).unwrap();
+    let raw_externs =
+        externs::prepare_raw_externs(externs::RawExterns::default(), &program, &resolved).unwrap();
     typechecker_for_modules(&program, &resolved, raw_externs, TypecheckConfig::default())
         .expect("typecheck failed")
 }

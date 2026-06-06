@@ -3,12 +3,12 @@ use std::collections::{HashMap, HashSet};
 use super::{
     ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, ModuleScope, NominalKey, TypeSubst,
     const_term::{ConstInferVarId, ConstTerm},
-    type_ops::TypeFolder,
 };
 use crate::{
     ast::{
         ArrayLen, ConstArg, ConstParamId, ContractRef, EscapeMode, ExprId, FuncParam, GenericArg,
-        Ident, ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type, TypeVarId,
+        Ident, ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type, TypeFolder,
+        TypeVarId,
     },
     span::SourceSpan,
 };

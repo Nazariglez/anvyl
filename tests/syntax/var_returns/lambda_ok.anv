@@ -4,6 +4,8 @@
 
 fn main() {
     let id = |var x: int| -> var int { x };
+    let f: fn(var int) -> var int = id;
     var n = 1;
     id(n) = 2;
+    f(n) = 3;
 }

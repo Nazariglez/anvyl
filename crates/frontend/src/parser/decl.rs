@@ -531,7 +531,7 @@ fn resolve_extern_params(
                 const_param_map,
                 Some(self_type),
             );
-            ast::Param { ty, ..p }
+            p.with_ty(ty)
         })
         .collect()
 }
@@ -684,7 +684,8 @@ fn extern_type_member<'src>(
 }
 
 fn is_self_type(ty: &ast::Type) -> bool {
-    bare_type_name(ty).is_some_and(|name| name.0.as_ref() == SELF_TYPE)
+    ty.bare_unresolved_name()
+        .is_some_and(|name| name.0.as_ref() == SELF_TYPE)
 }
 
 fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
@@ -747,7 +748,7 @@ fn extern_type_op_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
 fn extern_type_field_member<'src>() -> BoxedParser<'src, ast::ExternTypeMember> {
     doc_comment_block()
         .then(contextual_ident("computed").or_not())
-        .then(identifier())
+        .then(field_name_ident())
         .then_ignore(select! { Token::Colon => () })
         .then(type_ident())
         .map(
@@ -888,7 +889,7 @@ fn function_body<'src>(
                 .into_iter()
                 .map(|p| {
                     let ty = resolve_type_params(&p.ty, &type_param_map, &const_param_map);
-                    ast::Param { ty, ..p }
+                    p.with_ty(ty)
                 })
                 .collect();
 
@@ -1286,7 +1287,7 @@ fn aggregate_declaration<'src>(
                                 &combined_const_param_map,
                                 Some(&self_type),
                             );
-                            ast::Param { ty, ..p }
+                            p.with_ty(ty)
                         })
                         .collect();
 
@@ -1937,18 +1938,6 @@ fn resolve_const_arg(
     }
 }
 
-fn bare_type_name(ty: &ast::Type) -> Option<ast::Ident> {
-    match ty {
-        ast::Type::UnresolvedName(name) => Some(*name),
-        ast::Type::UnresolvedNominal {
-            qualifier: None,
-            name,
-            generic_args,
-        } if generic_args.is_empty() => Some(*name),
-        _ => None,
-    }
-}
-
 fn resolve_generic_args(
     args: &[ast::GenericArg],
     type_param_map: &HashMap<ast::Ident, ast::TypeVarId>,
@@ -1958,7 +1947,10 @@ fn resolve_generic_args(
     args.iter()
         .map(|arg| match arg {
             ast::GenericArg::Type(ty) => {
-                match bare_type_name(ty).and_then(|name| const_param_map.get(&name).copied()) {
+                match ty
+                    .bare_unresolved_name()
+                    .and_then(|name| const_param_map.get(&name).copied())
+                {
                     Some(id) => ast::GenericArg::Const(ast::ConstArg::Param(id)),
                     None => ast::GenericArg::Type(resolve_type_params_with_self(
                         ty,
@@ -2087,17 +2079,14 @@ fn resolve_type_params_with_self(
             let resolved_params = params
                 .iter()
                 .map(|p| {
-                    ast::FuncParam::new(
+                    p.map_ty(|ty| {
                         resolve_type_params_with_self(
-                            &p.ty,
+                            ty,
                             type_param_map,
                             const_param_map,
                             self_type,
-                        ),
-                        p.mutable,
-                        p.cast_accept,
-                        p.escape,
-                    )
+                        )
+                    })
                 })
                 .collect::<Vec<_>>();
             Func {

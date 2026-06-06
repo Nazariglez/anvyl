@@ -1,25 +1,18 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, AirBody, CallArg, Callee, ExternDecl, ExternMember, ExternParamDecl,
-        ExternReceiverDecl, ExternRep, ExternTypeDecl, Function, FunctionKind, Local, LocalKind,
-        Mutability, Operand, Param, ParamMode, ParamRole, Place, Program, Projection, RValue,
-        Signature, TypeData,
+        self, CallArg, Callee, ExternDecl, ExternMember, ExternParamDecl, ExternReceiverDecl,
+        ExternRep, ExternTypeDecl, Function, FunctionKind, LocalKind, Mutability, Operand,
+        ParamMode, Program, RValue, Signature, TypeData,
     },
     ast::Ident,
 };
 
-fn structured_body(stmts: Vec<Statement>, tail: air::AirTail) -> AirBody {
-    AirBody {
-        block: air::AirBlock { stmts, tail },
-    }
-}
-
 use super::{
     compile::{VmCompileError, VmCompileErrorKind, VmCompiler},
     runtime::{ExternDispatcher, NoExterns, unsupported_callback},
-    vir::{VirCallArg, VirCallee},
 };
+use crate::test_support::{local, param, place, root_module, structured_body};
 
 #[test]
 fn compiler_lowers_value_and_shared_borrow_modes() {
@@ -90,11 +83,14 @@ fn compiler_lowers_value_and_shared_borrow_modes() {
 
     let verified = air::verify(&program).expect("AIR verify failed");
     let vir = VmCompiler::compile(verified).expect("VM compile failed");
-    assert_eq!(vir.functions[0].params[0].mode, ParamMode::Value);
-    assert_eq!(vir.functions[0].params[1].mode, ParamMode::SharedBorrow);
+    assert_eq!(vir.functions[0].params[0].param.mode, ParamMode::Value);
+    assert_eq!(
+        vir.functions[0].params[1].param.mode,
+        ParamMode::SharedBorrow
+    );
     assert!(matches!(
         vir.functions[1].calls[0].args[1],
-        VirCallArg::SharedBorrow(_)
+        CallArg::SharedBorrow(_)
     ));
 }
 
@@ -124,7 +120,8 @@ fn compiler_lowers_mut_borrow_as_projected_place_ref() {
         value: air::ConstValue::Int(0),
     });
     let caller_local = air::LocalId::from_index(0);
-    let projected = projected_place(caller_local, int);
+    let mut projected = place(caller_local, int);
+    projected.projection.push(air::Projection::TupleField(0));
     let caller = program.alloc_function(Function {
         name: Ident::new("caller"),
         module,
@@ -158,14 +155,11 @@ fn compiler_lowers_mut_borrow_as_projected_place_ref() {
 
     let verified = air::verify(&program).expect("AIR verify failed");
     let vir = VmCompiler::compile(verified).expect("VM compile failed");
-    assert_eq!(vir.functions[0].params[0].mode, ParamMode::MutBorrow);
-    assert_eq!(
-        vir.functions[1].calls[0].callee,
-        VirCallee::Function(callee)
-    );
+    assert_eq!(vir.functions[0].params[0].param.mode, ParamMode::MutBorrow);
+    assert_eq!(vir.functions[1].calls[0].callee, Callee::Function(callee));
     assert_eq!(
         vir.functions[1].calls[0].args[0],
-        VirCallArg::MutBorrow(projected)
+        CallArg::MutBorrow(projected)
     );
 }
 
@@ -197,7 +191,7 @@ fn compiler_collects_calls_inside_structured_control() {
         specialization: None,
         signature: Signature::new(vec![], void),
         locals: vec![],
-        body: AirBody {
+        body: air::AirBody {
             block: air::AirBlock {
                 stmts: vec![Statement::If(air::AirIf {
                     cond: Operand::Const(cond),
@@ -222,10 +216,7 @@ fn compiler_collects_calls_inside_structured_control() {
     let verified = air::verify(&program).expect("AIR verify failed");
     let vir = VmCompiler::compile(verified).expect("VM compile failed");
     assert_eq!(vir.functions[1].calls.len(), 1);
-    assert_eq!(
-        vir.functions[1].calls[0].callee,
-        VirCallee::Function(callee)
-    );
+    assert_eq!(vir.functions[1].calls[0].callee, Callee::Function(callee));
 }
 
 #[test]
@@ -276,7 +267,7 @@ fn compiler_records_extern_metadata_from_call_params() {
     assert_eq!(vir.externs[0].params[0].ty, int);
     assert_eq!(vir.externs[0].params[0].mode, ParamMode::Value);
     assert_eq!(vir.externs[0].ret, void);
-    assert_eq!(vir.functions[0].calls[0].callee, VirCallee::Extern(ext));
+    assert_eq!(vir.functions[0].calls[0].callee, Callee::Extern(ext));
 }
 
 #[test]
@@ -293,6 +284,7 @@ fn compiler_records_member_extern_receiver_metadata() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
+        init_fields: vec![],
         fields: vec![],
         methods: vec![],
         statics: vec![],
@@ -453,50 +445,4 @@ fn has_compile_error(
     errors
         .iter()
         .any(|error| error.function == function && error.kind == kind)
-}
-
-fn param(name: &str, ty: air::TypeId, mode: ParamMode, local_id: air::LocalId) -> Param {
-    Param {
-        name: Some(Ident::new(name)),
-        ty,
-        mode,
-        role: ParamRole::Normal,
-        local_id,
-    }
-}
-
-fn local(ty: air::TypeId, mutability: Mutability, kind: LocalKind) -> Local {
-    Local {
-        name: None,
-        ty,
-        mutability,
-        kind,
-    }
-}
-
-fn place(local: air::LocalId, ty: air::TypeId) -> Place {
-    Place {
-        root: local,
-        projection: vec![],
-        ty,
-    }
-}
-
-fn projected_place(local: air::LocalId, ty: air::TypeId) -> Place {
-    Place {
-        root: local,
-        projection: vec![Projection::TupleField(0)],
-        ty,
-    }
-}
-
-fn root_module() -> air::Module {
-    air::Module {
-        path: vec![],
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
-    }
 }

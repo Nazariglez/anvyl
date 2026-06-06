@@ -234,11 +234,14 @@ impl ClosureClassifier {
 
     fn borrowed_capture(&self, binding_id: BindingId) -> Option<BorrowedCapture> {
         let binding = self.bindings.get(&binding_id)?;
-        borrowed_capture_origin(binding.storage).then_some(BorrowedCapture {
-            id: binding_id,
-            name: binding.name,
-            origin: binding.storage,
-        })
+        binding
+            .storage
+            .is_borrowed_runtime()
+            .then_some(BorrowedCapture {
+                id: binding_id,
+                name: binding.name,
+                origin: binding.storage,
+            })
     }
 
     pub(super) fn bind_local(
@@ -707,7 +710,10 @@ impl ClosureClassifier {
         for capture in &lambda.captures {
             let ty = type_of(capture.type_id);
             let source_mutable = matches!(capture.kind.mutability, BindingMutability::Mutable);
-            let storage = capture_storage(capture.kind.storage, source_mutable, escaping);
+            let storage = capture
+                .kind
+                .storage
+                .capture_storage(source_mutable, escaping);
             facts.lambda_captures.insert(
                 (lambda.expr_id, capture.binding_id),
                 LambdaCaptureFact {
@@ -1105,51 +1111,6 @@ fn strongest_capture_access(current: CaptureAccess, new: CaptureAccess) -> Captu
     match (current, new) {
         (CaptureAccess::Mutable, _) | (_, CaptureAccess::Mutable) => CaptureAccess::Mutable,
         _ => CaptureAccess::Read,
-    }
-}
-
-fn borrowed_capture_origin(origin: CaptureStorageOrigin) -> bool {
-    matches!(
-        origin,
-        CaptureStorageOrigin::BorrowedParam
-            | CaptureStorageOrigin::VarSelf
-            | CaptureStorageOrigin::DynView
-            | CaptureStorageOrigin::PatternAlias
-            | CaptureStorageOrigin::MutableDowncastAlias
-            | CaptureStorageOrigin::ForVarAlias
-    )
-}
-
-fn capture_storage(
-    origin: CaptureStorageOrigin,
-    source_mutable: bool,
-    escaping: bool,
-) -> CaptureStorage {
-    if borrowed_capture_origin(origin) {
-        return if escaping {
-            CaptureStorage::BorrowedEscaping
-        } else {
-            CaptureStorage::BorrowedScoped
-        };
-    }
-
-    match origin {
-        CaptureStorageOrigin::Const => CaptureStorage::NoRuntime,
-        CaptureStorageOrigin::Owned if source_mutable && escaping => {
-            CaptureStorage::OwnedMutableUpvalue
-        }
-        CaptureStorageOrigin::Owned if source_mutable => CaptureStorage::OwnedMutableScoped,
-        CaptureStorageOrigin::Owned | CaptureStorageOrigin::ReadonlySelf => {
-            CaptureStorage::OwnedReadonly
-        }
-        CaptureStorageOrigin::BorrowedParam
-        | CaptureStorageOrigin::VarSelf
-        | CaptureStorageOrigin::DynView
-        | CaptureStorageOrigin::PatternAlias
-        | CaptureStorageOrigin::MutableDowncastAlias
-        | CaptureStorageOrigin::ForVarAlias => {
-            unreachable!("borrowed capture origin returned early")
-        }
     }
 }
 

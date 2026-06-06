@@ -29,10 +29,10 @@ use super::{
 };
 use crate::{
     ast::{
-        AggregateDeclNode, BlockNode, CastFromNode, ConstValue, ExprKind, ExprNode, ExtendDeclNode,
-        Func, FuncNode, FuncParam, Ident, MethodReceiver, Mutability, Param, Pattern, PatternHead,
-        PatternNode, Program, ReturnAccess, ReturnSpec, Stmt, StmtNode, StructDecl, Type,
-        TypeAliasDeclNode, Visibility,
+        AggregateDeclNode, BlockNode, CastFromNode, ConstValue, EnumPatternPayload, ExprKind,
+        ExprNode, ExtendDeclNode, Func, FuncNode, FuncParam, Ident, MethodReceiver, Mutability,
+        Param, Pattern, PatternHead, PatternNode, Program, ReturnAccess, ReturnSpec, Stmt,
+        StmtNode, StructDecl, Type, TypeAliasDeclNode, Visibility,
     },
     span::Span,
 };
@@ -259,10 +259,16 @@ pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
     let extern_functions = tc
         .externs
         .functions_in_scope(&tc.current_module)
-        .map(|function| (function.key.name, function.signature.to_func_type()))
+        .filter_map(|function| {
+            let value = tc
+                .decls
+                .local_value(&function.key.module, function.key.name)?;
+            let callee = tc.decls.callable_for_value(&value)?;
+            Some((function.key.name, function.signature.to_func_type(), callee))
+        })
         .collect::<Vec<_>>();
-    for (name, ty) in extern_functions {
-        tc.define(name, ty, false);
+    for (name, ty, callee) in extern_functions {
+        tc.define_local_callable(name, callee, ty);
     }
 
     let register_dyn_infer = tc.should_register_dyn_infer_params();
@@ -298,7 +304,14 @@ pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                             |value| value.decl.ty().clone(),
                         )
                 };
-                tc.define(func.name, func_ty, false);
+                let callee = tc
+                    .decls
+                    .local_value(&tc.current_module, func.name)
+                    .and_then(|value| tc.decls.callable_for_value(&value));
+                match callee {
+                    Some(callee) => tc.define_local_callable(func.name, callee, func_ty),
+                    None => tc.define(func.name, func_ty, false),
+                }
             }
             Stmt::Const(const_node) => {
                 let c = &const_node.node;
@@ -608,6 +621,7 @@ pub(super) fn register_block_declarations(
             },
             receiver_ty: None,
             owner_args: decl.sig.owner_args.clone(),
+            is_stringify_override: false,
         };
         tc.define_local_callable(func.name, callee, decl.sig.surface_ty.clone());
     }
@@ -685,16 +699,13 @@ fn add_callable_decl_placeholders(
             },
             receiver_ty: None,
             owner_args: GenericArgs::default(),
+            is_stringify_override: false,
         };
         let binding_id = tc.fresh_binding_id();
         let type_id = tc.solver.alloc_local_type(&Type::Infer);
         add_env_symbol(
             func.name,
-            LocalSymbol::Callable(Box::new(LocalCallableInfo {
-                binding_id,
-                type_id,
-                callee,
-            })),
+            LocalSymbol::callable(LocalCallableInfo::new(binding_id, type_id, callee)),
             env,
         );
     }
@@ -765,14 +776,7 @@ fn add_capture_blocker(
     let type_id = tc.solver.alloc_local_type(&Type::Infer);
     add_env_symbol(
         name,
-        LocalSymbol::Value(VarInfo {
-            binding_id,
-            type_id,
-            kind,
-            const_value: None,
-            local_const: None,
-            alias: None,
-        }),
+        LocalSymbol::value(VarInfo::new(binding_id, type_id, kind)),
         env,
     );
 }
@@ -791,25 +795,31 @@ fn add_pattern_capture_blockers(
 ) {
     match &pattern.node {
         Pattern::Ident(name) => add_capture_blocker(*name, kind, env, tc),
-        Pattern::Tuple(fields)
-        | Pattern::EnumTuple { fields, .. }
-        | Pattern::InferredEnumTuple { fields, .. }
-        | Pattern::Or(fields) => {
+        Pattern::Tuple(fields) | Pattern::Or(fields) => {
             for field in fields {
                 add_pattern_capture_blockers(field, kind, env, tc);
             }
         }
-        Pattern::Struct { fields, .. }
-        | Pattern::EnumStruct { fields, .. }
-        | Pattern::InferredEnumStruct { fields, .. } => {
+        Pattern::Struct { fields, .. } => {
             for (_, field) in fields {
                 add_pattern_capture_blockers(field, kind, env, tc);
             }
         }
+        Pattern::Enum { payload, .. } => match payload {
+            EnumPatternPayload::Unit => {}
+            EnumPatternPayload::Tuple(fields) => {
+                for field in fields {
+                    add_pattern_capture_blockers(field, kind, env, tc);
+                }
+            }
+            EnumPatternPayload::Struct { fields, .. } => {
+                for (_, field) in fields {
+                    add_pattern_capture_blockers(field, kind, env, tc);
+                }
+            }
+        },
         Pattern::Optional(inner) => add_pattern_capture_blockers(inner, kind, env, tc),
         Pattern::Wildcard
-        | Pattern::EnumUnit { .. }
-        | Pattern::InferredEnumUnit { .. }
         | Pattern::Range { .. }
         | Pattern::Lit(_)
         | Pattern::Rest

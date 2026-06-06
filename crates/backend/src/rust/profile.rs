@@ -134,8 +134,11 @@ impl ProfileCx<'_> {
 
     fn inline_payload_supported(&self, ty: TypeId) -> bool {
         match self.program.type_arena.data(ty) {
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
-            TypeData::DataRef(_) => true,
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::DataRef(_) => true,
             TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
             TypeData::Enum(enm) => self.enum_decl_supported(*enm),
             TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
@@ -572,10 +575,18 @@ impl ProfileCx<'_> {
                     return;
                 }
                 let decl = self.program.extern_type(*ext);
-                if decl.rep != air::ExternRep::Inline || decl.fields.len() != fields.len() {
+                if decl.rep != air::ExternRep::Inline {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    return;
+                }
+                let Some(expected) = decl.constructor_fields() else {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                    return;
+                };
+                let expected = expected.map(|(_, field)| field.ty).collect::<Vec<_>>();
+                if expected.len() != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                let expected = decl.fields.iter().map(|field| field.ty).collect::<Vec<_>>();
                 self.check_value_fields(site, fields, expected);
             }
             AggregateCtor::EnumVariant { enum_id, variant } => {
@@ -753,10 +764,9 @@ impl ProfileCx<'_> {
     }
 
     fn operand_ty(&self, operand: &Operand) -> TypeId {
-        match operand {
-            Operand::Place(place) => place.ty,
-            Operand::Const(id) => self.program.const_arena.get(*id).ty,
-        }
+        self.program
+            .operand_ty(operand)
+            .expect("verified AIR operand const should exist")
     }
 
     fn supports_param_mode(&self, ty: TypeId, mode: ParamMode) -> bool {

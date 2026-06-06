@@ -27,12 +27,10 @@ use super::{
     },
     source_job::{self, SourceJobStatus},
 };
-
-fn structured_body(stmts: Vec<Statement>, tail: air::AirTail) -> AirBody {
-    AirBody {
-        block: air::AirBlock { stmts, tail },
-    }
-}
+use crate::test_support::{
+    immutable_local as local, mutable_local as mut_local, param, place, root_module,
+    structured_body,
+};
 
 #[test]
 fn profile_accepts_empty_air() {
@@ -2223,6 +2221,7 @@ fn profile_accepts_bound_extern_members_but_rejects_missing_binding() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
+        init_fields: vec![],
         fields: vec![],
         methods: vec![],
         statics: vec![],
@@ -8012,15 +8011,6 @@ fn native_string_return_program() -> RirProgram {
     program
 }
 
-fn mut_local(ty: air::TypeId, kind: LocalKind) -> Local {
-    Local {
-        name: None,
-        ty,
-        mutability: Mutability::Mutable,
-        kind,
-    }
-}
-
 fn int_const(program: &mut Program, ty: air::TypeId, value: i64) -> air::ConstId {
     program.const_arena.alloc(ConstData {
         ty,
@@ -8246,10 +8236,6 @@ fn function_binding(
     }
 }
 
-fn root_module() -> air::Module {
-    air_module(&[])
-}
-
 fn runtime_module() -> air::Module {
     air_module(&["core_runtime"])
 }
@@ -8381,31 +8367,4 @@ fn extern_in_module(
     });
     program.module_mut(module).externs.push(id);
     id
-}
-
-fn param(name: &str, ty: air::TypeId, mode: ParamMode, local_id: air::LocalId) -> Param {
-    Param {
-        name: Some(Ident::new(name)),
-        ty,
-        mode,
-        role: ParamRole::Normal,
-        local_id,
-    }
-}
-
-fn local(ty: air::TypeId, kind: LocalKind) -> Local {
-    Local {
-        name: None,
-        ty,
-        mutability: Mutability::Immutable,
-        kind,
-    }
-}
-
-fn place(root: air::LocalId, ty: air::TypeId) -> Place {
-    Place {
-        root,
-        projection: vec![],
-        ty,
-    }
 }

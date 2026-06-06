@@ -18,11 +18,10 @@ pub(super) fn check_unary(
 
     let ret = decl.signature.ret.clone();
     tc.record_extern_use(expr_id, ExternUseTarget::UnaryOperator(operator));
-    Some(CheckedType {
-        ty: ret.ty.clone(),
-        handle: tc.type_handle(&ret.ty),
-        contains_extern_any: ret.contains_any(),
-    })
+    Some(
+        CheckedType::new(ret.ty.clone(), tc.type_handle(&ret.ty))
+            .with_extern_any(ret.contains_any()),
+    )
 }
 
 pub(super) fn check_binary(
@@ -139,11 +138,8 @@ fn apply_binary_candidate(
         tc.record_extern_use(expr_id, ExternUseTarget::BinaryOperator(candidate.operator));
     }
 
-    CheckedType {
-        ty: candidate.ret.ty.clone(),
-        handle: tc.type_handle(&candidate.ret.ty),
-        contains_extern_any: candidate.ret.contains_any(),
-    }
+    CheckedType::new(candidate.ret.ty.clone(), tc.type_handle(&candidate.ret.ty))
+        .with_extern_any(candidate.ret.contains_any())
 }
 
 fn invalid_operand(
@@ -153,27 +149,11 @@ fn invalid_operand(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     tc.push_error(TypeError::InvalidOperand {
-        op: binary_op_text(op).to_string(),
+        op: op.to_string(),
         operand_type,
         span: tc.error_span(span),
     });
     checked_type(Type::Infer, tc)
-}
-
-fn binary_op_text(op: anvyx_externs::BinaryOp) -> &'static str {
-    match op {
-        anvyx_externs::BinaryOp::Add => "+",
-        anvyx_externs::BinaryOp::Sub => "-",
-        anvyx_externs::BinaryOp::Mul => "*",
-        anvyx_externs::BinaryOp::Div => "/",
-        anvyx_externs::BinaryOp::Rem => "%",
-        anvyx_externs::BinaryOp::Eq => "==",
-        anvyx_externs::BinaryOp::NotEq => "!=",
-        anvyx_externs::BinaryOp::LessThan => "<",
-        anvyx_externs::BinaryOp::GreaterThan => ">",
-        anvyx_externs::BinaryOp::LessThanEq => "<=",
-        anvyx_externs::BinaryOp::GreaterThanEq => ">=",
-    }
 }
 
 fn binary_op(op: BinaryOp) -> Option<anvyx_externs::BinaryOp> {

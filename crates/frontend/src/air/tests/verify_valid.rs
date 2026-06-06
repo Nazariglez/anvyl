@@ -72,6 +72,60 @@ fn tuple_ctor_shape_is_valid() {
 }
 
 #[test]
+fn inline_extern_field_projection_is_valid() {
+    let mut program = Program::default();
+    let int_ty = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(empty_module("test"));
+    let ext_id = crate::air::ExternTypeId::from_index(0);
+    let ext_ty = program.alloc_type(TypeData::Extern(ext_id));
+    assert_eq!(
+        program.alloc_extern_type(ExternTypeDecl {
+            name: Ident::new("Point"),
+            module,
+            binding: None,
+            type_args: vec![],
+            const_args: vec![],
+            rep: ExternRep::Inline,
+            has_init: false,
+            init_fields: vec![],
+            fields: vec![ExternFieldDecl {
+                name: Ident::new("x"),
+                ty: int_ty,
+                get_receiver: ExternReceiverDecl {
+                    ty: ext_ty,
+                    mode: ParamMode::SharedBorrow,
+                },
+                set_receiver: ExternReceiverDecl {
+                    ty: ext_ty,
+                    mode: ParamMode::MutBorrow,
+                },
+                computed: false,
+                readable: true,
+                writable: true,
+            }],
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+        }),
+        ext_id
+    );
+    program.module_mut(module).extern_types.push(ext_id);
+
+    let mut fb = FunctionBuilder::new("extern_field", module, FunctionKind::Normal, int_ty);
+    let point = fb.push_param("point", ext_ty, ParamRole::Normal);
+    fb.push_block(term_return(Operand::Place(Place {
+        root: point,
+        projection: vec![Projection::Field(FieldId::from_index(0))],
+        ty: int_ty,
+    })));
+    let fid = program.alloc_function(fb.finish());
+    program.module_mut(module).functions.push(fid);
+    program.set_entry(fid);
+
+    expect_verified(&program);
+}
+
+#[test]
 fn fn_return() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -606,6 +660,7 @@ fn extern_call() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
+        init_fields: vec![],
         fields: vec![],
         methods: vec![],
         statics: vec![],

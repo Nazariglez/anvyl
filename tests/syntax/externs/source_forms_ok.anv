@@ -13,6 +13,7 @@ extern type Vec2 rep inline {
     computed length: float;
     computed bounds: Rect;
     computed label: string;
+    computed type: string;
     fn zero() -> Self;
     fn magnitude(shared self) -> float;
     fn translate(var self, dx: float, dy: float) -> void;

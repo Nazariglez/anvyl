@@ -1,6 +1,6 @@
 use super::{
-    DeprecatedUseKind, FieldSchema, GenericArgs, GenericParams, TypeChecker, TypeError,
-    VariantShape,
+    DeprecatedUseKind, FieldSchema, GenericArgs, GenericParams, ResolvedNominal, TypeChecker,
+    TypeError, VariantShape,
     annotation::{AccessPolicy, deprecated_lint},
     const_term::ConstTerm,
     decls::{
@@ -8,6 +8,7 @@ use super::{
         VariantPayload, VariantSchema, nominal_generic_args, nominal_type, nominal_type_with_args,
         owner_template,
     },
+    generic_bind::GenericSolveSession,
     infer::GenericSolverSeeds,
 };
 use crate::{
@@ -117,6 +118,7 @@ pub(super) fn tuple_callable_ref(
         },
         receiver_ty: None,
         owner_args,
+        is_stringify_override: false,
     }
 }
 
@@ -141,31 +143,22 @@ pub(super) fn solve_unit_owner_ty(
     let seeds = explicit_args.map_or_else(GenericSolverSeeds::default, |args| {
         GenericSolverSeeds::from_args(&resolved.generics, args)
     });
-    let vars = tc
-        .solver
-        .generic_solver_vars(&resolved.generics, &seeds, tc.error_span(span));
+    let session = GenericSolveSession::new(tc, &resolved.generics, &seeds, span);
 
     if let Some(expected) =
         expected.filter(|ty| tc.decls.key_for_type(ty).as_ref() == Some(&resolved.key))
     {
         let template = owner_template(&resolved.key, &resolved.generics);
-        let template = tc.solver.instantiate_generic_type(&template, &vars);
+        let template = tc
+            .solver
+            .instantiate_generic_type(&template, session.vars());
         let expected = tc.type_handle(expected);
         tc.expect_equal(span, template, expected);
     }
     if tc.solve_constraints() {
         return None;
     }
-    let args = match tc.solver.finalize_generic_args(&resolved.generics, &vars) {
-        Ok(args) => args,
-        Err(unbound) => {
-            tc.push_unbound_generic_errors(unbound, span);
-            return None;
-        }
-    };
-    if !tc.check_generic_bounds(&resolved.generics, &args, span) {
-        return None;
-    }
+    let args = session.finish(tc)?;
     resolved.owner_ty_from_args(&args)
 }
 
@@ -175,13 +168,19 @@ pub(super) fn resolve_use(
     variant: Ident,
     span: Span,
 ) -> Option<ResolvedEnumVariant> {
-    let schema = tc.decls.enum_schema(key)?;
-    let Some(variant_schema) = schema.variants.get(variant).cloned() else {
+    let nominal = tc.resolve_nominal(&nominal_type(key))?;
+    let Some(variants) = nominal.variants() else {
+        return None;
+    };
+    let Some(variant_schema) = variants.get(variant).cloned() else {
         tc.push_error(TypeError::UnknownEnumVariant {
             enum_name: key.name,
             variant,
             span: tc.error_span(span),
         });
+        return None;
+    };
+    let ResolvedNominal::Enum { schema, .. } = nominal else {
         return None;
     };
     let generics = schema.generics.clone();

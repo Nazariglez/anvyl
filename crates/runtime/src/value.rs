@@ -8,7 +8,7 @@ use ecow::{EcoString, EcoVec};
 
 use crate::{Trace, TraceDriver, Visitor};
 
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AnvString {
     text: EcoString,
 }

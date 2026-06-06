@@ -1,14 +1,12 @@
-use anvyx_frontend::air::ExternId;
+use anvyx_frontend::air::{CallArg, ExternId};
 use anvyx_runtime::{Ctx, RuntimeError};
-
-use super::vir::VirCallArg;
 
 pub trait ExternDispatcher {
     fn call(
         &mut self,
         ctx: &mut Ctx<'_, '_>,
         id: ExternId,
-        args: &[VirCallArg],
+        args: &[CallArg],
     ) -> Result<(), RuntimeError>;
 }
 
@@ -19,7 +17,7 @@ impl ExternDispatcher for NoExterns {
         &mut self,
         _ctx: &mut Ctx<'_, '_>,
         id: ExternId,
-        _args: &[VirCallArg],
+        _args: &[CallArg],
     ) -> Result<(), RuntimeError> {
         Err(RuntimeError::new(format!(
             "missing VM extern dispatch for extern #{}",

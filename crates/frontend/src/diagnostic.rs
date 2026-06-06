@@ -74,12 +74,7 @@ impl DiagnosticCode {
         Some(match origin {
             crate::config::LintLevelOrigin::Default => format!("lint `{name}` is on by default"),
             crate::config::LintLevelOrigin::Configured => {
-                let level = match level {
-                    crate::lint::LintLevel::Allow => "allow",
-                    crate::lint::LintLevel::Warn => "warning",
-                    crate::lint::LintLevel::Error => "error",
-                };
-                format!("lint `{name}` was set to {level}")
+                format!("lint `{name}` was set to {}", level.diagnostic_name())
             }
         })
     }

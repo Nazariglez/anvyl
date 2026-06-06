@@ -17,7 +17,7 @@ use super::{
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
-    generic_bind::bind_prefix_generic_seeds,
+    generic_bind::{GenericSolveSession, bind_prefix_generic_seeds},
     infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
     member,
     place::{self, MutableUseKind, PlaceUseFacts, PlaceValue},
@@ -223,52 +223,46 @@ fn local_value_subject(
     value: &super::LocalValue,
     tc: &mut TypeChecker,
 ) -> Subject {
-    let checked = super::checked_from_handle(expr, tc.local_handle(value.info.type_id), tc);
-    tc.record_local_read(expr.node.id, value);
-    let access = tc.local_value_access(value);
-    let mut value = PlaceValue::new(checked, access.access, access.facts);
-    value.identity = access.identity;
-    value.root_name = Some(name);
+    let (value, _) = tc.local_place_value(expr, name, value, None);
     Subject::Value(value)
+}
+
+fn warn_local_callable_deprecated(
+    info: &super::LocalCallableInfo,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    let id = &info.callee.def.id;
+    if id.parent.is_none()
+        && let Some(value) = tc.decls.local_value(&id.module, id.name)
+    {
+        tc.warn_named_value_deprecated(&value.decl, id.name, span);
+    }
 }
 
 fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subject> {
     match &expr.node.kind {
         ExprKind::Ident(name) => {
-            let local = match tc.lookup_local_symbol_checked(*name, expr.span) {
-                super::LocalSymbolLookup::Found(super::LocalSymbol::Callable(info), depth)
-                    if depth > 0 =>
-                {
-                    return Some(callable_subject(info.callee.clone(), None));
+            match tc.resolve_ident_subject(*name, expr.span, super::NameSubjectMode::PostfixBase) {
+                super::ResolvedIdentSubject::Local(super::LocalSymbol::Callable(info), _) => {
+                    warn_local_callable_deprecated(&info, expr.span, tc);
+                    Some(callable_subject(info.callee.clone(), None))
                 }
-                super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth)
-                    if depth > 0 =>
-                {
+                super::ResolvedIdentSubject::Local(super::LocalSymbol::Value(info), depth) => {
                     let value = tc.local_value_from_info(info, depth);
-                    return Some(local_value_subject(expr, *name, &value, tc));
+                    Some(local_value_subject(expr, *name, &value, tc))
                 }
-                super::LocalSymbolLookup::Blocked(error) => {
+                super::ResolvedIdentSubject::Blocked(error) => {
                     tc.push_error(*error);
-                    return Some(Subject::Error);
+                    Some(Subject::Error)
                 }
-                local => local,
-            };
-            if let Some((module, value_name, value)) = tc.lookup_named_value(*name) {
-                return Some(named_value_subject(
-                    tc, module, value_name, &value, expr.span,
-                ));
+                super::ResolvedIdentSubject::Named(module, value_name, value) => Some(
+                    named_value_subject(tc, module, value_name, &value, expr.span),
+                ),
+                super::ResolvedIdentSubject::Module(scope) => Some(Subject::Module(scope)),
+                super::ResolvedIdentSubject::Type(ty) => Some(Subject::Type(ty)),
+                super::ResolvedIdentSubject::Missing => None,
             }
-            if let super::LocalSymbolLookup::Found(super::LocalSymbol::Value(info), depth) = local {
-                let value = tc.local_value_from_info(info, depth);
-                return Some(local_value_subject(expr, *name, &value, tc));
-            }
-            if let Some(scope) = tc.lookup_module_alias(*name) {
-                return Some(Subject::Module(scope));
-            }
-            if let Some(ty) = tc.visible_type_subject(*name, expr.span) {
-                return Some(Subject::Type(ty));
-            }
-            None
         }
         ExprKind::TypeSubject(ty) => Some(match tc.resolve_type_subject(ty, expr.span) {
             Some(ty) => Subject::Type(ty),
@@ -1689,17 +1683,17 @@ fn solve_generic_call_with(
         return None;
     }
 
-    let vars = tc
-        .solver
-        .generic_solver_vars(generics, seeds, tc.error_span(call_span));
-    add_constraints(&vars, tc);
+    let session = GenericSolveSession::new(tc, generics, seeds, call_span);
+    add_constraints(session.vars(), tc);
     let mut failed = tc.solve_constraints();
 
-    let params = instantiate_call_params(template_params, &vars, tc);
+    let params = instantiate_call_params(template_params, session.vars(), tc);
     let args_check = check_source_args(args, &params, receiver_arg, tc);
     failed |= args_check.failed;
     if !inferred_ret {
-        let ret_handle = tc.solver.instantiate_generic_type(&template_ret.ty, &vars);
+        let ret_handle = tc
+            .solver
+            .instantiate_generic_type(&template_ret.ty, session.vars());
         failed |= constrain_expected_return(call_span, ret_handle, expected, tc).failed();
     }
 
@@ -1707,16 +1701,7 @@ fn solve_generic_call_with(
         return None;
     }
 
-    let args = match tc.solver.finalize_generic_args(generics, &vars) {
-        Ok(args) => args,
-        Err(unbound) => {
-            tc.push_unbound_generic_errors(unbound, call_span);
-            return None;
-        }
-    };
-    if !tc.check_generic_bounds(generics, &args, call_span) {
-        return None;
-    }
+    let args = session.finish(tc)?;
 
     let (type_subst, const_subst) = generics.substitutions(&args);
     let concrete_params =
@@ -2082,14 +2067,7 @@ fn substitute_params_checked(
 ) -> Vec<FuncParam> {
     params
         .iter()
-        .map(|param| {
-            FuncParam::new(
-                tc.substitute_checked(&param.ty, type_subst, const_subst, span),
-                param.mutable,
-                param.cast_accept,
-                param.escape,
-            )
-        })
+        .map(|param| param.map_ty(|ty| tc.substitute_checked(ty, type_subst, const_subst, span)))
         .collect()
 }
 

@@ -1,12 +1,12 @@
 use super::{
-    CallableTemplateEnv, DeprecatedUseKind, LocalConstId, LocalConstInfo, LocalSymbol,
-    LocalSymbolLookup, ModuleScope, TypeChecker, TypeError, ValueDecl,
-    body::with_callable_body_env, const_term::ConstTerm, type_ops::TypeFolder,
+    CallableTemplateEnv, CheckedType, DeprecatedUseKind, LocalConstId, LocalConstInfo, LocalSymbol,
+    ModuleScope, TypeChecker, TypeError, ValueDecl, VarInfo, body::with_callable_body_env,
+    checked_from_type, const_term::ConstTerm,
 };
 use crate::{
     ast::{
         ArrayLen, BinaryOp, CastNode, ConstArg, ConstDeclNode, ConstValue, ExprKind, ExprNode,
-        FieldAccessNode, Ident, Lit, Program, Stmt, StringPart, Type, UnaryOp,
+        FieldAccessNode, Ident, Lit, Program, Stmt, StringPart, Type, TypeFolder, UnaryOp,
     },
     span::{SourceSpan, Span},
 };
@@ -428,8 +428,8 @@ impl TypeChecker {
     }
 
     pub(super) fn lookup_visible_const_name(&mut self, name: Ident, span: Span) -> ConstNameLookup {
-        match self.lookup_local_symbol_checked(name, span) {
-            LocalSymbolLookup::Found(LocalSymbol::Value(info), depth) => {
+        match self.resolve_ident_subject(name, span, super::NameSubjectMode::Const) {
+            super::ResolvedIdentSubject::Local(LocalSymbol::Value(info), _) => {
                 if let Some(value) = info.const_value.clone() {
                     return ConstNameLookup::Value(value);
                 }
@@ -439,15 +439,23 @@ impl TypeChecker {
                         Err(error) => ConstNameLookup::Error(error),
                     };
                 }
-                if depth != 0 || !self.has_top_const(&self.current_module, name) {
-                    return ConstNameLookup::NotConstLocal;
+                if info.kind.is_const() && self.has_top_const(&self.current_module, name) {
+                    let module = self.current_module.clone();
+                    return match self.eval_top_const(&module, name, self.error_span(span)) {
+                        Ok(value) => ConstNameLookup::Value(value),
+                        Err(error) => ConstNameLookup::Error(error),
+                    };
                 }
-            }
-            LocalSymbolLookup::Found(LocalSymbol::Callable(_), _) => {
                 return ConstNameLookup::NotConstLocal;
             }
-            LocalSymbolLookup::Blocked(error) => return ConstNameLookup::Error(*error),
-            LocalSymbolLookup::Missing => {}
+            super::ResolvedIdentSubject::Local(LocalSymbol::Callable(_), _) => {
+                return ConstNameLookup::NotConstLocal;
+            }
+            super::ResolvedIdentSubject::Blocked(error) => return ConstNameLookup::Error(*error),
+            super::ResolvedIdentSubject::Missing => {}
+            super::ResolvedIdentSubject::Named(..)
+            | super::ResolvedIdentSubject::Module(_)
+            | super::ResolvedIdentSubject::Type(_) => unreachable!(),
         }
 
         if self.has_top_const(&self.current_module, name) {
@@ -472,6 +480,31 @@ impl TypeChecker {
             Some((_, _, ValueDecl::Global(sig))) => ConstNameLookup::RuntimeGlobal(sig.key),
             Some((_, _, ValueDecl::Func(_))) | None => ConstNameLookup::Missing,
         }
+    }
+
+    pub(super) fn check_top_const_local_expr(
+        &mut self,
+        expr: &ExprNode,
+        name: Ident,
+        info: &VarInfo,
+    ) -> Option<CheckedType> {
+        if info.local_const.is_some()
+            || !info.kind.is_const()
+            || !self.has_top_const(&self.current_module, name)
+        {
+            return None;
+        }
+
+        self.warn_local_const_deprecated(info, name, expr.span);
+        let module = self.current_module.clone();
+        let ty = match self.eval_top_const(&module, name, self.error_span(expr.span)) {
+            Ok(value) => const_type(&value),
+            Err(error) => {
+                self.push_error(error);
+                Type::Infer
+            }
+        };
+        Some(checked_from_type(expr, ty, self))
     }
 
     pub(super) fn eval_visible_const(

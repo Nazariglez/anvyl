@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use anvyx_frontend::{
     air::{self, FunctionId},
-    ast::{BinaryOp, UnaryOp},
+    ast::{BinaryOp, ScalarKind, UnaryOp},
 };
 use anvyx_runtime::{ExternTypeExpr, ExternTypeKey, RustExternAbi, RustParamAbi, RustReturnAbi};
 
@@ -1661,8 +1661,8 @@ impl VerifyCx<'_> {
                 self.structured_block_falls_through(&match_.some_block)
                     || self.structured_block_falls_through(&match_.none_block)
             }
-            RirStmt::Loop(_) => true,
-            RirStmt::Init { .. }
+            RirStmt::Loop(_)
+            | RirStmt::Init { .. }
             | RirStmt::Assign { .. }
             | RirStmt::DataRefSet { .. }
             | RirStmt::Eval(_) => true,
@@ -2217,14 +2217,8 @@ impl VerifyCx<'_> {
     }
 
     fn unary_ok(&self, op: UnaryOp, value: Option<RirTypeId>, ret: RirTypeId) -> bool {
-        match (op, value.and_then(|ty| self.ty(ty)), self.ty(ret)) {
-            (
-                UnaryOp::Neg,
-                Some(RirType::Int | RirType::Float),
-                Some(RirType::Int | RirType::Float),
-            ) => value == Some(ret),
-            (UnaryOp::Not, Some(RirType::Bool), Some(RirType::Bool)) => true,
-            (UnaryOp::BitNot, Some(RirType::Int), Some(RirType::Int)) => true,
+        match (value.and_then(|ty| self.scalar(ty)), self.scalar(ret)) {
+            (Some(value), Some(ret)) => op.scalar_result(value) == Some(ret),
             _ => false,
         }
     }
@@ -2236,32 +2230,23 @@ impl VerifyCx<'_> {
         rhs: Option<RirTypeId>,
         ret: RirTypeId,
     ) -> bool {
-        if lhs != rhs {
-            return false;
-        }
-        match (op, lhs.and_then(|ty| self.ty(ty)), self.ty(ret)) {
-            (
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
-                Some(RirType::Int | RirType::Float),
-                Some(RirType::Int | RirType::Float),
-            ) => lhs == Some(ret),
-            (
-                BinaryOp::Eq
-                | BinaryOp::NotEq
-                | BinaryOp::LessThan
-                | BinaryOp::GreaterThan
-                | BinaryOp::LessThanEq
-                | BinaryOp::GreaterThanEq,
-                Some(RirType::Int | RirType::Float | RirType::Bool),
-                Some(RirType::Bool),
-            ) => true,
-            (BinaryOp::And | BinaryOp::Or, Some(RirType::Bool), Some(RirType::Bool)) => true,
-            (
-                BinaryOp::Xor | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Shl | BinaryOp::Shr,
-                Some(RirType::Int),
-                Some(RirType::Int),
-            ) => true,
+        match (
+            lhs.and_then(|ty| self.scalar(ty)),
+            rhs.and_then(|ty| self.scalar(ty)),
+            self.scalar(ret),
+        ) {
+            (Some(lhs), Some(rhs), Some(ret)) => op.scalar_result(lhs, rhs) == Some(ret),
             _ => false,
+        }
+    }
+
+    fn scalar(&self, ty: RirTypeId) -> Option<ScalarKind> {
+        match self.ty(ty) {
+            Some(RirType::Int) => Some(ScalarKind::Int),
+            Some(RirType::Float) => Some(ScalarKind::Float),
+            Some(RirType::Bool) => Some(ScalarKind::Bool),
+            Some(RirType::String) => Some(ScalarKind::String),
+            _ => None,
         }
     }
 
@@ -2286,8 +2271,7 @@ impl VerifyCx<'_> {
 
     fn stringify_ok(&self, value: &RirOperand, source_ty: RirTypeId) -> bool {
         match self.ty(source_ty) {
-            Some(RirType::Int | RirType::Float | RirType::Bool) => true,
-            Some(RirType::String) => true,
+            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::String) => true,
             Some(RirType::Struct(_)) => {
                 matches!(value, RirOperand::Place(_))
                     && matches!(

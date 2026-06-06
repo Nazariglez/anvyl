@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
-use anvyx_externs::ParamFlow;
+use anvyx_externs::{ExternRep, ParamFlow};
 
 use super::{
-    ArityError, CheckedType, ExternUseTarget, MemberAccessKind, NominalKey, TypeChecker, TypeError,
-    check_arg_count, check_expected_value_expr, check_expr_checked, check_expr_checked_with_hint,
-    check_place, checked_from_type,
+    ArityError, CheckedType, ExternUseTarget, NominalKey, TypeChecker, TypeError, check_arg_count,
+    check_expected_value_expr, check_expr_checked, check_expr_checked_with_hint, check_place,
+    checked_from_type, field_check,
     infer::TypeHandle,
     literal::check_unknown_nominal_fields,
     nominal_type, place,
@@ -213,7 +211,10 @@ pub(super) fn check_extern_lit(
         return checked_from_type(expr, Type::Infer, tc);
     }
 
-    let Some(init) = tc.externs.init(owner).cloned() else {
+    let extern_type = tc.extern_type(owner);
+    let supports_literal =
+        extern_type.constructor_fields().is_some() && extern_type.rep == ExternRep::Inline;
+    if !supports_literal {
         tc.push_error(TypeError::InvalidStructLiteral {
             name: key.name,
             kind: "extern".to_string(),
@@ -221,7 +222,7 @@ pub(super) fn check_extern_lit(
         });
         check_unknown_nominal_fields(&lit.node.fields, tc);
         return checked_from_type(expr, Type::Infer, tc);
-    };
+    }
 
     let expected_ty = expected.map(|handle| tc.handle_type(handle));
     if let Some(expected_ty) = expected_ty.as_ref()
@@ -232,14 +233,8 @@ pub(super) fn check_extern_lit(
         tc.expect_equal(lit.span, actual, expected);
     }
 
-    let fields_failed = check_extern_literal_fields(
-        expr.node.id,
-        &lit.node.fields,
-        owner,
-        &init.field_init,
-        lit.span,
-        tc,
-    );
+    let fields_failed =
+        check_extern_literal_fields(expr.node.id, &lit.node.fields, owner, lit.span, tc);
     if fields_failed {
         return checked_from_type(expr, Type::Infer, tc);
     }
@@ -254,41 +249,35 @@ fn check_extern_literal_fields(
     aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
     owner: ExternTypeId,
-    explicit_init: &[Ident],
     span: Span,
     tc: &mut TypeChecker,
 ) -> bool {
     let owner_ty = nominal_type(&tc.extern_type(owner).nominal);
-    let mut seen = HashMap::new();
-    let mut failed = false;
-    for (name, value) in fields {
-        let duplicate = seen.insert(*name, value.span).is_some();
-        if duplicate {
-            tc.push_error(TypeError::DuplicateField {
-                name: *name,
-                span: tc.error_span(value.span),
-            });
-            failed = true;
-        }
+    let schema = field_check::extern_field_schema(tc.extern_type(owner));
+    let required = required_extern_literal_fields(owner, tc);
+    let field_owner = field_check::FieldOwner::Nominal(owner_ty);
+    let shape = field_check::check_named(
+        fields,
+        &schema,
+        &field_owner,
+        field_check::MissingFields::RequireOnly(&required),
+        Some(span),
+        |expr| expr.span,
+        tc,
+    );
+    let mut failed = shape.failed;
 
+    for index in &shape.invalid_indices {
+        check_expr_checked(&fields[*index].1, tc);
+    }
+
+    for checked_field in shape.fields {
+        let (name, value) = &fields[checked_field.index];
         let Some((_, field)) = tc.extern_field(owner, *name) else {
-            tc.push_error(TypeError::UnknownMember {
-                ty: owner_ty.clone(),
-                member: *name,
-                kind: MemberAccessKind::Field,
-                span: tc.error_span(value.span),
-            });
-            check_expr_checked(value, tc);
-            failed = true;
             continue;
         };
-
         let field_ty = field.ty.clone();
-        let allowed = if explicit_init.is_empty() {
-            !field.computed
-        } else {
-            explicit_init.contains(name)
-        };
+        let allowed = required.contains(name);
         if !allowed {
             tc.push_error(TypeError::ImmutableAssignment {
                 name: *name,
@@ -298,36 +287,17 @@ fn check_extern_literal_fields(
         }
         let hint = tc.type_handle(&field_ty.ty);
         let checked = check_expr_checked_with_hint(value, Some(hint), tc);
-        if !duplicate && allowed {
+        if allowed {
             tc.record_aggregate_elem_flow(aggregate, value);
         }
         failed |= !check_checked_value(value, &checked, &field_ty, tc);
     }
-
-    for name in required_extern_literal_fields(owner, explicit_init, tc) {
-        if !seen.contains_key(&name) {
-            tc.push_error(TypeError::MissingField {
-                name,
-                span: tc.error_span(span),
-            });
-            failed = true;
-        }
-    }
     failed
 }
 
-fn required_extern_literal_fields(
-    owner: ExternTypeId,
-    explicit_init: &[Ident],
-    tc: &TypeChecker,
-) -> Vec<Ident> {
-    if !explicit_init.is_empty() {
-        return explicit_init.to_vec();
-    }
+fn required_extern_literal_fields(owner: ExternTypeId, tc: &TypeChecker) -> Vec<Ident> {
     tc.extern_type(owner)
-        .fields
-        .iter()
-        .filter(|field| !field.computed)
-        .map(|field| field.name)
-        .collect()
+        .constructor_fields()
+        .map(|fields| fields.map(|(_, field)| field.name).collect())
+        .unwrap_or_default()
 }

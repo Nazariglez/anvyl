@@ -4,12 +4,11 @@ use super::{
     FuncParam, MethodReceiver, ParamTypeSpans, SemanticExprSite, TypeChecker, TypeError, contracts,
     convert::push_match_error,
     decls::{ContractRequirementSchema, ModuleScope},
-    type_ops::{TypeFolder, TypeVisitor},
 };
 use crate::{
     ast::{
         AnonymousContract, AnonymousContractParam, AnonymousContractRequirement, ContractRef,
-        DynContractHoleId, Ident, ReturnSpec, Type,
+        DynContractHoleId, Ident, ReturnSpec, Type, TypeFolder, TypeVisitor,
     },
     lint::{LintEvent, LintId},
     span::{SourceSpan, Span},

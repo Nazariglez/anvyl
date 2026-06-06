@@ -303,10 +303,7 @@ fn assert_core_provider_names_match_source_imports(
             let crate::ast::PackageModulePath::Named(path) = &import.node.target.path else {
                 panic!("core extern imports must name provider modules");
             };
-            let provider_path = path
-                .iter()
-                .map(|segment| segment.to_string())
-                .collect::<Vec<_>>();
+            let provider_path = path.iter().map(ToString::to_string).collect::<Vec<_>>();
             let ImportKind::Selective(items) = &import.node.kind else {
                 panic!("core extern imports must list provider functions explicitly");
             };
@@ -385,8 +382,7 @@ fn checked_with_core_modules(
     }
     resolved.module_groups.push(core_modules);
     resolved.system.core = Some(PackageId::core());
-    let mut raw = externs::collect_source_externs(&root, &resolved).unwrap();
-    raw.append(provider_raw);
+    let raw = externs::prepare_raw_externs(provider_raw, &root, &resolved).unwrap();
     let semantic =
         typecheck::check_semantic_with_modules(&root, &resolved, raw, TypecheckConfig::default())
             .expect("typecheck failed");

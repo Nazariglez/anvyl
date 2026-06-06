@@ -3,7 +3,7 @@
 // @frontend: new
 
 extern fn get() -> any;
-extern type Box { init; value: any; }
+extern type Box rep inline { init; value: any; }
 
 fn main() {
     Box { value: get() };

@@ -76,7 +76,22 @@ pub struct Place {
     pub ty: TypeId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceReadLocal {
+    Root(LocalId),
+    Index(LocalId),
+}
+
 impl Place {
+    pub(crate) fn for_each_read_local(&self, f: &mut impl FnMut(PlaceReadLocal)) {
+        f(PlaceReadLocal::Root(self.root));
+        for projection in &self.projection {
+            if let Projection::Index(local) = projection {
+                f(PlaceReadLocal::Index(*local));
+            }
+        }
+    }
+
     pub(crate) fn may_overlap(&self, other: &Self) -> bool {
         if self.root != other.root {
             return false;

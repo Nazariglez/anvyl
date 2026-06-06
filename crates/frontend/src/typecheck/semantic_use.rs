@@ -2,12 +2,12 @@ use std::{collections::HashMap, hash::Hash};
 
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
-    decls::{CallableId, CallableKind, ExtendId, GlobalKey},
+    decls::{CallableId, ExtendId, GlobalKey},
     infer::{SemanticLocalId, TypeHandle},
-    type_ops::{TypeVisitor, type_has_unfinished_facts},
+    type_ops::type_has_unfinished_facts,
 };
 use crate::{
-    ast::{ContractRef, ExprId, Ident, ReturnSpec},
+    ast::{ContractRef, ExprId, Ident, ReturnSpec, TypeVisitor},
     externs::catalog::{
         ExternFieldRef, ExternFunctionId, ExternMethodRef, ExternOperatorRef, ExternStaticRef,
         ExternTypeId,
@@ -131,6 +131,7 @@ pub(crate) struct SemanticFunctionInstanceFact {
     pub(crate) body_span: SourceSpan,
     pub(crate) params: Vec<SemanticParamSigFact>,
     pub(crate) ret: ReturnSpec,
+    pub(crate) is_stringify_override: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +170,12 @@ impl SemanticDeclarations {
                 debug_assert!(!type_has_unfinished_facts(&param.ty));
             }
             debug_assert!(!type_has_unfinished_facts(&fact.ret.ty));
+            if fact.is_stringify_override {
+                debug_assert_eq!(fact.name, Ident::new("to_string"));
+                debug_assert_eq!(fact.params.len(), 1);
+                debug_assert_eq!(fact.ret.ty, Type::String);
+                debug_assert!(fact.id.kind.has_receiver_param());
+            }
         }
     }
 
@@ -180,7 +187,7 @@ impl SemanticDeclarations {
                         function.id == default.callee.target && function.args == default.callee.args
                     }) {
                         let param_index = default.param_index
-                            + usize::from(function.id.kind == CallableKind::InstanceMethod);
+                            + usize::from(function.id.kind.has_receiver_param());
                         debug_assert!(param_index < function.params.len());
                         debug_assert_eq!(function.params[param_index].ty, default.ty);
                     } else if default.callee.args.is_empty() {
@@ -704,6 +711,59 @@ pub(crate) enum CaptureStorageOrigin {
     ForVarAlias,
     Const,
     ReadonlySelf,
+}
+
+impl CaptureStorageOrigin {
+    pub(crate) fn is_borrowed_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::BorrowedParam
+                | Self::VarSelf
+                | Self::DynView
+                | Self::PatternAlias
+                | Self::MutableDowncastAlias
+                | Self::ForVarAlias
+        )
+    }
+
+    pub(crate) fn requires_runtime_capture(self) -> bool {
+        !matches!(self, Self::Const)
+    }
+
+    pub(crate) fn is_air_local(self) -> bool {
+        matches!(
+            self,
+            Self::Owned
+                | Self::BorrowedParam
+                | Self::ReadonlySelf
+                | Self::VarSelf
+                | Self::PatternAlias
+                | Self::ForVarAlias
+        )
+    }
+
+    pub(crate) fn capture_storage(self, source_mutable: bool, escaping: bool) -> CaptureStorage {
+        if self.is_borrowed_runtime() {
+            return if escaping {
+                CaptureStorage::BorrowedEscaping
+            } else {
+                CaptureStorage::BorrowedScoped
+            };
+        }
+
+        match self {
+            Self::Const => CaptureStorage::NoRuntime,
+            Self::Owned if source_mutable && escaping => CaptureStorage::OwnedMutableUpvalue,
+            Self::Owned if source_mutable => CaptureStorage::OwnedMutableScoped,
+            Self::Owned | Self::ReadonlySelf => CaptureStorage::OwnedReadonly,
+            Self::BorrowedParam
+            | Self::VarSelf
+            | Self::DynView
+            | Self::PatternAlias
+            | Self::MutableDowncastAlias
+            | Self::ForVarAlias => unreachable!("borrowed capture origin returned early"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

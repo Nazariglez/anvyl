@@ -6,10 +6,9 @@ use super::{
         ExpectedFit, ExpectedProjectionMode, SourceAcceptance, apply_value_projection,
         classify_expected_fit,
     },
-    type_ops::TypeVisitor,
 };
 use crate::{
-    ast::{CastNode, ContractRef, DynContractHoleId, ExprId, ExprNode, Ident, Type},
+    ast::{CastNode, ContractRef, DynContractHoleId, ExprId, ExprNode, Ident, Type, TypeVisitor},
     span::Span,
 };
 

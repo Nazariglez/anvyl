@@ -246,25 +246,18 @@ fn build_dependent_embed_templates(decls: &mut DeclarationIndex) {
         .collect::<Vec<_>>();
     keys.sort_by_key(nominal_key_sort_key);
     for key in keys {
-        let Some(schema) = decls.aggregate(&key) else {
-            continue;
-        };
-        let mut templates = vec![];
-        for (name, field) in schema.fields.iter() {
-            let Some(embed) = &field.embed else {
-                continue;
-            };
-            if !type_depends_on_generics(&field.ty) {
-                continue;
-            }
-            templates.push(DependentEmbedTemplate {
-                field_path: vec![name],
-                target_ty: field.ty.clone(),
-                selector: embed.selector.clone(),
-                exposure: embed.exposure,
-                span: embed.span,
-            });
-        }
+        let templates = decls
+            .embedded_fields()
+            .filter(|field| field.owner == &key)
+            .filter(|field| type_depends_on_generics(&field.field.ty))
+            .map(|field| DependentEmbedTemplate {
+                field_path: vec![field.name],
+                target_ty: field.field.ty.clone(),
+                selector: field.embed.selector.clone(),
+                exposure: field.embed.exposure,
+                span: field.embed.span,
+            })
+            .collect();
         if let Some(schema) = decls.aggregate_mut(&key) {
             schema.dependent_embeds = templates;
         }

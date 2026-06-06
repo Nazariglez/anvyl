@@ -7,12 +7,11 @@ use super::{
     decls::CallableId,
     dyn_infer::DynInferenceFacts,
     infer::{GenericSolverSeeds, Solver},
-    type_ops::TypeFolder,
 };
 use crate::{
     ast::{
         ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef, FuncParam,
-        GenericArg, Ident, Type, TypeParam, TypeVarId,
+        GenericArg, Ident, Type, TypeFolder, TypeParam, TypeVarId,
     },
     span::Span,
 };

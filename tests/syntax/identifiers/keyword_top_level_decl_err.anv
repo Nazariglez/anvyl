@@ -1,0 +1,5 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token 'type'
+
+fn type() -> int { 1 }

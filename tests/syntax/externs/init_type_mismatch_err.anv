@@ -3,7 +3,7 @@
 // @frontend: new
 // @contains: mismatched types
 
-extern type Point {
+extern type Point rep inline {
     init;
     x: float;
     y: float;

@@ -33,6 +33,81 @@ pub(super) fn field_name_ident<'src>() -> BoxedParser<'src, ast::Ident> {
     choice((identifier(), keyword_as_ident())).boxed()
 }
 
+pub(super) fn comma<'src>() -> BoxedParser<'src, ()> {
+    select! { Token::Comma => () }.boxed()
+}
+
+pub(super) fn colon<'src>() -> BoxedParser<'src, ()> {
+    select! { Token::Colon => () }.boxed()
+}
+
+pub(super) fn dot<'src>() -> BoxedParser<'src, ()> {
+    select! { Token::Dot => () }.boxed()
+}
+
+pub(super) fn open_delimiter<'src>(delimiter: Delimiter) -> BoxedParser<'src, ()> {
+    select! { Token::Open(found) if found == delimiter => () }.boxed()
+}
+
+pub(super) fn close_delimiter<'src>(delimiter: Delimiter) -> BoxedParser<'src, ()> {
+    select! { Token::Close(found) if found == delimiter => () }.boxed()
+}
+
+pub(super) fn parens<'src, T: 'src>(item: impl AnvParser<'src, T>) -> BoxedParser<'src, T> {
+    item.delimited_by(
+        open_delimiter(Delimiter::Parent),
+        close_delimiter(Delimiter::Parent),
+    )
+    .boxed()
+}
+
+pub(super) fn braces<'src, T: 'src>(item: impl AnvParser<'src, T>) -> BoxedParser<'src, T> {
+    item.delimited_by(
+        open_delimiter(Delimiter::Brace),
+        close_delimiter(Delimiter::Brace),
+    )
+    .boxed()
+}
+
+pub(super) fn brackets<'src, T: 'src>(item: impl AnvParser<'src, T>) -> BoxedParser<'src, T> {
+    item.delimited_by(
+        open_delimiter(Delimiter::Bracket),
+        close_delimiter(Delimiter::Bracket),
+    )
+    .boxed()
+}
+
+pub(super) fn comma_list<'src, T: 'src>(
+    item: impl AnvParser<'src, T>,
+) -> BoxedParser<'src, Vec<T>> {
+    item.separated_by(comma())
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .or_not()
+        .map(Option::unwrap_or_default)
+        .boxed()
+}
+
+pub(super) fn nonempty_comma_list<'src, T: 'src>(
+    item: impl AnvParser<'src, T>,
+) -> BoxedParser<'src, Vec<T>> {
+    item.separated_by(comma())
+        .allow_trailing()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .boxed()
+}
+
+pub(super) fn qualified_name<'src>() -> BoxedParser<'src, (Option<ast::Ident>, ast::Ident)> {
+    identifier()
+        .then(dot().ignore_then(identifier()).or_not())
+        .map(|(first, second)| match second {
+            Some(second) => (Some(first), second),
+            None => (None, first),
+        })
+        .boxed()
+}
+
 pub(super) fn escaping_kw<'src>() -> BoxedParser<'src, ()> {
     select! { Token::Ident(ident) if ident.0.as_ref() == "escaping" => () }.boxed()
 }
@@ -89,23 +164,7 @@ pub(super) fn literal<'src>() -> BoxedParser<'src, ast::Lit> {
 pub(super) fn params<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, Vec<ast::Param>> {
-    select! {
-        Token::Open(Delimiter::Parent) => (),
-    }
-    .ignore_then(
-        param(stmt)
-            .separated_by(select! {
-                Token::Comma => (),
-            })
-            .allow_trailing()
-            .collect::<Vec<_>>()
-            .or_not()
-            .map(Option::unwrap_or_default),
-    )
-    .then_ignore(select! {
-        Token::Close(Delimiter::Parent) => (),
-    })
-    .boxed()
+    parens(comma_list(param(stmt))).boxed()
 }
 
 pub(super) fn param<'src>(
@@ -125,9 +184,7 @@ pub(super) fn param<'src>(
 
     var_kw
         .then(identifier())
-        .then_ignore(select! {
-            Token::Colon => (),
-        })
+        .then_ignore(colon())
         .then(ty)
         .then(
             select! { Token::Op(Op::Assign) => () }
@@ -180,27 +237,42 @@ pub(super) fn block_stmt<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     tail_expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::BlockNode> {
-    select! {
-        Token::Open(Delimiter::Brace) => (),
-    }
-    .ignore_then(stmt.repeated().collect::<Vec<_>>())
-    .then(tail_expr.or_not())
-    .then_ignore(select! {
-        Token::Close(Delimiter::Brace) => (),
-    })
-    .map_with(|(stmts, tail), e| {
-        let s = e.span();
-        Spanned::new(
-            ast::Block {
-                stmts,
-                tail: tail.map(Box::new),
-            },
-            s.byte(),
-        )
-    })
-    .labelled("block")
-    .as_context()
-    .boxed()
+    braces(stmt.repeated().collect::<Vec<_>>().then(tail_expr.or_not()))
+        .map_with(|(stmts, tail), e| {
+            let s = e.span();
+            Spanned::new(
+                ast::Block {
+                    stmts,
+                    tail: tail.map(Box::new),
+                },
+                s.byte(),
+            )
+        })
+        .labelled("block")
+        .as_context()
+        .boxed()
+}
+
+pub(super) struct TupleParts<T> {
+    pub first: Option<T>,
+    pub rest: Vec<T>,
+    pub trailing_comma: bool,
+}
+
+pub(super) fn parenthesized_tuple_parts<'src, T: 'src>(
+    elem: impl AnvParser<'src, T>,
+) -> BoxedParser<'src, TupleParts<T>> {
+    let rest = comma()
+        .ignore_then(elem.clone())
+        .repeated()
+        .collect::<Vec<_>>();
+    parens(elem.or_not().then(rest).then(comma().or_not()))
+        .map(|((first, rest), trailing_comma)| TupleParts {
+            first,
+            rest,
+            trailing_comma: trailing_comma.is_some(),
+        })
+        .boxed()
 }
 
 // Shared helper for validating tuple shapes (used by expr and types)

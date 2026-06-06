@@ -12,8 +12,8 @@ use super::{
     },
     enum_variant, expected_assignable_type, extern_boundary, field_check,
     generic::{ArityError, GenericArgs, GenericParams},
-    generic_bind::bind_exact_generic_args,
-    infer::{GenericSolverSeeds, GenericSolverVars, TypeHandle},
+    generic_bind::{GenericSolveSession, bind_exact_generic_args},
+    infer::{GenericSolverSeeds, TypeHandle},
     solve_and_checked_from_handle,
     type_ops::type_depends_on_generics,
     type_refs::map_key_type_error,
@@ -300,17 +300,17 @@ pub(super) fn check_tuple_checked_with_hint(
     checked
 }
 
-struct NominalLiteralSolver {
-    vars: GenericSolverVars,
+struct NominalLiteralSolver<'a> {
+    session: GenericSolveSession<'a>,
 }
 
-impl NominalLiteralSolver {
-    fn new(
-        generics: &GenericParams,
+impl NominalLiteralSolver<'_> {
+    fn new<'a>(
+        generics: &'a GenericParams,
         args: &[GenericArg],
         span: Span,
         tc: &mut TypeChecker,
-    ) -> Option<Self> {
+    ) -> Option<NominalLiteralSolver<'a>> {
         let seeds = if args.is_empty() {
             GenericSolverSeeds::default()
         } else {
@@ -320,20 +320,22 @@ impl NominalLiteralSolver {
         Some(Self::from_seeds(generics, &seeds, span, tc))
     }
 
-    fn without_args(generics: &GenericParams, span: Span, tc: &mut TypeChecker) -> Self {
+    fn without_args<'a>(
+        generics: &'a GenericParams,
+        span: Span,
+        tc: &mut TypeChecker,
+    ) -> NominalLiteralSolver<'a> {
         Self::from_seeds(generics, &GenericSolverSeeds::default(), span, tc)
     }
 
-    fn from_seeds(
-        generics: &GenericParams,
+    fn from_seeds<'a>(
+        generics: &'a GenericParams,
         seeds: &GenericSolverSeeds,
         span: Span,
         tc: &mut TypeChecker,
-    ) -> Self {
-        Self {
-            vars: tc
-                .solver
-                .generic_solver_vars(generics, seeds, tc.error_span(span)),
+    ) -> NominalLiteralSolver<'a> {
+        NominalLiteralSolver {
+            session: GenericSolveSession::new(tc, generics, seeds, span),
         }
     }
 
@@ -352,33 +354,26 @@ impl NominalLiteralSolver {
             return true;
         }
         let template = nominal_literal_type(key, generics, None);
-        let template = tc.solver.instantiate_generic_type(&template, &self.vars);
+        let template = tc
+            .solver
+            .instantiate_generic_type(&template, self.session.vars());
         let expected = tc.type_handle(expected);
         tc.expect_equal(span, template, expected);
         !tc.solve_constraints()
     }
 
     fn instantiate(&self, ty: &Type, tc: &mut TypeChecker) -> TypeHandle {
-        tc.solver.instantiate_generic_type(ty, &self.vars)
+        tc.solver.instantiate_generic_type(ty, self.session.vars())
     }
 
     fn finalize(
         &self,
         key: &NominalKey,
         generics: &GenericParams,
-        span: Span,
+        _span: Span,
         tc: &mut TypeChecker,
     ) -> Option<Type> {
-        let args = match tc.solver.finalize_generic_args(generics, &self.vars) {
-            Ok(args) => args,
-            Err(unbound) => {
-                tc.push_unbound_generic_errors(unbound, span);
-                return None;
-            }
-        };
-        if !tc.check_generic_bounds(generics, &args, span) {
-            return None;
-        }
+        let args = self.session.finish(tc)?;
         Some(nominal_literal_type(key, generics, Some(&args)))
     }
 }

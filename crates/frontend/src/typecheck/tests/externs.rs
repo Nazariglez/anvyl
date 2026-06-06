@@ -320,8 +320,7 @@ fn check_named_with_provider(
     .expect("valid provider");
     let external_modules = externs::raw_extern_module_ids(&provider_raw);
     let resolved = resolved_modules_with_core_option_external(&root, modules, &external_modules);
-    let mut raw = externs::collect_source_externs(&root, &resolved).expect("valid source externs");
-    raw.append(provider_raw);
+    let raw = externs::prepare_raw_externs(provider_raw, &root, &resolved).expect("valid externs");
     check_with_raw_externs(&root, &resolved, raw)
 }
 
@@ -999,7 +998,7 @@ mod struct_literals {
     fn records_init() {
         let result = check(
             r"
-            extern type Point { init; x: float; y: float; }
+            extern type Point rep inline { init; x: float; y: float; }
             fn make() -> Point { Point { x: 1.0, y: 2.0 } }
             ",
         )
@@ -1816,6 +1815,7 @@ mod provider_imports {
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
                 types: vec![ExternTypeDescriptor {
+                    rep: ExternRep::Inline,
                     fields: vec![
                         field("x", ExternTypeExpr::Float),
                         field("y", ExternTypeExpr::Float),
@@ -2265,7 +2265,7 @@ mod named_modules {
                 "math",
                 r"
                 extern fn tick(p: Point);
-                pub extern type Point {
+                pub extern type Point rep inline {
                     init;
                     x: float;
                     fn shift(var self, delta: Point);

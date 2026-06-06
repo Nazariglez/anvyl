@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn take(value: int) {}
+
+fn main() {
+    let __value = 1;
+    take(__value);
+}

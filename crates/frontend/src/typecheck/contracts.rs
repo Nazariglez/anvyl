@@ -9,11 +9,10 @@ use super::{
     annotation::deprecated_lint,
     member::{self, PromotedMethodTarget},
     semantic_use::{ContractWitnessKey, WitnessId, WitnessSlot, WitnessSlotTarget},
-    type_ops::TypeVisitor,
     type_refs::{TypeRefResolver, type_ref_error},
 };
 use crate::{
-    ast::{AnonymousContract, ContractRef, Ident, ReturnSpec, Type},
+    ast::{AnonymousContract, ContractRef, Ident, ReturnSpec, Type, TypeVisitor},
     lint::LintEvent,
     span::{SourceSpan, Span},
 };
