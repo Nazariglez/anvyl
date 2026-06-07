@@ -1571,25 +1571,17 @@ impl TypeChecker {
             .record_param_def(self.current_body(), index, local);
     }
 
-    fn has_recordable_semantic_local(&self, local: SemanticLocalId) -> bool {
-        self.can_record_local_facts()
-            && self
-                .local_def_bodies
-                .get(&local)
-                .is_some_and(|body| *body == self.current_body())
-    }
-
     fn record_local_use(&mut self, expr_id: ExprId, local: SemanticLocalId, mode: LocalUseMode) {
         if !self.can_record_local_facts() {
             return;
         }
         let body = self.current_body();
-        let has_def = self
-            .semantic_facts
-            .body(&body)
-            .is_some_and(|facts| facts.locals.defs.contains_key(&local));
-        debug_assert!(has_def, "semantic local use missing local definition");
-        if !has_def {
+        let def_body = self.local_def_bodies.get(&local);
+        let binding_id = def_body
+            .and_then(|body| self.semantic_facts.body(body))
+            .and_then(|facts| facts.locals.defs.get(&local))
+            .and_then(|def| def.binding_id);
+        if def_body != Some(&body) && binding_id.is_none() {
             return;
         }
         self.semantic_facts.record_local_use(
@@ -1597,6 +1589,7 @@ impl TypeChecker {
             LocalUseFact {
                 expr_id,
                 local,
+                binding_id,
                 mode,
             },
         );
@@ -1987,7 +1980,6 @@ impl TypeChecker {
         self.record_local_read(expr.node.id, value);
         if let Some(mode) = mode
             && value.info.kind.is_air_local()
-            && self.has_recordable_semantic_local(value.info.type_id)
         {
             self.record_local_use(expr.node.id, value.info.type_id, mode);
         }

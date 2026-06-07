@@ -1313,6 +1313,39 @@ enum CaptureLocalAccess {
     Scoped(Mutability),
 }
 
+fn function_captures_local_source(
+    program: &Program,
+    function_id: FunctionId,
+    binding: BindingId,
+    source: CaptureLocalSource,
+    ty: TypeId,
+) -> bool {
+    let Some(function) = program.functions.get(function_id.index()) else {
+        return false;
+    };
+    let FunctionKind::Lambda(lambda) = function.kind else {
+        return false;
+    };
+    program.lambdas[lambda.index()]
+        .captures
+        .iter()
+        .any(|capture| lambda_capture_matches_local_source(capture, binding, source, ty))
+}
+
+fn lambda_capture_matches_local_source(
+    capture: &LambdaCaptureDecl,
+    binding: BindingId,
+    source: CaptureLocalSource,
+    ty: TypeId,
+) -> bool {
+    lambda_capture_decl_binding(capture) == binding
+        && lambda_capture_decl_ty(capture) == ty
+        && matches!(
+            lambda_capture_decl_source(capture),
+            Some(LambdaCaptureSourceKey::Local(found)) if found == source
+        )
+}
+
 fn verify_capture_local_source(
     cx: &mut VerifyCx<'_>,
     site: VerifySite,
@@ -1324,7 +1357,9 @@ fn verify_capture_local_source(
     ty: TypeId,
     access: CaptureLocalAccess,
 ) {
-    if source.owner != expected_owner {
+    if source.owner != expected_owner
+        && !function_captures_local_source(cx.program, expected_owner, binding, source, ty)
+    {
         cx.push(
             site,
             VerifyErrorKind::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
@@ -3501,7 +3536,7 @@ fn verify_lambda_captures(
             );
         }
         if let LambdaCaptureArg::ReadonlyLocal { value } = capture
-            && !readonly_capture_is_immutable_owned(cx.program, function_id, value, None)
+            && !readonly_capture_arg_is_valid(cx.program, function_id, decl_capture, value)
         {
             cx.push(
                 site.clone(),
@@ -3516,6 +3551,26 @@ fn verify_lambda_captures(
             verify_mutable_place(cx, function_id, site, place);
         }
     }
+}
+
+fn readonly_capture_arg_is_valid(
+    program: &Program,
+    function_id: FunctionId,
+    decl: &LambdaCaptureDecl,
+    value: &Operand,
+) -> bool {
+    if readonly_capture_is_immutable_owned(program, function_id, value, None) {
+        return true;
+    }
+    let LambdaCaptureDecl::ReadonlyLocal {
+        binding,
+        source,
+        ty,
+    } = decl
+    else {
+        return false;
+    };
+    operand_is_matching_lambda_capture(program, function_id, value, *binding, *source, *ty)
 }
 
 fn readonly_capture_is_immutable_owned(
@@ -3573,17 +3628,49 @@ fn lambda_capture_matches(
     match (decl, capture) {
         (LambdaCaptureDecl::NoRuntime { .. }, LambdaCaptureArg::NoRuntime) => true,
         (
-            LambdaCaptureDecl::ReadonlyLocal { source, ty, .. },
+            LambdaCaptureDecl::ReadonlyLocal {
+                binding,
+                source,
+                ty,
+            },
             LambdaCaptureArg::ReadonlyLocal { value },
         ) => {
             typing::operand_ty(program, value) == Some(*ty)
-                && source.owner == function_id
-                && readonly_capture_is_immutable_owned(program, function_id, value, Some(*source))
+                && (source.owner == function_id
+                    && readonly_capture_is_immutable_owned(
+                        program,
+                        function_id,
+                        value,
+                        Some(*source),
+                    )
+                    || operand_is_matching_lambda_capture(
+                        program,
+                        function_id,
+                        value,
+                        *binding,
+                        *source,
+                        *ty,
+                    ))
         }
         (
-            LambdaCaptureDecl::ScopedLocal { source, ty, .. },
+            LambdaCaptureDecl::ScopedLocal {
+                binding,
+                source,
+                ty,
+                ..
+            },
             LambdaCaptureArg::ScopedLocal { place },
-        ) => source.owner == function_id && place_is_exact_local(place, *source, *ty),
+        ) => {
+            source.owner == function_id && place_is_exact_local(place, *source, *ty)
+                || place_is_matching_lambda_capture(
+                    program,
+                    function_id,
+                    place,
+                    *binding,
+                    *source,
+                    *ty,
+                )
+        }
         (
             LambdaCaptureDecl::ScopedBorrow { borrow, ty, .. },
             LambdaCaptureArg::ScopedBorrow { place },
@@ -3594,6 +3681,44 @@ fn lambda_capture_matches(
         ) => cell == expected,
         _ => false,
     }
+}
+
+fn operand_is_matching_lambda_capture(
+    program: &Program,
+    function_id: FunctionId,
+    operand: &Operand,
+    binding: BindingId,
+    source: CaptureLocalSource,
+    ty: TypeId,
+) -> bool {
+    matches!(operand, Operand::Place(place)
+        if place_is_matching_lambda_capture(program, function_id, place, binding, source, ty))
+}
+
+fn place_is_matching_lambda_capture(
+    program: &Program,
+    function_id: FunctionId,
+    place: &Place,
+    binding: BindingId,
+    source: CaptureLocalSource,
+    ty: TypeId,
+) -> bool {
+    if !place.projection.is_empty() || place.ty != ty {
+        return false;
+    }
+    let PlaceRoot::LambdaCapture(slot) = place.root else {
+        return false;
+    };
+    let Some(function) = program.functions.get(function_id.index()) else {
+        return false;
+    };
+    let FunctionKind::Lambda(lambda) = function.kind else {
+        return false;
+    };
+    let Some(capture) = program.lambdas[lambda.index()].captures.get(slot.index()) else {
+        return false;
+    };
+    lambda_capture_matches_local_source(capture, binding, source, ty)
 }
 
 fn verify_function_value_type(

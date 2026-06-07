@@ -32,14 +32,14 @@ use self::{
         RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm,
         RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
-        RirIf, RirLambda, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
-        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
-        RirLoopId, RirNativeExtern, RirOperand, RirOptionMatch, RirParam, RirParamEscape,
-        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue,
-        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaEscape, RirLambdaId,
+        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
+        RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
+        RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
+        RirRawEnumValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
+        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
+        RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId,
+        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -250,10 +250,28 @@ struct PlanCx<'a> {
     function_map: HashMap<FunctionId, RirFunctionId>,
     function_lambda_map: HashMap<FunctionId, RirLambdaId>,
     lambda_map: HashMap<air::LambdaId, RirLambdaId>,
+    function_type_copyable: HashMap<TypeId, bool>,
+    lambda_runtime_capture_slots: HashMap<(air::LambdaId, air::LambdaCaptureSlotId), usize>,
     extern_map: HashMap<ExternId, RirExternId>,
     dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
     tuple_map: HashMap<Vec<RirTypeId>, RirTupleId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KnownLambdaValue {
+    lambda: RirLambdaId,
+    ty: RirTypeId,
+}
+
+impl KnownLambdaValue {
+    fn rvalue(self) -> RirRValue {
+        RirRValue::Lambda {
+            lambda: self.lambda,
+            captures: vec![],
+            ty: self.ty,
+        }
+    }
 }
 
 struct PlannedRValue {
@@ -329,6 +347,8 @@ impl<'a> PlanCx<'a> {
             function_map: HashMap::new(),
             function_lambda_map: HashMap::new(),
             lambda_map: HashMap::new(),
+            function_type_copyable: HashMap::new(),
+            lambda_runtime_capture_slots: HashMap::new(),
             extern_map: HashMap::new(),
             dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
@@ -356,6 +376,7 @@ impl<'a> PlanCx<'a> {
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
         self.plan_lambdas(&mut program)?;
+        self.plan_function_type_copyability(&program);
         self.plan_stringify_helpers(&mut program)?;
         for index in 0..self.air.functions.len() {
             let id = FunctionId::from_index(index);
@@ -1170,15 +1191,18 @@ impl<'a> PlanCx<'a> {
             self.function_lambda_map.insert(air_id, id);
         }
         for (index, decl) in self.air.lambdas.iter().enumerate() {
-            if !decl.captures.is_empty() {
+            let lambda = air::LambdaId::from_index(index);
+            if decl.escape == air::LambdaEscape::Escaping
+                && decl.captures.iter().any(lambda_capture_has_runtime)
+            {
                 return Err(Self::gap(
                     RustTargetGapSite::Function(decl.owner),
                     RustTargetGapKind::UnsupportedLambdaCapture,
                 ));
             }
-            let lambda = air::LambdaId::from_index(index);
+            let captures = self.plan_lambda_captures(program, lambda, decl)?;
             let sig = self.intern_lambda_sig(program, &decl.signature);
-            let id = Self::push_zero_env_lambda(
+            let id = Self::push_lambda(
                 program,
                 RirLambdaSource::Lambda(lambda),
                 self.function_map[&decl.body],
@@ -1187,10 +1211,100 @@ impl<'a> PlanCx<'a> {
                     air::LambdaEscape::NonEscaping => RirLambdaEscape::NonEscaping,
                     air::LambdaEscape::Escaping => RirLambdaEscape::Escaping,
                 },
+                captures,
             );
             self.lambda_map.insert(lambda, id);
         }
         Ok(())
+    }
+
+    fn plan_function_type_copyability(&mut self, program: &RirProgram) {
+        let policy = RustRepPolicy::new(program);
+        self.function_type_copyable.clear();
+        for (ty, sig) in &self.lambda_sig_map {
+            self.function_type_copyable
+                .insert(*ty, policy.lambda_sig_copyable(*sig));
+        }
+    }
+
+    fn plan_lambda_captures(
+        &mut self,
+        program: &RirProgram,
+        lambda: air::LambdaId,
+        decl: &air::LambdaDecl,
+    ) -> Result<Vec<RirLambdaCapture>, RustPlanError> {
+        let policy = RustRepPolicy::new(program);
+        let mut captures = vec![];
+        for (slot, capture) in decl.captures.iter().enumerate() {
+            let Some(capture) = self.plan_lambda_capture(program, decl.owner, capture)? else {
+                continue;
+            };
+            self.lambda_runtime_capture_slots.insert(
+                (lambda, air::LambdaCaptureSlotId::from_index(slot)),
+                captures.len(),
+            );
+            captures.push(capture);
+        }
+        for capture in &captures {
+            if !policy.supports_param(capture.ty, capture.semantic) {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(decl.owner),
+                    RustTargetGapKind::UnsupportedLambdaCapture,
+                ));
+            }
+        }
+        Ok(captures)
+    }
+
+    fn plan_lambda_capture(
+        &self,
+        program: &RirProgram,
+        owner: FunctionId,
+        capture: &air::LambdaCaptureDecl,
+    ) -> Result<Option<RirLambdaCapture>, RustPlanError> {
+        let policy = RustRepPolicy::new(program);
+        match capture {
+            air::LambdaCaptureDecl::NoRuntime { .. } => Ok(None),
+            air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
+                if !self.rust_shareable_air_type(*ty) {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(owner),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
+                let semantic = if self.rust_copyable_air_type(*ty) {
+                    RirParamSemantic::Value
+                } else {
+                    RirParamSemantic::SharedBorrow
+                };
+                let ty = self.type_map[ty];
+                Ok(Some(RirLambdaCapture {
+                    ty,
+                    semantic,
+                    abi: policy.param_abi(semantic),
+                }))
+            }
+            air::LambdaCaptureDecl::ScopedLocal { ty, mutability, .. } => {
+                if *mutability != Mutability::Mutable {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(owner),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
+                let ty = self.type_map[ty];
+                let semantic = RirParamSemantic::MutBorrow;
+                Ok(Some(RirLambdaCapture {
+                    ty,
+                    semantic,
+                    abi: policy.param_abi(semantic),
+                }))
+            }
+            air::LambdaCaptureDecl::ScopedBorrow { .. }
+            | air::LambdaCaptureDecl::UpvalueCell { .. } => Err(Self::gap(
+                RustTargetGapSite::Function(owner),
+                RustTargetGapKind::UnsupportedLambdaCapture,
+            )),
+        }
     }
 
     fn push_zero_env_lambda(
@@ -1200,14 +1314,31 @@ impl<'a> PlanCx<'a> {
         sig: RirLambdaSigId,
         escape: RirLambdaEscape,
     ) -> RirLambdaId {
+        Self::push_lambda(program, source, function, sig, escape, vec![])
+    }
+
+    fn push_lambda(
+        program: &mut RirProgram,
+        source: RirLambdaSource,
+        function: RirFunctionId,
+        sig: RirLambdaSigId,
+        escape: RirLambdaEscape,
+        captures: Vec<RirLambdaCapture>,
+    ) -> RirLambdaId {
         let id = RirLambdaId::from_index(program.lambdas.len());
+        let storage = if captures.is_empty() {
+            RirLambdaStorage::ZeroEnv
+        } else {
+            RirLambdaStorage::ScopedCaptures
+        };
         program.lambdas.push(RirLambda {
             id,
             source,
             function,
             sig,
             escape,
-            storage: RirLambdaStorage::ZeroEnv,
+            storage,
+            captures,
         });
         id
     }
@@ -1254,23 +1385,50 @@ impl<'a> PlanCx<'a> {
             }
         }
         let policy = RustRepPolicy::new(program);
-        let params = function
-            .signature
-            .params
-            .iter()
-            .map(|param| {
-                let ty = self.type_map[&param.ty];
-                let semantic = rir::semantic_from_air(param.mode);
-                RirParam {
-                    local: RirLocalId::from_index(param.local_id.index()),
-                    ty,
-                    semantic,
-                    abi: policy.param_abi(semantic),
-                    escape: rir_param_escape(param.escape),
-                }
-            })
-            .collect();
-        let body = self.plan_air_block(air_id, &function.body.block, &mut locals)?;
+        let mut params = vec![];
+        if let air::FunctionKind::Lambda(lambda) = function.kind {
+            for (index, capture) in program.lambdas[self.lambda_map[&lambda].index()]
+                .captures
+                .iter()
+                .enumerate()
+            {
+                let local = RirLocalId::from_index(locals.len());
+                locals.push(RirLocal {
+                    id: local,
+                    ty: capture.ty,
+                    mutable: capture.semantic == RirParamSemantic::MutBorrow,
+                    symbol: local_symbol(local.index(), None),
+                    initialized: true,
+                    payload_ref: false,
+                });
+                params.push(RirParam {
+                    local,
+                    ty: capture.ty,
+                    semantic: capture.semantic,
+                    abi: capture.abi,
+                    escape: RirParamEscape::NonEscaping,
+                });
+                debug_assert_eq!(local.index(), function.locals.len() + index);
+            }
+        }
+        params.extend(function.signature.params.iter().map(|param| {
+            let ty = self.type_map[&param.ty];
+            let semantic = rir::semantic_from_air(param.mode);
+            RirParam {
+                local: RirLocalId::from_index(param.local_id.index()),
+                ty,
+                semantic,
+                abi: policy.param_abi(semantic),
+                escape: rir_param_escape(param.escape),
+            }
+        }));
+        let mut lambda_values = vec![None; locals.len()];
+        let body = self.plan_air_block(
+            air_id,
+            &function.body.block,
+            &mut locals,
+            &mut lambda_values,
+        )?;
         Ok(RirFunction {
             id: self.function_map[&air_id],
             air_id: Some(air_id),
@@ -1296,10 +1454,11 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         block: &air::AirBlock,
         locals: &mut Vec<RirLocal>,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<RirStructuredBlock, RustPlanError> {
         let mut stmts = vec![];
         for stmt in &block.stmts {
-            stmts.extend(self.plan_air_stmt(function, stmt, locals)?);
+            stmts.extend(self.plan_air_stmt(function, stmt, locals, lambda_values)?);
         }
         let (tail_stmts, term) = self.plan_air_tail(function, &block.tail, locals);
         stmts.extend(tail_stmts);
@@ -1311,20 +1470,28 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         stmt: &air::AirStmt,
         locals: &mut Vec<RirLocal>,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<Vec<RirStmt>, RustPlanError> {
         match stmt {
             air::AirStmt::Init { local, value } => {
-                let mut planned = self.plan_rvalue(function, value, locals)?;
+                let mut planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+                let known = self.known_lambda_rvalue(&planned.value);
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Init {
                     local: RirLocalId::from_index(local.index()),
                     value: planned.value,
                 });
                 stmts.append(&mut planned.post_stmts);
+                self.set_known_lambda(lambda_values, RirLocalId::from_index(local.index()), known);
                 Ok(stmts)
             }
             air::AirStmt::Assign { dst, value } => {
-                let mut planned = self.plan_rvalue(function, value, locals)?;
+                let mut planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+                let known = planned
+                    .post_stmts
+                    .is_empty()
+                    .then(|| self.known_lambda_rvalue(&planned.value))
+                    .flatten();
                 let mut stmts = planned.stmts;
                 let value = if planned.post_stmts.is_empty() {
                     planned.value
@@ -1334,10 +1501,11 @@ impl<'a> PlanCx<'a> {
                     RirRValue::Use(operand)
                 };
                 self.lower_place_write(function, dst, value, locals, &mut stmts);
+                self.set_place_known_lambda(lambda_values, dst, known);
                 Ok(stmts)
             }
             air::AirStmt::Eval(value) => {
-                let mut planned = self.plan_rvalue(function, value, locals)?;
+                let mut planned = self.plan_rvalue(function, value, locals, lambda_values)?;
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Eval(planned.value));
                 stmts.append(&mut planned.post_stmts);
@@ -1345,45 +1513,85 @@ impl<'a> PlanCx<'a> {
             }
             air::AirStmt::If(branch) => {
                 let cond = self.plan_operand_read(function, &branch.cond, locals);
+                let entry_lambdas = lambda_values.clone();
+                let mut then_lambdas = entry_lambdas.clone();
+                let then_block =
+                    self.plan_air_block(function, &branch.then_block, locals, &mut then_lambdas)?;
+                let (else_block, else_lambdas) = match &branch.else_block {
+                    Some(block) => {
+                        let mut else_lambdas = entry_lambdas.clone();
+                        let block =
+                            self.plan_air_block(function, block, locals, &mut else_lambdas)?;
+                        (Some(block), else_lambdas)
+                    }
+                    None => (None, entry_lambdas),
+                };
+                self.merge_known_lambdas(
+                    lambda_values,
+                    locals.len(),
+                    [&then_lambdas, &else_lambdas],
+                );
                 let mut stmts = cond.stmts;
                 stmts.push(RirStmt::If(RirIf {
                     cond: cond.operand,
-                    then_block: self.plan_air_block(function, &branch.then_block, locals)?,
-                    else_block: branch
-                        .else_block
-                        .as_ref()
-                        .map(|block| self.plan_air_block(function, block, locals))
-                        .transpose()?,
+                    then_block,
+                    else_block,
                 }));
                 Ok(stmts)
             }
-            air::AirStmt::Loop(loop_) => Ok(vec![RirStmt::Loop(RirLoop {
-                id: RirLoopId::from_index(loop_.id.index()),
-                body: self.plan_air_block(function, &loop_.body, locals)?,
-            })]),
+            air::AirStmt::Loop(loop_) => {
+                let entry_lambdas = lambda_values.clone();
+                let mut body_lambdas = entry_lambdas.clone();
+                let body = self.plan_air_block(function, &loop_.body, locals, &mut body_lambdas)?;
+                self.merge_known_lambdas(
+                    lambda_values,
+                    locals.len(),
+                    [&entry_lambdas, &body_lambdas],
+                );
+                Ok(vec![RirStmt::Loop(RirLoop {
+                    id: RirLoopId::from_index(loop_.id.index()),
+                    body,
+                })])
+            }
             air::AirStmt::EnumMatch(match_) => {
                 let discr = self.lower_place_read(function, &match_.discr, locals);
                 let RirOperand::Place(discr_place) = discr.operand else {
                     unreachable!("place read returns a place operand")
                 };
                 let mut stmts = discr.stmts;
+                let entry_lambdas = lambda_values.clone();
+                let mut states = vec![];
+                let arms = match_
+                    .arms
+                    .iter()
+                    .map(|arm| {
+                        let mut arm_lambdas = entry_lambdas.clone();
+                        let block =
+                            self.plan_air_block(function, &arm.block, locals, &mut arm_lambdas)?;
+                        states.push(arm_lambdas);
+                        Ok(RirEnumMatchArm {
+                            variant: RirVariantId::from_index(arm.variant.index()),
+                            block,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, RustPlanError>>()?;
+                let else_block = match &match_.else_block {
+                    Some(block) => {
+                        let mut else_lambdas = entry_lambdas.clone();
+                        let block =
+                            self.plan_air_block(function, block, locals, &mut else_lambdas)?;
+                        states.push(else_lambdas);
+                        Some(block)
+                    }
+                    None => None,
+                };
+                if !states.is_empty() {
+                    self.merge_known_lambdas(lambda_values, locals.len(), states.iter());
+                }
                 stmts.push(RirStmt::EnumMatch(RirEnumMatch {
                     discr: discr_place,
-                    arms: match_
-                        .arms
-                        .iter()
-                        .map(|arm| {
-                            Ok(RirEnumMatchArm {
-                                variant: RirVariantId::from_index(arm.variant.index()),
-                                block: self.plan_air_block(function, &arm.block, locals)?,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, RustPlanError>>()?,
-                    else_block: match_
-                        .else_block
-                        .as_ref()
-                        .map(|block| self.plan_air_block(function, block, locals))
-                        .transpose()?,
+                    arms,
+                    else_block,
                 }));
                 Ok(stmts)
             }
@@ -1402,15 +1610,78 @@ impl<'a> PlanCx<'a> {
                 {
                     local.payload_ref = true;
                 }
+                let entry_lambdas = lambda_values.clone();
+                let mut some_lambdas = entry_lambdas.clone();
+                let some_block =
+                    self.plan_air_block(function, &match_.some_block, locals, &mut some_lambdas)?;
+                let mut none_lambdas = entry_lambdas;
+                let none_block =
+                    self.plan_air_block(function, &match_.none_block, locals, &mut none_lambdas)?;
+                self.merge_known_lambdas(
+                    lambda_values,
+                    locals.len(),
+                    [&some_lambdas, &none_lambdas],
+                );
                 stmts.push(RirStmt::OptionMatch(RirOptionMatch {
                     discr: discr_place,
                     payload,
                     payload_ref: match_.payload_ref,
                     payload_escapes: match_.payload_escapes,
-                    some_block: self.plan_air_block(function, &match_.some_block, locals)?,
-                    none_block: self.plan_air_block(function, &match_.none_block, locals)?,
+                    some_block,
+                    none_block,
                 }));
                 Ok(stmts)
+            }
+        }
+    }
+
+    fn set_known_lambda(
+        &self,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        local: RirLocalId,
+        known: Option<KnownLambdaValue>,
+    ) {
+        if lambda_values.len() <= local.index() {
+            lambda_values.resize(local.index() + 1, None);
+        }
+        lambda_values[local.index()] = known;
+    }
+
+    fn set_place_known_lambda(
+        &self,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        place: &Place,
+        known: Option<KnownLambdaValue>,
+    ) {
+        let Some(local) = place.root.local() else {
+            return;
+        };
+        self.set_known_lambda(
+            lambda_values,
+            RirLocalId::from_index(local.index()),
+            place.projection.is_empty().then_some(known).flatten(),
+        );
+    }
+
+    fn merge_known_lambdas<'b>(
+        &self,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        len: usize,
+        states: impl IntoIterator<Item = &'b Vec<Option<KnownLambdaValue>>>,
+    ) {
+        let states = states.into_iter().collect::<Vec<_>>();
+        lambda_values.clear();
+        lambda_values.resize(len, None);
+        let Some(first_state) = states.first() else {
+            return;
+        };
+        for (index, slot) in lambda_values.iter_mut().enumerate() {
+            let first = first_state.get(index).copied().flatten();
+            if states
+                .iter()
+                .all(|state| state.get(index).copied().flatten() == first)
+            {
+                *slot = first;
             }
         }
     }
@@ -1441,9 +1712,10 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         value: &RValue,
         locals: &mut Vec<RirLocal>,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
         let planned = match value {
-            RValue::Use(operand) => return self.plan_use(function, operand, locals),
+            RValue::Use(operand) => return self.plan_use(function, operand, locals, lambda_values),
             RValue::Unary { op, value, ty } => {
                 let value = self.plan_operand_read(function, value, locals);
                 PlannedRValue {
@@ -1509,7 +1781,9 @@ impl<'a> PlanCx<'a> {
                     post_stmts: vec![],
                 }
             }
-            RValue::Call { callee, args } => self.plan_call(function, callee, args, locals)?,
+            RValue::Call { callee, args } => {
+                self.plan_call(function, callee, args, locals, lambda_values)?
+            }
             RValue::Stringify { value, source_ty } => {
                 let value = self.plan_operand_read(function, value, locals);
                 PlannedRValue {
@@ -1571,7 +1845,7 @@ impl<'a> PlanCx<'a> {
                 PlannedRValue {
                     stmts: value.stmts,
                     value: RirRValue::ListPush {
-                        list: self.plan_place(list),
+                        list: self.plan_place_in_function(function, list),
                         value: value.operand,
                     },
                     post_stmts: vec![],
@@ -1655,7 +1929,7 @@ impl<'a> PlanCx<'a> {
                 PlannedRValue {
                     stmts,
                     value: RirRValue::MapInsert {
-                        map: self.plan_place(map),
+                        map: self.plan_place_in_function(function, map),
                         key: key.operand,
                         value: value.operand,
                     },
@@ -1673,7 +1947,7 @@ impl<'a> PlanCx<'a> {
                 PlannedRValue {
                     stmts: key.stmts,
                     value: RirRValue::MapRemove {
-                        map: self.plan_place(map),
+                        map: self.plan_place_in_function(function, map),
                         key: key.operand,
                         ty: self.type_map[ty],
                     },
@@ -1685,6 +1959,7 @@ impl<'a> PlanCx<'a> {
                 ty,
             } => PlannedRValue::from_value(RirRValue::Lambda {
                 lambda: self.function_lambda_map[target],
+                captures: vec![],
                 ty: self.type_map[ty],
             }),
             RValue::MakeLambda {
@@ -1692,14 +1967,10 @@ impl<'a> PlanCx<'a> {
                 captures,
                 ty,
             } => {
-                if !captures.is_empty() {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedLambdaCapture,
-                    ));
-                }
+                let captures = self.plan_lambda_capture_args(function, captures, locals)?;
                 PlannedRValue::from_value(RirRValue::Lambda {
                     lambda: self.lambda_map[lambda],
+                    captures,
                     ty: self.type_map[ty],
                 })
             }
@@ -1713,15 +1984,102 @@ impl<'a> PlanCx<'a> {
         Ok(planned)
     }
 
+    fn plan_lambda_capture_args(
+        &self,
+        function: FunctionId,
+        captures: &[air::LambdaCaptureArg],
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<Vec<RirLambdaCaptureArg>, RustPlanError> {
+        let mut planned = vec![];
+        for capture in captures {
+            match capture {
+                air::LambdaCaptureArg::NoRuntime => {}
+                air::LambdaCaptureArg::ReadonlyLocal { value } => {
+                    let value = self.plan_operand_read(function, value, locals);
+                    if !value.stmts.is_empty() {
+                        return Err(Self::gap(
+                            RustTargetGapSite::Function(function),
+                            RustTargetGapKind::UnsupportedLambdaCapture,
+                        ));
+                    }
+                    planned.push(RirLambdaCaptureArg::Readonly {
+                        value: value.operand,
+                    });
+                }
+                air::LambdaCaptureArg::ScopedLocal { place } => {
+                    planned.push(RirLambdaCaptureArg::Scoped {
+                        place: self.plan_place_in_function(function, place),
+                    });
+                }
+                air::LambdaCaptureArg::ScopedBorrow { .. }
+                | air::LambdaCaptureArg::UpvalueCell { .. } => {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
+            }
+        }
+        Ok(planned)
+    }
+
+    fn air_place_value_readable(&self, ty: TypeId) -> bool {
+        self.rust_copyable_air_type(ty) || self.rust_shareable_air_type(ty)
+    }
+
+    fn known_lambda_rvalue(&self, value: &RirRValue) -> Option<KnownLambdaValue> {
+        let RirRValue::Lambda {
+            lambda,
+            captures,
+            ty,
+        } = value
+        else {
+            return None;
+        };
+        captures.is_empty().then_some(KnownLambdaValue {
+            lambda: *lambda,
+            ty: *ty,
+        })
+    }
+
+    fn known_lambda_place(
+        &self,
+        place: &Place,
+        lambda_values: &[Option<KnownLambdaValue>],
+    ) -> Option<KnownLambdaValue> {
+        if place.projection.is_empty()
+            && matches!(self.air.type_arena.data(place.ty), TypeData::Function(_))
+            && let Some(local) = place.root.local()
+        {
+            return lambda_values.get(local.index()).copied().flatten();
+        }
+        None
+    }
+
+    fn unbound_lambda_temp_place(&self, function: FunctionId, place: &Place) -> bool {
+        if !place.projection.is_empty()
+            || !matches!(self.air.type_arena.data(place.ty), TypeData::Function(_))
+        {
+            return false;
+        }
+        let Some(local) = place.root.local() else {
+            return false;
+        };
+        self.air.function(function).locals[local.index()]
+            .binding
+            .is_none()
+    }
+
     fn plan_use(
         &self,
         function: FunctionId,
         operand: &Operand,
         locals: &mut Vec<RirLocal>,
+        lambda_values: &[Option<KnownLambdaValue>],
     ) -> Result<PlannedRValue, RustPlanError> {
         let Operand::Place(place) = operand else {
             return Ok(PlannedRValue::from_value(RirRValue::Use(
-                self.plan_operand(operand),
+                self.plan_operand(function, operand),
             )));
         };
         if self.place_crosses_dataref(function, place) {
@@ -1732,17 +2090,20 @@ impl<'a> PlanCx<'a> {
                 post_stmts: vec![],
             });
         }
-        if !self.rust_copyable_air_type(place.ty)
-            && !self.air_policy().value_place_shareable(place.ty)
-        {
-            return Err(Self::gap(
-                RustTargetGapSite::Function(function),
-                RustTargetGapKind::NonCopyValueRequired,
-            ));
+        if !self.air_place_value_readable(place.ty) {
+            if let Some(known) = self.known_lambda_place(place, lambda_values) {
+                return Ok(PlannedRValue::from_value(known.rvalue()));
+            }
+            if !self.unbound_lambda_temp_place(function, place) {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::NonCopyValueRequired,
+                ));
+            }
         }
         let TypeData::Aggregate(aggregate) = self.air.type_arena.data(place.ty) else {
             return Ok(PlannedRValue::from_value(RirRValue::Use(
-                self.plan_operand(operand),
+                self.plan_operand(function, operand),
             )));
         };
         let decl = self.air.aggregate(*aggregate);
@@ -1758,7 +2119,7 @@ impl<'a> PlanCx<'a> {
                         .projection
                         .push(Projection::Field(air::FieldId::from_index(index)));
                     field_place.ty = field.ty;
-                    RirOperand::Place(self.plan_place(&field_place))
+                    RirOperand::Place(self.plan_place_in_function(function, &field_place))
                 })
                 .collect(),
         }))
@@ -1827,6 +2188,7 @@ impl<'a> PlanCx<'a> {
         callee: &Callee,
         args: &[CallArg],
         locals: &mut Vec<RirLocal>,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
         let (target, ty, callee_stmts) = match callee {
             Callee::Function(id) => {
@@ -1869,7 +2231,7 @@ impl<'a> PlanCx<'a> {
         let mut post_stmts = vec![];
         let mut planned_args = vec![];
         for arg in args {
-            let planned = self.plan_arg(function_id, arg, locals);
+            let planned = self.plan_arg(function_id, arg, locals, lambda_values)?;
             stmts.extend(planned.stmts);
             post_stmts.extend(planned.post_stmts);
             planned_args.push(planned.arg);
@@ -1885,38 +2247,79 @@ impl<'a> PlanCx<'a> {
         })
     }
 
+    fn moves_bound_noncopy_lambda(&self, function: FunctionId, operand: &Operand) -> bool {
+        let Operand::Place(place) = operand else {
+            return false;
+        };
+        let Some(local) = place.root.local() else {
+            return false;
+        };
+        self.air.function(function).locals[local.index()]
+            .binding
+            .is_some()
+            && !self.air_place_value_readable(place.ty)
+    }
+
     fn plan_arg(
         &self,
         function: FunctionId,
         arg: &CallArg,
         locals: &mut Vec<RirLocal>,
-    ) -> PlannedCallArg {
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+    ) -> Result<PlannedCallArg, RustPlanError> {
         match arg {
             CallArg::Value(operand) => {
+                if let Operand::Place(place) = operand
+                    && !self.air_place_value_readable(place.ty)
+                    && let Some(known) = self.known_lambda_place(place, lambda_values)
+                {
+                    let local = self.alloc_temp(locals, place.ty);
+                    self.set_known_lambda(lambda_values, local, Some(known));
+                    return Ok(PlannedCallArg {
+                        stmts: vec![RirStmt::Init {
+                            local,
+                            value: known.rvalue(),
+                        }],
+                        arg: RirCallArg::Value(RirOperand::Place(RirPlace {
+                            local,
+                            projections: vec![],
+                            ty: known.ty,
+                        })),
+                        post_stmts: vec![],
+                    });
+                }
+                if self.moves_bound_noncopy_lambda(function, operand) {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::NonCopyValueRequired,
+                    ));
+                }
                 let planned = self.plan_operand_read(function, operand, locals);
-                PlannedCallArg {
+                Ok(PlannedCallArg {
                     stmts: planned.stmts,
                     arg: RirCallArg::Value(planned.operand),
                     post_stmts: vec![],
-                }
+                })
             }
             CallArg::SharedBorrow(place) => {
                 let planned = self.lower_place_read(function, place, locals);
                 let RirOperand::Place(place) = planned.operand else {
                     unreachable!("place read returns a place operand")
                 };
-                PlannedCallArg {
+                Ok(PlannedCallArg {
                     stmts: planned.stmts,
                     arg: RirCallArg::SharedBorrow(place),
                     post_stmts: vec![],
-                }
+                })
             }
-            CallArg::SharedStringConst(id) => {
-                PlannedCallArg::from_arg(RirCallArg::SharedStringConst(self.const_map[id]))
-            }
+            CallArg::SharedStringConst(id) => Ok(PlannedCallArg::from_arg(
+                RirCallArg::SharedStringConst(self.const_map[id]),
+            )),
             CallArg::MutBorrow(place) => {
                 if !self.place_crosses_dataref(function, place) {
-                    return PlannedCallArg::from_arg(RirCallArg::MutBorrow(self.plan_place(place)));
+                    return Ok(PlannedCallArg::from_arg(RirCallArg::MutBorrow(
+                        self.plan_place_in_function(function, place),
+                    )));
                 }
                 let planned = self.lower_place_read(function, place, locals);
                 let RirOperand::Place(temp_place) = planned.operand else {
@@ -1931,11 +2334,11 @@ impl<'a> PlanCx<'a> {
                     locals,
                     &mut post_stmts,
                 );
-                PlannedCallArg {
+                Ok(PlannedCallArg {
                     stmts: planned.stmts,
                     arg: RirCallArg::MutBorrow(temp_place),
                     post_stmts,
-                }
+                })
             }
         }
     }
@@ -1973,9 +2376,11 @@ impl<'a> PlanCx<'a> {
         }
     }
 
-    fn plan_operand(&self, operand: &Operand) -> RirOperand {
+    fn plan_operand(&self, function: FunctionId, operand: &Operand) -> RirOperand {
         match operand {
-            Operand::Place(place) => RirOperand::Place(self.plan_place(place)),
+            Operand::Place(place) => {
+                RirOperand::Place(self.plan_place_in_function(function, place))
+            }
             Operand::Const(id) => RirOperand::Const(self.const_map[id]),
         }
     }
@@ -1987,7 +2392,9 @@ impl<'a> PlanCx<'a> {
         locals: &mut Vec<RirLocal>,
     ) -> PlannedOperand {
         if !self.place_crosses_dataref(function, place) {
-            return PlannedOperand::from_operand(RirOperand::Place(self.plan_place(place)));
+            return PlannedOperand::from_operand(RirOperand::Place(
+                self.plan_place_in_function(function, place),
+            ));
         }
         let mut stmts = vec![];
         let (mut current_ty, mut current_place) = self.root_place(function, place);
@@ -2015,7 +2422,7 @@ impl<'a> PlanCx<'a> {
     ) {
         if !self.place_crosses_dataref(function, place) {
             stmts.push(RirStmt::Assign {
-                dst: self.plan_place(place),
+                dst: self.plan_place_in_function(function, place),
                 value,
             });
             return;
@@ -2043,11 +2450,11 @@ impl<'a> PlanCx<'a> {
     }
 
     fn root_place(&self, function: FunctionId, place: &Place) -> (TypeId, RirPlace) {
-        let ty = self.current_place_root_ty(function, place);
+        let (ty, local) = self.current_place_root(function, place);
         (
             ty,
             RirPlace {
-                local: RirLocalId::from_index(local_place_root(place).index()),
+                local,
                 projections: vec![],
                 ty: self.type_map[&ty],
             },
@@ -2152,7 +2559,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn place_crosses_dataref(&self, function: FunctionId, place: &Place) -> bool {
-        let mut ty = self.current_place_root_ty(function, place);
+        let (mut ty, _) = self.current_place_root(function, place);
         for projection in &place.projection {
             if matches!(self.air.type_arena.data(ty), TypeData::DataRef(_)) {
                 return true;
@@ -2162,8 +2569,29 @@ impl<'a> PlanCx<'a> {
         false
     }
 
-    fn current_place_root_ty(&self, function: FunctionId, place: &Place) -> TypeId {
-        self.air.function(function).locals[local_place_root(place).index()].ty
+    fn current_place_root(&self, function: FunctionId, place: &Place) -> (TypeId, RirLocalId) {
+        match place.root {
+            air::PlaceRoot::Local(local) => (
+                self.air.function(function).locals[local.index()].ty,
+                RirLocalId::from_index(local.index()),
+            ),
+            air::PlaceRoot::LambdaCapture(slot) => {
+                let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
+                    unreachable!("AIR verifier rejects capture roots outside lambdas")
+                };
+                let decl = &self.air.lambdas[lambda.index()].captures[slot.index()];
+                let runtime = self.lambda_runtime_capture_slots[&(lambda, slot)];
+                (
+                    lambda_capture_ty(decl),
+                    RirLocalId::from_index(self.air.function(function).locals.len() + runtime),
+                )
+            }
+            air::PlaceRoot::ScopedBorrow(_)
+            | air::PlaceRoot::UpvalueCell(_)
+            | air::PlaceRoot::Global(_) => {
+                unreachable!("Rust backend profile rejects unsupported place roots")
+            }
+        }
     }
 
     fn projected_ty(&self, ty: TypeId, projection: &Projection) -> TypeId {
@@ -2215,27 +2643,49 @@ impl<'a> PlanCx<'a> {
     }
 
     fn rust_copyable_air_type(&self, ty: TypeId) -> bool {
+        if matches!(self.air.type_arena.data(ty), TypeData::Function(_)) {
+            return self
+                .function_type_copyable
+                .get(&ty)
+                .copied()
+                .unwrap_or(true);
+        }
         self.air_policy().copyable(ty)
+    }
+
+    fn rust_shareable_air_type(&self, ty: TypeId) -> bool {
+        if matches!(self.air.type_arena.data(ty), TypeData::Function(_)) {
+            return self.rust_copyable_air_type(ty);
+        }
+        self.air_policy().value_place_shareable(ty)
     }
 
     fn air_policy(&self) -> AirRustRepPolicy<'_> {
         AirRustRepPolicy::new(self.air, &self.classes)
     }
 
-    fn plan_place(&self, place: &Place) -> RirPlace {
+    fn plan_place_in_function(&self, function: FunctionId, place: &Place) -> RirPlace {
+        let (_, root) = self.current_place_root(function, place);
         RirPlace {
-            local: RirLocalId::from_index(local_place_root(place).index()),
+            local: root,
             projections: place.projection.iter().map(Self::rir_projection).collect(),
             ty: self.type_map[&place.ty],
         }
     }
 }
 
-fn local_place_root(place: &Place) -> LocalId {
-    place
-        .root
-        .local()
-        .expect("Rust backend profile rejects non-local AIR place roots")
+fn lambda_capture_has_runtime(capture: &air::LambdaCaptureDecl) -> bool {
+    !matches!(capture, air::LambdaCaptureDecl::NoRuntime { .. })
+}
+
+fn lambda_capture_ty(capture: &air::LambdaCaptureDecl) -> TypeId {
+    match capture {
+        air::LambdaCaptureDecl::NoRuntime { ty, .. }
+        | air::LambdaCaptureDecl::ReadonlyLocal { ty, .. }
+        | air::LambdaCaptureDecl::ScopedLocal { ty, .. }
+        | air::LambdaCaptureDecl::ScopedBorrow { ty, .. }
+        | air::LambdaCaptureDecl::UpvalueCell { ty, .. } => *ty,
+    }
 }
 
 fn set_if_changed(slot: &mut bool, value: bool) -> bool {

@@ -205,6 +205,14 @@ pub struct RirLambda {
     pub sig: RirLambdaSigId,
     pub escape: RirLambdaEscape,
     pub storage: RirLambdaStorage,
+    pub captures: Vec<RirLambdaCapture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RirLambdaCapture {
+    pub ty: RirTypeId,
+    pub semantic: RirParamSemantic,
+    pub abi: RirParamAbi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +239,7 @@ impl RirLambdaEscape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RirLambdaStorage {
     ZeroEnv,
+    ScopedCaptures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,6 +509,7 @@ pub enum RirRValue {
     },
     Lambda {
         lambda: RirLambdaId,
+        captures: Vec<RirLambdaCaptureArg>,
         ty: RirTypeId,
     },
 }
@@ -538,6 +548,12 @@ pub enum RirFormatKind {
     Binary,
     Exp,
     ExpUpper,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RirLambdaCaptureArg {
+    Readonly { value: RirOperand },
+    Scoped { place: RirPlace },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -730,6 +746,7 @@ pub enum RirVerifyErrorKind {
     UninitializedLocal(RirLocalId),
     UnsupportedAbi,
     UnsupportedRValueType,
+    UnsupportedLambdaCapture,
     RawEnumMissingRawType,
     RawEnumWrongRawType,
     RawEnumMissingValue,
@@ -1014,7 +1031,30 @@ impl VerifyCx<'_> {
             }
             self.check_function_id(site, lambda.function);
             self.check_lambda_sig_id(site, lambda.sig);
+            self.check_lambda_storage(site, lambda);
             self.check_lambda_function_signature(site, lambda);
+        }
+    }
+
+    fn check_lambda_storage(&mut self, site: RirVerifySite, lambda: &RirLambda) {
+        match lambda.storage {
+            RirLambdaStorage::ZeroEnv if !lambda.captures.is_empty() => {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            RirLambdaStorage::ScopedCaptures if lambda.captures.is_empty() => {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            RirLambdaStorage::ScopedCaptures if lambda.escape == RirLambdaEscape::Escaping => {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            RirLambdaStorage::ZeroEnv | RirLambdaStorage::ScopedCaptures => {}
+        }
+        for capture in &lambda.captures {
+            self.check_type_id(site, capture.ty);
+            self.check_abi(site, capture.ty, capture.semantic, capture.abi);
+            if capture.semantic == RirParamSemantic::Value && !self.copyable_type(capture.ty) {
+                self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+            }
         }
     }
 
@@ -1025,17 +1065,39 @@ impl VerifyCx<'_> {
         let Some(sig) = self.program.lambda_sigs.get(lambda.sig.index()) else {
             return;
         };
-        if function.params.len() != sig.params.len() {
+        let hidden_params = lambda.captures.len();
+        let expected_params = hidden_params + sig.params.len();
+        if function.params.len() != expected_params {
             self.push(
                 site,
                 RirVerifyErrorKind::CallArgCount {
-                    expected: sig.params.len(),
+                    expected: expected_params,
                     found: function.params.len(),
                 },
             );
             return;
         }
-        for (param, sig_param) in function.params.iter().zip(&sig.params) {
+        for (param, capture) in function.params.iter().zip(&lambda.captures) {
+            if param.ty != capture.ty {
+                self.push(
+                    site,
+                    RirVerifyErrorKind::TypeMismatch {
+                        expected: capture.ty,
+                        found: param.ty,
+                    },
+                );
+            }
+            if param.semantic != capture.semantic {
+                self.push(site, RirVerifyErrorKind::CallArgMode);
+            }
+            if param.abi != capture.abi {
+                self.push(site, RirVerifyErrorKind::UnsupportedAbi);
+            }
+            if param.escape != RirParamEscape::NonEscaping {
+                self.push(site, RirVerifyErrorKind::CallArgEscape);
+            }
+        }
+        for (param, sig_param) in function.params.iter().skip(hidden_params).zip(&sig.params) {
             if param.ty != sig_param.ty {
                 self.push(
                     site,
@@ -2041,6 +2103,79 @@ impl VerifyCx<'_> {
         self.lambda_escapes = lambda_escapes;
     }
 
+    fn check_lambda_capture_args(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        lambda: &RirLambda,
+        captures: &[RirLambdaCaptureArg],
+    ) {
+        if captures.len() != lambda.captures.len() {
+            self.push(
+                site,
+                RirVerifyErrorKind::CallArgCount {
+                    expected: lambda.captures.len(),
+                    found: captures.len(),
+                },
+            );
+            return;
+        }
+        for (arg, decl) in captures.iter().zip(&lambda.captures) {
+            match (arg, decl.semantic) {
+                (RirLambdaCaptureArg::Readonly { value }, RirParamSemantic::Value) => {
+                    let RirOperand::Place(place) = value else {
+                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                        continue;
+                    };
+                    self.check_lambda_capture_place(site, function, place, decl.ty);
+                    if !self.copyable_type(decl.ty) {
+                        self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+                    }
+                }
+                (RirLambdaCaptureArg::Readonly { value }, RirParamSemantic::SharedBorrow) => {
+                    let RirOperand::Place(place) = value else {
+                        self.push(site, RirVerifyErrorKind::CallArgMode);
+                        continue;
+                    };
+                    self.check_lambda_capture_place(site, function, place, decl.ty);
+                }
+                (RirLambdaCaptureArg::Scoped { place }, RirParamSemantic::MutBorrow) => {
+                    self.check_lambda_capture_place(site, function, place, decl.ty);
+                    if !function
+                        .locals
+                        .get(place.local.index())
+                        .is_some_and(|local| local.mutable)
+                    {
+                        self.push(site, RirVerifyErrorKind::ImmutableAssign);
+                    }
+                }
+                _ => self.push(site, RirVerifyErrorKind::CallArgMode),
+            }
+        }
+    }
+
+    fn check_lambda_capture_place(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        place: &RirPlace,
+        expected: RirTypeId,
+    ) {
+        self.check_place(site, function, place);
+        if !place.projections.is_empty() {
+            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+        }
+        if place.ty != expected {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected,
+                    found: place.ty,
+                },
+            );
+        }
+    }
+
     fn check_rvalue(
         &mut self,
         function_id: RirFunctionId,
@@ -2051,7 +2186,7 @@ impl VerifyCx<'_> {
     ) {
         let site = RirVerifySite::RValue(function_id, index);
         let found = match value {
-            RirRValue::Use(operand) => self.value_operand_ty(site, function, operand),
+            RirRValue::Use(operand) => self.use_rvalue_operand_ty(site, function, operand),
             RirRValue::Struct { ty, fields } => {
                 self.check_type_id(site, *ty);
                 let Some(RirType::Struct(struct_id)) = self.ty(*ty) else {
@@ -2371,14 +2506,20 @@ impl VerifyCx<'_> {
                 self.check_value_operand_ty(site, function, key, key_ty);
                 Some(*ty)
             }
-            RirRValue::Lambda { lambda, ty } => {
+            RirRValue::Lambda {
+                lambda,
+                captures,
+                ty,
+            } => {
                 self.check_type_id(site, *ty);
                 let Some(RirType::Lambda(sig)) = self.ty(*ty) else {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
                 match self.program.lambdas.get(lambda.index()) {
-                    Some(decl) if decl.sig == sig => {}
+                    Some(decl) if decl.sig == sig => {
+                        self.check_lambda_capture_args(site, function, decl, captures);
+                    }
                     Some(_) => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
                     None => self.push(site, RirVerifyErrorKind::BadId),
                 }
@@ -2475,11 +2616,7 @@ impl VerifyCx<'_> {
                 let Some(sig_decl) = self.program.lambda_sigs.get(sig.index()) else {
                     return;
                 };
-                match self.value_operand_ty(
-                    RirVerifySite::RValue(function_id, stmt),
-                    function,
-                    &callee,
-                ) {
+                match self.operand_ty(RirVerifySite::RValue(function_id, stmt), function, &callee) {
                     Some(ty) if self.ty(ty) == Some(RirType::Lambda(sig)) => {}
                     Some(found) => {
                         let site = RirVerifySite::RValue(function_id, stmt);
@@ -2535,6 +2672,9 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::CallArgEscape);
             }
             let found = match arg {
+                RirCallArg::Value(operand) if matches!(self.operand_ty(site, function, operand), Some(ty) if matches!(self.ty(ty), Some(RirType::Lambda(_)))) => {
+                    self.operand_ty(site, function, operand)
+                }
                 RirCallArg::Value(operand) => self.value_operand_ty(site, function, operand),
                 RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
                     self.check_place(site, function, place);
@@ -2581,6 +2721,12 @@ impl VerifyCx<'_> {
                     }
                     if matches!(self.ty(found), Some(RirType::Slice(_))) {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    }
+                    if matches!(self.ty(function.ret.ty), Some(RirType::Lambda(_)))
+                        && self.operand_lambda_escape(function, operand)
+                            != Some(RirLambdaEscape::Escaping)
+                    {
+                        self.push(site, RirVerifyErrorKind::CallArgEscape);
                     }
                 }
             }
@@ -2756,6 +2902,19 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn use_rvalue_operand_ty(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        operand: &RirOperand,
+    ) -> Option<RirTypeId> {
+        let ty = self.operand_ty(site, function, operand);
+        if !ty.is_some_and(|ty| matches!(self.ty(ty), Some(RirType::Lambda(_)))) {
+            self.check_value_operand_shareable(site, operand, ty);
+        }
+        ty
+    }
+
     fn value_operand_ty(
         &mut self,
         site: RirVerifySite,
@@ -2763,12 +2922,21 @@ impl VerifyCx<'_> {
         operand: &RirOperand,
     ) -> Option<RirTypeId> {
         let ty = self.operand_ty(site, function, operand);
+        self.check_value_operand_shareable(site, operand, ty);
+        ty
+    }
+
+    fn check_value_operand_shareable(
+        &mut self,
+        site: RirVerifySite,
+        operand: &RirOperand,
+        ty: Option<RirTypeId>,
+    ) {
         if matches!(operand, RirOperand::Place(_))
             && ty.is_some_and(|ty| !RustRepPolicy::new(self.program).shareable_value(ty))
         {
             self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
         }
-        ty
     }
 
     fn check_value_operand_ty(

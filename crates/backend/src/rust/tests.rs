@@ -13,21 +13,22 @@ use anvyx_frontend::{
 };
 
 use super::{
-    RustPlanConfig, cargo_job, emit, plan,
+    RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job, emit, plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::RustTracePlan,
     rir::{
         self, RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
         RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern,
         RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatKind,
-        RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirParam, RirParamAbi,
-        RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
-        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
+        RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
+        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
+        RirLoopId, RirOperand, RirOptionMatch, RirParam, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirReturn, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
 };
@@ -2170,6 +2171,7 @@ fn rir_rejects_non_escaping_lambda_arg_to_escaping_param() {
             sig,
             escape: RirLambdaEscape::NonEscaping,
             storage: RirLambdaStorage::ZeroEnv,
+            captures: vec![],
         }],
         functions: vec![
             RirFunction {
@@ -2223,6 +2225,7 @@ fn rir_rejects_non_escaping_lambda_arg_to_escaping_param() {
                             local: f,
                             value: RirRValue::Lambda {
                                 lambda,
+                                captures: vec![],
                                 ty: lambda_ty,
                             },
                         },
@@ -2271,6 +2274,7 @@ fn rir_rejects_lambda_descriptor_signature_mismatch() {
             sig,
             escape: RirLambdaEscape::Escaping,
             storage: RirLambdaStorage::ZeroEnv,
+            captures: vec![],
         }],
         functions: vec![RirFunction {
             id: function,
@@ -2295,6 +2299,192 @@ fn rir_rejects_lambda_descriptor_signature_mismatch() {
 }
 
 #[test]
+fn rir_accepts_scoped_capture_lambda_descriptor_and_value() {
+    let int = RirTypeId::from_index(1);
+    let program = scoped_capture_rir(
+        vec![RirType::Void, RirType::Int],
+        vec![],
+        RirLambdaCapture {
+            ty: int,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+        },
+        int,
+        false,
+        RirLambdaCaptureArg::Readonly {
+            value: RirOperand::Place(RirPlace {
+                local: RirLocalId::from_index(0),
+                projections: vec![],
+                ty: int,
+            }),
+        },
+    );
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_shared_readonly_capture_from_const() {
+    let int = RirTypeId::from_index(1);
+    let mut program = scoped_capture_rir(
+        vec![RirType::Void, RirType::Int],
+        vec![],
+        RirLambdaCapture {
+            ty: int,
+            semantic: RirParamSemantic::SharedBorrow,
+            abi: RirParamAbi::SharedBorrow,
+        },
+        int,
+        false,
+        RirLambdaCaptureArg::Readonly {
+            value: RirOperand::Const(RirConstId::from_index(0)),
+        },
+    );
+    program.consts.push(RirConst {
+        id: RirConstId::from_index(0),
+        ty: int,
+        value: RirConstValue::Int(1),
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_noncopy_value_capture() {
+    let string = RirTypeId::from_index(1);
+    let program = scoped_capture_rir(
+        vec![RirType::Void, RirType::String],
+        vec![],
+        RirLambdaCapture {
+            ty: string,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+        },
+        string,
+        false,
+        RirLambdaCaptureArg::Readonly {
+            value: RirOperand::Place(RirPlace {
+                local: RirLocalId::from_index(0),
+                projections: vec![],
+                ty: string,
+            }),
+        },
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
+}
+
+#[test]
+fn rir_rejects_projected_scoped_capture() {
+    let int = RirTypeId::from_index(1);
+    let tuple_ty = RirTypeId::from_index(2);
+    let tuple = RirTupleId::from_index(0);
+    let field = RirFieldId::from_index(0);
+    let program = scoped_capture_rir(
+        vec![RirType::Void, RirType::Int, RirType::Tuple(tuple)],
+        vec![RirTuple {
+            id: tuple,
+            symbol: RirSymbol::new("Pair"),
+            display: RirSymbol::new("Pair"),
+            copyable: true,
+            fields: vec![RirField {
+                id: field,
+                symbol: RirSymbol::new("_0"),
+                ty: int,
+            }],
+        }],
+        RirLambdaCapture {
+            ty: int,
+            semantic: RirParamSemantic::MutBorrow,
+            abi: RirParamAbi::MutBorrow,
+        },
+        tuple_ty,
+        true,
+        RirLambdaCaptureArg::Scoped {
+            place: RirPlace {
+                local: RirLocalId::from_index(0),
+                projections: vec![RirProjection::TupleField(field)],
+                ty: int,
+            },
+        },
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_returning_non_escaping_lambda() {
+    let void = RirTypeId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(1);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda = RirLambdaId::from_index(0);
+    let target = RirFunctionId::from_index(0);
+    let maker = RirFunctionId::from_index(1);
+    let f = RirLocalId::from_index(0);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Lambda(sig)],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: lambda,
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: target,
+            sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ZeroEnv,
+            captures: vec![],
+        }],
+        functions: vec![
+            RirFunction {
+                id: target,
+                air_id: None,
+                symbol: RirSymbol::new("target"),
+                params: vec![],
+                ret: RirReturn { ty: void },
+                locals: vec![],
+                body: RirStructuredBlock::default(),
+            },
+            RirFunction {
+                id: maker,
+                air_id: None,
+                symbol: RirSymbol::new("maker"),
+                params: vec![],
+                ret: RirReturn { ty: lambda_ty },
+                locals: vec![RirLocal {
+                    id: f,
+                    ty: lambda_ty,
+                    mutable: false,
+                    symbol: RirSymbol::new("f"),
+                    initialized: false,
+                    payload_ref: false,
+                }],
+                body: RirStructuredBlock {
+                    stmts: vec![RirStmt::Init {
+                        local: f,
+                        value: RirRValue::Lambda {
+                            lambda,
+                            captures: vec![],
+                            ty: lambda_ty,
+                        },
+                    }],
+                    term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
+                        local: f,
+                        projections: vec![],
+                        ty: lambda_ty,
+                    }))),
+                },
+            },
+        ],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
+}
+
+#[test]
 fn emit_zero_env_lambda_values_without_heap_envs() {
     let void = RirTypeId::from_index(0);
     let lambda_ty = RirTypeId::from_index(1);
@@ -2315,6 +2505,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
             sig,
             escape: RirLambdaEscape::Escaping,
             storage: RirLambdaStorage::ZeroEnv,
+            captures: vec![],
         }],
         entry: Some(RirFunctionId::from_index(1)),
         ..RirProgram::default()
@@ -2351,6 +2542,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
                     local,
                     value: RirRValue::Lambda {
                         lambda,
+                        captures: vec![],
                         ty: lambda_ty,
                     },
                 },
@@ -2379,6 +2571,160 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
     assert!(!text.contains("Box<dyn"));
     assert!(!text.contains("LambdaEnv"));
     assert!(!text.contains("Vec<"));
+
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn emit_mutable_scoped_lambda_capture_without_heap_envs() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let lambda_ty = RirTypeId::from_index(2);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda = RirLambdaId::from_index(0);
+    let capture = RirLocalId::from_index(0);
+    let f = RirLocalId::from_index(1);
+    let hidden = RirLocalId::from_index(0);
+    let mut program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
+        consts: vec![
+            RirConst {
+                id: RirConstId::from_index(0),
+                ty: int,
+                value: RirConstValue::Int(0),
+            },
+            RirConst {
+                id: RirConstId::from_index(1),
+                ty: int,
+                value: RirConstValue::Int(1),
+            },
+        ],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: lambda,
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: RirFunctionId::from_index(0),
+            sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![RirLambdaCapture {
+                ty: int,
+                semantic: RirParamSemantic::MutBorrow,
+                abi: RirParamAbi::MutBorrow,
+            }],
+        }],
+        entry: Some(RirFunctionId::from_index(1)),
+        ..RirProgram::default()
+    };
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(0),
+        air_id: None,
+        symbol: RirSymbol::new("target"),
+        params: vec![RirParam {
+            local: hidden,
+            ty: int,
+            semantic: RirParamSemantic::MutBorrow,
+            abi: RirParamAbi::MutBorrow,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn { ty: void },
+        locals: vec![RirLocal {
+            id: hidden,
+            ty: int,
+            mutable: true,
+            symbol: RirSymbol::new("captured"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock {
+            stmts: vec![RirStmt::Assign {
+                dst: RirPlace {
+                    local: hidden,
+                    projections: vec![],
+                    ty: int,
+                },
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(1))),
+            }],
+            term: RirTerm::Return(None),
+        },
+    });
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(1),
+        air_id: None,
+        symbol: RirSymbol::new("main_fn"),
+        params: vec![],
+        ret: RirReturn { ty: void },
+        locals: vec![
+            RirLocal {
+                id: capture,
+                ty: int,
+                mutable: true,
+                symbol: RirSymbol::new("count"),
+                initialized: false,
+                payload_ref: false,
+            },
+            RirLocal {
+                id: f,
+                ty: lambda_ty,
+                mutable: false,
+                symbol: RirSymbol::new("f"),
+                initialized: false,
+                payload_ref: false,
+            },
+        ],
+        body: RirStructuredBlock {
+            stmts: vec![
+                RirStmt::Init {
+                    local: capture,
+                    value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+                },
+                RirStmt::Init {
+                    local: f,
+                    value: RirRValue::Lambda {
+                        lambda,
+                        captures: vec![RirLambdaCaptureArg::Scoped {
+                            place: RirPlace {
+                                local: capture,
+                                projections: vec![],
+                                ty: int,
+                            },
+                        }],
+                        ty: lambda_ty,
+                    },
+                },
+                RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::LambdaValue {
+                        callee: RirOperand::Place(RirPlace {
+                            local: f,
+                            projections: vec![],
+                            ty: lambda_ty,
+                        }),
+                        sig,
+                    },
+                    args: vec![],
+                    ty: void,
+                }),
+            ],
+            term: RirTerm::Return(None),
+        },
+    });
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
+    let text = source.as_str();
+    assert!(text.contains("enum LambdaSig0<'env>"));
+    assert!(text.contains("L0 { c0: &'env mut i64 }"));
+    assert!(!text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
+    assert!(text.contains("c0: &mut count"));
+    assert!(!text.contains("Box<dyn"));
+    assert!(!text.contains("LambdaEnv"));
+    assert!(!text.contains("LambdaCell"));
+    assert!(!text.contains("Rc<"));
+    assert!(!text.contains("RefCell"));
 
     let output = run_source(source);
     assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
@@ -2471,7 +2817,7 @@ fn profile_rejects_deferred_function_kinds_and_param_roles() {
 }
 
 #[test]
-fn profile_rejects_lambda_captures_and_values() {
+fn profile_accepts_mutable_scoped_lambda_captures_and_still_rejects_unrelated_local_kinds() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
     let int = program.alloc_type(TypeData::Int);
@@ -2506,7 +2852,7 @@ fn profile_rejects_lambda_captures_and_values() {
                 local: captured,
             },
             ty: int,
-            mutability: Mutability::Immutable,
+            mutability: Mutability::Mutable,
         }],
     });
     program.function_mut(body).kind = FunctionKind::Lambda(lambda);
@@ -2526,7 +2872,7 @@ fn profile_rejects_lambda_captures_and_values() {
                 name: None,
                 binding: Some(BindingId::from_index(0)),
                 ty: int,
-                mutability: Mutability::Immutable,
+                mutability: Mutability::Mutable,
                 kind: LocalKind::User,
             },
             local(void, LocalKind::PatternBinding),
@@ -2557,7 +2903,7 @@ fn profile_rejects_lambda_captures_and_values() {
     program.module_mut(module).functions.extend([body, func]);
 
     let errors = profile_errors(program);
-    assert!(has_error(
+    assert!(!has_error(
         &errors,
         ProfileErrorKind::UnsupportedLambdaCapture
     ));
@@ -2566,6 +2912,186 @@ fn profile_rejects_lambda_captures_and_values() {
         &errors,
         ProfileErrorKind::UnsupportedLambdaValue
     ));
+}
+
+#[test]
+fn plan_scoped_lambda_capture_to_rir_descriptor() {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let int = program.alloc_type(TypeData::Int);
+    let lambda_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+    let module = program.alloc_module(root_module());
+    let owner = FunctionId::from_index(1);
+    let captured = air::LocalId::from_index(0);
+    let body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let lambda = program.alloc_lambda(LambdaDecl {
+        source: ExprId(0),
+        module,
+        owner,
+        body,
+        signature: air::SignatureType::new(vec![], air::ReturnMode::Value(void)),
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![air::LambdaCaptureDecl::ScopedLocal {
+            binding: BindingId::from_index(0),
+            source: CaptureLocalSource {
+                owner,
+                local: captured,
+            },
+            ty: int,
+            mutability: Mutability::Mutable,
+        }],
+    });
+    program.function_mut(body).kind = FunctionKind::Lambda(lambda);
+    let one = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let func = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![Local {
+            name: None,
+            binding: Some(BindingId::from_index(0)),
+            ty: int,
+            mutability: Mutability::Mutable,
+            kind: LocalKind::User,
+        }],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: captured,
+                    value: RValue::Use(Operand::Const(one)),
+                },
+                Statement::Eval(RValue::MakeLambda {
+                    lambda,
+                    captures: vec![air::LambdaCaptureArg::ScopedLocal {
+                        place: Place {
+                            root: PlaceRoot::Local(captured),
+                            projection: vec![],
+                            ty: int,
+                        },
+                    }],
+                    ty: lambda_ty,
+                }),
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    debug_assert_eq!(func, owner);
+    program.module_mut(module).functions.extend([body, func]);
+    let verified = air::verify(&program).expect("AIR verify failed");
+
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let lambda = &plan.program().lambdas[0];
+    assert_eq!(lambda.storage, RirLambdaStorage::ScopedCaptures);
+    assert_eq!(lambda.captures.len(), 1);
+}
+
+#[test]
+fn plan_rejects_escaping_runtime_capture_by_target_gap() {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let int = program.alloc_type(TypeData::Int);
+    let lambda_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+    let module = program.alloc_module(root_module());
+    let owner = FunctionId::from_index(1);
+    let captured = air::LocalId::from_index(0);
+    let body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let lambda = program.alloc_lambda(LambdaDecl {
+        source: ExprId(0),
+        module,
+        owner,
+        body,
+        signature: air::SignatureType::new(vec![], air::ReturnMode::Value(void)),
+        escape: LambdaEscape::Escaping,
+        captures: vec![air::LambdaCaptureDecl::ReadonlyLocal {
+            binding: BindingId::from_index(0),
+            source: CaptureLocalSource {
+                owner,
+                local: captured,
+            },
+            ty: int,
+        }],
+    });
+    program.function_mut(body).kind = FunctionKind::Lambda(lambda);
+    let one = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let func = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![Local {
+            name: None,
+            binding: Some(BindingId::from_index(0)),
+            ty: int,
+            mutability: Mutability::Immutable,
+            kind: LocalKind::User,
+        }],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: captured,
+                    value: RValue::Use(Operand::Const(one)),
+                },
+                Statement::Eval(RValue::MakeLambda {
+                    lambda,
+                    captures: vec![air::LambdaCaptureArg::ReadonlyLocal {
+                        value: Operand::Place(Place {
+                            root: PlaceRoot::Local(captured),
+                            projection: vec![],
+                            ty: int,
+                        }),
+                    }],
+                    ty: lambda_ty,
+                }),
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    debug_assert_eq!(func, owner);
+    program.module_mut(module).functions.extend([body, func]);
+    let verified = air::verify(&program).expect("AIR verify failed");
+
+    let Err(RustPlanError::TargetGaps(gaps)) = plan(&verified, rust_plan_config()) else {
+        panic!("expected target gap");
+    };
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.kind == RustTargetGapKind::UnsupportedLambdaCapture)
+    );
 }
 
 #[test]
@@ -4435,6 +4961,104 @@ fn rir_verify_accepts_mut_borrow_abi() {
     });
 
     rir::verify(&program).expect("RIR rejected mut borrow ABI");
+}
+
+fn scoped_capture_rir(
+    mut types: Vec<RirType>,
+    tuples: Vec<RirTuple>,
+    capture: RirLambdaCapture,
+    source_ty: RirTypeId,
+    source_mutable: bool,
+    arg: RirLambdaCaptureArg,
+) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(types.len());
+    types.push(RirType::Lambda(sig));
+    let lambda = RirLambdaId::from_index(0);
+    let target = RirFunctionId::from_index(0);
+    let maker = RirFunctionId::from_index(1);
+    let source = RirLocalId::from_index(0);
+    let f = RirLocalId::from_index(1);
+    RirProgram {
+        types,
+        tuples,
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: lambda,
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: target,
+            sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![capture],
+        }],
+        functions: vec![
+            RirFunction {
+                id: target,
+                air_id: None,
+                symbol: RirSymbol::new("target"),
+                params: vec![RirParam {
+                    local: source,
+                    ty: capture.ty,
+                    semantic: capture.semantic,
+                    abi: capture.abi,
+                    escape: RirParamEscape::NonEscaping,
+                }],
+                ret: RirReturn { ty: void },
+                locals: vec![RirLocal {
+                    id: source,
+                    ty: capture.ty,
+                    mutable: capture.semantic == RirParamSemantic::MutBorrow,
+                    symbol: RirSymbol::new("capture"),
+                    initialized: true,
+                    payload_ref: false,
+                }],
+                body: RirStructuredBlock::default(),
+            },
+            RirFunction {
+                id: maker,
+                air_id: None,
+                symbol: RirSymbol::new("maker"),
+                params: vec![],
+                ret: RirReturn { ty: void },
+                locals: vec![
+                    RirLocal {
+                        id: source,
+                        ty: source_ty,
+                        mutable: source_mutable,
+                        symbol: RirSymbol::new("source"),
+                        initialized: true,
+                        payload_ref: false,
+                    },
+                    RirLocal {
+                        id: f,
+                        ty: lambda_ty,
+                        mutable: false,
+                        symbol: RirSymbol::new("f"),
+                        initialized: false,
+                        payload_ref: false,
+                    },
+                ],
+                body: RirStructuredBlock {
+                    stmts: vec![RirStmt::Init {
+                        local: f,
+                        value: RirRValue::Lambda {
+                            lambda,
+                            captures: vec![arg],
+                            ty: lambda_ty,
+                        },
+                    }],
+                    term: RirTerm::Return(None),
+                },
+            },
+        ],
+        ..RirProgram::default()
+    }
 }
 
 fn assert_rir_error(program: RirProgram, kind: RirVerifyErrorKind) {

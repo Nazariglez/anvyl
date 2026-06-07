@@ -51,11 +51,11 @@ impl<'a> AirRustRepPolicy<'a> {
         if let TypeData::Optional(inner) = self.program.type_arena.data(ty) {
             return self.copyable(*inner);
         }
-        if matches!(
-            self.program.type_arena.data(ty),
-            TypeData::DataRef(_) | TypeData::Function(_)
-        ) {
-            return matches!(self.program.type_arena.data(ty), TypeData::Function(_));
+        if matches!(self.program.type_arena.data(ty), TypeData::DataRef(_)) {
+            return false;
+        }
+        if matches!(self.program.type_arena.data(ty), TypeData::Function(_)) {
+            return true;
         }
         self.classes.get(ty).is_some_and(|class| {
             matches!(
@@ -407,13 +407,27 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn param_ty(self, ty: RirTypeId, abi: RirParamAbi) -> String {
+        self.param_ty_with_lifetime(ty, abi, None)
+    }
+
+    pub fn capture_field_ty(self, ty: RirTypeId, abi: RirParamAbi) -> String {
+        self.param_ty_with_lifetime(ty, abi, Some("'env"))
+    }
+
+    fn param_ty_with_lifetime(
+        self,
+        ty: RirTypeId,
+        abi: RirParamAbi,
+        lifetime: Option<&str>,
+    ) -> String {
+        let lifetime = lifetime.map_or(String::new(), |lifetime| format!("{lifetime} "));
         match abi {
             RirParamAbi::Value => self.rust_ty(ty),
             RirParamAbi::SharedBorrow => match self.borrow_view(ty) {
-                RustBorrowView::Str => "&str".into(),
-                _ => format!("&{}", self.rust_ty(ty)),
+                RustBorrowView::Str => format!("&{lifetime}str"),
+                _ => format!("&{lifetime}{}", self.rust_ty(ty)),
             },
-            RirParamAbi::MutBorrow => format!("&mut {}", self.rust_ty(ty)),
+            RirParamAbi::MutBorrow => format!("&{lifetime}mut {}", self.rust_ty(ty)),
         }
     }
 
@@ -427,7 +441,35 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn lambda_sig_ty(self, id: RirLambdaSigId) -> String {
+        let symbol = self.lambda_sig_symbol(id);
+        if self.lambda_sig_needs_lifetime(id) {
+            format!("{symbol}<'_>")
+        } else {
+            symbol
+        }
+    }
+
+    pub fn lambda_sig_symbol(self, id: RirLambdaSigId) -> String {
         format!("LambdaSig{}", id.index())
+    }
+
+    pub fn lambda_sig_needs_lifetime(self, id: RirLambdaSigId) -> bool {
+        self.program.lambdas_for_sig(id).any(|lambda| {
+            lambda
+                .captures
+                .iter()
+                .any(|capture| capture.abi != RirParamAbi::Value)
+        })
+    }
+
+    pub fn lambda_sig_copyable(self, id: RirLambdaSigId) -> bool {
+        self.program.lambdas_for_sig(id).all(|lambda| {
+            lambda.captures.iter().all(|capture| match capture.abi {
+                RirParamAbi::Value => self.copyable(capture.ty),
+                RirParamAbi::SharedBorrow => true,
+                RirParamAbi::MutBorrow => false,
+            })
+        })
     }
 
     pub fn fields_cx_dependent(self, fields: &[RirField]) -> bool {
@@ -538,7 +580,7 @@ impl<'a> RustRepPolicy<'a> {
             | RirType::List(_)
             | RirType::Map { .. }
             | RirType::Slice(_) => false,
-            RirType::Lambda(_) => true,
+            RirType::Lambda(id) => self.lambda_sig_copyable(id),
             RirType::Option(inner) => self.copyable(inner),
             RirType::Array { elem, .. } => self.copyable(elem),
             RirType::Struct(id) => self.program.structs[id.index()].copyable,

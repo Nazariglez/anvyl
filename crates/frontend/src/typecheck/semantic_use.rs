@@ -1,4 +1,7 @@
-use std::{collections::HashMap, hash::Hash};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    hash::Hash,
+};
 
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
@@ -64,6 +67,7 @@ pub(crate) enum LocalDefKind {
 pub(crate) struct LocalUseFact {
     pub(crate) expr_id: ExprId,
     pub(crate) local: SemanticLocalId,
+    pub(crate) binding_id: Option<BindingId>,
     pub(crate) mode: LocalUseMode,
 }
 
@@ -101,7 +105,7 @@ impl LocalFacts {
         }
         for (expr_id, fact) in &self.uses {
             debug_assert_eq!(*expr_id, fact.expr_id);
-            debug_assert!(self.defs.contains_key(&fact.local));
+            debug_assert!(self.defs.contains_key(&fact.local) || fact.binding_id.is_some());
         }
     }
 
@@ -553,13 +557,13 @@ impl SemanticFactMaps {
     }
 
     pub(super) fn record_local_use(&mut self, body: BodyInstanceKey, fact: LocalUseFact) {
-        let existing = self
-            .body_mut(body)
-            .locals
-            .uses
-            .insert(fact.expr_id, fact.clone());
-        if let Some(existing) = existing {
-            debug_assert_eq!(existing, fact, "conflicting semantic local use fact");
+        match self.body_mut(body).locals.uses.entry(fact.expr_id) {
+            Entry::Occupied(existing) => {
+                debug_assert_eq!(existing.get(), &fact, "conflicting semantic local use fact");
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(fact);
+            }
         }
     }
 
@@ -755,8 +759,28 @@ impl SemanticFactMaps {
         for (witness_id, fact) in &self.contract_witnesses {
             debug_assert_eq!(*witness_id, fact.id);
         }
+        #[cfg(debug_assertions)]
+        let binding_defs = self
+            .bodies
+            .values()
+            .flat_map(|body| {
+                body.locals
+                    .defs
+                    .iter()
+                    .map(|(local, fact)| (*local, fact.binding_id))
+            })
+            .collect::<HashMap<_, _>>();
         for body in self.bodies.values() {
             body.validate_finished();
+            #[cfg(debug_assertions)]
+            {
+                for fact in body.locals.uses.values() {
+                    debug_assert_eq!(
+                        binding_defs.get(&fact.local).copied().flatten(),
+                        fact.binding_id
+                    );
+                }
+            }
         }
     }
 }

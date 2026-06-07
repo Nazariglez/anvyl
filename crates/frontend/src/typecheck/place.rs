@@ -952,9 +952,7 @@ fn record_direct_use(
     let Some(local) = value.root_local.or_else(|| value.identity.root_local()) else {
         return;
     };
-    if tc.has_recordable_semantic_local(local) {
-        tc.record_local_use(expr_id, local, mode);
-    }
+    tc.record_local_use(expr_id, local, mode);
 }
 
 pub(super) fn record_place_use(

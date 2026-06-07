@@ -9,7 +9,7 @@ use anvyx_frontend::{
     ast::{FormatKind, FormatSign, FormatSpec},
 };
 
-use super::rep_policy::AirRustRepPolicy;
+use super::{lambda_capture_has_runtime, lambda_capture_ty, rep_policy::AirRustRepPolicy};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustBackendProfile;
@@ -259,11 +259,7 @@ impl ProfileCx<'_> {
         }
         if let FunctionKind::Lambda(lambda) = function.kind {
             match self.program.lambdas.get(lambda.index()) {
-                Some(decl) if decl.captures.is_empty() => {}
-                Some(_) => self.push(
-                    ProfileSite::Function(id),
-                    ProfileErrorKind::UnsupportedLambdaCapture,
-                ),
+                Some(decl) => self.check_lambda_decl(ProfileSite::Function(id), decl),
                 None => self.push(
                     ProfileSite::Function(id),
                     ProfileErrorKind::UnsupportedLambdaValue,
@@ -294,12 +290,41 @@ impl ProfileCx<'_> {
         self.check_air_block(id, &function.body.block);
     }
 
+    fn check_lambda_decl(&mut self, site: ProfileSite, decl: &air::LambdaDecl) {
+        if decl.escape == air::LambdaEscape::Escaping
+            && decl.captures.iter().any(lambda_capture_has_runtime)
+        {
+            self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+        }
+        for capture in &decl.captures {
+            match capture {
+                air::LambdaCaptureDecl::NoRuntime { .. } => {}
+                air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
+                    if !self.policy().value_place_shareable(*ty) {
+                        self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                    }
+                }
+                air::LambdaCaptureDecl::ScopedLocal { mutability, .. } => {
+                    if *mutability != Mutability::Mutable {
+                        self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                    }
+                }
+                air::LambdaCaptureDecl::ScopedBorrow { .. } => {
+                    self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                }
+                air::LambdaCaptureDecl::UpvalueCell { .. } => {
+                    self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
+                }
+            }
+        }
+    }
+
     fn check_air_block(&mut self, function: FunctionId, body: &air::AirBlock) {
         for (index, stmt) in body.stmts.iter().enumerate() {
             let site = ProfileSite::Statement(function, index);
             match stmt {
                 air::AirStmt::Init { value, .. } | air::AirStmt::Eval(value) => {
-                    self.check_mutating_rvalue(site, function, value);
+                    self.check_mutating_rvalue(site, value);
                     self.check_rvalue(site, value);
                 }
                 air::AirStmt::Assign { dst, value } => {
@@ -386,24 +411,40 @@ impl ProfileCx<'_> {
         self.check_type_ref(ProfileSite::Local(function, local), data.ty);
     }
 
-    fn check_mutating_rvalue(&mut self, site: ProfileSite, function: FunctionId, value: &RValue) {
+    fn check_mutating_rvalue(&mut self, site: ProfileSite, value: &RValue) {
         let place = match value {
             RValue::ListPush { list, .. } => list,
             RValue::MapInsert { map, .. } | RValue::MapRemove { map, .. } => map,
             _ => return,
         };
-        let Some(root) = place.root.local() else {
-            self.push(site, unsupported_place_root(place.root));
-            return;
-        };
         if self
-            .program
-            .function(function)
-            .locals
-            .get(root.index())
-            .is_some_and(|local| local.mutability != Mutability::Mutable)
+            .place_root_mutable(site, place)
+            .is_some_and(|mutable| !mutable)
         {
             self.push(site, ProfileErrorKind::UnsupportedRValue);
+        }
+    }
+
+    fn place_root_mutable(&mut self, site: ProfileSite, place: &Place) -> Option<bool> {
+        match place.root {
+            PlaceRoot::Local(root) => self
+                .current_local(site, root)
+                .map(|local| local.mutability == Mutability::Mutable),
+            PlaceRoot::LambdaCapture(slot) => {
+                self.current_lambda_capture(site, slot).map(|capture| {
+                    matches!(
+                        capture,
+                        air::LambdaCaptureDecl::ScopedLocal {
+                            mutability: Mutability::Mutable,
+                            ..
+                        }
+                    )
+                })
+            }
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+                self.push(site, unsupported_place_root(place.root));
+                None
+            }
         }
     }
 
@@ -578,18 +619,35 @@ impl ProfileCx<'_> {
                 self.check_place(site, map);
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
-            RValue::MakeLambda { captures, .. } => {
-                for capture in captures {
+            RValue::MakeLambda {
+                lambda, captures, ..
+            } => {
+                let decl = self.program.lambdas.get(lambda.index());
+                for (index, capture) in captures.iter().enumerate() {
                     match capture {
                         air::LambdaCaptureArg::UpvalueCell { .. } => {
                             self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
                         }
                         air::LambdaCaptureArg::ReadonlyLocal { value } => {
                             self.check_operand(site, value);
-                            self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                         }
-                        air::LambdaCaptureArg::ScopedLocal { place }
-                        | air::LambdaCaptureArg::ScopedBorrow { place } => {
+                        air::LambdaCaptureArg::ScopedLocal { place } => {
+                            self.check_place(site, place);
+                            if !decl.and_then(|decl| decl.captures.get(index)).is_some_and(
+                                |capture| {
+                                    matches!(
+                                        capture,
+                                        air::LambdaCaptureDecl::ScopedLocal {
+                                            mutability: Mutability::Mutable,
+                                            ..
+                                        }
+                                    )
+                                },
+                            ) {
+                                self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                            }
+                        }
+                        air::LambdaCaptureArg::ScopedBorrow { place } => {
                             self.check_place(site, place);
                             self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                         }
@@ -784,6 +842,33 @@ impl ProfileCx<'_> {
         self.program.function(function).locals.get(local.index())
     }
 
+    fn current_lambda_capture(
+        &self,
+        site: ProfileSite,
+        slot: air::LambdaCaptureSlotId,
+    ) -> Option<&air::LambdaCaptureDecl> {
+        let (ProfileSite::Statement(function, _) | ProfileSite::Terminator(function)) = site else {
+            return None;
+        };
+        let FunctionKind::Lambda(lambda) = self.program.function(function).kind else {
+            return None;
+        };
+        self.program
+            .lambdas
+            .get(lambda.index())?
+            .captures
+            .get(slot.index())
+    }
+
+    fn current_lambda_capture_ty(
+        &self,
+        site: ProfileSite,
+        slot: air::LambdaCaptureSlotId,
+    ) -> Option<TypeId> {
+        self.current_lambda_capture(site, slot)
+            .map(lambda_capture_ty)
+    }
+
     fn check_callee(&mut self, site: ProfileSite, callee: &Callee) {
         match callee {
             Callee::Function(_) => {}
@@ -845,15 +930,26 @@ impl ProfileCx<'_> {
     }
 
     fn check_place(&mut self, site: ProfileSite, place: &Place) {
-        let Some(root) = place.root.local() else {
-            self.push(site, unsupported_place_root(place.root));
-            return;
+        let mut ty = match place.root {
+            PlaceRoot::Local(root) => {
+                let Some(local) = self.current_local(site, root) else {
+                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                    return;
+                };
+                local.ty
+            }
+            PlaceRoot::LambdaCapture(slot) => {
+                let Some(ty) = self.current_lambda_capture_ty(site, slot) else {
+                    self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                    return;
+                };
+                ty
+            }
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+                self.push(site, unsupported_place_root(place.root));
+                return;
+            }
         };
-        let Some(local) = self.current_local(site, root) else {
-            self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
-            return;
-        };
-        let mut ty = local.ty;
         for projection in &place.projection {
             let Some(next) = self.projected_ty(ty, projection) else {
                 self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
@@ -868,13 +964,23 @@ impl ProfileCx<'_> {
     }
 
     fn place_crosses_dataref(&self, site: ProfileSite, place: &Place) -> bool {
-        let Some(root) = place.root.local() else {
-            return false;
+        let mut ty = match place.root {
+            PlaceRoot::Local(root) => {
+                let Some(local) = self.current_local(site, root) else {
+                    return false;
+                };
+                local.ty
+            }
+            PlaceRoot::LambdaCapture(slot) => {
+                let Some(ty) = self.current_lambda_capture_ty(site, slot) else {
+                    return false;
+                };
+                ty
+            }
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+                return false;
+            }
         };
-        let Some(local) = self.current_local(site, root) else {
-            return false;
-        };
-        let mut ty = local.ty;
         for projection in &place.projection {
             if matches!(self.program.type_arena.data(ty), TypeData::DataRef(_)) {
                 return true;

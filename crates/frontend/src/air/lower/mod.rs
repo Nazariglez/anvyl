@@ -5,15 +5,15 @@ use anvyx_externs::ParamFlow;
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
     AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId,
-    CallArg, Callee, ConstData, ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl,
-    EnumRepr, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember,
-    ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
-    ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, FieldDecl, FieldId, Function,
-    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, LambdaDecl, LambdaEscape,
-    LambdaId, Local, LocalId, LocalKind, Module, ModuleId, Mutability as AirMutability, Operand,
-    Param, ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue,
-    RawEnumValue, ReturnMode, Signature, SignatureType, TypeData, TypeId, VariantDecl,
-    VariantShape, VerifyError, ownership,
+    CallArg, Callee, CaptureLocalSource, ConstData, ConstId, ConstValue, CoreEnumKind,
+    DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId,
+    ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl,
+    ExternRep, ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, FieldDecl, FieldId,
+    Function, FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, LambdaCaptureArg,
+    LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId,
+    LocalKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamEscape,
+    ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode,
+    Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -29,7 +29,7 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
-        CallableParent, CaptureStorageOrigin, ConstTerm, DeclarationIndex, DefaultArgFact,
+        CallableParent, CaptureStorage, ConstTerm, DeclarationIndex, DefaultArgFact,
         EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, FunctionValueKind, GenericArgs,
         LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact,
         LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface,
@@ -95,10 +95,6 @@ pub(crate) enum LowerError {
         expr_id: ExprId,
     },
     DuplicateBindingBridge {
-        body: Box<BodyInstanceKey>,
-        binding: BindingId,
-    },
-    MissingBindingBridge {
         body: Box<BodyInstanceKey>,
         binding: BindingId,
     },
@@ -833,15 +829,90 @@ impl LowerCx<'_> {
             .ok_or(LowerError::MissingLambdaEscape { expr_id })
     }
 
-    fn lambda_capture_facts(&self, expr_id: ExprId) -> Result<Vec<LambdaCaptureFact>, LowerError> {
-        Ok(self
+    fn ordered_lambda_capture_facts(
+        &self,
+        expr_id: ExprId,
+    ) -> Result<Vec<LambdaCaptureFact>, LowerError> {
+        let mut facts = self
             .typecheck_facts
             .ok_or(LowerError::MissingTypecheckFacts)?
             .lambda_captures()
             .values()
             .filter(|capture| capture.lambda_id == expr_id)
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        facts.sort_by_key(|fact| fact.binding_id);
+        Ok(facts)
+    }
+
+    fn lower_lambda_capture_decls(
+        &mut self,
+        expr_id: ExprId,
+        owner: FunctionId,
+        owner_function: &Function,
+        sources: &HashMap<BindingId, LambdaCaptureSource>,
+    ) -> Result<Vec<LambdaCaptureDecl>, LowerError> {
+        let escape = self.lambda_escape_fact(expr_id)?.escape;
+        self.ordered_lambda_capture_facts(expr_id)?
+            .into_iter()
+            .map(|capture| {
+                self.lower_lambda_capture_decl(
+                    expr_id,
+                    owner,
+                    owner_function,
+                    escape,
+                    sources,
+                    &capture,
+                )
+            })
+            .collect()
+    }
+
+    fn lower_lambda_capture_decl(
+        &mut self,
+        expr_id: ExprId,
+        owner: FunctionId,
+        owner_function: &Function,
+        escape: LambdaEscapeKind,
+        sources: &HashMap<BindingId, LambdaCaptureSource>,
+        capture: &LambdaCaptureFact,
+    ) -> Result<LambdaCaptureDecl, LowerError> {
+        let binding = air_binding_id(capture.binding_id);
+        let ty = self.lower_ty(&capture.ty)?;
+        match lowered_capture_kind(expr_id, escape, capture.storage)? {
+            LoweredCaptureKind::NoRuntime => Ok(LambdaCaptureDecl::NoRuntime { binding, ty }),
+            LoweredCaptureKind::ReadonlyLocal => {
+                let source = exact_local_capture_source(
+                    expr_id,
+                    owner,
+                    owner_function,
+                    sources,
+                    capture,
+                    ty,
+                )?;
+                Ok(LambdaCaptureDecl::ReadonlyLocal {
+                    binding,
+                    source,
+                    ty,
+                })
+            }
+            LoweredCaptureKind::ScopedLocal => {
+                let (source, mutability) = exact_scoped_capture_source(
+                    expr_id,
+                    owner,
+                    owner_function,
+                    sources,
+                    capture,
+                    ty,
+                )?;
+                Ok(LambdaCaptureDecl::ScopedLocal {
+                    binding,
+                    source,
+                    ty,
+                    mutability,
+                })
+            }
+        }
     }
 
     fn set_entry(&mut self, root: &CallableInstanceKey) -> Result<(), LowerError> {
@@ -1487,7 +1558,15 @@ impl LowerCx<'_> {
         &mut self,
         functions: &ReachableCallables<'_>,
     ) -> Result<(), LowerError> {
+        let mut lowered = std::collections::HashSet::new();
         for source in &functions.items {
+            if let ReachableSource::Lambda { owner, .. } = &source.source
+                && !lowered.contains(owner)
+            {
+                return Err(LowerError::MissingSpecializedBodyFacts {
+                    body: Box::new(owner.clone()),
+                });
+            }
             let facts = source.body_facts.as_facts();
             let function = self.maps.bodies[&source.body];
             let locals = self
@@ -1512,6 +1591,7 @@ impl LowerCx<'_> {
                     lowerer.lower_lambda_body(&lambda.node.body)?;
                 }
             }
+            lowered.insert(source.body.clone());
         }
         Ok(())
     }
@@ -1535,8 +1615,17 @@ struct ParamLowerSpec<'a> {
 #[derive(Clone)]
 enum LambdaCaptureSource {
     Local(Place),
+    Capture {
+        slot: LambdaCaptureSlotId,
+        decl: LambdaCaptureDecl,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum LoweredCaptureKind {
     NoRuntime,
-    TargetGap,
+    ReadonlyLocal,
+    ScopedLocal,
 }
 
 struct FunctionLowerer<'cx, 'facts, 'tc> {
@@ -1549,6 +1638,7 @@ struct FunctionLowerer<'cx, 'facts, 'tc> {
     function: Function,
     locals: HashMap<SemanticLocalId, Place>,
     capture_sources: HashMap<BindingId, LambdaCaptureSource>,
+    owned_lambdas: Vec<(ExprId, LambdaId)>,
     block: AirBlock,
     terminated: bool,
     next_loop: u32,
@@ -1566,7 +1656,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         source: SourceId,
     ) -> Result<Self, LowerError> {
         let function = cx.program.function(function_id).clone();
-        let capture_sources = initial_capture_sources(body, facts, &locals, &function)?;
+        let mut capture_sources = initial_capture_sources(body, facts, &locals, &function)?;
+        capture_sources.extend(lambda_capture_sources(&cx.program, &function));
+        let owned_lambdas = owned_reachable_lambdas(cx, functions, body);
         let locals = locals
             .into_iter()
             .map(|(semantic, local)| (semantic, function_local_place(&function, local)))
@@ -1581,6 +1673,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             function,
             locals,
             capture_sources,
+            owned_lambdas,
             block: AirBlock::default(),
             terminated: false,
             next_loop: 0,
@@ -1607,26 +1700,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             });
         }
         Ok(())
-    }
-
-    fn resolve_capture_source(
-        &self,
-        capture: &LambdaCaptureFact,
-    ) -> Result<LambdaCaptureSource, LowerError> {
-        match capture.origin {
-            CaptureStorageOrigin::Const => return Ok(LambdaCaptureSource::NoRuntime),
-            origin if origin.is_borrowed_runtime() => {
-                return Ok(LambdaCaptureSource::TargetGap);
-            }
-            _ => {}
-        }
-        self.capture_sources
-            .get(&capture.binding_id)
-            .cloned()
-            .ok_or_else(|| LowerError::MissingBindingBridge {
-                body: Box::new(self.body.clone()),
-                binding: capture.binding_id,
-            })
     }
 
     fn current_specialization(&self) -> GenericArgs {
@@ -1676,6 +1749,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if !self.terminated {
             return Err(LowerError::UnterminatedBlock);
         }
+        self.populate_owned_lambda_capture_decls()?;
         self.function.body = AirBody {
             block: std::mem::take(&mut self.block),
         };
@@ -2264,7 +2338,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 },
             }
         };
-        let root = self.binding_place(fact.local)?;
+        let root = self.binding_place(&fact)?;
         let Some(root_local) = root.root.local() else {
             return Err(unsupported_expr(expr));
         };
@@ -2279,7 +2353,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_mut_place_from_read_fact(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
         let root = projection_root(expr).unwrap_or(expr);
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
-            let root = self.binding_place(fact.local)?;
+            let root = self.binding_place(&fact)?;
             let Some(root_local) = root.root.local() else {
                 return Err(unsupported_expr(expr));
             };
@@ -2352,7 +2426,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Err(unsupported_expr(expr));
         };
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
-            return self.lower_projected_place(expr, self.binding_place(fact.local)?);
+            return self.lower_projected_place(expr, self.binding_place(&fact)?);
         }
         if matches!(&root.node.kind, ExprKind::Ident(name) if name.as_str() == "self") {
             return self.lower_projected_place(expr, self.self_place(expr)?);
@@ -2695,7 +2769,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 RValue::FunctionRef { function, ty }
             }
             FunctionValueKind::Lambda { lambda_expr } => {
-                self.reject_lambda_captures(*lambda_expr)?;
                 let key = LambdaBodyKey {
                     expr: *lambda_expr,
                     specialization: self.current_specialization(),
@@ -2707,7 +2780,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 };
                 RValue::MakeLambda {
                     lambda,
-                    captures: vec![],
+                    captures: self.lower_lambda_capture_args(*lambda_expr)?,
                     ty,
                 }
             }
@@ -2716,17 +2789,56 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(Some(self.emit_typed_temp(ty, value)?))
     }
 
-    fn reject_lambda_captures(&mut self, expr_id: ExprId) -> Result<(), LowerError> {
-        let Some(capture) = self.cx.lambda_capture_facts(expr_id)?.into_iter().next() else {
-            return Ok(());
-        };
-        if let LambdaCaptureSource::Local(place) = self.resolve_capture_source(&capture)? {
-            debug_assert_eq!(place.ty, self.cx.lower_ty(&capture.ty)?);
+    fn lower_lambda_capture_args(
+        &mut self,
+        expr_id: ExprId,
+    ) -> Result<Vec<LambdaCaptureArg>, LowerError> {
+        let escape = self.cx.lambda_escape_fact(expr_id)?.escape;
+        self.cx
+            .ordered_lambda_capture_facts(expr_id)?
+            .into_iter()
+            .map(|capture| self.lower_lambda_capture_arg(expr_id, escape, &capture))
+            .collect()
+    }
+
+    fn populate_owned_lambda_capture_decls(&mut self) -> Result<(), LowerError> {
+        for (expr_id, lambda) in &self.owned_lambdas {
+            let captures = self.cx.lower_lambda_capture_decls(
+                *expr_id,
+                self.function_id,
+                &self.function,
+                &self.capture_sources,
+            )?;
+            let decl = &mut self.cx.program.lambdas[lambda.index()];
+            if decl.captures.is_empty() {
+                decl.captures = captures;
+            } else if decl.captures != captures {
+                return Err(lambda_capture_gap(*expr_id));
+            }
         }
-        Err(LowerError::UnsupportedExpr {
-            expr_id,
-            kind: "LambdaCapture",
-        })
+        Ok(())
+    }
+
+    fn lower_lambda_capture_arg(
+        &mut self,
+        expr_id: ExprId,
+        escape: LambdaEscapeKind,
+        capture: &LambdaCaptureFact,
+    ) -> Result<LambdaCaptureArg, LowerError> {
+        let ty = self.cx.lower_ty(&capture.ty)?;
+        match lowered_capture_kind(expr_id, escape, capture.storage)? {
+            LoweredCaptureKind::NoRuntime => Ok(LambdaCaptureArg::NoRuntime),
+            LoweredCaptureKind::ReadonlyLocal => {
+                let place = exact_local_capture_place(expr_id, &self.capture_sources, capture, ty)?;
+                Ok(LambdaCaptureArg::ReadonlyLocal {
+                    value: Operand::Place(place),
+                })
+            }
+            LoweredCaptureKind::ScopedLocal => {
+                let place = exact_local_capture_place(expr_id, &self.capture_sources, capture, ty)?;
+                Ok(LambdaCaptureArg::ScopedLocal { place })
+            }
+        }
     }
 
     fn lower_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
@@ -4744,6 +4856,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         {
             return Ok(());
         }
+        if let PlaceRoot::LambdaCapture(slot) = place.root
+            && self.lambda_capture_mutability(slot) == Some(AirMutability::Mutable)
+        {
+            return Ok(());
+        }
         Err(unsupported_expr(expr))
     }
 
@@ -5047,7 +5164,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_place(&mut self, expr: &ExprNode, fact: &LocalUseFact) -> Result<Place, LowerError> {
-        self.lower_projected_place(expr, self.binding_place(fact.local)?)
+        self.lower_projected_place(expr, self.binding_place(fact)?)
     }
 
     fn require_builtin_scalar(&self, expr: &ExprNode) -> Result<(), LowerError> {
@@ -5124,14 +5241,38 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             })
     }
 
-    fn binding_place(&self, local: SemanticLocalId) -> Result<Place, LowerError> {
-        self.locals
-            .get(&local)
-            .cloned()
-            .ok_or_else(|| LowerError::MissingLocalDef {
+    fn binding_place(&self, fact: &LocalUseFact) -> Result<Place, LowerError> {
+        if let Some(place) = self.locals.get(&fact.local) {
+            return Ok(place.clone());
+        }
+        let Some(binding) = fact.binding_id else {
+            return Err(LowerError::MissingLocalDef {
                 body: Box::new(self.body.clone()),
-                local,
-            })
+                local: fact.local,
+            });
+        };
+        let Some(LambdaCaptureSource::Capture { slot, decl }) = self.capture_sources.get(&binding)
+        else {
+            return Err(LowerError::MissingLocalDef {
+                body: Box::new(self.body.clone()),
+                local: fact.local,
+            });
+        };
+        Ok(Place {
+            root: PlaceRoot::LambdaCapture(*slot),
+            projection: vec![],
+            ty: lambda_capture_decl_ty(decl),
+        })
+    }
+
+    fn lambda_capture_mutability(&self, slot: LambdaCaptureSlotId) -> Option<AirMutability> {
+        let FunctionKind::Lambda(lambda) = self.function.kind else {
+            return None;
+        };
+        self.cx.program.lambdas[lambda.index()]
+            .captures
+            .get(slot.index())
+            .map(lambda_capture_decl_mutability)
     }
 
     fn push_local(
@@ -5663,8 +5804,7 @@ pub(crate) fn lower_with_modules(
     let entry = roots.entry.clone();
     let roots = roots.normalized();
     validate_roots(&roots, &callable_facts)?;
-    let functions =
-        ReachableCallables::new(&index, semantic, typecheck_facts, &callable_facts, roots)?;
+    let functions = ReachableCallables::new(&index, semantic, &callable_facts, roots)?;
     let mut cx = LowerCx {
         decls: Some(semantic.declarations.clone()),
         externs: Some(semantic.externs.clone()),
@@ -6268,6 +6408,208 @@ impl PayloadMode {
     }
 }
 
+fn lowered_capture_kind(
+    expr_id: ExprId,
+    escape: LambdaEscapeKind,
+    storage: CaptureStorage,
+) -> Result<LoweredCaptureKind, LowerError> {
+    match storage {
+        CaptureStorage::NoRuntime => Ok(LoweredCaptureKind::NoRuntime),
+        CaptureStorage::OwnedReadonly => Ok(LoweredCaptureKind::ReadonlyLocal),
+        CaptureStorage::OwnedMutableScoped if escape == LambdaEscapeKind::NonEscaping => {
+            Ok(LoweredCaptureKind::ScopedLocal)
+        }
+        CaptureStorage::OwnedMutableScoped
+        | CaptureStorage::OwnedMutableUpvalue
+        | CaptureStorage::BorrowedScoped
+        | CaptureStorage::BorrowedEscaping => Err(lambda_capture_gap(expr_id)),
+    }
+}
+
+fn lambda_capture_gap(expr_id: ExprId) -> LowerError {
+    LowerError::UnsupportedExpr {
+        expr_id,
+        kind: "LambdaCapture",
+    }
+}
+
+fn exact_local_capture_source(
+    expr_id: ExprId,
+    owner: FunctionId,
+    owner_function: &Function,
+    sources: &HashMap<BindingId, LambdaCaptureSource>,
+    capture: &LambdaCaptureFact,
+    ty: TypeId,
+) -> Result<CaptureLocalSource, LowerError> {
+    match exact_capture_source(expr_id, sources, capture, ty)? {
+        LambdaCaptureSource::Local(place) => {
+            exact_owner_local_capture_source(expr_id, owner, owner_function, capture, &place)
+                .map(|(source, _)| source)
+        }
+        LambdaCaptureSource::Capture { decl, .. } => match decl {
+            LambdaCaptureDecl::ReadonlyLocal { source, .. } => Ok(source),
+            _ => Err(lambda_capture_gap(expr_id)),
+        },
+    }
+}
+
+fn exact_scoped_capture_source(
+    expr_id: ExprId,
+    owner: FunctionId,
+    owner_function: &Function,
+    sources: &HashMap<BindingId, LambdaCaptureSource>,
+    capture: &LambdaCaptureFact,
+    ty: TypeId,
+) -> Result<(CaptureLocalSource, AirMutability), LowerError> {
+    match exact_capture_source(expr_id, sources, capture, ty)? {
+        LambdaCaptureSource::Local(place) => {
+            exact_owner_local_capture_source(expr_id, owner, owner_function, capture, &place)
+                .map(|(source, local)| (source, local.mutability))
+        }
+        LambdaCaptureSource::Capture { decl, .. } => match decl {
+            LambdaCaptureDecl::ScopedLocal {
+                source, mutability, ..
+            } => Ok((source, mutability)),
+            _ => Err(lambda_capture_gap(expr_id)),
+        },
+    }
+}
+
+fn exact_owner_local_capture_source<'a>(
+    expr_id: ExprId,
+    owner: FunctionId,
+    owner_function: &'a Function,
+    capture: &LambdaCaptureFact,
+    place: &Place,
+) -> Result<(CaptureLocalSource, &'a Local), LowerError> {
+    let PlaceRoot::Local(local) = place.root else {
+        return Err(lambda_capture_gap(expr_id));
+    };
+    let source = CaptureLocalSource { owner, local };
+    let local_decl = &owner_function.locals[local.index()];
+    if local_decl.binding != Some(air_binding_id(capture.binding_id)) {
+        return Err(lambda_capture_gap(expr_id));
+    }
+    Ok((source, local_decl))
+}
+
+fn exact_local_capture_place(
+    expr_id: ExprId,
+    sources: &HashMap<BindingId, LambdaCaptureSource>,
+    capture: &LambdaCaptureFact,
+    ty: TypeId,
+) -> Result<Place, LowerError> {
+    match exact_capture_source(expr_id, sources, capture, ty)? {
+        LambdaCaptureSource::Local(place) => Ok(place),
+        LambdaCaptureSource::Capture { slot, .. } => Ok(Place {
+            root: PlaceRoot::LambdaCapture(slot),
+            projection: vec![],
+            ty,
+        }),
+    }
+}
+
+fn exact_capture_source(
+    expr_id: ExprId,
+    sources: &HashMap<BindingId, LambdaCaptureSource>,
+    capture: &LambdaCaptureFact,
+    ty: TypeId,
+) -> Result<LambdaCaptureSource, LowerError> {
+    let Some(source) = sources.get(&capture.binding_id) else {
+        return Err(lambda_capture_gap(expr_id));
+    };
+    match source {
+        LambdaCaptureSource::Local(place) if place.projection.is_empty() && place.ty == ty => {
+            Ok(source.clone())
+        }
+        LambdaCaptureSource::Capture { decl, .. } if lambda_capture_decl_ty(decl) == ty => {
+            Ok(source.clone())
+        }
+        _ => Err(lambda_capture_gap(expr_id)),
+    }
+}
+
+fn owned_reachable_lambdas(
+    cx: &LowerCx<'_>,
+    functions: &ReachableCallables<'_>,
+    body: &BodyInstanceKey,
+) -> Vec<(ExprId, LambdaId)> {
+    functions
+        .items
+        .iter()
+        .filter_map(|source| match (&source.source, &source.body) {
+            (ReachableSource::Lambda { owner, .. }, BodyInstanceKey::Lambda(key))
+                if owner == body =>
+            {
+                cx.maps
+                    .lambdas
+                    .get(key)
+                    .copied()
+                    .map(|lambda| (key.expr, lambda))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn lambda_capture_sources(
+    program: &Program,
+    function: &Function,
+) -> HashMap<BindingId, LambdaCaptureSource> {
+    let FunctionKind::Lambda(lambda) = function.kind else {
+        return HashMap::new();
+    };
+    program.lambdas[lambda.index()]
+        .captures
+        .iter()
+        .enumerate()
+        .map(|(index, decl)| {
+            (
+                typecheck_binding_id(lambda_capture_decl_binding(decl)),
+                LambdaCaptureSource::Capture {
+                    slot: LambdaCaptureSlotId::from_index(index),
+                    decl: decl.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn lambda_capture_decl_binding(capture: &LambdaCaptureDecl) -> AirBindingId {
+    match capture {
+        LambdaCaptureDecl::NoRuntime { binding, .. }
+        | LambdaCaptureDecl::ReadonlyLocal { binding, .. }
+        | LambdaCaptureDecl::ScopedLocal { binding, .. }
+        | LambdaCaptureDecl::ScopedBorrow { binding, .. }
+        | LambdaCaptureDecl::UpvalueCell { binding, .. } => *binding,
+    }
+}
+
+fn lambda_capture_decl_ty(capture: &LambdaCaptureDecl) -> TypeId {
+    match capture {
+        LambdaCaptureDecl::NoRuntime { ty, .. }
+        | LambdaCaptureDecl::ReadonlyLocal { ty, .. }
+        | LambdaCaptureDecl::ScopedLocal { ty, .. }
+        | LambdaCaptureDecl::ScopedBorrow { ty, .. }
+        | LambdaCaptureDecl::UpvalueCell { ty, .. } => *ty,
+    }
+}
+
+fn lambda_capture_decl_mutability(capture: &LambdaCaptureDecl) -> AirMutability {
+    match capture {
+        LambdaCaptureDecl::ScopedLocal { mutability, .. }
+        | LambdaCaptureDecl::ScopedBorrow { mutability, .. } => *mutability,
+        LambdaCaptureDecl::UpvalueCell { .. } => AirMutability::Mutable,
+        LambdaCaptureDecl::NoRuntime { .. } | LambdaCaptureDecl::ReadonlyLocal { .. } => {
+            AirMutability::Immutable
+        }
+    }
+}
+
+fn typecheck_binding_id(binding: AirBindingId) -> BindingId {
+    BindingId(binding.0)
+}
+
 fn function_local_place(function: &Function, local: LocalId) -> Place {
     Place {
         root: PlaceRoot::Local(local),
@@ -6437,7 +6779,6 @@ impl<'a> ReachableCallables<'a> {
     fn new(
         index: &'a SourceProgramIndex<'a>,
         semantic: &'a SemanticProgram,
-        typecheck_facts: &TypecheckFacts,
         semantic_functions: &SemanticCallableFacts<'a>,
         roots: Vec<CallableInstanceKey>,
     ) -> Result<Self, LowerError> {
@@ -6462,7 +6803,6 @@ impl<'a> ReachableCallables<'a> {
             enqueue_body_references(
                 index,
                 semantic,
-                typecheck_facts,
                 item.body_facts.as_facts(),
                 &item.body,
                 item.source_id,
@@ -6576,7 +6916,6 @@ fn reachable_lambda<'a>(
 fn enqueue_body_references(
     index: &SourceProgramIndex<'_>,
     semantic: &SemanticProgram,
-    typecheck_facts: &TypecheckFacts,
     body_facts: &SemanticBodyFacts,
     body: &BodyInstanceKey,
     source_id: SourceId,
@@ -6607,15 +6946,7 @@ fn enqueue_body_references(
             }),
         );
     }
-    enqueue_function_values(
-        index,
-        typecheck_facts,
-        body_facts,
-        body,
-        source_id,
-        queued,
-        worklist,
-    )?;
+    enqueue_function_values(index, body_facts, body, source_id, queued, worklist)?;
     enqueue_stringify_overrides(index, semantic, body_facts, queued, worklist);
     Ok(())
 }
@@ -6645,7 +6976,6 @@ fn queue_reachable(
 
 fn enqueue_function_values(
     index: &SourceProgramIndex<'_>,
-    typecheck_facts: &TypecheckFacts,
     body_facts: &SemanticBodyFacts,
     owner: &BodyInstanceKey,
     source: SourceId,
@@ -6666,16 +6996,6 @@ fn enqueue_function_values(
                 queue_reachable(queued, worklist, ReachableKey::Callable(target.clone()));
             }
             FunctionValueKind::Lambda { lambda_expr } => {
-                if typecheck_facts
-                    .lambda_captures()
-                    .values()
-                    .any(|capture| capture.lambda_id == *lambda_expr)
-                {
-                    return Err(LowerError::UnsupportedExpr {
-                        expr_id: *lambda_expr,
-                        kind: "LambdaCapture",
-                    });
-                }
                 queue_reachable(
                     queued,
                     worklist,
@@ -9348,6 +9668,145 @@ fn main() {}
     }
 
     #[test]
+    fn readonly_lambda_capture_lowers_to_slot() {
+        let source = "fn f(seed: int) { let x = seed + 1; let g: fn() = || { x; }; g; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::ReadonlyLocal { .. }]
+        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal { .. }]))
+        }));
+        assert!(
+            function_statements(air.function(lambda.body)).any(|statement| {
+                matches!(statement, AirStmt::Eval(RValue::Use(Operand::Place(place)))
+                if matches!(place.root, PlaceRoot::LambdaCapture(_)))
+            })
+        );
+    }
+
+    #[test]
+    fn mutable_lambda_capture_lowers_to_scoped_slot() {
+        let source = "fn f(seed: int) { var x = seed; let g: fn() = || { x = x + 1; }; g; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::ScopedLocal { .. }]
+        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ScopedLocal { .. }]))
+        }));
+        assert!(
+            function_statements(air.function(lambda.body)).any(|statement| {
+                matches!(statement, AirStmt::Assign { dst, .. }
+                if matches!(dst.root, PlaceRoot::LambdaCapture(_)))
+            })
+        );
+    }
+
+    #[test]
+    fn nested_lambda_capture_lowers_through_parent_slot() {
+        let source = "fn f(seed: int) { let x = seed + 1; let outer: fn() = || { let inner: fn() = || { x; }; inner; }; outer; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let outer = air
+            .lambdas
+            .iter()
+            .find(|decl| air.function(decl.owner).name == Ident::new("f"))
+            .expect("missing outer lambda");
+        let inner = air
+            .lambdas
+            .iter()
+            .find(|decl| decl.owner == outer.body)
+            .expect("missing inner lambda");
+
+        assert!(matches!(
+            &outer.captures[..],
+            [LambdaCaptureDecl::ReadonlyLocal { .. }]
+        ));
+        assert!(matches!(
+            &inner.captures[..],
+            [LambdaCaptureDecl::ReadonlyLocal { .. }]
+        ));
+        assert!(
+            function_statements(air.function(outer.body)).any(|statement| {
+                matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal {
+                    value: Operand::Place(place)
+                }] if matches!(place.root, PlaceRoot::LambdaCapture(_))))
+            })
+        );
+    }
+
+    #[test]
+    fn captured_iife_uses_same_capture_slots() {
+        let source = "fn f(seed: int) { let x = seed + 1; || { x; }(); }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::ReadonlyLocal { .. }]
+        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal { .. }]))
+        }));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Eval(RValue::Call {
+                    callee: Callee::Lambda(_),
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn captured_callback_argument_uses_positional_capture_args() {
+        let source =
+            "fn each(f: fn()) { f(); } fn main(seed: int) { let x = seed + 1; each(|| { x; }); }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::ReadonlyLocal { .. }]
+        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal { .. }]))
+        }));
+    }
+
+    #[test]
+    fn captured_alias_call_materializes_lambda_value() {
+        let source = "fn f(seed: int) { let x = seed + 1; let g: fn() = || { x; }; g(); }";
+        let air = lower_root(source, "f").expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal { .. }]))
+        }));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Eval(RValue::Call {
+                    callee: Callee::Lambda(_),
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
     fn borrowed_lambda_capture_reports_capture_gap() {
         let source = "fn f(var x: int) { || { x = 1; }; }";
         let (root, resolved, semantic) = checked(source);
@@ -9468,7 +9927,7 @@ fn main() {}
         let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
         assert_eq!(air.lambdas.len(), 1);
         assert!(air.functions.iter().any(|function| {
-            matches!(function.kind, FunctionKind::Lambda(lambda) if lambda == crate::air::LambdaId::from_index(0))
+            matches!(function.kind, FunctionKind::Lambda(lambda) if lambda == LambdaId::from_index(0))
         }));
         assert!(program_statements(&air).any(|statement| {
             matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. } if captures.is_empty())
@@ -9790,14 +10249,8 @@ fn main() {}
         let index = SourceProgramIndex::new(&root, &resolved);
         let facts = SemanticCallableFacts::new(&semantic.program);
         let roots = names.iter().map(|name| root_function(name)).collect();
-        let functions = ReachableCallables::new(
-            &index,
-            &semantic.program,
-            &semantic.public_facts,
-            &facts,
-            roots,
-        )
-        .expect("source functions failed");
+        let functions = ReachableCallables::new(&index, &semantic.program, &facts, roots)
+            .expect("source functions failed");
         f(&index.modules, &functions, &semantic.program)
     }
 

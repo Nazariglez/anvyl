@@ -5,9 +5,10 @@ use super::{
     rir::{
         RirCallArg, RirCallTarget, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
-        RirLambdaId, RirLambdaSig, RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirPlace,
-        RirProgram, RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLambdaCaptureArg, RirLambdaId, RirLambdaSig, RirLoop, RirLoopId, RirOperand,
+        RirOptionMatch, RirParamSemantic, RirPlace, RirProgram, RirRValue, RirRawEnumValue,
+        RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -420,11 +421,11 @@ impl EmitCx<'_> {
 
     fn emit_lambda_sig(&mut self, sig: &RirLambdaSig) {
         let policy = RustRepPolicy::new(self.program);
-        let symbol = policy.lambda_sig_ty(sig.id);
+        let symbol = policy.lambda_sig_symbol(sig.id);
         let variants = self
             .program
             .lambdas_for_sig(sig.id)
-            .map(|lambda| (lambda.id, lambda.function))
+            .map(|lambda| (lambda.id, lambda.function, lambda.captures.as_slice()))
             .collect::<Vec<_>>();
         let params = std::iter::once(format!("ctx: &mut {}", self.ctx_ty()))
             .chain(sig.params.iter().enumerate().map(|(index, param)| {
@@ -433,46 +434,93 @@ impl EmitCx<'_> {
             .collect::<Vec<_>>();
         let fallible = variants
             .iter()
-            .any(|(_, function)| self.fallible_functions[function.index()]);
+            .any(|(_, function, _)| self.fallible_functions[function.index()]);
         let ret = self.lambda_sig_ret_ty(sig, fallible);
+        let captures_self = variants.iter().any(|(_, _, captures)| !captures.is_empty());
+        let self_arg = if captures_self { "&mut self" } else { "self" };
         let header = if ret == "()" {
-            format!("fn call<'cx, 'rt>(self, {})", comma(params))
+            format!("fn call<'cx, 'rt>({self_arg}, {})", comma(params))
         } else {
-            format!("fn call<'cx, 'rt>(self, {}) -> {ret}", comma(params))
+            format!("fn call<'cx, 'rt>({self_arg}, {}) -> {ret}", comma(params))
         };
         let arity = sig.params.len();
         let program = self.program;
         let fallible_functions = &self.fallible_functions;
+        let lifetime = if policy.lambda_sig_needs_lifetime(sig.id) {
+            "<'env>"
+        } else {
+            ""
+        };
 
-        self.w.line("#[derive(Clone, Copy)]");
-        self.w.block(format_args!("enum {symbol}"), |w| {
-            for (lambda, _) in &variants {
-                w.line(format_args!("{},", lambda_variant(*lambda)));
+        if policy.lambda_sig_copyable(sig.id) {
+            self.w.line("#[derive(Clone, Copy)]");
+        }
+        self.w.block(format_args!("enum {symbol}{lifetime}"), |w| {
+            for (lambda, _, captures) in &variants {
+                if captures.is_empty() {
+                    w.line(format_args!("{},", lambda_variant(*lambda)));
+                } else {
+                    let fields = captures
+                        .iter()
+                        .enumerate()
+                        .map(|(index, capture)| {
+                            format!(
+                                "c{index}: {}",
+                                policy.capture_field_ty(capture.ty, capture.abi)
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    w.line(format_args!(
+                        "{} {{ {} }},",
+                        lambda_variant(*lambda),
+                        comma(fields)
+                    ));
+                }
             }
         });
         self.w.blank();
-        self.w.block(format_args!("impl {symbol}"), |w| {
-            w.line(format_args!("{header} {{"));
-            w.indented(|w| {
-                w.line("match self {");
+        self.w
+            .block(format_args!("impl{lifetime} {symbol}{lifetime}"), |w| {
+                w.line(format_args!("{header} {{"));
                 w.indented(|w| {
-                    for (lambda, function_id) in &variants {
-                        let function = &program.functions[function_id.index()];
-                        let args = std::iter::once("ctx".to_string())
-                            .chain((0..arity).map(|index| format!("arg_{index}")));
-                        let call = format!("{}({})", function.symbol.as_str(), comma(args));
-                        let call = if fallible && !fallible_functions[function.id.index()] {
-                            format!("Ok({call})")
-                        } else {
-                            call
-                        };
-                        w.line(format_args!("Self::{} => {call},", lambda_variant(*lambda)));
-                    }
+                    w.line("match self {");
+                    w.indented(|w| {
+                        for (lambda, function_id, captures) in &variants {
+                            let function = &program.functions[function_id.index()];
+                            let capture_args =
+                                captures.iter().enumerate().map(|(index, capture)| {
+                                    lambda_capture_call_arg(index, capture.semantic)
+                                });
+                            let args = std::iter::once("ctx".to_string())
+                                .chain(capture_args)
+                                .chain((0..arity).map(|index| format!("arg_{index}")));
+                            let call = format!("{}({})", function.symbol.as_str(), comma(args));
+                            let call = if fallible && !fallible_functions[function.id.index()] {
+                                format!("Ok({call})")
+                            } else {
+                                call
+                            };
+                            if captures.is_empty() {
+                                w.line(format_args!(
+                                    "Self::{} => {call},",
+                                    lambda_variant(*lambda)
+                                ));
+                            } else {
+                                let fields = (0..captures.len())
+                                    .map(|index| format!("c{index}"))
+                                    .collect::<Vec<_>>();
+                                w.line(format_args!(
+                                    "Self::{} {{ {} }} => {call},",
+                                    lambda_variant(*lambda),
+                                    comma(fields)
+                                ));
+                            }
+                        }
+                    });
+                    w.line("}");
                 });
                 w.line("}");
             });
-            w.line("}");
-        });
         self.w.blank();
     }
 
@@ -503,8 +551,13 @@ impl EmitCx<'_> {
         let mut params = vec![format!("{ctx}: &mut {}", self.ctx_ty())];
         params.extend(function.params.iter().map(|param| {
             let local = &function.locals[param.local.index()];
+            let mutability = if self.local_needs_mut_binding(local.ty) {
+                "mut "
+            } else {
+                ""
+            };
             format!(
-                "{}: {}",
+                "{mutability}{}: {}",
                 local.symbol.as_str(),
                 RustRepPolicy::new(self.program).param_ty(param.ty, param.abi)
             )
@@ -559,6 +612,10 @@ impl EmitCx<'_> {
         format!("{}<'cx, 'rt>", self.program.ctx.symbol.as_str())
     }
 
+    fn local_needs_mut_binding(&self, ty: RirTypeId) -> bool {
+        matches!(self.program.types[ty.index()], RirType::Lambda(_))
+    }
+
     fn emit_local_declarations(&mut self, function: &RirFunction) {
         for local in &function.locals {
             if local.payload_ref || function.params.iter().any(|param| param.local == local.id) {
@@ -591,7 +648,12 @@ impl EmitCx<'_> {
                         self.rvalue(function, value)
                     ));
                 } else {
-                    let mutability = if local_data.mutable { "mut " } else { "" };
+                    let mutability =
+                        if local_data.mutable || self.local_needs_mut_binding(local_data.ty) {
+                            "mut "
+                        } else {
+                            ""
+                        };
                     self.w.line(format_args!(
                         "let {mutability}{}: {} = {};",
                         local_data.symbol.as_str(),
@@ -972,14 +1034,54 @@ impl EmitCx<'_> {
                     values.operand(key)
                 )
             }
-            RirRValue::Lambda { lambda, .. } => {
+            RirRValue::Lambda {
+                lambda, captures, ..
+            } => {
                 let decl = &self.program.lambdas[lambda.index()];
-                format!(
-                    "{}::{}",
-                    RustRepPolicy::new(self.program).lambda_sig_ty(decl.sig),
-                    lambda_variant(*lambda)
-                )
+                let sig = RustRepPolicy::new(self.program).lambda_sig_symbol(decl.sig);
+                let variant = lambda_variant(*lambda);
+                if captures.is_empty() {
+                    format!("{sig}::{variant}")
+                } else {
+                    let fields = decl
+                        .captures
+                        .iter()
+                        .zip(captures)
+                        .enumerate()
+                        .map(|(index, (decl, capture))| {
+                            field_init(
+                                &format!("c{index}"),
+                                self.lambda_capture_arg(function, decl.semantic, capture),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!("{sig}::{variant} {{ {} }}", comma(fields))
+                }
             }
+        }
+    }
+
+    fn lambda_capture_arg(
+        &self,
+        function: &RirFunction,
+        semantic: RirParamSemantic,
+        capture: &RirLambdaCaptureArg,
+    ) -> String {
+        let values = RustValues::new(self.program, function);
+        match (semantic, capture) {
+            (RirParamSemantic::Value, RirLambdaCaptureArg::Readonly { value }) => {
+                values.value_operand(value)
+            }
+            (RirParamSemantic::SharedBorrow, RirLambdaCaptureArg::Readonly { value }) => {
+                let RirOperand::Place(place) = value else {
+                    unreachable!("verified shared readonly capture place")
+                };
+                values.borrow_arg(place)
+            }
+            (RirParamSemantic::MutBorrow, RirLambdaCaptureArg::Scoped { place }) => {
+                values.mut_borrow_arg(place)
+            }
+            _ => unreachable!("verified lambda capture arg mode"),
         }
     }
 
@@ -1332,4 +1434,11 @@ fn loop_label(id: RirLoopId) -> String {
 
 fn lambda_variant(id: RirLambdaId) -> String {
     format!("L{}", id.index())
+}
+
+fn lambda_capture_call_arg(index: usize, semantic: RirParamSemantic) -> String {
+    match semantic {
+        RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
+        RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
+    }
 }
