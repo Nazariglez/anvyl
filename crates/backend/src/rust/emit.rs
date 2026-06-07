@@ -4,10 +4,10 @@ use super::{
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
         RirCallArg, RirCallTarget, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
-        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLoop,
-        RirLoopId, RirOperand, RirOptionMatch, RirPlace, RirProgram, RirRValue, RirRawEnumValue,
-        RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
+        RirLambdaId, RirLambdaSig, RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirPlace,
+        RirProgram, RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -79,6 +79,9 @@ impl EmitCx<'_> {
         }
         for helper in &self.program.stringify_helpers {
             self.emit_stringify_helper(helper);
+        }
+        for sig in &self.program.lambda_sigs {
+            self.emit_lambda_sig(sig);
         }
         for function in &self.program.functions {
             self.emit_function(function);
@@ -405,13 +408,90 @@ impl EmitCx<'_> {
                     | RirType::List(_)
                     | RirType::Map { .. }
                     | RirType::Option(_)
-                    | RirType::Slice(_) => unreachable!("verified stringify helper field"),
+                    | RirType::Slice(_)
+                    | RirType::Lambda(_) => unreachable!("verified stringify helper field"),
                 }
             }
             w.line("out.push(')');");
             w.line(target::anv_string_from("out"));
         });
         self.w.blank();
+    }
+
+    fn emit_lambda_sig(&mut self, sig: &RirLambdaSig) {
+        let policy = RustRepPolicy::new(self.program);
+        let symbol = policy.lambda_sig_ty(sig.id);
+        let variants = self
+            .program
+            .lambdas_for_sig(sig.id)
+            .map(|lambda| (lambda.id, lambda.function))
+            .collect::<Vec<_>>();
+        let params = std::iter::once(format!("ctx: &mut {}", self.ctx_ty()))
+            .chain(sig.params.iter().enumerate().map(|(index, param)| {
+                format!("arg_{index}: {}", policy.param_ty(param.ty, param.abi))
+            }))
+            .collect::<Vec<_>>();
+        let fallible = variants
+            .iter()
+            .any(|(_, function)| self.fallible_functions[function.index()]);
+        let ret = self.lambda_sig_ret_ty(sig, fallible);
+        let header = if ret == "()" {
+            format!("fn call<'cx, 'rt>(self, {})", comma(params))
+        } else {
+            format!("fn call<'cx, 'rt>(self, {}) -> {ret}", comma(params))
+        };
+        let arity = sig.params.len();
+        let program = self.program;
+        let fallible_functions = &self.fallible_functions;
+
+        self.w.line("#[derive(Clone, Copy)]");
+        self.w.block(format_args!("enum {symbol}"), |w| {
+            for (lambda, _) in &variants {
+                w.line(format_args!("{},", lambda_variant(*lambda)));
+            }
+        });
+        self.w.blank();
+        self.w.block(format_args!("impl {symbol}"), |w| {
+            w.line(format_args!("{header} {{"));
+            w.indented(|w| {
+                w.line("match self {");
+                w.indented(|w| {
+                    for (lambda, function_id) in &variants {
+                        let function = &program.functions[function_id.index()];
+                        let args = std::iter::once("ctx".to_string())
+                            .chain((0..arity).map(|index| format!("arg_{index}")));
+                        let call = format!("{}({})", function.symbol.as_str(), comma(args));
+                        let call = if fallible && !fallible_functions[function.id.index()] {
+                            format!("Ok({call})")
+                        } else {
+                            call
+                        };
+                        w.line(format_args!("Self::{} => {call},", lambda_variant(*lambda)));
+                    }
+                });
+                w.line("}");
+            });
+            w.line("}");
+        });
+        self.w.blank();
+    }
+
+    fn lambda_sig_fallible(&self, sig: &RirLambdaSig) -> bool {
+        self.program
+            .lambdas_for_sig(sig.id)
+            .any(|lambda| self.fallible_functions[lambda.function.index()])
+    }
+
+    fn lambda_sig_ret_ty(&self, sig: &RirLambdaSig, fallible: bool) -> String {
+        let ret = self.ty(sig.ret);
+        if !fallible {
+            return ret;
+        }
+        if ret == "()" {
+            target::result_ty("()")
+        } else {
+            target::result_ty(&ret)
+        }
     }
 
     fn emit_function(&mut self, function: &RirFunction) {
@@ -796,6 +876,17 @@ impl EmitCx<'_> {
                     }
                 }
                 RirCallTarget::Extern(id) => self.extern_call(function, *id, args),
+                RirCallTarget::LambdaValue { callee, sig } => {
+                    let rendered = std::iter::once("ctx".to_string())
+                        .chain(args.iter().map(|arg| values.call_arg(arg)));
+                    let call =
+                        format!("{}.call({})", values.value_operand(callee), comma(rendered));
+                    if self.lambda_sig_fallible(&self.program.lambda_sigs[sig.index()]) {
+                        format!("{call}?")
+                    } else {
+                        call
+                    }
+                }
             },
             RirRValue::Stringify { value, source_ty } => {
                 match self.program.types[source_ty.index()] {
@@ -812,7 +903,10 @@ impl EmitCx<'_> {
                     | RirType::List(_)
                     | RirType::Map { .. }
                     | RirType::Option(_)
-                    | RirType::Slice(_) => unreachable!("verified structural stringify target gap"),
+                    | RirType::Slice(_)
+                    | RirType::Lambda(_) => {
+                        unreachable!("verified structural stringify target gap")
+                    }
                 }
             }
             RirRValue::StringConcat { parts } => self.string_concat(function, parts),
@@ -876,6 +970,14 @@ impl EmitCx<'_> {
                     "{}.remove(&{})",
                     places.local_place(map),
                     values.operand(key)
+                )
+            }
+            RirRValue::Lambda { lambda, .. } => {
+                let decl = &self.program.lambdas[lambda.index()];
+                format!(
+                    "{}::{}",
+                    RustRepPolicy::new(self.program).lambda_sig_ty(decl.sig),
+                    lambda_variant(*lambda)
                 )
             }
         }
@@ -1226,4 +1328,8 @@ fn rust_format_spec(spec: RirFormatSpec) -> FormatSpec {
 
 fn loop_label(id: RirLoopId) -> String {
     format!("'loop_{}", id.index())
+}
+
+fn lambda_variant(id: RirLambdaId) -> String {
+    format!("L{}", id.index())
 }

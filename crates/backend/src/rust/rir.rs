@@ -40,6 +40,8 @@ rir_id!(RirVariantId);
 rir_id!(RirFieldId);
 rir_id!(RirStringifyHelperId);
 rir_id!(RirStringifyReqId);
+rir_id!(RirLambdaSigId);
+rir_id!(RirLambdaId);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirSymbol(pub String);
@@ -64,10 +66,18 @@ pub struct RirProgram {
     pub datarefs: Vec<RirDataRef>,
     pub enums: Vec<RirEnum>,
     pub tuples: Vec<RirTuple>,
+    pub lambda_sigs: Vec<RirLambdaSig>,
+    pub lambdas: Vec<RirLambda>,
     pub stringify_reqs: Vec<RirStringifyReq>,
     pub stringify_helpers: Vec<RirStringifyHelper>,
     pub consts: Vec<RirConst>,
     pub entry: Option<RirFunctionId>,
+}
+
+impl RirProgram {
+    pub fn lambdas_for_sig(&self, sig: RirLambdaSigId) -> impl Iterator<Item = &RirLambda> {
+        self.lambdas.iter().filter(move |lambda| lambda.sig == sig)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +177,63 @@ pub enum RirVariantKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirLambdaSig {
+    pub id: RirLambdaSigId,
+    pub params: Vec<RirLambdaParam>,
+    pub ret: RirTypeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RirLambdaParam {
+    pub ty: RirTypeId,
+    pub semantic: RirParamSemantic,
+    pub abi: RirParamAbi,
+    pub escape: RirParamEscape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RirParamEscape {
+    NonEscaping,
+    Escaping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirLambda {
+    pub id: RirLambdaId,
+    pub source: RirLambdaSource,
+    pub function: RirFunctionId,
+    pub sig: RirLambdaSigId,
+    pub escape: RirLambdaEscape,
+    pub storage: RirLambdaStorage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirLambdaSource {
+    Function(FunctionId),
+    Lambda(air::LambdaId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirLambdaEscape {
+    NonEscaping,
+    Escaping,
+}
+
+impl RirLambdaEscape {
+    fn from_param_escape(escape: RirParamEscape) -> Self {
+        match escape {
+            RirParamEscape::NonEscaping => Self::NonEscaping,
+            RirParamEscape::Escaping => Self::Escaping,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirLambdaStorage {
+    ZeroEnv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirStringifyReq {
     pub id: RirStringifyReqId,
     pub ty: RirTypeId,
@@ -219,6 +286,7 @@ pub struct RirParam {
     pub ty: RirTypeId,
     pub semantic: RirParamSemantic,
     pub abi: RirParamAbi,
+    pub escape: RirParamEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,6 +498,10 @@ pub enum RirRValue {
         key: RirOperand,
         ty: RirTypeId,
     },
+    Lambda {
+        lambda: RirLambdaId,
+        ty: RirTypeId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -468,10 +540,14 @@ pub enum RirFormatKind {
     ExpUpper,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirCallTarget {
     Function(RirFunctionId),
     Extern(RirExternId),
+    LambdaValue {
+        callee: RirOperand,
+        sig: RirLambdaSigId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -538,6 +614,7 @@ pub enum RirType {
     Map { key: RirTypeId, value: RirTypeId },
     Option(RirTypeId),
     Slice(RirTypeId),
+    Lambda(RirLambdaSigId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -601,6 +678,7 @@ pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVer
         initialized: vec![],
         possibly_initialized: vec![],
         payload_ref_owned: vec![],
+        lambda_escapes: vec![],
         loops: vec![],
     };
     cx.check();
@@ -668,6 +746,7 @@ pub enum RirVerifyErrorKind {
         found: usize,
     },
     CallArgMode,
+    CallArgEscape,
     DuplicateMatchArm,
     MatchNotExhaustive,
     OptionPayloadEscapeRequiresPayload,
@@ -689,12 +768,15 @@ impl fmt::Display for RirVerifyError {
 
 impl Error for RirVerifyError {}
 
+type RirBlockState = (Vec<bool>, Vec<bool>, Vec<Option<RirLambdaEscape>>);
+
 struct VerifyCx<'a> {
     program: &'a RirProgram,
     errors: Vec<RirVerifyError>,
     initialized: Vec<bool>,
     possibly_initialized: Vec<bool>,
     payload_ref_owned: Vec<bool>,
+    lambda_escapes: Vec<Option<RirLambdaEscape>>,
     loops: Vec<RirLoopId>,
 }
 
@@ -795,15 +877,24 @@ impl VerifyCx<'_> {
                 RirType::Tuple(id) => self.check_tuple_id(site, *id),
                 RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => {
                     self.check_type_id(site, *elem);
+                    self.check_lambda_container_type(site, *elem);
                 }
                 RirType::Map { key, value } => {
                     self.check_type_id(site, *key);
                     self.check_type_id(site, *value);
+                    self.check_lambda_container_type(site, *key);
+                    self.check_lambda_container_type(site, *value);
                 }
-                RirType::Option(inner) => self.check_type_id(site, *inner),
+                RirType::Option(inner) => {
+                    self.check_type_id(site, *inner);
+                    self.check_lambda_container_type(site, *inner);
+                }
+                RirType::Lambda(sig) => self.check_lambda_sig_id(site, *sig),
                 _ => {}
             }
         }
+        self.check_lambda_sigs();
+        self.check_lambdas();
         self.check_structs();
         self.check_datarefs();
         self.check_enums();
@@ -829,6 +920,149 @@ impl VerifyCx<'_> {
                 self.push(RirVerifySite::Function(id), RirVerifyErrorKind::BadId);
             }
             self.check_function(id, function);
+        }
+    }
+
+    fn check_lambda_container_type(&mut self, site: RirVerifySite, ty: RirTypeId) {
+        if self.type_contains_lambda(ty) {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        }
+    }
+
+    fn type_contains_lambda(&self, ty: RirTypeId) -> bool {
+        self.type_contains_lambda_inner(ty, &mut Vec::new())
+    }
+
+    fn type_contains_lambda_inner(&self, ty: RirTypeId, visited: &mut Vec<RirTypeId>) -> bool {
+        if visited.contains(&ty) {
+            return false;
+        }
+        visited.push(ty);
+        match self.ty(ty) {
+            Some(RirType::Lambda(_)) => true,
+            Some(
+                RirType::Array { elem, .. }
+                | RirType::List(elem)
+                | RirType::Slice(elem)
+                | RirType::Option(elem),
+            ) => self.type_contains_lambda_inner(elem, visited),
+            Some(RirType::Map { key, value }) => {
+                self.type_contains_lambda_inner(key, visited)
+                    || self.type_contains_lambda_inner(value, visited)
+            }
+            Some(RirType::Struct(id)) => {
+                self.program.structs.get(id.index()).is_some_and(|strukt| {
+                    strukt
+                        .fields
+                        .iter()
+                        .any(|field| self.type_contains_lambda_inner(field.ty, visited))
+                })
+            }
+            Some(RirType::DataRef(id)) => {
+                self.program
+                    .datarefs
+                    .get(id.index())
+                    .is_some_and(|dataref| {
+                        dataref
+                            .fields
+                            .iter()
+                            .any(|field| self.type_contains_lambda_inner(field.ty, visited))
+                    })
+            }
+            Some(RirType::Enum(id)) => self.program.enums.get(id.index()).is_some_and(|enm| {
+                enm.variants.iter().any(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .any(|field| self.type_contains_lambda_inner(field.ty, visited))
+                })
+            }),
+            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
+                tuple
+                    .fields
+                    .iter()
+                    .any(|field| self.type_contains_lambda_inner(field.ty, visited))
+            }),
+            Some(
+                RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Void,
+            )
+            | None => false,
+        }
+    }
+
+    fn check_lambda_sigs(&mut self) {
+        for (index, sig) in self.program.lambda_sigs.iter().enumerate() {
+            let id = RirLambdaSigId::from_index(index);
+            let site = RirVerifySite::Program;
+            if sig.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            for param in &sig.params {
+                self.check_type_id(site, param.ty);
+                self.check_abi(site, param.ty, param.semantic, param.abi);
+            }
+            self.check_type_id(site, sig.ret);
+        }
+    }
+
+    fn check_lambdas(&mut self) {
+        for (index, lambda) in self.program.lambdas.iter().enumerate() {
+            let site = RirVerifySite::Program;
+            let id = RirLambdaId::from_index(index);
+            if lambda.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            self.check_function_id(site, lambda.function);
+            self.check_lambda_sig_id(site, lambda.sig);
+            self.check_lambda_function_signature(site, lambda);
+        }
+    }
+
+    fn check_lambda_function_signature(&mut self, site: RirVerifySite, lambda: &RirLambda) {
+        let Some(function) = self.program.functions.get(lambda.function.index()) else {
+            return;
+        };
+        let Some(sig) = self.program.lambda_sigs.get(lambda.sig.index()) else {
+            return;
+        };
+        if function.params.len() != sig.params.len() {
+            self.push(
+                site,
+                RirVerifyErrorKind::CallArgCount {
+                    expected: sig.params.len(),
+                    found: function.params.len(),
+                },
+            );
+            return;
+        }
+        for (param, sig_param) in function.params.iter().zip(&sig.params) {
+            if param.ty != sig_param.ty {
+                self.push(
+                    site,
+                    RirVerifyErrorKind::TypeMismatch {
+                        expected: sig_param.ty,
+                        found: param.ty,
+                    },
+                );
+            }
+            if param.semantic != sig_param.semantic {
+                self.push(site, RirVerifyErrorKind::CallArgMode);
+            }
+            if param.abi != sig_param.abi {
+                self.push(site, RirVerifyErrorKind::UnsupportedAbi);
+            }
+            if param.escape != sig_param.escape {
+                self.push(site, RirVerifyErrorKind::CallArgEscape);
+            }
+        }
+        if function.ret.ty != sig.ret {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected: sig.ret,
+                    found: function.ret.ty,
+                },
+            );
         }
     }
 
@@ -858,6 +1092,7 @@ impl VerifyCx<'_> {
                 }
                 field_symbols.push(field.symbol.clone());
                 self.check_type_id(site, field.ty);
+                self.check_lambda_container_type(site, field.ty);
                 if strukt.copyable && !self.copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }
@@ -900,6 +1135,7 @@ impl VerifyCx<'_> {
                 }
                 field_symbols.push(field.symbol.clone());
                 self.check_type_id(site, field.ty);
+                self.check_lambda_container_type(site, field.ty);
                 if matches!(self.ty(field.ty), Some(RirType::Void | RirType::Slice(_))) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
@@ -955,6 +1191,7 @@ impl VerifyCx<'_> {
                     }
                     field_symbols.push(field.symbol.clone());
                     self.check_type_id(site, field.ty);
+                    self.check_lambda_container_type(site, field.ty);
                     if matches!(self.ty(field.ty), Some(RirType::Void)) {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     }
@@ -995,6 +1232,7 @@ impl VerifyCx<'_> {
                 }
                 field_symbols.push(field.symbol.clone());
                 self.check_type_id(site, field.ty);
+                self.check_lambda_container_type(site, field.ty);
                 if tuple.copyable && !self.copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }
@@ -1266,6 +1504,7 @@ impl VerifyCx<'_> {
         let previous_initialized = std::mem::take(&mut self.initialized);
         let previous_possible = std::mem::take(&mut self.possibly_initialized);
         let previous_payload_ref_owned = std::mem::take(&mut self.payload_ref_owned);
+        let previous_lambda_escapes = std::mem::take(&mut self.lambda_escapes);
         self.initialized = function
             .locals
             .iter()
@@ -1273,12 +1512,18 @@ impl VerifyCx<'_> {
             .collect();
         self.possibly_initialized.clone_from(&self.initialized);
         self.payload_ref_owned = vec![false; function.locals.len()];
+        self.lambda_escapes = vec![None; function.locals.len()];
         for param in &function.params {
             if let Some(initialized) = self.initialized.get_mut(param.local.index()) {
                 *initialized = true;
             }
             if let Some(possible) = self.possibly_initialized.get_mut(param.local.index()) {
                 *possible = true;
+            }
+            if matches!(self.ty(param.ty), Some(RirType::Lambda(_)))
+                && let Some(escape) = self.lambda_escapes.get_mut(param.local.index())
+            {
+                *escape = Some(RirLambdaEscape::from_param_escape(param.escape));
             }
         }
         for (stmt_index, stmt) in function.body.stmts.iter().enumerate() {
@@ -1310,6 +1555,7 @@ impl VerifyCx<'_> {
         self.initialized = previous_initialized;
         self.possibly_initialized = previous_possible;
         self.payload_ref_owned = previous_payload_ref_owned;
+        self.lambda_escapes = previous_lambda_escapes;
     }
 
     fn check_stmt(
@@ -1344,6 +1590,8 @@ impl VerifyCx<'_> {
                 if let Some(expected) = function.locals.get(local.index()).map(|local| local.ty) {
                     self.check_rvalue(function_id, function, index, value, Some(expected));
                 }
+                let escape = self.rvalue_lambda_escape(function, value);
+                self.set_local_lambda_escape(function, *local, escape);
                 if let Some(initialized) = self.initialized.get_mut(local.index()) {
                     *initialized = true;
                 }
@@ -1359,6 +1607,10 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
                 self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                if dst.projections.is_empty() {
+                    let escape = self.rvalue_lambda_escape(function, value);
+                    self.set_local_lambda_escape(function, dst.local, escape);
+                }
             }
             RirStmt::DataRefSet {
                 object,
@@ -1390,16 +1642,22 @@ impl VerifyCx<'_> {
                 }
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
+                let entry_lambda_escapes = self.lambda_escapes.clone();
                 let then_state = self.check_structured_block(
                     function_id,
                     function,
                     &branch.then_block,
                     entry_definite.clone(),
                     entry_possible.clone(),
+                    entry_lambda_escapes.clone(),
                     None,
                 );
                 let else_state = branch.else_block.as_ref().map_or(
-                    Some((entry_definite.clone(), entry_possible.clone())),
+                    Some((
+                        entry_definite.clone(),
+                        entry_possible.clone(),
+                        entry_lambda_escapes.clone(),
+                    )),
                     |else_block| {
                         self.check_structured_block(
                             function_id,
@@ -1407,6 +1665,7 @@ impl VerifyCx<'_> {
                             else_block,
                             entry_definite.clone(),
                             entry_possible.clone(),
+                            entry_lambda_escapes.clone(),
                             None,
                         )
                     },
@@ -1421,6 +1680,7 @@ impl VerifyCx<'_> {
                     &loop_.body,
                     self.initialized.clone(),
                     self.possibly_initialized.clone(),
+                    self.lambda_escapes.clone(),
                     None,
                 );
                 self.loops.pop();
@@ -1440,6 +1700,7 @@ impl VerifyCx<'_> {
                 let mut seen = Vec::new();
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
+                let entry_lambda_escapes = self.lambda_escapes.clone();
                 let mut states = vec![];
                 for arm in &match_.arms {
                     if variant_count.is_none_or(|len| arm.variant.index() >= len) {
@@ -1455,6 +1716,7 @@ impl VerifyCx<'_> {
                         &arm.block,
                         entry_definite.clone(),
                         entry_possible.clone(),
+                        entry_lambda_escapes.clone(),
                         None,
                     ));
                 }
@@ -1465,6 +1727,7 @@ impl VerifyCx<'_> {
                         else_block,
                         entry_definite.clone(),
                         entry_possible.clone(),
+                        entry_lambda_escapes.clone(),
                         None,
                     ));
                 } else if variant_count.is_some_and(|len| seen.len() < len) {
@@ -1483,8 +1746,10 @@ impl VerifyCx<'_> {
                 };
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
+                let entry_lambda_escapes = self.lambda_escapes.clone();
                 let mut some_definite = entry_definite.clone();
                 let mut some_possible = entry_possible.clone();
+                let mut some_lambda_escapes = entry_lambda_escapes.clone();
                 if (match_.payload_ref || match_.payload_escapes) && match_.payload.is_none() {
                     self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload);
                 }
@@ -1539,6 +1804,9 @@ impl VerifyCx<'_> {
                         if let Some(slot) = some_possible.get_mut(payload.index()) {
                             *slot = true;
                         }
+                        if let Some(slot) = some_lambda_escapes.get_mut(payload.index()) {
+                            *slot = None;
+                        }
                     } else {
                         self.push(site, RirVerifyErrorKind::BadId);
                     }
@@ -1563,11 +1831,12 @@ impl VerifyCx<'_> {
                     &match_.some_block,
                     some_definite,
                     some_possible,
+                    some_lambda_escapes,
                     escaping_payload,
                 );
                 if match_.payload_ref
                     && !match_.payload_escapes
-                    && let (Some(payload), Some((definite, possible))) =
+                    && let (Some(payload), Some((definite, possible, _))) =
                         (match_.payload, &mut some_state)
                 {
                     if let Some(slot) = definite.get_mut(payload.index()) {
@@ -1583,6 +1852,7 @@ impl VerifyCx<'_> {
                     &match_.none_block,
                     entry_definite,
                     entry_possible,
+                    entry_lambda_escapes,
                     None,
                 );
                 if match_.payload_escapes && none_state.is_some() {
@@ -1593,6 +1863,60 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn set_local_lambda_escape(
+        &mut self,
+        function: &RirFunction,
+        local: RirLocalId,
+        escape: Option<RirLambdaEscape>,
+    ) {
+        let is_lambda = function
+            .locals
+            .get(local.index())
+            .is_some_and(|local| matches!(self.ty(local.ty), Some(RirType::Lambda(_))));
+        if let Some(slot) = self.lambda_escapes.get_mut(local.index()) {
+            *slot = is_lambda.then_some(escape).flatten();
+        }
+    }
+
+    fn rvalue_lambda_escape(
+        &self,
+        function: &RirFunction,
+        value: &RirRValue,
+    ) -> Option<RirLambdaEscape> {
+        match value {
+            RirRValue::Lambda { lambda, .. } => self
+                .program
+                .lambdas
+                .get(lambda.index())
+                .map(|decl| decl.escape),
+            RirRValue::Use(operand) => self.operand_lambda_escape(function, operand),
+            _ => None,
+        }
+    }
+
+    fn operand_lambda_escape(
+        &self,
+        function: &RirFunction,
+        operand: &RirOperand,
+    ) -> Option<RirLambdaEscape> {
+        let RirOperand::Place(place) = operand else {
+            return None;
+        };
+        if !place.projections.is_empty()
+            || !matches!(self.ty(place.ty), Some(RirType::Lambda(_)))
+            || function
+                .locals
+                .get(place.local.index())
+                .is_none_or(|local| local.ty != place.ty)
+        {
+            return None;
+        }
+        self.lambda_escapes
+            .get(place.local.index())
+            .copied()
+            .flatten()
+    }
+
     fn check_structured_block(
         &mut self,
         function_id: RirFunctionId,
@@ -1600,10 +1924,12 @@ impl VerifyCx<'_> {
         body: &RirStructuredBlock,
         definite: Vec<bool>,
         possible: Vec<bool>,
+        lambda_escapes: Vec<Option<RirLambdaEscape>>,
         preserved_payload_ref: Option<RirLocalId>,
-    ) -> Option<(Vec<bool>, Vec<bool>)> {
+    ) -> Option<RirBlockState> {
         let outer_definite = std::mem::replace(&mut self.initialized, definite);
         let outer_possible = std::mem::replace(&mut self.possibly_initialized, possible);
+        let outer_lambda_escapes = std::mem::replace(&mut self.lambda_escapes, lambda_escapes);
         for (index, stmt) in body.stmts.iter().enumerate() {
             self.check_stmt(function_id, function, index, stmt);
         }
@@ -1612,6 +1938,7 @@ impl VerifyCx<'_> {
         let result = falls_through.then(|| {
             let mut definite = self.initialized.clone();
             let mut possible = self.possibly_initialized.clone();
+            let lambda_escapes = self.lambda_escapes.clone();
             for local in &function.locals {
                 if local.payload_ref && Some(local.id) != preserved_payload_ref {
                     if let Some(slot) = definite.get_mut(local.id.index()) {
@@ -1622,10 +1949,11 @@ impl VerifyCx<'_> {
                     }
                 }
             }
-            (definite, possible)
+            (definite, possible, lambda_escapes)
         });
         self.initialized = outer_definite;
         self.possibly_initialized = outer_possible;
+        self.lambda_escapes = outer_lambda_escapes;
         result
     }
 
@@ -1686,15 +2014,12 @@ impl VerifyCx<'_> {
         seen.len() == enm.variants.len()
     }
 
-    fn merge_structured_states(
-        &mut self,
-        states: impl IntoIterator<Item = Option<(Vec<bool>, Vec<bool>)>>,
-    ) {
+    fn merge_structured_states(&mut self, states: impl IntoIterator<Item = Option<RirBlockState>>) {
         let mut states = states.into_iter().flatten();
-        let Some((mut definite, mut possible)) = states.next() else {
+        let Some((mut definite, mut possible, mut lambda_escapes)) = states.next() else {
             return;
         };
-        for (next_definite, next_possible) in states {
+        for (next_definite, next_possible, next_lambda_escapes) in states {
             definite = definite
                 .iter()
                 .zip(&next_definite)
@@ -1705,9 +2030,15 @@ impl VerifyCx<'_> {
                 .zip(&next_possible)
                 .map(|(lhs, rhs)| *lhs || *rhs)
                 .collect();
+            lambda_escapes = lambda_escapes
+                .iter()
+                .zip(&next_lambda_escapes)
+                .map(|(lhs, rhs)| if lhs == rhs { *lhs } else { None })
+                .collect();
         }
         self.initialized = definite;
         self.possibly_initialized = possible;
+        self.lambda_escapes = lambda_escapes;
     }
 
     fn check_rvalue(
@@ -1929,7 +2260,7 @@ impl VerifyCx<'_> {
             }
             RirRValue::Call { callee, args, ty } => {
                 self.check_type_id(site, *ty);
-                self.check_call(function_id, function, index, *callee, args, *ty);
+                self.check_call(function_id, function, index, callee.clone(), args, *ty);
                 Some(*ty)
             }
             RirRValue::Len { source } => {
@@ -2040,6 +2371,19 @@ impl VerifyCx<'_> {
                 self.check_value_operand_ty(site, function, key, key_ty);
                 Some(*ty)
             }
+            RirRValue::Lambda { lambda, ty } => {
+                self.check_type_id(site, *ty);
+                let Some(RirType::Lambda(sig)) = self.ty(*ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                match self.program.lambdas.get(lambda.index()) {
+                    Some(decl) if decl.sig == sig => {}
+                    Some(_) => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
+                    None => self.push(site, RirVerifyErrorKind::BadId),
+                }
+                Some(*ty)
+            }
             RirRValue::MapInsert { map, key, value } => {
                 self.check_place(site, function, map);
                 if function
@@ -2069,6 +2413,19 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn call_arg_lambda_escape(
+        &self,
+        function: &RirFunction,
+        arg: &RirCallArg,
+    ) -> Option<RirLambdaEscape> {
+        match arg {
+            RirCallArg::Value(operand) => self.operand_lambda_escape(function, operand),
+            RirCallArg::SharedBorrow(_)
+            | RirCallArg::MutBorrow(_)
+            | RirCallArg::SharedStringConst(_) => None,
+        }
+    }
+
     fn check_call(
         &mut self,
         function_id: RirFunctionId,
@@ -2086,7 +2443,7 @@ impl VerifyCx<'_> {
                         function
                             .params
                             .iter()
-                            .map(|param| (param.ty, param.semantic, param.abi))
+                            .map(|param| (param.ty, param.semantic, param.abi, param.escape))
                             .collect::<Vec<_>>(),
                         function.ret.ty,
                     ),
@@ -2099,12 +2456,49 @@ impl VerifyCx<'_> {
                     Some(ext) => (
                         ext.params
                             .iter()
-                            .map(|param| (param.ty, param.semantic, param.abi))
+                            .map(|param| {
+                                (
+                                    param.ty,
+                                    param.semantic,
+                                    param.abi,
+                                    RirParamEscape::NonEscaping,
+                                )
+                            })
                             .collect::<Vec<_>>(),
                         ext.ret,
                     ),
                     None => return,
                 }
+            }
+            RirCallTarget::LambdaValue { callee, sig } => {
+                self.check_lambda_sig_id(RirVerifySite::RValue(function_id, stmt), sig);
+                let Some(sig_decl) = self.program.lambda_sigs.get(sig.index()) else {
+                    return;
+                };
+                match self.value_operand_ty(
+                    RirVerifySite::RValue(function_id, stmt),
+                    function,
+                    &callee,
+                ) {
+                    Some(ty) if self.ty(ty) == Some(RirType::Lambda(sig)) => {}
+                    Some(found) => {
+                        let site = RirVerifySite::RValue(function_id, stmt);
+                        match self.type_id(RirType::Lambda(sig)) {
+                            Some(expected) => self
+                                .push(site, RirVerifyErrorKind::TypeMismatch { expected, found }),
+                            None => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
+                        }
+                    }
+                    None => return,
+                }
+                (
+                    sig_decl
+                        .params
+                        .iter()
+                        .map(|param| (param.ty, param.semantic, param.abi, param.escape))
+                        .collect::<Vec<_>>(),
+                    sig_decl.ret,
+                )
             }
         };
         if expected.len() != args.len() {
@@ -2126,13 +2520,19 @@ impl VerifyCx<'_> {
                 },
             );
         }
-        for (index, (arg, (ty, mode, abi))) in args.iter().zip(expected).enumerate() {
+        for (index, (arg, (ty, mode, abi, escape))) in args.iter().zip(expected).enumerate() {
             let site = RirVerifySite::CallArg(function_id, stmt, index);
             if arg.semantic() != mode {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
             if RustRepPolicy::new(self.program).call_arg_abi(ty, arg.semantic()) != Some(abi) {
                 self.push(site, RirVerifyErrorKind::UnsupportedAbi);
+            }
+            if escape == RirParamEscape::Escaping
+                && matches!(self.ty(ty), Some(RirType::Lambda(_)))
+                && self.call_arg_lambda_escape(function, arg) != Some(RirLambdaEscape::Escaping)
+            {
+                self.push(site, RirVerifyErrorKind::CallArgEscape);
             }
             let found = match arg {
                 RirCallArg::Value(operand) => self.value_operand_ty(site, function, operand),
@@ -2291,7 +2691,8 @@ impl VerifyCx<'_> {
                 | RirType::List(_)
                 | RirType::Map { .. }
                 | RirType::Option(_)
-                | RirType::Slice(_),
+                | RirType::Slice(_)
+                | RirType::Lambda(_),
             )
             | None => false,
         }
@@ -2312,7 +2713,8 @@ impl VerifyCx<'_> {
             | RirType::List(_)
             | RirType::Map { .. }
             | RirType::Option(_)
-            | RirType::Slice(_) => {
+            | RirType::Slice(_)
+            | RirType::Lambda(_) => {
                 return false;
             }
         }
@@ -2704,6 +3106,7 @@ impl VerifyCx<'_> {
                 | RirType::List(_)
                 | RirType::Map { .. }
                 | RirType::Slice(_)
+                | RirType::Lambda(_)
                 | RirType::String,
             )
             | None => false,
@@ -2718,6 +3121,12 @@ impl VerifyCx<'_> {
 
     fn check_extern_id(&mut self, site: RirVerifySite, id: RirExternId) {
         if id.index() >= self.program.externs.len() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
+    fn check_lambda_sig_id(&mut self, site: RirVerifySite, id: RirLambdaSigId) {
+        if id.index() >= self.program.lambda_sigs.len() {
             self.push(site, RirVerifyErrorKind::BadId);
         }
     }

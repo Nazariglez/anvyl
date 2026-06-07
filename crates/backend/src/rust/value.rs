@@ -125,7 +125,9 @@ impl<'a> RustValues<'a> {
                 self.copy_from_ref(ty, &format!("&{expr}"))
             }
             RirType::Option(_) => self.copy_from_ref(ty, &format!("&{expr}")),
-            RirType::Slice(_) | RirType::Void => unreachable!("verified dataref field value"),
+            RirType::Slice(_) | RirType::Lambda(_) | RirType::Void => {
+                unreachable!("verified dataref field value")
+            }
         }
     }
 
@@ -321,7 +323,9 @@ impl<'a> RustValues<'a> {
 
     fn copy_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
         match self.program.types[ty.index()] {
-            RirType::Int | RirType::Float | RirType::Bool => format!("*({expr})"),
+            RirType::Int | RirType::Float | RirType::Bool | RirType::Lambda(_) => {
+                format!("*({expr})")
+            }
             RirType::Struct(id) => {
                 let strukt = &self.program.structs[id.index()];
                 self.copy_record_from_ref(strukt.symbol.as_str(), &strukt.fields, expr)

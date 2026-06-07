@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @match: tick
+
+fn tick() {
+    println("tick");
+}
+
+fn keep(f: escaping fn()) {
+    f();
+}
+
+fn main() {
+    let f = tick;
+    keep(f);
+}

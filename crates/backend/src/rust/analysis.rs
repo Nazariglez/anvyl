@@ -49,6 +49,9 @@ fn rvalue_calls_fallible(program: &RirProgram, fallible: &[bool], value: &RirRVa
             RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
                 RirExternKind::Native(native) => native.abi.fallible,
             },
+            RirCallTarget::LambdaValue { sig, .. } => program
+                .lambdas_for_sig(*sig)
+                .any(|lambda| fallible[lambda.function.index()]),
         },
         RirRValue::Use(_)
         | RirRValue::Unary { .. }
@@ -68,6 +71,7 @@ fn rvalue_calls_fallible(program: &RirProgram, fallible: &[bool], value: &RirRVa
         | RirRValue::MapInsert { .. }
         | RirRValue::MapRemove { .. }
         | RirRValue::ListSlice { .. }
+        | RirRValue::Lambda { .. }
         | RirRValue::Struct { .. }
         | RirRValue::Tuple { .. }
         | RirRValue::EnumVariant { .. }
@@ -169,6 +173,7 @@ fn rvalue_uses_ctx(program: &RirProgram, value: &RirRValue) -> bool {
         | RirRValue::MapInsert { .. }
         | RirRValue::MapRemove { .. }
         | RirRValue::ListSlice { .. }
+        | RirRValue::Lambda { .. }
         | RirRValue::Struct { .. }
         | RirRValue::Tuple { .. }
         | RirRValue::EnumVariant { .. } => false,

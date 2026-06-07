@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn tick() {}
+
+fn each(f: fn()) {
+    f();
+}
+
+fn keep(f: escaping fn()) {}
+
+fn main() {
+    let f = tick;
+    f();
+    each(tick);
+    keep(f);
+}

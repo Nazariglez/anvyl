@@ -17,8 +17,8 @@ use std::{collections::HashMap, error::Error, fmt};
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId, LocalId,
-        LocalKind, Mutability, Operand, ParamMode, Place, Projection, RValue, TypeData, TypeId,
-        TypePassClasses, VerifiedProgram,
+        LocalKind, Mutability, Operand, ParamEscape, ParamMode, Place, Projection, RValue,
+        TypeData, TypeId, TypePassClasses, VerifiedProgram,
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -32,12 +32,14 @@ use self::{
         RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm,
         RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
-        RirIf, RirLocal, RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand,
-        RirOptionMatch, RirParam, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
-        RirRawEnumValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
-        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
-        RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId,
-        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirIf, RirLambda, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
+        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
+        RirLoopId, RirNativeExtern, RirOperand, RirOptionMatch, RirParam, RirParamEscape,
+        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue,
+        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -159,7 +161,6 @@ pub enum RustTargetGapKind {
     UnsupportedExternMember,
     UnsupportedEntry,
     UnsupportedRustAbi,
-    UnsupportedLambdaType,
     UnsupportedLambdaValue,
     UnsupportedLambdaCall,
     UnsupportedLambdaCapture,
@@ -222,11 +223,9 @@ impl From<RustBackendProfileError> for RustTargetGap {
                     RustTargetGapKind::UnsupportedExternMember
                 }
                 ProfileErrorKind::UnsupportedEntry => RustTargetGapKind::UnsupportedEntry,
-                ProfileErrorKind::UnsupportedLambdaType => RustTargetGapKind::UnsupportedLambdaType,
                 ProfileErrorKind::UnsupportedLambdaValue => {
                     RustTargetGapKind::UnsupportedLambdaValue
                 }
-                ProfileErrorKind::UnsupportedLambdaCall => RustTargetGapKind::UnsupportedLambdaCall,
                 ProfileErrorKind::UnsupportedLambdaCapture => {
                     RustTargetGapKind::UnsupportedLambdaCapture
                 }
@@ -246,8 +245,11 @@ struct PlanCx<'a> {
     classes: TypePassClasses,
     config: RustPlanConfig,
     type_map: HashMap<TypeId, RirTypeId>,
+    lambda_sig_map: HashMap<TypeId, RirLambdaSigId>,
     const_map: HashMap<ConstId, RirConstId>,
     function_map: HashMap<FunctionId, RirFunctionId>,
+    function_lambda_map: HashMap<FunctionId, RirLambdaId>,
+    lambda_map: HashMap<air::LambdaId, RirLambdaId>,
     extern_map: HashMap<ExternId, RirExternId>,
     dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
@@ -322,8 +324,11 @@ impl<'a> PlanCx<'a> {
             classes: TypePassClasses::analyze(air),
             config,
             type_map: HashMap::new(),
+            lambda_sig_map: HashMap::new(),
             const_map: HashMap::new(),
             function_map: HashMap::new(),
+            function_lambda_map: HashMap::new(),
+            lambda_map: HashMap::new(),
             extern_map: HashMap::new(),
             dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
@@ -350,6 +355,7 @@ impl<'a> PlanCx<'a> {
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
+        self.plan_lambdas(&mut program)?;
         self.plan_stringify_helpers(&mut program)?;
         for index in 0..self.air.functions.len() {
             let id = FunctionId::from_index(index);
@@ -421,7 +427,12 @@ impl<'a> PlanCx<'a> {
                     RirType::Tuple(tuple_id)
                 }
                 TypeData::Slice(elem) => RirType::Slice(self.type_map[elem]),
-                TypeData::Any | TypeData::Map { .. } | TypeData::Function(_) | TypeData::Dyn(_) => {
+                TypeData::Function(sig) => {
+                    let sig = self.intern_lambda_sig(program, sig);
+                    self.lambda_sig_map.insert(type_id, sig);
+                    RirType::Lambda(sig)
+                }
+                TypeData::Any | TypeData::Map { .. } | TypeData::Dyn(_) => {
                     return Err(Self::gap(
                         RustTargetGapSite::Type(type_id),
                         RustTargetGapKind::UnsupportedType,
@@ -457,6 +468,37 @@ impl<'a> PlanCx<'a> {
             .collect::<Vec<_>>();
         self.finalize_copyable_flags(program, &struct_types, &enum_types, &tuple_types);
         Ok(())
+    }
+
+    fn intern_lambda_sig(
+        &self,
+        program: &mut RirProgram,
+        sig: &air::SignatureType,
+    ) -> RirLambdaSigId {
+        let params = sig
+            .params
+            .iter()
+            .map(|param| {
+                let semantic = rir::semantic_from_air(param.mode);
+                RirLambdaParam {
+                    ty: self.type_map[&param.ty],
+                    semantic,
+                    abi: RustRepPolicy::new(program).param_abi(semantic),
+                    escape: rir_param_escape(param.escape),
+                }
+            })
+            .collect::<Vec<_>>();
+        let ret = self.type_map[&sig.ret.ty()];
+        if let Some(existing) = program
+            .lambda_sigs
+            .iter()
+            .find(|existing| existing.params == params && existing.ret == ret)
+        {
+            return existing.id;
+        }
+        let id = RirLambdaSigId::from_index(program.lambda_sigs.len());
+        program.lambda_sigs.push(RirLambdaSig { id, params, ret });
+        id
     }
 
     fn intern_tuple(
@@ -1101,6 +1143,92 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn plan_lambdas(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+        let mut function_refs = Vec::new();
+        for function in &self.air.functions {
+            function.body.for_each_rvalue(&mut |value| {
+                if let RValue::FunctionRef { function, .. } = value
+                    && !function_refs.contains(function)
+                {
+                    function_refs.push(*function);
+                }
+            });
+        }
+        for air_id in function_refs {
+            let function = self.air.function(air_id);
+            if matches!(function.kind, air::FunctionKind::Lambda(_)) {
+                continue;
+            }
+            let sig = self.function_lambda_sig(program, function);
+            let id = Self::push_zero_env_lambda(
+                program,
+                RirLambdaSource::Function(air_id),
+                self.function_map[&air_id],
+                sig,
+                RirLambdaEscape::Escaping,
+            );
+            self.function_lambda_map.insert(air_id, id);
+        }
+        for (index, decl) in self.air.lambdas.iter().enumerate() {
+            if !decl.captures.is_empty() {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(decl.owner),
+                    RustTargetGapKind::UnsupportedLambdaCapture,
+                ));
+            }
+            let lambda = air::LambdaId::from_index(index);
+            let sig = self.intern_lambda_sig(program, &decl.signature);
+            let id = Self::push_zero_env_lambda(
+                program,
+                RirLambdaSource::Lambda(lambda),
+                self.function_map[&decl.body],
+                sig,
+                match decl.escape {
+                    air::LambdaEscape::NonEscaping => RirLambdaEscape::NonEscaping,
+                    air::LambdaEscape::Escaping => RirLambdaEscape::Escaping,
+                },
+            );
+            self.lambda_map.insert(lambda, id);
+        }
+        Ok(())
+    }
+
+    fn push_zero_env_lambda(
+        program: &mut RirProgram,
+        source: RirLambdaSource,
+        function: RirFunctionId,
+        sig: RirLambdaSigId,
+        escape: RirLambdaEscape,
+    ) -> RirLambdaId {
+        let id = RirLambdaId::from_index(program.lambdas.len());
+        program.lambdas.push(RirLambda {
+            id,
+            source,
+            function,
+            sig,
+            escape,
+            storage: RirLambdaStorage::ZeroEnv,
+        });
+        id
+    }
+
+    fn function_lambda_sig(
+        &self,
+        program: &mut RirProgram,
+        function: &air::Function,
+    ) -> RirLambdaSigId {
+        let sig = air::SignatureType::new(
+            function
+                .signature
+                .params
+                .iter()
+                .map(air::Param::param_type)
+                .collect(),
+            function.signature.return_mode,
+        );
+        self.intern_lambda_sig(program, &sig)
+    }
+
     fn plan_function(
         &self,
         air_id: FunctionId,
@@ -1138,6 +1266,7 @@ impl<'a> PlanCx<'a> {
                     ty,
                     semantic,
                     abi: policy.param_abi(semantic),
+                    escape: rir_param_escape(param.escape),
                 }
             })
             .collect();
@@ -1551,11 +1680,28 @@ impl<'a> PlanCx<'a> {
                     post_stmts: vec![],
                 }
             }
-            RValue::FunctionRef { .. } | RValue::MakeLambda { .. } => {
-                return Err(Self::gap(
-                    RustTargetGapSite::Function(function),
-                    RustTargetGapKind::UnsupportedLambdaValue,
-                ));
+            RValue::FunctionRef {
+                function: target,
+                ty,
+            } => PlannedRValue::from_value(RirRValue::Lambda {
+                lambda: self.function_lambda_map[target],
+                ty: self.type_map[ty],
+            }),
+            RValue::MakeLambda {
+                lambda,
+                captures,
+                ty,
+            } => {
+                if !captures.is_empty() {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
+                PlannedRValue::from_value(RirRValue::Lambda {
+                    lambda: self.lambda_map[lambda],
+                    ty: self.type_map[ty],
+                })
             }
             RValue::ListPop { .. } | RValue::MapEntryAt { .. } => {
                 return Err(Self::gap(
@@ -1682,12 +1828,13 @@ impl<'a> PlanCx<'a> {
         args: &[CallArg],
         locals: &mut Vec<RirLocal>,
     ) -> Result<PlannedRValue, RustPlanError> {
-        let (target, ty) = match callee {
+        let (target, ty, callee_stmts) = match callee {
             Callee::Function(id) => {
                 let function = self.air.function(*id);
                 (
                     RirCallTarget::Function(self.function_map[id]),
                     self.type_map[&function.signature.return_type()],
+                    vec![],
                 )
             }
             Callee::Extern(id) => {
@@ -1695,16 +1842,30 @@ impl<'a> PlanCx<'a> {
                 (
                     RirCallTarget::Extern(self.extern_map[id]),
                     self.type_map[&ext.return_type],
+                    vec![],
                 )
             }
-            Callee::Lambda(_) => {
-                return Err(Self::gap(
-                    RustTargetGapSite::Function(function_id),
-                    RustTargetGapKind::UnsupportedLambdaCall,
-                ));
+            Callee::Lambda(operand) => {
+                let air_ty = self.operand_ty(operand);
+                let TypeData::Function(sig_ty) = self.air.type_arena.data(air_ty) else {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function_id),
+                        RustTargetGapKind::UnsupportedLambdaCall,
+                    ));
+                };
+                let callee = self.plan_operand_read(function_id, operand, locals);
+                let sig = self.lambda_sig_map[&air_ty];
+                (
+                    RirCallTarget::LambdaValue {
+                        callee: callee.operand,
+                        sig,
+                    },
+                    self.type_map[&sig_ty.ret.ty()],
+                    callee.stmts,
+                )
             }
         };
-        let mut stmts = vec![];
+        let mut stmts = callee_stmts;
         let mut post_stmts = vec![];
         let mut planned_args = vec![];
         for arg in args {
@@ -2083,6 +2244,13 @@ fn set_if_changed(slot: &mut bool, value: bool) -> bool {
     changed
 }
 
+fn rir_param_escape(escape: ParamEscape) -> RirParamEscape {
+    match escape {
+        ParamEscape::NonEscaping => RirParamEscape::NonEscaping,
+        ParamEscape::Escaping => RirParamEscape::Escaping,
+    }
+}
+
 fn rir_format_spec(spec: FormatSpec) -> RirFormatSpec {
     RirFormatSpec {
         fill: spec.fill,
@@ -2184,6 +2352,7 @@ fn type_suffix(program: &RirProgram, ty: RirTypeId) -> String {
             type_suffix(program, value)
         ),
         RirType::Slice(elem) => format!("slice_{}", type_suffix(program, elem)),
+        RirType::Lambda(sig) => format!("lambda_{}", sig.index()),
         RirType::Array { elem, len } => format!("array_{}_{}", len, type_suffix(program, elem)),
         RirType::Struct(id) => named_type_suffix(ty.index(), &program.structs[id.index()].display),
         RirType::Tuple(id) => named_type_suffix(ty.index(), &program.tuples[id.index()].display),

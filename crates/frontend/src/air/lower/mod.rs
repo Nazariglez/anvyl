@@ -9,10 +9,11 @@ use super::{
     EnumRepr, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember,
     ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
     ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, FieldDecl, FieldId, Function,
-    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, Local, LocalId, LocalKind,
-    Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode,
-    ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, Signature,
-    SignatureType, TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
+    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, LambdaDecl, LambdaEscape,
+    LambdaId, Local, LocalId, LocalKind, Module, ModuleId, Mutability as AirMutability, Operand,
+    Param, ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue,
+    RawEnumValue, ReturnMode, Signature, SignatureType, TypeData, TypeId, VariantDecl,
+    VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -29,10 +30,10 @@ use crate::{
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
         CallableParent, CaptureStorageOrigin, ConstTerm, DeclarationIndex, DefaultArgFact,
-        EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, GenericArgs, LambdaBodyKey,
-        LambdaCaptureFact, LambdaEscapeFact, LocalDefFact, LocalDefKind, LocalUseFact,
-        LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope, NominalKey,
-        RawEnumValue as TcRawEnumValue, SemanticBodyFacts, SemanticFactMaps,
+        EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, FunctionValueKind, GenericArgs,
+        LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact,
+        LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface,
+        ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
         SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
         VariantPayload, nominal_generic_args, substitute_aggregate_member,
         type_has_unfinished_facts,
@@ -792,6 +793,7 @@ struct LoweringMaps {
     modules: HashMap<ModuleScope, ModuleId>,
     bodies: HashMap<BodyInstanceKey, FunctionId>,
     locals: HashMap<BodyInstanceKey, HashMap<SemanticLocalId, LocalId>>,
+    lambdas: HashMap<LambdaBodyKey, LambdaId>,
     externs: HashMap<ExternUseTarget, ExternId>,
 }
 
@@ -802,7 +804,6 @@ struct LowerCx<'facts> {
     maps: LoweringMaps,
     decls: Option<DeclarationIndex>,
     externs: Option<ExternCatalog>,
-    semantic_facts: Option<&'facts SemanticFactMaps>,
     typecheck_facts: Option<&'facts TypecheckFacts>,
 }
 
@@ -830,16 +831,6 @@ impl LowerCx<'_> {
             .lambda_escapes()
             .get(&expr_id)
             .ok_or(LowerError::MissingLambdaEscape { expr_id })
-    }
-
-    fn lambda_body_facts(&self, key: LambdaBodyKey) -> Result<&SemanticBodyFacts, LowerError> {
-        let body = BodyInstanceKey::Lambda(key);
-        self.semantic_facts
-            .expect("AIR lowering requires semantic facts")
-            .body(&body)
-            .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
-                body: Box::new(body),
-            })
     }
 
     fn lambda_capture_facts(&self, expr_id: ExprId) -> Result<Vec<LambdaCaptureFact>, LowerError> {
@@ -878,11 +869,40 @@ impl LowerCx<'_> {
         let module = self.ensure_module(scope);
         let id = self.program.alloc_function(build(module));
         self.program.module_mut(module).functions.push(id);
-        let old = self.maps.bodies.insert(body.clone(), id);
+        self.register_body_function(body, locals, id);
+        id
+    }
+
+    fn alloc_lambda_function_in_module(
+        &mut self,
+        module: ModuleId,
+        body: BodyInstanceKey,
+        locals: HashMap<SemanticLocalId, LocalId>,
+        decl: impl FnOnce(FunctionId) -> LambdaDecl,
+        build: impl FnOnce(LambdaId) -> Function,
+    ) -> FunctionId {
+        let expected = FunctionId::from_index(self.program.functions.len());
+        let lambda = self.program.alloc_lambda(decl(expected));
+        let function = self.program.alloc_function(build(lambda));
+        debug_assert_eq!(function, expected);
+        self.program.module_mut(module).functions.push(function);
+        if let BodyInstanceKey::Lambda(key) = &body {
+            self.maps.lambdas.insert(key.clone(), lambda);
+        }
+        self.register_body_function(body, locals, function);
+        function
+    }
+
+    fn register_body_function(
+        &mut self,
+        body: BodyInstanceKey,
+        locals: HashMap<SemanticLocalId, LocalId>,
+        function: FunctionId,
+    ) {
+        let old = self.maps.bodies.insert(body.clone(), function);
         debug_assert!(old.is_none(), "duplicate lowered function body");
         let old = self.maps.locals.insert(body, locals);
         debug_assert!(old.is_none(), "duplicate lowered function local map");
-        id
     }
 
     fn alloc_extern_in_module(
@@ -1196,82 +1216,212 @@ impl LowerCx<'_> {
         functions: &ReachableCallables<'_>,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
-            let module_scope = &modules.items[source.callable.module()].scope;
-            let fact = source.fact;
-            let return_type = self.lower_ty(&fact.ret.ty)?;
-            let return_mode = match fact.ret.access {
-                ReturnAccess::Value => ReturnMode::Value(return_type),
-                ReturnAccess::Place => ReturnMode::Place(return_type),
-            };
-            let mut params = vec![];
-            let mut locals = vec![];
-            let mut local_map = HashMap::new();
-            for (index, param_fact) in fact.params.iter().enumerate() {
-                let body_facts = source.body_facts.as_facts();
-                let semantic_local = body_facts
-                    .locals
-                    .param_defs
-                    .get(&index)
-                    .copied()
-                    .ok_or_else(|| LowerError::MissingParamDef {
-                        body: Box::new(source.body.clone()),
-                        index,
-                    })?;
-                let def = body_facts.locals.defs.get(&semantic_local).ok_or_else(|| {
-                    LowerError::MissingLocalDef {
-                        body: Box::new(source.body.clone()),
-                        local: semantic_local,
-                    }
-                })?;
-                debug_assert_eq!(def.kind, LocalDefKind::Parameter);
-                debug_assert_eq!(def.name, param_fact.name);
-                debug_assert_eq!(def.mutable, param_fact.mutable);
-                let ty = self.lower_ty(&param_fact.ty)?;
-                let escape = param_fact.escape.into();
-                let local_id = LocalId::from_index(locals.len());
-                locals.push(Local {
-                    name: Some(param_fact.name),
-                    binding: def.binding_id.map(air_binding_id),
-                    ty,
-                    mutability: if param_fact.mutable {
-                        AirMutability::Mutable
-                    } else {
-                        AirMutability::Immutable
-                    },
-                    kind: LocalKind::Arg,
-                });
-                let old = local_map.insert(semantic_local, local_id);
-                debug_assert!(old.is_none(), "duplicate semantic param local");
-                params.push(Param {
-                    name: Some(param_fact.name),
-                    ty,
-                    mode: source_param_mode(param_fact.mutable),
-                    escape,
-                    role: if source.callable.is_instance_method() && index == 0 {
+            match &source.source {
+                ReachableSource::Callable { callable, fact } => {
+                    let module_scope = &modules.items[callable.module()].scope;
+                    let return_type = self.lower_ty(&fact.ret.ty)?;
+                    let return_mode = match fact.ret.access {
+                        ReturnAccess::Value => ReturnMode::Value(return_type),
+                        ReturnAccess::Place => ReturnMode::Place(return_type),
+                    };
+                    let (params, locals, local_map) =
+                        self.lower_callable_params(source, *callable, fact)?;
+                    let specialization = self.function_specialization(&source.body)?;
+                    self.alloc_function_in_module(
+                        module_scope,
+                        source.body.clone(),
+                        local_map,
+                        |module| Function {
+                            name: callable.name(),
+                            module,
+                            kind: callable.function_kind(),
+                            owner: callable.owner(),
+                            specialization,
+                            signature: Signature::with_return_mode(params, return_mode),
+                            locals,
+                            body: AirBody {
+                                block: AirBlock::default(),
+                            },
+                        },
+                    );
+                }
+                ReachableSource::Lambda { owner, lambda, ty } => {
+                    let owner = self.maps.bodies[owner];
+                    let module = self.program.function(owner).module;
+                    let ty = *ty;
+                    let Type::Func {
+                        params: source_params,
+                        ret,
+                    } = ty
+                    else {
+                        return Err(LowerError::UnsupportedType {
+                            ty: Box::new(ty.clone()),
+                        });
+                    };
+                    let return_ty = self.lower_ty(&ret.ty)?;
+                    let return_mode = match ret.access {
+                        ReturnAccess::Value => ReturnMode::Value(return_ty),
+                        ReturnAccess::Place => ReturnMode::Place(return_ty),
+                    };
+                    let (params, locals, local_map) =
+                        self.lower_lambda_params(source, lambda, source_params)?;
+                    let signature = Signature::with_return_mode(params, return_mode);
+                    let lambda_signature = SignatureType::new(
+                        signature.params.iter().map(Param::param_type).collect(),
+                        signature.return_mode,
+                    );
+                    let lambda_key = match &source.body {
+                        BodyInstanceKey::Lambda(key) => key.clone(),
+                        _ => unreachable!("lambda source must use lambda body key"),
+                    };
+                    let escape = self.lambda_escape(lambda_key.expr)?;
+                    self.alloc_lambda_function_in_module(
+                        module,
+                        source.body.clone(),
+                        local_map,
+                        |body| LambdaDecl {
+                            source: lambda_key.expr,
+                            module,
+                            owner,
+                            body,
+                            signature: lambda_signature,
+                            escape,
+                            captures: vec![],
+                        },
+                        |lambda| Function {
+                            name: Ident::new("lambda"),
+                            module,
+                            kind: FunctionKind::Lambda(lambda),
+                            owner: None,
+                            specialization: None,
+                            signature,
+                            locals,
+                            body: AirBody {
+                                block: AirBlock::default(),
+                            },
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_callable_params(
+        &mut self,
+        source: &ReachableCallable<'_>,
+        callable: SourceCallable<'_>,
+        fact: &SemanticFunctionInstanceFact,
+    ) -> Result<ParamLowerResult, LowerError> {
+        let receiver = callable.is_instance_method();
+        self.lower_params(
+            source,
+            fact.params
+                .iter()
+                .enumerate()
+                .map(|(index, param)| ParamLowerSpec {
+                    name: param.name,
+                    ty: &param.ty,
+                    mutable: param.mutable,
+                    escape: param.escape,
+                    role: if receiver && index == 0 {
                         ParamRole::Receiver
                     } else {
                         ParamRole::Normal
                     },
-                    local_id,
-                });
-            }
-            let specialization = self.function_specialization(&source.body)?;
-            self.alloc_function_in_module(module_scope, source.body.clone(), local_map, |module| {
-                Function {
-                    name: source.callable.name(),
-                    module,
-                    kind: source.callable.function_kind(),
-                    owner: source.callable.owner(),
-                    specialization,
-                    signature: Signature::with_return_mode(params, return_mode),
-                    locals,
-                    body: AirBody {
-                        block: AirBlock::default(),
-                    },
+                }),
+        )
+    }
+
+    fn lower_lambda_params(
+        &mut self,
+        source: &ReachableCallable<'_>,
+        lambda: &ast::LambdaNode,
+        source_params: &[ast::FuncParam],
+    ) -> Result<ParamLowerResult, LowerError> {
+        let specs =
+            source_params
+                .iter()
+                .enumerate()
+                .map(|(index, param)| {
+                    let lambda_param = lambda.node.params.get(index).ok_or_else(|| {
+                        LowerError::MissingParamDef {
+                            body: Box::new(source.body.clone()),
+                            index,
+                        }
+                    })?;
+                    Ok(ParamLowerSpec {
+                        name: lambda_param.name,
+                        ty: &param.ty,
+                        mutable: param.mutable,
+                        escape: param.escape,
+                        role: ParamRole::Normal,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        self.lower_params(source, specs)
+    }
+
+    fn lower_params<'a>(
+        &mut self,
+        source: &ReachableCallable<'_>,
+        specs: impl IntoIterator<Item = ParamLowerSpec<'a>>,
+    ) -> Result<ParamLowerResult, LowerError> {
+        let body_facts = source.body_facts.as_facts();
+        let mut params = vec![];
+        let mut locals = vec![];
+        let mut local_map = HashMap::new();
+        for (index, spec) in specs.into_iter().enumerate() {
+            let semantic_local = body_facts
+                .locals
+                .param_defs
+                .get(&index)
+                .copied()
+                .ok_or_else(|| LowerError::MissingParamDef {
+                    body: Box::new(source.body.clone()),
+                    index,
+                })?;
+            let def = body_facts.locals.defs.get(&semantic_local).ok_or_else(|| {
+                LowerError::MissingLocalDef {
+                    body: Box::new(source.body.clone()),
+                    local: semantic_local,
                 }
+            })?;
+            debug_assert_eq!(def.kind, LocalDefKind::Parameter);
+            debug_assert_eq!(def.name, spec.name);
+            debug_assert_eq!(def.mutable, spec.mutable);
+            let ty = self.lower_ty(spec.ty)?;
+            let local_id = LocalId::from_index(locals.len());
+            locals.push(Local {
+                name: Some(spec.name),
+                binding: def.binding_id.map(air_binding_id),
+                ty,
+                mutability: if spec.mutable {
+                    AirMutability::Mutable
+                } else {
+                    AirMutability::Immutable
+                },
+                kind: LocalKind::Arg,
+            });
+            let old = local_map.insert(semantic_local, local_id);
+            debug_assert!(old.is_none(), "duplicate semantic param local");
+            params.push(Param {
+                name: Some(spec.name),
+                ty,
+                mode: source_param_mode(spec.mutable),
+                escape: spec.escape.into(),
+                role: spec.role,
+                local_id,
             });
         }
-        Ok(())
+        Ok((params, locals, local_map))
+    }
+
+    fn lambda_escape(&self, expr: ExprId) -> Result<LambdaEscape, LowerError> {
+        match self.lambda_escape_fact(expr)?.escape {
+            LambdaEscapeKind::NonEscaping => Ok(LambdaEscape::NonEscaping),
+            LambdaEscapeKind::Escaping => Ok(LambdaEscape::Escaping),
+        }
     }
 
     fn function_specialization(
@@ -1315,7 +1465,10 @@ impl LowerCx<'_> {
 
     fn attach_stringify_overrides(&mut self, functions: &ReachableCallables<'_>) {
         for source in &functions.items {
-            if !source.fact.is_stringify_override {
+            let ReachableSource::Callable { fact, .. } = &source.source else {
+                continue;
+            };
+            if !fact.is_stringify_override {
                 continue;
             }
             let function_id = self.maps.bodies[&source.body];
@@ -1342,9 +1495,23 @@ impl LowerCx<'_> {
                 .locals
                 .remove(&source.body)
                 .expect("lowered function missing local map");
-            let mut lowerer =
-                FunctionLowerer::new(self, functions, source, facts, function, locals)?;
-            lowerer.lower_body(source.callable.body())?;
+            let mut lowerer = FunctionLowerer::new(
+                self,
+                functions,
+                &source.body,
+                facts,
+                function,
+                locals,
+                source.source_id,
+            )?;
+            match &source.source {
+                ReachableSource::Callable { callable, .. } => {
+                    lowerer.lower_body(callable.body())?;
+                }
+                ReachableSource::Lambda { lambda, .. } => {
+                    lowerer.lower_lambda_body(&lambda.node.body)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1355,17 +1522,21 @@ type EnumMatchArms<'a> = (
     Option<&'a ExprNode>,
 );
 
+type ParamLowerResult = (Vec<Param>, Vec<Local>, HashMap<SemanticLocalId, LocalId>);
+
+struct ParamLowerSpec<'a> {
+    name: Ident,
+    ty: &'a Type,
+    mutable: bool,
+    escape: ast::EscapeMode,
+    role: ParamRole,
+}
+
 #[derive(Clone)]
 enum LambdaCaptureSource {
     Local(Place),
     NoRuntime,
-    TargetGap(LambdaCaptureTargetGap),
-}
-
-#[derive(Clone)]
-struct LambdaCaptureTargetGap {
-    binding: BindingId,
-    origin: CaptureStorageOrigin,
+    TargetGap,
 }
 
 struct FunctionLowerer<'cx, 'facts, 'tc> {
@@ -1388,24 +1559,25 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn new(
         cx: &'cx mut LowerCx<'tc>,
         functions: &'facts ReachableCallables<'facts>,
-        source: &ReachableCallable<'_>,
+        body: &BodyInstanceKey,
         facts: &'facts SemanticBodyFacts,
         function_id: FunctionId,
         locals: HashMap<SemanticLocalId, LocalId>,
+        source: SourceId,
     ) -> Result<Self, LowerError> {
         let function = cx.program.function(function_id).clone();
-        let capture_sources = initial_capture_sources(&source.body, facts, &locals, &function)?;
+        let capture_sources = initial_capture_sources(body, facts, &locals, &function)?;
         let locals = locals
             .into_iter()
             .map(|(semantic, local)| (semantic, function_local_place(&function, local)))
             .collect();
         Ok(Self {
             cx,
-            body: source.body.clone(),
+            body: body.clone(),
             facts,
             index: functions.index,
             function_id,
-            source: source.source,
+            source,
             function,
             locals,
             capture_sources,
@@ -1444,10 +1616,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match capture.origin {
             CaptureStorageOrigin::Const => return Ok(LambdaCaptureSource::NoRuntime),
             origin if origin.is_borrowed_runtime() => {
-                return Ok(LambdaCaptureSource::TargetGap(LambdaCaptureTargetGap {
-                    binding: capture.binding_id,
-                    origin,
-                }));
+                return Ok(LambdaCaptureSource::TargetGap);
             }
             _ => {}
         }
@@ -1485,6 +1654,25 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if !self.terminated && self.returns_void() {
             self.terminate(AirTail::Return(None))?;
         }
+        self.finish_body()
+    }
+
+    fn lower_lambda_body(&mut self, body: &ExprNode) -> Result<(), LowerError> {
+        if self.returns_void() {
+            self.lower_effect(body)?;
+            if !self.terminated {
+                self.terminate(AirTail::Return(None))?;
+            }
+        } else {
+            let value = self.lower_return_operand(body)?;
+            if !self.terminated {
+                self.terminate(AirTail::Return(Some(value)))?;
+            }
+        }
+        self.finish_body()
+    }
+
+    fn finish_body(&mut self) -> Result<(), LowerError> {
         if !self.terminated {
             return Err(LowerError::UnterminatedBlock);
         }
@@ -2491,8 +2679,61 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
+    fn lower_function_value(&mut self, expr: &ExprNode) -> Result<Option<Operand>, LowerError> {
+        let Some(fact) = self.facts.function_values.get(&expr.node.id) else {
+            return Ok(None);
+        };
+        let ty = self.cx.lower_ty(&fact.ty)?;
+        let value = match &fact.kind {
+            FunctionValueKind::Named(target) => {
+                let body = BodyInstanceKey::Callable(target.clone());
+                let Some(function) = self.cx.maps.bodies.get(&body).copied() else {
+                    return Err(LowerError::MissingLoweredCallee {
+                        body: Box::new(body),
+                    });
+                };
+                RValue::FunctionRef { function, ty }
+            }
+            FunctionValueKind::Lambda { lambda_expr } => {
+                self.reject_lambda_captures(*lambda_expr)?;
+                let key = LambdaBodyKey {
+                    expr: *lambda_expr,
+                    specialization: self.current_specialization(),
+                };
+                let Some(lambda) = self.cx.maps.lambdas.get(&key).copied() else {
+                    return Err(LowerError::MissingSpecializedBodyFacts {
+                        body: Box::new(BodyInstanceKey::Lambda(key)),
+                    });
+                };
+                RValue::MakeLambda {
+                    lambda,
+                    captures: vec![],
+                    ty,
+                }
+            }
+            FunctionValueKind::LocalOrPlace => return Ok(None),
+        };
+        Ok(Some(self.emit_typed_temp(ty, value)?))
+    }
+
+    fn reject_lambda_captures(&mut self, expr_id: ExprId) -> Result<(), LowerError> {
+        let Some(capture) = self.cx.lambda_capture_facts(expr_id)?.into_iter().next() else {
+            return Ok(());
+        };
+        if let LambdaCaptureSource::Local(place) = self.resolve_capture_source(&capture)? {
+            debug_assert_eq!(place.ty, self.cx.lower_ty(&capture.ty)?);
+        }
+        Err(LowerError::UnsupportedExpr {
+            expr_id,
+            kind: "LambdaCapture",
+        })
+    }
+
     fn lower_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
         if let Some(value) = self.lower_extern_value(expr)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.lower_function_value(expr)? {
             return Ok(value);
         }
         match &expr.node.kind {
@@ -2610,30 +2851,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ExprKind::MapLiteral(literal) => self.lower_map_literal(expr, literal),
             ExprKind::InferredEnum(inferred) => self.lower_inferred_enum(expr, inferred),
             ExprKind::Cast(cast) => self.lower_cast_expr(expr, cast),
-            ExprKind::Lambda(_) => {
-                self.cx.lambda_escape_fact(expr.node.id)?;
-                let _body = self.cx.lambda_body_facts(LambdaBodyKey {
-                    expr: expr.node.id,
-                    specialization: self.current_specialization(),
-                })?;
-                for capture in self.cx.lambda_capture_facts(expr.node.id)? {
-                    match self.resolve_capture_source(&capture)? {
-                        LambdaCaptureSource::Local(place) => {
-                            debug_assert_eq!(place.ty, self.cx.lower_ty(&capture.ty)?);
-                        }
-                        LambdaCaptureSource::NoRuntime => {}
-                        LambdaCaptureSource::TargetGap(gap) => {
-                            debug_assert_eq!(gap.binding, capture.binding_id);
-                            debug_assert_eq!(gap.origin, capture.origin);
-                            return Err(LowerError::UnsupportedExpr {
-                                expr_id: expr.node.id,
-                                kind: "LambdaCapture",
-                            });
-                        }
-                    }
-                }
-                Err(unsupported_expr(expr))
-            }
             _ => Err(unsupported_expr(expr)),
         }
     }
@@ -4097,6 +4314,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             self.lower_effect(arg)?;
             return self.string_const("<void>");
         }
+        if matches!(source, Type::Func { .. }) {
+            return Err(unsupported_expr(arg));
+        }
         let source_ty = self.cx.lower_ty(source)?;
         let value = self.lower_value(arg)?;
         let result_ty = self.string_ty()?;
@@ -4317,10 +4537,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return self.lower_extern_call(expr, call, *target);
         }
         if self.facts.function_value_calls.contains_key(&expr.node.id) {
-            return Err(LowerError::UnsupportedExpr {
-                expr_id: expr.node.id,
-                kind: "FunctionValueCall",
-            });
+            return self.lower_function_value_call(expr, call);
         }
 
         let target = self
@@ -4426,6 +4643,29 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             callee: Callee::Function(callee),
             args,
         })
+    }
+
+    fn lower_function_value_call(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<RValue, LowerError> {
+        let fact = self
+            .facts
+            .function_value_calls
+            .get(&expr.node.id)
+            .expect("function-value call fact checked before lowering");
+        if fact.callee != call.node.func.node.id {
+            return Err(unsupported_expr(expr));
+        }
+        let sig = fact.sig.clone();
+        let callee = self.lower_value(&call.node.func)?;
+        if self.operand_ty(&callee) != self.cx.lower_ty(&sig)? {
+            return Err(unsupported_expr(&call.node.func));
+        }
+        let callee = Callee::Lambda(callee);
+        let args = self.lower_exact_call_args(expr.node.id, &callee, call.node.args.iter())?;
+        Ok(RValue::Call { callee, args })
     }
 
     fn lower_list_push_call(
@@ -5423,11 +5663,11 @@ pub(crate) fn lower_with_modules(
     let entry = roots.entry.clone();
     let roots = roots.normalized();
     validate_roots(&roots, &callable_facts)?;
-    let functions = ReachableCallables::new(&index, semantic, &callable_facts, roots)?;
+    let functions =
+        ReachableCallables::new(&index, semantic, typecheck_facts, &callable_facts, roots)?;
     let mut cx = LowerCx {
         decls: Some(semantic.declarations.clone()),
         externs: Some(semantic.externs.clone()),
-        semantic_facts: Some(&semantic.facts),
         typecheck_facts: Some(typecheck_facts),
         ..LowerCx::default()
     };
@@ -5620,6 +5860,7 @@ impl<'a> SourceModules<'a> {
 struct SourceProgramIndex<'a> {
     modules: SourceModules<'a>,
     callables: HashMap<CallableId, SourceCallable<'a>>,
+    lambdas: HashMap<ExprId, &'a ast::LambdaNode>,
     default_exprs: HashMap<(CallableId, SourceId, ExprId), &'a ExprNode>,
 }
 
@@ -5652,6 +5893,199 @@ enum SourceCallable<'a> {
         mode: MethodMode,
         source: SourceId,
     },
+}
+
+fn collect_block_lambdas<'a>(
+    block: &'a BlockNode,
+    lambdas: &mut HashMap<ExprId, &'a ast::LambdaNode>,
+) {
+    for stmt in &block.node.stmts {
+        collect_stmt_lambdas(stmt, lambdas);
+    }
+    if let Some(tail) = &block.node.tail {
+        collect_expr_lambdas(tail, lambdas);
+    }
+}
+
+fn collect_stmt_lambdas<'a>(
+    stmt: &'a StmtNode,
+    lambdas: &mut HashMap<ExprId, &'a ast::LambdaNode>,
+) {
+    match &stmt.node {
+        Stmt::Expr(expr) => collect_expr_lambdas(expr, lambdas),
+        Stmt::Binding(binding) => collect_expr_lambdas(&binding.node.value, lambdas),
+        Stmt::LetElse(let_else) => {
+            collect_expr_lambdas(&let_else.node.value, lambdas);
+            match &let_else.node.fallback.node {
+                ast::LetElseFallback::Block(block) => collect_block_lambdas(block, lambdas),
+                ast::LetElseFallback::Return(ret) => {
+                    if let Some(value) = &ret.node.value {
+                        collect_expr_lambdas(value, lambdas);
+                    }
+                }
+                ast::LetElseFallback::Break | ast::LetElseFallback::Continue => {}
+            }
+        }
+        Stmt::Return(ret) => {
+            if let Some(value) = &ret.node.value {
+                collect_expr_lambdas(value, lambdas);
+            }
+        }
+        Stmt::While(while_) => {
+            collect_expr_lambdas(&while_.node.cond, lambdas);
+            collect_block_lambdas(&while_.node.body, lambdas);
+        }
+        Stmt::WhileLet(while_) => {
+            collect_expr_lambdas(&while_.node.value, lambdas);
+            collect_block_lambdas(&while_.node.body, lambdas);
+        }
+        Stmt::For(for_) => {
+            collect_expr_lambdas(&for_.node.iterable, lambdas);
+            if let Some(step) = &for_.node.step {
+                collect_expr_lambdas(step, lambdas);
+            }
+            collect_block_lambdas(&for_.node.body, lambdas);
+        }
+        Stmt::Defer(defer) => match &defer.node.body {
+            ast::DeferBody::Expr(expr) => collect_expr_lambdas(expr, lambdas),
+            ast::DeferBody::Block(block) => collect_block_lambdas(block, lambdas),
+        },
+        Stmt::Import(_)
+        | Stmt::Func(_)
+        | Stmt::ExternFunc(_)
+        | Stmt::ExternType(_)
+        | Stmt::Aggregate(_)
+        | Stmt::Enum(_)
+        | Stmt::Extend(_)
+        | Stmt::Const(_)
+        | Stmt::Global(_)
+        | Stmt::TypeAlias(_)
+        | Stmt::Contract(_)
+        | Stmt::Break
+        | Stmt::Continue => {}
+    }
+}
+
+fn collect_expr_lambdas<'a>(
+    expr: &'a ExprNode,
+    lambdas: &mut HashMap<ExprId, &'a ast::LambdaNode>,
+) {
+    match &expr.node.kind {
+        ExprKind::Block(block) => collect_block_lambdas(block, lambdas),
+        ExprKind::Call(call) => {
+            collect_expr_lambdas(&call.node.func, lambdas);
+            for arg in &call.node.args {
+                collect_expr_lambdas(arg, lambdas);
+            }
+        }
+        ExprKind::Binary(binary) => {
+            collect_expr_lambdas(&binary.node.left, lambdas);
+            collect_expr_lambdas(&binary.node.right, lambdas);
+        }
+        ExprKind::Unary(unary) => collect_expr_lambdas(&unary.node.expr, lambdas),
+        ExprKind::Assign(assign) => {
+            collect_expr_lambdas(&assign.node.target, lambdas);
+            collect_expr_lambdas(&assign.node.value, lambdas);
+        }
+        ExprKind::If(if_) => {
+            collect_expr_lambdas(&if_.node.cond, lambdas);
+            collect_block_lambdas(&if_.node.then_block, lambdas);
+            if let Some(block) = &if_.node.else_block {
+                collect_block_lambdas(block, lambdas);
+            }
+        }
+        ExprKind::Ternary(ternary) => {
+            collect_expr_lambdas(&ternary.node.cond, lambdas);
+            collect_expr_lambdas(&ternary.node.then_expr, lambdas);
+            collect_expr_lambdas(&ternary.node.else_expr, lambdas);
+        }
+        ExprKind::IfLet(if_) => {
+            collect_expr_lambdas(&if_.node.value, lambdas);
+            collect_block_lambdas(&if_.node.then_block, lambdas);
+            if let Some(block) = &if_.node.else_block {
+                collect_block_lambdas(block, lambdas);
+            }
+        }
+        ExprKind::Tuple(items) => {
+            for item in items {
+                collect_expr_lambdas(item, lambdas);
+            }
+        }
+        ExprKind::ArrayLiteral(array) => {
+            for item in &array.node.elements {
+                collect_expr_lambdas(item, lambdas);
+            }
+        }
+        ExprKind::TupleIndex(tuple) => collect_expr_lambdas(&tuple.node.target, lambdas),
+        ExprKind::Field(field) => collect_expr_lambdas(&field.node.target, lambdas),
+        ExprKind::StructLiteral(literal) => {
+            for (_, value) in &literal.node.fields {
+                collect_expr_lambdas(value, lambdas);
+            }
+        }
+        ExprKind::Range(range) => match &range.node {
+            ast::Range::Bounded { start, end, .. } => {
+                collect_expr_lambdas(start, lambdas);
+                collect_expr_lambdas(end, lambdas);
+            }
+            ast::Range::From { start } => collect_expr_lambdas(start, lambdas),
+            ast::Range::To { end, .. } => collect_expr_lambdas(end, lambdas),
+        },
+        ExprKind::ArrayFill(fill) => {
+            collect_expr_lambdas(&fill.node.value, lambdas);
+            collect_expr_lambdas(&fill.node.len, lambdas);
+        }
+        ExprKind::MapLiteral(map) => {
+            for (key, value) in &map.node.entries {
+                collect_expr_lambdas(key, lambdas);
+                collect_expr_lambdas(value, lambdas);
+            }
+        }
+        ExprKind::Index(index) => {
+            collect_expr_lambdas(&index.node.target, lambdas);
+            collect_expr_lambdas(&index.node.index, lambdas);
+        }
+        ExprKind::Match(match_) => {
+            collect_expr_lambdas(&match_.node.scrutinee, lambdas);
+            for arm in &match_.node.arms {
+                collect_expr_lambdas(&arm.node.body, lambdas);
+            }
+        }
+        ExprKind::StringInterp(parts) => {
+            for part in parts {
+                if let ast::StringPart::Expr(expr, _) = part {
+                    collect_expr_lambdas(expr, lambdas);
+                }
+            }
+        }
+        ExprKind::Cast(cast) | ExprKind::ExactDowncast(cast) => {
+            collect_expr_lambdas(&cast.node.expr, lambdas);
+        }
+        ExprKind::Try(try_) => collect_expr_lambdas(&try_.node.expr, lambdas),
+        ExprKind::Lambda(lambda) => {
+            lambdas.insert(expr.node.id, lambda);
+            collect_expr_lambdas(&lambda.node.body, lambdas);
+        }
+        ExprKind::InferredEnum(inferred) => match &inferred.node.args {
+            ast::InferredEnumArgs::Unit => {}
+            ast::InferredEnumArgs::Tuple(args) => {
+                for arg in args {
+                    collect_expr_lambdas(arg, lambdas);
+                }
+            }
+            ast::InferredEnumArgs::Struct(fields) => {
+                for (_, value) in fields {
+                    collect_expr_lambdas(value, lambdas);
+                }
+            }
+        },
+        ExprKind::IntrinsicCall(call) => {
+            for arg in &call.node.args {
+                collect_expr_lambdas(arg, lambdas);
+            }
+        }
+        ExprKind::Ident(_) | ExprKind::TypeSubject(_) | ExprKind::Lit(_) => {}
+    }
 }
 
 impl<'a> SourceCallable<'a> {
@@ -5737,11 +6171,23 @@ struct ReachableCallables<'a> {
 
 #[derive(Debug)]
 struct ReachableCallable<'a> {
-    callable: SourceCallable<'a>,
+    source: ReachableSource<'a>,
     body: BodyInstanceKey,
-    fact: &'a SemanticFunctionInstanceFact,
     body_facts: ReachableBodyFacts<'a>,
-    source: SourceId,
+    source_id: SourceId,
+}
+
+#[derive(Debug)]
+enum ReachableSource<'a> {
+    Callable {
+        callable: SourceCallable<'a>,
+        fact: &'a SemanticFunctionInstanceFact,
+    },
+    Lambda {
+        owner: BodyInstanceKey,
+        lambda: &'a ast::LambdaNode,
+        ty: &'a Type,
+    },
 }
 
 #[derive(Debug)]
@@ -5879,6 +6325,7 @@ impl<'a> SourceProgramIndex<'a> {
     fn new(root: &'a ast::Program, resolved: &'a ResolveResult) -> Self {
         let modules = SourceModules::new(root, resolved);
         let mut callables = HashMap::new();
+        let mut lambdas = HashMap::new();
         let mut default_exprs = HashMap::new();
 
         for (module_index, module) in modules.items.iter().enumerate() {
@@ -5886,6 +6333,7 @@ impl<'a> SourceProgramIndex<'a> {
             for stmt in &module.program.stmts {
                 match &stmt.node {
                     Stmt::Func(func_node) => {
+                        collect_block_lambdas(&func_node.node.body, &mut lambdas);
                         let id = CallableId::function(module.scope.clone(), func_node.node.name);
                         for param in &func_node.node.params {
                             if let Some(default) = &param.default {
@@ -5910,6 +6358,7 @@ impl<'a> SourceProgramIndex<'a> {
                             name: agg.name,
                         };
                         for method in &agg.methods {
+                            collect_block_lambdas(&method.body, &mut lambdas);
                             let mode = MethodMode::from_receiver(method.sig.receiver);
                             let id = CallableId::aggregate_method(
                                 owner.clone(),
@@ -5944,6 +6393,7 @@ impl<'a> SourceProgramIndex<'a> {
                         extend_index += 1;
                         for method_node in &extend_node.node.methods {
                             let method = &method_node.node;
+                            collect_block_lambdas(&method.body, &mut lambdas);
                             let mode = MethodMode::from_receiver(method.sig.receiver);
                             let id = CallableId::extend_method(
                                 extend_id.clone(),
@@ -5977,6 +6427,7 @@ impl<'a> SourceProgramIndex<'a> {
         Self {
             modules,
             callables,
+            lambdas,
             default_exprs,
         }
     }
@@ -5986,92 +6437,187 @@ impl<'a> ReachableCallables<'a> {
     fn new(
         index: &'a SourceProgramIndex<'a>,
         semantic: &'a SemanticProgram,
+        typecheck_facts: &TypecheckFacts,
         semantic_functions: &SemanticCallableFacts<'a>,
         roots: Vec<CallableInstanceKey>,
     ) -> Result<Self, LowerError> {
         let mut queued = std::collections::HashSet::new();
         let mut worklist = vec![];
         for root in roots {
-            queue_callable(&mut queued, &mut worklist, root);
+            queue_reachable(&mut queued, &mut worklist, ReachableKey::Callable(root));
         }
 
         let mut items = vec![];
         let mut worklist_index = 0;
         while let Some(key) = worklist.get(worklist_index).cloned() {
             worklist_index += 1;
-            let Some(source) = index.callables.get(&key.target).copied() else {
-                if key.target.kind == CallableKind::EnumVariant {
-                    continue;
+            let item = match key {
+                ReachableKey::Callable(key) => {
+                    reachable_callable(index, semantic, semantic_functions, &key)?
                 }
-                return Err(LowerError::UnsupportedCallableInstance {
-                    id: Box::new(key.target.clone()),
-                    args: Box::new(key.args.clone()),
-                });
-            };
-            if source.has_generics() && key.args.is_empty() {
-                return Err(LowerError::MissingGenericInstanceArgs {
-                    id: Box::new(key.target.clone()),
-                });
-            }
-            let body = BodyInstanceKey::Callable(key.clone());
-            let Some(fact) = semantic_functions.get(&key) else {
-                return Err(LowerError::MissingFunctionFact {
-                    id: Box::new(key.target.clone()),
-                    args: Box::new(key.args.clone()),
-                });
-            };
-            let body_facts = match semantic.facts.body(&body) {
-                Some(facts) => ReachableBodyFacts::Facts(facts),
-                None if can_omit_body_facts(fact, source) => {
-                    ReachableBodyFacts::Empty(Box::default())
-                }
-                None => {
-                    return Err(LowerError::MissingSpecializedBodyFacts {
-                        body: Box::new(body.clone()),
-                    });
+                ReachableKey::Lambda { owner, key, source } => {
+                    reachable_lambda(index, semantic, *owner, &key, source)?
                 }
             };
-            let mut calls = body_facts.as_facts().calls.iter().collect::<Vec<_>>();
-            calls.sort_by_key(|(expr, _)| expr.0);
-            for (expr, target) in calls {
-                if target.form != CallForm::Normal {
-                    return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
-                }
-                if target.id.kind == CallableKind::EnumVariant
-                    || is_lowered_collection_stub(&target.id)
-                {
-                    continue;
-                }
-                if !index.callables.contains_key(&target.id) {
-                    return Err(LowerError::UnsupportedCallableInstance {
-                        id: Box::new(target.id.clone()),
-                        args: Box::new(target.args.clone()),
-                    });
-                }
-                let called = CallableInstanceKey {
-                    target: target.id.clone(),
-                    args: target.args.clone(),
-                };
-                queue_callable(&mut queued, &mut worklist, called);
-            }
-            enqueue_stringify_overrides(
+            enqueue_body_references(
                 index,
                 semantic,
-                body_facts.as_facts(),
+                typecheck_facts,
+                item.body_facts.as_facts(),
+                &item.body,
+                item.source_id,
                 &mut queued,
                 &mut worklist,
-            );
-            items.push(ReachableCallable {
-                callable: source,
-                body,
-                fact,
-                body_facts,
-                source: source.source(),
-            });
+            )?;
+            items.push(item);
         }
 
         Ok(Self { index, items })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReachableKey {
+    Callable(CallableInstanceKey),
+    Lambda {
+        owner: Box<BodyInstanceKey>,
+        key: LambdaBodyKey,
+        source: SourceId,
+    },
+}
+
+fn reachable_callable<'a>(
+    index: &'a SourceProgramIndex<'a>,
+    semantic: &'a SemanticProgram,
+    semantic_functions: &SemanticCallableFacts<'a>,
+    key: &CallableInstanceKey,
+) -> Result<ReachableCallable<'a>, LowerError> {
+    let Some(source) = index.callables.get(&key.target).copied() else {
+        return Err(LowerError::UnsupportedCallableInstance {
+            id: Box::new(key.target.clone()),
+            args: Box::new(key.args.clone()),
+        });
+    };
+    if source.has_generics() && key.args.is_empty() {
+        return Err(LowerError::MissingGenericInstanceArgs {
+            id: Box::new(key.target.clone()),
+        });
+    }
+    let body = BodyInstanceKey::Callable(key.clone());
+    let Some(fact) = semantic_functions.get(key) else {
+        return Err(LowerError::MissingFunctionFact {
+            id: Box::new(key.target.clone()),
+            args: Box::new(key.args.clone()),
+        });
+    };
+    let body_facts = match semantic.facts.body(&body) {
+        Some(facts) => ReachableBodyFacts::Facts(facts),
+        None if can_omit_body_facts(fact, source) => ReachableBodyFacts::Empty(Box::default()),
+        None => {
+            return Err(LowerError::MissingSpecializedBodyFacts {
+                body: Box::new(body.clone()),
+            });
+        }
+    };
+    Ok(ReachableCallable {
+        source: ReachableSource::Callable {
+            callable: source,
+            fact,
+        },
+        body,
+        body_facts,
+        source_id: source.source(),
+    })
+}
+
+fn reachable_lambda<'a>(
+    index: &'a SourceProgramIndex<'a>,
+    semantic: &'a SemanticProgram,
+    owner: BodyInstanceKey,
+    key: &LambdaBodyKey,
+    source_id: SourceId,
+) -> Result<ReachableCallable<'a>, LowerError> {
+    let body = BodyInstanceKey::Lambda(key.clone());
+    let facts =
+        semantic
+            .facts
+            .body(&body)
+            .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
+                body: Box::new(body.clone()),
+            })?;
+    let lambda = index
+        .lambdas
+        .get(&key.expr)
+        .copied()
+        .ok_or(LowerError::UnsupportedExpr {
+            expr_id: key.expr,
+            kind: "Lambda",
+        })?;
+    let fact = semantic
+        .facts
+        .body(&owner)
+        .and_then(|facts| facts.function_values.get(&key.expr))
+        .ok_or(LowerError::UnsupportedExpr {
+            expr_id: key.expr,
+            kind: "Lambda",
+        })?;
+    Ok(ReachableCallable {
+        source: ReachableSource::Lambda {
+            owner,
+            lambda,
+            ty: &fact.ty,
+        },
+        body,
+        body_facts: ReachableBodyFacts::Facts(facts),
+        source_id,
+    })
+}
+
+fn enqueue_body_references(
+    index: &SourceProgramIndex<'_>,
+    semantic: &SemanticProgram,
+    typecheck_facts: &TypecheckFacts,
+    body_facts: &SemanticBodyFacts,
+    body: &BodyInstanceKey,
+    source_id: SourceId,
+    queued: &mut std::collections::HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
+) -> Result<(), LowerError> {
+    let mut calls = body_facts.calls.iter().collect::<Vec<_>>();
+    calls.sort_by_key(|(expr, _)| expr.0);
+    for (expr, target) in calls {
+        if target.form != CallForm::Normal {
+            return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
+        }
+        if target.id.kind == CallableKind::EnumVariant || is_lowered_collection_stub(&target.id) {
+            continue;
+        }
+        if !index.callables.contains_key(&target.id) {
+            return Err(LowerError::UnsupportedCallableInstance {
+                id: Box::new(target.id.clone()),
+                args: Box::new(target.args.clone()),
+            });
+        }
+        queue_reachable(
+            queued,
+            worklist,
+            ReachableKey::Callable(CallableInstanceKey {
+                target: target.id.clone(),
+                args: target.args.clone(),
+            }),
+        );
+    }
+    enqueue_function_values(
+        index,
+        typecheck_facts,
+        body_facts,
+        body,
+        source_id,
+        queued,
+        worklist,
+    )?;
+    enqueue_stringify_overrides(index, semantic, body_facts, queued, worklist);
+    Ok(())
 }
 
 fn is_lowered_collection_stub(id: &CallableId) -> bool {
@@ -6087,22 +6633,80 @@ fn is_lowered_collection_stub(id: &CallableId) -> bool {
                 if path.segments().len() == 1 && path.segments()[0] == "collections"))
 }
 
-fn queue_callable(
-    queued: &mut std::collections::HashSet<CallableInstanceKey>,
-    worklist: &mut Vec<CallableInstanceKey>,
-    key: CallableInstanceKey,
+fn queue_reachable(
+    queued: &mut std::collections::HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
+    key: ReachableKey,
 ) {
     if queued.insert(key.clone()) {
         worklist.push(key);
     }
 }
 
+fn enqueue_function_values(
+    index: &SourceProgramIndex<'_>,
+    typecheck_facts: &TypecheckFacts,
+    body_facts: &SemanticBodyFacts,
+    owner: &BodyInstanceKey,
+    source: SourceId,
+    queued: &mut std::collections::HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
+) -> Result<(), LowerError> {
+    let mut function_values = body_facts.function_values.values().collect::<Vec<_>>();
+    function_values.sort_by_key(|fact| fact.expr.0);
+    for fact in function_values {
+        match &fact.kind {
+            FunctionValueKind::Named(target) => {
+                if !index.callables.contains_key(&target.target) {
+                    return Err(LowerError::UnsupportedCallableInstance {
+                        id: Box::new(target.target.clone()),
+                        args: Box::new(target.args.clone()),
+                    });
+                }
+                queue_reachable(queued, worklist, ReachableKey::Callable(target.clone()));
+            }
+            FunctionValueKind::Lambda { lambda_expr } => {
+                if typecheck_facts
+                    .lambda_captures()
+                    .values()
+                    .any(|capture| capture.lambda_id == *lambda_expr)
+                {
+                    return Err(LowerError::UnsupportedExpr {
+                        expr_id: *lambda_expr,
+                        kind: "LambdaCapture",
+                    });
+                }
+                queue_reachable(
+                    queued,
+                    worklist,
+                    ReachableKey::Lambda {
+                        owner: Box::new(owner.clone()),
+                        key: LambdaBodyKey {
+                            expr: *lambda_expr,
+                            specialization: match owner {
+                                BodyInstanceKey::Callable(key) => key.args.clone(),
+                                BodyInstanceKey::Lambda(key) => key.specialization.clone(),
+                                BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => {
+                                    GenericArgs::default()
+                                }
+                            },
+                        },
+                        source,
+                    },
+                );
+            }
+            FunctionValueKind::LocalOrPlace => {}
+        }
+    }
+    Ok(())
+}
+
 fn enqueue_stringify_overrides(
     index: &SourceProgramIndex<'_>,
     semantic: &SemanticProgram,
     body_facts: &SemanticBodyFacts,
-    queued: &mut std::collections::HashSet<CallableInstanceKey>,
-    worklist: &mut Vec<CallableInstanceKey>,
+    queued: &mut std::collections::HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
 ) {
     let mut visited = std::collections::HashSet::new();
     for stringify in body_facts.stringifies.values() {
@@ -6121,8 +6725,8 @@ fn enqueue_type_stringify_overrides(
     index: &SourceProgramIndex<'_>,
     semantic: &SemanticProgram,
     ty: &Type,
-    queued: &mut std::collections::HashSet<CallableInstanceKey>,
-    worklist: &mut Vec<CallableInstanceKey>,
+    queued: &mut std::collections::HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
     visited: &mut std::collections::HashSet<Type>,
 ) {
     if !visited.insert(ty.clone()) {
@@ -6167,8 +6771,8 @@ fn enqueue_nominal_stringify_override(
     index: &SourceProgramIndex<'_>,
     semantic: &SemanticProgram,
     ty: &Type,
-    queued: &mut std::collections::HashSet<CallableInstanceKey>,
-    worklist: &mut Vec<CallableInstanceKey>,
+    queued: &mut std::collections::HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
     visited: &mut std::collections::HashSet<Type>,
 ) {
     if !type_is_concrete(ty) {
@@ -6191,7 +6795,7 @@ fn enqueue_nominal_stringify_override(
                 args,
             };
             if index.callables.contains_key(&key.target) {
-                queue_callable(queued, worklist, key);
+                queue_reachable(queued, worklist, ReachableKey::Callable(key));
             }
             return;
         }
@@ -6711,17 +7315,64 @@ mod tests {
     }
 
     #[test]
-    fn function_value_call_uses_fact_before_unsupported_gap() {
-        let err = lower_root("fn main(f: fn() -> int) -> int { f() }", "main")
-            .expect_err("expected unsupported function-value call");
+    fn function_value_call_lowers_to_lambda_callee() {
+        let air =
+            lower_root("fn main(f: fn() -> int) -> int { f() }", "main").expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
 
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedExpr {
-                kind: "FunctionValueCall",
-                ..
-            }
-        ));
+        assert!(function_statements(main).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::Call { callee: Callee::Lambda(_), args }, .. } if args.is_empty())
+        }));
+    }
+
+    #[test]
+    fn named_function_value_can_be_passed_and_called() {
+        let source = "fn tick() {} fn each(f: fn()) { f(); } fn main() { each(tick); }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let each = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("each"))
+            .expect("missing each");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert_eq!(function_names(&air), vec!["main", "each", "tick"]);
+        assert!(function_statements(each).any(|statement| {
+            matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Lambda(_), args }) if args.is_empty())
+        }));
+        assert!(function_statements(main).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::FunctionRef { .. },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn named_function_alias_can_flow_to_escaping_param() {
+        let source =
+            "fn tick() {} fn keep(f: escaping fn()) {} fn main() { let f = tick; keep(f); }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(function_statements(main).any(|statement| {
+            matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Function(_), args }) if matches!(args.as_slice(), [CallArg::Value(Operand::Place(_))]))
+        }));
     }
 
     #[test]
@@ -6906,9 +7557,9 @@ mod tests {
         with_source_functions("fn f(a: int) -> int { a }", &["f"], |_, functions, _| {
             assert_eq!(functions.items.len(), 1);
             let function = &functions.items[0];
-            assert_eq!(function.callable.module(), 0);
-            assert_eq!(function.callable.name(), Ident::new("f"));
-            assert_eq!(function.body, function.fact.body);
+            assert_eq!(test_reachable_callable(function).module(), 0);
+            assert_eq!(test_reachable_callable(function).name(), Ident::new("f"));
+            assert_eq!(function.body, test_reachable_fact(function).body);
         });
     }
 
@@ -7003,8 +7654,8 @@ mod tests {
             &["main"],
             |_, functions, _| {
                 assert!(functions.items.iter().any(|function| {
-                    function.callable.name() == Ident::new("f")
-                        && function.fact.args.type_args == vec![Type::Int]
+                    test_reachable_callable(function).name() == Ident::new("f")
+                        && test_reachable_fact(function).args.type_args == vec![Type::Int]
                 }));
             },
         );
@@ -7530,8 +8181,11 @@ mod tests {
             &["f"],
             |_, functions, _| {
                 assert_eq!(functions.items.len(), 1);
-                assert_eq!(functions.items[0].callable.name(), Ident::new("f"));
-                assert_eq!(functions.items[0].fact.params.len(), 1);
+                assert_eq!(
+                    test_reachable_callable(&functions.items[0]).name(),
+                    Ident::new("f")
+                );
+                assert_eq!(test_reachable_fact(&functions.items[0]).params.len(), 1);
             },
         );
     }
@@ -8597,15 +9251,50 @@ fn main() {}
     }
 
     #[test]
-    fn rejects_function_value_read_as_unsupported() {
+    fn named_function_value_lowers_to_ref_and_reaches_body() {
         let source = "fn g() -> int { 1 } fn f() -> void { g; }";
         let (root, resolved, semantic) = checked(source);
-        let err =
-            lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect_err("expected error");
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedExpr { kind: "Ident", .. }
-        ));
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
+
+        assert_eq!(function_names(&air), vec!["f", "g"]);
+        let f = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+        assert!(function_statements(f).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::FunctionRef { .. },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn named_function_alias_uses_local_storage() {
+        let source = "fn g() -> int { 1 } fn f() -> int { let h = g; h; 0 }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let f = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+
+        assert!(function_statements(f).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::FunctionRef { .. },
+                    ..
+                }
+            )
+        }));
+        assert!(function_statements(f).any(|statement| {
+            matches!(statement, AirStmt::Eval(RValue::Use(Operand::Place(place))) if matches!(air.type_data(place.ty), TypeData::Function(_)))
+        }));
     }
 
     #[test]
@@ -8677,6 +9366,84 @@ fn main() {}
     }
 
     #[test]
+    fn non_capturing_lambdas_get_distinct_body_functions() {
+        let source = "fn f() { let a: fn() = || {}; let b: fn() = || {}; a; b; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let f = air
+            .functions
+            .iter()
+            .position(|function| function.name == Ident::new("f"))
+            .map(FunctionId::from_index)
+            .expect("missing f");
+
+        assert_eq!(air.lambdas.len(), 2);
+        assert!(
+            air.lambdas
+                .iter()
+                .all(|decl| decl.owner == f && decl.captures.is_empty())
+        );
+        assert_eq!(
+            air.functions
+                .iter()
+                .filter(|function| matches!(function.kind, FunctionKind::Lambda(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn nested_non_capturing_lambda_uses_lambda_body_facts() {
+        let source = "fn f() { let outer: fn() = || { let inner: fn() = || {}; inner; }; outer; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let outer = air
+            .lambdas
+            .iter()
+            .find(|decl| air.function(decl.owner).name == Ident::new("f"))
+            .expect("missing outer lambda");
+        let inner = air
+            .lambdas
+            .iter()
+            .find(|decl| decl.owner == outer.body)
+            .expect("missing inner lambda");
+
+        assert!(matches!(
+            air.function(outer.body).kind,
+            FunctionKind::Lambda(_)
+        ));
+        assert!(matches!(
+            air.function(inner.body).kind,
+            FunctionKind::Lambda(_)
+        ));
+        assert!(outer.captures.is_empty());
+        assert!(inner.captures.is_empty());
+    }
+
+    #[test]
+    fn non_capturing_lambda_values_and_calls_use_make_lambda_and_lambda_callee() {
+        let source =
+            "fn each(f: fn()) { f(); } fn f() { let g: fn() = || {}; g(); each(|| {}); || {}(); }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let f = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+
+        assert!(function_statements(f).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. } if captures.is_empty())
+        }));
+        assert!(function_statements(f).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Eval(RValue::Call {
+                    callee: Callee::Lambda(_),
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
     fn lambda_value_lowering_uses_passed_typecheck_facts() {
         let source = "fn f() { || {}; }";
         let (root, resolved, semantic) = checked(source);
@@ -8698,12 +9465,14 @@ fn main() {}
         .expect_err("expected missing lambda fact");
         assert!(matches!(err, LowerError::MissingLambdaEscape { .. }));
 
-        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
-            .expect_err("expected unsupported lambda lowering");
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedExpr { kind: "Lambda", .. }
-        ));
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
+        assert_eq!(air.lambdas.len(), 1);
+        assert!(air.functions.iter().any(|function| {
+            matches!(function.kind, FunctionKind::Lambda(lambda) if lambda == crate::air::LambdaId::from_index(0))
+        }));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. } if captures.is_empty())
+        }));
     }
 
     #[test]
@@ -8998,6 +9767,20 @@ fn main() {}
         }));
     }
 
+    fn test_reachable_callable<'a>(item: &ReachableCallable<'a>) -> SourceCallable<'a> {
+        match item.source {
+            ReachableSource::Callable { callable, .. } => callable,
+            ReachableSource::Lambda { .. } => panic!("expected callable item"),
+        }
+    }
+
+    fn test_reachable_fact<'a>(item: &ReachableCallable<'a>) -> &'a SemanticFunctionInstanceFact {
+        match item.source {
+            ReachableSource::Callable { fact, .. } => fact,
+            ReachableSource::Lambda { .. } => panic!("expected callable item"),
+        }
+    }
+
     fn with_source_functions<R>(
         source: &str,
         names: &[&str],
@@ -9007,8 +9790,14 @@ fn main() {}
         let index = SourceProgramIndex::new(&root, &resolved);
         let facts = SemanticCallableFacts::new(&semantic.program);
         let roots = names.iter().map(|name| root_function(name)).collect();
-        let functions = ReachableCallables::new(&index, &semantic.program, &facts, roots)
-            .expect("source functions failed");
+        let functions = ReachableCallables::new(
+            &index,
+            &semantic.program,
+            &semantic.public_facts,
+            &facts,
+            roots,
+        )
+        .expect("source functions failed");
         f(&index.modules, &functions, &semantic.program)
     }
 

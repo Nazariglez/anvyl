@@ -70,9 +70,7 @@ pub enum ProfileErrorKind {
     UnsupportedExtern,
     UnsupportedExternMember,
     UnsupportedEntry,
-    UnsupportedLambdaType,
     UnsupportedLambdaValue,
-    UnsupportedLambdaCall,
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
@@ -250,12 +248,27 @@ impl ProfileCx<'_> {
     }
 
     fn check_function(&mut self, id: FunctionId, function: &Function) {
-        if !matches!(function.kind, FunctionKind::Normal | FunctionKind::Method) {
-            let kind = match function.kind {
-                FunctionKind::Lambda(_) => ProfileErrorKind::UnsupportedLambdaValue,
-                _ => ProfileErrorKind::UnsupportedFunctionKind,
-            };
-            self.push(ProfileSite::Function(id), kind);
+        if !matches!(
+            function.kind,
+            FunctionKind::Normal | FunctionKind::Method | FunctionKind::Lambda(_)
+        ) {
+            self.push(
+                ProfileSite::Function(id),
+                ProfileErrorKind::UnsupportedFunctionKind,
+            );
+        }
+        if let FunctionKind::Lambda(lambda) = function.kind {
+            match self.program.lambdas.get(lambda.index()) {
+                Some(decl) if decl.captures.is_empty() => {}
+                Some(_) => self.push(
+                    ProfileSite::Function(id),
+                    ProfileErrorKind::UnsupportedLambdaCapture,
+                ),
+                None => self.push(
+                    ProfileSite::Function(id),
+                    ProfileErrorKind::UnsupportedLambdaValue,
+                ),
+            }
         }
         if matches!(function.signature.return_mode, ReturnMode::Place(_))
             || matches!(
@@ -396,9 +409,7 @@ impl ProfileCx<'_> {
 
     fn check_rvalue(&mut self, site: ProfileSite, value: &RValue) {
         match value {
-            RValue::FunctionRef { .. } => {
-                self.push(site, ProfileErrorKind::UnsupportedLambdaValue);
-            }
+            RValue::FunctionRef { .. } => {}
             RValue::Use(operand) => {
                 self.check_operand(site, operand);
                 if self.non_shareable_value_operand(operand) {
@@ -568,7 +579,6 @@ impl ProfileCx<'_> {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
             RValue::MakeLambda { captures, .. } => {
-                self.push(site, ProfileErrorKind::UnsupportedLambdaValue);
                 for capture in captures {
                     match capture {
                         air::LambdaCaptureArg::UpvalueCell { .. } => {
@@ -783,7 +793,6 @@ impl ProfileCx<'_> {
             }
             Callee::Lambda(operand) => {
                 self.check_operand(site, operand);
-                self.push(site, ProfileErrorKind::UnsupportedLambdaCall);
             }
         }
     }
@@ -917,55 +926,121 @@ impl ProfileCx<'_> {
     }
 
     fn type_contains_function(&self, ty: TypeId) -> bool {
+        self.type_contains_function_inner(ty, &mut std::collections::HashSet::new())
+    }
+
+    fn type_contains_function_inner(
+        &self,
+        ty: TypeId,
+        visited: &mut std::collections::HashSet<TypeId>,
+    ) -> bool {
+        if !visited.insert(ty) {
+            return false;
+        }
         match self.program.type_arena.data(ty) {
             TypeData::Function(_) => true,
             TypeData::Optional(inner)
             | TypeData::Array { elem: inner, .. }
-            | TypeData::Slice(inner) => self.type_contains_function(*inner),
-            TypeData::List(elem) => self.type_contains_function(*elem),
+            | TypeData::Slice(inner) => self.type_contains_function_inner(*inner, visited),
+            TypeData::List(elem) => self.type_contains_function_inner(*elem, visited),
             TypeData::Map { key, value, .. } => {
-                self.type_contains_function(*key) || self.type_contains_function(*value)
+                self.type_contains_function_inner(*key, visited)
+                    || self.type_contains_function_inner(*value, visited)
             }
-            TypeData::Tuple(elems) => elems.iter().any(|elem| self.type_contains_function(*elem)),
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .any(|elem| self.type_contains_function_inner(*elem, visited)),
+            TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate) => self
+                .program
+                .aggregate(*aggregate)
+                .fields
+                .iter()
+                .any(|field| self.type_contains_function_inner(field.ty, visited)),
+            TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().any(|variant| {
+                variant_field_tys(variant).any(|ty| self.type_contains_function_inner(ty, visited))
+            }),
+            TypeData::Extern(ext) => self
+                .program
+                .extern_type(*ext)
+                .fields
+                .iter()
+                .any(|field| self.type_contains_function_inner(field.ty, visited)),
             _ => false,
         }
     }
 
     fn check_type_ref(&mut self, site: ProfileSite, ty: TypeId) {
         let ok = match self.program.type_arena.data(ty) {
-            TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
-            TypeData::DataRef(aggregate) => self.dataref_decl_supported(*aggregate),
-            TypeData::Enum(enm) => self.enum_decl_supported(*enm),
-            TypeData::Extern(ext) => self.extern_type_supported(*ext),
+            TypeData::Aggregate(aggregate) => {
+                self.reject_function_container(site, ty)
+                    || self.aggregate_decl_supported(*aggregate)
+            }
+            TypeData::DataRef(aggregate) => {
+                self.reject_function_container(site, ty) || self.dataref_decl_supported(*aggregate)
+            }
+            TypeData::Enum(enm) => {
+                self.reject_function_container(site, ty) || self.enum_decl_supported(*enm)
+            }
+            TypeData::Extern(ext) => {
+                self.reject_function_container(site, ty) || self.extern_type_supported(*ext)
+            }
             TypeData::Array { elem, .. } => {
-                self.check_type_ref(site, *elem);
-                !self.non_copy_type(*elem)
+                if self.reject_function_container(site, *elem) {
+                    true
+                } else {
+                    self.check_type_ref(site, *elem);
+                    !self.non_copy_type(*elem)
+                }
             }
             TypeData::List(elem) => {
-                self.check_type_ref(site, *elem);
-                self.policy().list_supported(ty)
+                if self.reject_function_container(site, *elem) {
+                    true
+                } else {
+                    self.check_type_ref(site, *elem);
+                    self.policy().list_supported(ty)
+                }
             }
             TypeData::Slice(elem) => {
-                self.check_type_ref(site, *elem);
-                true
-            }
-            TypeData::Map { key, value, .. } => {
-                self.check_type_ref(site, *key);
-                self.check_type_ref(site, *value);
-                self.policy().map_supported(ty)
-            }
-            TypeData::Optional(inner) => {
-                self.check_type_ref(site, *inner);
-                true
-            }
-            TypeData::Tuple(elems) => {
-                for elem in elems {
+                if !self.reject_function_container(site, *elem) {
                     self.check_type_ref(site, *elem);
                 }
                 true
             }
-            TypeData::Function(_) => {
-                self.push(site, ProfileErrorKind::UnsupportedLambdaType);
+            TypeData::Map { key, value, .. } => {
+                let has_function = self.reject_function_container(site, *key)
+                    | self.reject_function_container(site, *value);
+                if has_function {
+                    true
+                } else {
+                    self.check_type_ref(site, *key);
+                    self.check_type_ref(site, *value);
+                    self.policy().map_supported(ty)
+                }
+            }
+            TypeData::Optional(inner) => {
+                if !self.reject_function_container(site, *inner) {
+                    self.check_type_ref(site, *inner);
+                }
+                true
+            }
+            TypeData::Tuple(elems) => {
+                if elems
+                    .iter()
+                    .any(|elem| self.reject_function_container(site, *elem))
+                {
+                    true
+                } else {
+                    for elem in elems {
+                        self.check_type_ref(site, *elem);
+                    }
+                    true
+                }
+            }
+            TypeData::Function(sig) => {
+                for param in &sig.params {
+                    self.check_type_ref(site, param.ty);
+                }
+                self.check_type_ref(site, sig.ret.ty());
                 true
             }
             ty => type_is_slice1(ty),
@@ -973,6 +1048,14 @@ impl ProfileCx<'_> {
         if !ok {
             self.push(site, ProfileErrorKind::UnsupportedType);
         }
+    }
+
+    fn reject_function_container(&mut self, site: ProfileSite, ty: TypeId) -> bool {
+        let contains = self.type_contains_function(ty);
+        if contains {
+            self.push(site, ProfileErrorKind::UnsupportedLambdaValue);
+        }
+        contains
     }
 
     fn check_const_ref(&mut self, site: ProfileSite, id: ConstId) {

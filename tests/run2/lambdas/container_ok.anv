@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @skip: function values in arrays and containers will be fully supported later
+
+fn tick() {}
+
+fn main() {
+    let xs = [tick];
+}

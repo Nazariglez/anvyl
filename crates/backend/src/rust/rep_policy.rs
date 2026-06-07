@@ -7,8 +7,8 @@ use anvyx_frontend::air::{
 
 use super::{
     rir::{
-        RirDataRef, RirEnum, RirEnumId, RirField, RirParamAbi, RirParamSemantic, RirProgram,
-        RirStruct, RirStructId, RirTuple, RirTupleId, RirType, RirTypeId,
+        RirDataRef, RirEnum, RirEnumId, RirField, RirLambdaSigId, RirParamAbi, RirParamSemantic,
+        RirProgram, RirStruct, RirStructId, RirTuple, RirTupleId, RirType, RirTypeId,
     },
     target,
 };
@@ -51,8 +51,11 @@ impl<'a> AirRustRepPolicy<'a> {
         if let TypeData::Optional(inner) = self.program.type_arena.data(ty) {
             return self.copyable(*inner);
         }
-        if matches!(self.program.type_arena.data(ty), TypeData::DataRef(_)) {
-            return false;
+        if matches!(
+            self.program.type_arena.data(ty),
+            TypeData::DataRef(_) | TypeData::Function(_)
+        ) {
+            return matches!(self.program.type_arena.data(ty), TypeData::Function(_));
         }
         self.classes.get(ty).is_some_and(|class| {
             matches!(
@@ -74,7 +77,8 @@ impl<'a> AirRustRepPolicy<'a> {
             | TypeData::String
             | TypeData::DataRef(_)
             | TypeData::List(_)
-            | TypeData::Map { .. } => true,
+            | TypeData::Map { .. }
+            | TypeData::Function(_) => true,
             TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
                 self.value_from_ref_supported(*inner)
             }
@@ -94,11 +98,7 @@ impl<'a> AirRustRepPolicy<'a> {
                 .fields
                 .iter()
                 .all(|field| self.value_from_ref_supported(field.ty)),
-            TypeData::Void
-            | TypeData::Any
-            | TypeData::Slice(_)
-            | TypeData::Function(_)
-            | TypeData::Dyn(_) => false,
+            TypeData::Void | TypeData::Any | TypeData::Slice(_) | TypeData::Dyn(_) => false,
         }
     }
 
@@ -231,9 +231,8 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Array { .. }
                 | TypeData::List(_)
                 | TypeData::Map { .. } => true,
-                TypeData::Any | TypeData::Slice(_) | TypeData::Function(_) | TypeData::Dyn(_) => {
-                    false
-                }
+                TypeData::Function(_) => true,
+                TypeData::Any | TypeData::Slice(_) | TypeData::Dyn(_) => false,
             },
             ParamMode::SharedBorrow => match self.program.type_arena.data(ty) {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
@@ -300,6 +299,7 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Map { .. } => RustValueRep::CowMap,
             RirType::Option(_) => RustValueRep::InlineEnum,
             RirType::Slice(_) => RustValueRep::Opaque,
+            RirType::Lambda(_) => RustValueRep::InlineCopy,
             RirType::Struct(_) | RirType::Tuple(_) => RustValueRep::InlineStruct,
             RirType::DataRef(_) => RustValueRep::HeapHandle,
             RirType::Enum(id) => self.enum_rep(id),
@@ -393,6 +393,7 @@ impl<'a> RustRepPolicy<'a> {
                         .all(|field| self.value_from_ref_supported(field.ty))
                 }),
             RirType::Slice(_) | RirType::Void => false,
+            RirType::Lambda(_) => true,
         }
     }
 
@@ -423,6 +424,10 @@ impl<'a> RustRepPolicy<'a> {
         } else {
             storage
         }
+    }
+
+    pub fn lambda_sig_ty(self, id: RirLambdaSigId) -> String {
+        format!("LambdaSig{}", id.index())
     }
 
     pub fn fields_cx_dependent(self, fields: &[RirField]) -> bool {
@@ -472,6 +477,7 @@ impl<'a> RustRepPolicy<'a> {
             }
             RirType::Option(inner) => format!("Option<{}>", self.rust_ty(inner)),
             RirType::Slice(elem) => format!("&[{}]", self.rust_ty(elem)),
+            RirType::Lambda(id) => self.lambda_sig_ty(id),
         }
     }
 
@@ -532,6 +538,7 @@ impl<'a> RustRepPolicy<'a> {
             | RirType::List(_)
             | RirType::Map { .. }
             | RirType::Slice(_) => false,
+            RirType::Lambda(_) => true,
             RirType::Option(inner) => self.copyable(inner),
             RirType::Array { elem, .. } => self.copyable(elem),
             RirType::Struct(id) => self.program.structs[id.index()].copyable,
@@ -554,7 +561,8 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Enum(_)
                 | RirType::Array { .. }
                 | RirType::List(_)
-                | RirType::Map { .. } => true,
+                | RirType::Map { .. }
+                | RirType::Lambda(_) => true,
                 RirType::Tuple(id) => self.program.tuples[id.index()]
                     .fields
                     .iter()
@@ -575,7 +583,8 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Void
-                | RirType::Slice(_) => false,
+                | RirType::Slice(_)
+                | RirType::Lambda(_) => false,
             },
             RirParamSemantic::MutBorrow => match ty {
                 RirType::Option(inner) => self.supports_param(inner, semantic),
@@ -590,7 +599,7 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Array { .. }
                 | RirType::List(_)
                 | RirType::Map { .. } => true,
-                RirType::Void | RirType::Slice(_) => false,
+                RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
         }
     }
@@ -701,7 +710,8 @@ impl RustTracePlan {
             | RirType::Bool
             | RirType::String
             | RirType::Void
-            | RirType::DataRef(_) => {}
+            | RirType::DataRef(_)
+            | RirType::Lambda(_) => {}
         }
     }
 }
@@ -744,6 +754,10 @@ mod tests {
         let int = program.alloc_type(TypeData::Int);
         let string = program.alloc_type(TypeData::String);
         let list = program.alloc_type(TypeData::List(int));
+        let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
+            vec![],
+            air::ReturnMode::Value(int),
+        )));
         let classes = TypePassClasses::analyze(&program);
         let policy = AirRustRepPolicy::new(&program, &classes);
 
@@ -752,6 +766,8 @@ mod tests {
         assert!(policy.supports_param_mode(string, ParamMode::Value));
         assert!(policy.supports_param_mode(list, ParamMode::Value));
         assert!(policy.supports_param_mode(list, ParamMode::MutBorrow));
+        assert!(policy.copyable(function));
+        assert!(policy.value_from_ref_supported(function));
     }
 
     #[test]
