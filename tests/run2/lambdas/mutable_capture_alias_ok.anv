@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @contains: 2
+
+fn main() {
+    var count = 0;
+    let f = || {
+        count += 1;
+    };
+    let g = f;
+    f();
+    g();
+    println(count);
+}

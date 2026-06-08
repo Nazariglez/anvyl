@@ -519,7 +519,7 @@ impl ParamUseAnalyzer<'_> {
 
     fn observe_lambda_capture(&mut self, capture: &LambdaCaptureArg) {
         match capture {
-            LambdaCaptureArg::NoRuntime | LambdaCaptureArg::UpvalueCell { .. } => {}
+            LambdaCaptureArg::NoRuntime | LambdaCaptureArg::CaptureCell { .. } => {}
             LambdaCaptureArg::ReadonlyLocal { value } => {
                 self.observe_operand(value, ValueContext::Store);
             }

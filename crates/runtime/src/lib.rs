@@ -3,6 +3,7 @@ mod check;
 pub mod ctx;
 pub mod cycle_collector;
 pub mod error;
+mod lambda_cell;
 pub mod managed_rc;
 pub mod provider;
 pub mod suspect_buffer;
@@ -21,6 +22,7 @@ pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::RuntimeError;
 pub use inventory;
+pub use lambda_cell::StackLambdaCell;
 pub use managed_rc::{
     CycleColor, CycleVtable, ManagedRc, ManagedRcInner, RcHeader, managed_alloc_count,
     managed_alloc_details, typed_dropper,

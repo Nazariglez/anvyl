@@ -179,7 +179,7 @@ impl CompileCx<'_> {
 
     fn check_place(&mut self, function: FunctionId, place: &Place) {
         match place.root {
-            PlaceRoot::UpvalueCell(_) => {
+            PlaceRoot::CaptureCell(_) => {
                 self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCell);
             }
             PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
@@ -274,7 +274,7 @@ impl CompileCx<'_> {
                 self.check_place(function, place);
                 self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCapture);
             }
-            LambdaCaptureArg::UpvalueCell { .. } => {
+            LambdaCaptureArg::CaptureCell { .. } => {
                 self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCell);
             }
             LambdaCaptureArg::NoRuntime => {}

@@ -5,10 +5,10 @@ use super::{
     rir::{
         RirCallArg, RirCallTarget, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
-        RirLambdaCaptureArg, RirLambdaId, RirLambdaSig, RirLoop, RirLoopId, RirOperand,
-        RirOptionMatch, RirParamSemantic, RirPlace, RirProgram, RirRValue, RirRawEnumValue,
-        RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaId, RirLambdaSig,
+        RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirParamSemantic, RirPlace, RirProgram,
+        RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId,
+        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -437,7 +437,16 @@ impl EmitCx<'_> {
             .any(|(_, function, _)| self.fallible_functions[function.index()]);
         let ret = self.lambda_sig_ret_ty(sig, fallible);
         let captures_self = variants.iter().any(|(_, _, captures)| !captures.is_empty());
-        let self_arg = if captures_self { "&mut self" } else { "self" };
+        let mut_self = variants.iter().any(|(_, _, captures)| {
+            captures
+                .iter()
+                .any(|capture| capture.semantic == RirParamSemantic::MutBorrow)
+        });
+        let self_arg = match (captures_self, mut_self) {
+            (_, true) => "&mut self",
+            (true, false) => "&self",
+            (false, false) => "self",
+        };
         let header = if ret == "()" {
             format!("fn call<'cx, 'rt>({self_arg}, {})", comma(params))
         } else {
@@ -487,10 +496,10 @@ impl EmitCx<'_> {
                     w.indented(|w| {
                         for (lambda, function_id, captures) in &variants {
                             let function = &program.functions[function_id.index()];
-                            let capture_args =
-                                captures.iter().enumerate().map(|(index, capture)| {
-                                    lambda_capture_call_arg(index, capture.semantic)
-                                });
+                            let capture_args = captures
+                                .iter()
+                                .enumerate()
+                                .map(|(index, capture)| lambda_capture_call_arg(index, capture));
                             let args = std::iter::once("ctx".to_string())
                                 .chain(capture_args)
                                 .chain((0..arity).map(|index| format!("arg_{index}")));
@@ -613,12 +622,43 @@ impl EmitCx<'_> {
     }
 
     fn local_needs_mut_binding(&self, ty: RirTypeId) -> bool {
-        matches!(self.program.types[ty.index()], RirType::Lambda(_))
+        match self.program.types[ty.index()] {
+            RirType::Lambda(sig) => self.lambda_sig_needs_mut_self(sig),
+            _ => false,
+        }
+    }
+
+    fn lambda_sig_needs_mut_self(&self, sig: super::rir::RirLambdaSigId) -> bool {
+        self.program.lambdas_for_sig(sig).any(|lambda| {
+            lambda
+                .captures
+                .iter()
+                .any(|capture| capture.semantic == RirParamSemantic::MutBorrow)
+        })
     }
 
     fn emit_local_declarations(&mut self, function: &RirFunction) {
+        for cell in self
+            .program
+            .cells
+            .iter()
+            .filter(|cell| cell.owner == function.id)
+        {
+            self.w.line(format_args!(
+                "let {}: {};",
+                cell.symbol.as_str(),
+                target::stack_lambda_cell_ty(&self.ty(cell.payload_ty))
+            ));
+        }
         for local in &function.locals {
-            if local.payload_ref || function.params.iter().any(|param| param.local == local.id) {
+            if local.payload_ref
+                || function.params.iter().any(|param| param.local == local.id)
+                || self
+                    .program
+                    .cells
+                    .iter()
+                    .any(|cell| cell.owner == function.id && cell.source_local == local.id)
+            {
                 continue;
             }
             self.w.line(format_args!(
@@ -665,6 +705,30 @@ impl EmitCx<'_> {
             RirStmt::Assign { dst, value } => self.w.line(format_args!(
                 "{} = {};",
                 RustPlaces::new(self.program, function).local_place(dst),
+                self.rvalue(function, value)
+            )),
+            RirStmt::CellInit { cell, value } => {
+                let payload_ty = self.cell_payload_ty(function, *cell);
+                if predeclared {
+                    self.w.line(format_args!(
+                        "{} = {}::new({});",
+                        self.cell_ref(function, *cell),
+                        target::stack_lambda_cell_ctor(&payload_ty),
+                        self.rvalue(function, value)
+                    ));
+                } else {
+                    self.w.line(format_args!(
+                        "let {}: {} = {}::new({});",
+                        self.cell_ref(function, *cell),
+                        target::stack_lambda_cell_ty(&payload_ty),
+                        target::stack_lambda_cell_ctor(&payload_ty),
+                        self.rvalue(function, value)
+                    ));
+                }
+            }
+            RirStmt::CellSet { cell, value } => self.w.line(format_args!(
+                "{}.set({});",
+                self.cell_ref(function, *cell),
                 self.rvalue(function, value)
             )),
             RirStmt::DataRefSet {
@@ -881,6 +945,9 @@ impl EmitCx<'_> {
                 projections,
                 ty,
             } => self.dataref_get(function, object, *dataref, projections, *ty),
+            RirRValue::CellGetCopy { cell, .. } => {
+                format!("{}.get_copy()", self.cell_ref(function, *cell))
+            }
             RirRValue::Array { elems, .. } => {
                 format!(
                     "[{}]",
@@ -1051,7 +1118,7 @@ impl EmitCx<'_> {
                         .map(|(index, (decl, capture))| {
                             field_init(
                                 &format!("c{index}"),
-                                self.lambda_capture_arg(function, decl.semantic, capture),
+                                self.lambda_capture_arg(function, decl, capture),
                             )
                         })
                         .collect::<Vec<_>>();
@@ -1061,26 +1128,61 @@ impl EmitCx<'_> {
         }
     }
 
+    fn cell_ref(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
+        match cell {
+            super::rir::RirCellRef::Owner(cell) => {
+                self.program.cells[cell.index()].symbol.as_str().to_string()
+            }
+            super::rir::RirCellRef::Capture { local, .. } => {
+                function.locals[local.index()].symbol.as_str().to_string()
+            }
+        }
+    }
+
+    fn cell_payload_ty(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
+        let ty = match cell {
+            super::rir::RirCellRef::Owner(cell) => self.program.cells[cell.index()].payload_ty,
+            super::rir::RirCellRef::Capture { local, .. } => function.locals[local.index()].ty,
+        };
+        self.ty(ty)
+    }
+
     fn lambda_capture_arg(
         &self,
         function: &RirFunction,
-        semantic: RirParamSemantic,
+        decl: &RirLambdaCapture,
         capture: &RirLambdaCaptureArg,
     ) -> String {
         let values = RustValues::new(self.program, function);
-        match (semantic, capture) {
-            (RirParamSemantic::Value, RirLambdaCaptureArg::Readonly { value }) => {
-                values.value_operand(value)
-            }
-            (RirParamSemantic::SharedBorrow, RirLambdaCaptureArg::Readonly { value }) => {
+        match (decl.kind, decl.semantic, capture) {
+            (
+                RirLambdaCaptureKind::Param,
+                RirParamSemantic::Value,
+                RirLambdaCaptureArg::Readonly { value },
+            ) => values.value_operand(value),
+            (
+                RirLambdaCaptureKind::Param,
+                RirParamSemantic::SharedBorrow,
+                RirLambdaCaptureArg::Readonly { value },
+            ) => {
                 let RirOperand::Place(place) = value else {
                     unreachable!("verified shared readonly capture place")
                 };
                 values.borrow_arg(place)
             }
-            (RirParamSemantic::MutBorrow, RirLambdaCaptureArg::Scoped { place }) => {
-                values.mut_borrow_arg(place)
-            }
+            (
+                RirLambdaCaptureKind::Param,
+                RirParamSemantic::MutBorrow,
+                RirLambdaCaptureArg::Scoped { place },
+            ) => values.mut_borrow_arg(place),
+            (
+                RirLambdaCaptureKind::StackCell { .. },
+                RirParamSemantic::StackCell,
+                RirLambdaCaptureArg::StackCell { cell },
+            ) => match cell {
+                super::rir::RirCellRef::Owner(_) => format!("&{}", self.cell_ref(function, *cell)),
+                super::rir::RirCellRef::Capture { .. } => self.cell_ref(function, *cell),
+            },
             _ => unreachable!("verified lambda capture arg mode"),
         }
     }
@@ -1436,9 +1538,13 @@ fn lambda_variant(id: RirLambdaId) -> String {
     format!("L{}", id.index())
 }
 
-fn lambda_capture_call_arg(index: usize, semantic: RirParamSemantic) -> String {
-    match semantic {
-        RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
-        RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
+fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
+    match capture.kind {
+        RirLambdaCaptureKind::Param => match capture.semantic {
+            RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
+            RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
+            RirParamSemantic::StackCell => unreachable!("verified stack-cell capture kind"),
+        },
+        RirLambdaCaptureKind::StackCell { .. } => format!("*c{index}"),
     }
 }

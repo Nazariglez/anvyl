@@ -9,14 +9,14 @@ pub(super) use support::{
 pub(super) use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
     AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail, BindingId, BlockId, CallArg,
-    Callee, CaptureLocalSource, ConstArena, ConstData, ConstId, ConstValue, EnumDecl, EnumId,
-    ExternDecl, ExternFieldDecl, ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep,
-    ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, GlobalDecl, GlobalId,
-    LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId,
-    Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability, Operand, Param, ParamEscape,
-    ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, Projection, RValue, ReturnMode,
-    ScopedBorrowDecl, ScopedBorrowId, Signature, SignatureType, TypeArena, TypeData, TypeId,
-    UpvalueCellDecl, UpvalueCellId, VariantDecl, VariantId, VariantShape, verify,
+    Callee, CaptureCellDecl, CaptureCellId, CaptureLocalSource, ConstArena, ConstData, ConstId,
+    ConstValue, EnumDecl, EnumId, ExternDecl, ExternFieldDecl, ExternMember, ExternParamDecl,
+    ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId,
+    FunctionKind, GlobalDecl, GlobalId, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId,
+    LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability,
+    Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program,
+    Projection, RValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId, Signature, SignatureType,
+    TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape, verify,
 };
 
 mod structure;

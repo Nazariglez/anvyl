@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @contains: 11
+
+fn main() {
+    var count = 0;
+    let inc = || {
+        count += 1;
+    };
+    count = 10;
+    inc();
+    println(count);
+}

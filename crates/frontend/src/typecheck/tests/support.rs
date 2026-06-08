@@ -11,12 +11,11 @@ use crate::{
         resolved_with_core_option,
     },
     typecheck::{
-        self, BindingPromotionMap, BodyInstanceKey, CallMap, CallableId, CallableInstanceKey,
-        CompileWarning, ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap,
-        DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact, ExpectedProjectionMap,
-        ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap,
-        SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
-        decls::DeclarationIndex,
+        self, BodyInstanceKey, CallMap, CallableId, CallableInstanceKey, CaptureCellRequirementMap,
+        ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap, DynDowncastMap,
+        DynWeakeningMap, ExpectedProjectionFact, ExpectedProjectionMap, ExternUseMap,
+        GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap, SemanticBodyFacts,
+        SemanticCheckOutput, SemanticProgram, TypeError, decls::DeclarationIndex,
     },
 };
 
@@ -25,7 +24,6 @@ pub(crate) struct TypecheckTestResult {
     source_types: typecheck::infer::SourceExprTypes,
     public_facts: typecheck::TypecheckFacts,
     flat_facts: SemanticBodyFacts,
-    warnings: Vec<CompileWarning>,
     lint_events: Vec<LintEvent>,
 }
 
@@ -37,7 +35,6 @@ impl TypecheckTestResult {
             source_types: semantic.source_types,
             public_facts: semantic.public_facts,
             flat_facts,
-            warnings: semantic.warnings,
             lint_events: semantic.lint_events,
         }
     }
@@ -119,12 +116,8 @@ impl TypecheckTestResult {
         self.public_facts.lambda_captures()
     }
 
-    pub(crate) fn binding_promotions(&self) -> &BindingPromotionMap {
-        self.public_facts.binding_promotions()
-    }
-
-    pub(crate) fn warnings(&self) -> &[CompileWarning] {
-        &self.warnings
+    pub(crate) fn capture_cell_requirements(&self) -> &CaptureCellRequirementMap {
+        self.public_facts.capture_cell_requirements()
     }
 
     pub(crate) fn lint_events(&self) -> &[LintEvent] {
@@ -383,11 +376,6 @@ pub(crate) fn ty_of(source: &str) -> Type {
 pub(crate) fn assert_ty(source: &str, expected: Type) {
     let ty = ty_of(source);
     assert_eq!(ty, expected, "source: {source}");
-}
-
-pub(crate) fn assert_err(source: &str) {
-    let result = check(source);
-    assert!(result.is_err(), "expected error but got Ok in: {source}");
 }
 
 pub(crate) fn assert_err_count(source: &str, count: usize) {

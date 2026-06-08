@@ -39,7 +39,7 @@ fn non_local_roots_verify_with_declarations() {
         ty: int_ty,
         mutability: Mutability::Immutable,
     });
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner: FunctionId::from_index(0),
         source_local: LocalId::from_index(0),
@@ -76,7 +76,7 @@ fn non_local_roots_verify_with_declarations() {
         bb0,
         stmt_assign(
             Place {
-                root: PlaceRoot::UpvalueCell(cell),
+                root: PlaceRoot::CaptureCell(cell),
                 projection: vec![],
                 ty: int_ty,
             },
@@ -90,7 +90,7 @@ fn non_local_roots_verify_with_declarations() {
 }
 
 #[test]
-fn upvalue_cell_is_shared_by_lambdas_and_owner() {
+fn capture_cell_is_shared_by_lambdas_and_owner() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
@@ -103,7 +103,7 @@ fn upvalue_cell_is_shared_by_lambdas_and_owner() {
     let body_b = FunctionId::from_index(1);
     let owner = FunctionId::from_index(2);
     let source_local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local,
@@ -118,7 +118,7 @@ fn upvalue_cell_is_shared_by_lambdas_and_owner() {
                 owner,
                 signature: lambda_sig.clone(),
                 escape: LambdaEscape::Escaping,
-                captures: vec![LambdaCaptureDecl::UpvalueCell {
+                captures: vec![LambdaCaptureDecl::CaptureCell {
                     binding,
                     cell,
                     ty: int_ty,
@@ -150,7 +150,7 @@ fn upvalue_cell_is_shared_by_lambdas_and_owner() {
     );
     fb.bind_local(source_local, binding);
     let bb0 = fb.push_block(term_return(Operand::Place(Place {
-        root: PlaceRoot::UpvalueCell(cell),
+        root: PlaceRoot::CaptureCell(cell),
         projection: vec![],
         ty: int_ty,
     })));
@@ -158,7 +158,7 @@ fn upvalue_cell_is_shared_by_lambdas_and_owner() {
         bb0,
         stmt_assign(
             Place {
-                root: PlaceRoot::UpvalueCell(cell),
+                root: PlaceRoot::CaptureCell(cell),
                 projection: vec![],
                 ty: int_ty,
             },
@@ -170,7 +170,7 @@ fn upvalue_cell_is_shared_by_lambdas_and_owner() {
             bb0,
             stmt_eval(RValue::MakeLambda {
                 lambda,
-                captures: vec![LambdaCaptureArg::UpvalueCell { cell }],
+                captures: vec![LambdaCaptureArg::CaptureCell { cell }],
                 ty: lambda_ty,
             }),
         );
@@ -179,7 +179,7 @@ fn upvalue_cell_is_shared_by_lambdas_and_owner() {
         bb0,
         stmt_assign(
             Place {
-                root: PlaceRoot::UpvalueCell(cell),
+                root: PlaceRoot::CaptureCell(cell),
                 projection: vec![],
                 ty: int_ty,
             },
@@ -193,7 +193,7 @@ fn upvalue_cell_is_shared_by_lambdas_and_owner() {
 }
 
 #[test]
-fn nested_lambda_forwards_upvalue_cell() {
+fn nested_lambda_forwards_capture_cell() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
@@ -206,7 +206,7 @@ fn nested_lambda_forwards_upvalue_cell() {
     let inner_body = FunctionId::from_index(1);
     let owner = FunctionId::from_index(2);
     let source_local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local,
@@ -225,7 +225,7 @@ fn nested_lambda_forwards_upvalue_cell() {
                 },
                 signature: sig.clone(),
                 escape: LambdaEscape::Escaping,
-                captures: vec![LambdaCaptureDecl::UpvalueCell {
+                captures: vec![LambdaCaptureDecl::CaptureCell {
                     binding,
                     cell,
                     ty: int_ty,
@@ -250,7 +250,7 @@ fn nested_lambda_forwards_upvalue_cell() {
         bb0,
         stmt_eval(RValue::MakeLambda {
             lambda: inner_lambda,
-            captures: vec![LambdaCaptureArg::UpvalueCell { cell }],
+            captures: vec![LambdaCaptureArg::CaptureCell { cell }],
             ty: lambda_ty,
         }),
     );
@@ -287,7 +287,7 @@ fn nested_lambda_forwards_upvalue_cell() {
         bb0,
         stmt_assign(
             Place {
-                root: PlaceRoot::UpvalueCell(cell),
+                root: PlaceRoot::CaptureCell(cell),
                 projection: vec![],
                 ty: int_ty,
             },
@@ -298,7 +298,7 @@ fn nested_lambda_forwards_upvalue_cell() {
         bb0,
         stmt_eval(RValue::MakeLambda {
             lambda: outer_lambda,
-            captures: vec![LambdaCaptureArg::UpvalueCell { cell }],
+            captures: vec![LambdaCaptureArg::CaptureCell { cell }],
             ty: lambda_ty,
         }),
     );

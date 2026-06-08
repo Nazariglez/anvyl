@@ -28,15 +28,16 @@ use self::{
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
-        RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
-        RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm,
-        RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
-        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
-        RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaEscape, RirLambdaId,
+        RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellRef, RirCellStorage, RirConst,
+        RirConstId, RirConstValue, RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum,
+        RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId,
+        RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind,
+        RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEscape, RirLambdaId,
         RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
         RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
-        RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
-        RirRawEnumValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
+        RirRValue, RirRawEnumValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
         RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
         RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId,
         RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
@@ -252,6 +253,7 @@ struct PlanCx<'a> {
     lambda_map: HashMap<air::LambdaId, RirLambdaId>,
     function_type_copyable: HashMap<TypeId, bool>,
     lambda_runtime_capture_slots: HashMap<(air::LambdaId, air::LambdaCaptureSlotId), usize>,
+    capture_cell_map: HashMap<air::CaptureCellId, RirCellId>,
     extern_map: HashMap<ExternId, RirExternId>,
     dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
@@ -349,6 +351,7 @@ impl<'a> PlanCx<'a> {
             lambda_map: HashMap::new(),
             function_type_copyable: HashMap::new(),
             lambda_runtime_capture_slots: HashMap::new(),
+            capture_cell_map: HashMap::new(),
             extern_map: HashMap::new(),
             dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
@@ -375,7 +378,9 @@ impl<'a> PlanCx<'a> {
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
+        self.plan_cells(&mut program);
         self.plan_lambdas(&mut program)?;
+        self.check_lambda_value_capture_cycles(&program)?;
         self.plan_function_type_copyability(&program);
         self.plan_stringify_helpers(&mut program)?;
         for index in 0..self.air.functions.len() {
@@ -1164,6 +1169,22 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn plan_cells(&mut self, program: &mut RirProgram) {
+        for (index, cell) in self.air.capture_cells.iter().enumerate() {
+            let air_id = air::CaptureCellId::from_index(index);
+            let id = RirCellId::from_index(program.cells.len());
+            self.capture_cell_map.insert(air_id, id);
+            program.cells.push(RirCellDecl {
+                id,
+                owner: self.function_map[&cell.owner],
+                source_local: RirLocalId::from_index(cell.source_local.index()),
+                payload_ty: self.type_map[&cell.ty],
+                storage: RirCellStorage::StackScoped,
+                symbol: RirSymbol::new(format!("__cell{}", id.index())),
+            });
+        }
+    }
+
     fn plan_lambdas(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
         let mut function_refs = Vec::new();
         for function in &self.air.functions {
@@ -1216,6 +1237,68 @@ impl<'a> PlanCx<'a> {
             self.lambda_map.insert(lambda, id);
         }
         Ok(())
+    }
+
+    fn check_lambda_value_capture_cycles(&self, program: &RirProgram) -> Result<(), RustPlanError> {
+        for lambda in &program.lambdas {
+            for capture in &lambda.captures {
+                let Some(sig) = Self::value_capture_sig(program, capture) else {
+                    continue;
+                };
+                let mut visited = vec![];
+                if Self::lambda_sig_reaches_value_capture(program, sig, lambda.sig, &mut visited) {
+                    return Err(Self::gap(
+                        self.lambda_gap_site(lambda),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn value_capture_sig(
+        program: &RirProgram,
+        capture: &RirLambdaCapture,
+    ) -> Option<RirLambdaSigId> {
+        if capture.abi != RirParamAbi::Value {
+            return None;
+        }
+        match program.types[capture.ty.index()] {
+            RirType::Lambda(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    fn lambda_sig_reaches_value_capture(
+        program: &RirProgram,
+        from: RirLambdaSigId,
+        target: RirLambdaSigId,
+        visited: &mut Vec<RirLambdaSigId>,
+    ) -> bool {
+        if from == target {
+            return true;
+        }
+        if visited.contains(&from) {
+            return false;
+        }
+        visited.push(from);
+        program.lambdas_for_sig(from).any(|lambda| {
+            lambda
+                .captures
+                .iter()
+                .filter_map(|capture| Self::value_capture_sig(program, capture))
+                .any(|sig| Self::lambda_sig_reaches_value_capture(program, sig, target, visited))
+        })
+    }
+
+    fn lambda_gap_site(&self, lambda: &RirLambda) -> RustTargetGapSite {
+        match lambda.source {
+            RirLambdaSource::Function(function) => RustTargetGapSite::Function(function),
+            RirLambdaSource::Lambda(lambda) => {
+                RustTargetGapSite::Function(self.air.lambdas[lambda.index()].owner)
+            }
+        }
     }
 
     fn plan_function_type_copyability(&mut self, program: &RirProgram) {
@@ -1282,6 +1365,7 @@ impl<'a> PlanCx<'a> {
                     ty,
                     semantic,
                     abi: policy.param_abi(semantic),
+                    kind: RirLambdaCaptureKind::Param,
                 }))
             }
             air::LambdaCaptureDecl::ScopedLocal { ty, mutability, .. } => {
@@ -1297,13 +1381,24 @@ impl<'a> PlanCx<'a> {
                     ty,
                     semantic,
                     abi: policy.param_abi(semantic),
+                    kind: RirLambdaCaptureKind::Param,
                 }))
             }
-            air::LambdaCaptureDecl::ScopedBorrow { .. }
-            | air::LambdaCaptureDecl::UpvalueCell { .. } => Err(Self::gap(
+            air::LambdaCaptureDecl::ScopedBorrow { .. } => Err(Self::gap(
                 RustTargetGapSite::Function(owner),
                 RustTargetGapKind::UnsupportedLambdaCapture,
             )),
+            air::LambdaCaptureDecl::CaptureCell { cell, ty, .. } => {
+                let ty = self.type_map[ty];
+                Ok(Some(RirLambdaCapture {
+                    ty,
+                    semantic: RirParamSemantic::StackCell,
+                    abi: policy.param_abi(RirParamSemantic::StackCell),
+                    kind: RirLambdaCaptureKind::StackCell {
+                        cell: self.capture_cell_map[cell],
+                    },
+                }))
+            }
         }
     }
 
@@ -1423,11 +1518,24 @@ impl<'a> PlanCx<'a> {
             }
         }));
         let mut lambda_values = vec![None; locals.len()];
+        let mut initialized_cells = vec![false; self.air.capture_cells.len()];
+        let mut possible_cells = vec![false; self.air.capture_cells.len()];
+        if let air::FunctionKind::Lambda(lambda) = function.kind {
+            for capture in &self.air.lambdas[lambda.index()].captures {
+                if let air::LambdaCaptureDecl::CaptureCell { cell, .. } = capture {
+                    initialized_cells[cell.index()] = true;
+                    possible_cells[cell.index()] = true;
+                }
+            }
+        }
         let body = self.plan_air_block(
             air_id,
             &function.body.block,
             &mut locals,
             &mut lambda_values,
+            &mut initialized_cells,
+            &mut possible_cells,
+            false,
         )?;
         Ok(RirFunction {
             id: self.function_map[&air_id],
@@ -1455,10 +1563,21 @@ impl<'a> PlanCx<'a> {
         block: &air::AirBlock,
         locals: &mut Vec<RirLocal>,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+        in_loop: bool,
     ) -> Result<RirStructuredBlock, RustPlanError> {
         let mut stmts = vec![];
         for stmt in &block.stmts {
-            stmts.extend(self.plan_air_stmt(function, stmt, locals, lambda_values)?);
+            stmts.extend(self.plan_air_stmt(
+                function,
+                stmt,
+                locals,
+                lambda_values,
+                initialized_cells,
+                possible_cells,
+                in_loop,
+            )?);
         }
         let (tail_stmts, term) = self.plan_air_tail(function, &block.tail, locals);
         stmts.extend(tail_stmts);
@@ -1471,6 +1590,9 @@ impl<'a> PlanCx<'a> {
         stmt: &air::AirStmt,
         locals: &mut Vec<RirLocal>,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+        in_loop: bool,
     ) -> Result<Vec<RirStmt>, RustPlanError> {
         match stmt {
             air::AirStmt::Init { local, value } => {
@@ -1500,7 +1622,16 @@ impl<'a> PlanCx<'a> {
                     stmts.append(&mut planned.post_stmts);
                     RirRValue::Use(operand)
                 };
-                self.lower_place_write(function, dst, value, locals, &mut stmts);
+                self.lower_place_write(
+                    function,
+                    dst,
+                    value,
+                    locals,
+                    &mut stmts,
+                    initialized_cells,
+                    possible_cells,
+                    in_loop,
+                )?;
                 self.set_place_known_lambda(lambda_values, dst, known);
                 Ok(stmts)
             }
@@ -1514,23 +1645,56 @@ impl<'a> PlanCx<'a> {
             air::AirStmt::If(branch) => {
                 let cond = self.plan_operand_read(function, &branch.cond, locals);
                 let entry_lambdas = lambda_values.clone();
+                let entry_cells = initialized_cells.to_vec();
+                let entry_possible = possible_cells.to_vec();
                 let mut then_lambdas = entry_lambdas.clone();
-                let then_block =
-                    self.plan_air_block(function, &branch.then_block, locals, &mut then_lambdas)?;
-                let (else_block, else_lambdas) = match &branch.else_block {
+                let mut then_cells = entry_cells.clone();
+                let mut then_possible = entry_possible.clone();
+                let then_block = self.plan_air_block(
+                    function,
+                    &branch.then_block,
+                    locals,
+                    &mut then_lambdas,
+                    &mut then_cells,
+                    &mut then_possible,
+                    in_loop,
+                )?;
+                let (else_block, else_lambdas, else_cells, else_possible) = match &branch.else_block
+                {
                     Some(block) => {
                         let mut else_lambdas = entry_lambdas.clone();
-                        let block =
-                            self.plan_air_block(function, block, locals, &mut else_lambdas)?;
-                        (Some(block), else_lambdas)
+                        let mut else_cells = entry_cells.clone();
+                        let mut else_possible = entry_possible.clone();
+                        let block = self.plan_air_block(
+                            function,
+                            block,
+                            locals,
+                            &mut else_lambdas,
+                            &mut else_cells,
+                            &mut else_possible,
+                            in_loop,
+                        )?;
+                        (Some(block), else_lambdas, else_cells, else_possible)
                     }
-                    None => (None, entry_lambdas),
+                    None => (None, entry_lambdas, entry_cells, entry_possible),
                 };
                 self.merge_known_lambdas(
                     lambda_values,
                     locals.len(),
                     [&then_lambdas, &else_lambdas],
                 );
+                for (dst, (then, else_)) in initialized_cells
+                    .iter_mut()
+                    .zip(then_cells.iter().zip(&else_cells))
+                {
+                    *dst = *then && *else_;
+                }
+                for (dst, (then, else_)) in possible_cells
+                    .iter_mut()
+                    .zip(then_possible.iter().zip(&else_possible))
+                {
+                    *dst = *then || *else_;
+                }
                 let mut stmts = cond.stmts;
                 stmts.push(RirStmt::If(RirIf {
                     cond: cond.operand,
@@ -1541,13 +1705,37 @@ impl<'a> PlanCx<'a> {
             }
             air::AirStmt::Loop(loop_) => {
                 let entry_lambdas = lambda_values.clone();
+                let entry_cells = initialized_cells.to_vec();
+                let entry_possible = possible_cells.to_vec();
                 let mut body_lambdas = entry_lambdas.clone();
-                let body = self.plan_air_block(function, &loop_.body, locals, &mut body_lambdas)?;
+                let mut body_cells = entry_cells.clone();
+                let mut body_possible = entry_possible.clone();
+                let body = self.plan_air_block(
+                    function,
+                    &loop_.body,
+                    locals,
+                    &mut body_lambdas,
+                    &mut body_cells,
+                    &mut body_possible,
+                    true,
+                )?;
                 self.merge_known_lambdas(
                     lambda_values,
                     locals.len(),
                     [&entry_lambdas, &body_lambdas],
                 );
+                for (dst, (entry, body)) in initialized_cells
+                    .iter_mut()
+                    .zip(entry_cells.iter().zip(&body_cells))
+                {
+                    *dst = *entry && *body;
+                }
+                for (dst, (entry, body)) in possible_cells
+                    .iter_mut()
+                    .zip(entry_possible.iter().zip(&body_possible))
+                {
+                    *dst = *entry || *body;
+                }
                 Ok(vec![RirStmt::Loop(RirLoop {
                     id: RirLoopId::from_index(loop_.id.index()),
                     body,
@@ -1560,15 +1748,30 @@ impl<'a> PlanCx<'a> {
                 };
                 let mut stmts = discr.stmts;
                 let entry_lambdas = lambda_values.clone();
+                let entry_cells = initialized_cells.to_vec();
+                let entry_possible = possible_cells.to_vec();
                 let mut states = vec![];
+                let mut cell_states = vec![];
+                let mut possible_states = vec![];
                 let arms = match_
                     .arms
                     .iter()
                     .map(|arm| {
                         let mut arm_lambdas = entry_lambdas.clone();
-                        let block =
-                            self.plan_air_block(function, &arm.block, locals, &mut arm_lambdas)?;
+                        let mut arm_cells = entry_cells.clone();
+                        let mut arm_possible = entry_possible.clone();
+                        let block = self.plan_air_block(
+                            function,
+                            &arm.block,
+                            locals,
+                            &mut arm_lambdas,
+                            &mut arm_cells,
+                            &mut arm_possible,
+                            in_loop,
+                        )?;
                         states.push(arm_lambdas);
+                        cell_states.push(arm_cells);
+                        possible_states.push(arm_possible);
                         Ok(RirEnumMatchArm {
                             variant: RirVariantId::from_index(arm.variant.index()),
                             block,
@@ -1578,15 +1781,30 @@ impl<'a> PlanCx<'a> {
                 let else_block = match &match_.else_block {
                     Some(block) => {
                         let mut else_lambdas = entry_lambdas.clone();
-                        let block =
-                            self.plan_air_block(function, block, locals, &mut else_lambdas)?;
+                        let mut else_cells = entry_cells.clone();
+                        let mut else_possible = entry_possible.clone();
+                        let block = self.plan_air_block(
+                            function,
+                            block,
+                            locals,
+                            &mut else_lambdas,
+                            &mut else_cells,
+                            &mut else_possible,
+                            in_loop,
+                        )?;
                         states.push(else_lambdas);
+                        cell_states.push(else_cells);
+                        possible_states.push(else_possible);
                         Some(block)
                     }
                     None => None,
                 };
                 if !states.is_empty() {
                     self.merge_known_lambdas(lambda_values, locals.len(), states.iter());
+                    for index in 0..initialized_cells.len() {
+                        initialized_cells[index] = cell_states.iter().all(|state| state[index]);
+                        possible_cells[index] = possible_states.iter().any(|state| state[index]);
+                    }
                 }
                 stmts.push(RirStmt::EnumMatch(RirEnumMatch {
                     discr: discr_place,
@@ -1611,17 +1829,49 @@ impl<'a> PlanCx<'a> {
                     local.payload_ref = true;
                 }
                 let entry_lambdas = lambda_values.clone();
+                let entry_cells = initialized_cells.to_vec();
+                let entry_possible = possible_cells.to_vec();
                 let mut some_lambdas = entry_lambdas.clone();
-                let some_block =
-                    self.plan_air_block(function, &match_.some_block, locals, &mut some_lambdas)?;
+                let mut some_cells = entry_cells.clone();
+                let mut some_possible = entry_possible.clone();
+                let some_block = self.plan_air_block(
+                    function,
+                    &match_.some_block,
+                    locals,
+                    &mut some_lambdas,
+                    &mut some_cells,
+                    &mut some_possible,
+                    in_loop,
+                )?;
                 let mut none_lambdas = entry_lambdas;
-                let none_block =
-                    self.plan_air_block(function, &match_.none_block, locals, &mut none_lambdas)?;
+                let mut none_cells = entry_cells;
+                let mut none_possible = entry_possible;
+                let none_block = self.plan_air_block(
+                    function,
+                    &match_.none_block,
+                    locals,
+                    &mut none_lambdas,
+                    &mut none_cells,
+                    &mut none_possible,
+                    in_loop,
+                )?;
                 self.merge_known_lambdas(
                     lambda_values,
                     locals.len(),
                     [&some_lambdas, &none_lambdas],
                 );
+                for (dst, (some, none)) in initialized_cells
+                    .iter_mut()
+                    .zip(some_cells.iter().zip(&none_cells))
+                {
+                    *dst = *some && *none;
+                }
+                for (dst, (some, none)) in possible_cells
+                    .iter_mut()
+                    .zip(some_possible.iter().zip(&none_possible))
+                {
+                    *dst = *some || *none;
+                }
                 stmts.push(RirStmt::OptionMatch(RirOptionMatch {
                     discr: discr_place,
                     payload,
@@ -2011,12 +2261,16 @@ impl<'a> PlanCx<'a> {
                         place: self.plan_place_in_function(function, place),
                     });
                 }
-                air::LambdaCaptureArg::ScopedBorrow { .. }
-                | air::LambdaCaptureArg::UpvalueCell { .. } => {
+                air::LambdaCaptureArg::ScopedBorrow { .. } => {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(function),
                         RustTargetGapKind::UnsupportedLambdaCapture,
                     ));
+                }
+                air::LambdaCaptureArg::CaptureCell { cell } => {
+                    planned.push(RirLambdaCaptureArg::StackCell {
+                        cell: self.capture_cell_ref(function, *cell),
+                    });
                 }
             }
         }
@@ -2082,6 +2336,18 @@ impl<'a> PlanCx<'a> {
                 self.plan_operand(function, operand),
             )));
         };
+        if let Some(cell) = self.place_capture_cell(function, place) {
+            if !place.projection.is_empty() {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedPlaceProjection,
+                ));
+            }
+            return Ok(PlannedRValue::from_value(RirRValue::CellGetCopy {
+                cell: self.capture_cell_ref(function, cell),
+                ty: self.type_map[&place.ty],
+            }));
+        }
         if self.place_crosses_dataref(function, place) {
             let planned = self.lower_place_read(function, place, locals);
             return Ok(PlannedRValue {
@@ -2327,13 +2593,18 @@ impl<'a> PlanCx<'a> {
                 };
                 locals[temp_place.local.index()].mutable = true;
                 let mut post_stmts = vec![];
+                let mut ignored_cells = vec![];
+                let mut ignored_possible_cells = vec![];
                 self.lower_place_write(
                     function,
                     place,
                     RirRValue::Use(RirOperand::Place(temp_place.clone())),
                     locals,
                     &mut post_stmts,
-                );
+                    &mut ignored_cells,
+                    &mut ignored_possible_cells,
+                    false,
+                )?;
                 Ok(PlannedCallArg {
                     stmts: planned.stmts,
                     arg: RirCallArg::MutBorrow(temp_place),
@@ -2391,6 +2662,26 @@ impl<'a> PlanCx<'a> {
         place: &Place,
         locals: &mut Vec<RirLocal>,
     ) -> PlannedOperand {
+        if let Some(cell) = self.place_capture_cell(function, place) {
+            if !place.projection.is_empty() {
+                unreachable!("Rust backend profile rejects projected capture-cell places")
+            }
+            let local = self.alloc_temp(locals, place.ty);
+            return PlannedOperand {
+                stmts: vec![RirStmt::Init {
+                    local,
+                    value: RirRValue::CellGetCopy {
+                        cell: self.capture_cell_ref(function, cell),
+                        ty: self.type_map[&place.ty],
+                    },
+                }],
+                operand: RirOperand::Place(RirPlace {
+                    local,
+                    projections: vec![],
+                    ty: self.type_map[&place.ty],
+                }),
+            };
+        }
         if !self.place_crosses_dataref(function, place) {
             return PlannedOperand::from_operand(RirOperand::Place(
                 self.plan_place_in_function(function, place),
@@ -2419,13 +2710,49 @@ impl<'a> PlanCx<'a> {
         value: RirRValue,
         locals: &mut Vec<RirLocal>,
         stmts: &mut Vec<RirStmt>,
-    ) {
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+        in_loop: bool,
+    ) -> Result<(), RustPlanError> {
+        if let Some(cell) = self.place_capture_cell(function, place) {
+            if !place.projection.is_empty() {
+                unreachable!("Rust backend profile rejects projected capture-cell places")
+            }
+            let cell_ref = self.capture_cell_ref(function, cell);
+            if initialized_cells
+                .get(cell.index())
+                .copied()
+                .unwrap_or(false)
+            {
+                stmts.push(RirStmt::CellSet {
+                    cell: cell_ref,
+                    value,
+                });
+            } else if in_loop || possible_cells.get(cell.index()).copied().unwrap_or(false) {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedLambdaCell,
+                ));
+            } else {
+                stmts.push(RirStmt::CellInit {
+                    cell: cell_ref,
+                    value,
+                });
+                if let Some(slot) = initialized_cells.get_mut(cell.index()) {
+                    *slot = true;
+                }
+                if let Some(slot) = possible_cells.get_mut(cell.index()) {
+                    *slot = true;
+                }
+            }
+            return Ok(());
+        }
         if !self.place_crosses_dataref(function, place) {
             stmts.push(RirStmt::Assign {
                 dst: self.plan_place_in_function(function, place),
                 value,
             });
-            return;
+            return Ok(());
         }
         let value = self.rvalue_operand(value, place.ty, locals, stmts);
         let (mut current_ty, mut current_place) = self.root_place(function, place);
@@ -2440,7 +2767,7 @@ impl<'a> PlanCx<'a> {
                     projections: segment.projections,
                     value,
                 });
-                return;
+                return Ok(());
             }
             index = segment.next_index;
             current_ty = segment.ty;
@@ -2569,6 +2896,52 @@ impl<'a> PlanCx<'a> {
         false
     }
 
+    fn place_capture_cell(
+        &self,
+        function: FunctionId,
+        place: &Place,
+    ) -> Option<air::CaptureCellId> {
+        match place.root {
+            air::PlaceRoot::CaptureCell(cell) => Some(cell),
+            air::PlaceRoot::LambdaCapture(slot) => {
+                let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
+                    return None;
+                };
+                match self.air.lambdas[lambda.index()].captures[slot.index()] {
+                    air::LambdaCaptureDecl::CaptureCell { cell, .. } => Some(cell),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn capture_cell_ref(&self, function: FunctionId, cell: air::CaptureCellId) -> RirCellRef {
+        let rir_cell = self.capture_cell_map[&cell];
+        if self.air.capture_cells[cell.index()].owner == function {
+            return RirCellRef::Owner(rir_cell);
+        }
+        let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
+            unreachable!("AIR verifier rejects inaccessible capture cells")
+        };
+        let slot = self.air.lambdas[lambda.index()]
+            .captures
+            .iter()
+            .enumerate()
+            .find_map(|(slot, capture)| match capture {
+                air::LambdaCaptureDecl::CaptureCell { cell: found, .. } if *found == cell => {
+                    Some(air::LambdaCaptureSlotId::from_index(slot))
+                }
+                _ => None,
+            })
+            .expect("AIR verifier rejects uncaptured capture-cell use");
+        let runtime = self.lambda_runtime_capture_slots[&(lambda, slot)];
+        RirCellRef::Capture {
+            cell: rir_cell,
+            local: RirLocalId::from_index(self.air.function(function).locals.len() + runtime),
+        }
+    }
+
     fn current_place_root(&self, function: FunctionId, place: &Place) -> (TypeId, RirLocalId) {
         match place.root {
             air::PlaceRoot::Local(local) => (
@@ -2587,7 +2960,7 @@ impl<'a> PlanCx<'a> {
                 )
             }
             air::PlaceRoot::ScopedBorrow(_)
-            | air::PlaceRoot::UpvalueCell(_)
+            | air::PlaceRoot::CaptureCell(_)
             | air::PlaceRoot::Global(_) => {
                 unreachable!("Rust backend profile rejects unsupported place roots")
             }
@@ -2684,7 +3057,7 @@ fn lambda_capture_ty(capture: &air::LambdaCaptureDecl) -> TypeId {
         | air::LambdaCaptureDecl::ReadonlyLocal { ty, .. }
         | air::LambdaCaptureDecl::ScopedLocal { ty, .. }
         | air::LambdaCaptureDecl::ScopedBorrow { ty, .. }
-        | air::LambdaCaptureDecl::UpvalueCell { ty, .. } => *ty,
+        | air::LambdaCaptureDecl::CaptureCell { ty, .. } => *ty,
     }
 }
 

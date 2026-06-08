@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{
-    BindingId, BindingMutability, BindingPromotionFact, BodyInstanceKey, CaptureAccess,
+    BindingId, BindingMutability, BodyInstanceKey, CaptureAccess, CaptureCellRequirementFact,
     CaptureStorage, CaptureStorageOrigin, CheckedType, FunctionValueKind, LambdaBodyKey,
     LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LambdaEscapeMap, LocalBindingKind,
     LocalValue, ReturnAccess, ReturnSpec, TypeChecker, TypeError, TypecheckFacts,
@@ -727,10 +727,13 @@ impl ClosureClassifier {
                     storage,
                 },
             );
-            if escaping && storage == CaptureStorage::OwnedMutableUpvalue {
-                facts.binding_promotions.insert(
+            if matches!(
+                storage,
+                CaptureStorage::OwnedMutableScoped | CaptureStorage::OwnedMutableUpvalue
+            ) {
+                facts.capture_cell_requirements.insert(
                     capture.binding_id,
-                    BindingPromotionFact {
+                    CaptureCellRequirementFact {
                         binding_id: capture.binding_id,
                         name: capture.name,
                         ty,
@@ -748,8 +751,8 @@ impl ClosureClassifier {
             .lambda_captures
             .extend(facts.lambda_captures);
         self.replayed_facts
-            .binding_promotions
-            .extend(facts.binding_promotions);
+            .capture_cell_requirements
+            .extend(facts.capture_cell_requirements);
     }
 
     fn crosses_capture_boundary(&self, depth: usize) -> bool {

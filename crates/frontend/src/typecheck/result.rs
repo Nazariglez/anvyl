@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::{
-    BindingPromotionMap, CompileWarning, ForStepRuntimeCheckMap, ImportId, ImportRecord,
+    CaptureCellRequirementMap, CompileWarning, ForStepRuntimeCheckMap, ImportId, ImportRecord,
     LambdaCaptureMap, LambdaEscapeMap, ModuleScope, NominalKey, SemanticDeclarations,
     SemanticFactMaps, TypeError, decls::DeclarationIndex, infer::SourceExprTypes,
     semantic_use::map_delta,
@@ -136,7 +136,7 @@ impl TypecheckOutput {
 pub struct TypecheckFacts {
     pub(super) lambda_escapes: LambdaEscapeMap,
     pub(super) lambda_captures: LambdaCaptureMap,
-    pub(super) binding_promotions: BindingPromotionMap,
+    pub(super) capture_cell_requirements: CaptureCellRequirementMap,
     pub(super) for_step_runtime_checks: ForStepRuntimeCheckMap,
     pub(super) import_records: Vec<ImportRecord>,
     pub(super) used_imports: std::collections::HashSet<ImportId>,
@@ -163,8 +163,8 @@ impl TypecheckFacts {
         &self.lambda_captures
     }
 
-    pub(crate) fn binding_promotions(&self) -> &BindingPromotionMap {
-        &self.binding_promotions
+    pub(crate) fn capture_cell_requirements(&self) -> &CaptureCellRequirementMap {
+        &self.capture_cell_requirements
     }
 
     #[cfg(test)]
@@ -190,7 +190,10 @@ impl TypecheckFacts {
         Self {
             lambda_escapes: map_delta(&old.lambda_escapes, &self.lambda_escapes),
             lambda_captures: map_delta(&old.lambda_captures, &self.lambda_captures),
-            binding_promotions: map_delta(&old.binding_promotions, &self.binding_promotions),
+            capture_cell_requirements: map_delta(
+                &old.capture_cell_requirements,
+                &self.capture_cell_requirements,
+            ),
             for_step_runtime_checks: map_delta(
                 &old.for_step_runtime_checks,
                 &self.for_step_runtime_checks,
@@ -212,7 +215,7 @@ impl TypecheckFacts {
         for span in self.for_step_runtime_checks.values() {
             debug_assert!(span.span.start <= span.span.end);
         }
-        for (binding_id, fact) in &self.binding_promotions {
+        for (binding_id, fact) in &self.capture_cell_requirements {
             debug_assert_eq!(*binding_id, fact.binding_id);
         }
     }

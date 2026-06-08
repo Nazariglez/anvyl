@@ -29,7 +29,7 @@ define_id!(TypeId);
 define_id!(ConstId);
 define_id!(LocalId);
 define_id!(ScopedBorrowId);
-define_id!(UpvalueCellId);
+define_id!(CaptureCellId);
 define_id!(GlobalId);
 define_id!(BlockId);
 define_id!(AirLoopId);

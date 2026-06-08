@@ -81,7 +81,7 @@ pub enum PlaceRoot {
     Local(LocalId),
     LambdaCapture(LambdaCaptureSlotId),
     ScopedBorrow(ScopedBorrowId),
-    UpvalueCell(UpvalueCellId),
+    CaptureCell(CaptureCellId),
     Global(GlobalId),
 }
 
@@ -91,7 +91,7 @@ impl PlaceRoot {
             Self::Local(local) => Some(local),
             Self::LambdaCapture(_)
             | Self::ScopedBorrow(_)
-            | Self::UpvalueCell(_)
+            | Self::CaptureCell(_)
             | Self::Global(_) => None,
         }
     }
@@ -212,7 +212,7 @@ pub enum LambdaCaptureArg {
     ReadonlyLocal { value: Operand },
     ScopedLocal { place: Place },
     ScopedBorrow { place: Place },
-    UpvalueCell { cell: UpvalueCellId },
+    CaptureCell { cell: CaptureCellId },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -16,9 +16,9 @@ use std::fmt::Write;
 pub use body::*;
 pub use decl::*;
 pub use ids::{
-    AggregateId, AirLoopId, BindingId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FieldId,
-    FunctionId, GlobalId, LambdaCaptureSlotId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId,
-    UpvalueCellId, VariantId,
+    AggregateId, AirLoopId, BindingId, BlockId, CaptureCellId, ConstId, EnumId, ExternId,
+    ExternTypeId, FieldId, FunctionId, GlobalId, LambdaCaptureSlotId, LambdaId, LocalId, ModuleId,
+    ScopedBorrowId, TypeId, VariantId,
 };
 pub use ownership::*;
 pub use types::*;
@@ -57,7 +57,7 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub lambdas: Vec<LambdaDecl>,
     pub scoped_borrows: Vec<ScopedBorrowDecl>,
-    pub upvalue_cells: Vec<UpvalueCellDecl>,
+    pub capture_cells: Vec<CaptureCellDecl>,
     pub globals: Vec<GlobalDecl>,
     pub externs: Vec<ExternDecl>,
     pub extern_types: Vec<ExternTypeDecl>,
@@ -108,9 +108,9 @@ impl Program {
         id
     }
 
-    pub fn alloc_upvalue_cell(&mut self, decl: UpvalueCellDecl) -> UpvalueCellId {
-        let id = UpvalueCellId::from_index(self.upvalue_cells.len());
-        self.upvalue_cells.push(decl);
+    pub fn alloc_capture_cell(&mut self, decl: CaptureCellDecl) -> CaptureCellId {
+        let id = CaptureCellId::from_index(self.capture_cells.len());
+        self.capture_cells.push(decl);
         id
     }
 

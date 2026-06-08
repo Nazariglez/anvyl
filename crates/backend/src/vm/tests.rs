@@ -1,10 +1,10 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, BindingId, CallArg, Callee, CaptureLocalSource, ExternDecl, ExternMember,
-        ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl, Function, FunctionId,
-        FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand, ParamEscape,
-        ParamMode, Place, PlaceRoot, Program, RValue, Signature, TypeData, UpvalueCellDecl,
+        self, BindingId, CallArg, Callee, CaptureCellDecl, CaptureLocalSource, ExternDecl,
+        ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl, Function,
+        FunctionId, FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand,
+        ParamEscape, ParamMode, Place, PlaceRoot, Program, RValue, Signature, TypeData,
     },
     ast::{ExprId, Ident},
 };
@@ -584,11 +584,11 @@ fn compiler_rejects_global_roots() {
 }
 
 #[test]
-fn compiler_rejects_upvalue_cell_roots() {
+fn compiler_rejects_capture_cell_roots() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let module = program.alloc_module(root_module());
-    let cell = program.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = program.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner: FunctionId::from_index(0),
         source_local: air::LocalId::from_index(0),
@@ -611,14 +611,14 @@ fn compiler_rejects_upvalue_cell_roots() {
         body: structured_body(
             vec![Statement::Assign {
                 dst: Place {
-                    root: PlaceRoot::UpvalueCell(cell),
+                    root: PlaceRoot::CaptureCell(cell),
                     projection: vec![],
                     ty: int,
                 },
                 value: RValue::Use(Operand::Const(init)),
             }],
             air::AirTail::Return(Some(Operand::Place(Place {
-                root: PlaceRoot::UpvalueCell(cell),
+                root: PlaceRoot::CaptureCell(cell),
                 projection: vec![],
                 ty: int,
             }))),

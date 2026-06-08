@@ -85,7 +85,7 @@ struct ProfileCx<'a> {
 
 fn unsupported_place_root(root: PlaceRoot) -> ProfileErrorKind {
     match root {
-        PlaceRoot::UpvalueCell(_) => ProfileErrorKind::UnsupportedLambdaCell,
+        PlaceRoot::CaptureCell(_) => ProfileErrorKind::UnsupportedLambdaCell,
         PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
             ProfileErrorKind::UnsupportedLambdaCapture
         }
@@ -312,8 +312,10 @@ impl ProfileCx<'_> {
                 air::LambdaCaptureDecl::ScopedBorrow { .. } => {
                     self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                 }
-                air::LambdaCaptureDecl::UpvalueCell { .. } => {
-                    self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
+                air::LambdaCaptureDecl::CaptureCell { .. } => {
+                    if decl.escape != air::LambdaEscape::NonEscaping {
+                        self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
+                    }
                 }
             }
         }
@@ -437,11 +439,12 @@ impl ProfileCx<'_> {
                         air::LambdaCaptureDecl::ScopedLocal {
                             mutability: Mutability::Mutable,
                             ..
-                        }
+                        } | air::LambdaCaptureDecl::CaptureCell { .. }
                     )
                 })
             }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+            PlaceRoot::CaptureCell(_) => Some(true),
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => {
                 self.push(site, unsupported_place_root(place.root));
                 None
             }
@@ -625,8 +628,14 @@ impl ProfileCx<'_> {
                 let decl = self.program.lambdas.get(lambda.index());
                 for (index, capture) in captures.iter().enumerate() {
                     match capture {
-                        air::LambdaCaptureArg::UpvalueCell { .. } => {
-                            self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
+                        air::LambdaCaptureArg::CaptureCell { .. } => {
+                            if !decl.and_then(|decl| decl.captures.get(index)).is_some_and(
+                                |capture| {
+                                    matches!(capture, air::LambdaCaptureDecl::CaptureCell { .. })
+                                },
+                            ) {
+                                self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
+                            }
                         }
                         air::LambdaCaptureArg::ReadonlyLocal { value } => {
                             self.check_operand(site, value);
@@ -890,10 +899,18 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
-            CallArg::SharedBorrow(place) => self.check_place(site, place),
+            CallArg::SharedBorrow(place) => {
+                self.check_place(site, place);
+                if self.place_capture_cell(site, place).is_some() {
+                    self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                }
+            }
             CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
                 self.check_place(site, place);
+                if self.place_capture_cell(site, place).is_some() {
+                    self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                }
                 if !self.supports_param_mode(place.ty, ParamMode::MutBorrow) {
                     self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
                 }
@@ -924,7 +941,14 @@ impl ProfileCx<'_> {
 
     fn check_operand(&mut self, site: ProfileSite, operand: &Operand) {
         match operand {
-            Operand::Place(place) => self.check_place(site, place),
+            Operand::Place(place) => {
+                self.check_place(site, place);
+                if self.place_capture_cell(site, place).is_some()
+                    && !self.policy().copyable(place.ty)
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
+                }
+            }
             Operand::Const(id) => self.check_const_ref(site, *id),
         }
     }
@@ -943,9 +967,24 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                     return;
                 };
+                if self.place_capture_cell(site, place).is_some() && !place.projection.is_empty() {
+                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                    return;
+                }
                 ty
             }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+            PlaceRoot::CaptureCell(cell) => {
+                if !place.projection.is_empty() {
+                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                    return;
+                }
+                let Some(decl) = self.program.capture_cells.get(cell.index()) else {
+                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                    return;
+                };
+                decl.ty
+            }
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => {
                 self.push(site, unsupported_place_root(place.root));
                 return;
             }
@@ -963,6 +1002,17 @@ impl ProfileCx<'_> {
         self.check_type_ref(site, place.ty);
     }
 
+    fn place_capture_cell(&self, site: ProfileSite, place: &Place) -> Option<air::CaptureCellId> {
+        match place.root {
+            PlaceRoot::CaptureCell(cell) => Some(cell),
+            PlaceRoot::LambdaCapture(slot) => match self.current_lambda_capture(site, slot) {
+                Some(air::LambdaCaptureDecl::CaptureCell { cell, .. }) => Some(*cell),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn place_crosses_dataref(&self, site: ProfileSite, place: &Place) -> bool {
         let mut ty = match place.root {
             PlaceRoot::Local(root) => {
@@ -977,7 +1027,7 @@ impl ProfileCx<'_> {
                 };
                 ty
             }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::CaptureCell(_) | PlaceRoot::Global(_) => {
                 return false;
             }
         };

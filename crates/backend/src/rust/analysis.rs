@@ -34,9 +34,11 @@ fn block_calls_fallible(
 
 fn stmt_calls_fallible(program: &RirProgram, fallible: &[bool], stmt: &RirStmt) -> bool {
     match stmt {
-        RirStmt::Init { value, .. } | RirStmt::Assign { value, .. } | RirStmt::Eval(value) => {
-            rvalue_calls_fallible(program, fallible, value)
-        }
+        RirStmt::Init { value, .. }
+        | RirStmt::Assign { value, .. }
+        | RirStmt::CellInit { value, .. }
+        | RirStmt::CellSet { value, .. }
+        | RirStmt::Eval(value) => rvalue_calls_fallible(program, fallible, value),
         RirStmt::DataRefSet { .. } => false,
         _ => stmt_child_blocks_any(stmt, |block| block_calls_fallible(program, fallible, block)),
     }
@@ -76,7 +78,8 @@ fn rvalue_calls_fallible(program: &RirProgram, fallible: &[bool], value: &RirRVa
         | RirRValue::Tuple { .. }
         | RirRValue::EnumVariant { .. }
         | RirRValue::DataRefAlloc { .. }
-        | RirRValue::DataRefGet { .. } => false,
+        | RirRValue::DataRefGet { .. }
+        | RirRValue::CellGetCopy { .. } => false,
         RirRValue::Stringify { source_ty, .. } => {
             stringify_calls_fallible(program, fallible, *source_ty)
         }
@@ -111,9 +114,11 @@ fn block_uses_ctx(program: &RirProgram, block: &RirStructuredBlock) -> bool {
 
 fn stmt_uses_ctx(program: &RirProgram, stmt: &RirStmt) -> bool {
     match stmt {
-        RirStmt::Init { value, .. } | RirStmt::Assign { value, .. } | RirStmt::Eval(value) => {
-            rvalue_uses_ctx(program, value)
-        }
+        RirStmt::Init { value, .. }
+        | RirStmt::Assign { value, .. }
+        | RirStmt::CellInit { value, .. }
+        | RirStmt::CellSet { value, .. }
+        | RirStmt::Eval(value) => rvalue_uses_ctx(program, value),
         RirStmt::DataRefSet { .. } => true,
         _ => stmt_child_blocks_any(stmt, |block| block_uses_ctx(program, block)),
     }
@@ -144,6 +149,8 @@ fn stmt_child_blocks_any(
         }
         RirStmt::Init { .. }
         | RirStmt::Assign { .. }
+        | RirStmt::CellInit { .. }
+        | RirStmt::CellSet { .. }
         | RirStmt::Eval(_)
         | RirStmt::DataRefSet { .. } => false,
     }
@@ -176,7 +183,8 @@ fn rvalue_uses_ctx(program: &RirProgram, value: &RirRValue) -> bool {
         | RirRValue::Lambda { .. }
         | RirRValue::Struct { .. }
         | RirRValue::Tuple { .. }
-        | RirRValue::EnumVariant { .. } => false,
+        | RirRValue::EnumVariant { .. }
+        | RirRValue::CellGetCopy { .. } => false,
         RirRValue::DataRefAlloc { .. } | RirRValue::DataRefGet { .. } => true,
     }
 }

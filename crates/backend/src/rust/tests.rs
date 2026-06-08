@@ -2,12 +2,12 @@ use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, AirBody, AirOptionalMatch, BindingId, CallArg, Callee,
-        CaptureLocalSource, ConstData, ConstValue, EnumDecl, ExternBindingDecl, ExternDecl,
-        ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl, FieldDecl, Function, FunctionId,
-        FunctionKind, FunctionSpecialization, GlobalDecl, LambdaDecl, LambdaEscape, Local,
-        LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot,
-        Program, Projection, RValue, RawEnumValue, Signature, TypeData, UpvalueCellDecl,
-        VariantDecl, VariantId, VariantShape,
+        CaptureCellDecl, CaptureLocalSource, ConstData, ConstValue, EnumDecl, ExternBindingDecl,
+        ExternDecl, ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
+        FunctionId, FunctionKind, FunctionSpecialization, GlobalDecl, LambdaDecl, LambdaEscape,
+        Local, LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
+        PlaceRoot, Program, Projection, RValue, RawEnumValue, Signature, TypeData, VariantDecl,
+        VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -15,13 +15,14 @@ use anvyx_frontend::{
 use super::{
     RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job, emit, plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
-    rep_policy::RustTracePlan,
+    rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
-        self, RirCallArg, RirCallTarget, RirConst, RirConstId, RirConstValue, RirCoreEnumKind,
-        RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern,
-        RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatKind,
-        RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
+        self, RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellRef, RirCellStorage,
+        RirConst, RirConstId, RirConstValue, RirCoreEnumKind, RirDataRef, RirDataRefId, RirEnum,
+        RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId, RirExternKind,
+        RirExternParam, RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction,
+        RirFunctionId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg,
+        RirLambdaCaptureKind, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
         RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
         RirLoopId, RirOperand, RirOptionMatch, RirParam, RirParamAbi, RirParamEscape,
         RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirReturn, RirStmt,
@@ -622,11 +623,11 @@ fn profile_rejects_non_local_place_roots() {
 }
 
 #[test]
-fn profile_rejects_upvalue_cell_roots_with_lambda_cell_gap() {
+fn profile_accepts_whole_copyable_capture_cell_roots() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let module = program.alloc_module(root_module());
-    let cell = program.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = program.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner: FunctionId::from_index(0),
         source_local: air::LocalId::from_index(0),
@@ -649,14 +650,14 @@ fn profile_rejects_upvalue_cell_roots_with_lambda_cell_gap() {
         body: structured_body(
             vec![Statement::Assign {
                 dst: Place {
-                    root: PlaceRoot::UpvalueCell(cell),
+                    root: PlaceRoot::CaptureCell(cell),
                     projection: vec![],
                     ty: int,
                 },
                 value: RValue::Use(Operand::Const(init)),
             }],
             air::AirTail::Return(Some(Operand::Place(Place {
-                root: PlaceRoot::UpvalueCell(cell),
+                root: PlaceRoot::CaptureCell(cell),
                 projection: vec![],
                 ty: int,
             }))),
@@ -666,18 +667,218 @@ fn profile_rejects_upvalue_cell_roots_with_lambda_cell_gap() {
     program.module_mut(module).functions.push(id);
     program.set_entry(id);
 
-    expect_reject(program, ProfileErrorKind::UnsupportedLambdaCell);
+    check(program);
 }
 
 #[test]
-fn profile_rejects_upvalue_cell_in_unsupported_rvalue_with_lambda_cell_gap() {
+fn source_job_compiles_hand_built_air_capture_cell_lambdas() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let writer_sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
+    let reader_sig = air::SignatureType::new(vec![], air::ReturnMode::Value(int));
+    let writer_ty = program.alloc_type(TypeData::Function(writer_sig.clone()));
+    let reader_ty = program.alloc_type(TypeData::Function(reader_sig.clone()));
+    let module = program.alloc_module(root_module());
+    let binding = BindingId::from_index(0);
+    let owner = FunctionId::from_index(2);
+    let source_local = air::LocalId::from_index(0);
+    let writer_lambda = air::LambdaId::from_index(0);
+    let reader_lambda = air::LambdaId::from_index(1);
+    let writer_body = FunctionId::from_index(0);
+    let reader_body = FunctionId::from_index(1);
+    let cell = program.alloc_capture_cell(CaptureCellDecl {
+        binding,
+        owner,
+        source_local,
+        ty: int,
+    });
+    assert_eq!(
+        program.alloc_lambda(LambdaDecl {
+            source: ExprId(0),
+            module,
+            owner,
+            body: writer_body,
+            signature: writer_sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![air::LambdaCaptureDecl::CaptureCell {
+                binding,
+                cell,
+                ty: int,
+            }],
+        }),
+        writer_lambda
+    );
+    assert_eq!(
+        program.alloc_lambda(LambdaDecl {
+            source: ExprId(1),
+            module,
+            owner,
+            body: reader_body,
+            signature: reader_sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![air::LambdaCaptureDecl::CaptureCell {
+                binding,
+                cell,
+                ty: int,
+            }],
+        }),
+        reader_lambda
+    );
+    let zero = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(0),
+    });
+    let one = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let mut writer = Function {
+        name: Ident::new("writer"),
+        module,
+        kind: FunctionKind::Lambda(writer_lambda),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::Assign {
+                dst: Place {
+                    root: PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                    projection: vec![],
+                    ty: int,
+                },
+                value: RValue::Use(Operand::Const(one)),
+            }],
+            air::AirTail::Return(None),
+        ),
+    };
+    writer.signature.return_mode = air::ReturnMode::Value(void);
+    let reader = Function {
+        name: Ident::new("reader"),
+        module,
+        kind: FunctionKind::Lambda(reader_lambda),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(
+            vec![],
+            air::AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                projection: vec![],
+                ty: int,
+            }))),
+        ),
+    };
+    let mut source = mut_local(int, LocalKind::User);
+    source.binding = Some(binding);
+    let writer_local = local(writer_ty, LocalKind::User);
+    let reader_local = local(reader_ty, LocalKind::User);
+    let result_local = local(int, LocalKind::Temp);
+    let owner_fn = Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![source, writer_local, reader_local, result_local],
+        body: structured_body(
+            vec![
+                Statement::Assign {
+                    dst: Place {
+                        root: PlaceRoot::CaptureCell(cell),
+                        projection: vec![],
+                        ty: int,
+                    },
+                    value: RValue::Use(Operand::Const(zero)),
+                },
+                Statement::Init {
+                    local: air::LocalId::from_index(1),
+                    value: RValue::MakeLambda {
+                        lambda: writer_lambda,
+                        captures: vec![air::LambdaCaptureArg::CaptureCell { cell }],
+                        ty: writer_ty,
+                    },
+                },
+                Statement::Init {
+                    local: air::LocalId::from_index(2),
+                    value: RValue::MakeLambda {
+                        lambda: reader_lambda,
+                        captures: vec![air::LambdaCaptureArg::CaptureCell { cell }],
+                        ty: reader_ty,
+                    },
+                },
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Lambda(Operand::Place(Place {
+                        root: PlaceRoot::Local(air::LocalId::from_index(1)),
+                        projection: vec![],
+                        ty: writer_ty,
+                    })),
+                    args: vec![],
+                }),
+                Statement::Init {
+                    local: air::LocalId::from_index(3),
+                    value: RValue::Call {
+                        callee: Callee::Lambda(Operand::Place(Place {
+                            root: PlaceRoot::Local(air::LocalId::from_index(2)),
+                            projection: vec![],
+                            ty: reader_ty,
+                        })),
+                        args: vec![],
+                    },
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Local(air::LocalId::from_index(3)),
+                projection: vec![],
+                ty: int,
+            }))),
+        ),
+    };
+    assert_eq!(program.alloc_function(writer), writer_body);
+    assert_eq!(program.alloc_function(reader), reader_body);
+    assert_eq!(program.alloc_function(owner_fn), owner);
+    program
+        .module_mut(module)
+        .functions
+        .extend([writer_body, reader_body, owner]);
+    program.set_entry(owner);
+
+    let source = plan_source(program);
+    let text = source.as_str();
+    assert!(text.contains("StackLambdaCell<i64>"));
+    assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
+    assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig1<'env>"));
+    assert!(text.contains("c0: &'env anvyx_runtime::StackLambdaCell<i64>"));
+    assert!(text.contains("fn call<'cx, 'rt>(&self, ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(text.contains(".set(1);"));
+    assert!(text.contains(".get_copy()"));
+    assert!(text.contains("c0: &__cell0"));
+    assert!(!text.contains("&'env mut"));
+    assert!(!text.contains("&mut v0"));
+    assert!(!text.contains("fn call<'cx, 'rt>(&mut self"));
+    assert!(!text.contains("LambdaEnv"));
+    assert!(!text.contains("anvyx_runtime::LambdaCell"));
+    assert!(!text.contains("Box<dyn"));
+    assert!(!text.contains("Rc<"));
+    assert!(!text.contains("RefCell"));
+    assert!(!text.contains("erased::Value"));
+
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn profile_rejects_capture_cell_in_unsupported_rvalue() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let list = program.alloc_type(TypeData::List(int));
     let optional_int = program.alloc_type(TypeData::Optional(int));
     let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
-    let cell = program.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = program.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner: FunctionId::from_index(0),
         source_local: air::LocalId::from_index(0),
@@ -702,7 +903,7 @@ fn profile_rejects_upvalue_cell_in_unsupported_rvalue_with_lambda_cell_gap() {
             vec![
                 Statement::Assign {
                     dst: Place {
-                        root: PlaceRoot::UpvalueCell(cell),
+                        root: PlaceRoot::CaptureCell(cell),
                         projection: vec![],
                         ty: list,
                     },
@@ -710,7 +911,7 @@ fn profile_rejects_upvalue_cell_in_unsupported_rvalue_with_lambda_cell_gap() {
                 },
                 Statement::Eval(RValue::ListPop {
                     list: Place {
-                        root: PlaceRoot::UpvalueCell(cell),
+                        root: PlaceRoot::CaptureCell(cell),
                         projection: vec![],
                         ty: list,
                     },
@@ -726,7 +927,7 @@ fn profile_rejects_upvalue_cell_in_unsupported_rvalue_with_lambda_cell_gap() {
 
     let errors = profile_errors(program);
     assert!(errors.iter().any(|error| {
-        error.kind == ProfileErrorKind::UnsupportedLambdaCell
+        error.kind == ProfileErrorKind::UnsupportedRValue
             && error.site == ProfileSite::Statement(id, 1)
     }));
 }
@@ -2093,6 +2294,593 @@ fn plan_interns_function_type_signatures_with_escape_modes() {
 }
 
 #[test]
+fn rir_accepts_stack_cell_declaration() {
+    rir::verify(&stack_cell_rir(valid_stack_cell_decl())).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_stack_cell_bad_id() {
+    assert_rir_error(
+        stack_cell_rir_with(|cell| cell.id = RirCellId::from_index(1)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_bad_owner() {
+    assert_rir_error(
+        stack_cell_rir_with(|cell| cell.owner = RirFunctionId::from_index(1)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_bad_source_local() {
+    assert_rir_error(
+        stack_cell_rir_with(|cell| cell.source_local = RirLocalId::from_index(1)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_payload_type_mismatch() {
+    assert_rir_type_error(stack_cell_rir_with(|cell| {
+        cell.payload_ty = RirTypeId::from_index(0)
+    }));
+}
+
+#[test]
+fn rir_rejects_stack_cell_immutable_source_local() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    program.functions[0].locals[0].mutable = false;
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::ImmutableCellSourceLocal(RirLocalId::from_index(0)),
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_payload_ref_source_local() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    program.functions[0].locals[0].payload_ref = true;
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::CellSourceLocalPayloadRef(RirLocalId::from_index(0)),
+    );
+}
+
+#[test]
+fn rir_rejects_duplicate_stack_cells_for_source_local() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    let mut duplicate = valid_stack_cell_decl();
+    duplicate.id = RirCellId::from_index(1);
+    program.cells.push(duplicate);
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::DuplicateCell {
+            owner: RirFunctionId::from_index(0),
+            source_local: RirLocalId::from_index(0),
+            first: RirCellId::from_index(0),
+            second: RirCellId::from_index(1),
+        },
+    );
+}
+
+#[test]
+fn rir_accepts_stack_cell_init_get_and_set() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    let int = RirTypeId::from_index(1);
+    let one = push_int_const(&mut program, 1);
+    let two = push_int_const(&mut program, 2);
+    program.functions[0].body.stmts = vec![
+        RirStmt::CellInit {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(one)),
+        },
+        RirStmt::Eval(RirRValue::CellGetCopy {
+            cell: owner_cell_ref(),
+            ty: int,
+        }),
+        RirStmt::CellSet {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(two)),
+        },
+    ];
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_stack_cell_read_before_init() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    program.functions[0].body.stmts = vec![RirStmt::Eval(RirRValue::CellGetCopy {
+        cell: owner_cell_ref(),
+        ty: RirTypeId::from_index(1),
+    })];
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::UninitializedCell(RirCellId::from_index(0)),
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_set_before_init() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    let one = push_int_const(&mut program, 1);
+    program.functions[0].body.stmts = vec![RirStmt::CellSet {
+        cell: owner_cell_ref(),
+        value: RirRValue::Use(RirOperand::Const(one)),
+    }];
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::UninitializedCell(RirCellId::from_index(0)),
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_double_init() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    let one = push_int_const(&mut program, 1);
+    let two = push_int_const(&mut program, 2);
+    program.functions[0].body.stmts = vec![
+        RirStmt::CellInit {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(one)),
+        },
+        RirStmt::CellInit {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(two)),
+        },
+    ];
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::InitCellTwice(RirCellId::from_index(0)),
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_get_type_mismatch() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    let one = push_int_const(&mut program, 1);
+    program.functions[0].body.stmts = vec![
+        RirStmt::CellInit {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(one)),
+        },
+        RirStmt::Eval(RirRValue::CellGetCopy {
+            cell: owner_cell_ref(),
+            ty: RirTypeId::from_index(0),
+        }),
+    ];
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_rejects_noncopy_stack_cell_get_copy() {
+    let mut program = stack_cell_rir_with(|cell| cell.payload_ty = RirTypeId::from_index(2));
+    program.types.push(RirType::String);
+    program.functions[0].locals[0].ty = RirTypeId::from_index(2);
+    let value = RirConstId::from_index(0);
+    program.consts.push(RirConst {
+        id: value,
+        ty: RirTypeId::from_index(2),
+        value: RirConstValue::String("x".to_string()),
+    });
+    program.functions[0].body.stmts = vec![
+        RirStmt::CellInit {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(value)),
+        },
+        RirStmt::Eval(RirRValue::CellGetCopy {
+            cell: owner_cell_ref(),
+            ty: RirTypeId::from_index(2),
+        }),
+    ];
+
+    assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
+}
+
+#[test]
+fn rir_rejects_cell_ops_with_capture_ref_until_hidden_capture_validation() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    program.functions[0].body.stmts = vec![RirStmt::Eval(RirRValue::CellGetCopy {
+        cell: RirCellRef::Capture {
+            cell: RirCellId::from_index(0),
+            local: RirLocalId::from_index(99),
+        },
+        ty: RirTypeId::from_index(1),
+    })];
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn emit_stack_cell_ops_use_runtime_cell() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    program.entry = Some(RirFunctionId::from_index(0));
+    let one = push_int_const(&mut program, 1);
+    let two = push_int_const(&mut program, 2);
+    program.functions[0].body.stmts = vec![
+        RirStmt::CellInit {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(one)),
+        },
+        RirStmt::Eval(RirRValue::CellGetCopy {
+            cell: owner_cell_ref(),
+            ty: RirTypeId::from_index(1),
+        }),
+        RirStmt::CellSet {
+            cell: owner_cell_ref(),
+            value: RirRValue::Use(RirOperand::Const(two)),
+        },
+    ];
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
+    assert!(
+        source.as_str().contains(
+            "let __cell0: anvyx_runtime::StackLambdaCell<i64> = anvyx_runtime::StackLambdaCell::<i64>::new(1);"
+        ),
+        "{}",
+        source.as_str()
+    );
+    assert!(source.as_str().contains("__cell0.get_copy();"));
+    assert!(source.as_str().contains("__cell0.set(2);"));
+    assert!(!source.as_str().contains("RefCell"));
+    assert!(!source.as_str().contains("Rc<"));
+
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn emit_stack_cell_init_is_control_flow_safe() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    program.entry = Some(RirFunctionId::from_index(0));
+    let bool_ty = RirTypeId::from_index(2);
+    program.types.push(RirType::Bool);
+    let cond = RirConstId::from_index(program.consts.len());
+    program.consts.push(RirConst {
+        id: cond,
+        ty: bool_ty,
+        value: RirConstValue::Bool(true),
+    });
+    let one = push_int_const(&mut program, 1);
+    let two = push_int_const(&mut program, 2);
+    let cell = owner_cell_ref();
+    program.functions[0].body.stmts = vec![
+        RirStmt::If(RirIf {
+            cond: RirOperand::Const(cond),
+            then_block: RirStructuredBlock {
+                stmts: vec![RirStmt::CellInit {
+                    cell,
+                    value: RirRValue::Use(RirOperand::Const(one)),
+                }],
+                term: RirTerm::None,
+            },
+            else_block: Some(RirStructuredBlock {
+                stmts: vec![RirStmt::CellInit {
+                    cell,
+                    value: RirRValue::Use(RirOperand::Const(two)),
+                }],
+                term: RirTerm::None,
+            }),
+        }),
+        RirStmt::Eval(RirRValue::CellGetCopy {
+            cell,
+            ty: RirTypeId::from_index(1),
+        }),
+    ];
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
+    let text = source.as_str();
+    assert!(text.contains("let __cell0: anvyx_runtime::StackLambdaCell<i64>;"));
+    assert!(text.contains("__cell0 = anvyx_runtime::StackLambdaCell::<i64>::new(1);"));
+    assert!(text.contains("__cell0 = anvyx_runtime::StackLambdaCell::<i64>::new(2);"));
+    assert!(!text.contains("let mut source: i64;"));
+
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn rir_rejects_stack_cell_init_in_loop() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    let one = push_int_const(&mut program, 1);
+    program.functions[0].body.stmts = vec![RirStmt::Loop(RirLoop {
+        id: RirLoopId::from_index(0),
+        body: RirStructuredBlock {
+            stmts: vec![RirStmt::CellInit {
+                cell: owner_cell_ref(),
+                value: RirRValue::Use(RirOperand::Const(one)),
+            }],
+            term: RirTerm::None,
+        },
+    })];
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCell);
+}
+
+#[test]
+fn rir_accepts_stack_cell_lambda_capture_descriptor_and_value() {
+    rir::verify(&valid_stack_cell_lambda_rir()).expect("RIR verify failed");
+}
+
+#[test]
+fn emit_stack_cell_lambda_values_are_copyable_shared_refs() {
+    let mut program = valid_stack_cell_lambda_rir();
+    program.entry = Some(RirFunctionId::from_index(0));
+    let lambda_ty = RirTypeId::from_index(2);
+    let f = RirLocalId::from_index(1);
+    let g = RirLocalId::from_index(2);
+    program.functions[0].locals.push(RirLocal {
+        id: g,
+        ty: lambda_ty,
+        mutable: false,
+        symbol: RirSymbol::new("g"),
+        initialized: false,
+        payload_ref: false,
+    });
+    program.functions[0].body.stmts.extend([
+        RirStmt::Init {
+            local: g,
+            value: RirRValue::Use(RirOperand::Place(RirPlace {
+                local: f,
+                projections: vec![],
+                ty: lambda_ty,
+            })),
+        },
+        RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::LambdaValue {
+                callee: RirOperand::Place(RirPlace {
+                    local: f,
+                    projections: vec![],
+                    ty: lambda_ty,
+                }),
+                sig: RirLambdaSigId::from_index(0),
+            },
+            args: vec![],
+            ty: RirTypeId::from_index(0),
+        }),
+        RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::LambdaValue {
+                callee: RirOperand::Place(RirPlace {
+                    local: g,
+                    projections: vec![],
+                    ty: lambda_ty,
+                }),
+                sig: RirLambdaSigId::from_index(0),
+            },
+            args: vec![],
+            ty: RirTypeId::from_index(0),
+        }),
+    ]);
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
+    let text = source.as_str();
+    assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
+    assert!(text.contains("L0 { c0: &'env anvyx_runtime::StackLambdaCell<i64> }"));
+    assert!(text.contains("fn call<'cx, 'rt>(&self, ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(text.contains("c0: &__cell0"));
+    assert!(text.contains("target(ctx, *c0)"));
+    assert!(!text.contains("&'env mut"));
+    assert!(!text.contains("fn call<'cx, 'rt>(&mut self"));
+    assert!(!text.contains("&mut source"));
+    assert!(!text.contains("let mut f"));
+    assert!(!text.contains("RefCell"));
+    assert!(!text.contains("Rc<"));
+
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn rir_rejects_ordinary_place_use_of_stack_cell_capture_param() {
+    let mut program = valid_stack_cell_lambda_rir();
+    program.functions[1].body.stmts =
+        vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(0),
+            projections: vec![],
+            ty: RirTypeId::from_index(1),
+        })))];
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_stack_cell_and_mut_borrow_variants_sharing_signature() {
+    let mut program = valid_stack_cell_lambda_rir();
+    let mut_function = RirFunctionId::from_index(2);
+    program.lambdas.push(RirLambda {
+        id: RirLambdaId::from_index(1),
+        source: RirLambdaSource::Lambda(air::LambdaId::from_index(1)),
+        function: mut_function,
+        sig: RirLambdaSigId::from_index(0),
+        escape: RirLambdaEscape::NonEscaping,
+        storage: RirLambdaStorage::ScopedCaptures,
+        captures: vec![RirLambdaCapture {
+            ty: RirTypeId::from_index(1),
+            semantic: RirParamSemantic::MutBorrow,
+            abi: RirParamAbi::MutBorrow,
+            kind: RirLambdaCaptureKind::Param,
+        }],
+    });
+    program.functions.push(RirFunction {
+        id: mut_function,
+        air_id: None,
+        symbol: RirSymbol::new("mut_target"),
+        params: vec![RirParam {
+            local: RirLocalId::from_index(0),
+            ty: RirTypeId::from_index(1),
+            semantic: RirParamSemantic::MutBorrow,
+            abi: RirParamAbi::MutBorrow,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn {
+            ty: RirTypeId::from_index(0),
+        },
+        locals: vec![RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: RirTypeId::from_index(1),
+            mutable: true,
+            symbol: RirSymbol::new("capture"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock::default(),
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_escaping_stack_cell_lambda_capture() {
+    assert_rir_error(
+        stack_cell_lambda_rir(
+            RirLambdaEscape::Escaping,
+            RirCellId::from_index(0),
+            RirTypeId::from_index(1),
+            RirParamSemantic::StackCell,
+            RirParamAbi::StackCell,
+            valid_stack_cell_arg(),
+        ),
+        RirVerifyErrorKind::UnsupportedLambdaCapture,
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_lambda_capture_wrong_cell() {
+    let mut program = stack_cell_lambda_rir(
+        RirLambdaEscape::NonEscaping,
+        RirCellId::from_index(0),
+        RirTypeId::from_index(1),
+        RirParamSemantic::StackCell,
+        RirParamAbi::StackCell,
+        RirLambdaCaptureArg::StackCell {
+            cell: RirCellRef::Owner(RirCellId::from_index(1)),
+        },
+    );
+    program.cells.push(RirCellDecl {
+        id: RirCellId::from_index(1),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(2),
+        payload_ty: RirTypeId::from_index(1),
+        storage: RirCellStorage::StackScoped,
+        symbol: RirSymbol::new("__cell0"),
+    });
+    program.functions[0].locals.push(RirLocal {
+        id: RirLocalId::from_index(2),
+        ty: RirTypeId::from_index(1),
+        mutable: true,
+        symbol: RirSymbol::new("other"),
+        initialized: true,
+        payload_ref: false,
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_stack_cell_lambda_capture_wrong_payload_type() {
+    assert_rir_type_error(stack_cell_lambda_rir(
+        RirLambdaEscape::NonEscaping,
+        RirCellId::from_index(0),
+        RirTypeId::from_index(0),
+        RirParamSemantic::StackCell,
+        RirParamAbi::StackCell,
+        valid_stack_cell_arg(),
+    ));
+}
+
+#[test]
+fn rir_rejects_stack_cell_lambda_capture_wrong_hidden_param() {
+    assert_rir_error(
+        stack_cell_lambda_rir(
+            RirLambdaEscape::NonEscaping,
+            RirCellId::from_index(0),
+            RirTypeId::from_index(1),
+            RirParamSemantic::Value,
+            RirParamAbi::Value,
+            valid_stack_cell_arg(),
+        ),
+        RirVerifyErrorKind::CallArgMode,
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_lambda_capture_before_cell_init() {
+    let mut program = valid_stack_cell_lambda_rir();
+    program.functions[0].body.stmts.remove(0);
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::UninitializedCell(RirCellId::from_index(0)),
+    );
+}
+
+#[test]
+fn rir_rejects_stack_cell_source_visible_lambda_sig_param() {
+    let mut program = valid_stack_cell_lambda_rir();
+    program.lambda_sigs[0].params.push(RirLambdaParam {
+        ty: RirTypeId::from_index(1),
+        semantic: RirParamSemantic::StackCell,
+        abi: RirParamAbi::StackCell,
+        escape: RirParamEscape::NonEscaping,
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedAbi);
+}
+
+#[test]
+fn rir_rejects_stack_cell_ordinary_function_param() {
+    let mut program = stack_cell_rir(valid_stack_cell_decl());
+    program.functions[0].params.push(RirParam {
+        local: RirLocalId::from_index(0),
+        ty: RirTypeId::from_index(1),
+        semantic: RirParamSemantic::StackCell,
+        abi: RirParamAbi::StackCell,
+        escape: RirParamEscape::NonEscaping,
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedAbi);
+}
+
+#[test]
+fn rir_rejects_inconsistent_stack_cell_lambda_descriptors_for_shared_body() {
+    let mut program = valid_stack_cell_lambda_rir();
+    program.cells.push(RirCellDecl {
+        id: RirCellId::from_index(1),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(2),
+        payload_ty: RirTypeId::from_index(1),
+        storage: RirCellStorage::StackScoped,
+        symbol: RirSymbol::new("__cell0"),
+    });
+    program.functions[0].locals.push(RirLocal {
+        id: RirLocalId::from_index(2),
+        ty: RirTypeId::from_index(1),
+        mutable: true,
+        symbol: RirSymbol::new("other"),
+        initialized: true,
+        payload_ref: false,
+    });
+    let mut lambda = program.lambdas[0].clone();
+    lambda.id = RirLambdaId::from_index(1);
+    lambda.captures[0].kind = RirLambdaCaptureKind::StackCell {
+        cell: RirCellId::from_index(1),
+    };
+    program.lambdas.push(lambda);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
 fn rir_verifies_lambda_signature_ids() {
     let void = RirTypeId::from_index(0);
     let lambda_ty = RirTypeId::from_index(1);
@@ -2308,6 +3096,7 @@ fn rir_accepts_scoped_capture_lambda_descriptor_and_value() {
             ty: int,
             semantic: RirParamSemantic::Value,
             abi: RirParamAbi::Value,
+            kind: RirLambdaCaptureKind::Param,
         },
         int,
         false,
@@ -2333,6 +3122,7 @@ fn rir_rejects_shared_readonly_capture_from_const() {
             ty: int,
             semantic: RirParamSemantic::SharedBorrow,
             abi: RirParamAbi::SharedBorrow,
+            kind: RirLambdaCaptureKind::Param,
         },
         int,
         false,
@@ -2359,6 +3149,7 @@ fn rir_rejects_noncopy_value_capture() {
             ty: string,
             semantic: RirParamSemantic::Value,
             abi: RirParamAbi::Value,
+            kind: RirLambdaCaptureKind::Param,
         },
         string,
         false,
@@ -2397,6 +3188,7 @@ fn rir_rejects_projected_scoped_capture() {
             ty: int,
             semantic: RirParamSemantic::MutBorrow,
             abi: RirParamAbi::MutBorrow,
+            kind: RirLambdaCaptureKind::Param,
         },
         tuple_ty,
         true,
@@ -2410,6 +3202,140 @@ fn rir_rejects_projected_scoped_capture() {
     );
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_accepts_copying_stack_cell_lambda_value() {
+    let mut program = valid_stack_cell_lambda_rir();
+    let g = RirLocalId::from_index(2);
+    let lambda_ty = RirTypeId::from_index(2);
+    program.functions[0].locals.push(RirLocal {
+        id: g,
+        ty: lambda_ty,
+        mutable: false,
+        symbol: RirSymbol::new("g"),
+        initialized: false,
+        payload_ref: false,
+    });
+    program.functions[0].body.stmts.push(RirStmt::Init {
+        local: g,
+        value: RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(1),
+            projections: vec![],
+            ty: lambda_ty,
+        })),
+    });
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn mut_borrow_lambda_signature_remains_noncopyable() {
+    let program = mut_borrow_lambda_rir();
+
+    assert!(!RustRepPolicy::new(&program).lambda_sig_copyable(RirLambdaSigId::from_index(0)));
+}
+
+#[test]
+fn rir_rejects_copying_mut_borrow_lambda_value() {
+    let mut program = mut_borrow_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    let g = RirLocalId::from_index(2);
+    program.functions[1].locals.push(RirLocal {
+        id: g,
+        ty: lambda_ty,
+        mutable: false,
+        symbol: RirSymbol::new("g"),
+        initialized: false,
+        payload_ref: false,
+    });
+    program.functions[1].body.stmts.push(RirStmt::Init {
+        local: g,
+        value: RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(1),
+            projections: vec![],
+            ty: lambda_ty,
+        })),
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
+}
+
+#[test]
+fn rir_rejects_passing_mut_borrow_lambda_value() {
+    let mut program = mut_borrow_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    let callee = RirFunctionId::from_index(2);
+    program.functions.push(RirFunction {
+        id: callee,
+        air_id: None,
+        symbol: RirSymbol::new("callee"),
+        params: vec![RirParam {
+            local: RirLocalId::from_index(0),
+            ty: lambda_ty,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn {
+            ty: RirTypeId::from_index(0),
+        },
+        locals: vec![RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: lambda_ty,
+            mutable: false,
+            symbol: RirSymbol::new("f"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock::default(),
+    });
+    program.functions[1]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::Function(callee),
+            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
+                local: RirLocalId::from_index(1),
+                projections: vec![],
+                ty: lambda_ty,
+            }))],
+            ty: RirTypeId::from_index(0),
+        }));
+
+    assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
+}
+
+#[test]
+fn lambda_sig_copyable_rejects_value_capture_cycles() {
+    let void = RirTypeId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(1);
+    let sig = RirLambdaSigId::from_index(0);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Lambda(sig)],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: RirLambdaId::from_index(0),
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: RirFunctionId::from_index(0),
+            sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![RirLambdaCapture {
+                ty: lambda_ty,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                kind: RirLambdaCaptureKind::Param,
+            }],
+        }],
+        ..RirProgram::default()
+    };
+
+    assert!(!RustRepPolicy::new(&program).lambda_sig_copyable(sig));
 }
 
 #[test]
@@ -2577,7 +3503,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
 }
 
 #[test]
-fn emit_mutable_scoped_lambda_capture_without_heap_envs() {
+fn emit_internal_direct_mut_borrow_lambda_capture_without_heap_envs() {
     let void = RirTypeId::from_index(0);
     let int = RirTypeId::from_index(1);
     let lambda_ty = RirTypeId::from_index(2);
@@ -2616,6 +3542,7 @@ fn emit_mutable_scoped_lambda_capture_without_heap_envs() {
                 ty: int,
                 semantic: RirParamSemantic::MutBorrow,
                 abi: RirParamAbi::MutBorrow,
+                kind: RirLambdaCaptureKind::Param,
             }],
         }],
         entry: Some(RirFunctionId::from_index(1)),
@@ -4963,6 +5890,203 @@ fn rir_verify_accepts_mut_borrow_abi() {
     rir::verify(&program).expect("RIR rejected mut borrow ABI");
 }
 
+fn valid_stack_cell_decl() -> RirCellDecl {
+    RirCellDecl {
+        id: RirCellId::from_index(0),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(0),
+        payload_ty: RirTypeId::from_index(1),
+        storage: RirCellStorage::StackScoped,
+        symbol: RirSymbol::new("__cell0"),
+    }
+}
+
+fn stack_cell_rir_with(edit: impl FnOnce(&mut RirCellDecl)) -> RirProgram {
+    let mut cell = valid_stack_cell_decl();
+    edit(&mut cell);
+    stack_cell_rir(cell)
+}
+
+fn owner_cell_ref() -> RirCellRef {
+    RirCellRef::Owner(RirCellId::from_index(0))
+}
+
+fn valid_stack_cell_arg() -> RirLambdaCaptureArg {
+    RirLambdaCaptureArg::StackCell {
+        cell: owner_cell_ref(),
+    }
+}
+
+fn valid_stack_cell_lambda_rir() -> RirProgram {
+    stack_cell_lambda_rir(
+        RirLambdaEscape::NonEscaping,
+        RirCellId::from_index(0),
+        RirTypeId::from_index(1),
+        RirParamSemantic::StackCell,
+        RirParamAbi::StackCell,
+        valid_stack_cell_arg(),
+    )
+}
+
+fn push_int_const(program: &mut RirProgram, value: i64) -> RirConstId {
+    let id = RirConstId::from_index(program.consts.len());
+    program.consts.push(RirConst {
+        id,
+        ty: RirTypeId::from_index(1),
+        value: RirConstValue::Int(value),
+    });
+    id
+}
+
+fn stack_cell_rir(cell: RirCellDecl) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let owner = RirFunctionId::from_index(0);
+    let source = RirLocalId::from_index(0);
+    RirProgram {
+        types: vec![RirType::Void, RirType::Int],
+        cells: vec![cell],
+        functions: vec![RirFunction {
+            id: owner,
+            air_id: None,
+            symbol: RirSymbol::new("owner"),
+            params: vec![],
+            ret: RirReturn { ty: void },
+            locals: vec![RirLocal {
+                id: source,
+                ty: int,
+                mutable: true,
+                symbol: RirSymbol::new("source"),
+                initialized: true,
+                payload_ref: false,
+            }],
+            body: RirStructuredBlock::default(),
+        }],
+        ..RirProgram::default()
+    }
+}
+
+fn stack_cell_lambda_rir(
+    escape: RirLambdaEscape,
+    cell: RirCellId,
+    payload_ty: RirTypeId,
+    hidden_semantic: RirParamSemantic,
+    hidden_abi: RirParamAbi,
+    arg: RirLambdaCaptureArg,
+) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(2);
+    let owner = RirFunctionId::from_index(0);
+    let target = RirFunctionId::from_index(1);
+    let source = RirLocalId::from_index(0);
+    let f = RirLocalId::from_index(1);
+    RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
+        cells: vec![valid_stack_cell_decl()],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: RirLambdaId::from_index(0),
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: target,
+            sig,
+            escape,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![RirLambdaCapture {
+                ty: payload_ty,
+                semantic: RirParamSemantic::StackCell,
+                abi: RirParamAbi::StackCell,
+                kind: RirLambdaCaptureKind::StackCell { cell },
+            }],
+        }],
+        functions: vec![
+            RirFunction {
+                id: owner,
+                air_id: None,
+                symbol: RirSymbol::new("owner"),
+                params: vec![],
+                ret: RirReturn { ty: void },
+                locals: vec![
+                    RirLocal {
+                        id: source,
+                        ty: RirTypeId::from_index(1),
+                        mutable: true,
+                        symbol: RirSymbol::new("source"),
+                        initialized: true,
+                        payload_ref: false,
+                    },
+                    RirLocal {
+                        id: f,
+                        ty: lambda_ty,
+                        mutable: false,
+                        symbol: RirSymbol::new("f"),
+                        initialized: false,
+                        payload_ref: false,
+                    },
+                ],
+                body: RirStructuredBlock {
+                    stmts: vec![
+                        RirStmt::CellInit {
+                            cell: owner_cell_ref(),
+                            value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+                        },
+                        RirStmt::Init {
+                            local: f,
+                            value: RirRValue::Lambda {
+                                lambda: RirLambdaId::from_index(0),
+                                captures: vec![arg],
+                                ty: lambda_ty,
+                            },
+                        },
+                    ],
+                    term: RirTerm::Return(None),
+                },
+            },
+            RirFunction {
+                id: target,
+                air_id: None,
+                symbol: RirSymbol::new("target"),
+                params: vec![RirParam {
+                    local: source,
+                    ty: payload_ty,
+                    semantic: hidden_semantic,
+                    abi: hidden_abi,
+                    escape: RirParamEscape::NonEscaping,
+                }],
+                ret: RirReturn { ty: void },
+                locals: vec![RirLocal {
+                    id: source,
+                    ty: payload_ty,
+                    mutable: false,
+                    symbol: RirSymbol::new("cell"),
+                    initialized: true,
+                    payload_ref: false,
+                }],
+                body: RirStructuredBlock {
+                    stmts: vec![RirStmt::Eval(RirRValue::CellGetCopy {
+                        cell: RirCellRef::Capture {
+                            cell: RirCellId::from_index(0),
+                            local: source,
+                        },
+                        ty: RirTypeId::from_index(1),
+                    })],
+                    term: RirTerm::Return(None),
+                },
+            },
+        ],
+        consts: vec![RirConst {
+            id: RirConstId::from_index(0),
+            ty: RirTypeId::from_index(1),
+            value: RirConstValue::Int(1),
+        }],
+        ..RirProgram::default()
+    }
+}
+
 fn scoped_capture_rir(
     mut types: Vec<RirType>,
     tuples: Vec<RirTuple>,
@@ -5059,6 +6183,29 @@ fn scoped_capture_rir(
         ],
         ..RirProgram::default()
     }
+}
+
+fn mut_borrow_lambda_rir() -> RirProgram {
+    let int = RirTypeId::from_index(1);
+    scoped_capture_rir(
+        vec![RirType::Void, RirType::Int],
+        vec![],
+        RirLambdaCapture {
+            ty: int,
+            semantic: RirParamSemantic::MutBorrow,
+            abi: RirParamAbi::MutBorrow,
+            kind: RirLambdaCaptureKind::Param,
+        },
+        int,
+        true,
+        RirLambdaCaptureArg::Scoped {
+            place: RirPlace {
+                local: RirLocalId::from_index(0),
+                projections: vec![],
+                ty: int,
+            },
+        },
+    )
 }
 
 fn assert_rir_error(program: RirProgram, kind: RirVerifyErrorKind) {

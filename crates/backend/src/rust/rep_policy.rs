@@ -318,6 +318,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamSemantic::Value => RirParamAbi::Value,
             RirParamSemantic::SharedBorrow => RirParamAbi::SharedBorrow,
             RirParamSemantic::MutBorrow => RirParamAbi::MutBorrow,
+            RirParamSemantic::StackCell => RirParamAbi::StackCell,
         }
     }
 
@@ -428,6 +429,10 @@ impl<'a> RustRepPolicy<'a> {
                 _ => format!("&{lifetime}{}", self.rust_ty(ty)),
             },
             RirParamAbi::MutBorrow => format!("&{lifetime}mut {}", self.rust_ty(ty)),
+            RirParamAbi::StackCell => {
+                let payload = self.rust_ty(ty);
+                format!("&{lifetime}{}", target::stack_lambda_cell_ty(&payload))
+            }
         }
     }
 
@@ -463,13 +468,26 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn lambda_sig_copyable(self, id: RirLambdaSigId) -> bool {
-        self.program.lambdas_for_sig(id).all(|lambda| {
+        self.lambda_sig_copyable_inner(id, &mut BTreeSet::new())
+    }
+
+    fn lambda_sig_copyable_inner(
+        self,
+        id: RirLambdaSigId,
+        active: &mut BTreeSet<RirLambdaSigId>,
+    ) -> bool {
+        if !active.insert(id) {
+            return false;
+        }
+        let copyable = self.program.lambdas_for_sig(id).all(|lambda| {
             lambda.captures.iter().all(|capture| match capture.abi {
-                RirParamAbi::Value => self.copyable(capture.ty),
-                RirParamAbi::SharedBorrow => true,
+                RirParamAbi::Value => self.copyable_inner(capture.ty, active),
+                RirParamAbi::SharedBorrow | RirParamAbi::StackCell => true,
                 RirParamAbi::MutBorrow => false,
             })
-        })
+        });
+        active.remove(&id);
+        copyable
     }
 
     pub fn fields_cx_dependent(self, fields: &[RirField]) -> bool {
@@ -573,6 +591,10 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn copyable(self, ty: RirTypeId) -> bool {
+        self.copyable_inner(ty, &mut BTreeSet::new())
+    }
+
+    fn copyable_inner(self, ty: RirTypeId, active: &mut BTreeSet<RirLambdaSigId>) -> bool {
         match self.ty(ty) {
             RirType::Int | RirType::Float | RirType::Bool | RirType::Void => true,
             RirType::String
@@ -580,9 +602,9 @@ impl<'a> RustRepPolicy<'a> {
             | RirType::List(_)
             | RirType::Map { .. }
             | RirType::Slice(_) => false,
-            RirType::Lambda(id) => self.lambda_sig_copyable(id),
-            RirType::Option(inner) => self.copyable(inner),
-            RirType::Array { elem, .. } => self.copyable(elem),
+            RirType::Lambda(id) => self.lambda_sig_copyable_inner(id, active),
+            RirType::Option(inner) => self.copyable_inner(inner, active),
+            RirType::Array { elem, .. } => self.copyable_inner(elem, active),
             RirType::Struct(id) => self.program.structs[id.index()].copyable,
             RirType::Enum(id) => self.program.enums[id.index()].copyable,
             RirType::Tuple(id) => self.program.tuples[id.index()].copyable,
@@ -643,6 +665,7 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Map { .. } => true,
                 RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
+            RirParamSemantic::StackCell => !matches!(ty, RirType::Void),
         }
     }
 

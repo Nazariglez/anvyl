@@ -35,7 +35,7 @@ pub(crate) type GlobalAccessMap = HashMap<ExprId, GlobalAccessFact>;
 pub(crate) type StringifyMap = HashMap<ExprId, StringifyFact>;
 pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
 pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
-pub(crate) type BindingPromotionMap = HashMap<BindingId, BindingPromotionFact>;
+pub(crate) type CaptureCellRequirementMap = HashMap<BindingId, CaptureCellRequirementFact>;
 pub(crate) type ForStepRuntimeCheckMap = HashMap<ExprId, SourceSpan>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -895,7 +895,7 @@ pub(crate) struct LambdaCaptureFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BindingPromotionFact {
+pub(crate) struct CaptureCellRequirementFact {
     pub(crate) binding_id: BindingId,
     pub(crate) name: Ident,
     pub(crate) ty: Type,

@@ -92,9 +92,9 @@ pub enum LambdaCaptureDecl {
         ty: TypeId,
         mutability: Mutability,
     },
-    UpvalueCell {
+    CaptureCell {
         binding: BindingId,
-        cell: UpvalueCellId,
+        cell: CaptureCellId,
         ty: TypeId,
     },
 }
@@ -185,7 +185,7 @@ pub struct ScopedBorrowDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpvalueCellDecl {
+pub struct CaptureCellDecl {
     pub binding: BindingId,
     pub owner: FunctionId,
     pub source_local: LocalId,

@@ -1186,7 +1186,7 @@ fn invalid_unused_root_decls_are_rejected() {
         ty: invalid_ty,
         mutability: Mutability::Immutable,
     });
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner: FunctionId::from_index(0),
         source_local: LocalId::from_index(0),
@@ -1206,7 +1206,7 @@ fn invalid_unused_root_decls_are_rejected() {
     ) && matches!(e.kind, EK::BadReference(BadReference::InvalidType(ty)) if ty == invalid_ty)));
     assert!(errors.iter().any(|e| matches!(
         e.site,
-        VerifySite::UpvalueCell(id) if id == cell
+        VerifySite::CaptureCell(id) if id == cell
     ) && matches!(e.kind, EK::BadReference(BadReference::InvalidType(ty)) if ty == invalid_ty)));
     assert!(errors.iter().any(|e| matches!(
         e.site,
@@ -1224,11 +1224,11 @@ fn invalid_scoped_borrow_root() {
 }
 
 #[test]
-fn invalid_upvalue_cell_root() {
-    let errors = invalid_root_errors(PlaceRoot::UpvalueCell(UpvalueCellId::from_index(0)));
+fn invalid_capture_cell_root() {
+    let errors = invalid_root_errors(PlaceRoot::CaptureCell(CaptureCellId::from_index(0)));
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadReference(BadReference::InvalidUpvalueCell(id)) if id == UpvalueCellId::from_index(0)
+        EK::BadReference(BadReference::InvalidCaptureCell(id)) if id == CaptureCellId::from_index(0)
     )));
 }
 
@@ -1394,9 +1394,9 @@ fn lambda_decl_body_kind_and_capture_are_checked() {
             owner: FunctionId::from_index(0),
             signature: sig,
             escape: LambdaEscape::NonEscaping,
-            captures: vec![LambdaCaptureDecl::UpvalueCell {
+            captures: vec![LambdaCaptureDecl::CaptureCell {
                 binding: BindingId::from_index(0),
-                cell: UpvalueCellId::from_index(99),
+                cell: CaptureCellId::from_index(99),
                 ty: int_ty,
             }],
         }),
@@ -1418,7 +1418,7 @@ fn lambda_decl_body_kind_and_capture_are_checked() {
     )));
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadReference(BadReference::InvalidUpvalueCell(id)) if id == UpvalueCellId::from_index(99)
+        EK::BadReference(BadReference::InvalidCaptureCell(id)) if id == CaptureCellId::from_index(99)
     )));
 }
 
@@ -2731,18 +2731,18 @@ fn escaping_function_param_rejects_unknown_function_value() {
 }
 
 #[test]
-fn duplicate_upvalue_cell_for_binding_owner_is_rejected() {
+fn duplicate_capture_cell_for_binding_owner_is_rejected() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let binding = BindingId::from_index(0);
     let owner = FunctionId::from_index(0);
-    let first = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let first = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local: LocalId::from_index(0),
         ty: int_ty,
     });
-    let second = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let second = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local: LocalId::from_index(0),
@@ -2760,7 +2760,7 @@ fn duplicate_upvalue_cell_for_binding_owner_is_rejected() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::DuplicateUpvalueCell {
+        EK::BadFunction(BadFunction::DuplicateCaptureCell {
             owner: found_owner,
             binding: found_binding,
             first: found_first,
@@ -2773,18 +2773,18 @@ fn duplicate_upvalue_cell_for_binding_owner_is_rejected() {
 }
 
 #[test]
-fn duplicate_upvalue_cell_for_source_local_is_rejected() {
+fn duplicate_capture_cell_for_source_local_is_rejected() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let first = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let first = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner,
         source_local: local,
         ty: int_ty,
     });
-    let second = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let second = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(1),
         owner,
         source_local: local,
@@ -2806,7 +2806,7 @@ fn duplicate_upvalue_cell_for_source_local_is_rejected() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::DuplicateUpvalueCellSourceLocal {
+        EK::BadFunction(BadFunction::DuplicateCaptureCellSourceLocal {
             owner: found_owner,
             local: found_local,
             first: found_first,
@@ -2825,7 +2825,7 @@ fn promoted_binding_must_not_use_source_local_root() {
     let binding = BindingId::from_index(0);
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local: local,
@@ -2859,7 +2859,7 @@ fn promoted_binding_must_not_be_initialized_as_local() {
     let binding = BindingId::from_index(0);
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local: local,
@@ -2900,12 +2900,12 @@ fn promoted_binding_must_not_be_initialized_as_local() {
 }
 
 #[test]
-fn upvalue_cell_read_requires_initialization() {
+fn capture_cell_read_requires_initialization() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner,
         source_local: local,
@@ -2918,7 +2918,7 @@ fn upvalue_cell_read_requires_initialization() {
         local
     );
     fb.push_block(term_return(Operand::Place(Place {
-        root: PlaceRoot::UpvalueCell(cell),
+        root: PlaceRoot::CaptureCell(cell),
         projection: vec![],
         ty: int_ty,
     })));
@@ -2928,12 +2928,12 @@ fn upvalue_cell_read_requires_initialization() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadStatement(BadStatement::ReadUninitializedUpvalueCell(found)) if found == cell
+        EK::BadStatement(BadStatement::ReadUninitializedCaptureCell(found)) if found == cell
     )));
 }
 
 #[test]
-fn lambda_body_must_not_use_raw_upvalue_cell_root_for_capture() {
+fn lambda_body_must_not_use_raw_capture_cell_root_for_capture() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
@@ -2942,7 +2942,7 @@ fn lambda_body_must_not_use_raw_upvalue_cell_root_for_capture() {
     let body = FunctionId::from_index(0);
     let owner = FunctionId::from_index(1);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local: local,
@@ -2956,7 +2956,7 @@ fn lambda_body_must_not_use_raw_upvalue_cell_root_for_capture() {
             body,
             signature: SignatureType::new(vec![], ReturnMode::Value(int_ty)),
             escape: LambdaEscape::Escaping,
-            captures: vec![LambdaCaptureDecl::UpvalueCell {
+            captures: vec![LambdaCaptureDecl::CaptureCell {
                 binding,
                 cell,
                 ty: int_ty,
@@ -2967,7 +2967,7 @@ fn lambda_body_must_not_use_raw_upvalue_cell_root_for_capture() {
     let mut lambda_body =
         FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), int_ty);
     lambda_body.push_block(term_return(Operand::Place(Place {
-        root: PlaceRoot::UpvalueCell(cell),
+        root: PlaceRoot::CaptureCell(cell),
         projection: vec![],
         ty: int_ty,
     })));
@@ -2988,19 +2988,19 @@ fn lambda_body_must_not_use_raw_upvalue_cell_root_for_capture() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadPlace(BadPlace::RawUpvalueCellCaptureBypass { lambda: found, root })
+        EK::BadPlace(BadPlace::RawCaptureCellCaptureBypass { lambda: found, root })
             if found == lambda && root == cell
     )));
 }
 
 #[test]
-fn upvalue_cell_cannot_be_used_from_unrelated_function() {
+fn capture_cell_cannot_be_used_from_unrelated_function() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let owner = FunctionId::from_index(0);
     let other = FunctionId::from_index(1);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner,
         source_local: local,
@@ -3020,7 +3020,7 @@ fn upvalue_cell_cannot_be_used_from_unrelated_function() {
 
     let mut other_fb = FunctionBuilder::new("other", module, FunctionKind::Normal, int_ty);
     other_fb.push_block(term_return(Operand::Place(Place {
-        root: PlaceRoot::UpvalueCell(cell),
+        root: PlaceRoot::CaptureCell(cell),
         projection: vec![],
         ty: int_ty,
     })));
@@ -3030,7 +3030,7 @@ fn upvalue_cell_cannot_be_used_from_unrelated_function() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadPlace(BadPlace::UpvalueCellNotAccessible {
+        EK::BadPlace(BadPlace::CaptureCellNotAccessible {
             cell: found_cell,
             function,
         }) if found_cell == cell && function == other
@@ -3049,7 +3049,7 @@ fn promoted_binding_must_not_use_source_local_as_index() {
     let owner = FunctionId::from_index(0);
     let index_local = LocalId::from_index(0);
     let array_local = LocalId::from_index(1);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local: index_local,
@@ -3082,13 +3082,13 @@ fn promoted_binding_must_not_use_source_local_as_index() {
 }
 
 #[test]
-fn upvalue_cell_source_local_must_match_payload_type() {
+fn capture_cell_source_local_must_match_payload_type() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let string_ty = builder.string_ty();
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner,
         source_local: local,
@@ -3110,7 +3110,7 @@ fn upvalue_cell_source_local_must_match_payload_type() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::UpvalueCellSourceLocalTypeMismatch {
+        EK::BadFunction(BadFunction::CaptureCellSourceLocalTypeMismatch {
             cell: found_cell,
             expected,
             found,
@@ -3119,14 +3119,14 @@ fn upvalue_cell_source_local_must_match_payload_type() {
 }
 
 #[test]
-fn upvalue_cell_source_local_must_match_binding() {
+fn capture_cell_source_local_must_match_binding() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
     let expected = BindingId::from_index(0);
     let other = BindingId::from_index(1);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: expected,
         owner,
         source_local: local,
@@ -3149,7 +3149,7 @@ fn upvalue_cell_source_local_must_match_binding() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::UpvalueCellSourceLocalBindingMismatch {
+        EK::BadFunction(BadFunction::CaptureCellSourceLocalBindingMismatch {
             cell: found_cell,
             expected: found_expected,
             found,
@@ -3158,12 +3158,12 @@ fn upvalue_cell_source_local_must_match_binding() {
 }
 
 #[test]
-fn upvalue_cell_source_local_must_be_owned_binding() {
+fn capture_cell_source_local_must_be_owned_binding() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner,
         source_local: local,
@@ -3185,7 +3185,7 @@ fn upvalue_cell_source_local_must_be_owned_binding() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::UpvalueCellSourceLocalMustBeOwnedBinding {
+        EK::BadFunction(BadFunction::CaptureCellSourceLocalMustBeOwnedBinding {
             cell: found_cell,
             local: found_local,
             kind: LocalKind::Arg,
@@ -3194,12 +3194,12 @@ fn upvalue_cell_source_local_must_be_owned_binding() {
 }
 
 #[test]
-fn upvalue_cell_source_local_must_not_be_pattern_alias() {
+fn capture_cell_source_local_must_not_be_pattern_alias() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner,
         source_local: local,
@@ -3226,7 +3226,7 @@ fn upvalue_cell_source_local_must_not_be_pattern_alias() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::UpvalueCellSourceLocalMustBeOwnedBinding {
+        EK::BadFunction(BadFunction::CaptureCellSourceLocalMustBeOwnedBinding {
             cell: found_cell,
             local: found_local,
             kind: LocalKind::PatternBinding,
@@ -3235,12 +3235,12 @@ fn upvalue_cell_source_local_must_not_be_pattern_alias() {
 }
 
 #[test]
-fn upvalue_cell_source_local_must_be_mutable() {
+fn capture_cell_source_local_must_be_mutable() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let owner = FunctionId::from_index(0);
     let local = LocalId::from_index(0);
-    let cell = builder.alloc_upvalue_cell(UpvalueCellDecl {
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner,
         source_local: local,
@@ -3262,7 +3262,7 @@ fn upvalue_cell_source_local_must_be_mutable() {
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadFunction(BadFunction::UpvalueCellSourceLocalMustBeMutable {
+        EK::BadFunction(BadFunction::CaptureCellSourceLocalMustBeMutable {
             cell: found_cell,
             local: found_local,
         }) if found_cell == cell && found_local == local

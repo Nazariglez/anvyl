@@ -155,7 +155,9 @@ impl<'a> RustValues<'a> {
                 };
                 self.borrow_arg(place)
             }
-            RirParamSemantic::MutBorrow => unreachable!("verified stringify override mode"),
+            RirParamSemantic::MutBorrow | RirParamSemantic::StackCell => {
+                unreachable!("verified stringify override mode")
+            }
         }
     }
 

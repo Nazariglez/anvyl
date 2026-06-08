@@ -14,9 +14,9 @@ fn capture<'a>(result: &'a TypecheckTestResult, name: &str) -> &'a LambdaCapture
         .unwrap_or_else(|| panic!("{name} capture fact"))
 }
 
-fn promoted(result: &TypecheckTestResult, capture: &LambdaCaptureFact) -> bool {
+fn requires_cell(result: &TypecheckTestResult, capture: &LambdaCaptureFact) -> bool {
     result
-        .binding_promotions()
+        .capture_cell_requirements()
         .contains_key(&capture.binding_id)
 }
 
@@ -25,18 +25,17 @@ fn checked(source: &str) -> TypecheckTestResult {
 }
 
 #[test]
-fn shadowed_captures_use_distinct_binding_ids() {
+fn non_escaping_mutable_captures_share_one_cell_requirement() {
     let result = checked(
-        r#"
+        r"
         fn main() {
-            var x = 1;
-            let a = || { x = 2; };
-            {
-                var x = 3;
-                let b = || { x = 4; };
-            }
+            var x = 0;
+            let a = || { x = 1; };
+            let b = || { x = 2; };
+            a();
+            b();
         }
-        "#,
+        ",
     );
 
     let captures = result
@@ -45,24 +44,61 @@ fn shadowed_captures_use_distinct_binding_ids() {
         .filter(|capture| capture.name.as_str() == "x")
         .collect::<Vec<_>>();
     assert_eq!(captures.len(), 2);
-    assert_ne!(captures[0].binding_id, captures[1].binding_id);
+    assert!(
+        captures
+            .iter()
+            .all(|capture| requires_cell(&result, capture))
+    );
+    let binding = captures[0].binding_id;
+    assert!(captures.iter().all(|capture| capture.binding_id == binding));
+    assert_eq!(result.capture_cell_requirements().len(), 1);
 }
 
 #[test]
-fn escaping_mutable_capture_records_promotion() {
+fn shadowed_captures_use_distinct_cell_requirements() {
     let result = checked(
-        r#"
+        r"
+        fn main() {
+            var x = 1;
+            let a = || { x = 2; };
+            {
+                var x = 3;
+                let b = || { x = 4; };
+            }
+        }
+        ",
+    );
+
+    let captures = result
+        .lambda_captures()
+        .values()
+        .filter(|capture| capture.name.as_str() == "x")
+        .collect::<Vec<_>>();
+    assert_eq!(captures.len(), 2);
+    assert!(
+        captures
+            .iter()
+            .all(|capture| requires_cell(&result, capture))
+    );
+    assert_ne!(captures[0].binding_id, captures[1].binding_id);
+    assert_eq!(result.capture_cell_requirements().len(), 2);
+}
+
+#[test]
+fn escaping_mutable_capture_records_cell_requirement() {
+    let result = checked(
+        r"
         fn make() -> fn() {
             var x = 1;
             || { x = 2; }
         }
-        "#,
+        ",
     );
 
     let capture = capture(&result, "x");
     assert_eq!(capture.origin, CaptureStorageOrigin::Owned);
     assert_eq!(capture.storage, CaptureStorage::OwnedMutableUpvalue);
-    assert!(promoted(&result, capture));
+    assert!(requires_cell(&result, capture));
     assert!(
         result
             .lambda_escapes()
@@ -74,18 +110,18 @@ fn escaping_mutable_capture_records_promotion() {
 #[test]
 fn local_function_alias_stays_non_escaping() {
     let result = checked(
-        r#"
+        r"
         fn main() {
             var x = 1;
             let f = || { x = 2; };
             f();
         }
-        "#,
+        ",
     );
 
     let capture = capture(&result, "x");
     assert_eq!(capture.storage, CaptureStorage::OwnedMutableScoped);
-    assert!(!promoted(&result, capture));
+    assert!(requires_cell(&result, capture));
     assert!(
         result
             .lambda_escapes()
@@ -95,26 +131,26 @@ fn local_function_alias_stays_non_escaping() {
 }
 
 #[test]
-fn escaping_read_of_mutable_binding_records_promotion() {
+fn escaping_read_of_mutable_binding_records_cell_requirement() {
     let result = checked(
-        r#"
+        r"
         fn make() -> fn() {
             var x = 1;
             || { let y = x; }
         }
-        "#,
+        ",
     );
 
     let capture = capture(&result, "x");
     assert_eq!(capture.access, CaptureAccess::Read);
     assert_eq!(capture.storage, CaptureStorage::OwnedMutableUpvalue);
-    assert!(promoted(&result, capture));
+    assert!(requires_cell(&result, capture));
 }
 
 #[test]
 fn projected_var_argument_records_mutable_capture_access() {
     let result = checked(
-        r#"
+        r"
         struct Point { x: int }
 
         fn bump(var x: int) {}
@@ -124,7 +160,7 @@ fn projected_var_argument_records_mutable_capture_access() {
             let f = || { bump(p.x); };
             f();
         }
-        "#,
+        ",
     );
 
     assert_eq!(capture(&result, "p").access, CaptureAccess::Mutable);
@@ -133,7 +169,7 @@ fn projected_var_argument_records_mutable_capture_access() {
 #[test]
 fn indexed_mut_receiver_records_mutable_capture_access() {
     let result = checked(
-        r#"
+        r"
         struct Player {
             hp: int,
 
@@ -147,7 +183,7 @@ fn indexed_mut_receiver_records_mutable_capture_access() {
             let f = || { players[0].reset(); };
             f();
         }
-        "#,
+        ",
     );
 
     assert_eq!(capture(&result, "players").access, CaptureAccess::Mutable);
@@ -156,7 +192,7 @@ fn indexed_mut_receiver_records_mutable_capture_access() {
 #[test]
 fn branch_alias_to_distinct_lambdas_marks_both_escaping() {
     let result = checked(
-        r#"
+        r"
         fn make(cond: bool) -> fn() {
             var x = 1;
             var y = 2;
@@ -166,33 +202,33 @@ fn branch_alias_to_distinct_lambdas_marks_both_escaping() {
             }
             f
         }
-        "#,
+        ",
     );
 
-    let promoted = result
+    let required = result
         .lambda_captures()
         .values()
         .filter(|capture| matches!(capture.name.as_str(), "x" | "y"))
-        .filter(|capture| promoted(&result, capture))
+        .filter(|capture| requires_cell(&result, capture))
         .count();
-    assert_eq!(promoted, 2);
+    assert_eq!(required, 2);
 }
 
 #[test]
 fn escaping_capture_of_local_closure_marks_closure_escaping() {
     let result = checked(
-        r#"
+        r"
         fn make() -> fn() {
             var x = 1;
             let inner = || { x = 2; };
             || { inner(); }
         }
-        "#,
+        ",
     );
 
     let capture = capture(&result, "x");
     assert_eq!(capture.storage, CaptureStorage::OwnedMutableUpvalue);
-    assert!(promoted(&result, capture));
+    assert!(requires_cell(&result, capture));
 }
 
 #[test]
@@ -227,16 +263,16 @@ fn generic_specialization_preserves_capture_facts() {
 #[test]
 fn non_escaping_borrowed_capture_records_scoped_storage() {
     let result = checked(
-        r#"
+        r"
         fn touch(var x: int) {
             let f = || { x = 1; };
             f();
         }
-        "#,
+        ",
     );
 
     let capture = capture(&result, "x");
     assert_eq!(capture.origin, CaptureStorageOrigin::BorrowedParam);
     assert_eq!(capture.storage, CaptureStorage::BorrowedScoped);
-    assert!(!promoted(&result, capture));
+    assert!(!requires_cell(&result, capture));
 }

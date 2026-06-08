@@ -44,7 +44,7 @@ pub enum VerifySite {
     Extern(ExternId),
     Lambda(LambdaId),
     ScopedBorrow(ScopedBorrowId),
-    UpvalueCell(UpvalueCellId),
+    CaptureCell(CaptureCellId),
     Global(GlobalId),
     Function(FunctionId),
     Statement {
@@ -263,9 +263,9 @@ pub enum BadStatement {
     InitTypeMismatch { expected: TypeId, found: TypeId },
     AssignTypeMismatch { expected: TypeId, found: TypeId },
     ReadUninitializedLocal(LocalId),
-    ReadUninitializedUpvalueCell(UpvalueCellId),
+    ReadUninitializedCaptureCell(CaptureCellId),
     AssignUninitializedLocal(LocalId),
-    AssignUninitializedUpvalueCell(UpvalueCellId),
+    AssignUninitializedCaptureCell(CaptureCellId),
     InitImmutableLocalTwice(LocalId),
 }
 
@@ -283,7 +283,7 @@ pub enum BadReference {
     InvalidConst(ConstId),
     InvalidLocal(LocalId),
     InvalidScopedBorrow(ScopedBorrowId),
-    InvalidUpvalueCell(UpvalueCellId),
+    InvalidCaptureCell(CaptureCellId),
     InvalidGlobal(GlobalId),
     InvalidField {
         aggregate: AggregateId,
@@ -439,43 +439,43 @@ pub enum BadFunction {
     LambdaCaptureCellNotAccessible {
         lambda: LambdaId,
         owner: FunctionId,
-        cell: UpvalueCellId,
+        cell: CaptureCellId,
     },
-    DuplicateUpvalueCell {
+    DuplicateCaptureCell {
         owner: FunctionId,
         binding: BindingId,
-        first: UpvalueCellId,
-        second: UpvalueCellId,
+        first: CaptureCellId,
+        second: CaptureCellId,
     },
-    UpvalueCellSourceLocalMismatch {
-        cell: UpvalueCellId,
+    CaptureCellSourceLocalMismatch {
+        cell: CaptureCellId,
         owner: FunctionId,
         local: LocalId,
     },
-    UpvalueCellSourceLocalTypeMismatch {
-        cell: UpvalueCellId,
+    CaptureCellSourceLocalTypeMismatch {
+        cell: CaptureCellId,
         expected: TypeId,
         found: TypeId,
     },
-    UpvalueCellSourceLocalMustBeOwnedBinding {
-        cell: UpvalueCellId,
+    CaptureCellSourceLocalMustBeOwnedBinding {
+        cell: CaptureCellId,
         local: LocalId,
         kind: LocalKind,
     },
-    UpvalueCellSourceLocalMustBeMutable {
-        cell: UpvalueCellId,
+    CaptureCellSourceLocalMustBeMutable {
+        cell: CaptureCellId,
         local: LocalId,
     },
-    UpvalueCellSourceLocalBindingMismatch {
-        cell: UpvalueCellId,
+    CaptureCellSourceLocalBindingMismatch {
+        cell: CaptureCellId,
         expected: BindingId,
         found: Option<BindingId>,
     },
-    DuplicateUpvalueCellSourceLocal {
+    DuplicateCaptureCellSourceLocal {
         owner: FunctionId,
         local: LocalId,
-        first: UpvalueCellId,
-        second: UpvalueCellId,
+        first: CaptureCellId,
+        second: CaptureCellId,
     },
 }
 
@@ -513,11 +513,11 @@ pub enum BadPlace {
     ImmutableRoot(PlaceRoot),
     PromotedBindingBypassesCell {
         binding: BindingId,
-        cell: UpvalueCellId,
+        cell: CaptureCellId,
         local: LocalId,
     },
-    UpvalueCellNotAccessible {
-        cell: UpvalueCellId,
+    CaptureCellNotAccessible {
+        cell: CaptureCellId,
         function: FunctionId,
     },
     EscapingLambdaScopedBorrowRoot {
@@ -528,9 +528,9 @@ pub enum BadPlace {
         lambda: LambdaId,
         root: ScopedBorrowId,
     },
-    RawUpvalueCellCaptureBypass {
+    RawCaptureCellCaptureBypass {
         lambda: LambdaId,
-        root: UpvalueCellId,
+        root: CaptureCellId,
     },
 }
 
@@ -694,8 +694,8 @@ impl<'a> VerifyCx<'a> {
         id.index() < self.program.scoped_borrows.len()
     }
 
-    fn has_upvalue_cell(&self, id: UpvalueCellId) -> bool {
-        id.index() < self.program.upvalue_cells.len()
+    fn has_capture_cell(&self, id: CaptureCellId) -> bool {
+        id.index() < self.program.capture_cells.len()
     }
 
     fn has_global(&self, id: GlobalId) -> bool {
@@ -788,7 +788,7 @@ impl LocalInit {
                     }
                 })
                 .collect(),
-            cell_definite: vec![false; program.upvalue_cells.len()],
+            cell_definite: vec![false; program.capture_cells.len()],
         };
         for param in &function.signature.params {
             if param.local_id.index() < function.locals.len() {
@@ -807,7 +807,7 @@ impl LocalInit {
             && let Some(decl) = program.lambdas.get(lambda.index())
         {
             for capture in &decl.captures {
-                if let LambdaCaptureDecl::UpvalueCell { cell, .. } = capture
+                if let LambdaCaptureDecl::CaptureCell { cell, .. } = capture
                     && cell.index() < state.cell_definite.len()
                 {
                     state.cell_definite[cell.index()] = true;
@@ -845,13 +845,13 @@ impl LocalInit {
             .unwrap_or(FunctionValueCapability::Unknown)
     }
 
-    fn init_cell(&mut self, cell: UpvalueCellId) {
+    fn init_cell(&mut self, cell: CaptureCellId) {
         if cell.index() < self.cell_definite.len() {
             self.cell_definite[cell.index()] = true;
         }
     }
 
-    fn cell_is_definite(&self, cell: UpvalueCellId) -> bool {
+    fn cell_is_definite(&self, cell: CaptureCellId) -> bool {
         self.cell_definite
             .get(cell.index())
             .copied()
@@ -963,10 +963,10 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     for (id, _) in cx.program.scoped_borrows.iter().enumerate() {
         verify_scoped_borrow(cx, ScopedBorrowId::from_index(id));
     }
-    for (id, _) in cx.program.upvalue_cells.iter().enumerate() {
-        verify_upvalue_cell(cx, UpvalueCellId::from_index(id));
+    for (id, _) in cx.program.capture_cells.iter().enumerate() {
+        verify_capture_cell(cx, CaptureCellId::from_index(id));
     }
-    verify_upvalue_cell_uniqueness(cx);
+    verify_capture_cell_uniqueness(cx);
     for (id, _) in cx.program.globals.iter().enumerate() {
         verify_global(cx, GlobalId::from_index(id));
     }
@@ -1157,7 +1157,7 @@ fn lambda_capture_decl_binding(capture: &LambdaCaptureDecl) -> BindingId {
         | LambdaCaptureDecl::ReadonlyLocal { binding, .. }
         | LambdaCaptureDecl::ScopedLocal { binding, .. }
         | LambdaCaptureDecl::ScopedBorrow { binding, .. }
-        | LambdaCaptureDecl::UpvalueCell { binding, .. } => *binding,
+        | LambdaCaptureDecl::CaptureCell { binding, .. } => *binding,
     }
 }
 
@@ -1167,7 +1167,7 @@ fn lambda_capture_decl_ty(capture: &LambdaCaptureDecl) -> TypeId {
         | LambdaCaptureDecl::ReadonlyLocal { ty, .. }
         | LambdaCaptureDecl::ScopedLocal { ty, .. }
         | LambdaCaptureDecl::ScopedBorrow { ty, .. }
-        | LambdaCaptureDecl::UpvalueCell { ty, .. } => *ty,
+        | LambdaCaptureDecl::CaptureCell { ty, .. } => *ty,
     }
 }
 
@@ -1175,7 +1175,7 @@ fn lambda_capture_decl_ty(capture: &LambdaCaptureDecl) -> TypeId {
 enum LambdaCaptureSourceKey {
     Local(CaptureLocalSource),
     ScopedBorrow(ScopedBorrowId),
-    UpvalueCell(UpvalueCellId),
+    CaptureCell(CaptureCellId),
 }
 
 fn lambda_capture_decl_source(capture: &LambdaCaptureDecl) -> Option<LambdaCaptureSourceKey> {
@@ -1185,7 +1185,7 @@ fn lambda_capture_decl_source(capture: &LambdaCaptureDecl) -> Option<LambdaCaptu
         LambdaCaptureDecl::ScopedBorrow { borrow, .. } => {
             LambdaCaptureSourceKey::ScopedBorrow(*borrow)
         }
-        LambdaCaptureDecl::UpvalueCell { cell, .. } => LambdaCaptureSourceKey::UpvalueCell(*cell),
+        LambdaCaptureDecl::CaptureCell { cell, .. } => LambdaCaptureSourceKey::CaptureCell(*cell),
         LambdaCaptureDecl::NoRuntime { .. } => return None,
     })
 }
@@ -1194,7 +1194,7 @@ fn lambda_capture_decl_mutability(capture: &LambdaCaptureDecl) -> Mutability {
     match capture {
         LambdaCaptureDecl::ScopedLocal { mutability, .. }
         | LambdaCaptureDecl::ScopedBorrow { mutability, .. } => *mutability,
-        LambdaCaptureDecl::UpvalueCell { .. } => Mutability::Mutable,
+        LambdaCaptureDecl::CaptureCell { .. } => Mutability::Mutable,
         LambdaCaptureDecl::NoRuntime { .. } | LambdaCaptureDecl::ReadonlyLocal { .. } => {
             Mutability::Immutable
         }
@@ -1274,11 +1274,11 @@ fn verify_lambda_capture_decl(
                 ),
             }
         }
-        LambdaCaptureDecl::UpvalueCell { binding, cell, ty } => {
+        LambdaCaptureDecl::CaptureCell { binding, cell, ty } => {
             cx.verify_type_ref(site.clone(), *ty);
-            match cx.program.upvalue_cells.get(cell.index()) {
+            match cx.program.capture_cells.get(cell.index()) {
                 Some(cell_decl) if cell_decl.binding == *binding && cell_decl.ty == *ty => {
-                    if !function_can_access_upvalue_cell(cx.program, decl.owner, *cell) {
+                    if !function_can_access_capture_cell(cx.program, decl.owner, *cell) {
                         cx.push(
                             site,
                             VerifyErrorKind::BadFunction(
@@ -1300,7 +1300,7 @@ fn verify_lambda_capture_decl(
                 ),
                 None => cx.push(
                     site,
-                    VerifyErrorKind::BadReference(BadReference::InvalidUpvalueCell(*cell)),
+                    VerifyErrorKind::BadReference(BadReference::InvalidCaptureCell(*cell)),
                 ),
             }
         }
@@ -1501,9 +1501,9 @@ fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
     cx.verify_type_ref(VerifySite::ScopedBorrow(id), decl.ty);
 }
 
-fn verify_upvalue_cell(cx: &mut VerifyCx<'_>, id: UpvalueCellId) {
-    let decl = &cx.program.upvalue_cells[id.index()];
-    let site = VerifySite::UpvalueCell(id);
+fn verify_capture_cell(cx: &mut VerifyCx<'_>, id: CaptureCellId) {
+    let decl = &cx.program.capture_cells[id.index()];
+    let site = VerifySite::CaptureCell(id);
     if !cx.has_function(decl.owner) {
         cx.push(
             site.clone(),
@@ -1518,7 +1518,7 @@ fn verify_upvalue_cell(cx: &mut VerifyCx<'_>, id: UpvalueCellId) {
                     cx.push(
                         site.clone(),
                         VerifyErrorKind::BadFunction(
-                            BadFunction::UpvalueCellSourceLocalTypeMismatch {
+                            BadFunction::CaptureCellSourceLocalTypeMismatch {
                                 cell: id,
                                 expected: decl.ty,
                                 found: source.ty,
@@ -1530,7 +1530,7 @@ fn verify_upvalue_cell(cx: &mut VerifyCx<'_>, id: UpvalueCellId) {
                     cx.push(
                         site.clone(),
                         VerifyErrorKind::BadFunction(
-                            BadFunction::UpvalueCellSourceLocalBindingMismatch {
+                            BadFunction::CaptureCellSourceLocalBindingMismatch {
                                 cell: id,
                                 expected: decl.binding,
                                 found: source.binding,
@@ -1542,7 +1542,7 @@ fn verify_upvalue_cell(cx: &mut VerifyCx<'_>, id: UpvalueCellId) {
                     cx.push(
                         site.clone(),
                         VerifyErrorKind::BadFunction(
-                            BadFunction::UpvalueCellSourceLocalMustBeOwnedBinding {
+                            BadFunction::CaptureCellSourceLocalMustBeOwnedBinding {
                                 cell: id,
                                 local,
                                 kind: source.kind,
@@ -1554,14 +1554,14 @@ fn verify_upvalue_cell(cx: &mut VerifyCx<'_>, id: UpvalueCellId) {
                     cx.push(
                         site.clone(),
                         VerifyErrorKind::BadFunction(
-                            BadFunction::UpvalueCellSourceLocalMustBeMutable { cell: id, local },
+                            BadFunction::CaptureCellSourceLocalMustBeMutable { cell: id, local },
                         ),
                     );
                 }
             }
             None => cx.push(
                 site.clone(),
-                VerifyErrorKind::BadFunction(BadFunction::UpvalueCellSourceLocalMismatch {
+                VerifyErrorKind::BadFunction(BadFunction::CaptureCellSourceLocalMismatch {
                     cell: id,
                     owner: decl.owner,
                     local,
@@ -1572,15 +1572,15 @@ fn verify_upvalue_cell(cx: &mut VerifyCx<'_>, id: UpvalueCellId) {
     cx.verify_type_ref(site, decl.ty);
 }
 
-fn verify_upvalue_cell_uniqueness(cx: &mut VerifyCx<'_>) {
+fn verify_capture_cell_uniqueness(cx: &mut VerifyCx<'_>) {
     let mut bindings = std::collections::HashMap::new();
     let mut locals = std::collections::HashMap::new();
-    for (index, decl) in cx.program.upvalue_cells.iter().enumerate() {
-        let id = UpvalueCellId::from_index(index);
+    for (index, decl) in cx.program.capture_cells.iter().enumerate() {
+        let id = CaptureCellId::from_index(index);
         if let Some(first) = bindings.insert((decl.owner, decl.binding), id) {
             cx.push(
-                VerifySite::UpvalueCell(id),
-                VerifyErrorKind::BadFunction(BadFunction::DuplicateUpvalueCell {
+                VerifySite::CaptureCell(id),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateCaptureCell {
                     owner: decl.owner,
                     binding: decl.binding,
                     first,
@@ -1590,8 +1590,8 @@ fn verify_upvalue_cell_uniqueness(cx: &mut VerifyCx<'_>) {
         }
         if let Some(first) = locals.insert((decl.owner, decl.source_local), id) {
             cx.push(
-                VerifySite::UpvalueCell(id),
-                VerifyErrorKind::BadFunction(BadFunction::DuplicateUpvalueCellSourceLocal {
+                VerifySite::CaptureCell(id),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateCaptureCellSourceLocal {
                     owner: decl.owner,
                     local: decl.source_local,
                     first,
@@ -2445,7 +2445,7 @@ fn verify_air_stmt(
                             ),
                         );
                     }
-                    PlaceRoot::UpvalueCell(cell) => next.init_cell(cell),
+                    PlaceRoot::CaptureCell(cell) => next.init_cell(cell),
                     PlaceRoot::LambdaCapture(_)
                     | PlaceRoot::ScopedBorrow(_)
                     | PlaceRoot::Global(_) => {}
@@ -2850,7 +2850,7 @@ fn verify_air_lambda_capture_read(
 ) {
     match capture {
         LambdaCaptureArg::NoRuntime => {}
-        LambdaCaptureArg::UpvalueCell { cell } => {
+        LambdaCaptureArg::CaptureCell { cell } => {
             verify_air_cell_read(cx, function_id, index, *cell, state);
         }
         LambdaCaptureArg::ReadonlyLocal { value } => {
@@ -2887,7 +2887,7 @@ fn verify_air_place_read(
         };
         verify_air_local_read(cx, function_id, index, local, state);
     });
-    if let PlaceRoot::UpvalueCell(cell) = place.root {
+    if let PlaceRoot::CaptureCell(cell) = place.root {
         verify_air_cell_read(cx, function_id, index, cell, state);
     }
 }
@@ -2909,7 +2909,7 @@ fn verify_air_place_write(
             VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
             VerifyErrorKind::BadStatement(BadStatement::AssignUninitializedLocal(local)),
         ),
-        PlaceRoot::UpvalueCell(cell) if !place.projection.is_empty() => {
+        PlaceRoot::CaptureCell(cell) if !place.projection.is_empty() => {
             verify_air_cell_write(cx, function_id, index, cell, state);
         }
         _ => {}
@@ -2937,13 +2937,13 @@ fn verify_air_cell_read(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
     index: usize,
-    cell: UpvalueCellId,
+    cell: CaptureCellId,
     state: &LocalInit,
 ) {
     if !state.cell_is_definite(cell) {
         cx.push(
             VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
-            VerifyErrorKind::BadStatement(BadStatement::ReadUninitializedUpvalueCell(cell)),
+            VerifyErrorKind::BadStatement(BadStatement::ReadUninitializedCaptureCell(cell)),
         );
     }
 }
@@ -2952,13 +2952,13 @@ fn verify_air_cell_write(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
     index: usize,
-    cell: UpvalueCellId,
+    cell: CaptureCellId,
     state: &LocalInit,
 ) {
     if !state.cell_is_definite(cell) {
         cx.push(
             VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
-            VerifyErrorKind::BadStatement(BadStatement::AssignUninitializedUpvalueCell(cell)),
+            VerifyErrorKind::BadStatement(BadStatement::AssignUninitializedCaptureCell(cell)),
         );
     }
 }
@@ -2980,13 +2980,13 @@ fn verify_promoted_local_not_used(
     site: &VerifySite,
     local: LocalId,
 ) {
-    for (cell_index, decl) in cx.program.upvalue_cells.iter().enumerate() {
+    for (cell_index, decl) in cx.program.capture_cells.iter().enumerate() {
         if decl.owner == function_id && decl.source_local == local {
             cx.push(
                 site.clone(),
                 VerifyErrorKind::BadPlace(BadPlace::PromotedBindingBypassesCell {
                     binding: decl.binding,
-                    cell: UpvalueCellId::from_index(cell_index),
+                    cell: CaptureCellId::from_index(cell_index),
                     local,
                 }),
             );
@@ -3615,7 +3615,7 @@ fn lambda_capture_arg_place(capture: &LambdaCaptureArg) -> Option<&Place> {
         }
         LambdaCaptureArg::NoRuntime
         | LambdaCaptureArg::ReadonlyLocal { .. }
-        | LambdaCaptureArg::UpvalueCell { .. } => None,
+        | LambdaCaptureArg::CaptureCell { .. } => None,
     }
 }
 
@@ -3676,8 +3676,8 @@ fn lambda_capture_matches(
             LambdaCaptureArg::ScopedBorrow { place },
         ) => place_is_exact_scoped_borrow(place, *borrow, *ty),
         (
-            LambdaCaptureDecl::UpvalueCell { cell: expected, .. },
-            LambdaCaptureArg::UpvalueCell { cell },
+            LambdaCaptureDecl::CaptureCell { cell: expected, .. },
+            LambdaCaptureArg::CaptureCell { cell },
         ) => cell == expected,
         _ => false,
     }
@@ -3878,17 +3878,17 @@ fn verify_lambda_capture(
         LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
             verify_place(cx, function_id, block_id, stmt_index, place);
         }
-        LambdaCaptureArg::UpvalueCell { cell } => {
+        LambdaCaptureArg::CaptureCell { cell } => {
             let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
-            if !cx.has_upvalue_cell(*cell) {
+            if !cx.has_capture_cell(*cell) {
                 cx.push(
                     site,
-                    VerifyErrorKind::BadReference(BadReference::InvalidUpvalueCell(*cell)),
+                    VerifyErrorKind::BadReference(BadReference::InvalidCaptureCell(*cell)),
                 );
-            } else if !function_can_access_upvalue_cell(cx.program, function_id, *cell) {
+            } else if !function_can_access_capture_cell(cx.program, function_id, *cell) {
                 cx.push(
                     site,
-                    VerifyErrorKind::BadPlace(BadPlace::UpvalueCellNotAccessible {
+                    VerifyErrorKind::BadPlace(BadPlace::CaptureCellNotAccessible {
                         cell: *cell,
                         function: function_id,
                     }),
@@ -4018,35 +4018,35 @@ fn verify_place_root(
             }
             Some(cx.program.scoped_borrows[id.index()].ty)
         }
-        PlaceRoot::UpvalueCell(id) => {
-            if !cx.has_upvalue_cell(id) {
+        PlaceRoot::CaptureCell(id) => {
+            if !cx.has_capture_cell(id) {
                 cx.push(
                     site.clone(),
-                    VerifyErrorKind::BadReference(BadReference::InvalidUpvalueCell(id)),
+                    VerifyErrorKind::BadReference(BadReference::InvalidCaptureCell(id)),
                 );
                 return None;
             }
             if let Some(lambda) = lambda_function(cx.program, function_id)
-                && lambda_captures_upvalue_cell(cx.program, lambda, id)
+                && lambda_captures_capture_cell(cx.program, lambda, id)
             {
                 cx.push(
                     site.clone(),
-                    VerifyErrorKind::BadPlace(BadPlace::RawUpvalueCellCaptureBypass {
+                    VerifyErrorKind::BadPlace(BadPlace::RawCaptureCellCaptureBypass {
                         lambda,
                         root: id,
                     }),
                 );
             }
-            if !function_can_access_upvalue_cell(cx.program, function_id, id) {
+            if !function_can_access_capture_cell(cx.program, function_id, id) {
                 cx.push(
                     site.clone(),
-                    VerifyErrorKind::BadPlace(BadPlace::UpvalueCellNotAccessible {
+                    VerifyErrorKind::BadPlace(BadPlace::CaptureCellNotAccessible {
                         cell: id,
                         function: function_id,
                     }),
                 );
             }
-            Some(cx.program.upvalue_cells[id.index()].ty)
+            Some(cx.program.capture_cells[id.index()].ty)
         }
         PlaceRoot::Global(id) => {
             if cx.has_global(id) {
@@ -4080,13 +4080,13 @@ fn lambda_function(program: &Program, function_id: FunctionId) -> Option<LambdaI
     Some(lambda)
 }
 
-fn function_can_access_upvalue_cell(
+fn function_can_access_capture_cell(
     program: &Program,
     function_id: FunctionId,
-    cell: UpvalueCellId,
+    cell: CaptureCellId,
 ) -> bool {
     if program
-        .upvalue_cells
+        .capture_cells
         .get(cell.index())
         .is_some_and(|decl| decl.owner == function_id)
     {
@@ -4097,15 +4097,15 @@ fn function_can_access_upvalue_cell(
     else {
         return false;
     };
-    lambda_captures_upvalue_cell(program, lambda, cell)
+    lambda_captures_capture_cell(program, lambda, cell)
 }
 
-fn lambda_captures_upvalue_cell(program: &Program, lambda: LambdaId, cell: UpvalueCellId) -> bool {
+fn lambda_captures_capture_cell(program: &Program, lambda: LambdaId, cell: CaptureCellId) -> bool {
     program
         .lambdas
         .get(lambda.index())
         .is_some_and(|decl| decl.captures.iter().any(|capture| {
-            matches!(capture, LambdaCaptureDecl::UpvalueCell { cell: captured, .. } if *captured == cell)
+            matches!(capture, LambdaCaptureDecl::CaptureCell { cell: captured, .. } if *captured == cell)
         }))
 }
 
@@ -4128,8 +4128,8 @@ fn place_mutability(
             .scoped_borrows
             .get(id.index())
             .map(|decl| decl.mutability),
-        PlaceRoot::UpvalueCell(id) => program
-            .upvalue_cells
+        PlaceRoot::CaptureCell(id) => program
+            .capture_cells
             .get(id.index())
             .map(|_| Mutability::Mutable),
         PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.mutability),
@@ -4167,7 +4167,7 @@ fn place_root_ty(program: &Program, function_id: FunctionId, root: PlaceRoot) ->
             .and_then(|decl| decl.captures.get(slot.index()))
             .map(lambda_capture_decl_ty),
         PlaceRoot::ScopedBorrow(id) => program.scoped_borrows.get(id.index()).map(|decl| decl.ty),
-        PlaceRoot::UpvalueCell(id) => program.upvalue_cells.get(id.index()).map(|decl| decl.ty),
+        PlaceRoot::CaptureCell(id) => program.capture_cells.get(id.index()).map(|decl| decl.ty),
         PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.ty),
     }
 }
@@ -4910,7 +4910,7 @@ fn operand_function_escape(
             PlaceRoot::LambdaCapture(slot) => {
                 lambda_capture_function_escape(program, function_id, slot)
             }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::UpvalueCell(_) | PlaceRoot::Global(_) => {
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::CaptureCell(_) | PlaceRoot::Global(_) => {
                 type_function_capability(program, place.ty)
             }
         },
@@ -4944,7 +4944,7 @@ fn lambda_capture_function_escape(
         | LambdaCaptureDecl::ScopedLocal { source, .. } => *source,
         LambdaCaptureDecl::NoRuntime { .. }
         | LambdaCaptureDecl::ScopedBorrow { .. }
-        | LambdaCaptureDecl::UpvalueCell { .. } => return FunctionValueCapability::Unknown,
+        | LambdaCaptureDecl::CaptureCell { .. } => return FunctionValueCapability::Unknown,
     };
     program
         .functions

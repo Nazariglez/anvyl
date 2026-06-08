@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @contains: 2
+
+fn main() {
+    var count = 0;
+    let outer = || {
+        let inner = || {
+            count += 1;
+        };
+        inner();
+    };
+    outer();
+    outer();
+    println(count);
+}

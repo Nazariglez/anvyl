@@ -1,12 +1,12 @@
 use super::super::{
-    AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, ConstData, EnumDecl, EnumRepr, ExternDecl,
-    ExternTypeDecl, Function, FunctionKind, GlobalDecl, LambdaDecl, Local, LocalKind, Module,
-    Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot, Program,
-    RValue, RawEnumValue, ScopedBorrowDecl, Signature, TypeData, UpvalueCellDecl, VariantDecl,
+    AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CaptureCellDecl, ConstData, EnumDecl,
+    EnumRepr, ExternDecl, ExternTypeDecl, Function, FunctionKind, GlobalDecl, LambdaDecl, Local,
+    LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
+    PlaceRoot, Program, RValue, RawEnumValue, ScopedBorrowDecl, Signature, TypeData, VariantDecl,
     VariantShape,
     ids::{
-        AggregateId, BindingId, BlockId, ConstId, EnumId, ExternId, ExternTypeId, FunctionId,
-        GlobalId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId, UpvalueCellId,
+        AggregateId, BindingId, BlockId, CaptureCellId, ConstId, EnumId, ExternId, ExternTypeId,
+        FunctionId, GlobalId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId,
     },
 };
 use crate::{
@@ -171,8 +171,8 @@ impl ProgramBuilder {
         self.program.alloc_scoped_borrow(decl)
     }
 
-    pub fn alloc_upvalue_cell(&mut self, decl: UpvalueCellDecl) -> UpvalueCellId {
-        self.program.alloc_upvalue_cell(decl)
+    pub fn alloc_capture_cell(&mut self, decl: CaptureCellDecl) -> CaptureCellId {
+        self.program.alloc_capture_cell(decl)
     }
 
     pub fn alloc_global(&mut self, decl: GlobalDecl) -> GlobalId {
