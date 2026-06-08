@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: borrowed mutable captures await lambda_capture_cell_mutable_places
+// @skip: borrowed var-param captures await lambda_borrowed_mutable_captures
 // @match: 1
 
 fn touch(var count: int) {

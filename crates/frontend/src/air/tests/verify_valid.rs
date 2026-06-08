@@ -309,6 +309,135 @@ fn nested_lambda_forwards_capture_cell() {
 }
 
 #[test]
+fn distinct_capture_cell_call_args_do_not_alias() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let callee = FunctionId::from_index(0);
+    let body = FunctionId::from_index(1);
+    let owner = FunctionId::from_index(2);
+    let lambda = LambdaId::from_index(0);
+    let first_binding = BindingId::from_index(0);
+    let second_binding = BindingId::from_index(1);
+    let first_local = LocalId::from_index(0);
+    let second_local = LocalId::from_index(1);
+    let first_cell = builder.alloc_capture_cell(CaptureCellDecl {
+        binding: first_binding,
+        owner,
+        source_local: first_local,
+        ty: int_ty,
+    });
+    let second_cell = builder.alloc_capture_cell(CaptureCellDecl {
+        binding: second_binding,
+        owner,
+        source_local: second_local,
+        ty: int_ty,
+    });
+
+    let mut both = FunctionBuilder::new("both", module, FunctionKind::Normal, void_ty);
+    both.push_param_with_mode("a", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    both.push_param_with_mode("b", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    both.push_block(term_return_void());
+    assert_eq!(builder.alloc_function(both.finish()), callee);
+
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            owner,
+            body,
+            signature: SignatureType::new(vec![], ReturnMode::Value(void_ty)),
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![
+                LambdaCaptureDecl::CaptureCell {
+                    binding: first_binding,
+                    cell: first_cell,
+                    ty: int_ty,
+                },
+                LambdaCaptureDecl::CaptureCell {
+                    binding: second_binding,
+                    cell: second_cell,
+                    ty: int_ty,
+                },
+            ],
+        }),
+        lambda
+    );
+    let mut lambda_body =
+        FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), void_ty);
+    let bb0 = lambda_body.push_block(term_return_void());
+    lambda_body.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![
+                CallArg::MutBorrow(Place {
+                    root: PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)),
+                    projection: vec![],
+                    ty: int_ty,
+                }),
+                CallArg::MutBorrow(Place {
+                    root: PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(1)),
+                    projection: vec![],
+                    ty: int_ty,
+                }),
+            ],
+        }),
+    );
+    assert_eq!(builder.alloc_function(lambda_body.finish()), body);
+
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let lambda_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![],
+        ReturnMode::Value(void_ty),
+    )));
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, void_ty);
+    assert_eq!(
+        main.push_local(Some("a"), int_ty, Mutability::Mutable, LocalKind::User),
+        first_local
+    );
+    main.bind_local(first_local, first_binding);
+    assert_eq!(
+        main.push_local(Some("b"), int_ty, Mutability::Mutable, LocalKind::User),
+        second_local
+    );
+    main.bind_local(second_local, second_binding);
+    let bb0 = main.push_block(term_return_void());
+    for cell in [first_cell, second_cell] {
+        main.add_statement(
+            bb0,
+            stmt_assign(
+                Place {
+                    root: PlaceRoot::CaptureCell(cell),
+                    projection: vec![],
+                    ty: int_ty,
+                },
+                RValue::Use(op_const(zero)),
+            ),
+        );
+    }
+    main.add_statement(
+        bb0,
+        stmt_eval(RValue::MakeLambda {
+            lambda,
+            captures: vec![
+                LambdaCaptureArg::CaptureCell { cell: first_cell },
+                LambdaCaptureArg::CaptureCell { cell: second_cell },
+            ],
+            ty: lambda_ty,
+        }),
+    );
+    assert_eq!(builder.alloc_function(main.finish()), owner);
+    builder.set_entry(owner);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
 fn nonescaping_lambda_body_may_use_declared_scoped_borrow() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();

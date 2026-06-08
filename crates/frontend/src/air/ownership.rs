@@ -662,7 +662,8 @@ fn final_param_mode(
 
 fn force_alias_snapshots(program: &Program, modes: &mut [Vec<ParamMode>]) -> bool {
     let mut changed = false;
-    for function in &program.functions {
+    for (index, function) in program.functions.iter().enumerate() {
+        let function_id = FunctionId::from_index(index);
         function.body.for_each_rvalue(&mut |value| {
             let RValue::Call {
                 callee: Callee::Function(callee),
@@ -676,7 +677,14 @@ fn force_alias_snapshots(program: &Program, modes: &mut [Vec<ParamMode>]) -> boo
             };
             for first in 0..args.len() {
                 for second in first + 1..args.len() {
-                    changed |= force_alias_snapshot(callee_modes, args, first, second);
+                    changed |= force_alias_snapshot(
+                        program,
+                        function_id,
+                        callee_modes,
+                        args,
+                        first,
+                        second,
+                    );
                 }
             }
         });
@@ -685,6 +693,8 @@ fn force_alias_snapshots(program: &Program, modes: &mut [Vec<ParamMode>]) -> boo
 }
 
 fn force_alias_snapshot(
+    program: &Program,
+    function_id: FunctionId,
     modes: &mut [ParamMode],
     args: &[CallArg],
     first: usize,
@@ -701,17 +711,22 @@ fn force_alias_snapshot(
         (ParamMode::MutBorrow, ParamMode::SharedBorrow) => second,
         _ => return false,
     };
-    if !call_args_overlap(&args[first], &args[second]) {
+    if !call_args_overlap(program, function_id, &args[first], &args[second]) {
         return false;
     }
     modes[snapshot] = ParamMode::Value;
     true
 }
 
-fn call_args_overlap(left: &CallArg, right: &CallArg) -> bool {
+fn call_args_overlap(
+    program: &Program,
+    function_id: FunctionId,
+    left: &CallArg,
+    right: &CallArg,
+) -> bool {
     left.place()
         .zip(right.place())
-        .is_some_and(|(left, right)| left.may_overlap(right))
+        .is_some_and(|(left, right)| program.places_may_overlap(function_id, left, right))
 }
 
 fn apply_param_modes(program: &mut Program, modes: &[Vec<ParamMode>]) {

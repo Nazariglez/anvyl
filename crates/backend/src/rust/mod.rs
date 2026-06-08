@@ -245,6 +245,9 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileErrorKind::UnsupportedMutablePlaceProjection => {
                     RustTargetGapKind::UnsupportedMutablePlaceProjection
                 }
+                ProfileErrorKind::UnsupportedMutablePlaceDataRef => {
+                    RustTargetGapKind::UnsupportedMutablePlaceDataRef
+                }
                 ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary => {
                     RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary
                 }
@@ -2641,13 +2644,14 @@ impl<'a> PlanCx<'a> {
                         RustTargetGapKind::UnsupportedMutablePlaceProjection,
                     ));
                 }
-                if self.place_capture_cell(function, place).is_some() {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedMutablePlace,
-                    ));
-                }
                 let ty = self.type_map[&place.ty];
+                if let Some(cell) = self.place_capture_cell(function, place) {
+                    let arg = RirMutPlaceArg::StackCell {
+                        cell: self.capture_cell_ref(function, cell),
+                        ty,
+                    };
+                    return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)));
+                }
                 let Some(root) = place.root.local() else {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(function),
@@ -2979,7 +2983,13 @@ impl<'a> PlanCx<'a> {
     }
 
     fn place_crosses_dataref(&self, function: FunctionId, place: &Place) -> bool {
-        let (mut ty, _) = self.current_place_root(function, place);
+        let mut ty = match place.root {
+            air::PlaceRoot::CaptureCell(cell) => self.air.capture_cells[cell.index()].ty,
+            air::PlaceRoot::ScopedBorrow(_) | air::PlaceRoot::Global(_) => return false,
+            air::PlaceRoot::Local(_) | air::PlaceRoot::LambdaCapture(_) => {
+                self.current_place_root(function, place).0
+            }
+        };
         for projection in &place.projection {
             if matches!(self.air.type_arena.data(ty), TypeData::DataRef(_)) {
                 return true;
@@ -2994,19 +3004,7 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         place: &Place,
     ) -> Option<air::CaptureCellId> {
-        match place.root {
-            air::PlaceRoot::CaptureCell(cell) => Some(cell),
-            air::PlaceRoot::LambdaCapture(slot) => {
-                let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
-                    return None;
-                };
-                match self.air.lambdas[lambda.index()].captures[slot.index()] {
-                    air::LambdaCaptureDecl::CaptureCell { cell, .. } => Some(cell),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        self.air.capture_cell_root(function, place.root)
     }
 
     fn capture_cell_ref(&self, function: FunctionId, cell: air::CaptureCellId) -> RirCellRef {

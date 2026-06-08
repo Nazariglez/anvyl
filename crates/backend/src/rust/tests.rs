@@ -4748,6 +4748,129 @@ fn profile_accepts_mut_borrow_call() {
 }
 
 #[test]
+fn profile_accepts_lambda_callee_capture_cell_source_var_arg() {
+    let mut program = owner_capture_cell_source_var_arg_program();
+    let callee = FunctionId::from_index(0);
+    let caller = FunctionId::from_index(1);
+    let int = program.function(callee).signature.params[0].ty;
+    let void = program.function(callee).signature.return_mode.ty();
+    let lambda_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![air::ParamType {
+            ty: int,
+            mode: ParamMode::MutBorrow,
+            escape: ParamEscape::NonEscaping,
+        }],
+        air::ReturnMode::Value(void),
+    )));
+    let callee_local = air::LocalId::from_index(program.function(caller).locals.len());
+    let function = program.function_mut(caller);
+    function.locals.push(local(lambda_ty, LocalKind::Temp));
+    function.body.block.stmts.insert(
+        1,
+        Statement::Init {
+            local: callee_local,
+            value: RValue::FunctionRef {
+                function: callee,
+                ty: lambda_ty,
+            },
+        },
+    );
+    let Statement::Eval(RValue::Call { callee, .. }) = &mut function.body.block.stmts[2] else {
+        unreachable!("test helper should end with the source var call")
+    };
+    *callee = Callee::Lambda(Operand::Place(place(callee_local, lambda_ty)));
+
+    check(program);
+}
+
+#[test]
+fn profile_rejects_dataref_source_var_arg() {
+    expect_reject(
+        projected_mut_call_arg_program(),
+        ProfileErrorKind::UnsupportedMutablePlaceDataRef,
+    );
+}
+
+#[test]
+fn profile_rejects_capture_cell_dataref_source_var_arg() {
+    expect_reject(
+        capture_cell_dataref_source_var_arg_program(),
+        ProfileErrorKind::UnsupportedMutablePlaceDataRef,
+    );
+}
+
+#[test]
+fn profile_rejects_capture_cell_to_native_mut_borrow() {
+    let mut program = lambda_capture_cell_source_var_arg_program();
+    let body = FunctionId::from_index(1);
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let void = program.function(body).signature.return_mode.ty();
+    let ext = extern_in_module(
+        &mut program,
+        &["host"],
+        "touch",
+        vec![(int, ParamMode::MutBorrow)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let Statement::Eval(RValue::Call { callee, .. }) =
+        &mut program.function_mut(body).body.block.stmts[0]
+    else {
+        unreachable!("test helper should start with the source var call")
+    };
+    *callee = Callee::Extern(ext);
+
+    expect_reject(
+        program,
+        ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+    );
+}
+
+#[test]
+fn plan_lowers_owner_capture_cell_source_var_arg_to_stack_cell() {
+    let program = owner_capture_cell_source_var_arg_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let caller = rir_function_for_air(plan.program(), FunctionId::from_index(1));
+    let arg = only_call_arg(caller);
+
+    assert!(matches!(
+        arg,
+        RirCallArg::MutPlace(RirMutPlaceArg::StackCell {
+            cell: RirCellRef::Owner(id),
+            ..
+        }) if *id == RirCellId::from_index(0)
+    ));
+}
+
+#[test]
+fn plan_lowers_lambda_capture_cell_source_var_arg_to_stack_cell() {
+    let program = lambda_capture_cell_source_var_arg_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
+    let arg = only_call_arg(lambda_body);
+
+    assert!(matches!(
+        arg,
+        RirCallArg::MutPlace(RirMutPlaceArg::StackCell {
+            cell: RirCellRef::Capture { cell, .. },
+            ..
+        }) if *cell == RirCellId::from_index(0)
+    ));
+}
+
+#[test]
+fn emit_passes_capture_cell_var_arg_as_stack_cell_mut_place() {
+    let source = plan_source(lambda_capture_cell_source_var_arg_program()).into_string();
+
+    assert!(source.contains("MutPlace::stack_cell(&"));
+    assert!(!source.contains("MutPlace::local(&mut"));
+    assert!(!source.contains(".get_copy()?"));
+}
+
+#[test]
 fn profile_rejects_source_var_param_to_native_mut_borrow() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -7429,6 +7552,56 @@ fn projected_mut_call_arg_program() -> Program {
         ),
     });
     program.module_mut(module).functions.extend([bump, main]);
+    program
+}
+
+fn capture_cell_dataref_source_var_arg_program() -> Program {
+    let mut program = projected_mut_call_arg_program();
+    let owner = FunctionId::from_index(1);
+    let binding = BindingId::from_index(0);
+    let source_local = air::LocalId::from_index(0);
+    let node = program.function(owner).locals[source_local.index()].ty;
+    let aggregate = match program.type_arena.data(node) {
+        TypeData::DataRef(aggregate) => *aggregate,
+        _ => unreachable!("test helper should use a dataref local"),
+    };
+    let int = program.aggregate(aggregate).fields[0].ty;
+    let zero = int_const(&mut program, int, 0);
+    let cell = program.alloc_capture_cell(CaptureCellDecl {
+        binding,
+        owner,
+        source_local,
+        ty: node,
+    });
+
+    let function = program.function_mut(owner);
+    function.signature.params.clear();
+    let source = &mut function.locals[source_local.index()];
+    source.kind = LocalKind::User;
+    source.mutability = Mutability::Mutable;
+    source.binding = Some(binding);
+    let Statement::Eval(RValue::Call { args, .. }) = &mut function.body.block.stmts[0] else {
+        unreachable!("test helper should start with the projected mut call")
+    };
+    let [CallArg::MutBorrow(place)] = args.as_mut_slice() else {
+        unreachable!("test helper should have one mut call arg")
+    };
+    place.root = PlaceRoot::CaptureCell(cell);
+    function.body.block.stmts.insert(
+        0,
+        Statement::Assign {
+            dst: Place {
+                root: PlaceRoot::CaptureCell(cell),
+                projection: vec![],
+                ty: node,
+            },
+            value: RValue::Aggregate {
+                kind: AggregateCtor::DataRef(aggregate),
+                fields: vec![Operand::Const(zero)],
+                ty: node,
+            },
+        },
+    );
     program
 }
 
@@ -10719,6 +10892,213 @@ fn int_const(program: &mut Program, ty: air::TypeId, value: i64) -> air::ConstId
         ty,
         value: ConstValue::Int(value),
     })
+}
+
+fn owner_capture_cell_source_var_arg_program() -> Program {
+    capture_cell_source_var_arg_program(false)
+}
+
+fn lambda_capture_cell_source_var_arg_program() -> Program {
+    capture_cell_source_var_arg_program(true)
+}
+
+fn capture_cell_source_var_arg_program(in_lambda: bool) -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let callee = source_var_callee(&mut program, module, int, void);
+    let binding = BindingId::from_index(0);
+    let source_local = air::LocalId::from_index(0);
+
+    if !in_lambda {
+        let owner = FunctionId::from_index(1);
+        let cell = capture_cell(&mut program, owner, source_local, binding, int);
+        let init = init_cell(&mut program, cell, int);
+        let caller = program.alloc_function(Function {
+            name: Ident::new("main"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(vec![], void),
+            locals: vec![bound_source_local(binding, int)],
+            body: structured_body(
+                vec![
+                    init,
+                    source_var_call(callee, PlaceRoot::CaptureCell(cell), int),
+                ],
+                air::AirTail::Return(None),
+            ),
+        });
+        assert_eq!(caller, owner);
+        program
+            .module_mut(module)
+            .functions
+            .extend([callee, caller]);
+        program.entry = Some(caller);
+        return program;
+    }
+
+    let body = FunctionId::from_index(1);
+    let owner = FunctionId::from_index(2);
+    let lambda = air::LambdaId::from_index(0);
+    let cell = capture_cell(&mut program, owner, source_local, binding, int);
+    let sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
+    let lambda_ty = program.alloc_type(TypeData::Function(sig.clone()));
+    assert_eq!(
+        program.alloc_lambda(LambdaDecl {
+            source: ExprId(0),
+            module,
+            owner,
+            body,
+            signature: sig,
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![air::LambdaCaptureDecl::CaptureCell {
+                binding,
+                cell,
+                ty: int,
+            }],
+        }),
+        lambda
+    );
+    let lambda_body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Lambda(lambda),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![source_var_call(
+                callee,
+                PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                int,
+            )],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(lambda_body, body);
+    let init = init_cell(&mut program, cell, int);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![
+            bound_source_local(binding, int),
+            local(lambda_ty, LocalKind::User),
+        ],
+        body: structured_body(
+            vec![
+                init,
+                Statement::Init {
+                    local: air::LocalId::from_index(1),
+                    value: RValue::MakeLambda {
+                        lambda,
+                        captures: vec![air::LambdaCaptureArg::CaptureCell { cell }],
+                        ty: lambda_ty,
+                    },
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(caller, owner);
+    program
+        .module_mut(module)
+        .functions
+        .extend([callee, lambda_body, caller]);
+    program.entry = Some(caller);
+    program
+}
+
+fn source_var_callee(
+    program: &mut Program,
+    module: air::ModuleId,
+    int: air::TypeId,
+    void: air::TypeId,
+) -> FunctionId {
+    let arg = air::LocalId::from_index(0);
+    program.alloc_function(Function {
+        name: Ident::new("bump"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("x", int, ParamMode::MutBorrow, arg)], void),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    })
+}
+
+fn capture_cell(
+    program: &mut Program,
+    owner: FunctionId,
+    source_local: air::LocalId,
+    binding: BindingId,
+    ty: air::TypeId,
+) -> air::CaptureCellId {
+    program.alloc_capture_cell(CaptureCellDecl {
+        binding,
+        owner,
+        source_local,
+        ty,
+    })
+}
+
+fn bound_source_local(binding: BindingId, ty: air::TypeId) -> Local {
+    let mut local = mut_local(ty, LocalKind::User);
+    local.binding = Some(binding);
+    local
+}
+
+fn init_cell(program: &mut Program, cell: air::CaptureCellId, ty: air::TypeId) -> Statement {
+    Statement::Assign {
+        dst: root_place(PlaceRoot::CaptureCell(cell), ty),
+        value: RValue::Use(Operand::Const(int_const(program, ty, 0))),
+    }
+}
+
+fn source_var_call(callee: FunctionId, root: PlaceRoot, ty: air::TypeId) -> Statement {
+    Statement::Eval(RValue::Call {
+        callee: Callee::Function(callee),
+        args: vec![CallArg::MutBorrow(root_place(root, ty))],
+    })
+}
+
+fn root_place(root: PlaceRoot, ty: air::TypeId) -> Place {
+    Place {
+        root,
+        projection: vec![],
+        ty,
+    }
+}
+
+fn rir_function_for_air(program: &RirProgram, air_id: FunctionId) -> &RirFunction {
+    program
+        .functions
+        .iter()
+        .find(|function| function.air_id == Some(air_id))
+        .expect("missing RIR function for AIR function")
+}
+
+fn only_call_arg(function: &RirFunction) -> &RirCallArg {
+    let calls = function
+        .body
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            RirStmt::Eval(RirRValue::Call { args, .. }) => Some(args),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].len(), 1);
+    &calls[0][0]
 }
 
 fn plan_source(program: Program) -> emit::RustSource {

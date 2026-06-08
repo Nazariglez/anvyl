@@ -9,9 +9,10 @@ fn bump(var x: int) {
 
 fn main() {
     var count = 0;
-    let f = || {
-        bump(count);
+    let outer = || {
+        let inner = || { bump(count); };
+        inner();
     };
-    f();
+    outer();
     println(count);
 }

@@ -128,6 +128,46 @@ impl Program {
         &mut self.functions[id.index()]
     }
 
+    pub fn capture_cell_root(
+        &self,
+        function_id: FunctionId,
+        root: PlaceRoot,
+    ) -> Option<CaptureCellId> {
+        match root {
+            PlaceRoot::CaptureCell(cell) => Some(cell),
+            PlaceRoot::LambdaCapture(slot) => {
+                let FunctionKind::Lambda(lambda) = self.function(function_id).kind else {
+                    return None;
+                };
+                match self
+                    .lambdas
+                    .get(lambda.index())?
+                    .captures
+                    .get(slot.index())?
+                {
+                    LambdaCaptureDecl::CaptureCell { cell, .. } => Some(*cell),
+                    _ => None,
+                }
+            }
+            PlaceRoot::Local(_) | PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => None,
+        }
+    }
+
+    pub(crate) fn places_may_overlap(
+        &self,
+        function_id: FunctionId,
+        left: &Place,
+        right: &Place,
+    ) -> bool {
+        match (
+            self.capture_cell_root(function_id, left.root),
+            self.capture_cell_root(function_id, right.root),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => left.may_overlap(right),
+        }
+    }
+
     pub fn alloc_extern(&mut self, decl: ExternDecl) -> ExternId {
         let id = ExternId::from_index(self.externs.len());
         self.externs.push(decl);

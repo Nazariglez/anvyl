@@ -76,6 +76,7 @@ pub enum ProfileErrorKind {
     UnsupportedLambdaExternBoundary,
     UnsupportedMutablePlace,
     UnsupportedMutablePlaceProjection,
+    UnsupportedMutablePlaceDataRef,
     UnsupportedMutablePlaceNativeBoundary,
     NonCopyValueRequired,
 }
@@ -944,12 +945,17 @@ impl ProfileCx<'_> {
             }
             CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
-                self.check_place(site, place);
                 match expected.unwrap_or(rir::RirParamSemantic::MutBorrow) {
                     rir::RirParamSemantic::MutPlace => {
-                        if self.place_capture_cell(site, place).is_some() {
-                            self.push(site, ProfileErrorKind::UnsupportedMutablePlace);
+                        if self.place_crosses_dataref(site, place) {
+                            self.push(site, ProfileErrorKind::UnsupportedMutablePlaceDataRef);
+                            return;
                         }
+                        if !place.projection.is_empty() {
+                            self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
+                            return;
+                        }
+                        self.check_place(site, place);
                     }
                     rir::RirParamSemantic::MutBorrow => {
                         let source_place = place
@@ -964,7 +970,9 @@ impl ProfileCx<'_> {
                                 site,
                                 ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
                             );
+                            return;
                         }
+                        self.check_place(site, place);
                         if !self.supports_param_mode(place.ty, ParamMode::MutBorrow) {
                             self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
                         }
@@ -1098,14 +1106,8 @@ impl ProfileCx<'_> {
     }
 
     fn place_capture_cell(&self, site: ProfileSite, place: &Place) -> Option<air::CaptureCellId> {
-        match place.root {
-            PlaceRoot::CaptureCell(cell) => Some(cell),
-            PlaceRoot::LambdaCapture(slot) => match self.current_lambda_capture(site, slot) {
-                Some(air::LambdaCaptureDecl::CaptureCell { cell, .. }) => Some(*cell),
-                _ => None,
-            },
-            _ => None,
-        }
+        let function = self.current_function_id(site)?;
+        self.program.capture_cell_root(function, place.root)
     }
 
     fn place_crosses_dataref(&self, site: ProfileSite, place: &Place) -> bool {
@@ -1122,9 +1124,13 @@ impl ProfileCx<'_> {
                 };
                 ty
             }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::CaptureCell(_) | PlaceRoot::Global(_) => {
-                return false;
+            PlaceRoot::CaptureCell(cell) => {
+                let Some(decl) = self.program.capture_cells.get(cell.index()) else {
+                    return false;
+                };
+                decl.ty
             }
+            PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => return false,
         };
         for projection in &place.projection {
             if matches!(self.program.type_arena.data(ty), TypeData::DataRef(_)) {

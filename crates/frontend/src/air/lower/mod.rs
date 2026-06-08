@@ -2355,6 +2355,19 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         requires_mut: bool,
     ) -> Result<Place, LowerError> {
+        self.lower_place_arg_impl(expr, requires_mut, false)
+    }
+
+    fn lower_mut_call_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+        self.lower_place_arg_impl(expr, true, true)
+    }
+
+    fn lower_place_arg_impl(
+        &mut self,
+        expr: &ExprNode,
+        requires_mut: bool,
+        allow_capture_cell: bool,
+    ) -> Result<Place, LowerError> {
         let fact = if requires_mut {
             match self
                 .local_use(expr, LocalUseMode::VarArgument)
@@ -2362,7 +2375,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             {
                 Ok(fact) => fact,
                 Err(LowerError::MissingLocalUse { .. }) => {
-                    return self.lower_mut_place_from_read_fact(expr);
+                    return self.lower_mut_place_from_read_fact(expr, allow_capture_cell);
                 }
                 Err(err) => return Err(err),
             }
@@ -2378,7 +2391,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let root = self.binding_place(&fact)?;
         if requires_mut {
             if self.place_is_capture_cell(&root) {
-                return Err(lambda_capture_gap(expr.node.id));
+                return lower_capture_cell_mut_arg(expr, root, allow_capture_cell);
             }
             let Some(root_local) = root.root.local() else {
                 return Err(unsupported_expr(expr));
@@ -2390,12 +2403,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.lower_projected_place(expr, root)
     }
 
-    fn lower_mut_place_from_read_fact(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
+    fn lower_mut_place_from_read_fact(
+        &mut self,
+        expr: &ExprNode,
+        allow_capture_cell: bool,
+    ) -> Result<Place, LowerError> {
         let root = projection_root(expr).unwrap_or(expr);
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
             let root = self.binding_place(&fact)?;
             if self.place_is_capture_cell(&root) {
-                return Err(lambda_capture_gap(expr.node.id));
+                return lower_capture_cell_mut_arg(expr, root, allow_capture_cell);
             }
             let Some(root_local) = root.root.local() else {
                 return Err(unsupported_expr(expr));
@@ -2581,21 +2598,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn place_is_capture_cell(&self, place: &Place) -> bool {
-        match place.root {
-            PlaceRoot::CaptureCell(_) => true,
-            PlaceRoot::LambdaCapture(slot) => {
-                let FunctionKind::Lambda(lambda) = self.function.kind else {
-                    return false;
-                };
-                matches!(
-                    self.cx.program.lambdas[lambda.index()]
-                        .captures
-                        .get(slot.index()),
-                    Some(LambdaCaptureDecl::CaptureCell { .. })
-                )
-            }
-            _ => false,
-        }
+        self.cx
+            .program
+            .capture_cell_root(self.function_id, place.root)
+            .is_some()
     }
 
     fn project_tuple_index(
@@ -4558,7 +4564,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                         .lower_value_to(expr, param.ty, expr)
                         .map(CallArg::Value),
                     ParamMode::SharedBorrow => self.lower_shared_call_arg(expr, param.ty),
-                    ParamMode::MutBorrow => self.lower_place_arg(expr, true).and_then(|place| {
+                    ParamMode::MutBorrow => self.lower_mut_call_arg(expr).and_then(|place| {
                         if place.ty == param.ty {
                             Ok(CallArg::MutBorrow(place))
                         } else {
@@ -6558,6 +6564,28 @@ fn lambda_capture_gap(expr_id: ExprId) -> LowerError {
     LowerError::UnsupportedExpr {
         expr_id,
         kind: "UnsupportedLambdaCapture",
+    }
+}
+
+fn lower_capture_cell_mut_arg(
+    expr: &ExprNode,
+    root: Place,
+    allow_capture_cell: bool,
+) -> Result<Place, LowerError> {
+    if !allow_capture_cell {
+        return Err(lambda_capture_gap(expr.node.id));
+    }
+    if matches!(expr.node.kind, ExprKind::Ident(_)) {
+        Ok(root)
+    } else {
+        Err(mutable_place_projection_gap(expr.node.id))
+    }
+}
+
+fn mutable_place_projection_gap(expr_id: ExprId) -> LowerError {
+    LowerError::UnsupportedExpr {
+        expr_id,
+        kind: "UnsupportedMutablePlaceProjection",
     }
 }
 
@@ -9328,6 +9356,46 @@ mod tests {
                 }) if matches!(args.as_slice(), [CallArg::MutBorrow(_)])
             )
         }));
+    }
+
+    #[test]
+    fn mutable_capture_var_arg_lowers_owner_cell() {
+        let source = "fn bump(var x: int) {} fn f() { var count = 0; let g: fn() = || { count = 1; }; bump(count); g; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let cell = CaptureCellId::from_index(0);
+
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+
+        assert!(function_statements(function).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Eval(RValue::Call {
+                    args,
+                    ..
+                }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if place.root == PlaceRoot::CaptureCell(cell) && place.projection.is_empty())
+            )
+        }));
+    }
+
+    #[test]
+    fn projected_capture_var_arg_remains_gap() {
+        let source = "struct Point { x: int } fn bump(var x: int) {} fn f() { var p = Point { x: 0 }; let g: fn() = || { bump(p.x); }; g; }";
+        let err = lower_root(source, "f").expect_err("expected projection gap");
+
+        assert!(
+            matches!(
+                err,
+                LowerError::UnsupportedExpr {
+                    kind: "UnsupportedMutablePlaceProjection",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

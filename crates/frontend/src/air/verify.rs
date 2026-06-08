@@ -511,6 +511,7 @@ pub enum BadPlace {
         found: TypeId,
     },
     ImmutableRoot(PlaceRoot),
+    UnsupportedCaptureCellProjection(CaptureCellId),
     PromotedBindingBypassesCell {
         binding: BindingId,
         cell: CaptureCellId,
@@ -3795,6 +3796,14 @@ fn verify_mutable_place(
     if place_crosses_dataref(cx.program, function_id, place) {
         return;
     }
+    if let Some(cell) = cx.program.capture_cell_root(function_id, place.root)
+        && !place.projection.is_empty()
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadPlace(BadPlace::UnsupportedCaptureCellProjection(cell)),
+        );
+    }
     if place_mutability(cx.program, function_id, place.root) == Some(Mutability::Immutable) {
         cx.push(
             site.clone(),
@@ -4114,6 +4123,9 @@ fn place_mutability(
     function_id: FunctionId,
     root: PlaceRoot,
 ) -> Option<Mutability> {
+    if program.capture_cell_root(function_id, root).is_some() {
+        return Some(Mutability::Mutable);
+    }
     match root {
         PlaceRoot::Local(local) => program
             .function(function_id)
@@ -4128,10 +4140,7 @@ fn place_mutability(
             .scoped_borrows
             .get(id.index())
             .map(|decl| decl.mutability),
-        PlaceRoot::CaptureCell(id) => program
-            .capture_cells
-            .get(id.index())
-            .map(|_| Mutability::Mutable),
+        PlaceRoot::CaptureCell(_) => Some(Mutability::Mutable),
         PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.mutability),
     }
 }
@@ -4792,7 +4801,7 @@ fn verify_call(
         Callee::Extern(_) => {}
     }
 
-    verify_call_args(cx, &site, callee, args);
+    verify_call_args(cx, function_id, &site, callee, args);
 }
 
 fn verify_call_arg(
@@ -4998,7 +5007,13 @@ fn type_function_capability(program: &Program, ty: TypeId) -> FunctionValueCapab
     }
 }
 
-fn verify_call_args(cx: &mut VerifyCx<'_>, site: &VerifySite, callee: &Callee, args: &[CallArg]) {
+fn verify_call_args(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    site: &VerifySite,
+    callee: &Callee,
+    args: &[CallArg],
+) {
     let Some(params) = typing::callee_params(cx.program, callee) else {
         return;
     };
@@ -5016,7 +5031,7 @@ fn verify_call_args(cx: &mut VerifyCx<'_>, site: &VerifySite, callee: &Callee, a
     }
     for first in 0..args.len() {
         for second in first + 1..args.len() {
-            if call_args_conflict(&args[first], &args[second]) {
+            if call_args_conflict(cx.program, function_id, &args[first], &args[second]) {
                 cx.push(
                     site.clone(),
                     VerifyErrorKind::BadCall(BadCall::ArgAliasConflict { first, second }),
@@ -5053,7 +5068,12 @@ fn verify_call_args(cx: &mut VerifyCx<'_>, site: &VerifySite, callee: &Callee, a
     }
 }
 
-fn call_args_conflict(left: &CallArg, right: &CallArg) -> bool {
+fn call_args_conflict(
+    program: &Program,
+    function_id: FunctionId,
+    left: &CallArg,
+    right: &CallArg,
+) -> bool {
     let borrow_conflict = matches!(
         (left.mode(), right.mode()),
         (ParamMode::SharedBorrow, ParamMode::MutBorrow)
@@ -5066,7 +5086,7 @@ fn call_args_conflict(left: &CallArg, right: &CallArg) -> bool {
         && left
             .place()
             .zip(right.place())
-            .is_some_and(|(left, right)| left.may_overlap(right))
+            .is_some_and(|(left, right)| program.places_may_overlap(function_id, left, right))
 }
 
 fn verify_slice_index(

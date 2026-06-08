@@ -144,6 +144,7 @@ pub enum Projection {
 fn place_roots_may_overlap(left: PlaceRoot, right: PlaceRoot) -> bool {
     match (left, right) {
         (PlaceRoot::Local(left), PlaceRoot::Local(right)) => left == right,
+        (PlaceRoot::CaptureCell(left), PlaceRoot::CaptureCell(right)) => left == right,
         _ => true,
     }
 }

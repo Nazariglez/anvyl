@@ -2933,6 +2933,57 @@ fn capture_cell_read_requires_initialization() {
 }
 
 #[test]
+fn projected_capture_cell_mut_call_arg_is_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![int_ty]));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let callee = FunctionId::from_index(0);
+    let owner = FunctionId::from_index(1);
+    let binding = BindingId::from_index(0);
+    let source_local = LocalId::from_index(0);
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
+        binding,
+        owner,
+        source_local,
+        ty: tuple_ty,
+    });
+
+    let mut bump = FunctionBuilder::new("bump", module, FunctionKind::Normal, void_ty);
+    bump.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    bump.push_block(term_return_void());
+    assert_eq!(builder.alloc_function(bump.finish()), callee);
+
+    let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, void_ty);
+    assert_eq!(
+        owner_fb.push_local(Some("x"), tuple_ty, Mutability::Mutable, LocalKind::User),
+        source_local
+    );
+    owner_fb.bind_local(source_local, binding);
+    let bb0 = owner_fb.push_block(term_return_void());
+    owner_fb.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![CallArg::MutBorrow(Place {
+                root: PlaceRoot::CaptureCell(cell),
+                projection: vec![Projection::TupleField(0)],
+                ty: int_ty,
+            })],
+        }),
+    );
+    assert_eq!(builder.alloc_function(owner_fb.finish()), owner);
+    builder.set_entry(owner);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadPlace(BadPlace::UnsupportedCaptureCellProjection(found)) if found == cell
+    )));
+}
+
+#[test]
 fn lambda_body_must_not_use_raw_capture_cell_root_for_capture() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
