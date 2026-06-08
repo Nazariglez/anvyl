@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: projected mutable places await mutable_place_projected_values
+// @match: 2
+
+struct Point {
+    x: int,
+}
+
+fn bump(var point: Point) {
+    point.x += 1;
+}
+
+fn main() {
+    var point = Point { x: 1 };
+    bump(point);
+    println(point.x);
+}

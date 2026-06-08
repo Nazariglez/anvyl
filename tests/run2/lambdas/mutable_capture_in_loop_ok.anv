@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: loop-scoped mutable capture cells await stable repeated cell initialization support
+// @match: 1
+
+fn main() {
+    var i = 0;
+    while i < 1 {
+        var count = 0;
+        let f = || {
+            count += 1;
+        };
+        f();
+        println(count);
+        i += 1;
+    }
+}

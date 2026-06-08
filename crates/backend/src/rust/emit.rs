@@ -6,9 +6,9 @@ use super::{
         RirCallArg, RirCallTarget, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaId, RirLambdaSig,
-        RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirParamSemantic, RirPlace, RirProgram,
-        RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId,
-        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace,
+        RirProgram, RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -560,11 +560,12 @@ impl EmitCx<'_> {
         let mut params = vec![format!("{ctx}: &mut {}", self.ctx_ty())];
         params.extend(function.params.iter().map(|param| {
             let local = &function.locals[param.local.index()];
-            let mutability = if self.local_needs_mut_binding(local.ty) {
-                "mut "
-            } else {
-                ""
-            };
+            let mutability =
+                if param.abi == RirParamAbi::MutPlace || self.local_needs_mut_binding(local.ty) {
+                    "mut "
+                } else {
+                    ""
+                };
             format!(
                 "{mutability}{}: {}",
                 local.symbol.as_str(),
@@ -600,6 +601,12 @@ impl EmitCx<'_> {
                 this.emit_stmt_mode(function, stmt, predeclare);
             }
             this.emit_term(function, &block.term);
+            if this.fallible_functions[function.id.index()]
+                && matches!(block.term, RirTerm::None)
+                && matches!(this.program.types[function.ret.ty.index()], RirType::Void)
+            {
+                this.w.line("Ok(())");
+            }
         });
         self.w.line("}");
         self.w.blank();
@@ -702,11 +709,23 @@ impl EmitCx<'_> {
                     ));
                 }
             }
-            RirStmt::Assign { dst, value } => self.w.line(format_args!(
-                "{} = {};",
-                RustPlaces::new(self.program, function).local_place(dst),
-                self.rvalue(function, value)
-            )),
+            RirStmt::Assign { dst, value } => {
+                let places = RustPlaces::new(self.program, function);
+                if places.mut_place_root_param(dst) {
+                    self.w.line(format_args!(
+                        "{}.set({}, {})?;",
+                        places.local_place(dst),
+                        target::ctx_runtime("ctx"),
+                        self.rvalue(function, value)
+                    ));
+                } else {
+                    self.w.line(format_args!(
+                        "{} = {};",
+                        places.local_place(dst),
+                        self.rvalue(function, value)
+                    ));
+                }
+            }
             RirStmt::CellInit { cell, value } => {
                 let payload_ty = self.cell_payload_ty(function, *cell);
                 if predeclared {
@@ -727,7 +746,7 @@ impl EmitCx<'_> {
                 }
             }
             RirStmt::CellSet { cell, value } => self.w.line(format_args!(
-                "{}.set({});",
+                "{}.set({})?;",
                 self.cell_ref(function, *cell),
                 self.rvalue(function, value)
             )),
@@ -946,7 +965,7 @@ impl EmitCx<'_> {
                 ty,
             } => self.dataref_get(function, object, *dataref, projections, *ty),
             RirRValue::CellGetCopy { cell, .. } => {
-                format!("{}.get_copy()", self.cell_ref(function, *cell))
+                format!("{}.get_copy()?", self.cell_ref(function, *cell))
             }
             RirRValue::Array { elems, .. } => {
                 format!(
@@ -1047,7 +1066,17 @@ impl EmitCx<'_> {
                 &rust_string(&format_fragment(rust_format_spec(*spec))),
                 &values.format_arg(value, *source_ty),
             ),
+            RirRValue::Len { source } if places.mut_place_root_param(source) => {
+                self.mut_place_region(function, source, "access", "Ok(value.len() as i64)".into())
+            }
             RirRValue::Len { source } => format!("{}.len() as i64", places.local_place(source)),
+            RirRValue::ListPush { list, value } if places.mut_place_root_param(list) => self
+                .mut_place_region(
+                    function,
+                    list,
+                    "mutate",
+                    format!("{{ value.push({}); Ok(()) }}", values.value_operand(value)),
+                ),
             RirRValue::ListPush { list, value } => format!(
                 "{}.push({})",
                 places.local_place(list),
@@ -1078,13 +1107,32 @@ impl EmitCx<'_> {
                 let RirType::Option(value_ty) = self.program.types[ty.index()] else {
                     unreachable!("verified map get result")
                 };
-                format!(
-                    "{}.get(&{}).map(|value| {})",
-                    places.local_place(map),
-                    values.operand(key),
+                let key = values.operand(key);
+                let body = format!(
+                    "value.get(&{key}).map(|value| {})",
                     values.value_from_ref(value_ty, "value")
-                )
+                );
+                if places.mut_place_root_param(map) {
+                    self.mut_place_region(function, map, "access", format!("Ok({body})"))
+                } else {
+                    format!(
+                        "{}.get(&{key}).map(|value| {})",
+                        places.local_place(map),
+                        values.value_from_ref(value_ty, "value")
+                    )
+                }
             }
+            RirRValue::MapInsert { map, key, value } if places.mut_place_root_param(map) => self
+                .mut_place_region(
+                    function,
+                    map,
+                    "mutate",
+                    format!(
+                        "{{ value.insert({}, {}); Ok(()) }}",
+                        values.value_operand(key),
+                        values.value_operand(value)
+                    ),
+                ),
             RirRValue::MapInsert { map, key, value } => block_expr(
                 [format!(
                     "{}.insert({}, {});",
@@ -1094,6 +1142,13 @@ impl EmitCx<'_> {
                 )],
                 None,
             ),
+            RirRValue::MapRemove { map, key, .. } if places.mut_place_root_param(map) => self
+                .mut_place_region(
+                    function,
+                    map,
+                    "mutate",
+                    format!("Ok(value.remove(&{}))", values.operand(key)),
+                ),
             RirRValue::MapRemove { map, key, .. } => {
                 format!(
                     "{}.remove(&{})",
@@ -1126,6 +1181,22 @@ impl EmitCx<'_> {
                 }
             }
         }
+    }
+
+    fn mut_place_region(
+        &self,
+        function: &RirFunction,
+        place: &RirPlace,
+        op: &str,
+        body: String,
+    ) -> String {
+        format!(
+            "{}.{}({}, |value| {})?",
+            RustPlaces::new(self.program, function).local_place(place),
+            op,
+            target::ctx_runtime("ctx"),
+            body
+        )
     }
 
     fn cell_ref(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
@@ -1543,7 +1614,9 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
         RirLambdaCaptureKind::Param => match capture.semantic {
             RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
             RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
-            RirParamSemantic::StackCell => unreachable!("verified stack-cell capture kind"),
+            RirParamSemantic::MutPlace | RirParamSemantic::StackCell => {
+                unreachable!("verified non-param capture kind")
+            }
         },
         RirLambdaCaptureKind::StackCell { .. } => format!("*c{index}"),
     }

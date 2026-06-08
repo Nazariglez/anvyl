@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: recursive function-valued captures await lambda_mutable_upvalues
+// @match: 1
+
+fn main() {
+    var count = 0;
+    let f = || {
+        count += 1;
+    };
+    let g = || {
+        f();
+    };
+    g();
+    println(count);
+}

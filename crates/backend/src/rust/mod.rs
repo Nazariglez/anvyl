@@ -35,12 +35,13 @@ use self::{
         RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda,
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEscape, RirLambdaId,
         RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
-        RirRValue, RirRawEnumValue, RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId,
-        RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId,
-        RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId,
-        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand,
+        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
+        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram,
     },
 };
 
@@ -171,6 +172,10 @@ pub enum RustTargetGapKind {
     UnsupportedStructuralStringify,
     UnsupportedContextBorrowAcrossCall,
     UnsupportedProviderNativeRepresentation,
+    UnsupportedMutablePlace,
+    UnsupportedMutablePlaceProjection,
+    UnsupportedMutablePlaceDataRef,
+    UnsupportedMutablePlaceNativeBoundary,
 }
 
 impl fmt::Display for RustTargetGap {
@@ -233,6 +238,15 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileErrorKind::UnsupportedLambdaCell => RustTargetGapKind::UnsupportedLambdaCell,
                 ProfileErrorKind::UnsupportedLambdaExternBoundary => {
                     RustTargetGapKind::UnsupportedLambdaExternBoundary
+                }
+                ProfileErrorKind::UnsupportedMutablePlace => {
+                    RustTargetGapKind::UnsupportedMutablePlace
+                }
+                ProfileErrorKind::UnsupportedMutablePlaceProjection => {
+                    RustTargetGapKind::UnsupportedMutablePlaceProjection
+                }
+                ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary => {
+                    RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary
                 }
                 ProfileErrorKind::NonCopyValueRequired => RustTargetGapKind::NonCopyValueRequired,
             },
@@ -505,7 +519,7 @@ impl<'a> PlanCx<'a> {
             .params
             .iter()
             .map(|param| {
-                let semantic = rir::semantic_from_air(param.mode);
+                let semantic = rir::source_param_semantic(param.mode);
                 RirLambdaParam {
                     ty: self.type_map[&param.ty],
                     semantic,
@@ -1071,7 +1085,7 @@ impl<'a> PlanCx<'a> {
         decl.call_params()
             .map(|param| {
                 let ty = self.type_map[&param.ty];
-                let semantic = rir::semantic_from_air(param.mode);
+                let semantic = rir::native_param_semantic(param.mode);
                 RirExternParam {
                     ty,
                     semantic,
@@ -1508,7 +1522,7 @@ impl<'a> PlanCx<'a> {
         }
         params.extend(function.signature.params.iter().map(|param| {
             let ty = self.type_map[&param.ty];
-            let semantic = rir::semantic_from_air(param.mode);
+            let semantic = rir::source_param_semantic(param.mode);
             RirParam {
                 local: RirLocalId::from_index(param.local_id.index()),
                 ty,
@@ -2456,13 +2470,19 @@ impl<'a> PlanCx<'a> {
         locals: &mut Vec<RirLocal>,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
-        let (target, ty, callee_stmts) = match callee {
+        let (target, ty, callee_stmts, expected_args) = match callee {
             Callee::Function(id) => {
                 let function = self.air.function(*id);
                 (
                     RirCallTarget::Function(self.function_map[id]),
                     self.type_map[&function.signature.return_type()],
                     vec![],
+                    function
+                        .signature
+                        .params
+                        .iter()
+                        .map(|param| rir::source_param_semantic(param.mode))
+                        .collect::<Vec<_>>(),
                 )
             }
             Callee::Extern(id) => {
@@ -2471,6 +2491,9 @@ impl<'a> PlanCx<'a> {
                     RirCallTarget::Extern(self.extern_map[id]),
                     self.type_map[&ext.return_type],
                     vec![],
+                    ext.call_params()
+                        .map(|param| rir::native_param_semantic(param.mode))
+                        .collect::<Vec<_>>(),
                 )
             }
             Callee::Lambda(operand) => {
@@ -2490,14 +2513,25 @@ impl<'a> PlanCx<'a> {
                     },
                     self.type_map[&sig_ty.ret.ty()],
                     callee.stmts,
+                    sig_ty
+                        .params
+                        .iter()
+                        .map(|param| rir::source_param_semantic(param.mode))
+                        .collect::<Vec<_>>(),
                 )
             }
         };
         let mut stmts = callee_stmts;
         let mut post_stmts = vec![];
         let mut planned_args = vec![];
-        for arg in args {
-            let planned = self.plan_arg(function_id, arg, locals, lambda_values)?;
+        if args.len() != expected_args.len() {
+            return Err(Self::gap(
+                RustTargetGapSite::Function(function_id),
+                RustTargetGapKind::UnsupportedCallArgMode,
+            ));
+        }
+        for (arg, expected) in args.iter().zip(expected_args) {
+            let planned = self.plan_arg(function_id, arg, expected, locals, lambda_values)?;
             stmts.extend(planned.stmts);
             post_stmts.extend(planned.post_stmts);
             planned_args.push(planned.arg);
@@ -2511,6 +2545,18 @@ impl<'a> PlanCx<'a> {
             },
             post_stmts,
         })
+    }
+
+    fn place_is_source_mut_place_param(&self, function: FunctionId, place: &Place) -> bool {
+        let Some(local) = place.root.local() else {
+            return false;
+        };
+        self.air
+            .function(function)
+            .signature
+            .params
+            .iter()
+            .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
     }
 
     fn moves_bound_noncopy_lambda(&self, function: FunctionId, operand: &Operand) -> bool {
@@ -2530,6 +2576,7 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         arg: &CallArg,
+        expected: RirParamSemantic,
         locals: &mut Vec<RirLocal>,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<PlannedCallArg, RustPlanError> {
@@ -2581,35 +2628,58 @@ impl<'a> PlanCx<'a> {
             CallArg::SharedStringConst(id) => Ok(PlannedCallArg::from_arg(
                 RirCallArg::SharedStringConst(self.const_map[id]),
             )),
-            CallArg::MutBorrow(place) => {
-                if !self.place_crosses_dataref(function, place) {
-                    return Ok(PlannedCallArg::from_arg(RirCallArg::MutBorrow(
-                        self.plan_place_in_function(function, place),
-                    )));
+            CallArg::MutBorrow(place) if expected == RirParamSemantic::MutPlace => {
+                if self.place_crosses_dataref(function, place) {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedMutablePlaceDataRef,
+                    ));
                 }
-                let planned = self.lower_place_read(function, place, locals);
-                let RirOperand::Place(temp_place) = planned.operand else {
-                    unreachable!("place read returns a place operand")
+                if !place.projection.is_empty() {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedMutablePlaceProjection,
+                    ));
+                }
+                if self.place_capture_cell(function, place).is_some() {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedMutablePlace,
+                    ));
+                }
+                let ty = self.type_map[&place.ty];
+                let Some(root) = place.root.local() else {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedMutablePlace,
+                    ));
                 };
-                locals[temp_place.local.index()].mutable = true;
-                let mut post_stmts = vec![];
-                let mut ignored_cells = vec![];
-                let mut ignored_possible_cells = vec![];
-                self.lower_place_write(
-                    function,
-                    place,
-                    RirRValue::Use(RirOperand::Place(temp_place.clone())),
-                    locals,
-                    &mut post_stmts,
-                    &mut ignored_cells,
-                    &mut ignored_possible_cells,
-                    false,
-                )?;
-                Ok(PlannedCallArg {
-                    stmts: planned.stmts,
-                    arg: RirCallArg::MutBorrow(temp_place),
-                    post_stmts,
-                })
+                let local = RirLocalId::from_index(root.index());
+                let arg = if self.place_is_source_mut_place_param(function, place) {
+                    RirMutPlaceArg::Param { local, ty }
+                } else {
+                    RirMutPlaceArg::Local(self.rir_root_place(local, place.ty))
+                };
+                Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)))
+            }
+            CallArg::MutBorrow(place) => {
+                if self.place_is_source_mut_place_param(function, place)
+                    || self.place_capture_cell(function, place).is_some()
+                {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary,
+                    ));
+                }
+                if self.place_crosses_dataref(function, place) {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedMutablePlaceDataRef,
+                    ));
+                }
+                Ok(PlannedCallArg::from_arg(RirCallArg::MutBorrow(
+                    self.plan_place_in_function(function, place),
+                )))
             }
         }
     }
@@ -2675,20 +2745,30 @@ impl<'a> PlanCx<'a> {
                         ty: self.type_map[&place.ty],
                     },
                 }],
-                operand: RirOperand::Place(RirPlace {
-                    local,
-                    projections: vec![],
-                    ty: self.type_map[&place.ty],
-                }),
+                operand: RirOperand::Place(self.rir_root_place(local, place.ty)),
             };
         }
         if !self.place_crosses_dataref(function, place) {
+            if self.place_is_source_mut_place_param(function, place) && place.projection.is_empty()
+            {
+                let local = self.alloc_temp(locals, place.ty);
+                return PlannedOperand {
+                    stmts: vec![RirStmt::Init {
+                        local,
+                        value: RirRValue::Use(RirOperand::Place(
+                            self.plan_place_in_function(function, place),
+                        )),
+                    }],
+                    operand: RirOperand::Place(self.rir_root_place(local, place.ty)),
+                };
+            }
             return PlannedOperand::from_operand(RirOperand::Place(
                 self.plan_place_in_function(function, place),
             ));
         }
         let mut stmts = vec![];
-        let (mut current_ty, mut current_place) = self.root_place(function, place);
+        let (mut current_ty, mut current_place) =
+            self.dataref_root_place(function, place, locals, &mut stmts);
         let mut index = 0;
         while let Some(segment) =
             self.next_dataref_segment(place, &mut index, &mut current_ty, &mut current_place)
@@ -2755,7 +2835,8 @@ impl<'a> PlanCx<'a> {
             return Ok(());
         }
         let value = self.rvalue_operand(value, place.ty, locals, stmts);
-        let (mut current_ty, mut current_place) = self.root_place(function, place);
+        let (mut current_ty, mut current_place) =
+            self.dataref_root_place(function, place, locals, stmts);
         let mut index = 0;
         while let Some(segment) =
             self.next_dataref_segment(place, &mut index, &mut current_ty, &mut current_place)
@@ -2778,14 +2859,34 @@ impl<'a> PlanCx<'a> {
 
     fn root_place(&self, function: FunctionId, place: &Place) -> (TypeId, RirPlace) {
         let (ty, local) = self.current_place_root(function, place);
-        (
-            ty,
-            RirPlace {
-                local,
-                projections: vec![],
-                ty: self.type_map[&ty],
-            },
-        )
+        (ty, self.rir_root_place(local, ty))
+    }
+
+    fn dataref_root_place(
+        &self,
+        function: FunctionId,
+        place: &Place,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) -> (TypeId, RirPlace) {
+        let (ty, root) = self.root_place(function, place);
+        if !self.place_is_source_mut_place_param(function, place) {
+            return (ty, root);
+        }
+        let local = self.alloc_temp(locals, ty);
+        stmts.push(RirStmt::Init {
+            local,
+            value: RirRValue::Use(RirOperand::Place(root)),
+        });
+        (ty, self.rir_root_place(local, ty))
+    }
+
+    fn rir_root_place(&self, local: RirLocalId, ty: TypeId) -> RirPlace {
+        RirPlace {
+            local,
+            projections: vec![],
+            ty: self.type_map[&ty],
+        }
     }
 
     fn next_dataref_segment(
@@ -2834,11 +2935,7 @@ impl<'a> PlanCx<'a> {
                 ty: self.type_map[&segment.ty],
             },
         });
-        RirPlace {
-            local,
-            projections: vec![],
-            ty: self.type_map[&segment.ty],
-        }
+        self.rir_root_place(local, segment.ty)
     }
 
     fn rvalue_operand(
@@ -2853,11 +2950,7 @@ impl<'a> PlanCx<'a> {
             value => {
                 let local = self.alloc_temp(locals, ty);
                 stmts.push(RirStmt::Init { local, value });
-                RirOperand::Place(RirPlace {
-                    local,
-                    projections: vec![],
-                    ty: self.type_map[&ty],
-                })
+                RirOperand::Place(self.rir_root_place(local, ty))
             }
         }
     }

@@ -24,12 +24,12 @@ use super::{
         RirFunctionId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg,
         RirLambdaCaptureKind, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
         RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
-        RirLoopId, RirOperand, RirOptionMatch, RirParam, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirReturn, RirStmt,
-        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        RirVerifyErrorKind, RirVerifySite,
+        RirLoopId, RirMutPlaceArg, RirOperand, RirOptionMatch, RirParam, RirParamAbi,
+        RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
+        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
 };
@@ -853,8 +853,8 @@ fn source_job_compiles_hand_built_air_capture_cell_lambdas() {
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig1<'env>"));
     assert!(text.contains("c0: &'env anvyx_runtime::StackLambdaCell<i64>"));
     assert!(text.contains("fn call<'cx, 'rt>(&self, ctx: &mut AnvCtx<'cx, 'rt>)"));
-    assert!(text.contains(".set(1);"));
-    assert!(text.contains(".get_copy()"));
+    assert!(text.contains(".set(1)?;"));
+    assert!(text.contains(".get_copy()?"));
     assert!(text.contains("c0: &__cell0"));
     assert!(!text.contains("&'env mut"));
     assert!(!text.contains("&mut v0"));
@@ -1037,55 +1037,31 @@ fn emit_dataref_set_uses_short_mut_heap_borrow() {
 }
 
 #[test]
-fn plan_lowers_projected_mut_call_arg_with_postlude_writeback() {
-    let program = projected_mut_call_arg_program();
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
-    let stmts = &plan.program().functions[1].body.stmts;
-
-    assert!(matches!(
-        stmts[0],
-        RirStmt::Init {
-            value: RirRValue::DataRefGet { .. },
-            ..
-        }
-    ));
-    assert!(matches!(stmts[1], RirStmt::Eval(RirRValue::Call { .. })));
-    assert!(matches!(stmts[2], RirStmt::DataRefSet { .. }));
+fn plan_gaps_projected_source_mut_call_arg_instead_of_copyback() {
+    assert_plan_gap(
+        projected_mut_call_arg_program(),
+        rust_plan_config(),
+        RustTargetGapKind::UnsupportedMutablePlaceDataRef,
+    );
 }
 
 #[test]
-fn plan_lowers_multiple_projected_mut_call_args_in_source_order() {
-    let program = multi_projected_mut_call_arg_program();
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
-    let stmts = &plan.program().functions[1].body.stmts;
-
-    assert!(matches!(
-        stmts[0],
-        RirStmt::Init {
-            value: RirRValue::DataRefGet { .. },
-            ..
-        }
-    ));
-    assert!(matches!(
-        stmts[1],
-        RirStmt::Init {
-            value: RirRValue::DataRefGet { .. },
-            ..
-        }
-    ));
-    assert!(matches!(stmts[2], RirStmt::Eval(RirRValue::Call { .. })));
-    assert!(matches!(stmts[3], RirStmt::DataRefSet { .. }));
-    assert!(matches!(stmts[4], RirStmt::DataRefSet { .. }));
+fn plan_gaps_multiple_projected_source_mut_call_args_without_copyback() {
+    assert_plan_gap(
+        multi_projected_mut_call_arg_program(),
+        rust_plan_config(),
+        RustTargetGapKind::UnsupportedMutablePlaceDataRef,
+    );
 }
 
 #[test]
 fn emit_dataref_mut_borrow_root_rebinds_handle() {
     let source = plan_source(dataref_root_rebind_program()).into_string();
 
-    assert!(source.contains("v0: &mut anvT2_Node<'cx>, v1: anvT2_Node<'cx>"));
-    assert!(source.contains("(*v0) = v1.clone();"));
+    assert!(source.contains(
+        "mut v0: anvyx_runtime::MutPlace<'_, 'cx, anvT2_Node<'cx>>, v1: anvT2_Node<'cx>"
+    ));
+    assert!(source.contains("v0.set(ctx.runtime(), v1.clone())?;"));
 }
 
 #[test]
@@ -1341,12 +1317,10 @@ fn stringify_override_noncopy_value_receiver_is_target_gap() {
     program.module_mut(module).functions.push(main);
     program.set_entry(main);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let Err(err) = plan(&verified, RustPlanConfig::default()) else {
-        panic!("plan should reject noncopy override");
-    };
-    assert!(
-        matches!(err, super::RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == super::RustTargetGapKind::NonCopyValueRequired))
+    assert_plan_gap(
+        program,
+        RustPlanConfig::default(),
+        RustTargetGapKind::NonCopyValueRequired,
     );
 }
 
@@ -2260,7 +2234,7 @@ fn plan_interns_function_type_signatures_with_escape_modes() {
         vec![air::ParamType {
             ty: inner,
             mode: ParamMode::Value,
-            escape: air::ParamEscape::NonEscaping,
+            escape: ParamEscape::NonEscaping,
         }],
         air::ReturnMode::Value(void),
     )));
@@ -2268,7 +2242,7 @@ fn plan_interns_function_type_signatures_with_escape_modes() {
         vec![air::ParamType {
             ty: inner,
             mode: ParamMode::Value,
-            escape: air::ParamEscape::Escaping,
+            escape: ParamEscape::Escaping,
         }],
         air::ReturnMode::Value(void),
     )));
@@ -2325,7 +2299,7 @@ fn rir_rejects_stack_cell_bad_source_local() {
 #[test]
 fn rir_rejects_stack_cell_payload_type_mismatch() {
     assert_rir_type_error(stack_cell_rir_with(|cell| {
-        cell.payload_ty = RirTypeId::from_index(0)
+        cell.payload_ty = RirTypeId::from_index(0);
     }));
 }
 
@@ -2530,8 +2504,8 @@ fn emit_stack_cell_ops_use_runtime_cell() {
         "{}",
         source.as_str()
     );
-    assert!(source.as_str().contains("__cell0.get_copy();"));
-    assert!(source.as_str().contains("__cell0.set(2);"));
+    assert!(source.as_str().contains("__cell0.get_copy()?;"));
+    assert!(source.as_str().contains("__cell0.set(2)?;"));
     assert!(!source.as_str().contains("RefCell"));
     assert!(!source.as_str().contains("Rc<"));
 
@@ -3040,6 +3014,172 @@ fn rir_rejects_non_escaping_lambda_arg_to_escaping_param() {
             .iter()
             .any(|error| error.kind == RirVerifyErrorKind::CallArgEscape)
     );
+}
+
+#[test]
+fn rir_accepts_mut_place_local_call_arg() {
+    let int = RirTypeId::from_index(1);
+    let local = RirLocalId::from_index(0);
+    let program = mut_place_call_rir(
+        vec![rir_local(local, int, true, "n")],
+        vec![],
+        RirCallArg::MutPlace(RirMutPlaceArg::Local(rir_place(local, int))),
+    );
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_mut_borrow_for_mut_place_param() {
+    let int = RirTypeId::from_index(1);
+    let local = RirLocalId::from_index(0);
+    let program = mut_place_call_rir(
+        vec![rir_local(local, int, true, "n")],
+        vec![],
+        RirCallArg::MutBorrow(rir_place(local, int)),
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_mut_place_local_arg_from_mut_place_param() {
+    let int = RirTypeId::from_index(1);
+    let local = RirLocalId::from_index(0);
+    let program = mut_place_call_rir(
+        vec![rir_local(local, int, true, "x")],
+        vec![rir_param(
+            local,
+            int,
+            RirParamSemantic::MutPlace,
+            RirParamAbi::MutPlace,
+        )],
+        RirCallArg::MutPlace(RirMutPlaceArg::Local(rir_place(local, int))),
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_mut_place_param_as_mut_borrow_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let local = RirLocalId::from_index(0);
+    let callee = RirFunctionId::from_index(0);
+    let caller = RirFunctionId::from_index(1);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int],
+        functions: vec![
+            rir_function(
+                callee,
+                void,
+                vec![rir_param(
+                    local,
+                    int,
+                    RirParamSemantic::MutBorrow,
+                    RirParamAbi::MutBorrow,
+                )],
+                vec![rir_local(local, int, true, "x")],
+                vec![],
+            ),
+            rir_function(
+                caller,
+                void,
+                vec![rir_param(
+                    local,
+                    int,
+                    RirParamSemantic::MutPlace,
+                    RirParamAbi::MutPlace,
+                )],
+                vec![rir_local(local, int, true, "x")],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(callee),
+                    args: vec![RirCallArg::MutBorrow(rir_place(local, int))],
+                    ty: void,
+                })],
+            ),
+        ],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_projected_mut_place_param() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let tuple_ty = RirTypeId::from_index(2);
+    let tuple = RirTupleId::from_index(0);
+    let field = RirFieldId::from_index(0);
+    let local = RirLocalId::from_index(0);
+    let mut place = rir_place(local, int);
+    place.projections.push(RirProjection::TupleField(field));
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Tuple(tuple)],
+        tuples: vec![RirTuple {
+            id: tuple,
+            symbol: RirSymbol::new("Pair"),
+            display: RirSymbol::new("Pair"),
+            copyable: true,
+            fields: vec![RirField {
+                id: field,
+                symbol: RirSymbol::new("_0"),
+                ty: int,
+            }],
+        }],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![rir_param(
+                local,
+                tuple_ty,
+                RirParamSemantic::MutPlace,
+                RirParamAbi::MutPlace,
+            )],
+            vec![rir_local(local, tuple_ty, true, "x")],
+            vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(place)))],
+        )],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_rejects_mut_place_operand_inside_short_region() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let xs = RirLocalId::from_index(0);
+    let value = RirLocalId::from_index(1);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![
+                rir_param(xs, list, RirParamSemantic::MutPlace, RirParamAbi::MutPlace),
+                rir_param(
+                    value,
+                    int,
+                    RirParamSemantic::MutPlace,
+                    RirParamAbi::MutPlace,
+                ),
+            ],
+            vec![
+                rir_local(xs, list, true, "xs"),
+                rir_local(value, int, true, "value"),
+            ],
+            vec![RirStmt::Eval(RirRValue::ListPush {
+                list: rir_place(xs, list),
+                value: RirOperand::Place(rir_place(value, int)),
+            })],
+        )],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -4010,14 +4150,11 @@ fn plan_rejects_escaping_runtime_capture_by_target_gap() {
     });
     debug_assert_eq!(func, owner);
     program.module_mut(module).functions.extend([body, func]);
-    let verified = air::verify(&program).expect("AIR verify failed");
 
-    let Err(RustPlanError::TargetGaps(gaps)) = plan(&verified, rust_plan_config()) else {
-        panic!("expected target gap");
-    };
-    assert!(
-        gaps.iter()
-            .any(|gap| gap.kind == RustTargetGapKind::UnsupportedLambdaCapture)
+    assert_plan_gap(
+        program,
+        rust_plan_config(),
+        RustTargetGapKind::UnsupportedLambdaCapture,
     );
 }
 
@@ -4204,7 +4341,7 @@ fn plan_rejects_missing_native_binding() {
     };
 
     assert!(
-        matches!(err, super::RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == super::RustTargetGapKind::UnsupportedExtern))
+        matches!(err, RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == RustTargetGapKind::UnsupportedExtern))
     );
 }
 
@@ -4220,7 +4357,7 @@ fn plan_rejects_unsupported_native_abi() {
     };
 
     assert!(
-        matches!(err, super::RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == super::RustTargetGapKind::UnsupportedRustAbi))
+        matches!(err, RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == RustTargetGapKind::UnsupportedRustAbi))
     );
 }
 
@@ -4608,6 +4745,95 @@ fn profile_accepts_mut_borrow_call() {
     program.entry = Some(caller);
 
     check(program);
+}
+
+#[test]
+fn profile_rejects_source_var_param_to_native_mut_borrow() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let ext = extern_in_module(
+        &mut program,
+        &["host"],
+        "touch",
+        vec![(int, ParamMode::MutBorrow)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let module = program.alloc_module(root_module());
+    let x = air::LocalId::from_index(0);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("caller"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("x", int, ParamMode::MutBorrow, x)], void),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(
+            vec![Statement::Eval(RValue::Call {
+                callee: Callee::Extern(ext),
+                args: vec![CallArg::MutBorrow(place(x, int))],
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(caller);
+
+    expect_reject(
+        program,
+        ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+    );
+}
+
+#[test]
+fn profile_rejects_dataref_field_to_native_mut_borrow() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let ext = extern_in_module(
+        &mut program,
+        &["host"],
+        "touch",
+        vec![(int, ParamMode::MutBorrow)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let module = program.alloc_module(root_module());
+    let aggregate = dataref_decl(&mut program, module, int);
+    let node = program.alloc_type(TypeData::DataRef(aggregate));
+    let node_local = air::LocalId::from_index(0);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("caller"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("node", node, ParamMode::Value, node_local)],
+            void,
+        ),
+        locals: vec![local(node, LocalKind::Arg)],
+        body: structured_body(
+            vec![Statement::Eval(RValue::Call {
+                callee: Callee::Extern(ext),
+                args: vec![CallArg::MutBorrow(Place {
+                    root: PlaceRoot::Local(node_local),
+                    projection: vec![Projection::Field(air::FieldId::from_index(0))],
+                    ty: int,
+                })],
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(caller);
+
+    expect_reject(
+        program,
+        ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+    );
 }
 
 #[test]
@@ -6615,6 +6841,101 @@ fn tuple_rir_program(value: RirRValue) -> RirProgram {
     }
 }
 
+fn rir_function(
+    id: RirFunctionId,
+    ret: RirTypeId,
+    params: Vec<RirParam>,
+    locals: Vec<RirLocal>,
+    stmts: Vec<RirStmt>,
+) -> RirFunction {
+    RirFunction {
+        id,
+        air_id: None,
+        symbol: RirSymbol::new(format!("f{}", id.index())),
+        params,
+        ret: RirReturn { ty: ret },
+        locals,
+        body: RirStructuredBlock {
+            stmts,
+            term: RirTerm::Return(None),
+        },
+    }
+}
+
+fn rir_param(
+    local: RirLocalId,
+    ty: RirTypeId,
+    semantic: RirParamSemantic,
+    abi: RirParamAbi,
+) -> RirParam {
+    RirParam {
+        local,
+        ty,
+        semantic,
+        abi,
+        escape: RirParamEscape::NonEscaping,
+    }
+}
+
+fn rir_local(id: RirLocalId, ty: RirTypeId, mutable: bool, symbol: &str) -> RirLocal {
+    RirLocal {
+        id,
+        ty,
+        mutable,
+        symbol: RirSymbol::new(symbol),
+        initialized: true,
+        payload_ref: false,
+    }
+}
+
+fn rir_place(local: RirLocalId, ty: RirTypeId) -> RirPlace {
+    RirPlace {
+        local,
+        projections: vec![],
+        ty,
+    }
+}
+
+fn mut_place_call_rir(
+    caller_locals: Vec<RirLocal>,
+    caller_params: Vec<RirParam>,
+    arg: RirCallArg,
+) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let local = RirLocalId::from_index(0);
+    let callee = RirFunctionId::from_index(0);
+    RirProgram {
+        types: vec![RirType::Void, RirType::Int],
+        functions: vec![
+            rir_function(
+                callee,
+                void,
+                vec![rir_param(
+                    local,
+                    int,
+                    RirParamSemantic::MutPlace,
+                    RirParamAbi::MutPlace,
+                )],
+                vec![rir_local(local, int, true, "x")],
+                vec![],
+            ),
+            rir_function(
+                RirFunctionId::from_index(1),
+                void,
+                caller_params,
+                caller_locals,
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(callee),
+                    args: vec![arg],
+                    ty: void,
+                })],
+            ),
+        ],
+        ..RirProgram::default()
+    }
+}
+
 fn empty_rir_function(ret: RirType) -> RirProgram {
     RirProgram {
         types: vec![ret],
@@ -8091,7 +8412,7 @@ mod enums {
             panic!("plan should reject stringify");
         };
         assert!(
-            matches!(err, super::super::RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == super::super::RustTargetGapKind::UnsupportedStructuralStringify))
+            matches!(err, RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == RustTargetGapKind::UnsupportedStructuralStringify))
         );
     }
 
@@ -10483,6 +10804,14 @@ fn run_source(source: emit::RustSource) -> source_job::RustSourceJobOutput {
 fn check(program: Program) {
     let verified = air::verify(&program).expect("AIR verify failed");
     RustBackendProfile::check(&verified).expect("profile rejected AIR");
+}
+
+fn assert_plan_gap(program: Program, config: RustPlanConfig, kind: RustTargetGapKind) {
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let Err(RustPlanError::TargetGaps(gaps)) = plan(&verified, config) else {
+        panic!("expected target gap");
+    };
+    assert!(gaps.iter().any(|gap| gap.kind == kind));
 }
 
 fn expect_reject(program: Program, kind: ProfileErrorKind) {

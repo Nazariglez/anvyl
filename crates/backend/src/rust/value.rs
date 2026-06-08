@@ -2,8 +2,9 @@ use super::{
     place::RustPlaces,
     rep_policy::{RustBorrowView, RustRepPolicy},
     rir::{
-        RirCallArg, RirConst, RirConstValue, RirEnum, RirField, RirFunction, RirOperand,
-        RirParamSemantic, RirPlace, RirProgram, RirType, RirTypeId, RirVariant, RirVariantKind,
+        RirCallArg, RirCellRef, RirConst, RirConstValue, RirEnum, RirField, RirFunction,
+        RirMutPlaceArg, RirOperand, RirParamSemantic, RirPlace, RirProgram, RirType, RirTypeId,
+        RirVariant, RirVariantKind,
     },
     syntax::{
         comma, field_init, match_expr, rust_string, struct_lit, struct_variant, tuple_variant,
@@ -14,6 +15,7 @@ use super::{
 
 pub(super) struct RustValues<'a> {
     program: &'a RirProgram,
+    function: &'a RirFunction,
     policy: RustRepPolicy<'a>,
     places: RustPlaces<'a>,
 }
@@ -22,6 +24,7 @@ impl<'a> RustValues<'a> {
     pub(super) fn new(program: &'a RirProgram, function: &'a RirFunction) -> Self {
         Self {
             program,
+            function,
             policy: RustRepPolicy::new(program),
             places: RustPlaces::new(program, function),
         }
@@ -36,6 +39,7 @@ impl<'a> RustValues<'a> {
                 _ => unreachable!("verified shared string const"),
             },
             RirCallArg::MutBorrow(place) => self.mut_borrow_arg(place),
+            RirCallArg::MutPlace(arg) => self.mut_place_arg(arg),
         }
     }
 
@@ -56,6 +60,41 @@ impl<'a> RustValues<'a> {
         format!("&mut {}", self.place(place))
     }
 
+    pub(super) fn mut_place_arg(&self, arg: &RirMutPlaceArg) -> String {
+        match arg {
+            RirMutPlaceArg::Local(place) => {
+                format!(
+                    "{}::local(&mut {})",
+                    target::mut_place_ty(),
+                    self.place(place)
+                )
+            }
+            RirMutPlaceArg::Param { local, .. } => {
+                format!(
+                    "{}.reborrow()",
+                    self.function.locals[local.index()].symbol.as_str()
+                )
+            }
+            RirMutPlaceArg::StackCell { cell, .. } => {
+                format!(
+                    "{}::stack_cell(&{})",
+                    target::mut_place_ty(),
+                    self.cell_ref(*cell)
+                )
+            }
+        }
+    }
+
+    fn cell_ref(&self, cell: RirCellRef) -> String {
+        match cell {
+            RirCellRef::Owner(cell) => self.program.cells[cell.index()].symbol.as_str().to_string(),
+            RirCellRef::Capture { local, .. } => self.function.locals[local.index()]
+                .symbol
+                .as_str()
+                .to_string(),
+        }
+    }
+
     pub(super) fn operand_ref(&self, operand: &RirOperand) -> String {
         match operand {
             RirOperand::Place(place) => {
@@ -74,6 +113,9 @@ impl<'a> RustValues<'a> {
         let RirOperand::Place(place) = operand else {
             return self.operand(operand);
         };
+        if self.places.mut_place_root_param(place) {
+            return self.mut_place_value_operand(place);
+        }
         let place_expr = self.place(place);
         if self.policy.cow_value(place.ty) {
             if self.places.shared_borrow_root_param(place)
@@ -91,6 +133,9 @@ impl<'a> RustValues<'a> {
 
     pub(super) fn operand(&self, operand: &RirOperand) -> String {
         match operand {
+            RirOperand::Place(place) if self.places.mut_place_root_param(place) => {
+                self.mut_place_value_operand(place)
+            }
             RirOperand::Place(place) => match self.program.types[place.ty.index()] {
                 RirType::Struct(id) if self.program.structs[id.index()].copyable => {
                     self.copy_struct_place(place)
@@ -110,6 +155,24 @@ impl<'a> RustValues<'a> {
 
     fn place(&self, place: &RirPlace) -> String {
         self.places.local_place(place)
+    }
+
+    fn mut_place_value_operand(&self, place: &RirPlace) -> String {
+        let place_expr = self.place(place);
+        if self.policy.cow_value(place.ty) {
+            return format!(
+                "{place_expr}.access({}, |value| Ok(value.share()))?",
+                target::ctx_runtime("ctx")
+            );
+        }
+        if !self.policy.copyable(place.ty) && self.policy.shareable_value(place.ty) {
+            let value = self.value_from_ref(place.ty, "value");
+            return format!(
+                "{place_expr}.access({}, |value| Ok({value}))?",
+                target::ctx_runtime("ctx")
+            );
+        }
+        format!("{place_expr}.get_copy({})?", target::ctx_runtime("ctx"))
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
@@ -155,9 +218,9 @@ impl<'a> RustValues<'a> {
                 };
                 self.borrow_arg(place)
             }
-            RirParamSemantic::MutBorrow | RirParamSemantic::StackCell => {
-                unreachable!("verified stringify override mode")
-            }
+            RirParamSemantic::MutBorrow
+            | RirParamSemantic::MutPlace
+            | RirParamSemantic::StackCell => unreachable!("verified stringify override mode"),
         }
     }
 

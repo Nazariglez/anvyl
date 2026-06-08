@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: borrowed mutable captures await lambda_capture_cell_mutable_places
+// @match: 1
+
+fn touch(var count: int) {
+    let f = || {
+        count += 1;
+    };
+    f();
+}
+
+fn main() {
+    var count = 0;
+    touch(count);
+    println(count);
+}

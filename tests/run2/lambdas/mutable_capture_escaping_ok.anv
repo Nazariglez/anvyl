@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: escaping mutable captures await lambda_mutable_upvalues
+// @match: 1
+
+fn make() -> fn() {
+    var count = 0;
+    || {
+        count += 1;
+        println(count);
+    }
+}
+
+fn main() {
+    let f = make();
+    f();
+}

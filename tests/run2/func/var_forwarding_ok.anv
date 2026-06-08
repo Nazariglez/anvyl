@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 3
+
+fn inc(var x: int) {
+    x += 1;
+}
+
+fn outer(var x: int) {
+    inc(x);
+    x += 1;
+}
+
+fn main() {
+    var x = 1;
+    outer(x);
+    println(x);
+}

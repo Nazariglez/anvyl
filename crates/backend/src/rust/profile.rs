@@ -9,7 +9,7 @@ use anvyx_frontend::{
     ast::{FormatKind, FormatSign, FormatSpec},
 };
 
-use super::{lambda_capture_has_runtime, lambda_capture_ty, rep_policy::AirRustRepPolicy};
+use super::{lambda_capture_has_runtime, lambda_capture_ty, rep_policy::AirRustRepPolicy, rir};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustBackendProfile;
@@ -74,6 +74,9 @@ pub enum ProfileErrorKind {
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
+    UnsupportedMutablePlace,
+    UnsupportedMutablePlaceProjection,
+    UnsupportedMutablePlaceNativeBoundary,
     NonCopyValueRequired,
 }
 
@@ -471,8 +474,9 @@ impl ProfileCx<'_> {
             }
             RValue::Call { callee, args } => {
                 self.check_callee(site, callee);
-                for arg in args {
-                    self.check_call_arg(site, arg);
+                let expected = self.callee_param_semantics(callee);
+                for (index, arg) in args.iter().enumerate() {
+                    self.check_call_arg(site, arg, expected.get(index).copied());
                 }
             }
             RValue::Cast { value, target } => {
@@ -891,7 +895,40 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn check_call_arg(&mut self, site: ProfileSite, arg: &CallArg) {
+    fn callee_param_semantics(&self, callee: &Callee) -> Vec<rir::RirParamSemantic> {
+        match callee {
+            Callee::Function(id) => self
+                .program
+                .function(*id)
+                .signature
+                .params
+                .iter()
+                .map(|param| rir::source_param_semantic(param.mode))
+                .collect(),
+            Callee::Extern(id) => self
+                .program
+                .extern_decl(*id)
+                .call_params()
+                .map(|param| rir::native_param_semantic(param.mode))
+                .collect(),
+            Callee::Lambda(operand) => match self.program.type_arena.data(self.operand_ty(operand))
+            {
+                TypeData::Function(sig) => sig
+                    .params
+                    .iter()
+                    .map(|param| rir::source_param_semantic(param.mode))
+                    .collect(),
+                _ => vec![],
+            },
+        }
+    }
+
+    fn check_call_arg(
+        &mut self,
+        site: ProfileSite,
+        arg: &CallArg,
+        expected: Option<rir::RirParamSemantic>,
+    ) {
         match arg {
             CallArg::Value(operand) => {
                 self.check_operand(site, operand);
@@ -908,11 +945,35 @@ impl ProfileCx<'_> {
             CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
                 self.check_place(site, place);
-                if self.place_capture_cell(site, place).is_some() {
-                    self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
-                }
-                if !self.supports_param_mode(place.ty, ParamMode::MutBorrow) {
-                    self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                match expected.unwrap_or(rir::RirParamSemantic::MutBorrow) {
+                    rir::RirParamSemantic::MutPlace => {
+                        if self.place_capture_cell(site, place).is_some() {
+                            self.push(site, ProfileErrorKind::UnsupportedMutablePlace);
+                        }
+                    }
+                    rir::RirParamSemantic::MutBorrow => {
+                        let source_place = place
+                            .root
+                            .local()
+                            .is_some_and(|local| self.local_is_source_mut_place_param(site, local));
+                        if source_place
+                            || self.place_capture_cell(site, place).is_some()
+                            || self.place_crosses_dataref(site, place)
+                        {
+                            self.push(
+                                site,
+                                ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+                            );
+                        }
+                        if !self.supports_param_mode(place.ty, ParamMode::MutBorrow) {
+                            self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                        }
+                    }
+                    rir::RirParamSemantic::Value
+                    | rir::RirParamSemantic::SharedBorrow
+                    | rir::RirParamSemantic::StackCell => {
+                        self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                    }
                 }
             }
         }
@@ -960,6 +1021,13 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
                     return;
                 };
+                if self.local_is_source_mut_place_param(site, root)
+                    && !place.projection.is_empty()
+                    && !self.place_crosses_dataref(site, place)
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
+                    return;
+                }
                 local.ty
             }
             PlaceRoot::LambdaCapture(slot) => {
@@ -1000,6 +1068,33 @@ impl ProfileCx<'_> {
             self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
         }
         self.check_type_ref(site, place.ty);
+    }
+
+    fn local_is_source_mut_place_param(&self, site: ProfileSite, local: LocalId) -> bool {
+        let Some(function) = self.current_function_id(site) else {
+            return false;
+        };
+        self.program
+            .function(function)
+            .signature
+            .params
+            .iter()
+            .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
+    }
+
+    fn current_function_id(&self, site: ProfileSite) -> Option<FunctionId> {
+        match site {
+            ProfileSite::Function(function)
+            | ProfileSite::Local(function, _)
+            | ProfileSite::Param(function, _)
+            | ProfileSite::Statement(function, _)
+            | ProfileSite::Terminator(function) => Some(function),
+            ProfileSite::Entry
+            | ProfileSite::Type(_)
+            | ProfileSite::Const(_)
+            | ProfileSite::Module(_)
+            | ProfileSite::Extern(_) => None,
+        }
     }
 
     fn place_capture_cell(&self, site: ProfileSite, place: &Place) -> Option<air::CaptureCellId> {

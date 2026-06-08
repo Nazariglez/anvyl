@@ -5,6 +5,7 @@ pub mod cycle_collector;
 pub mod error;
 mod lambda_cell;
 pub mod managed_rc;
+mod mutable_place;
 pub mod provider;
 pub mod suspect_buffer;
 pub mod type_registry;
@@ -27,6 +28,7 @@ pub use managed_rc::{
     CycleColor, CycleVtable, ManagedRc, ManagedRcInner, RcHeader, managed_alloc_count,
     managed_alloc_details, typed_dropper,
 };
+pub use mutable_place::MutPlace;
 pub use provider::{
     AnvyxEnumExport, AnvyxInlineExport, AnvyxRefExport, BinaryOp, CallbackEscape, CallbackPolicy,
     CallbackThread, ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternCallbackParam,

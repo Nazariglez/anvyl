@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: capture-cell var arguments await lambda_capture_cell_mutable_places
+// @match: 1
+
+fn bump(var x: int) {
+    x += 1;
+}
+
+fn main() {
+    var count = 0;
+    let f = || {
+        bump(count);
+    };
+    f();
+    println(count);
+}

@@ -318,6 +318,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamSemantic::Value => RirParamAbi::Value,
             RirParamSemantic::SharedBorrow => RirParamAbi::SharedBorrow,
             RirParamSemantic::MutBorrow => RirParamAbi::MutBorrow,
+            RirParamSemantic::MutPlace => RirParamAbi::MutPlace,
             RirParamSemantic::StackCell => RirParamAbi::StackCell,
         }
     }
@@ -429,6 +430,10 @@ impl<'a> RustRepPolicy<'a> {
                 _ => format!("&{lifetime}{}", self.rust_ty(ty)),
             },
             RirParamAbi::MutBorrow => format!("&{lifetime}mut {}", self.rust_ty(ty)),
+            RirParamAbi::MutPlace => {
+                let payload = self.rust_ty(ty);
+                format!("{}<'_, 'cx, {payload}>", target::mut_place_ty())
+            }
             RirParamAbi::StackCell => {
                 let payload = self.rust_ty(ty);
                 format!("&{lifetime}{}", target::stack_lambda_cell_ty(&payload))
@@ -483,7 +488,7 @@ impl<'a> RustRepPolicy<'a> {
             lambda.captures.iter().all(|capture| match capture.abi {
                 RirParamAbi::Value => self.copyable_inner(capture.ty, active),
                 RirParamAbi::SharedBorrow | RirParamAbi::StackCell => true,
-                RirParamAbi::MutBorrow => false,
+                RirParamAbi::MutBorrow | RirParamAbi::MutPlace => false,
             })
         });
         active.remove(&id);
@@ -665,7 +670,9 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Map { .. } => true,
                 RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
-            RirParamSemantic::StackCell => !matches!(ty, RirType::Void),
+            RirParamSemantic::MutPlace | RirParamSemantic::StackCell => {
+                !matches!(ty, RirType::Void)
+            }
         }
     }
 

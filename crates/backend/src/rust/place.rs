@@ -74,19 +74,25 @@ impl<'a> RustPlaces<'a> {
     }
 
     pub(super) fn shared_borrow_root_param(&self, place: &RirPlace) -> bool {
-        place.projections.is_empty() && self.param_abi(place) == Some(RirParamAbi::SharedBorrow)
+        place.projections.is_empty()
+            && self.param_abi_for_local(place.local) == Some(RirParamAbi::SharedBorrow)
+    }
+
+    pub(super) fn mut_place_root_param(&self, place: &RirPlace) -> bool {
+        place.projections.is_empty()
+            && self.param_abi_for_local(place.local) == Some(RirParamAbi::MutPlace)
     }
 
     fn root_needs_deref(&self, place: &RirPlace) -> bool {
         self.function.locals[place.local.index()].payload_ref
-            || self.param_abi(place) == Some(RirParamAbi::MutBorrow)
+            || self.param_abi_for_local(place.local) == Some(RirParamAbi::MutBorrow)
     }
 
-    fn param_abi(&self, place: &RirPlace) -> Option<RirParamAbi> {
+    fn param_abi_for_local(&self, local: super::rir::RirLocalId) -> Option<RirParamAbi> {
         self.function
             .params
             .iter()
-            .find(|param| param.local == place.local)
+            .find(|param| param.local == local)
             .map(|param| param.abi)
     }
 
